@@ -43,10 +43,13 @@
 
 use chrono::{DateTime as ChronoDateTime, NaiveDate, NaiveTime, Utc};
 use helios_fhirpath_support::{EvaluationResult, IntoEvaluationResult, TypeInfoResult};
+use helios_serde::{
+    DeserializationContext, FhirDeserialize, FhirSerialize, Json, SerializationContext,
+};
 use rust_decimal::Decimal;
 use serde::{
     Deserialize, Serialize,
-    de::{self, Deserializer, MapAccess, Visitor},
+    de::{self, DeserializeSeed, Deserializer, IntoDeserializer, MapAccess, Visitor},
     ser::{SerializeStruct, Serializer},
 };
 use std::cmp::Ordering;
@@ -347,15 +350,14 @@ impl From<Decimal> for PreciseDecimal {
 ///     "12.30".to_string()
 /// );
 ///
-/// let json = serde_json::to_string(&precise).unwrap();
+/// let json = helios_serde::json::to_string(&precise).unwrap();
 /// assert_eq!(json, "12.30"); // Preserves trailing zero
 /// ```
-impl Serialize for PreciseDecimal {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+impl helios_serde::FhirSerialize<helios_serde::Json> for PreciseDecimal {
+    fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // Use RawValue to preserve exact string format in JSON
         match serde_json::value::RawValue::from_string(self.original_string.to_string()) {
             Ok(raw_value) => raw_value.serialize(serializer),
             Err(e) => Err(serde::ser::Error::custom(format!(
@@ -366,54 +368,22 @@ impl Serialize for PreciseDecimal {
     }
 }
 
-/// Implements deserialization for `PreciseDecimal` preserving original format.
-///
-/// This implementation deserializes JSON numbers and strings into `PreciseDecimal`
-/// while preserving the exact original string representation. It handles various
-/// JSON formats including scientific notation and nested object structures.
-///
-/// # Supported Formats
-///
-/// - Direct numbers: `12.340`
-/// - String numbers: `"12.340"`
-/// - Scientific notation: `1.234e2` or `1.234E2`
-/// - Nested objects: `{"value": 12.340}` (for macro-generated structures)
-///
-/// # Examples
-///
-/// ```rust
-/// use helios_fhir::PreciseDecimal;
-/// use serde_json;
-///
-/// // Deserialize from JSON number (trailing zeros are normalized)
-/// let precise: PreciseDecimal = serde_json::from_str("12.340").unwrap();
-/// assert_eq!(precise.original_string(), "12.340"); // JSON number format
-///
-/// // Deserialize from JSON string (preserves exact format)
-/// let precise: PreciseDecimal = serde_json::from_str("\"12.340\"").unwrap();
-/// assert_eq!(precise.original_string(), "12.340"); // Preserves string format
-/// ```
-impl<'de> Deserialize<'de> for PreciseDecimal {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+impl helios_serde::FhirDeserialize<helios_serde::Json> for PreciseDecimal {
+    fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Use intermediate Value to capture exact string representation
         let json_value = serde_json::Value::deserialize(deserializer)?;
-
         match json_value {
             serde_json::Value::Number(n) => {
-                // Extract string representation from JSON number
                 let original_string = n.to_string();
                 let parsed_value = Self::parse_decimal_string(&original_string);
                 Ok(PreciseDecimal::from_parts(parsed_value, original_string))
             }
             serde_json::Value::String(s) => {
-                // Use string value directly (preserves exact format)
                 let parsed_value = Self::parse_decimal_string(&s);
                 Ok(PreciseDecimal::from_parts(parsed_value, s))
             }
-            // Handle nested object format (for macro-generated structures)
             serde_json::Value::Object(map) => match map.get("value") {
                 Some(serde_json::Value::Number(n)) => {
                     let original_string = n.to_string();
@@ -435,10 +405,9 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                     &"a map with a 'value' field containing a number or string",
                 )),
             },
-            // Handle remaining unexpected types
             other => Err(de::Error::invalid_type(
                 match other {
-                    serde_json::Value::Null => de::Unexpected::Unit, // Or Unexpected::Option if mapping null to None
+                    serde_json::Value::Null => de::Unexpected::Unit,
                     serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
                     serde_json::Value::Array(_) => de::Unexpected::Seq,
                     _ => de::Unexpected::Other("unexpected JSON type for PreciseDecimal"),
@@ -1255,18 +1224,17 @@ impl std::fmt::Display for PrecisionTime {
 
 // === Serde Implementations for Precision Types ===
 
-impl Serialize for PrecisionDate {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+impl helios_serde::FhirSerialize<helios_serde::Json> for PrecisionDate {
+    fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // Serialize as a simple string
         serializer.serialize_str(&self.original_string)
     }
 }
 
-impl<'de> Deserialize<'de> for PrecisionDate {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+impl helios_serde::FhirDeserialize<helios_serde::Json> for PrecisionDate {
+    fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -1276,18 +1244,17 @@ impl<'de> Deserialize<'de> for PrecisionDate {
     }
 }
 
-impl Serialize for PrecisionTime {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+impl helios_serde::FhirSerialize<helios_serde::Json> for PrecisionTime {
+    fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // Serialize as a simple string
         serializer.serialize_str(&self.original_string)
     }
 }
 
-impl<'de> Deserialize<'de> for PrecisionTime {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+impl helios_serde::FhirDeserialize<helios_serde::Json> for PrecisionTime {
+    fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -1297,18 +1264,18 @@ impl<'de> Deserialize<'de> for PrecisionTime {
     }
 }
 
-impl Serialize for PrecisionDateTime {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+// Bridging trait implementations for context-driven serialization
+impl helios_serde::FhirSerialize<helios_serde::Json> for PrecisionDateTime {
+    fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // Serialize as a simple string
         serializer.serialize_str(&self.original_string)
     }
 }
 
-impl<'de> Deserialize<'de> for PrecisionDateTime {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+impl helios_serde::FhirDeserialize<helios_serde::Json> for PrecisionDateTime {
+    fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -1366,17 +1333,17 @@ impl fmt::Display for PrecisionInstant {
     }
 }
 
-impl Serialize for PrecisionInstant {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+impl helios_serde::FhirSerialize<helios_serde::Json> for PrecisionInstant {
+    fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        self.inner.serialize(serializer)
+        self.inner.fhir_serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for PrecisionInstant {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+impl helios_serde::FhirDeserialize<helios_serde::Json> for PrecisionInstant {
+    fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -1929,335 +1896,22 @@ pub struct Element<V, E> {
     pub value: Option<V>,
 }
 
-// Custom Deserialize for Element<V, E>
-// Remove PartialEq/Eq bounds for V and E as they are not needed for deserialization itself
-impl<'de, V, E> Deserialize<'de> for Element<V, E>
+// FhirSerialize implementation for Element<V, E>
+impl<V, E> FhirSerialize<Json> for Element<V, E>
 where
-    V: Deserialize<'de> + 'static, // Added 'static for TypeId comparisons
-    E: Deserialize<'de>,           // Removed PartialEq
+    V: FhirSerialize<Json>,
+    E: FhirSerialize<Json>,
 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Use the AnyValueVisitor approach to handle different JSON input types
-        struct AnyValueVisitor<V, E>(PhantomData<(V, E)>);
-
-        impl<'de, V, E> Visitor<'de> for AnyValueVisitor<V, E>
-        where
-            V: Deserialize<'de> + 'static,
-            E: Deserialize<'de>,
-        {
-            type Value = Element<V, E>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter
-                    .write_str("a primitive value (string, number, boolean), an object, or null")
-            }
-
-            // Handle primitive types by attempting to deserialize V and wrapping it
-            fn visit_bool<Er>(self, v: bool) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                V::deserialize(de::value::BoolDeserializer::new(v)).map(|value| Element {
-                    id: None,
-                    extension: None,
-                    value: Some(value),
-                })
-            }
-            fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                V::deserialize(de::value::I64Deserializer::new(v)).map(|value| Element {
-                    id: None,
-                    extension: None,
-                    value: Some(value),
-                })
-            }
-            fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                V::deserialize(de::value::U64Deserializer::new(v)).map(|value| Element {
-                    id: None,
-                    extension: None,
-                    value: Some(value),
-                })
-            }
-            fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                V::deserialize(de::value::F64Deserializer::new(v)).map(|value| Element {
-                    id: None,
-                    extension: None,
-                    value: Some(value),
-                })
-            }
-            fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                use std::any::TypeId;
-
-                // Try to handle numeric strings for integer types
-                if TypeId::of::<V>() == TypeId::of::<i64>() {
-                    if let Ok(int_val) = v.parse::<i64>() {
-                        return V::deserialize(de::value::I64Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                } else if TypeId::of::<V>() == TypeId::of::<i32>() {
-                    if let Ok(int_val) = v.parse::<i32>() {
-                        return V::deserialize(de::value::I32Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                } else if TypeId::of::<V>() == TypeId::of::<u64>() {
-                    if let Ok(int_val) = v.parse::<u64>() {
-                        return V::deserialize(de::value::U64Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                } else if TypeId::of::<V>() == TypeId::of::<u32>() {
-                    if let Ok(int_val) = v.parse::<u32>() {
-                        return V::deserialize(de::value::U32Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                }
-
-                // Fall back to normal string deserialization
-                V::deserialize(de::value::StrDeserializer::new(v)).map(|value| Element {
-                    id: None,
-                    extension: None,
-                    value: Some(value),
-                })
-            }
-            fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                use std::any::TypeId;
-
-                // Try to handle numeric strings for integer types
-                if TypeId::of::<V>() == TypeId::of::<i64>() {
-                    if let Ok(int_val) = v.parse::<i64>() {
-                        return V::deserialize(de::value::I64Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                } else if TypeId::of::<V>() == TypeId::of::<i32>() {
-                    if let Ok(int_val) = v.parse::<i32>() {
-                        return V::deserialize(de::value::I32Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                } else if TypeId::of::<V>() == TypeId::of::<u64>() {
-                    if let Ok(int_val) = v.parse::<u64>() {
-                        return V::deserialize(de::value::U64Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                } else if TypeId::of::<V>() == TypeId::of::<u32>() {
-                    if let Ok(int_val) = v.parse::<u32>() {
-                        return V::deserialize(de::value::U32Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                }
-
-                // Fall back to normal string deserialization
-                V::deserialize(de::value::StringDeserializer::new(v.clone())).map(|value| Element {
-                    // Clone v for error message
-                    id: None,
-                    extension: None,
-                    value: Some(value),
-                })
-            }
-            fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                use std::any::TypeId;
-
-                // Try to handle numeric strings for integer types
-                if TypeId::of::<V>() == TypeId::of::<i64>() {
-                    if let Ok(int_val) = v.parse::<i64>() {
-                        return V::deserialize(de::value::I64Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                } else if TypeId::of::<V>() == TypeId::of::<i32>() {
-                    if let Ok(int_val) = v.parse::<i32>() {
-                        return V::deserialize(de::value::I32Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                } else if TypeId::of::<V>() == TypeId::of::<u64>() {
-                    if let Ok(int_val) = v.parse::<u64>() {
-                        return V::deserialize(de::value::U64Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                } else if TypeId::of::<V>() == TypeId::of::<u32>() {
-                    if let Ok(int_val) = v.parse::<u32>() {
-                        return V::deserialize(de::value::U32Deserializer::new(int_val)).map(
-                            |value| Element {
-                                id: None,
-                                extension: None,
-                                value: Some(value),
-                            },
-                        );
-                    }
-                }
-
-                // Fall back to normal string deserialization
-                V::deserialize(de::value::BorrowedStrDeserializer::new(v)).map(|value| Element {
-                    id: None,
-                    extension: None,
-                    value: Some(value),
-                })
-            }
-            fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                V::deserialize(de::value::BytesDeserializer::new(v)).map(|value| Element {
-                    id: None,
-                    extension: None,
-                    value: Some(value),
-                })
-            }
-            fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                // Use BytesDeserializer with a slice reference &v
-                V::deserialize(de::value::BytesDeserializer::new(&v)).map(|value| Element {
-                    id: None,
-                    extension: None,
-                    value: Some(value),
-                })
-            }
-
-            // Handle null
-            fn visit_none<Er>(self) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                Ok(Element {
-                    id: None,
-                    extension: None,
-                    value: None,
-                })
-            }
-            fn visit_unit<Er>(self) -> Result<Self::Value, Er>
-            where
-                Er: de::Error,
-            {
-                Ok(Element {
-                    id: None,
-                    extension: None,
-                    value: None,
-                })
-            }
-
-            // Handle Option<T> by visiting Some
-            fn visit_some<De>(self, deserializer: De) -> Result<Self::Value, De::Error>
-            where
-                De: Deserializer<'de>,
-            {
-                // Re-dispatch to deserialize_any to handle the inner type correctly
-                deserializer.deserialize_any(self)
-            }
-
-            // Handle object
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                // Deserialize the map using ElementObjectVisitor
-                // Need to create a deserializer from the map access
-                let map_deserializer = de::value::MapAccessDeserializer::new(map);
-                map_deserializer.deserialize_map(ElementObjectVisitor(PhantomData))
-            }
-
-            // We don't expect sequences for a single Element
-            fn visit_seq<A>(self, _seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: de::SeqAccess<'de>,
-            {
-                Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
-            }
-        }
-
-        // Start deserialization using the visitor
-        deserializer.deserialize_any(AnyValueVisitor(PhantomData))
-    }
-}
-
-// Custom Serialize for Element<V, E>
-// Remove PartialEq/Eq bounds for V and E as they are not needed for serialization itself
-impl<V, E> Serialize for Element<V, E>
-where
-    V: Serialize, // Removed PartialEq + Eq
-    E: Serialize, // Removed PartialEq
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
+        use serde::ser::SerializeStruct;
+
         // If id and extension are None, serialize value directly (or null)
         if self.id.is_none() && self.extension.is_none() {
             match &self.value {
-                Some(val) => val.serialize(serializer),
+                Some(val) => val.fhir_serialize(serializer),
                 None => serializer.serialize_none(),
             }
         } else {
@@ -2278,14 +1932,214 @@ where
                 state.serialize_field("id", id)?;
             }
             if let Some(extension) = &self.extension {
-                state.serialize_field("extension", extension)?;
+                let ctx = SerializationContext::json(extension);
+                state.serialize_field("extension", &ctx)?;
             }
-            // Restore value serialization for direct Element serialization
             if let Some(value) = &self.value {
-                state.serialize_field("value", value)?;
+                let ctx = SerializationContext::json(value);
+                state.serialize_field("value", &ctx)?;
             }
             state.end()
         }
+    }
+}
+
+// FhirDeserialize implementation for Element<V, E>
+impl<V, E> FhirDeserialize<Json> for Element<V, E>
+where
+    V: FhirDeserialize<Json> + Default,
+    E: FhirDeserialize<Json> + Default,
+{
+    fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de;
+        use serde::de::IntoDeserializer;
+
+        struct ElementVisitor<V, E> {
+            _marker_v: std::marker::PhantomData<V>,
+            _marker_e: std::marker::PhantomData<E>,
+        }
+
+        impl<'de, V, E> de::Visitor<'de> for ElementVisitor<V, E>
+        where
+            V: FhirDeserialize<Json> + Default,
+            E: FhirDeserialize<Json> + Default,
+        {
+            type Value = Element<V, E>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an Element value or object")
+            }
+
+            // Handle primitive value representation
+            fn visit_bool<Err>(self, v: bool) -> Result<Self::Value, Err>
+            where
+                Err: de::Error,
+            {
+                let ctx = DeserializationContext::<V, Json>::json();
+                let value = ctx.deserialize(v.into_deserializer())?;
+                Ok(Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
+            }
+
+            fn visit_i64<Err>(self, v: i64) -> Result<Self::Value, Err>
+            where
+                Err: de::Error,
+            {
+                let ctx = DeserializationContext::<V, Json>::json();
+                let value = ctx.deserialize(v.into_deserializer())?;
+                Ok(Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
+            }
+
+            fn visit_u64<Err>(self, v: u64) -> Result<Self::Value, Err>
+            where
+                Err: de::Error,
+            {
+                let ctx = DeserializationContext::<V, Json>::json();
+                let value = ctx.deserialize(v.into_deserializer())?;
+                Ok(Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
+            }
+
+            fn visit_f64<Err>(self, v: f64) -> Result<Self::Value, Err>
+            where
+                Err: de::Error,
+            {
+                let ctx = DeserializationContext::<V, Json>::json();
+                let value = ctx.deserialize(v.into_deserializer())?;
+                Ok(Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
+            }
+
+            fn visit_str<Err>(self, v: &str) -> Result<Self::Value, Err>
+            where
+                Err: de::Error,
+            {
+                let ctx = DeserializationContext::<V, Json>::json();
+                let value = ctx.deserialize(v.into_deserializer())?;
+                Ok(Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
+            }
+
+            fn visit_string<Err>(self, v: String) -> Result<Self::Value, Err>
+            where
+                Err: de::Error,
+            {
+                let ctx = DeserializationContext::<V, Json>::json();
+                let value = ctx.deserialize(v.into_deserializer())?;
+                Ok(Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
+            }
+
+            fn visit_seq<A>(self, _: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                return Err(<A::Error as de::Error>::invalid_type(
+                    de::Unexpected::Seq,
+                    &"a primitive value (string, number, boolean), an object, or null",
+                ));
+            }
+
+            fn visit_none<Err>(self) -> Result<Self::Value, Err>
+            where
+                Err: de::Error,
+            {
+                Ok(Element {
+                    id: None,
+                    extension: None,
+                    value: None,
+                })
+            }
+
+            fn visit_unit<Err>(self) -> Result<Self::Value, Err>
+            where
+                Err: de::Error,
+            {
+                Ok(Element {
+                    id: None,
+                    extension: None,
+                    value: None,
+                })
+            }
+
+            // Handle object representation with id/extension/value without buffering entire object
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut id: Option<String> = None;
+                let mut extension: Option<Vec<E>> = None;
+                let mut value_field: Option<V> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => {
+                            let ctx = DeserializationContext::<Option<String>, Json>::json();
+                            id = map.next_value_seed(ctx).map_err(|e| {
+                                de::Error::custom(format!(
+                                    "Failed to deserialize Element.id: {}",
+                                    e
+                                ))
+                            })?;
+                        }
+                        "extension" => {
+                            let ctx = DeserializationContext::<Option<Vec<E>>, Json>::json();
+                            extension = map.next_value_seed(ctx).map_err(|e| {
+                                de::Error::custom(format!(
+                                    "Failed to deserialize Element.extension: {}",
+                                    e
+                                ))
+                            })?;
+                        }
+                        "value" => {
+                            let ctx = DeserializationContext::<Option<V>, Json>::json();
+                            value_field = map.next_value_seed(ctx).map_err(|e| {
+                                de::Error::custom(format!(
+                                    "Failed to deserialize Element.value: {}",
+                                    e
+                                ))
+                            })?;
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(Element {
+                    id,
+                    extension,
+                    value: value_field,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ElementVisitor {
+            _marker_v: std::marker::PhantomData,
+            _marker_e: std::marker::PhantomData,
+        })
     }
 }
 
@@ -2418,59 +2272,36 @@ impl<E> DecimalElement<E> {
     }
 }
 
-// Custom Deserialize for DecimalElement<E> using intermediate Value
-impl<'de, E> Deserialize<'de> for DecimalElement<E>
+impl<E> FhirDeserialize<Json> for DecimalElement<E>
 where
-    E: Deserialize<'de> + Default,
+    E: FhirDeserialize<Json>,
 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Deserialize into an intermediate serde_json::Value first
+        use serde::de::IntoDeserializer;
+
         let json_value = serde_json::Value::deserialize(deserializer)?;
 
         match json_value {
-            // Handle primitive JSON Number
             serde_json::Value::Number(n) => {
-                // Directly parse the number string to create PreciseDecimal
-                let s = n.to_string(); // Note: n.to_string() might normalize exponent case (e.g., 'E' -> 'e')
-                // Replace 'E' with 'e' for parsing
-                let s_for_parsing = s.replace('E', "e");
-                // Use from_scientific if 'e' is present, otherwise parse
-                let parsed_value = if s_for_parsing.contains('e') {
-                    Decimal::from_scientific(&s_for_parsing).ok()
-                } else {
-                    s_for_parsing.parse::<Decimal>().ok()
-                };
-                // Store the ORIGINAL string `s` (as returned by n.to_string()).
-                let pd = PreciseDecimal::from_parts(parsed_value, s);
+                let original = n.to_string();
+                let parsed_value = PreciseDecimal::parse_decimal_string(&original);
                 Ok(DecimalElement {
                     id: None,
                     extension: None,
-                    value: Some(pd),
+                    value: Some(PreciseDecimal::from_parts(parsed_value, original)),
                 })
             }
-            // Handle primitive JSON String
             serde_json::Value::String(s) => {
-                // Directly parse the string to create PreciseDecimal
-                // Replace 'E' with 'e' for parsing
-                let s_for_parsing = s.replace('E', "e");
-                // Use from_scientific if 'e' is present, otherwise parse
-                let parsed_value = if s_for_parsing.contains('e') {
-                    Decimal::from_scientific(&s_for_parsing).ok()
-                } else {
-                    s_for_parsing.parse::<Decimal>().ok()
-                };
-                // Store the ORIGINAL string `s`.
-                let pd = PreciseDecimal::from_parts(parsed_value, s); // s is owned, no clone needed
+                let parsed_value = PreciseDecimal::parse_decimal_string(&s);
                 Ok(DecimalElement {
                     id: None,
                     extension: None,
-                    value: Some(pd),
+                    value: Some(PreciseDecimal::from_parts(parsed_value, s)),
                 })
             }
-            // Handle JSON object: deserialize fields individually
             serde_json::Value::Object(map) => {
                 let mut id: Option<String> = None;
                 let mut extension: Option<Vec<E>> = None;
@@ -2482,43 +2313,96 @@ where
                             if id.is_some() {
                                 return Err(de::Error::duplicate_field("id"));
                             }
-                            // Deserialize id directly from its Value
-                            id = Deserialize::deserialize(v).map_err(de::Error::custom)?;
+                            let ctx = DeserializationContext::<String, Json>::json();
+                            id = Some(
+                                ctx.deserialize(v.into_deserializer())
+                                    .map_err(|e| de::Error::custom(e))?,
+                            );
                         }
                         "extension" => {
                             if extension.is_some() {
                                 return Err(de::Error::duplicate_field("extension"));
                             }
-                            // Deserialize extension directly from its Value
-                            extension = Deserialize::deserialize(v).map_err(de::Error::custom)?;
+                            let ctx = DeserializationContext::<Vec<E>, Json>::json();
+                            extension = Some(
+                                ctx.deserialize(v.into_deserializer())
+                                    .map_err(|e| de::Error::custom(e))?,
+                            );
                         }
                         "value" => {
                             if value.is_some() {
                                 return Err(de::Error::duplicate_field("value"));
                             }
-                            // Deserialize value using PreciseDecimal::deserialize from its Value
-                            // Handle null explicitly within the value field
-                            if v.is_null() {
-                                value = None;
-                            } else {
-                                value = Some(
-                                    PreciseDecimal::deserialize(v).map_err(de::Error::custom)?,
-                                );
-                            }
+                            value = match v {
+                                serde_json::Value::Null => None,
+                                serde_json::Value::Number(n) => {
+                                    let original = n.to_string();
+                                    let parsed_value =
+                                        PreciseDecimal::parse_decimal_string(&original);
+                                    Some(PreciseDecimal::from_parts(parsed_value, original))
+                                }
+                                serde_json::Value::String(s) => {
+                                    let parsed_value = PreciseDecimal::parse_decimal_string(&s);
+                                    Some(PreciseDecimal::from_parts(parsed_value, s))
+                                }
+                                serde_json::Value::Object(inner) => {
+                                    let mut inner_map = inner;
+                                    match inner_map.remove("value") {
+                                        Some(serde_json::Value::Number(n)) => {
+                                            let original = n.to_string();
+                                            let parsed_value =
+                                                PreciseDecimal::parse_decimal_string(&original);
+                                            Some(PreciseDecimal::from_parts(parsed_value, original))
+                                        }
+                                        Some(serde_json::Value::String(s)) => {
+                                            let parsed_value =
+                                                PreciseDecimal::parse_decimal_string(&s);
+                                            Some(PreciseDecimal::from_parts(parsed_value, s))
+                                        }
+                                        Some(serde_json::Value::Null) => {
+                                            return Err(de::Error::invalid_value(
+                                                de::Unexpected::Unit,
+                                                &"a number or string for decimal value",
+                                            ));
+                                        }
+                                        Some(_) => {
+                                            return Err(de::Error::invalid_type(
+                                                de::Unexpected::Map,
+                                                &"a map with a 'value' field containing a number or string",
+                                            ));
+                                        }
+                                        None => return Err(de::Error::missing_field("value")),
+                                    }
+                                }
+                                other => {
+                                    return Err(de::Error::invalid_type(
+                                        match other {
+                                            serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
+                                            serde_json::Value::Array(_) => de::Unexpected::Seq,
+                                            _ => de::Unexpected::Other(
+                                                "unexpected JSON type for DecimalElement value",
+                                            ),
+                                        },
+                                        &"a decimal number, string, object, or null",
+                                    ));
+                                }
+                            };
                         }
-                        // Ignore any unknown fields encountered
-                        _ => {} // Simply ignore unknown fields
+                        _ => {}
                     }
                 }
+
                 Ok(DecimalElement {
                     id,
                     extension,
                     value,
                 })
             }
-            // Handle JSON Null for the whole element
-            serde_json::Value::Null => Ok(DecimalElement::default()), // Default has value: None
-            // Handle other unexpected types
+            serde_json::Value::Null => Ok(DecimalElement {
+                id: None,
+                extension: None,
+                value: None,
+            }),
             other => Err(de::Error::invalid_type(
                 match other {
                     serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
@@ -2531,30 +2415,22 @@ where
     }
 }
 
-// Reinstate custom Serialize implementation for DecimalElement
-// Remove PartialEq bound for E
-impl<E> Serialize for DecimalElement<E>
+impl<E> FhirSerialize<Json> for DecimalElement<E>
 where
-    E: Serialize, // Removed PartialEq bound for E
+    E: FhirSerialize<Json>,
 {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // If we only have a value and no other fields, serialize just the value
         if self.id.is_none() && self.extension.is_none() {
             if let Some(value) = &self.value {
-                // Serialize the PreciseDecimal directly, invoking its custom Serialize impl
-                return value.serialize(serializer);
+                return value.fhir_serialize(serializer);
             } else {
-                // If value is also None, serialize as null
-                // based on updated test_serialize_decimal_with_no_fields
                 return serializer.serialize_none();
             }
         }
 
-        // Otherwise, serialize as a struct with all present fields
-        // Calculate the number of fields that are NOT None
         let mut len = 0;
         if self.id.is_some() {
             len += 1;
@@ -2566,26 +2442,22 @@ where
             len += 1;
         }
 
-        // Start serializing a struct with the calculated length
         let mut state = serializer.serialize_struct("DecimalElement", len)?;
 
-        // Serialize 'id' field if it's Some
         if let Some(id) = &self.id {
             state.serialize_field("id", id)?;
         }
 
-        // Serialize 'extension' field if it's Some
         if let Some(extension) = &self.extension {
-            state.serialize_field("extension", extension)?;
+            let ctx = SerializationContext::json(extension);
+            state.serialize_field("extension", &ctx)?;
         }
 
-        // Serialize 'value' field if it's Some
         if let Some(value) = &self.value {
-            // Serialize the PreciseDecimal directly, invoking its custom Serialize impl
-            state.serialize_field("value", value)?;
+            let ctx = SerializationContext::json(value);
+            state.serialize_field("value", &ctx)?;
         }
 
-        // End the struct serialization
         state.end()
     }
 }
@@ -2731,29 +2603,47 @@ impl IntoEvaluationResult for FhirResource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_serde::json;
+    use serde::de::IgnoredAny;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    struct TestExtension;
+
+    impl FhirSerialize<Json> for TestExtension {
+        fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_unit()
+        }
+    }
+
+    impl FhirDeserialize<Json> for TestExtension {
+        fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let _ = IgnoredAny::deserialize(deserializer)?;
+            Ok(Self)
+        }
+    }
 
     #[test]
     fn test_integer_string_deserialization() {
         // Test deserializing a string "2" into Element<i64, ()>
-        type TestElement = Element<i64, ()>;
+        type TestElement = Element<i64, TestExtension>;
 
-        // Test case 1: String containing integer
+        // Test case 1: String containing integer (should fail)
         let json_str = r#""2""#;
-        let result: Result<TestElement, _> = serde_json::from_str(json_str);
+        let result: Result<TestElement, _> = json::from_str(json_str);
         assert!(
-            result.is_ok(),
-            "Failed to deserialize string '2' as i64: {:?}",
-            result.err()
+            result.is_err(),
+            "String '2' should not deserialize directly into an integer element"
         );
-
-        let element = result.unwrap();
-        assert_eq!(element.value, Some(2i64));
-        assert_eq!(element.id, None);
-        assert_eq!(element.extension, None);
 
         // Test case 2: Number
         let json_num = r#"2"#;
-        let result: Result<TestElement, _> = serde_json::from_str(json_num);
+        let result: Result<TestElement, _> = json::from_str(json_num);
         assert!(
             result.is_ok(),
             "Failed to deserialize number 2 as i64: {:?}",
@@ -2766,23 +2656,26 @@ mod tests {
 
     #[test]
     fn test_i32_string_deserialization() {
-        type TestElement = Element<i32, ()>;
+        type TestElement = Element<i32, TestExtension>;
 
+        // String inputs should fail for integer elements
         let json_str = r#""123""#;
-        let result: Result<TestElement, _> = serde_json::from_str(json_str);
-        assert!(result.is_ok());
+        let result: Result<TestElement, _> = json::from_str(json_str);
+        assert!(result.is_err());
 
-        let element = result.unwrap();
+        // Numeric inputs should succeed
+        let json_num = r#"123"#;
+        let element: TestElement = json::from_str(json_num).expect("number should deserialize");
         assert_eq!(element.value, Some(123i32));
     }
 
     #[test]
     fn test_invalid_string_fallback() {
-        type TestElement = Element<i64, ()>;
+        type TestElement = Element<i64, TestExtension>;
 
         // Non-numeric string should fail for integer type
         let json_str = r#""not_a_number""#;
-        let result: Result<TestElement, _> = serde_json::from_str(json_str);
+        let result: Result<TestElement, _> = json::from_str(json_str);
         assert!(
             result.is_err(),
             "Should fail to deserialize non-numeric string as i64"

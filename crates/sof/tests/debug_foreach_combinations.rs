@@ -1,3 +1,4 @@
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
@@ -24,7 +25,7 @@ fn debug_foreach_combinations() {
         "entry": [{"resource": patient_json}]
     });
 
-    let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json).unwrap();
+    let bundle: helios_fhir::r4::Bundle = json::from_value(bundle_json).unwrap();
     let bundle = SofBundle::R4(bundle);
 
     // Create ViewDefinition exactly like the failing test
@@ -57,7 +58,7 @@ fn debug_foreach_combinations() {
     });
 
     let view_definition: helios_fhir::r4::ViewDefinition =
-        serde_json::from_value(view_definition_json).unwrap();
+        json::from_value(view_definition_json).unwrap();
     let view_definition = SofViewDefinition::R4(view_definition);
 
     println!("=== Running forEach combination debug test ===");
@@ -68,7 +69,7 @@ fn debug_foreach_combinations() {
     println!("Result: {}", result_str);
 
     // Parse and analyze the result
-    let result_rows: Vec<serde_json::Value> = serde_json::from_str(&result_str).unwrap();
+    let result_rows: Vec<serde_json::Value> = json::from_str(&result_str).unwrap();
 
     println!("\nAnalysis:");
     println!("Number of rows: {}", result_rows.len());

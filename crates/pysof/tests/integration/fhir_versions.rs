@@ -2,6 +2,7 @@
 //! 
 //! Tests the interaction between different FHIR versions and the pysof library.
 
+use helios_serde::json;
 use serde_json::json;
 
 #[test]
@@ -21,7 +22,7 @@ fn test_fhir_version_feature_flag_integration() {
             }]
         });
         
-        let result: Result<helios_fhir::r4::Patient, _> = serde_json::from_value(patient);
+        let result: Result<helios_fhir::r4::Patient, _> = json::from_value(patient);
         assert!(result.is_ok());
     }
     
@@ -39,7 +40,7 @@ fn test_fhir_version_feature_flag_integration() {
             }]
         });
         
-        let result: Result<helios_fhir::r4b::Patient, _> = serde_json::from_value(patient);
+        let result: Result<helios_fhir::r4b::Patient, _> = json::from_value(patient);
         assert!(result.is_ok());
     }
     
@@ -57,7 +58,7 @@ fn test_fhir_version_feature_flag_integration() {
             }]
         });
         
-        let result: Result<helios_fhir::r5::Patient, _> = serde_json::from_value(patient);
+        let result: Result<helios_fhir::r5::Patient, _> = json::from_value(patient);
         assert!(result.is_ok());
     }
 }
@@ -85,7 +86,7 @@ fn test_view_definition_version_compatibility() {
     #[cfg(feature = "R4")]
     {
         let result: Result<helios_fhir::r4::ViewDefinition, _> = 
-            serde_json::from_value(view_definition.clone());
+            json::from_value(view_definition.clone());
         // ViewDefinition parsing may be lenient, so we just ensure it doesn't panic
         let _parsed = result;
     }
@@ -93,14 +94,14 @@ fn test_view_definition_version_compatibility() {
     #[cfg(feature = "R4B")]
     {
         let result: Result<helios_fhir::r4b::ViewDefinition, _> = 
-            serde_json::from_value(view_definition.clone());
+            json::from_value(view_definition.clone());
         let _parsed = result;
     }
     
     #[cfg(feature = "R5")]
     {
         let result: Result<helios_fhir::r5::ViewDefinition, _> = 
-            serde_json::from_value(view_definition.clone());
+            json::from_value(view_definition.clone());
         let _parsed = result;
     }
 }
@@ -125,21 +126,21 @@ fn test_bundle_version_compatibility() {
     #[cfg(feature = "R4")]
     {
         let result: Result<helios_fhir::r4::Bundle, _> = 
-            serde_json::from_value(bundle.clone());
+            json::from_value(bundle.clone());
         assert!(result.is_ok());
     }
     
     #[cfg(feature = "R4B")]
     {
         let result: Result<helios_fhir::r4b::Bundle, _> = 
-            serde_json::from_value(bundle.clone());
+            json::from_value(bundle.clone());
         assert!(result.is_ok());
     }
     
     #[cfg(feature = "R5")]
     {
         let result: Result<helios_fhir::r5::Bundle, _> = 
-            serde_json::from_value(bundle.clone());
+            json::from_value(bundle.clone());
         assert!(result.is_ok());
     }
 }

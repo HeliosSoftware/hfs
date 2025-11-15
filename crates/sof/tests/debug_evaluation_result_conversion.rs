@@ -1,4 +1,5 @@
 use helios_fhirpath_support::IntoEvaluationResult;
+use helios_serde::json;
 
 #[test]
 fn test_evaluation_result_conversion() {
@@ -17,7 +18,7 @@ fn test_evaluation_result_conversion() {
 
     // Parse as R4 Patient
     let patient: helios_fhir::r4::Patient =
-        serde_json::from_value(patient_json).expect("Failed to parse patient");
+        json::from_value(patient_json).expect("Failed to parse patient");
 
     // Convert to EvaluationResult
     let eval_result = patient.to_evaluation_result();

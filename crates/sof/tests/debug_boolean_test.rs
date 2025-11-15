@@ -2,6 +2,7 @@
 mod tests {
     use helios_fhir::{FhirResource, r4::Patient};
     use helios_fhirpath::{EvaluationContext, evaluate_expression};
+    use helios_serde::json;
 
     #[test]
     fn debug_boolean_constant_test() {
@@ -18,7 +19,7 @@ mod tests {
         }
         "#;
 
-        let patient: Patient = serde_json::from_str(patient_json).unwrap();
+        let patient: Patient = json::from_str(patient_json).unwrap();
         println!("Patient: {:#?}", patient);
 
         // Check what the deceased field contains

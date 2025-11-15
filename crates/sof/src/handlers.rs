@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
+use helios_serde::json;
 use helios_sof::{
     ContentType, RunOptions, SofBundle, SofViewDefinition,
     data_source::{DataSource, UniversalDataSource},
@@ -462,7 +463,7 @@ fn parse_view_definition(json: serde_json::Value) -> ServerResult<SofViewDefinit
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => {
             let view_def: helios_fhir::r4::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
+                json::from_value(json).map_err(|e| {
                     ServerError::BadRequest(format!("Invalid R4 ViewDefinition: {}", e))
                 })?;
             Ok(SofViewDefinition::R4(view_def))
@@ -470,7 +471,7 @@ fn parse_view_definition(json: serde_json::Value) -> ServerResult<SofViewDefinit
         #[cfg(feature = "R4B")]
         helios_fhir::FhirVersion::R4B => {
             let view_def: helios_fhir::r4b::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
+                json::from_value(json).map_err(|e| {
                     ServerError::BadRequest(format!("Invalid R4B ViewDefinition: {}", e))
                 })?;
             Ok(SofViewDefinition::R4B(view_def))
@@ -478,7 +479,7 @@ fn parse_view_definition(json: serde_json::Value) -> ServerResult<SofViewDefinit
         #[cfg(feature = "R5")]
         helios_fhir::FhirVersion::R5 => {
             let view_def: helios_fhir::r5::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
+                json::from_value(json).map_err(|e| {
                     ServerError::BadRequest(format!("Invalid R5 ViewDefinition: {}", e))
                 })?;
             Ok(SofViewDefinition::R5(view_def))
@@ -486,7 +487,7 @@ fn parse_view_definition(json: serde_json::Value) -> ServerResult<SofViewDefinit
         #[cfg(feature = "R6")]
         helios_fhir::FhirVersion::R6 => {
             let view_def: helios_fhir::r6::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
+                json::from_value(json).map_err(|e| {
                     ServerError::BadRequest(format!("Invalid R6 ViewDefinition: {}", e))
                 })?;
             Ok(SofViewDefinition::R6(view_def))
@@ -514,25 +515,25 @@ fn parse_parameters(json: serde_json::Value) -> ServerResult<RunParameters> {
     match newest_version {
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(json)
+            let params: helios_fhir::r4::Parameters = json::from_value(json)
                 .map_err(|e| ServerError::BadRequest(format!("Invalid R4 Parameters: {}", e)))?;
             Ok(RunParameters::R4(params))
         }
         #[cfg(feature = "R4B")]
         helios_fhir::FhirVersion::R4B => {
-            let params: helios_fhir::r4b::Parameters = serde_json::from_value(json)
+            let params: helios_fhir::r4b::Parameters = json::from_value(json)
                 .map_err(|e| ServerError::BadRequest(format!("Invalid R4B Parameters: {}", e)))?;
             Ok(RunParameters::R4B(params))
         }
         #[cfg(feature = "R5")]
         helios_fhir::FhirVersion::R5 => {
-            let params: helios_fhir::r5::Parameters = serde_json::from_value(json)
+            let params: helios_fhir::r5::Parameters = json::from_value(json)
                 .map_err(|e| ServerError::BadRequest(format!("Invalid R5 Parameters: {}", e)))?;
             Ok(RunParameters::R5(params))
         }
         #[cfg(feature = "R6")]
         helios_fhir::FhirVersion::R6 => {
-            let params: helios_fhir::r6::Parameters = serde_json::from_value(json)
+            let params: helios_fhir::r6::Parameters = json::from_value(json)
                 .map_err(|e| ServerError::BadRequest(format!("Invalid R6 Parameters: {}", e)))?;
             Ok(RunParameters::R6(params))
         }
@@ -556,34 +557,30 @@ fn create_bundle_from_resources(resources: Vec<serde_json::Value>) -> ServerResu
     match newest_version {
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => {
-            let bundle: helios_fhir::r4::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R4 Bundle: {}", e))
-                })?;
+            let bundle: helios_fhir::r4::Bundle = json::from_value(bundle_json).map_err(|e| {
+                ServerError::InternalError(format!("Failed to create R4 Bundle: {}", e))
+            })?;
             Ok(SofBundle::R4(bundle))
         }
         #[cfg(feature = "R4B")]
         helios_fhir::FhirVersion::R4B => {
-            let bundle: helios_fhir::r4b::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R4B Bundle: {}", e))
-                })?;
+            let bundle: helios_fhir::r4b::Bundle = json::from_value(bundle_json).map_err(|e| {
+                ServerError::InternalError(format!("Failed to create R4B Bundle: {}", e))
+            })?;
             Ok(SofBundle::R4B(bundle))
         }
         #[cfg(feature = "R5")]
         helios_fhir::FhirVersion::R5 => {
-            let bundle: helios_fhir::r5::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R5 Bundle: {}", e))
-                })?;
+            let bundle: helios_fhir::r5::Bundle = json::from_value(bundle_json).map_err(|e| {
+                ServerError::InternalError(format!("Failed to create R5 Bundle: {}", e))
+            })?;
             Ok(SofBundle::R5(bundle))
         }
         #[cfg(feature = "R6")]
         helios_fhir::FhirVersion::R6 => {
-            let bundle: helios_fhir::r6::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R6 Bundle: {}", e))
-                })?;
+            let bundle: helios_fhir::r6::Bundle = json::from_value(bundle_json).map_err(|e| {
+                ServerError::InternalError(format!("Failed to create R6 Bundle: {}", e))
+            })?;
             Ok(SofBundle::R6(bundle))
         }
     }
@@ -599,7 +596,7 @@ fn extract_resources_from_bundle(bundle: &SofBundle) -> ServerResult<Vec<serde_j
             if let Some(entries) = &bundle.entry {
                 for entry in entries {
                     if let Some(resource) = &entry.resource {
-                        resources.push(serde_json::to_value(resource)?);
+                        resources.push(json::to_value(resource)?);
                     }
                 }
             }
@@ -609,7 +606,7 @@ fn extract_resources_from_bundle(bundle: &SofBundle) -> ServerResult<Vec<serde_j
             if let Some(entries) = &bundle.entry {
                 for entry in entries {
                     if let Some(resource) = &entry.resource {
-                        resources.push(serde_json::to_value(resource)?);
+                        resources.push(json::to_value(resource)?);
                     }
                 }
             }
@@ -619,7 +616,7 @@ fn extract_resources_from_bundle(bundle: &SofBundle) -> ServerResult<Vec<serde_j
             if let Some(entries) = &bundle.entry {
                 for entry in entries {
                     if let Some(resource) = &entry.resource {
-                        resources.push(serde_json::to_value(resource)?);
+                        resources.push(json::to_value(resource)?);
                     }
                 }
             }
@@ -629,7 +626,7 @@ fn extract_resources_from_bundle(bundle: &SofBundle) -> ServerResult<Vec<serde_j
             if let Some(entries) = &bundle.entry {
                 for entry in entries {
                     if let Some(resource) = &entry.resource {
-                        resources.push(serde_json::to_value(resource)?);
+                        resources.push(json::to_value(resource)?);
                     }
                 }
             }
@@ -653,7 +650,7 @@ fn merge_bundles(
             if let Some(entries) = bundle.entry {
                 for entry in entries {
                     if let Some(resource) = entry.resource {
-                        all_resources.push(serde_json::to_value(&resource)?);
+                        all_resources.push(json::to_value(&resource)?);
                     }
                 }
             }
@@ -663,7 +660,7 @@ fn merge_bundles(
             if let Some(entries) = bundle.entry {
                 for entry in entries {
                     if let Some(resource) = entry.resource {
-                        all_resources.push(serde_json::to_value(&resource)?);
+                        all_resources.push(json::to_value(&resource)?);
                     }
                 }
             }
@@ -673,7 +670,7 @@ fn merge_bundles(
             if let Some(entries) = bundle.entry {
                 for entry in entries {
                     if let Some(resource) = entry.resource {
-                        all_resources.push(serde_json::to_value(&resource)?);
+                        all_resources.push(json::to_value(&resource)?);
                     }
                 }
             }
@@ -683,7 +680,7 @@ fn merge_bundles(
             if let Some(entries) = bundle.entry {
                 for entry in entries {
                     if let Some(resource) = entry.resource {
-                        all_resources.push(serde_json::to_value(&resource)?);
+                        all_resources.push(json::to_value(&resource)?);
                     }
                 }
             }

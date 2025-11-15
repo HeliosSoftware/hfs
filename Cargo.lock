@@ -1414,6 +1414,7 @@ dependencies = [
  "clap",
  "helios-fhir-macro",
  "helios-fhirpath-support",
+ "helios-serde",
  "reqwest",
  "rust_decimal",
  "rust_decimal_macros",
@@ -1464,6 +1465,7 @@ dependencies = [
  "futures",
  "helios-fhir",
  "helios-fhirpath-support",
+ "helios-serde",
  "hex",
  "http",
  "lazy_static",
@@ -1502,6 +1504,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-serde"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "helios-sof"
 version = "0.1.29"
 dependencies = [
@@ -1520,6 +1530,7 @@ dependencies = [
  "helios-fhir",
  "helios-fhirpath",
  "helios-fhirpath-support",
+ "helios-serde",
  "http",
  "mime",
  "object_store",
@@ -2735,6 +2746,7 @@ dependencies = [
  "chrono",
  "csv",
  "helios-fhir",
+ "helios-serde",
  "helios-sof",
  "pyo3",
  "pyo3-build-config",

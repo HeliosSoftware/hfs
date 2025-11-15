@@ -1,3 +1,4 @@
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
@@ -28,7 +29,7 @@ fn test_extension_fix_verification() {
     });
 
     // Parse bundle
-    let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json).unwrap();
+    let bundle: helios_fhir::r4::Bundle = json::from_value(bundle_json).unwrap();
     let bundle = SofBundle::R4(bundle);
 
     // Create ViewDefinition matching the failing test
@@ -54,7 +55,7 @@ fn test_extension_fix_verification() {
     });
 
     let view_definition: helios_fhir::r4::ViewDefinition =
-        serde_json::from_value(view_definition_json).unwrap();
+        json::from_value(view_definition_json).unwrap();
     let view_definition = SofViewDefinition::R4(view_definition);
 
     println!("Running SQL-on-FHIR extension test...");

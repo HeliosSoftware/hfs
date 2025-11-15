@@ -1,3 +1,4 @@
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
@@ -25,7 +26,7 @@ fn test_simple_extension_debug() {
     });
 
     let bundle: helios_fhir::r4::Bundle =
-        serde_json::from_value(bundle_json).expect("Failed to parse bundle");
+        json::from_value(bundle_json).expect("Failed to parse bundle");
     let sof_bundle = SofBundle::R4(bundle);
 
     // Test the simplest extension function call
@@ -50,14 +51,14 @@ fn test_simple_extension_debug() {
     });
 
     let view_definition: helios_fhir::r4::ViewDefinition =
-        serde_json::from_value(view).expect("Failed to parse ViewDefinition");
+        json::from_value(view).expect("Failed to parse ViewDefinition");
     let sof_view = SofViewDefinition::R4(view_definition);
 
     let result = run_view_definition(sof_view, sof_bundle, ContentType::Json)
         .expect("Failed to run ViewDefinition");
 
     let actual_rows: Vec<serde_json::Value> =
-        serde_json::from_slice(&result).expect("Failed to parse result as JSON");
+        json::from_slice(&result).expect("Failed to parse result as JSON");
 
     println!("Result: {:?}", actual_rows);
 }

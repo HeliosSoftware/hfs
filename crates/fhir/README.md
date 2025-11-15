@@ -161,10 +161,10 @@ Each version provides a unified Resource enum containing all resource types:
 use helios_fhir::r5::Resource;
 
 let resource = Resource::Patient(patient);
-let json = serde_json::to_string(&resource)?;
+let json = helios_serde::json::to_string(&resource)?;
 
 // Deserialize from JSON
-let parsed: Resource = serde_json::from_str(&json)?;
+let parsed: Resource = helios_serde::json::from_str(&json)?;
 ```
 
 ## Serialization and Deserialization
@@ -175,8 +175,6 @@ All generated types are fully compatible with official FHIR JSON representations
 
 ```rust
 use helios_fhir::r5::Patient;
-use serde_json;
-
 // Deserialize from FHIR JSON
 let fhir_json = r#"{
     "resourceType": "Patient",
@@ -189,10 +187,10 @@ let fhir_json = r#"{
     ]
 }"#;
 
-let patient: Patient = serde_json::from_str(fhir_json)?;
+let patient: Patient = helios_serde::json::from_str(fhir_json)?;
 
 // Serialize back to JSON
-let json = serde_json::to_string_pretty(&patient)?;
+let json = helios_serde::json::to_string_pretty(&patient)?;
 ```
 
 ### Precision Handling

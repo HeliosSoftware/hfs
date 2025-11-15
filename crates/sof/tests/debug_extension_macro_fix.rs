@@ -1,4 +1,5 @@
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_serde::json;
 
 #[test]
 fn debug_extension_macro_fix() {
@@ -17,7 +18,7 @@ fn debug_extension_macro_fix() {
 
     // Parse into FHIR resource
     let patient: helios_fhir::r4::Patient =
-        serde_json::from_value(patient_json).expect("Failed to parse patient");
+        json::from_value(patient_json).expect("Failed to parse patient");
 
     println!("Patient parsed successfully");
 

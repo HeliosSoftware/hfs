@@ -1,5 +1,6 @@
 use helios_fhir::FhirResource;
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_serde::json;
 use serde_json::json;
 
 #[test]
@@ -23,7 +24,7 @@ fn test_uri_type_preserved_in_evaluation() {
     });
 
     // Parse the JSON into a FHIR resource
-    let resource: helios_fhir::r4::Resource = serde_json::from_value(patient_json).unwrap();
+    let resource: helios_fhir::r4::Resource = json::from_value(patient_json).unwrap();
     let fhir_resource = FhirResource::R4(Box::new(resource));
 
     // Create evaluation context
@@ -67,7 +68,7 @@ fn test_code_type_preserved_in_evaluation() {
     });
 
     // Parse the JSON into a FHIR resource
-    let resource: helios_fhir::r4::Resource = serde_json::from_value(patient_json).unwrap();
+    let resource: helios_fhir::r4::Resource = json::from_value(patient_json).unwrap();
     let fhir_resource = FhirResource::R4(Box::new(resource));
 
     // Create evaluation context

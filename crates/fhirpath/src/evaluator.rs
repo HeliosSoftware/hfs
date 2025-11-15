@@ -29,6 +29,7 @@
 //! ```rust
 //! use helios_fhirpath::{evaluate_expression, EvaluationContext};
 //! use helios_fhir::{FhirResource, FhirVersion, r4};
+//! use helios_serde::json;
 //! use serde_json::json;
 //!
 //! # fn main() -> Result<(), String> {
@@ -43,7 +44,7 @@
 //! });
 //!
 //! // Deserialize to a typed FHIR resource
-//! let patient: r4::Patient = serde_json::from_value(patient_json)
+//! let patient: r4::Patient = json::from_value(patient_json)
 //!     .map_err(|e| e.to_string())?;
 //!
 //! // Create an evaluation context with the resource

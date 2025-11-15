@@ -1,10 +1,11 @@
 use helios_fhir::r4::{Bundle, BundleEntry, Observation};
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn test_instant_constant_debug() {
     // Create Observation resource with effectiveInstant
-    let observation: Observation = serde_json::from_str(
+    let observation: Observation = json::from_str(
         r#"{
         "resourceType": "Observation",
         "id": "o1",
@@ -69,8 +70,7 @@ fn test_instant_constant_debug() {
         }]
     }"#;
 
-    let view_definition: helios_fhir::r4::ViewDefinition =
-        serde_json::from_str(view_def_json).unwrap();
+    let view_definition: helios_fhir::r4::ViewDefinition = json::from_str(view_def_json).unwrap();
 
     let sof_view = SofViewDefinition::R4(view_definition);
     let sof_bundle = SofBundle::R4(bundle);

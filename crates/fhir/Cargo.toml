@@ -24,6 +24,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 clap = { version = "4.0", features = ["derive"] }
 helios-fhir-macro = { path = "../fhir-macro", version = "0.1.29" }
 helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.29" }
+helios-serde = { workspace = true }
 time = "0.3"
 chrono = { workspace = true }
 # Re-add serde-with-arbitrary-precision, keep macros

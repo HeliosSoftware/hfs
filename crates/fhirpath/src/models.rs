@@ -9,6 +9,7 @@ use serde_json::Value;
 
 // Use the ParameterValueAccessor trait from helios_fhir
 use helios_fhir::ParameterValueAccessor;
+use helios_serde::json;
 
 /// Type alias for the version-independent Parameters container.
 ///
@@ -258,10 +259,7 @@ fn process_parameter_r4(
             }
         }
         "resource" => {
-            extracted.resource = param
-                .resource
-                .as_ref()
-                .and_then(|r| serde_json::to_value(r).ok());
+            extracted.resource = param.resource.as_ref().and_then(|r| json::to_value(r).ok());
         }
         "terminologyServer" => {
             extracted.terminology_server = param
@@ -296,11 +294,11 @@ fn parameter_value_to_json_r4(value: &helios_fhir::r4::ParametersParameterValue)
             .map(|v| Value::Number(serde_json::Number::from(v)))
             .unwrap_or(Value::Null),
         helios_fhir::r4::ParametersParameterValue::Decimal(d) => {
-            serde_json::to_value(d).unwrap_or(Value::Null)
+            json::to_value(d).unwrap_or(Value::Null)
         }
         _ => {
             // For other types, serialize to JSON
-            serde_json::to_value(value).unwrap_or(Value::Null)
+            json::to_value(value).unwrap_or(Value::Null)
         }
     }
 }
@@ -338,10 +336,7 @@ fn extract_parameters_from_r4b(
                     .unwrap_or(false);
             }
             "resource" => {
-                extracted.resource = param
-                    .resource
-                    .as_ref()
-                    .and_then(|r| serde_json::to_value(r).ok());
+                extracted.resource = param.resource.as_ref().and_then(|r| json::to_value(r).ok());
             }
             "terminologyServer" => {
                 extracted.terminology_server = param
@@ -389,10 +384,7 @@ fn extract_parameters_from_r5(
                     .unwrap_or(false);
             }
             "resource" => {
-                extracted.resource = param
-                    .resource
-                    .as_ref()
-                    .and_then(|r| serde_json::to_value(r).ok());
+                extracted.resource = param.resource.as_ref().and_then(|r| json::to_value(r).ok());
             }
             "terminologyServer" => {
                 extracted.terminology_server = param
@@ -440,10 +432,7 @@ fn extract_parameters_from_r6(
                     .unwrap_or(false);
             }
             "resource" => {
-                extracted.resource = param
-                    .resource
-                    .as_ref()
-                    .and_then(|r| serde_json::to_value(r).ok());
+                extracted.resource = param.resource.as_ref().and_then(|r| json::to_value(r).ok());
             }
             "terminologyServer" => {
                 extracted.terminology_server = param

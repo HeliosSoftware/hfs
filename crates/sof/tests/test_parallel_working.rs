@@ -1,3 +1,4 @@
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
@@ -29,9 +30,9 @@ fn test_parallel_processing_works() {
     }"#;
 
     let view_def: helios_fhir::r4::ViewDefinition =
-        serde_json::from_str(view_def_json).expect("Failed to parse ViewDefinition");
+        json::from_str(view_def_json).expect("Failed to parse ViewDefinition");
     let bundle: helios_fhir::r4::Bundle =
-        serde_json::from_str(bundle_json).expect("Failed to parse Bundle");
+        json::from_str(bundle_json).expect("Failed to parse Bundle");
 
     let sof_view = SofViewDefinition::R4(view_def);
     let sof_bundle = SofBundle::R4(bundle);

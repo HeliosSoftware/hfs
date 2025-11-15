@@ -2,7 +2,7 @@
 #[test]
 fn test_real_json_with_string_integers() {
     use helios_fhir::r6::Bundle;
-    use serde_json;
+    use helios_serde::json;
 
     // Simplified version of the problematic JSON with string integers
     let json_content = r#"{
@@ -36,7 +36,7 @@ fn test_real_json_with_string_integers() {
 }"#;
 
     // This should now succeed with our fix
-    let result: Result<Bundle, _> = serde_json::from_str(json_content);
+    let result: Result<Bundle, _> = json::from_str(json_content);
     assert!(
         result.is_ok(),
         "Failed to deserialize Bundle with string integers: {:?}",

@@ -1,3 +1,4 @@
+use helios_serde::json;
 #[test]
 fn test_raw_fhir_parsing() {
     // Test the raw FHIR parsing to see exactly what structure we get
@@ -18,10 +19,10 @@ fn test_raw_fhir_parsing() {
 
     // Parse as R4 Patient
     let patient: helios_fhir::r4::Patient =
-        serde_json::from_value(patient_json.clone()).expect("Failed to parse patient");
+        json::from_value(patient_json.clone()).expect("Failed to parse patient");
 
     // Serialize back to JSON to see what structure we get
-    let serialized = serde_json::to_value(&patient).expect("Failed to serialize patient");
+    let serialized = json::to_value(&patient).expect("Failed to serialize patient");
     println!("\nAfter R4 Patient parsing and serialization:");
     println!("{}", serde_json::to_string_pretty(&serialized).unwrap());
 
@@ -53,7 +54,7 @@ fn test_raw_fhir_parsing() {
             if let Some(value) = &first_ext.value {
                 println!("Extension value field exists");
                 // Serialize just the value to see its structure
-                let value_json = serde_json::to_value(value).expect("Failed to serialize value");
+                let value_json = json::to_value(value).expect("Failed to serialize value");
                 println!(
                     "Value structure: {}",
                     serde_json::to_string_pretty(&value_json).unwrap()

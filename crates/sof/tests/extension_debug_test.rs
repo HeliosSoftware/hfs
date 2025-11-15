@@ -1,6 +1,7 @@
 use helios_fhir::r4::{
     Bundle, Patient, ViewDefinition, ViewDefinitionSelect, ViewDefinitionSelectColumn,
 };
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
@@ -39,7 +40,7 @@ fn test_extension_function_debug() {
         ]
     });
 
-    let patient: Patient = serde_json::from_value(patient_json).unwrap();
+    let patient: Patient = json::from_value(patient_json).unwrap();
 
     // Create test bundle
     let bundle = Bundle {
@@ -90,7 +91,7 @@ fn test_extension_function_debug() {
             println!("Extension test output: {}", json_str);
 
             // Parse the result to check values
-            let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+            let parsed: serde_json::Value = json::from_str(&json_str).unwrap();
             if let Some(rows) = parsed.as_array() {
                 for row in rows {
                     println!("Row: {}", serde_json::to_string_pretty(row).unwrap());

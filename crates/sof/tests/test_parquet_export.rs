@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use helios_serde::json;
     use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
     use serde_json::json;
 
@@ -69,10 +70,10 @@ mod tests {
         });
 
         let view_definition =
-            serde_json::from_value::<helios_fhir::r4::ViewDefinition>(view_definition_json.clone())
+            json::from_value::<helios_fhir::r4::ViewDefinition>(view_definition_json.clone())
                 .expect("Failed to parse ViewDefinition");
 
-        let bundle = serde_json::from_value::<helios_fhir::r4::Bundle>(bundle_json.clone())
+        let bundle = json::from_value::<helios_fhir::r4::Bundle>(bundle_json.clone())
             .expect("Failed to parse Bundle");
 
         let sof_view = SofViewDefinition::R4(view_definition);
@@ -155,10 +156,10 @@ mod tests {
         });
 
         let view_definition =
-            serde_json::from_value::<helios_fhir::r4::ViewDefinition>(view_definition_json.clone())
+            json::from_value::<helios_fhir::r4::ViewDefinition>(view_definition_json.clone())
                 .expect("Failed to parse ViewDefinition");
 
-        let bundle = serde_json::from_value::<helios_fhir::r4::Bundle>(bundle_json.clone())
+        let bundle = json::from_value::<helios_fhir::r4::Bundle>(bundle_json.clone())
             .expect("Failed to parse Bundle");
 
         let sof_view = SofViewDefinition::R4(view_definition);
@@ -235,10 +236,10 @@ mod tests {
         });
 
         let view_definition =
-            serde_json::from_value::<helios_fhir::r4::ViewDefinition>(view_definition_json.clone())
+            json::from_value::<helios_fhir::r4::ViewDefinition>(view_definition_json.clone())
                 .expect("Failed to parse ViewDefinition");
 
-        let bundle = serde_json::from_value::<helios_fhir::r4::Bundle>(bundle_json.clone())
+        let bundle = json::from_value::<helios_fhir::r4::Bundle>(bundle_json.clone())
             .expect("Failed to parse Bundle");
 
         let sof_view = SofViewDefinition::R4(view_definition);
@@ -317,10 +318,10 @@ mod tests {
         });
 
         let view_definition =
-            serde_json::from_value::<helios_fhir::r4::ViewDefinition>(view_definition_json.clone())
+            json::from_value::<helios_fhir::r4::ViewDefinition>(view_definition_json.clone())
                 .expect("Failed to parse ViewDefinition");
 
-        let bundle = serde_json::from_value::<helios_fhir::r4::Bundle>(bundle_json.clone())
+        let bundle = json::from_value::<helios_fhir::r4::Bundle>(bundle_json.clone())
             .expect("Failed to parse Bundle");
 
         let sof_view = SofViewDefinition::R4(view_definition);

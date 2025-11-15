@@ -5,6 +5,9 @@
 //! to handle multiple FHIR versions simultaneously while maintaining type safety.
 
 use crate::FhirVersion;
+use helios_serde::{FhirDeserialize, FhirSerialize, Json, SerializationContext, json};
+use serde::de::{self, Deserializer};
+use serde::ser::Error as SerError;
 use serde::{Deserialize, Serialize};
 
 /// Multi-version Parameters container for version-agnostic operations.
@@ -39,7 +42,7 @@ use serde::{Deserialize, Serialize};
 ///     }]
 /// }"#;
 ///
-/// let params: Parameters = serde_json::from_str(json)?;
+/// let params: Parameters = helios_serde::json::from_str(json)?;
 /// let version_independent = VersionIndependentParameters::R4(params);
 ///
 /// // Check version
@@ -47,8 +50,7 @@ use serde::{Deserialize, Serialize};
 /// # }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum VersionIndependentParameters {
     /// FHIR 4.0.1 Parameters
     #[cfg(feature = "R4")]
@@ -112,7 +114,99 @@ impl VersionIndependentParameters {
     ///
     /// Returns an error if JSON serialization fails.
     pub fn to_json(&self) -> Result<serde_json::Value, serde_json::Error> {
-        serde_json::to_value(self)
+        match self {
+            #[cfg(feature = "R4")]
+            VersionIndependentParameters::R4(value) => {
+                serde_json::to_value(&SerializationContext::json(value))
+            }
+            #[cfg(feature = "R4B")]
+            VersionIndependentParameters::R4B(value) => {
+                serde_json::to_value(&SerializationContext::json(value))
+            }
+            #[cfg(feature = "R5")]
+            VersionIndependentParameters::R5(value) => {
+                serde_json::to_value(&SerializationContext::json(value))
+            }
+            #[cfg(feature = "R6")]
+            VersionIndependentParameters::R6(value) => {
+                serde_json::to_value(&SerializationContext::json(value))
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "No FHIR versions enabled for VersionIndependentParameters serialization",
+            ))),
+        }
+    }
+}
+
+impl FhirSerialize<Json> for VersionIndependentParameters {
+    fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            #[cfg(feature = "R4")]
+            VersionIndependentParameters::R4(value) => {
+                SerializationContext::json(value).serialize(serializer)
+            }
+            #[cfg(feature = "R4B")]
+            VersionIndependentParameters::R4B(value) => {
+                SerializationContext::json(value).serialize(serializer)
+            }
+            #[cfg(feature = "R5")]
+            VersionIndependentParameters::R5(value) => {
+                SerializationContext::json(value).serialize(serializer)
+            }
+            #[cfg(feature = "R6")]
+            VersionIndependentParameters::R6(value) => {
+                SerializationContext::json(value).serialize(serializer)
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(SerError::custom(
+                "No FHIR versions enabled for VersionIndependentParameters serialization",
+            )),
+        }
+    }
+}
+
+impl FhirDeserialize<Json> for VersionIndependentParameters {
+    fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let json_bytes = serde_json::to_vec(&value)
+            .map_err(|e| de::Error::custom(format!("Failed to buffer Parameters JSON: {}", e)))?;
+
+        #[cfg(feature = "R4")]
+        {
+            if let Ok(parsed) = json::from_slice::<crate::r4::Parameters>(&json_bytes) {
+                return Ok(Self::R4(parsed));
+            }
+        }
+        #[cfg(feature = "R4B")]
+        {
+            if let Ok(parsed) = json::from_slice::<crate::r4b::Parameters>(&json_bytes) {
+                return Ok(Self::R4B(parsed));
+            }
+        }
+        #[cfg(feature = "R5")]
+        {
+            if let Ok(parsed) = json::from_slice::<crate::r5::Parameters>(&json_bytes) {
+                return Ok(Self::R5(parsed));
+            }
+        }
+        #[cfg(feature = "R6")]
+        {
+            if let Ok(parsed) = json::from_slice::<crate::r6::Parameters>(&json_bytes) {
+                return Ok(Self::R6(parsed));
+            }
+        }
+
+        Err(de::Error::custom(
+            "Unable to deserialize Parameters for any enabled FHIR version",
+        ))
     }
 }
 

@@ -19,6 +19,7 @@ R6 = ["helios-fhir/R6"]
 [dependencies]
 helios-fhir = { path = "../fhir", version = "0.1.29" }
 helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.29" }
+helios-serde = { path = "../serde", version = "0.1.0" }
 chumsky = "0.10"
 roxmltree = "0.20"
 chrono = { workspace = true } # For date/time parsing and functions

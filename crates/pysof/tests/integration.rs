@@ -3,6 +3,7 @@
 //! This file contains integration tests that test the interaction
 //! between different components of the pysof library.
 
+use helios_serde::json;
 use helios_sof::ContentType;
 use serde_json::json;
 
@@ -45,7 +46,7 @@ fn test_fhir_version_feature_flag_integration() {
             }]
         });
 
-        let result: Result<helios_fhir::r4::Patient, _> = serde_json::from_value(patient);
+        let result: Result<helios_fhir::r4::Patient, _> = json::from_value(patient);
         assert!(result.is_ok());
     }
 }
@@ -54,7 +55,7 @@ fn test_fhir_version_feature_flag_integration() {
 fn test_error_chain_propagation() {
     // Test that errors properly chain through the system
     let invalid_json = "{ invalid json }";
-    let parse_result: Result<serde_json::Value, _> = serde_json::from_str(invalid_json);
+    let parse_result: Result<serde_json::Value, _> = json::from_str(invalid_json);
 
     assert!(parse_result.is_err());
     // Just verify that we get an error - the specific message format may vary

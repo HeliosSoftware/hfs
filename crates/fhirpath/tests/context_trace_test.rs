@@ -1,6 +1,7 @@
 use axum::Json;
 use helios_fhirpath::handlers::evaluate_fhirpath;
 use helios_fhirpath::models::FhirPathParameters;
+use helios_serde::json;
 use serde_json::json;
 
 #[tokio::test]
@@ -54,7 +55,7 @@ async fn test_context_with_trace_function() {
     });
 
     // Convert to FhirPathParameters
-    let fhir_params: FhirPathParameters = serde_json::from_value(params).unwrap();
+    let fhir_params: FhirPathParameters = json::from_value(params).unwrap();
 
     // Call the handler
     let response = evaluate_fhirpath(Json(fhir_params)).await;
@@ -102,7 +103,7 @@ fn test_trace_with_context_full_expression() {
         ]
     });
 
-    let patient: Patient = serde_json::from_value(patient_json.clone()).unwrap();
+    let patient: Patient = json::from_value(patient_json.clone()).unwrap();
     let patient_resource: helios_fhir::r4::Resource = helios_fhir::r4::Resource::Patient(patient);
     let resource = FhirResource::R4(Box::new(patient_resource));
 
@@ -165,7 +166,7 @@ fn test_trace_with_context_simple() {
         }]
     });
 
-    let patient: Patient = serde_json::from_value(patient_json.clone()).unwrap();
+    let patient: Patient = json::from_value(patient_json.clone()).unwrap();
     let patient_resource: helios_fhir::r4::Resource = helios_fhir::r4::Resource::Patient(patient);
     let resource = FhirResource::R4(Box::new(patient_resource));
 

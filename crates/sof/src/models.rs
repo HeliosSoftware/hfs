@@ -3,6 +3,8 @@
 //! This module contains data structures for handling HTTP requests and responses,
 //! including parameter parsing and content type negotiation.
 
+use helios_serde::json;
+
 use chrono::{DateTime, Utc};
 use helios_sof::{ContentType, SofParameters};
 use serde::Deserialize;
@@ -580,7 +582,7 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
     let mut result = ExtractedParameters::default();
 
     // Convert to JSON for version-independent processing
-    let params_json = match serde_json::to_value(&params) {
+    let params_json = match json::to_value(&params) {
         Ok(json) => json,
         Err(e) => return Err(format!("Failed to serialize parameters: {}", e)),
     };
@@ -675,8 +677,8 @@ fn apply_json_filtering(
     match params.format {
         ContentType::Json => {
             // Parse as JSON array and apply pagination
-            let mut records: Vec<serde_json::Value> = serde_json::from_str(&output_str)
-                .map_err(|e| format!("Invalid JSON output: {}", e))?;
+            let mut records: Vec<serde_json::Value> =
+                json::from_str(&output_str).map_err(|e| format!("Invalid JSON output: {}", e))?;
 
             apply_pagination_to_records(&mut records, params);
 
@@ -689,8 +691,8 @@ fn apply_json_filtering(
             let mut records = Vec::new();
             for line in output_str.lines() {
                 if !line.trim().is_empty() {
-                    let record: serde_json::Value = serde_json::from_str(line)
-                        .map_err(|e| format!("Invalid NDJSON line: {}", e))?;
+                    let record: serde_json::Value =
+                        json::from_str(line).map_err(|e| format!("Invalid NDJSON line: {}", e))?;
                     records.push(record);
                 }
             }
@@ -930,7 +932,7 @@ mod tests {
 
         let result = apply_json_filtering(json_data, &params).unwrap();
         let result_str = String::from_utf8(result).unwrap();
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result_str).unwrap();
+        let parsed: Vec<serde_json::Value> = json::from_str(&result_str).unwrap();
 
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["id"], "1");
@@ -951,7 +953,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -976,7 +978,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -996,7 +998,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -1016,7 +1018,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -1056,7 +1058,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -1079,7 +1081,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -1099,7 +1101,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -1126,7 +1128,7 @@ mod tests {
         #[cfg(feature = "R4")]
         {
             let params: helios_fhir::r4::Parameters =
-                serde_json::from_value(params_json.clone()).unwrap();
+                json::from_value(params_json.clone()).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
 
@@ -1148,8 +1150,7 @@ mod tests {
         #[cfg(feature = "R4")]
         {
             // When using from_str with an invalid instant, check what actually happens
-            let result: Result<helios_fhir::r4::Parameters, _> =
-                serde_json::from_str(invalid_json_str);
+            let result: Result<helios_fhir::r4::Parameters, _> = json::from_str(invalid_json_str);
             match result {
                 Ok(params) => {
                     // Check if the parameter value is None (skipped due to invalid instant)
@@ -1185,15 +1186,14 @@ mod tests {
         #[cfg(feature = "R4B")]
         {
             let params: helios_fhir::r4b::Parameters =
-                serde_json::from_value(params_json.clone()).unwrap();
+                json::from_value(params_json.clone()).unwrap();
             let run_params = RunParameters::R4B(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(err.contains("_since parameter must use valueInstant or valueDateTime"));
 
-            let result: Result<helios_fhir::r4b::Parameters, _> =
-                serde_json::from_str(invalid_json_str);
+            let result: Result<helios_fhir::r4b::Parameters, _> = json::from_str(invalid_json_str);
             if let Ok(params) = result {
                 if let Some(param_list) = &params.parameter {
                     if let Some(first_param) = param_list.first() {
@@ -1206,15 +1206,14 @@ mod tests {
         #[cfg(feature = "R5")]
         {
             let params: helios_fhir::r5::Parameters =
-                serde_json::from_value(params_json.clone()).unwrap();
+                json::from_value(params_json.clone()).unwrap();
             let run_params = RunParameters::R5(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(err.contains("_since parameter must use valueInstant or valueDateTime"));
 
-            let result: Result<helios_fhir::r5::Parameters, _> =
-                serde_json::from_str(invalid_json_str);
+            let result: Result<helios_fhir::r5::Parameters, _> = json::from_str(invalid_json_str);
             if let Ok(params) = result {
                 if let Some(param_list) = &params.parameter {
                     if let Some(first_param) = param_list.first() {
@@ -1238,7 +1237,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1259,7 +1258,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1280,7 +1279,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1301,7 +1300,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1322,7 +1321,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1343,7 +1342,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1364,7 +1363,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1385,7 +1384,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1406,7 +1405,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1427,7 +1426,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1469,7 +1468,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());

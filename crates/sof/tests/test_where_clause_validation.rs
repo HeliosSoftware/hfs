@@ -1,4 +1,5 @@
 use helios_fhir::r4::{Bundle, ViewDefinition};
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
@@ -24,7 +25,7 @@ fn test_where_clause_boolean_validation() {
         ]
     }"#;
 
-    let view_def: ViewDefinition = serde_json::from_str(view_def_json).unwrap();
+    let view_def: ViewDefinition = json::from_str(view_def_json).unwrap();
     let bundle = create_test_bundle();
 
     let result = run_view_definition(
@@ -59,7 +60,7 @@ fn test_where_clause_boolean_validation() {
         ]
     }"#;
 
-    let view_def: ViewDefinition = serde_json::from_str(view_def_json).unwrap();
+    let view_def: ViewDefinition = json::from_str(view_def_json).unwrap();
     let bundle = create_test_bundle();
 
     let result = run_view_definition(
@@ -91,7 +92,7 @@ fn test_where_clause_boolean_validation() {
         ]
     }"#;
 
-    let view_def: ViewDefinition = serde_json::from_str(view_def_json).unwrap();
+    let view_def: ViewDefinition = json::from_str(view_def_json).unwrap();
     let bundle = create_test_bundle();
 
     let result = run_view_definition(
@@ -131,7 +132,7 @@ fn test_where_clause_boolean_validation() {
         ]
     }"#;
 
-    let view_def: ViewDefinition = serde_json::from_str(view_def_json).unwrap();
+    let view_def: ViewDefinition = json::from_str(view_def_json).unwrap();
     let bundle = create_test_bundle();
 
     let result = run_view_definition(
@@ -168,5 +169,5 @@ fn create_test_bundle() -> Bundle {
         patient_json
     );
 
-    serde_json::from_str(&bundle_json).unwrap()
+    json::from_str(&bundle_json).unwrap()
 }

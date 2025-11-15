@@ -10,6 +10,8 @@ use helios_fhirpath::EvaluationContext;
 #[cfg(feature = "R5")]
 use helios_fhirpath_support::EvaluationResult;
 #[cfg(feature = "R5")]
+use helios_serde::json;
+#[cfg(feature = "R5")]
 use std::fs::File;
 #[cfg(feature = "R5")]
 use std::io::Read;
@@ -47,7 +49,7 @@ fn load_test_resource_r5(json_filename: &str) -> Result<EvaluationContext, Strin
 
     // Parse the JSON into a FHIR resource
     let resource: r5::Resource =
-        serde_json::from_str(&contents).map_err(|e| format!("Failed to parse JSON: {:?}", e))?;
+        json::from_str(&contents).map_err(|e| format!("Failed to parse JSON: {:?}", e))?;
 
     // Create an evaluation context with the resource
     let mut context =

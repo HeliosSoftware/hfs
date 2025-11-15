@@ -1,5 +1,6 @@
 use helios_fhir::FhirResource;
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_serde::json;
 
 #[test]
 fn debug_datetime_boundary_issue() {
@@ -14,8 +15,7 @@ fn debug_datetime_boundary_issue() {
         "valueDateTime": "2010-10-10"
     });
 
-    let observation: helios_fhir::r4::Observation =
-        serde_json::from_value(observation_json).unwrap();
+    let observation: helios_fhir::r4::Observation = json::from_value(observation_json).unwrap();
     let resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Observation(
         observation,
     )));

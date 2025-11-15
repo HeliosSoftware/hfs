@@ -3,6 +3,8 @@
 //! These tests focus on testing the core logic of the PyO3 binding functions
 //! without requiring Python runtime initialization.
 
+use helios_serde::json;
+
 use chrono::{DateTime, Utc};
 use helios_sof::{ContentType, RunOptions, SofError as RustSofError};
 use serde_json::json;
@@ -100,7 +102,7 @@ fn test_view_definition_validation_logic() {
     #[cfg(feature = "R4")]
     {
         let result: Result<helios_fhir::r4::ViewDefinition, _> =
-            serde_json::from_value(valid_view.clone());
+            json::from_value(valid_view.clone());
         assert!(result.is_ok());
     }
 
@@ -113,8 +115,7 @@ fn test_view_definition_validation_logic() {
 
     #[cfg(feature = "R4")]
     {
-        let result: Result<helios_fhir::r4::ViewDefinition, _> =
-            serde_json::from_value(invalid_view);
+        let result: Result<helios_fhir::r4::ViewDefinition, _> = json::from_value(invalid_view);
         // ViewDefinition validation might be lenient, so we just check it doesn't panic
         let _validation_result = result;
     }
@@ -127,8 +128,7 @@ fn test_bundle_validation_logic() {
     // Test that valid Bundle can be parsed
     #[cfg(feature = "R4")]
     {
-        let result: Result<helios_fhir::r4::Bundle, _> =
-            serde_json::from_value(valid_bundle.clone());
+        let result: Result<helios_fhir::r4::Bundle, _> = json::from_value(valid_bundle.clone());
         assert!(result.is_ok());
     }
 
@@ -141,7 +141,7 @@ fn test_bundle_validation_logic() {
 
     #[cfg(feature = "R4")]
     {
-        let result: Result<helios_fhir::r4::Bundle, _> = serde_json::from_value(minimal_bundle);
+        let result: Result<helios_fhir::r4::Bundle, _> = json::from_value(minimal_bundle);
         assert!(result.is_ok());
     }
 }
@@ -302,7 +302,7 @@ fn test_fhir_version_feature_flags() {
             "id": "feat-r4",
             "type": "collection"
         });
-        let result: Result<helios_fhir::r4::Bundle, _> = serde_json::from_value(bundle);
+        let result: Result<helios_fhir::r4::Bundle, _> = json::from_value(bundle);
         assert!(result.is_ok(), "R4 Bundle should deserialize");
     }
 
@@ -321,7 +321,7 @@ fn test_fhir_version_feature_flags() {
             "id": "feat-r4b",
             "type": "collection"
         });
-        let result: Result<helios_fhir::r4b::Bundle, _> = serde_json::from_value(bundle);
+        let result: Result<helios_fhir::r4b::Bundle, _> = json::from_value(bundle);
         assert!(result.is_ok(), "R4B Bundle should deserialize");
     }
 
@@ -333,7 +333,7 @@ fn test_fhir_version_feature_flags() {
             "id": "feat-r5",
             "type": "collection"
         });
-        let result: Result<helios_fhir::r5::Bundle, _> = serde_json::from_value(bundle);
+        let result: Result<helios_fhir::r5::Bundle, _> = json::from_value(bundle);
         assert!(result.is_ok(), "R5 Bundle should deserialize");
     }
 
@@ -345,7 +345,7 @@ fn test_fhir_version_feature_flags() {
             "id": "feat-r6",
             "type": "collection"
         });
-        let result: Result<helios_fhir::r6::Bundle, _> = serde_json::from_value(bundle);
+        let result: Result<helios_fhir::r6::Bundle, _> = json::from_value(bundle);
         assert!(result.is_ok(), "R6 Bundle should deserialize");
     }
 }

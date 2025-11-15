@@ -7,6 +7,7 @@ use helios_fhirpath::evaluator::evaluate;
 use helios_fhirpath::parser::parser;
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
 use helios_fhirpath_support::EvaluationResult;
+use helios_serde::json;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::fs::File;
@@ -42,7 +43,7 @@ fn load_test_resource_r4(json_filename: &str) -> Result<EvaluationContext, Strin
 
     // Parse the JSON into a FHIR resource
     let resource: r4::Resource =
-        serde_json::from_str(&contents).map_err(|e| format!("Failed to parse JSON: {:?}", e))?;
+        json::from_str(&contents).map_err(|e| format!("Failed to parse JSON: {:?}", e))?;
 
     // Create an evaluation context with the resource
     let mut context =
@@ -176,7 +177,7 @@ fn test_real_fhir_patient_type() {
         "active": true
     }"#;
 
-    let patient: r4::Patient = serde_json::from_str(patient_json).unwrap();
+    let patient: r4::Patient = json::from_str(patient_json).unwrap();
     let fhir_resource =
         helios_fhir::FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
     let context = EvaluationContext::new(vec![fhir_resource]);

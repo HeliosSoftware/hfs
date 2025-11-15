@@ -1,5 +1,7 @@
 //! Common test utilities for server tests
 
+use helios_serde::json;
+
 use axum::response::IntoResponse;
 use axum::{Json, Router};
 use axum_test::TestServer;
@@ -404,16 +406,15 @@ async fn run_view_definition_handler(
     };
 
     // Create ViewDefinition and Bundle
-    let view_definition =
-        match serde_json::from_value::<helios_fhir::r4::ViewDefinition>(view_def_json) {
-            Ok(vd) => SofViewDefinition::R4(vd),
-            Err(e) => {
-                return error_response(
-                    axum::http::StatusCode::BAD_REQUEST,
-                    &format!("Invalid ViewDefinition: {}", e),
-                );
-            }
-        };
+    let view_definition = match json::from_value::<helios_fhir::r4::ViewDefinition>(view_def_json) {
+        Ok(vd) => SofViewDefinition::R4(vd),
+        Err(e) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                &format!("Invalid ViewDefinition: {}", e),
+            );
+        }
+    };
 
     let bundle_json = serde_json::json!({
         "resourceType": "Bundle",
@@ -423,7 +424,7 @@ async fn run_view_definition_handler(
         }).collect::<Vec<_>>()
     });
 
-    let bundle = match serde_json::from_value::<helios_fhir::r4::Bundle>(bundle_json) {
+    let bundle = match json::from_value::<helios_fhir::r4::Bundle>(bundle_json) {
         Ok(b) => SofBundle::R4(b),
         Err(e) => {
             return error_response(
@@ -611,7 +612,7 @@ fn apply_pagination(
     match content_type {
         helios_sof::ContentType::Json => {
             let output_str = String::from_utf8(output).ok()?;
-            let mut records: Vec<serde_json::Value> = serde_json::from_str(&output_str).ok()?;
+            let mut records: Vec<serde_json::Value> = json::from_str(&output_str).ok()?;
 
             // Apply count limiting
             if let Some(count) = count {

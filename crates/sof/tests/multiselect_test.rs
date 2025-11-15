@@ -1,3 +1,4 @@
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
@@ -39,7 +40,7 @@ fn test_two_selects_with_columns() {
     }
 
     let bundle: helios_fhir::r4::Bundle =
-        serde_json::from_value(bundle_json).expect("Failed to create bundle");
+        json::from_value(bundle_json).expect("Failed to create bundle");
     let sof_bundle = SofBundle::R4(bundle);
 
     // Create ViewDefinition with two select clauses (this was failing before)
@@ -70,7 +71,7 @@ fn test_two_selects_with_columns() {
     });
 
     let view_definition: helios_fhir::r4::ViewDefinition =
-        serde_json::from_value(view).expect("Failed to create ViewDefinition");
+        json::from_value(view).expect("Failed to create ViewDefinition");
     let sof_view = SofViewDefinition::R4(view_definition);
 
     // Run the view definition
@@ -79,7 +80,7 @@ fn test_two_selects_with_columns() {
 
     // Parse result
     let actual_rows: Vec<serde_json::Value> =
-        serde_json::from_slice(&result).expect("Failed to parse result");
+        json::from_slice(&result).expect("Failed to parse result");
 
     println!("Multi-select test result:");
     println!("{}", serde_json::to_string_pretty(&actual_rows).unwrap());

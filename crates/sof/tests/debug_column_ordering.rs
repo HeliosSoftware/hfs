@@ -1,3 +1,4 @@
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
@@ -19,7 +20,7 @@ fn debug_column_ordering() {
         "entry": [{"resource": patient_json}]
     });
 
-    let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json).unwrap();
+    let bundle: helios_fhir::r4::Bundle = json::from_value(bundle_json).unwrap();
     let bundle = SofBundle::R4(bundle);
 
     // Create ViewDefinition exactly like the failing test
@@ -107,7 +108,7 @@ fn debug_column_ordering() {
     });
 
     let view_definition: helios_fhir::r4::ViewDefinition =
-        serde_json::from_value(view_definition_json).unwrap();
+        json::from_value(view_definition_json).unwrap();
     let view_definition = SofViewDefinition::R4(view_definition);
 
     println!("=== Testing column ordering ===");
@@ -117,7 +118,7 @@ fn debug_column_ordering() {
 
     println!("Result: {}", result_str);
 
-    let result_rows: Vec<serde_json::Value> = serde_json::from_str(&result_str).unwrap();
+    let result_rows: Vec<serde_json::Value> = json::from_str(&result_str).unwrap();
 
     println!("\nActual result:");
     for (i, row) in result_rows.iter().enumerate() {

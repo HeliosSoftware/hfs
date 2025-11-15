@@ -109,6 +109,7 @@
 use crate::{SofBundle, SofError};
 use async_trait::async_trait;
 use helios_fhir::Element;
+use helios_serde::json;
 use object_store::{
     ObjectStore, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
     gcp::GoogleCloudStorageBuilder, path::Path as ObjectPath,
@@ -473,19 +474,19 @@ pub fn parse_fhir_content(contents: &str, source_name: &str) -> Result<SofBundle
         if resource_type == "Bundle" {
             // Try parsing as each FHIR version
             #[cfg(feature = "R4")]
-            if let Ok(bundle) = serde_json::from_value::<helios_fhir::r4::Bundle>(value.clone()) {
+            if let Ok(bundle) = json::from_value::<helios_fhir::r4::Bundle>(value.clone()) {
                 return Ok(SofBundle::R4(bundle));
             }
             #[cfg(feature = "R4B")]
-            if let Ok(bundle) = serde_json::from_value::<helios_fhir::r4b::Bundle>(value.clone()) {
+            if let Ok(bundle) = json::from_value::<helios_fhir::r4b::Bundle>(value.clone()) {
                 return Ok(SofBundle::R4B(bundle));
             }
             #[cfg(feature = "R5")]
-            if let Ok(bundle) = serde_json::from_value::<helios_fhir::r5::Bundle>(value.clone()) {
+            if let Ok(bundle) = json::from_value::<helios_fhir::r5::Bundle>(value.clone()) {
                 return Ok(SofBundle::R5(bundle));
             }
             #[cfg(feature = "R6")]
-            if let Ok(bundle) = serde_json::from_value::<helios_fhir::r6::Bundle>(value.clone()) {
+            if let Ok(bundle) = json::from_value::<helios_fhir::r6::Bundle>(value.clone()) {
                 return Ok(SofBundle::R6(bundle));
             }
             return Err(SofError::InvalidSourceContent(format!(
@@ -517,7 +518,7 @@ fn wrap_resource_in_bundle(
     // Try each FHIR version
     // R4
     #[cfg(feature = "R4")]
-    if let Ok(res) = serde_json::from_value::<helios_fhir::r4::Resource>(resource.clone()) {
+    if let Ok(res) = json::from_value::<helios_fhir::r4::Resource>(resource.clone()) {
         let mut bundle = helios_fhir::r4::Bundle::default();
         bundle.r#type = Element {
             id: None,
@@ -533,7 +534,7 @@ fn wrap_resource_in_bundle(
 
     // R4B
     #[cfg(feature = "R4B")]
-    if let Ok(res) = serde_json::from_value::<helios_fhir::r4b::Resource>(resource.clone()) {
+    if let Ok(res) = json::from_value::<helios_fhir::r4b::Resource>(resource.clone()) {
         let mut bundle = helios_fhir::r4b::Bundle::default();
         bundle.r#type = Element {
             id: None,
@@ -549,7 +550,7 @@ fn wrap_resource_in_bundle(
 
     // R5
     #[cfg(feature = "R5")]
-    if let Ok(res) = serde_json::from_value::<helios_fhir::r5::Resource>(resource.clone()) {
+    if let Ok(res) = json::from_value::<helios_fhir::r5::Resource>(resource.clone()) {
         let mut bundle = helios_fhir::r5::Bundle::default();
         bundle.r#type = Element {
             id: None,
@@ -565,7 +566,7 @@ fn wrap_resource_in_bundle(
 
     // R6
     #[cfg(feature = "R6")]
-    if let Ok(res) = serde_json::from_value::<helios_fhir::r6::Resource>(resource.clone()) {
+    if let Ok(res) = json::from_value::<helios_fhir::r6::Resource>(resource.clone()) {
         let mut bundle = helios_fhir::r6::Bundle::default();
         bundle.r#type = Element {
             id: None,
@@ -606,7 +607,7 @@ fn wrap_resources_in_bundle(
 
     // Try R4
     #[cfg(feature = "R4")]
-    if serde_json::from_value::<helios_fhir::r4::Resource>(first.clone()).is_ok() {
+    if json::from_value::<helios_fhir::r4::Resource>(first.clone()).is_ok() {
         let mut bundle = helios_fhir::r4::Bundle::default();
         bundle.r#type = Element {
             id: None,
@@ -616,8 +617,8 @@ fn wrap_resources_in_bundle(
         let mut entries = Vec::new();
 
         for resource in arr {
-            let res = serde_json::from_value::<helios_fhir::r4::Resource>(resource.clone())
-                .map_err(|e| {
+            let res =
+                json::from_value::<helios_fhir::r4::Resource>(resource.clone()).map_err(|e| {
                     SofError::InvalidSourceContent(format!(
                         "Failed to parse R4 resource from '{}': {}",
                         source_name, e
@@ -635,7 +636,7 @@ fn wrap_resources_in_bundle(
 
     // Try R4B
     #[cfg(feature = "R4B")]
-    if serde_json::from_value::<helios_fhir::r4b::Resource>(first.clone()).is_ok() {
+    if json::from_value::<helios_fhir::r4b::Resource>(first.clone()).is_ok() {
         let mut bundle = helios_fhir::r4b::Bundle::default();
         bundle.r#type = Element {
             id: None,
@@ -645,8 +646,8 @@ fn wrap_resources_in_bundle(
         let mut entries = Vec::new();
 
         for resource in arr {
-            let res = serde_json::from_value::<helios_fhir::r4b::Resource>(resource.clone())
-                .map_err(|e| {
+            let res =
+                json::from_value::<helios_fhir::r4b::Resource>(resource.clone()).map_err(|e| {
                     SofError::InvalidSourceContent(format!(
                         "Failed to parse R4B resource from '{}': {}",
                         source_name, e
@@ -664,7 +665,7 @@ fn wrap_resources_in_bundle(
 
     // Try R5
     #[cfg(feature = "R5")]
-    if serde_json::from_value::<helios_fhir::r5::Resource>(first.clone()).is_ok() {
+    if json::from_value::<helios_fhir::r5::Resource>(first.clone()).is_ok() {
         let mut bundle = helios_fhir::r5::Bundle::default();
         bundle.r#type = Element {
             id: None,
@@ -674,8 +675,8 @@ fn wrap_resources_in_bundle(
         let mut entries = Vec::new();
 
         for resource in arr {
-            let res = serde_json::from_value::<helios_fhir::r5::Resource>(resource.clone())
-                .map_err(|e| {
+            let res =
+                json::from_value::<helios_fhir::r5::Resource>(resource.clone()).map_err(|e| {
                     SofError::InvalidSourceContent(format!(
                         "Failed to parse R5 resource from '{}': {}",
                         source_name, e
@@ -693,7 +694,7 @@ fn wrap_resources_in_bundle(
 
     // Try R6
     #[cfg(feature = "R6")]
-    if serde_json::from_value::<helios_fhir::r6::Resource>(first.clone()).is_ok() {
+    if json::from_value::<helios_fhir::r6::Resource>(first.clone()).is_ok() {
         let mut bundle = helios_fhir::r6::Bundle::default();
         bundle.r#type = Element {
             id: None,
@@ -703,8 +704,8 @@ fn wrap_resources_in_bundle(
         let mut entries = Vec::new();
 
         for resource in arr {
-            let res = serde_json::from_value::<helios_fhir::r6::Resource>(resource.clone())
-                .map_err(|e| {
+            let res =
+                json::from_value::<helios_fhir::r6::Resource>(resource.clone()).map_err(|e| {
                     SofError::InvalidSourceContent(format!(
                         "Failed to parse R6 resource from '{}': {}",
                         source_name, e

@@ -1,3 +1,4 @@
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 use serde::Deserialize;
 use std::fs;
@@ -46,7 +47,7 @@ fn create_test_bundle(
         }
     }
 
-    let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
+    let bundle: helios_fhir::r4::Bundle = json::from_value(bundle_json)?;
     Ok(SofBundle::R4(bundle))
 }
 
@@ -65,7 +66,7 @@ fn parse_view_definition(
         );
     }
 
-    let view_definition: helios_fhir::r4::ViewDefinition = serde_json::from_value(view_def)?;
+    let view_definition: helios_fhir::r4::ViewDefinition = json::from_value(view_def)?;
     Ok(SofViewDefinition::R4(view_definition))
 }
 
@@ -105,7 +106,7 @@ fn test_base64_binary_constant_type() {
 
             // Parse and compare with expected results
             let actual_rows: Vec<serde_json::Value> =
-                serde_json::from_slice(&result).expect("Failed to parse result JSON");
+                json::from_slice(&result).expect("Failed to parse result JSON");
             if let Some(expected) = &base64_test.expect {
                 assert_eq!(
                     actual_rows.len(),

@@ -781,16 +781,19 @@ fn generate_code(
 /// - Each variant contains the corresponding resource struct
 fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
-    // Add Clone to the derives for the Resource enum
-    output.push_str("#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, FhirPath)]\n");
-    output.push_str("#[serde(tag = \"resourceType\")]\n");
+
+    // Resource enum uses context-aware serialization via FhirSerde derive macro
+    // The tag attribute implements #[serde(tag = "resourceType")] pattern
+    output.push_str("#[derive(Debug, Clone, PartialEq, Eq, FhirPath, FhirSerde)]\n");
+    output.push_str("#[fhir_serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
 
-    for resource in resources {
+    for resource in &resources {
         output.push_str(&format!("    {}({}),\n", resource, resource));
     }
 
     output.push_str("}\n\n");
+
     output
 }
 

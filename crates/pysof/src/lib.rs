@@ -4,6 +4,7 @@
 //! enabling Python applications to use SQL-on-FHIR ViewDefinition transformations.
 
 use chrono::{DateTime, Utc};
+use helios_serde::json;
 use helios_sof::{
     ContentType, RunOptions, SofBundle, SofError as RustSofError, SofViewDefinition,
     run_view_definition, run_view_definition_with_options,
@@ -145,33 +146,33 @@ fn py_run_view_definition(
         #[cfg(feature = "R4")]
         "R4" => {
             let view_def: helios_fhir::r4::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             let bundle: helios_fhir::r4::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok((SofViewDefinition::R4(view_def), SofBundle::R4(bundle)))
         }
         #[cfg(feature = "R4B")]
         "R4B" => {
             let view_def: helios_fhir::r4b::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             let bundle: helios_fhir::r4b::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok((SofViewDefinition::R4B(view_def), SofBundle::R4B(bundle)))
         }
         #[cfg(feature = "R5")]
         "R5" => {
             let view_def: helios_fhir::r5::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             let bundle: helios_fhir::r5::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok((SofViewDefinition::R5(view_def), SofBundle::R5(bundle)))
         }
         #[cfg(feature = "R6")]
         "R6" => {
             let view_def: helios_fhir::r6::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             let bundle: helios_fhir::r6::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok((SofViewDefinition::R6(view_def), SofBundle::R6(bundle)))
         }
         _ => Err(PyUnsupportedContentTypeError::new_err(format!(
@@ -235,33 +236,33 @@ fn py_run_view_definition_with_options(
         #[cfg(feature = "R4")]
         "R4" => {
             let view_def: helios_fhir::r4::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             let bundle: helios_fhir::r4::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok((SofViewDefinition::R4(view_def), SofBundle::R4(bundle)))
         }
         #[cfg(feature = "R4B")]
         "R4B" => {
             let view_def: helios_fhir::r4b::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             let bundle: helios_fhir::r4b::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok((SofViewDefinition::R4B(view_def), SofBundle::R4B(bundle)))
         }
         #[cfg(feature = "R5")]
         "R5" => {
             let view_def: helios_fhir::r5::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             let bundle: helios_fhir::r5::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok((SofViewDefinition::R5(view_def), SofBundle::R5(bundle)))
         }
         #[cfg(feature = "R6")]
         "R6" => {
             let view_def: helios_fhir::r6::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             let bundle: helios_fhir::r6::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok((SofViewDefinition::R6(view_def), SofBundle::R6(bundle)))
         }
         _ => Err(PyUnsupportedContentTypeError::new_err(format!(
@@ -319,25 +320,25 @@ fn py_validate_view_definition(
         #[cfg(feature = "R4")]
         "R4" => {
             let _view_def: helios_fhir::r4::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             Ok(true)
         }
         #[cfg(feature = "R4B")]
         "R4B" => {
             let _view_def: helios_fhir::r4b::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             Ok(true)
         }
         #[cfg(feature = "R5")]
         "R5" => {
             let _view_def: helios_fhir::r5::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             Ok(true)
         }
         #[cfg(feature = "R6")]
         "R6" => {
             let _view_def: helios_fhir::r6::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+                json::from_value(view_def_json).map_err(json_error_to_py_err)?;
             Ok(true)
         }
         _ => Err(PyUnsupportedContentTypeError::new_err(format!(
@@ -368,25 +369,25 @@ fn py_validate_bundle(bundle: &Bound<'_, PyAny>, fhir_version: &str) -> PyResult
         #[cfg(feature = "R4")]
         "R4" => {
             let _bundle: helios_fhir::r4::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok(true)
         }
         #[cfg(feature = "R4B")]
         "R4B" => {
             let _bundle: helios_fhir::r4b::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok(true)
         }
         #[cfg(feature = "R5")]
         "R5" => {
             let _bundle: helios_fhir::r5::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok(true)
         }
         #[cfg(feature = "R6")]
         "R6" => {
             let _bundle: helios_fhir::r6::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+                json::from_value(bundle_json).map_err(json_error_to_py_err)?;
             Ok(true)
         }
         _ => Err(PyUnsupportedContentTypeError::new_err(format!(

@@ -1,5 +1,4 @@
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use helios_serde::{FhirDeserialize, FhirSerialize, Json, json};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -176,7 +175,10 @@ fn find_missing_linkid(json: &serde_json::Value) {
     }
 }
 
-fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
+fn test_examples_in_dir<R>(dir: &PathBuf)
+where
+    R: FhirSerialize<Json> + FhirDeserialize<Json>,
+{
     if !dir.exists() {
         println!("Directory does not exist: {:?}", dir);
         return;
@@ -361,14 +363,14 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
                                     }
 
                                     // Try to convert the JSON value to a FHIR Resource
-                                    match serde_json::from_value::<R>(json_value.clone()) {
+                                    match json::from_value::<R>(json_value.clone()) {
                                         Ok(resource) => {
                                             println!(
                                                 "Successfully converted JSON to FHIR Resource"
                                             );
 
                                             // Verify we can serialize the Resource back to JSON
-                                            match serde_json::to_value(&resource) {
+                                            match json::to_value(&resource) {
                                                 Ok(resource_json) => {
                                                     println!(
                                                         "Successfully serialized Resource back to JSON"

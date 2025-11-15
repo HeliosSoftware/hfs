@@ -1,11 +1,12 @@
 use helios_fhir::FhirResource;
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
-use serde_json::json;
+use helios_serde::json;
+use serde_json::json as serde_json_macro;
 
 #[test]
 fn test_uuid_type_preserved_in_evaluation() {
     // Create a Parameters resource with an extension containing a valueUuid
-    let parameters_json = json!({
+    let parameters_json = serde_json_macro!({
         "resourceType": "Parameters",
         "id": "example",
         "parameter": [{
@@ -18,7 +19,7 @@ fn test_uuid_type_preserved_in_evaluation() {
     });
 
     // Parse the JSON into a FHIR resource
-    let resource: helios_fhir::r4::Resource = serde_json::from_value(parameters_json).unwrap();
+    let resource: helios_fhir::r4::Resource = json::from_value(parameters_json).unwrap();
     let fhir_resource = FhirResource::R4(Box::new(resource));
 
     // Create evaluation context

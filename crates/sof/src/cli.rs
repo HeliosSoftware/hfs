@@ -122,6 +122,7 @@
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use helios_fhir::FhirVersion;
+use helios_serde::json;
 use helios_sof::{
     ContentType, ParquetOptions, RunOptions, SofBundle, SofViewDefinition,
     data_source::{DataSource, UniversalDataSource, parse_fhir_content},
@@ -302,22 +303,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let view_definition: SofViewDefinition = match args.fhir_version {
         #[cfg(feature = "R4")]
         FhirVersion::R4 => {
-            let vd: helios_fhir::r4::ViewDefinition = serde_json::from_str(&view_content)?;
+            let vd: helios_fhir::r4::ViewDefinition = json::from_str(&view_content)?;
             SofViewDefinition::R4(vd)
         }
         #[cfg(feature = "R4B")]
         FhirVersion::R4B => {
-            let vd: helios_fhir::r4b::ViewDefinition = serde_json::from_str(&view_content)?;
+            let vd: helios_fhir::r4b::ViewDefinition = json::from_str(&view_content)?;
             SofViewDefinition::R4B(vd)
         }
         #[cfg(feature = "R5")]
         FhirVersion::R5 => {
-            let vd: helios_fhir::r5::ViewDefinition = serde_json::from_str(&view_content)?;
+            let vd: helios_fhir::r5::ViewDefinition = json::from_str(&view_content)?;
             SofViewDefinition::R5(vd)
         }
         #[cfg(feature = "R6")]
         FhirVersion::R6 => {
-            let vd: helios_fhir::r6::ViewDefinition = serde_json::from_str(&view_content)?;
+            let vd: helios_fhir::r6::ViewDefinition = json::from_str(&view_content)?;
             SofViewDefinition::R6(vd)
         }
     };
@@ -436,7 +437,7 @@ fn merge_bundles(
             if let Some(entries) = bundle.entry {
                 for entry in entries {
                     if let Some(resource) = entry.resource {
-                        all_resources.push(serde_json::to_value(&resource)?);
+                        all_resources.push(json::to_value(&resource)?);
                     }
                 }
             }
@@ -446,7 +447,7 @@ fn merge_bundles(
             if let Some(entries) = bundle.entry {
                 for entry in entries {
                     if let Some(resource) = entry.resource {
-                        all_resources.push(serde_json::to_value(&resource)?);
+                        all_resources.push(json::to_value(&resource)?);
                     }
                 }
             }
@@ -456,7 +457,7 @@ fn merge_bundles(
             if let Some(entries) = bundle.entry {
                 for entry in entries {
                     if let Some(resource) = entry.resource {
-                        all_resources.push(serde_json::to_value(&resource)?);
+                        all_resources.push(json::to_value(&resource)?);
                     }
                 }
             }
@@ -466,7 +467,7 @@ fn merge_bundles(
             if let Some(entries) = bundle.entry {
                 for entry in entries {
                     if let Some(resource) = entry.resource {
-                        all_resources.push(serde_json::to_value(&resource)?);
+                        all_resources.push(json::to_value(&resource)?);
                     }
                 }
             }
@@ -480,7 +481,7 @@ fn merge_bundles(
             if let Some(entries) = &bundle.entry {
                 for entry in entries {
                     if let Some(resource) = &entry.resource {
-                        all_resources.push(serde_json::to_value(resource)?);
+                        all_resources.push(json::to_value(resource)?);
                     }
                 }
             }
@@ -490,7 +491,7 @@ fn merge_bundles(
             if let Some(entries) = &bundle.entry {
                 for entry in entries {
                     if let Some(resource) = &entry.resource {
-                        all_resources.push(serde_json::to_value(resource)?);
+                        all_resources.push(json::to_value(resource)?);
                     }
                 }
             }
@@ -500,7 +501,7 @@ fn merge_bundles(
             if let Some(entries) = &bundle.entry {
                 for entry in entries {
                     if let Some(resource) = &entry.resource {
-                        all_resources.push(serde_json::to_value(resource)?);
+                        all_resources.push(json::to_value(resource)?);
                     }
                 }
             }
@@ -510,7 +511,7 @@ fn merge_bundles(
             if let Some(entries) = &bundle.entry {
                 for entry in entries {
                     if let Some(resource) = &entry.resource {
-                        all_resources.push(serde_json::to_value(resource)?);
+                        all_resources.push(json::to_value(resource)?);
                     }
                 }
             }
@@ -528,7 +529,7 @@ fn merge_bundles(
                     serde_json::json!({"resource": r})
                 }).collect::<Vec<_>>()
             });
-            let bundle = serde_json::from_value(bundle_json)?;
+            let bundle = json::from_value(bundle_json)?;
             Ok(SofBundle::R4(bundle))
         }
         #[cfg(feature = "R4B")]
@@ -540,7 +541,7 @@ fn merge_bundles(
                     serde_json::json!({"resource": r})
                 }).collect::<Vec<_>>()
             });
-            let bundle = serde_json::from_value(bundle_json)?;
+            let bundle = json::from_value(bundle_json)?;
             Ok(SofBundle::R4B(bundle))
         }
         #[cfg(feature = "R5")]
@@ -552,7 +553,7 @@ fn merge_bundles(
                     serde_json::json!({"resource": r})
                 }).collect::<Vec<_>>()
             });
-            let bundle = serde_json::from_value(bundle_json)?;
+            let bundle = json::from_value(bundle_json)?;
             Ok(SofBundle::R5(bundle))
         }
         #[cfg(feature = "R6")]
@@ -564,7 +565,7 @@ fn merge_bundles(
                     serde_json::json!({"resource": r})
                 }).collect::<Vec<_>>()
             });
-            let bundle = serde_json::from_value(bundle_json)?;
+            let bundle = json::from_value(bundle_json)?;
             Ok(SofBundle::R6(bundle))
         }
     }

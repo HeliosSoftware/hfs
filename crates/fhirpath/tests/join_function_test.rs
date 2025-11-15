@@ -1,5 +1,6 @@
 use helios_fhir::FhirResource;
 use helios_fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
+use helios_serde::json;
 
 #[test]
 fn test_join_function_basic() {
@@ -12,7 +13,7 @@ fn test_join_function_basic() {
         }]
     });
 
-    let patient: helios_fhir::r4::Patient = serde_json::from_value(patient_json).unwrap();
+    let patient: helios_fhir::r4::Patient = json::from_value(patient_json).unwrap();
     let fhir_resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
     let context = EvaluationContext::new(vec![fhir_resource]);
 
@@ -38,7 +39,7 @@ fn test_join_function_with_space() {
         }]
     });
 
-    let patient: helios_fhir::r4::Patient = serde_json::from_value(patient_json).unwrap();
+    let patient: helios_fhir::r4::Patient = json::from_value(patient_json).unwrap();
     let fhir_resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
     let context = EvaluationContext::new(vec![fhir_resource]);
 
@@ -64,7 +65,7 @@ fn test_join_function_empty_separator() {
         }]
     });
 
-    let patient: helios_fhir::r4::Patient = serde_json::from_value(patient_json).unwrap();
+    let patient: helios_fhir::r4::Patient = json::from_value(patient_json).unwrap();
     let fhir_resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
     let context = EvaluationContext::new(vec![fhir_resource]);
 
@@ -88,7 +89,7 @@ fn test_join_function_empty_collection() {
         // No name field
     });
 
-    let patient: helios_fhir::r4::Patient = serde_json::from_value(patient_json).unwrap();
+    let patient: helios_fhir::r4::Patient = json::from_value(patient_json).unwrap();
     let fhir_resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
     let context = EvaluationContext::new(vec![fhir_resource]);
 
@@ -114,7 +115,7 @@ fn test_join_function_no_separator() {
         }]
     });
 
-    let patient: helios_fhir::r4::Patient = serde_json::from_value(patient_json).unwrap();
+    let patient: helios_fhir::r4::Patient = json::from_value(patient_json).unwrap();
     let fhir_resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
     let context = EvaluationContext::new(vec![fhir_resource]);
 

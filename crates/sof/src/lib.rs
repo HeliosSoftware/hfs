@@ -73,8 +73,8 @@
 //!     }]
 //! }"#;
 //!
-//! let view_definition: helios_fhir::r4::ViewDefinition = serde_json::from_str(view_definition_json)?;
-//! let bundle: helios_fhir::r4::Bundle = serde_json::from_str(bundle_json)?;
+//! let view_definition: helios_fhir::r4::ViewDefinition = json::from_str(view_definition_json)?;
+//! let bundle: helios_fhir::r4::Bundle = json::from_str(bundle_json)?;
 //!
 //! // Wrap in version-agnostic containers
 //! let sof_view = SofViewDefinition::R4(view_definition);
@@ -186,6 +186,7 @@ pub mod traits;
 
 use chrono::{DateTime, Utc};
 use helios_fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
+use helios_serde::json;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -230,7 +231,7 @@ pub use traits::{BundleTrait, ResourceTrait, ViewDefinitionTrait};
 ///     }]
 /// }"#;
 ///
-/// let view_def: ViewDefinition = serde_json::from_str(json)?;
+/// let view_def: ViewDefinition = json::from_str(json)?;
 /// let sof_view = SofViewDefinition::R4(view_def);
 ///
 /// // Check version
@@ -323,7 +324,7 @@ impl SofViewDefinition {
 ///     }]
 /// }"#;
 ///
-/// let bundle: Bundle = serde_json::from_str(json)?;
+/// let bundle: Bundle = json::from_str(json)?;
 /// let sof_bundle = SofBundle::R4(bundle);
 ///
 /// // Check version compatibility
@@ -393,8 +394,7 @@ impl SofBundle {
 /// - **R4B**: FHIR 4.3.0 CapabilityStatement (ballot)
 /// - **R5**: FHIR 5.0.0 CapabilityStatement (ballot)
 /// - **R6**: FHIR 6.0.0 CapabilityStatement (draft)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum SofCapabilityStatement {
     #[cfg(feature = "R4")]
     R4(helios_fhir::r4::CapabilityStatement),
@@ -419,6 +419,84 @@ impl SofCapabilityStatement {
             #[cfg(feature = "R6")]
             SofCapabilityStatement::R6(_) => helios_fhir::FhirVersion::R6,
         }
+    }
+}
+
+// Implement Serialize/Deserialize by delegating to context serialization
+impl Serialize for SofCapabilityStatement {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use helios_serde::SerializationContext;
+        match self {
+            #[cfg(feature = "R4")]
+            SofCapabilityStatement::R4(value) => {
+                SerializationContext::json(value).serialize(serializer)
+            }
+            #[cfg(feature = "R4B")]
+            SofCapabilityStatement::R4B(value) => {
+                SerializationContext::json(value).serialize(serializer)
+            }
+            #[cfg(feature = "R5")]
+            SofCapabilityStatement::R5(value) => {
+                SerializationContext::json(value).serialize(serializer)
+            }
+            #[cfg(feature = "R6")]
+            SofCapabilityStatement::R6(value) => {
+                SerializationContext::json(value).serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SofCapabilityStatement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let json_bytes = serde_json::to_vec(&value).map_err(|e| {
+            de::Error::custom(format!("Failed to buffer CapabilityStatement JSON: {}", e))
+        })?;
+
+        #[cfg(feature = "R4")]
+        {
+            if let Ok(parsed) =
+                json::from_slice::<helios_fhir::r4::CapabilityStatement>(&json_bytes)
+            {
+                return Ok(Self::R4(parsed));
+            }
+        }
+        #[cfg(feature = "R4B")]
+        {
+            if let Ok(parsed) =
+                json::from_slice::<helios_fhir::r4b::CapabilityStatement>(&json_bytes)
+            {
+                return Ok(Self::R4B(parsed));
+            }
+        }
+        #[cfg(feature = "R5")]
+        {
+            if let Ok(parsed) =
+                json::from_slice::<helios_fhir::r5::CapabilityStatement>(&json_bytes)
+            {
+                return Ok(Self::R5(parsed));
+            }
+        }
+        #[cfg(feature = "R6")]
+        {
+            if let Ok(parsed) =
+                json::from_slice::<helios_fhir::r6::CapabilityStatement>(&json_bytes)
+            {
+                return Ok(Self::R6(parsed));
+            }
+        }
+
+        Err(de::Error::custom(
+            "Unable to deserialize CapabilityStatement for any enabled FHIR version",
+        ))
     }
 }
 
@@ -881,7 +959,7 @@ pub struct ProcessedResult {
 ///         }]
 ///     }]
 /// });
-/// let view_def: helios_fhir::r4::ViewDefinition = serde_json::from_value(view_json)?;
+/// let view_def: helios_fhir::r4::ViewDefinition = json::from_value(view_json)?;
 ///
 /// // Create a simple Bundle
 /// let bundle_json = serde_json::json!({
@@ -889,7 +967,7 @@ pub struct ProcessedResult {
 ///     "type": "collection",
 ///     "entry": []
 /// });
-/// let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
+/// let bundle: helios_fhir::r4::Bundle = json::from_value(bundle_json)?;
 ///
 /// let sof_view = SofViewDefinition::R4(view_def);
 /// let sof_bundle = SofBundle::R4(bundle);

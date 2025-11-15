@@ -1,4 +1,5 @@
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 fn create_test_bundle() -> SofBundle {
@@ -24,7 +25,7 @@ fn create_test_bundle() -> SofBundle {
     });
 
     let bundle: helios_fhir::r4::Bundle =
-        serde_json::from_value(bundle_json).expect("Failed to parse bundle");
+        json::from_value(bundle_json).expect("Failed to parse bundle");
     SofBundle::R4(bundle)
 }
 
@@ -54,14 +55,14 @@ fn test_extension_function_debug() {
     });
 
     let view_definition: helios_fhir::r4::ViewDefinition =
-        serde_json::from_value(view).expect("Failed to parse ViewDefinition");
+        json::from_value(view).expect("Failed to parse ViewDefinition");
     let sof_view = SofViewDefinition::R4(view_definition);
 
     let result = run_view_definition(sof_view, bundle, ContentType::Json)
         .expect("Failed to run ViewDefinition");
 
     let actual_rows: Vec<serde_json::Value> =
-        serde_json::from_slice(&result).expect("Failed to parse result as JSON");
+        json::from_slice(&result).expect("Failed to parse result as JSON");
 
     println!("Result: {:?}", actual_rows);
 
@@ -80,7 +81,7 @@ fn test_extension_function_debug() {
 
     println!("Testing direct FHIRPath evaluation:");
     let patient: helios_fhir::r4::Patient =
-        serde_json::from_value(patient_json).expect("Failed to parse patient");
+        json::from_value(patient_json).expect("Failed to parse patient");
     let resources = vec![helios_fhir::FhirResource::R4(Box::new(
         helios_fhir::r4::Resource::Patient(patient),
     ))];

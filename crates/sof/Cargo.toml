@@ -30,6 +30,7 @@ tokio = { version = "1.0", features = ["full"] }
 helios-fhir = { path = "../fhir", version = "0.1.29" }
 helios-fhirpath = { path = "../fhirpath", version = "0.1.29" }
 helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.29" }
+helios-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 csv = "1.3"

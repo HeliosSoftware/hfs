@@ -1,3 +1,4 @@
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 use serde::Deserialize;
 use std::fs;
@@ -56,7 +57,7 @@ fn create_test_bundle(
     }
 
     // Parse as R4 Bundle
-    let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
+    let bundle: helios_fhir::r4::Bundle = json::from_value(bundle_json)?;
     Ok(SofBundle::R4(bundle))
 }
 
@@ -76,7 +77,7 @@ fn parse_view_definition(
         );
     }
 
-    let view_definition: helios_fhir::r4::ViewDefinition = serde_json::from_value(view_def)?;
+    let view_definition: helios_fhir::r4::ViewDefinition = json::from_value(view_def)?;
     Ok(SofViewDefinition::R4(view_definition))
 }
 
@@ -131,7 +132,7 @@ fn run_single_test(test: &Test, bundle: &SofBundle) -> TestResult {
     }
 
     // Parse the result as JSON
-    let actual_rows: Vec<serde_json::Value> = match serde_json::from_slice(&result) {
+    let actual_rows: Vec<serde_json::Value> = match json::from_slice(&result) {
         Ok(rows) => rows,
         Err(e) => {
             return TestResult {
@@ -249,7 +250,7 @@ fn test_basic_view_definition() {
         .expect("Failed to run ViewDefinition");
 
     let actual_rows: Vec<serde_json::Value> =
-        serde_json::from_slice(&result).expect("Failed to parse result as JSON");
+        json::from_slice(&result).expect("Failed to parse result as JSON");
 
     let expected = [
         serde_json::json!({"id": "pt1"}),
@@ -317,7 +318,7 @@ fn test_basic_boolean_attribute() {
         .expect("Failed to run ViewDefinition");
 
     let actual_rows: Vec<serde_json::Value> =
-        serde_json::from_slice(&result).expect("Failed to parse result as JSON");
+        json::from_slice(&result).expect("Failed to parse result as JSON");
 
     let expected = [
         serde_json::json!({"id": "pt1", "active": true}),

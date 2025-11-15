@@ -3,6 +3,7 @@ mod tests {
     use axum::{Json, response::Response};
     use helios_fhirpath::handlers::evaluate_fhirpath;
     use helios_fhirpath::models::FhirPathParameters;
+    use helios_serde::json;
     use serde_json::json;
 
     #[tokio::test]
@@ -35,7 +36,7 @@ mod tests {
 
         // Convert to FhirPathParameters
         let params: FhirPathParameters =
-            serde_json::from_value(params_json).expect("Failed to parse parameters");
+            json::from_value(params_json).expect("Failed to parse parameters");
 
         // Call the handler
         let response = evaluate_fhirpath(Json(params)).await;
@@ -53,8 +54,7 @@ mod tests {
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("Failed to read body");
-        let body: serde_json::Value =
-            serde_json::from_slice(&body_bytes).expect("Failed to parse JSON");
+        let body: serde_json::Value = json::from_slice(&body_bytes).expect("Failed to parse JSON");
 
         println!("Response: {}", serde_json::to_string_pretty(&body).unwrap());
 
@@ -108,7 +108,7 @@ mod tests {
         });
 
         let params: FhirPathParameters =
-            serde_json::from_value(params_json).expect("Failed to parse parameters");
+            json::from_value(params_json).expect("Failed to parse parameters");
 
         // Call the handler
         let response = evaluate_fhirpath(Json(params)).await;
@@ -124,8 +124,7 @@ mod tests {
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("Failed to read body");
-        let body: serde_json::Value =
-            serde_json::from_slice(&body_bytes).expect("Failed to parse JSON");
+        let body: serde_json::Value = json::from_slice(&body_bytes).expect("Failed to parse JSON");
 
         println!(
             "Response with projection: {}",

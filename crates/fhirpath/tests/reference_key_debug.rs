@@ -1,4 +1,5 @@
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_serde::json;
 
 #[test]
 fn debug_reference_key_functions() {
@@ -28,8 +29,8 @@ fn debug_reference_key_functions() {
     });
 
     // Parse into FHIR resources
-    let patient_p1: helios_fhir::r4::Patient = serde_json::from_value(patient_p1_json).unwrap();
-    let patient_p2: helios_fhir::r4::Patient = serde_json::from_value(patient_p2_json).unwrap();
+    let patient_p1: helios_fhir::r4::Patient = json::from_value(patient_p1_json).unwrap();
+    let patient_p2: helios_fhir::r4::Patient = json::from_value(patient_p2_json).unwrap();
 
     println!("=== Testing Reference Key Functions ===\n");
 

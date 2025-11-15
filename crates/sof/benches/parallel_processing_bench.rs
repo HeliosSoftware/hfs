@@ -1,4 +1,5 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 fn create_large_bundle(num_patients: usize) -> String {
@@ -68,7 +69,7 @@ fn create_complex_view_definition() -> &'static str {
 fn benchmark_parallel_processing(c: &mut Criterion) {
     let view_definition_json = create_complex_view_definition();
     let view_def_r4: helios_fhir::r4::ViewDefinition =
-        serde_json::from_str(view_definition_json).expect("Failed to parse ViewDefinition");
+        json::from_str(view_definition_json).expect("Failed to parse ViewDefinition");
     let view_definition = SofViewDefinition::R4(view_def_r4);
 
     let mut group = c.benchmark_group("parallel_resource_processing");
@@ -76,7 +77,7 @@ fn benchmark_parallel_processing(c: &mut Criterion) {
     for num_patients in [10, 50, 100, 200, 500].iter() {
         let bundle_json = create_large_bundle(*num_patients);
         let bundle_r4: helios_fhir::r4::Bundle =
-            serde_json::from_str(&bundle_json).expect("Failed to parse Bundle");
+            json::from_str(&bundle_json).expect("Failed to parse Bundle");
         let bundle = SofBundle::R4(bundle_r4);
 
         group.bench_with_input(
@@ -120,7 +121,7 @@ fn benchmark_with_foreach(c: &mut Criterion) {
     }"#;
 
     let view_def_r4: helios_fhir::r4::ViewDefinition =
-        serde_json::from_str(view_definition_with_foreach).expect("Failed to parse ViewDefinition");
+        json::from_str(view_definition_with_foreach).expect("Failed to parse ViewDefinition");
     let view_definition = SofViewDefinition::R4(view_def_r4);
 
     let mut group = c.benchmark_group("parallel_foreach_processing");
@@ -128,7 +129,7 @@ fn benchmark_with_foreach(c: &mut Criterion) {
     for num_patients in [10, 50, 100, 200].iter() {
         let bundle_json = create_large_bundle(*num_patients);
         let bundle_r4: helios_fhir::r4::Bundle =
-            serde_json::from_str(&bundle_json).expect("Failed to parse Bundle");
+            json::from_str(&bundle_json).expect("Failed to parse Bundle");
         let bundle = SofBundle::R4(bundle_r4);
 
         group.bench_with_input(

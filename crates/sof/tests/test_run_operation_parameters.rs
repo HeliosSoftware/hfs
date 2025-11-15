@@ -3,6 +3,7 @@
 //! This module tests parameter validation, filtering, and pagination functionality
 //! for the $run operation.
 
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 use serde_json::json;
 
@@ -92,7 +93,7 @@ fn create_test_bundle(
 
     #[cfg(feature = "R4")]
     {
-        let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
+        let bundle: helios_fhir::r4::Bundle = json::from_value(bundle_json)?;
         Ok(SofBundle::R4(bundle))
     }
 
@@ -108,7 +109,7 @@ fn create_view_definition(
 ) -> Result<SofViewDefinition, Box<dyn std::error::Error>> {
     #[cfg(feature = "R4")]
     {
-        let view_def: helios_fhir::r4::ViewDefinition = serde_json::from_value(json)?;
+        let view_def: helios_fhir::r4::ViewDefinition = json::from_value(json)?;
         Ok(SofViewDefinition::R4(view_def))
     }
 
@@ -144,7 +145,7 @@ fn test_basic_view_definition_execution() {
     assert!(json_result.is_ok());
 
     let json_data = String::from_utf8(json_result.unwrap()).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+    let parsed: serde_json::Value = json::from_str(&json_data).unwrap();
     assert!(parsed.is_array());
     assert_eq!(parsed.as_array().unwrap().len(), 5);
 }
@@ -191,7 +192,7 @@ fn test_output_format_consistency() {
     let json_result =
         run_view_definition(view_definition.clone(), bundle.clone(), ContentType::Json).unwrap();
     let json_str = String::from_utf8(json_result).unwrap();
-    let json_data: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+    let json_data: Vec<serde_json::Value> = json::from_str(&json_str).unwrap();
 
     // Get CSV output and parse it
     let csv_result =
@@ -224,7 +225,7 @@ fn test_ndjson_output_format() {
     assert_eq!(lines.len(), 5); // One line per patient
 
     for line in lines {
-        let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+        let parsed: serde_json::Value = json::from_str(line).unwrap();
         assert!(parsed.is_object());
         assert!(parsed.get("id").is_some());
         assert!(parsed.get("family_name").is_some());
@@ -245,7 +246,7 @@ fn test_empty_bundle() {
     )
     .unwrap();
     let json_str = String::from_utf8(json_result).unwrap();
-    let json_data: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+    let json_data: Vec<serde_json::Value> = json::from_str(&json_str).unwrap();
     assert_eq!(json_data.len(), 0);
 
     let csv_result =

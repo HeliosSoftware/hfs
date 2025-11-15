@@ -1,3 +1,4 @@
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -65,7 +66,7 @@ fn create_test_bundle(
         }
     }
 
-    let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
+    let bundle: helios_fhir::r4::Bundle = json::from_value(bundle_json)?;
     Ok(SofBundle::R4(bundle))
 }
 
@@ -84,7 +85,7 @@ fn parse_view_definition(
         );
     }
 
-    let view_definition: helios_fhir::r4::ViewDefinition = serde_json::from_value(view_def)?;
+    let view_definition: helios_fhir::r4::ViewDefinition = json::from_value(view_def)?;
     Ok(SofViewDefinition::R4(view_definition))
 }
 
@@ -139,7 +140,7 @@ fn run_single_test(test: &Test, bundle: &SofBundle) -> TestResult {
     }
 
     // Parse the result as JSON
-    let actual_rows: Vec<serde_json::Value> = match serde_json::from_slice(&result) {
+    let actual_rows: Vec<serde_json::Value> = match json::from_slice(&result) {
         Ok(rows) => rows,
         Err(e) => {
             return TestResult {

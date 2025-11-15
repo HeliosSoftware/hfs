@@ -3,6 +3,8 @@
 //! These tests focus on testing the actual PyO3 binding functions in lib.rs
 //! by calling them through unit tests that exercise the code paths.
 
+use helios_serde::json;
+
 use helios_sof::{ContentType, SofError as RustSofError};
 use serde_json::json;
 
@@ -102,7 +104,7 @@ fn test_fhir_version_feature_flags() {
             "active": true
         });
 
-        let result: Result<helios_fhir::r4::Patient, _> = serde_json::from_value(patient);
+        let result: Result<helios_fhir::r4::Patient, _> = json::from_value(patient);
         assert!(result.is_ok());
     }
 
@@ -114,7 +116,7 @@ fn test_fhir_version_feature_flags() {
             "active": true
         });
 
-        let result: Result<helios_fhir::r4b::Patient, _> = serde_json::from_value(patient);
+        let result: Result<helios_fhir::r4b::Patient, _> = json::from_value(patient);
         assert!(result.is_ok());
     }
 
@@ -126,7 +128,7 @@ fn test_fhir_version_feature_flags() {
             "active": true
         });
 
-        let result: Result<helios_fhir::r5::Patient, _> = serde_json::from_value(patient);
+        let result: Result<helios_fhir::r5::Patient, _> = json::from_value(patient);
         assert!(result.is_ok());
     }
 
@@ -138,7 +140,7 @@ fn test_fhir_version_feature_flags() {
             "active": true
         });
 
-        let result: Result<helios_fhir::r6::Patient, _> = serde_json::from_value(patient);
+        let result: Result<helios_fhir::r6::Patient, _> = json::from_value(patient);
         assert!(result.is_ok());
     }
 }
@@ -202,9 +204,8 @@ fn test_view_definition_and_bundle_parsing() {
     #[cfg(feature = "R4")]
     {
         let view_def: Result<helios_fhir::r4::ViewDefinition, _> =
-            serde_json::from_value(view_definition.clone());
-        let bundle_result: Result<helios_fhir::r4::Bundle, _> =
-            serde_json::from_value(bundle.clone());
+            json::from_value(view_definition.clone());
+        let bundle_result: Result<helios_fhir::r4::Bundle, _> = json::from_value(bundle.clone());
 
         // These should parse successfully or fail gracefully
         match (view_def, bundle_result) {
@@ -216,9 +217,8 @@ fn test_view_definition_and_bundle_parsing() {
     #[cfg(feature = "R4B")]
     {
         let view_def: Result<helios_fhir::r4b::ViewDefinition, _> =
-            serde_json::from_value(view_definition.clone());
-        let bundle_result: Result<helios_fhir::r4b::Bundle, _> =
-            serde_json::from_value(bundle.clone());
+            json::from_value(view_definition.clone());
+        let bundle_result: Result<helios_fhir::r4b::Bundle, _> = json::from_value(bundle.clone());
 
         match (view_def, bundle_result) {
             (Ok(_), Ok(_)) => println!("✅ R4B parsing successful"),
@@ -229,9 +229,8 @@ fn test_view_definition_and_bundle_parsing() {
     #[cfg(feature = "R5")]
     {
         let view_def: Result<helios_fhir::r5::ViewDefinition, _> =
-            serde_json::from_value(view_definition.clone());
-        let bundle_result: Result<helios_fhir::r5::Bundle, _> =
-            serde_json::from_value(bundle.clone());
+            json::from_value(view_definition.clone());
+        let bundle_result: Result<helios_fhir::r5::Bundle, _> = json::from_value(bundle.clone());
 
         match (view_def, bundle_result) {
             (Ok(_), Ok(_)) => println!("✅ R5 parsing successful"),
@@ -242,9 +241,8 @@ fn test_view_definition_and_bundle_parsing() {
     #[cfg(feature = "R6")]
     {
         let view_def: Result<helios_fhir::r6::ViewDefinition, _> =
-            serde_json::from_value(view_definition.clone());
-        let bundle_result: Result<helios_fhir::r6::Bundle, _> =
-            serde_json::from_value(bundle.clone());
+            json::from_value(view_definition.clone());
+        let bundle_result: Result<helios_fhir::r6::Bundle, _> = json::from_value(bundle.clone());
 
         match (view_def, bundle_result) {
             (Ok(_), Ok(_)) => println!("✅ R6 parsing successful"),

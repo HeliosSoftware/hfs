@@ -79,9 +79,122 @@ use heck::ToLowerCamelCase;
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Fields, GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type,
-    TypePath, parse_macro_input, punctuated::Punctuated, token,
+    Data, DataEnum, DeriveInput, Fields, GenericArgument, Ident, Lit, Meta, Path, PathArguments,
+    Type, TypePath, parse_macro_input, punctuated::Punctuated, token,
 };
+
+/// Generates a borrowed IdAndExtensionHelper for serialization only.
+///
+/// This helper is used during serialization to handle FHIR's `_fieldName` pattern.
+/// It has borrowed fields with lifetime `<'a>` and only includes serialization.
+fn generate_id_and_extension_helper() -> proc_macro2::TokenStream {
+    quote! {
+        // Helper struct for serializing the id/extension part from _fieldName
+        #[allow(dead_code)]
+        #[derive(Clone)]
+        struct IdAndExtensionHelper<'a> {
+            id: &'a Option<std::string::String>,
+            extension: &'a Option<Vec<Extension>>,
+        }
+
+        impl<'a> ::helios_serde::FhirSerialize<::helios_serde::Json> for IdAndExtensionHelper<'a> {
+            fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeStruct;
+                let mut state = serializer.serialize_struct("IdAndExtensionHelper", 2)?;
+                if self.id.is_some() {
+                    state.serialize_field("id", self.id)?;
+                }
+                if let Some(ref ext) = self.extension {
+                    let ctx = ::helios_serde::SerializationContext::json(ext);
+                    state.serialize_field("extension", &ctx)?;
+                }
+                state.end()
+            }
+        }
+    }
+}
+
+/// Generates an owned IdAndExtensionHelper with full deserialization support.
+///
+/// This helper is used for deserialization to handle FHIR's `_fieldName` pattern.
+/// It has owned fields and includes both serialization and deserialization.
+fn generate_id_and_extension_helper_owned() -> proc_macro2::TokenStream {
+    quote! {
+        // Helper struct for deserializing the id/extension part from _fieldName
+        #[derive(Clone, Default)]
+        struct IdAndExtensionHelper {
+            id: Option<std::string::String>,
+            extension: Option<Vec<Extension>>,
+        }
+
+        impl ::helios_serde::FhirSerialize<::helios_serde::Json> for IdAndExtensionHelper {
+            fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeStruct;
+                let mut state = serializer.serialize_struct("IdAndExtensionHelper", 2)?;
+                if self.id.is_some() {
+                    state.serialize_field("id", &self.id)?;
+                }
+                if let Some(ref ext) = self.extension {
+                    let ctx = ::helios_serde::SerializationContext::json(ext);
+                    state.serialize_field("extension", &ctx)?;
+                }
+                state.end()
+            }
+        }
+
+        impl ::helios_serde::FhirDeserialize<::helios_serde::Json> for IdAndExtensionHelper {
+            fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                use serde::de::{self, Visitor, MapAccess, DeserializeSeed};
+
+                struct HelperVisitor;
+
+                impl<'de> Visitor<'de> for HelperVisitor {
+                    type Value = IdAndExtensionHelper;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str("a map with optional id and extension fields")
+                    }
+
+                    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: MapAccess<'de>,
+                    {
+                        let mut id = None;
+                        let mut extension = None;
+
+                        while let Some(key) = map.next_key::<std::string::String>()? {
+                            match key.as_str() {
+                                "id" => {
+                                    id = Some(map.next_value()?);
+                                }
+                                "extension" => {
+                                    let ctx = ::helios_serde::DeserializationContext::<Vec<Extension>, ::helios_serde::Json>::json();
+                                    extension = Some(map.next_value_seed(ctx)?);
+                                }
+                                _ => {
+                                    let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                                }
+                            }
+                        }
+
+                        Ok(IdAndExtensionHelper { id, extension })
+                    }
+                }
+
+                deserializer.deserialize_map(HelperVisitor)
+            }
+        }
+    }
+}
 
 /// Determines the effective field name for FHIR serialization.
 ///
@@ -186,6 +299,193 @@ fn is_flattened(field: &syn::Field) -> bool {
     false
 }
 
+/// Extracts the tag field name from enum-level #[fhir_serde(tag = "field")] attribute.
+///
+/// This function checks if an enum has a tag attribute for internally-tagged serialization,
+/// which is used for enums like Resource where the variant is determined by a field value
+/// (e.g., "resourceType": "Patient").
+///
+/// # Arguments
+///
+/// * `attrs` - The enum's attributes to search
+///
+/// # Returns
+///
+/// `Some(String)` with the tag field name if present, `None` otherwise.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Enum with internally-tagged serialization
+/// #[derive(FhirSerde)]
+/// #[fhir_serde(tag = "resourceType")]
+/// pub enum Resource {
+///     Patient(Patient),
+///     Observation(Observation),
+/// }
+/// ```
+fn get_enum_tag(attrs: &[syn::Attribute]) -> Option<String> {
+    for attr in attrs {
+        if attr.path().is_ident("fhir_serde")
+            && let Ok(list) =
+                attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
+        {
+            for meta in list {
+                if let Meta::NameValue(nv) = meta
+                    && nv.path.is_ident("tag")
+                    && let syn::Expr::Lit(expr_lit) = nv.value
+                    && let Lit::Str(lit_str) = expr_lit.lit
+                {
+                    return Some(lit_str.value());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Generates complete FhirSerialize and FhirDeserialize implementations for internally-tagged enums.
+///
+/// Internally-tagged enums use a field value (like `resourceType`) to determine the variant.
+/// This function generates both serialization and deserialization in a single TokenStream.
+fn generate_internally_tagged_enum_impl(
+    name: &Ident,
+    data: &DataEnum,
+    impl_generics: &syn::ImplGenerics,
+    ty_generics: &syn::TypeGenerics,
+    where_clause: &Option<&syn::WhereClause>,
+    tag: &str,
+) -> TokenStream {
+    let mut serialize_arms = Vec::new();
+    let mut deserialize_arms = Vec::new();
+    let mut variant_names = Vec::new();
+
+    for variant in &data.variants {
+        let variant_name = &variant.ident;
+        let variant_str = variant_name.to_string();
+        variant_names.push(variant_str.clone());
+
+        match &variant.fields {
+            Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                let field_ty = &fields.unnamed.first().unwrap().ty;
+
+                // Serialization arm
+                serialize_arms.push(quote! {
+                    #name #ty_generics::#variant_name(inner) => {
+                        let ctx = ::helios_serde::SerializationContext::json(inner);
+                        let inner_json = serde_json::to_value(&ctx).map_err(|e| {
+                            serde::ser::Error::custom(format!(
+                                "Failed to serialize {} variant '{}': {}",
+                                stringify!(#name),
+                                #variant_str,
+                                e
+                            ))
+                        })?;
+                        if let serde_json::Value::Object(obj) = inner_json {
+                            let mut map = serializer.serialize_map(Some(obj.len() + 1))?;
+                            map.serialize_entry(#tag, #variant_str)?;
+                            for (k, v) in obj.into_iter() {
+                                map.serialize_entry(&k, &v)?;
+                            }
+                            map.end()
+                        } else {
+                            Err(serde::ser::Error::custom(format!(
+                                "Flattened {} variant '{}' did not produce an object",
+                                stringify!(#name),
+                                #variant_str
+                            )))
+                        }
+                    }
+                });
+
+                // Deserialization arm
+                deserialize_arms.push(quote! {
+                    #variant_str => {
+                        use serde::de::{self, DeserializeSeed, IntoDeserializer};
+                        let ctx = ::helios_serde::DeserializationContext::<#field_ty, ::helios_serde::Json>::json();
+                        let inner = ctx.deserialize(json_value.into_deserializer())
+                            .map_err(|e| de::Error::custom(format!("Failed to deserialize variant {}: {}", #variant_str, e)))?;
+                        Ok(#name::#variant_name(inner))
+                    }
+                });
+            }
+            _ => {
+                panic!("Internally-tagged enums must have newtype variants");
+            }
+        }
+    }
+
+    let expanded = quote! {
+        impl #impl_generics ::helios_serde::FhirSerialize<::helios_serde::Json> for #name #ty_generics #where_clause {
+            fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeMap;
+                match self {
+                    #(#serialize_arms)*
+                }
+            }
+        }
+
+        impl #impl_generics ::helios_serde::FhirDeserialize<::helios_serde::Json> for #name #ty_generics #where_clause {
+            fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                use serde::de::{self, Visitor, MapAccess};
+                use serde_json;
+
+                struct EnumVisitor;
+
+                impl<'de> Visitor<'de> for EnumVisitor {
+                    type Value = #name;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str(concat!("a ", stringify!(#name), " with a ", #tag, " field"))
+                    }
+
+                    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: MapAccess<'de>,
+                    {
+                        // Buffer the entire map into a serde_json::Value
+                        let mut obj = serde_json::Map::new();
+                        while let Some(key) = map.next_key::<::std::string::String>()? {
+                            let value: serde_json::Value = map.next_value()?;
+                            obj.insert(key, value);
+                        }
+
+                        // Extract the tag field and clone it to avoid borrow issues
+                        let tag_value = obj.get(#tag)
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .ok_or_else(|| de::Error::missing_field(#tag))?;
+
+                        // Convert the buffered map back to a Value for deserialization
+                        let json_value = serde_json::Value::Object(obj);
+
+                        // Match on tag value and deserialize the appropriate variant
+                        match tag_value.as_str() {
+                            #(#deserialize_arms)*
+                            _ => {
+                                Err(de::Error::unknown_variant(
+                                    &tag_value,
+                                    &[#(#variant_names),*]
+                                ))
+                            }
+                        }
+                    }
+                }
+
+                deserializer.deserialize_map(EnumVisitor)
+            }
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
 /// Derives `serde::Serialize` and `serde::Deserialize` implementations for FHIR types.
 ///
 /// This procedural macro automatically generates serialization and deserialization code
@@ -266,19 +566,41 @@ fn is_flattened(field: &syn::Field) -> bool {
 #[proc_macro_derive(FhirSerde, attributes(fhir_serde))]
 pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    let name = input.ident;
-    let generics = input.generics;
+    let name = &input.ident;
+    let generics = &input.generics;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-    let serialize_impl = generate_serialize_impl(&input.data, &name);
+    // Check if this is an internally-tagged enum and handle it specially
+    if let Data::Enum(ref data) = input.data {
+        if let Some(tag) = get_enum_tag(&input.attrs) {
+            // Generate internally-tagged enum implementation
+            return generate_internally_tagged_enum_impl(
+                name,
+                data,
+                &impl_generics,
+                &ty_generics,
+                &where_clause,
+                &tag,
+            );
+        }
+    }
+
+    let serialize_impl = generate_serialize_impl(
+        &input.data,
+        name,
+        &impl_generics,
+        &ty_generics,
+        &where_clause,
+        &input.attrs,
+    );
 
     // Pass all generic parts to deserialize generator
-    let deserialize_impl = generate_deserialize_impl(&input.data, &name);
+    let deserialize_impl = generate_deserialize_impl(&input.data, name, &input.attrs);
 
     let expanded = quote! {
-        // --- Serialize Implementation ---
-        impl #impl_generics serde::Serialize for #name #ty_generics #where_clause {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        // --- FhirSerialize Implementation (bridging trait) ---
+        impl #impl_generics ::helios_serde::FhirSerialize<::helios_serde::Json> for #name #ty_generics #where_clause {
+            fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
                 S: serde::Serializer,
             {
@@ -286,13 +608,9 @@ pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
             }
         }
 
-        // --- Deserialize Implementation ---
-        impl<'de> #impl_generics serde::Deserialize<'de> for #name #ty_generics #where_clause
-        where
-            // Add bounds for generic types used in fields if necessary
-            // Example: T: serde::Deserialize<'de>,
-        {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        // --- FhirDeserialize Implementation (bridging trait) ---
+        impl #impl_generics ::helios_serde::FhirDeserialize<::helios_serde::Json> for #name #ty_generics #where_clause {
+            fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
             where
                 D: serde::Deserializer<'de>,
             {
@@ -673,10 +991,81 @@ fn extract_inner_element_type(type_name: &str) -> &str {
 /// # Returns
 ///
 /// TokenStream containing the complete `serialize` method implementation.
-fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
+fn generate_serialize_impl(
+    data: &Data,
+    name: &Ident,
+    impl_generics: &syn::ImplGenerics,
+    ty_generics: &syn::TypeGenerics,
+    where_clause: &Option<&syn::WhereClause>,
+    attrs: &[syn::Attribute],
+) -> proc_macro2::TokenStream {
     match *data {
         Data::Enum(ref data) => {
-            // Handle enum serialization
+            // Check if this is an internally-tagged enum
+            let tag_field = get_enum_tag(attrs);
+
+            if let Some(tag) = tag_field {
+                // Generate internally-tagged enum serialization
+                // This is used for enums like Resource where variant is determined by a field
+                let mut match_arms = Vec::new();
+
+                for variant in &data.variants {
+                    let variant_name = &variant.ident;
+                    let variant_str = variant_name.to_string();
+
+                    // Only handle newtype variants for internally-tagged enums
+                    match &variant.fields {
+                        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                            match_arms.push(quote! {
+                                #name #ty_generics::#variant_name(inner) => {
+                                    let ctx = ::helios_serde::SerializationContext::json(inner);
+                                    let inner_json = serde_json::to_value(&ctx).map_err(|e| {
+                                        serde::ser::Error::custom(format!(
+                                            "Failed to serialize {} variant '{}': {}",
+                                            stringify!(#name),
+                                            #variant_str,
+                                            e
+                                        ))
+                                    })?;
+                                    if let serde_json::Value::Object(obj) = inner_json {
+                                        let mut map = serializer.serialize_map(Some(obj.len() + 1))?;
+                                        map.serialize_entry(#tag, #variant_str)?;
+                                        for (k, v) in obj.into_iter() {
+                                            map.serialize_entry(&k, &v)?;
+                                        }
+                                        map.end()
+                                    } else {
+                                        Err(serde::ser::Error::custom(format!(
+                                            "Flattened {} variant '{}' did not produce an object",
+                                            stringify!(#name),
+                                            #variant_str
+                                        )))
+                                    }
+                                }
+                            });
+                        }
+                        _ => {
+                            panic!("Internally-tagged enums must have newtype variants");
+                        }
+                    }
+                }
+
+                return quote! {
+                    impl #impl_generics ::helios_serde::FhirSerialize<::helios_serde::Json> for #name #ty_generics #where_clause {
+                        fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                        where
+                            S: serde::Serializer,
+                        {
+                            use serde::ser::SerializeMap;
+                            match self {
+                                #(#match_arms)*
+                            }
+                        }
+                    }
+                };
+            }
+
+            // Regular enum serialization (not internally-tagged)
             let mut match_arms = Vec::new();
 
             for variant in &data.variants {
@@ -717,42 +1106,48 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         if is_element || is_decimal_element {
                             // For Element types, we need special handling for the _fieldName pattern
                             let underscore_variant_key = format!("_{}", variant_key);
+                            let _helper_def = generate_id_and_extension_helper();
 
                             match_arms.push(quote! {
                                 // Removed 'ref' from pattern
-                                Self::#variant_name(value) => {
-                                    // Check if the element has id or extension that needs to be serialized
+                                #name #ty_generics::#variant_name(value) => {
                                     let has_extension = value.id.is_some() || value.extension.is_some();
-                                    // Serialize the primitive value
-                                    if value.value.is_some() {
-                                        // Use serialize_entry for SerializeMap
-                                        state.serialize_entry(#variant_key, &value.value)?;
+                                    let primitive_json = if let Some(inner_value) = value.value.as_ref() {
+                                        let ctx = ::helios_serde::SerializationContext::json(inner_value);
+                                        Some(serde_json::to_value(&ctx).map_err(|e| serde::ser::Error::custom(format!("Failed to serialize primitive value: {}", e)))?)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(json_val) = primitive_json {
+                                        state.serialize_entry(#variant_key, &json_val)?;
                                     }
-                                    // Serialize the extension part if present
                                     if has_extension {
-                                        #[derive(serde::Serialize)]
-                                        struct IdAndExtensionHelper<'a> {
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            id: &'a Option<std::string::String>,
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            extension: &'a Option<Vec<Extension>>,
+                                        // Create JSON object for id/extension
+                                        let mut ext_obj = serde_json::Map::new();
+                                        if let Some(ref id) = value.id {
+                                            ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
                                         }
-                                        let extension_part = IdAndExtensionHelper {
-                                            id: &value.id,
-                                            extension: &value.extension,
-                                        };
-                                        // Use serialize_entry for SerializeMap
-                                        state.serialize_entry(#underscore_variant_key, &extension_part)?;
+                                        if let Some(ref extension) = value.extension {
+                                            let ctx = ::helios_serde::SerializationContext::json(extension);
+                                            match serde_json::to_value(&ctx) {
+                                                Ok(json_val) => {
+                                                    ext_obj.insert("extension".to_string(), json_val);
+                                                },
+                                                Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
+                                            }
+                                        }
+                                        let ext_json = serde_json::Value::Object(ext_obj);
+                                        state.serialize_entry(#underscore_variant_key, &ext_json)?;
                                     }
                                     // Don't return Result here, just continue
                                 }
                             });
                         } else {
-                            // Regular newtype variant
+                            // Regular newtype variant - wrap in SerializationContext
                             match_arms.push(quote! {
-                                // Removed 'ref' from pattern
-                                Self::#variant_name(value) => {
-                                    state.serialize_entry(#variant_key, value)?;
+                                #name #ty_generics::#variant_name(value) => {
+                                    let ctx = ::helios_serde::SerializationContext::json(value);
+                                    state.serialize_entry(#variant_key, &ctx)?;
                                 }
                             });
                         }
@@ -760,23 +1155,25 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     Fields::Unnamed(_) => {
                         // Tuple variant with multiple fields
                         match_arms.push(quote! {
-                            Self::#variant_name(ref value) => {
-                                state.serialize_entry(#variant_key, value)?;
+                            #name #ty_generics::#variant_name(value) => {
+                                let ctx = ::helios_serde::SerializationContext::json(value);
+                                state.serialize_entry(#variant_key, &ctx)?;
                             }
                         });
                     }
                     Fields::Named(_fields) => {
                         // Struct variant
                         match_arms.push(quote! {
-                            Self::#variant_name { .. } => {
-                                state.serialize_entry(#variant_key, self)?;
+                            variant @ #name #ty_generics::#variant_name { .. } => {
+                                let ctx = ::helios_serde::SerializationContext::json(variant);
+                                state.serialize_entry(#variant_key, &ctx)?;
                             }
                         });
                     }
                     Fields::Unit => {
                         // Unit variant
                         match_arms.push(quote! {
-                            Self::#variant_name => {
+                            #name #ty_generics::#variant_name => {
                                 state.serialize_entry(#variant_key, &())?;
                             }
                         });
@@ -834,6 +1231,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let is_fhir_element = is_element || is_decimal_element;
 
                         // Use field_name_ident for accessing the struct field
+                        // Access through self since FhirSerialize operates on the raw type
                         let field_access = quote! { self.#field_name_ident };
 
                         let extension_field_ident =
@@ -912,14 +1310,53 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let field_is_flattened = is_flattened(field);
 
                         let field_serializing_code = if field_is_flattened {
-                            // For flattened fields, use FlatMapSerializer
-                            quote! {
-                                // Use serde::Serialize::serialize with FlatMapSerializer
-                                serde::Serialize::serialize(
-                                    &#field_access,
-                                    serde::__private::ser::FlatMapSerializer(&mut state)
-                                )?;
-                            }
+                            let flatten_serialization = if is_option {
+                                quote! {
+                                    if let Some(flattened_field) = &#field_access {
+                                        let ctx = ::helios_serde::SerializationContext::json(flattened_field);
+                                        let flattened_value = serde_json::to_value(&ctx).map_err(|e| {
+                                            serde::ser::Error::custom(format!(
+                                                "Failed to serialize flattened field '{}': {}",
+                                                #effective_field_name_str,
+                                                e
+                                            ))
+                                        })?;
+                                        if let serde_json::Value::Object(obj) = flattened_value {
+                                            for (k, v) in obj {
+                                                state.serialize_entry(&k, &v)?;
+                                            }
+                                        } else {
+                                            return Err(serde::ser::Error::custom(format!(
+                                                "Flattened field '{}' did not serialize to an object",
+                                                #effective_field_name_str
+                                            )));
+                                        }
+                                    }
+                                }
+                            } else {
+                                quote! {
+                                    let ctx = ::helios_serde::SerializationContext::json(&#field_access);
+                                    let flattened_value = serde_json::to_value(&ctx).map_err(|e| {
+                                        serde::ser::Error::custom(format!(
+                                            "Failed to serialize flattened field '{}': {}",
+                                            #effective_field_name_str,
+                                            e
+                                        ))
+                                    })?;
+                                    if let serde_json::Value::Object(obj) = flattened_value {
+                                        for (k, v) in obj {
+                                            state.serialize_entry(&k, &v)?;
+                                        }
+                                    } else {
+                                        return Err(serde::ser::Error::custom(format!(
+                                            "Flattened field '{}' did not serialize to an object",
+                                            #effective_field_name_str
+                                        )));
+                                    }
+                                }
+                            };
+                            // For flattened fields, manually merge serialized entries into the parent SerializeMap
+                            flatten_serialization
                         } else if is_vec && is_fhir_element {
                             // Handles Vec<Element> or Option<Vec<Element>>
                             // Determine how to access the vector based on whether it's wrapped in Option
@@ -935,6 +1372,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             } else {
                                 quote! { state.serialize_field }
                             };
+
+                            let _helper_def = generate_id_and_extension_helper();
 
                             quote! {
                                 // Handle Vec<Element> by splitting into primitive and extension arrays
@@ -952,7 +1391,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             // Add primitive value or null
                                             match &element.value {
                                                 Some(value) => {
-                                                    match serde_json::to_value(value) {
+                                                    // Wrap value in serialization context
+                                                    let ctx = ::helios_serde::SerializationContext::json(value);
+                                                    match serde_json::to_value(&ctx) {
                                                         Ok(json_val) => primitive_array.push(json_val),
                                                         Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize primitive value: {}", e))),
                                                     }
@@ -960,27 +1401,25 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 None => primitive_array.push(serde_json::Value::Null),
                                             }
 
-                                            // Check if this element has id or extension
+                                            // Check if this element has id or extension (pure context system)
                                             if element.id.is_some() || element.extension.is_some() {
                                                 has_extensions = true;
-                                                // Use helper struct for consistent serialization of id/extension
-                                                #[derive(serde::Serialize)]
-                                                struct IdAndExtensionHelper<'a> {
-                                                    #[serde(skip_serializing_if = "Option::is_none")]
-                                                    id: &'a Option<std::string::String>,
-                                                    #[serde(skip_serializing_if = "Option::is_none")]
-                                                    extension: &'a Option<Vec<Extension>>,
+
+                                                // Create JSON object for id/extension
+                                                let mut ext_obj = serde_json::Map::new();
+                                                if let Some(ref id) = element.id {
+                                                    ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
                                                 }
-                                                let extension_part = IdAndExtensionHelper {
-                                                    id: &element.id,
-                                                    extension: &element.extension,
-                                                };
-                                                // Serialize the helper and push null if it serializes to null (e.g., both fields are None)
-                                                match serde_json::to_value(&extension_part) {
-                                                    Ok(json_val) if !json_val.is_null() => extension_array.push(json_val),
-                                                    Ok(_) => extension_array.push(serde_json::Value::Null), // Push null if helper serialized to null
-                                                    Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension part: {}", e))),
+                                                if let Some(ref extension) = element.extension {
+                                                    let ctx = ::helios_serde::SerializationContext::json(extension);
+                                                    match serde_json::to_value(&ctx) {
+                                                        Ok(json_val) => {
+                                                            ext_obj.insert("extension".to_string(), json_val);
+                                                        },
+                                                        Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
+                                                    }
                                                 }
+                                                extension_array.push(serde_json::Value::Object(ext_obj));
                                             } else {
                                                 // No id or extension
                                                 extension_array.push(serde_json::Value::Null);
@@ -1007,53 +1446,63 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             // Handles Option<Element> (but not Vec)
                             if has_flattened_fields {
                                 // For SerializeMap
+                                let _helper_def = generate_id_and_extension_helper();
+
                                 quote! {
                                     if let Some(field) = &#field_access {
                                         if let Some(value) = field.value.as_ref() {
+                                            // Wrap value in serialization context
+                                            let ctx = ::helios_serde::SerializationContext::json(value);
                                             // Use serialize_entry for SerializeMap
-                                            state.serialize_entry(&#effective_field_name_str, value)?;
+                                            state.serialize_entry(&#effective_field_name_str, &ctx)?;
                                         }
                                         if #extension_field_ident {
-                                            #[derive(serde::Serialize)]
-                                            struct IdAndExtensionHelper<'a> {
-                                                #[serde(skip_serializing_if = "Option::is_none")]
-                                                id: &'a Option<std::string::String>,
-                                                #[serde(skip_serializing_if = "Option::is_none")]
-                                                extension: &'a Option<Vec<Extension>>,
+                                            // Create JSON object for id/extension
+                                            let mut ext_obj = serde_json::Map::new();
+                                            if let Some(ref id) = field.id {
+                                                ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
                                             }
-                                            let extension_part = IdAndExtensionHelper {
-                                                id: &field.id,
-                                                extension: &field.extension,
-                                            };
-                                            // Use serialize_entry for SerializeMap
-                                            // No format! here, #underscore_field_name_str is already a string literal
-                                            state.serialize_entry(&#underscore_field_name_str, &extension_part)?;
+                                            if let Some(ref extension) = field.extension {
+                                                let ctx = ::helios_serde::SerializationContext::json(extension);
+                                                match serde_json::to_value(&ctx) {
+                                                    Ok(json_val) => {
+                                                        ext_obj.insert("extension".to_string(), json_val);
+                                                    },
+                                                    Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
+                                                }
+                                            }
+                                            state.serialize_entry(&#underscore_field_name_str, &serde_json::Value::Object(ext_obj))?;
                                         }
                                     }
                                 }
                             } else {
                                 // For SerializeStruct
+                                let _helper_def = generate_id_and_extension_helper();
+
                                 quote! {
                                     if let Some(field) = &#field_access {
                                         if let Some(value) = field.value.as_ref() {
+                                            // Wrap value in serialization context
+                                            let ctx = ::helios_serde::SerializationContext::json(value);
                                             // Use serialize_field for SerializeStruct
-                                            state.serialize_field(&#effective_field_name_str, value)?;
+                                            state.serialize_field(&#effective_field_name_str, &ctx)?;
                                         }
                                         if #extension_field_ident {
-                                            #[derive(serde::Serialize)]
-                                            struct IdAndExtensionHelper<'a> {
-                                                #[serde(skip_serializing_if = "Option::is_none")]
-                                                id: &'a Option<std::string::String>,
-                                                #[serde(skip_serializing_if = "Option::is_none")]
-                                                extension: &'a Option<Vec<Extension>>,
+                                            // Create JSON object for id/extension
+                                            let mut ext_obj = serde_json::Map::new();
+                                            if let Some(ref id) = field.id {
+                                                ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
                                             }
-                                            let extension_part = IdAndExtensionHelper {
-                                                id: &field.id,
-                                                extension: &field.extension,
-                                            };
-                                            // Use serialize_field for SerializeStruct
-                                            // No format! here, #underscore_field_name_str is already a string literal
-                                            state.serialize_field(&#underscore_field_name_str, &extension_part)?;
+                                            if let Some(ref extension) = field.extension {
+                                                let ctx = ::helios_serde::SerializationContext::json(extension);
+                                                match serde_json::to_value(&ctx) {
+                                                    Ok(json_val) => {
+                                                        ext_obj.insert("extension".to_string(), json_val);
+                                                    },
+                                                    Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
+                                                }
+                                            }
+                                            state.serialize_field(&#underscore_field_name_str, &serde_json::Value::Object(ext_obj))?;
                                         }
                                     }
                                 }
@@ -1061,49 +1510,60 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         } else if !is_vec && is_fhir_element {
                             if has_flattened_fields {
                                 // For SerializeMap
+                                let _helper_def = generate_id_and_extension_helper();
+
                                 quote! {
                                     if let Some(value) = #field_access.value.as_ref() {
+                                        // Wrap value in serialization context
+                                        let ctx = ::helios_serde::SerializationContext::json(value);
                                         // Use serialize_entry for SerializeMap
-                                        state.serialize_entry(&#effective_field_name_str, value)?;
+                                        state.serialize_entry(&#effective_field_name_str, &ctx)?;
                                     }
                                     if #extension_field_ident {
-                                        #[derive(serde::Serialize)]
-                                        struct IdAndExtensionHelper<'a> {
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            id: &'a Option<std::string::String>,
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            extension: &'a Option<Vec<Extension>>,
+                                        // Create JSON object for id/extension
+                                        let mut ext_obj = serde_json::Map::new();
+                                        if let Some(ref id) = #field_access.id {
+                                            ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
                                         }
-                                        let extension_part = IdAndExtensionHelper {
-                                            id: &#field_access.id,
-                                            extension: &#field_access.extension,
-                                        };
-                                        // Use serialize_entry for SerializeMap
-                                        state.serialize_entry(#underscore_field_name_str, &extension_part)?;
+                                        if let Some(ref extension) = #field_access.extension {
+                                            let ctx = ::helios_serde::SerializationContext::json(extension);
+                                            match serde_json::to_value(&ctx) {
+                                                Ok(json_val) => {
+                                                    ext_obj.insert("extension".to_string(), json_val);
+                                                },
+                                                Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
+                                            }
+                                        }
+                                        state.serialize_entry(#underscore_field_name_str, &serde_json::Value::Object(ext_obj))?;
                                     }
                                 }
                             } else {
                                 // For SerializeStruct
+                                let _helper_def = generate_id_and_extension_helper();
+
                                 quote! {
                                     if let Some(value) = #field_access.value.as_ref() {
+                                        // Wrap value in serialization context
+                                        let ctx = ::helios_serde::SerializationContext::json(value);
                                         // Use serialize_field for SerializeStruct
-                                        state.serialize_field(&#effective_field_name_str, value)?;
+                                        state.serialize_field(&#effective_field_name_str, &ctx)?;
                                     }
                                     if #extension_field_ident {
-                                        #[derive(serde::Serialize)]
-                                        struct IdAndExtensionHelper<'a> {
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            id: &'a Option<std::string::String>,
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            extension: &'a Option<Vec<Extension>>,
+                                        // Create JSON object for id/extension
+                                        let mut ext_obj = serde_json::Map::new();
+                                        if let Some(ref id) = #field_access.id {
+                                            ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
                                         }
-                                        let extension_part = IdAndExtensionHelper {
-                                            id: &#field_access.id,
-                                            extension: &#field_access.extension,
-                                        };
-                                        // Use serialize_field for SerializeStruct
-                                        // No format! here, #underscore_field_name_str is already a string literal
-                                        state.serialize_field(&#underscore_field_name_str, &extension_part)?;
+                                        if let Some(ref extension) = #field_access.extension {
+                                            let ctx = ::helios_serde::SerializationContext::json(extension);
+                                            match serde_json::to_value(&ctx) {
+                                                Ok(json_val) => {
+                                                    ext_obj.insert("extension".to_string(), json_val);
+                                                },
+                                                Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
+                                            }
+                                        }
+                                        state.serialize_field(&#underscore_field_name_str, &serde_json::Value::Object(ext_obj))?;
                                     }
                                 }
                             }
@@ -1113,16 +1573,20 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 // For SerializeMap
                                 quote! {
                                     if let Some(value) = &#field_access {
+                                        // Wrap value in serialization context
+                                        let ctx = ::helios_serde::SerializationContext::json(value);
                                         // Use serialize_entry for SerializeMap
-                                        state.serialize_entry(&#effective_field_name_str, value)?;
+                                        state.serialize_entry(&#effective_field_name_str, &ctx)?;
                                     }
                                 }
                             } else {
                                 // For SerializeStruct
                                 quote! {
                                     if let Some(value) = &#field_access {
+                                        // Wrap value in serialization context
+                                        let ctx = ::helios_serde::SerializationContext::json(value);
                                         // Use serialize_field for SerializeStruct
-                                        state.serialize_field(&#effective_field_name_str, value)?;
+                                        state.serialize_field(&#effective_field_name_str, &ctx)?;
                                     }
                                 }
                             }
@@ -1131,21 +1595,25 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             if has_flattened_fields {
                                 // For SerializeMap
                                 quote! {
+                                    // Wrap value in serialization context for checking
+                                    let ctx = ::helios_serde::SerializationContext::json(&#field_access);
                                     // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
+                                    let json_value = serde_json::to_value(&ctx).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
                                     if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
                                         // Use serialize_entry for SerializeMap
-                                        state.serialize_entry(&#effective_field_name_str, &#field_access)?;
+                                        state.serialize_entry(&#effective_field_name_str, &ctx)?;
                                     }
                                 }
                             } else {
                                 // For SerializeStruct
                                 quote! {
+                                    // Wrap value in serialization context for checking
+                                    let ctx = ::helios_serde::SerializationContext::json(&#field_access);
                                     // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
+                                    let json_value = serde_json::to_value(&ctx).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
                                     if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
                                         // Use serialize_field for SerializeStruct
-                                        state.serialize_field(&#effective_field_name_str, &#field_access)?;
+                                        state.serialize_field(&#effective_field_name_str, &ctx)?;
                                     }
                                 }
                             }
@@ -1154,21 +1622,25 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             if has_flattened_fields {
                                 // For SerializeMap
                                 quote! {
+                                    // Wrap value in serialization context for checking
+                                    let ctx = ::helios_serde::SerializationContext::json(&#field_access);
                                     // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
+                                    let json_value = serde_json::to_value(&ctx).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
                                     if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
                                         // Use serialize_entry for SerializeMap
-                                        state.serialize_entry(&#effective_field_name_str, &#field_access)?;
+                                        state.serialize_entry(&#effective_field_name_str, &ctx)?;
                                     }
                                 }
                             } else {
                                 // For SerializeStruct
                                 quote! {
+                                    // Wrap value in serialization context for checking
+                                    let ctx = ::helios_serde::SerializationContext::json(&#field_access);
                                     // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
+                                    let json_value = serde_json::to_value(&ctx).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
                                     if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
                                         // Use serialize_field for SerializeStruct
-                                        state.serialize_field(&#effective_field_name_str, &#field_access)?;
+                                        state.serialize_field(&#effective_field_name_str, &ctx)?;
                                     }
                                 }
                             }
@@ -1438,13 +1910,21 @@ mod tests {
 
         let input: DeriveInput = syn::parse2(stream).unwrap();
         let name = &input.ident;
-        let serialize_impl = generate_serialize_impl(&input.data, name);
+        let generics = &input.generics;
+        let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+        let serialize_impl = generate_serialize_impl(
+            &input.data,
+            name,
+            &impl_generics,
+            &ty_generics,
+            &where_clause,
+            &input.attrs,
+        );
 
-        // Convert to string to check if FlatMapSerializer is used
         let serialize_impl_str = serialize_impl.to_string();
 
-        // Check that FlatMapSerializer is used for the flattened field
-        assert!(serialize_impl_str.contains("FlatMapSerializer"));
+        // Ensure flattened field serialization uses serde_json::to_value helpers
+        assert!(serialize_impl_str.contains("serde_json :: to_value"));
 
         // Check that regular serialization uses serialize_entry when flattening is active (due to serialize_map)
         assert!(serialize_impl_str.contains("serialize_entry"));
@@ -1518,14 +1998,101 @@ mod tests {
 /// # Returns
 ///
 /// TokenStream containing the complete `deserialize` method implementation.
-fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
+fn generate_deserialize_impl(
+    data: &Data,
+    name: &Ident,
+    attrs: &[syn::Attribute],
+) -> proc_macro2::TokenStream {
     let struct_name = format_ident!("Temp{}", name);
 
     let mut temp_struct_attributes = Vec::new();
     let mut constructor_attributes = Vec::new();
+    let mut deserialize_impl = proc_macro2::TokenStream::new();
 
     match *data {
         Data::Enum(ref data) => {
+            // Check if this is an internally-tagged enum
+            let tag_field = get_enum_tag(attrs);
+
+            if let Some(tag) = tag_field {
+                // Generate internally-tagged enum deserialization
+                let enum_name = name.to_string();
+                let mut match_arms = Vec::new();
+                let mut variant_names_list = Vec::new();
+
+                for variant in &data.variants {
+                    let variant_name = &variant.ident;
+                    let variant_str = variant_name.to_string();
+                    variant_names_list.push(variant_str.clone());
+
+                    match &variant.fields {
+                        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                            let field_ty = &fields.unnamed.first().unwrap().ty;
+                            match_arms.push(quote! {
+                                #variant_str => {
+                                    use serde::de::{self, DeserializeSeed, IntoDeserializer};
+                                    let ctx = ::helios_serde::DeserializationContext::<#field_ty, ::helios_serde::Json>::json();
+                                    let inner = ctx.deserialize(json_value.into_deserializer())
+                                        .map_err(|e| de::Error::custom(format!("Failed to deserialize variant {}: {}", #variant_str, e)))?;
+                                    Ok(#name::#variant_name(inner))
+                                }
+                            });
+                        }
+                        _ => {
+                            panic!("Internally-tagged enums must have newtype variants");
+                        }
+                    }
+                }
+
+                return quote! {
+                    use serde::de::{self, Visitor, MapAccess, DeserializeSeed, IntoDeserializer};
+                    use serde_json;
+
+                    struct EnumVisitor;
+
+                    impl<'de> Visitor<'de> for EnumVisitor {
+                        type Value = #name;
+
+                        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                            formatter.write_str(concat!("a ", #enum_name, " with a ", #tag, " field"))
+                        }
+
+                        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                        where
+                            A: MapAccess<'de>,
+                        {
+                            // Buffer the entire map into a serde_json::Value
+                            let mut obj = serde_json::Map::new();
+                            while let Some(key) = map.next_key::<::std::string::String>()? {
+                                let value: serde_json::Value = map.next_value()?;
+                                obj.insert(key, value);
+                            }
+
+                            // Extract the tag field
+                            let tag_value = obj.get(#tag)
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| de::Error::missing_field(#tag))?;
+
+                            // Convert the buffered map back to a Value for deserialization
+                            let json_value = serde_json::Value::Object(obj);
+
+                            // Match on tag value and deserialize the appropriate variant
+                            match tag_value {
+                                #(#match_arms)*
+                                _ => {
+                                    Err(de::Error::unknown_variant(
+                                        tag_value,
+                                        &[#(#variant_names_list),*]
+                                    ))
+                                }
+                            }
+                        }
+                    }
+
+                    deserializer.deserialize_map(EnumVisitor)
+                };
+            }
+
             // For enums, we need to deserialize from a map with a single key-value pair
             // where the key is the variant name and the value is the variant data
 
@@ -1633,14 +2200,18 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 // Deserialize the extension part if present
                                 let mut ext_helper_opt: Option<IdAndExtensionHelper> = None;
                                 if let Some(ext_value) = extension_part { // Move happens here
-                                    ext_helper_opt = Some(serde::Deserialize::deserialize(ext_value)
+                                    use serde::de::DeserializeSeed;
+                                    let ctx = ::helios_serde::DeserializationContext::<IdAndExtensionHelper, ::helios_serde::Json>::json();
+                                    ext_helper_opt = Some(ctx.deserialize(ext_value)
                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing extension {}: {}", #underscore_variant_key_str, e)))?);
                                 }
 
                                 // Deserialize the value part if present, consuming value_part
                                 let deserialized_value_opt = if let Some(prim_value) = value_part { // Move of value_part happens here
                                     // Use #primitive_type_for_element determined outside
-                                    Some(<#primitive_type_for_element>::deserialize(prim_value)
+                                    use serde::de::{DeserializeSeed, IntoDeserializer};
+                                    let ctx = ::helios_serde::DeserializationContext::<#primitive_type_for_element, ::helios_serde::Json>::json();
+                                    Some(ctx.deserialize(prim_value.into_deserializer())
                                          .map_err(|e| serde::de::Error::custom(format!("Error deserializing primitive {}: {}", #variant_key, e)))?)
                                 } else {
                                     None::<#primitive_type_for_element> // Explicit type needed for None
@@ -1670,8 +2241,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         } else {
                             // --- Regular Newtype Variant Construction ---
                             quote! {
+                                use serde::de::DeserializeSeed;
                                 let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                                let inner_value = serde::Deserialize::deserialize(value)
+                                let ctx = ::helios_serde::DeserializationContext::<#field_ty, ::helios_serde::Json>::json();
+                                let inner_value = ctx.deserialize(value)
                                     .map_err(|e| serde::de::Error::custom(format!("Error deserializing non-element variant {}: {}", #variant_key, e)))?;
                                 Ok(#name::#variant_name(inner_value)) // Removed .into()
                             }
@@ -1713,16 +2286,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
             } // End loop over variants
 
             // Define the helper struct needed for enum deserialization
-            let id_extension_helper_def = quote! {
-                // Helper struct for deserializing the id/extension part from _fieldName
-                #[derive(Clone, Deserialize, Default)] // Add Default derive
-                struct IdAndExtensionHelper {
-                    #[serde(skip_serializing_if = "Option::is_none")] // Change from default
-                    id: Option<std::string::String>,
-                    #[serde(skip_serializing_if = "Option::is_none")] // Change from default
-                    extension: Option<Vec<Extension>>,
-                }
-            };
+            let id_extension_helper_def = generate_id_and_extension_helper_owned();
 
             // Generate the enum deserialization implementation
             return quote! {
@@ -1839,6 +2403,18 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
         Data::Struct(ref data) => {
             match data.fields {
                 Fields::Named(ref fields) => {
+                    // Struct to hold field metadata for generating FhirDeserialize impl
+                    struct FieldInfo {
+                        field_ident: syn::Ident,
+                        field_ident_ext: Option<syn::Ident>,
+                        json_name: String,
+                        json_name_ext: Option<String>,
+                        field_type: proc_macro2::TokenStream,
+                        field_type_ext: Option<proc_macro2::TokenStream>,
+                        is_flattened: bool,
+                    }
+                    let mut field_infos = Vec::new();
+
                     for field in fields.named.iter() {
                         let field_name_ident = field.ident.as_ref().unwrap(); // Keep original ident for access
                         let field_name_ident_ext = format_ident!("{}_ext", field_name_ident);
@@ -1944,10 +2520,16 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             format!("_{}", effective_field_name_str);
 
                         // Base attribute for the regular field (primitive value)
-                        let base_attribute = quote! {
-                            // Use default for Option types in the temp struct
-                            #[serde(default, rename = #effective_field_name_str)]
-                            #field_name_ident: #temp_primitive_type_quote, // Use the determined Option<V> or original type
+                        let base_attribute = if is_flattened(field) {
+                            quote! {
+                                #[serde(default)]
+                                #field_name_ident: #temp_primitive_type_quote,
+                            }
+                        } else {
+                            quote! {
+                                #[serde(default, rename = #effective_field_name_str)]
+                                #field_name_ident: #temp_primitive_type_quote,
+                            }
                         };
 
                         // Conditionally add the underscore field attribute if it's an element type
@@ -2004,8 +2586,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                                 // Deserialize the Option<serde_json::Value> into Option<PreciseDecimal>
                                                 let precise_decimal_value = match prim_val_opt {
                                                     Some(json_val) if !json_val.is_null() => {
-                                                        // Map error explicitly
-                                                        crate::PreciseDecimal::deserialize(json_val)
+                                                        use serde::de::{DeserializeSeed, IntoDeserializer};
+                                                        let ctx = ::helios_serde::DeserializationContext::<crate::PreciseDecimal, ::helios_serde::Json>::json();
+                                                        ctx.deserialize(json_val.into_deserializer())
                                                             .map(Some)
                                                             .map_err(serde::de::Error::custom)? // Map error here
                                                     },
@@ -2083,12 +2666,13 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         // Deserialize PreciseDecimal from Option<serde_json::Value>
                                         let precise_decimal_value = match temp_struct.#field_name_ident {
                                             Some(json_val) if !json_val.is_null() => {
-                                                // Attempt deserialization, map error explicitly
-                                                crate::PreciseDecimal::deserialize(json_val)
+                                                use serde::de::{DeserializeSeed, IntoDeserializer};
+                                                let ctx = ::helios_serde::DeserializationContext::<crate::PreciseDecimal, ::helios_serde::Json>::json();
+                                                ctx.deserialize(json_val.into_deserializer())
                                                     .map(Some)
                                                     .map_err(serde::de::Error::custom)? // Map error here
                                             },
-                                            _ => None, // Treat None or JSON null as None
+                                        _ => None, // Treat None or JSON null as None
                                         };
                                         // Construct the DecimalElement (no Ok() needed)
                                         crate::DecimalElement {
@@ -2113,8 +2697,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                             // Deserialize PreciseDecimal from Option<serde_json::Value>
                                             let precise_decimal_value = match temp_struct.#field_name_ident {
                                                 Some(json_val) if !json_val.is_null() => {
-                                                    // Attempt deserialization, map error explicitly
-                                                    crate::PreciseDecimal::deserialize(json_val)
+                                                    use serde::de::{DeserializeSeed, IntoDeserializer};
+                                                    let ctx = ::helios_serde::DeserializationContext::<crate::PreciseDecimal, ::helios_serde::Json>::json();
+                                                    ctx.deserialize(json_val.into_deserializer())
                                                         .map(Some)
                                                         .map_err(serde::de::Error::custom)? // Map error here
                                                 },
@@ -2171,7 +2756,161 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                         temp_struct_attributes.push(temp_struct_attribute);
                         constructor_attributes.push(constructor_attribute); // Push the result
+
+                        // Collect field info for generating FhirDeserialize impl
+                        let is_field_flattened = is_flattened(field);
+                        field_infos.push(FieldInfo {
+                            field_ident: field_name_ident.clone(),
+                            field_ident_ext: if is_fhir_element {
+                                Some(field_name_ident_ext.clone())
+                            } else {
+                                None
+                            },
+                            json_name: effective_field_name_str.clone(),
+                            json_name_ext: if is_fhir_element {
+                                Some(underscore_field_name_literal.clone())
+                            } else {
+                                None
+                            },
+                            field_type: temp_primitive_type_quote.clone(),
+                            field_type_ext: if is_fhir_element {
+                                Some(temp_extension_type.clone())
+                            } else {
+                                None
+                            },
+                            is_flattened: is_field_flattened,
+                        });
                     }
+
+                    // Generate field deserialization code using FhirDeserialize/DeserializeSeed for each field
+                    let mut field_deserializations = Vec::new();
+                    let mut temp_struct_field_names = Vec::new();
+                    let mut temp_struct_field_decls = Vec::new();
+
+                    for field_info in &field_infos {
+                        let field_ident = &field_info.field_ident;
+                        let json_name = &field_info.json_name;
+                        let field_type = &field_info.field_type;
+
+                        temp_struct_field_names.push(field_ident.clone());
+                        temp_struct_field_decls.push(quote! {
+                            #field_ident: #field_type,
+                        });
+
+                        // Deserialize main field using FhirDeserialize
+                        if field_info.is_flattened {
+                            let underscore_prefix = format!("_{}", json_name);
+                            field_deserializations.push(quote! {
+                                let #field_ident = {
+                                    let mut flattened_map = serde_json::Map::new();
+                                    for (key, value) in &obj {
+                                        if key.starts_with(#json_name) || key.starts_with(#underscore_prefix) {
+                                            flattened_map.insert(key.clone(), value.clone());
+                                        }
+                                    }
+                                    if flattened_map.is_empty() {
+                                        Default::default()
+                                    } else {
+                                        use serde::de::{DeserializeSeed, IntoDeserializer};
+                                        let ctx = ::helios_serde::DeserializationContext::<#field_type, ::helios_serde::Json>::json();
+                                        ctx.deserialize(serde_json::Value::Object(flattened_map).into_deserializer())
+                                            .map_err(|e| de::Error::custom(format!("Failed to deserialize flattened field '{}': {}", #json_name, e)))?
+                                    }
+                                };
+                            });
+                        } else {
+                            field_deserializations.push(quote! {
+                                let #field_ident = if let Some(field_value) = obj.get(#json_name) {
+                                    use serde::de::{DeserializeSeed, IntoDeserializer};
+                                    let ctx = ::helios_serde::DeserializationContext::<#field_type, ::helios_serde::Json>::json();
+                                    ctx.deserialize(field_value.clone().into_deserializer())
+                                        .map_err(|e| de::Error::custom(format!("Failed to deserialize field '{}': {}", #json_name, e)))?
+                                } else {
+                                    // Field not present, use default (should be None for Option types)
+                                    Default::default()
+                                };
+                            });
+                        }
+
+                        // If there's an extension field, deserialize it too
+                        if let Some(ref field_ident_ext) = field_info.field_ident_ext {
+                            if let (Some(json_name_ext), Some(field_type_ext)) =
+                                (&field_info.json_name_ext, &field_info.field_type_ext)
+                            {
+                                temp_struct_field_names.push(field_ident_ext.clone());
+                                temp_struct_field_decls.push(quote! {
+                                    #field_ident_ext: #field_type_ext,
+                                });
+
+                                field_deserializations.push(quote! {
+                                    let #field_ident_ext = if let Some(field_value) = obj.get(#json_name_ext) {
+                                        use serde::de::{DeserializeSeed, IntoDeserializer};
+                                        let ctx = ::helios_serde::DeserializationContext::<#field_type_ext, ::helios_serde::Json>::json();
+                                        ctx.deserialize(field_value.clone().into_deserializer())
+                                            .map_err(|e| de::Error::custom(format!("Failed to deserialize field '{}': {}", #json_name_ext, e)))?
+                                    } else {
+                                        // Field not present, use default
+                                        Default::default()
+                                    };
+                                });
+                            }
+                        }
+                    }
+
+                    let id_extension_helper_def = generate_id_and_extension_helper_owned();
+
+                    // Pure FhirDeserialize approach: manually deserialize each field using DeserializationContext
+                    deserialize_impl = quote! {
+                        // Define the helper struct at the top level of the deserialize function
+                        #id_extension_helper_def
+
+                        use serde::de::{self, MapAccess, Visitor};
+                        use serde_json;
+
+                        struct StructVisitor;
+
+                        impl<'de> Visitor<'de> for StructVisitor {
+                            type Value = #name;
+
+                            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                                formatter.write_str(concat!("struct ", stringify!(#name)))
+                            }
+
+                            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                            where
+                                A: MapAccess<'de>,
+                            {
+                                // Buffer entire map to serde_json::Value with duplicate detection
+                                let mut obj = serde_json::Map::new();
+                                while let Some(key) = map.next_key::<::std::string::String>()? {
+                                    let value: serde_json::Value = map.next_value()?;
+                                    if obj.insert(key.clone(), value).is_some() {
+                                        return Err(de::Error::custom(format!(
+                                            "duplicate field `{}`",
+                                            key
+                                        )));
+                                    }
+                                }
+
+                                // Manually deserialize each field using FhirDeserialize via DeserializationContext
+                                #(#field_deserializations)*
+
+                                // Build temp struct manually from deserialized fields (plain declarations, no serde attributes)
+                                #[allow(non_snake_case)]
+                                struct #struct_name {
+                                    #(#temp_struct_field_decls)*
+                                }
+
+                                let temp_struct = #struct_name {
+                                    #(#temp_struct_field_names),*
+                                };
+
+                                Ok(#name{#(#constructor_attributes)*})
+                            }
+                        }
+
+                        deserializer.deserialize_map(StructVisitor)
+                    };
                 }
                 Fields::Unnamed(_) => panic!("Tuple structs not supported by FhirSerde"),
                 Fields::Unit => panic!("Unit structs not supported by FhirSerde"),
@@ -2180,38 +2919,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
         Data::Union(_) => panic!("Enums and Unions not supported by FhirSerde"),
     }
 
-    let id_extension_helper_def = quote! {
-        // Helper struct for deserializing the id/extension part from _fieldName
-        #[derive(Clone, Deserialize, Default)] // Add Default derive
-        struct IdAndExtensionHelper {
-            #[serde(skip_serializing_if = "Option::is_none")] // Change from default
-            id: Option<std::string::String>,
-            #[serde(skip_serializing_if = "Option::is_none")] // Change from default
-            extension: Option<Vec<Extension>>,
-        }
-    };
-
-    let temp_struct = quote! {
-        #[derive(Deserialize)]
-        struct #struct_name {
-            #(#temp_struct_attributes)*
-        }
-    };
-
-    quote! {
-        // Define the helper struct at the top level of the deserialize function
-        #id_extension_helper_def
-
-        // Define the temporary struct for deserialization
-        #temp_struct
-
-         // Perform the actual deserialization into the temporary struct
-        let temp_struct = #struct_name::deserialize(deserializer)?;
-
-
-        Ok(#name{#(#constructor_attributes)*})
-
-    }
+    deserialize_impl
 }
 
 //=============================================================================

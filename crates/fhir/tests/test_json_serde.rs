@@ -3,8 +3,9 @@ use helios_fhir::Element;
 use helios_fhir::PreciseDecimal;
 use helios_fhir::PrecisionDate;
 use helios_fhir::r4::*;
+use helios_serde::{FhirDeserialize, FhirSerialize, Json, json};
 use rust_decimal_macros::dec;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[test]
 fn test_serialize_decimal_with_value_present() {
@@ -21,10 +22,10 @@ fn test_serialize_decimal_with_value_present() {
     };
 
     // Serialize the actual element
-    let actual_json_string = serde_json::to_string(&element).expect("Serialization failed");
+    let actual_json_string = json::to_string(&element).expect("Serialization failed");
     // Prefix unused variable
     let _actual_value: serde_json::Value =
-        serde_json::from_str(&actual_json_string).expect("Parsing actual JSON failed");
+        json::from_str(&actual_json_string).expect("Parsing actual JSON failed");
 
     // With our new implementation, a bare decimal with no other fields
     // is serialized as just the number.
@@ -118,7 +119,7 @@ fn test_deserialize_timing_with_null_primitive_and_extension() {
 
     // Deserialize the JSON input
     let deserialized_struct: TimingTestStruct =
-        serde_json::from_str(json_input).expect("Deserialization failed");
+        json::from_str(json_input).expect("Deserialization failed");
 
     // Assert that the deserialized struct matches the expected structure
     assert_eq!(
@@ -139,7 +140,7 @@ fn test_decimal_out_of_range() {
 
     for json_input in json_inputs {
         // Deserialize from string
-        let element: DecimalElement<Extension> = serde_json::from_str(json_input)
+        let element: DecimalElement<Extension> = json::from_str(json_input)
             .unwrap_or_else(|e| panic!("Deserialization from '{}' failed: {}", json_input, e));
 
         // Check that the original string was preserved exactly
@@ -174,7 +175,7 @@ fn test_decimal_out_of_range() {
         }
 
         // Serialize back to string
-        let reserialized_string = serde_json::to_string(&element).unwrap_or_else(|e| {
+        let reserialized_string = json::to_string(&element).unwrap_or_else(|e| {
             panic!(
                 "Serialization back to string for input '{}' failed: {}",
                 json_input, e
@@ -189,7 +190,7 @@ fn test_decimal_out_of_range() {
         );
 
         // Serialize back to JSON Value
-        let reserialized_value = serde_json::to_value(&element).unwrap_or_else(|e| {
+        let reserialized_value = json::to_value(&element).unwrap_or_else(|e| {
             panic!(
                 "Serialization back to value for input '{}' failed: {}",
                 json_input, e
@@ -198,7 +199,7 @@ fn test_decimal_out_of_range() {
 
         // Verify the reserialized value matches the original input number/string
         // We need to parse the original input string into a Value for comparison
-        let original_value: serde_json::Value = serde_json::from_str(json_input).unwrap();
+        let original_value: serde_json::Value = json::from_str(json_input).unwrap();
         assert_eq!(
             reserialized_value, original_value,
             "Roundtrip value mismatch for input: {}",
@@ -215,9 +216,8 @@ fn test_serialize_decimal_with_value_absent() {
         value: None,
     };
 
-    let json_string = serde_json::to_string(&element).expect("Serialization failed");
-    let json_value: serde_json::Value =
-        serde_json::from_str(&json_string).expect("Parsing JSON failed");
+    let json_string = json::to_string(&element).expect("Serialization failed");
+    let json_value: serde_json::Value = json::from_str(&json_string).expect("Parsing JSON failed");
 
     assert!(
         json_value.get("value").is_none(),
@@ -268,9 +268,8 @@ fn test_serialize_decimal_with_all_fields() {
         )),
     };
 
-    let json_string = serde_json::to_string(&element).expect("Serialization failed");
-    let json_value: serde_json::Value =
-        serde_json::from_str(&json_string).expect("Parsing JSON failed");
+    let json_string = json::to_string(&element).expect("Serialization failed");
+    let json_value: serde_json::Value = json::from_str(&json_string).expect("Parsing JSON failed");
 
     assert_eq!(
         json_value.get("id"),
@@ -303,7 +302,7 @@ fn test_serialize_decimal_with_no_fields() {
         value: None,
     };
 
-    let json_string = serde_json::to_string(&element).expect("Serialization failed");
+    let json_string = json::to_string(&element).expect("Serialization failed");
     assert_eq!(
         json_string, "null",
         "Serialization of empty element should be null"
@@ -315,7 +314,7 @@ fn test_deserialize_decimal_from_integer() {
     // Test with an integer value in an object
     let json_string = r#"{"value": 10}"#;
     let element: DecimalElement<Extension> =
-        serde_json::from_str(json_string).expect("Deserialization failed");
+        json::from_str(json_string).expect("Deserialization failed");
 
     // Check the numerical value (pd.value() now returns Option<Decimal>)
     assert_eq!(
@@ -334,7 +333,7 @@ fn test_deserialize_decimal_from_integer() {
     // Test with a bare integer string
     let json_string = r#"10"#;
     let element: DecimalElement<Extension> =
-        serde_json::from_str(json_string).expect("Deserialization from bare integer string failed");
+        json::from_str(json_string).expect("Deserialization from bare integer string failed");
 
     // Check the numerical value (pd.value() now returns Option<Decimal>)
     assert_eq!(
@@ -359,10 +358,10 @@ fn test_roundtrip_decimal_serialization() {
 
     // Deserialize from string
     let element: DecimalElement<Extension> =
-        serde_json::from_str(json_input).expect("Deserialization from integer string failed");
+        json::from_str(json_input).expect("Deserialization from integer string failed");
 
     // Serialize back to JSON Value
-    let reserialized_value = serde_json::to_value(&element).expect("Serialization to value failed");
+    let reserialized_value = json::to_value(&element).expect("Serialization to value failed");
 
     // Verify we get the expected JSON number value back
     assert_eq!(
@@ -377,10 +376,10 @@ fn test_roundtrip_decimal_serialization() {
 
     // Deserialize from string
     let element: DecimalElement<Extension> =
-        serde_json::from_str(json_input).expect("Deserialization from decimal string failed");
+        json::from_str(json_input).expect("Deserialization from decimal string failed");
 
     // Serialize back to JSON Value
-    let reserialized_value = serde_json::to_value(&element).expect("Serialization to value failed");
+    let reserialized_value = json::to_value(&element).expect("Serialization to value failed");
 
     // Verify we get the expected JSON number value back
     assert_eq!(
@@ -398,11 +397,11 @@ fn test_decimal_with_trailing_zeros() {
 
     // Deserialize from string
     let element_num_3_0: DecimalElement<Extension> =
-        serde_json::from_str(json_input_num_3_0).expect("Deserialization from '3.0' failed");
+        json::from_str(json_input_num_3_0).expect("Deserialization from '3.0' failed");
 
     // Serialize back to string
     let reserialized_string_num_3_0 =
-        serde_json::to_string(&element_num_3_0).expect("Serialization to string failed");
+        json::to_string(&element_num_3_0).expect("Serialization to string failed");
 
     // Verify the string representation is "3.0"
     assert_eq!(
@@ -418,11 +417,11 @@ fn test_decimal_with_trailing_zeros() {
 
     // Deserialize from string
     let element_str_3_0: DecimalElement<Extension> =
-        serde_json::from_str(json_input_str_3_0).expect("Deserialization from '\"3.0\"' failed");
+        json::from_str(json_input_str_3_0).expect("Deserialization from '\"3.0\"' failed");
 
     // Serialize back to string
     let reserialized_string_str_3_0 =
-        serde_json::to_string(&element_str_3_0).expect("Serialization to string failed");
+        json::to_string(&element_str_3_0).expect("Serialization to string failed");
 
     // Verify the string representation is "3.0"
     assert_eq!(
@@ -437,11 +436,11 @@ fn test_decimal_with_trailing_zeros() {
 
     // Deserialize from string
     let element_num_3_00: DecimalElement<Extension> =
-        serde_json::from_str(json_input_num_3_00).expect("Deserialization from '3.00' failed");
+        json::from_str(json_input_num_3_00).expect("Deserialization from '3.00' failed");
 
     // Serialize back to string
     let reserialized_string_num_3_00 =
-        serde_json::to_string(&element_num_3_00).expect("Serialization to string failed");
+        json::to_string(&element_num_3_00).expect("Serialization to string failed");
 
     // Verify the string representation is "3.00"
     assert_eq!(
@@ -457,11 +456,11 @@ fn test_decimal_with_trailing_zeros() {
 
     // Deserialize from string
     let element_str_3_00: DecimalElement<Extension> =
-        serde_json::from_str(json_input_str_3_00).expect("Deserialization from '\"3.00\"' failed");
+        json::from_str(json_input_str_3_00).expect("Deserialization from '\"3.00\"' failed");
 
     // Serialize back to string
     let reserialized_string_str_3_00 =
-        serde_json::to_string(&element_str_3_00).expect("Serialization to string failed");
+        json::to_string(&element_str_3_00).expect("Serialization to string failed");
 
     // Verify the string representation is "3.00"
     assert_eq!(
@@ -476,11 +475,11 @@ fn test_decimal_with_trailing_zeros() {
 
     // Deserialize from string
     let element_num_3: DecimalElement<Extension> =
-        serde_json::from_str(json_input_num_3).expect("Deserialization from '3' failed");
+        json::from_str(json_input_num_3).expect("Deserialization from '3' failed");
 
     // Serialize back to string
     let reserialized_string_num_3 =
-        serde_json::to_string(&element_num_3).expect("Serialization to string failed");
+        json::to_string(&element_num_3).expect("Serialization to string failed");
 
     // Verify the string representation is "3"
     assert_eq!(
@@ -497,7 +496,7 @@ fn test_serialize_element_primitive() {
         extension: None,
         value: Some("test_value".to_string()),
     };
-    let json_string = serde_json::to_string(&element).unwrap();
+    let json_string = json::to_string(&element).unwrap();
     // Should serialize as the primitive value directly
     assert_eq!(json_string, r#""test_value""#);
 
@@ -506,7 +505,7 @@ fn test_serialize_element_primitive() {
         extension: None,
         value: None,
     };
-    let json_string_null = serde_json::to_string(&element_null).unwrap();
+    let json_string_null = json::to_string(&element_null).unwrap();
     // Should serialize as null
     assert_eq!(json_string_null, "null");
 
@@ -516,7 +515,7 @@ fn test_serialize_element_primitive() {
         extension: None,
         value: Some(123),
     };
-    let json_string_int = serde_json::to_string(&element_int).unwrap();
+    let json_string_int = json::to_string(&element_int).unwrap();
     assert_eq!(json_string_int, "123");
 
     // Test with boolean
@@ -525,7 +524,7 @@ fn test_serialize_element_primitive() {
         extension: None,
         value: Some(true),
     };
-    let json_string_bool = serde_json::to_string(&element_bool).unwrap();
+    let json_string_bool = json::to_string(&element_bool).unwrap();
     assert_eq!(json_string_bool, "true");
 }
 
@@ -546,7 +545,7 @@ fn test_serialize_element_object() {
         }]),
         value: Some("test_value".to_string()),
     };
-    let json_string = serde_json::to_string(&element).unwrap();
+    let json_string = json::to_string(&element).unwrap();
     // Should serialize as an object because id/extension are present
     let expected_json = r#"{"id":"elem-id","extension":[{"url":"http://example.com/ext1","valueBoolean":true}],"value":"test_value"}"#;
     assert_eq!(json_string, expected_json);
@@ -557,7 +556,7 @@ fn test_serialize_element_object() {
         extension: None,
         value: Some("test_value_id".to_string()),
     };
-    let json_string_id_only = serde_json::to_string(&element_id_only).unwrap();
+    let json_string_id_only = json::to_string(&element_id_only).unwrap();
     let expected_json_id_only = r#"{"id":"elem-id-only","value":"test_value_id"}"#;
     assert_eq!(json_string_id_only, expected_json_id_only);
 
@@ -577,7 +576,7 @@ fn test_serialize_element_object() {
         }]),
         value: Some("test_value_ext".to_string()),
     };
-    let json_string_ext_only = serde_json::to_string(&element_ext_only).unwrap();
+    let json_string_ext_only = json::to_string(&element_ext_only).unwrap();
     let expected_json_ext_only = r#"{"extension":[{"url":"http://example.com/ext2","valueString":"val2"}],"value":"test_value_ext"}"#;
     assert_eq!(json_string_ext_only, expected_json_ext_only);
 
@@ -597,7 +596,7 @@ fn test_serialize_element_object() {
         }]),
         value: None,
     };
-    let json_string_no_value = serde_json::to_string(&element_no_value).unwrap();
+    let json_string_no_value = json::to_string(&element_no_value).unwrap();
     // Should serialize object without the "value" field
     let expected_json_no_value = r#"{"id":"elem-id-no-val","extension":[{"url":"http://example.com/ext3","valueInteger":123}]}"#;
     assert_eq!(json_string_no_value, expected_json_no_value);
@@ -607,29 +606,28 @@ fn test_serialize_element_object() {
 fn test_deserialize_element_primitive() {
     // String primitive
     let json_string = r#""test_value""#;
-    let element: Element<std::string::String, Extension> =
-        serde_json::from_str(json_string).unwrap();
+    let element: Element<std::string::String, Extension> = json::from_str(json_string).unwrap();
     assert_eq!(element.id, None);
     assert_eq!(element.extension, None);
     assert_eq!(element.value, Some("test_value".to_string()));
 
     // Null primitive
     let json_null = "null";
-    let element_null: Element<String, Extension> = serde_json::from_str(json_null).unwrap();
+    let element_null: Element<String, Extension> = json::from_str(json_null).unwrap();
     assert_eq!(element_null.id, None);
     assert_eq!(element_null.extension, None);
     assert_eq!(element_null.value, None);
 
     // Number primitive
     let json_num = "123";
-    let element_num: Element<i32, Extension> = serde_json::from_str(json_num).unwrap();
+    let element_num: Element<i32, Extension> = json::from_str(json_num).unwrap();
     assert_eq!(element_num.id, None);
     assert_eq!(element_num.extension, None);
     assert_eq!(element_num.value, Some(123));
 
     // Boolean primitive
     let json_bool = "true";
-    let element_bool: Element<bool, Extension> = serde_json::from_str(json_bool).unwrap();
+    let element_bool: Element<bool, Extension> = json::from_str(json_bool).unwrap();
     assert_eq!(element_bool.id, None);
     assert_eq!(element_bool.extension, None);
     assert_eq!(element_bool.value, Some(true));
@@ -639,8 +637,7 @@ fn test_deserialize_element_primitive() {
 fn test_deserialize_element_object() {
     // Full object
     let json_string = r#"{"id":"elem-id","extension":[{"url":"http://example.com/ext1","valueBoolean":true}],"value":"test_value"}"#;
-    let element: Element<std::string::String, Extension> =
-        serde_json::from_str(json_string).unwrap();
+    let element: Element<std::string::String, Extension> = json::from_str(json_string).unwrap();
     assert_eq!(element.id, Some("elem-id".to_string()));
     assert_eq!(
         element.extension,
@@ -661,7 +658,7 @@ fn test_deserialize_element_object() {
     // Object with missing value
     let json_missing_value = r#"{"id":"elem-id-no-val","extension":[{"url":"http://example.com/ext3","valueInteger":123}]}"#;
     let element_missing_value: Element<String, Extension> =
-        serde_json::from_str(json_missing_value).unwrap();
+        json::from_str(json_missing_value).unwrap();
     assert_eq!(element_missing_value.id, Some("elem-id-no-val".to_string()));
     assert_eq!(
         element_missing_value.extension,
@@ -682,7 +679,7 @@ fn test_deserialize_element_object() {
     // Object with missing extension
     let json_missing_ext = r#"{"id":"elem-id-only","value":"test_value_id"}"#;
     let element_missing_ext: Element<std::string::String, Extension> =
-        serde_json::from_str(json_missing_ext).unwrap();
+        json::from_str(json_missing_ext).unwrap();
     assert_eq!(element_missing_ext.id, Some("elem-id-only".to_string()));
     assert_eq!(element_missing_ext.extension, None);
     assert_eq!(element_missing_ext.value, Some("test_value_id".to_string()));
@@ -690,7 +687,7 @@ fn test_deserialize_element_object() {
     // Object with missing id
     let json_missing_id = r#"{"extension":[{"url":"http://example.com/ext2","valueString":"val2"}],"value":"test_value_ext"}"#;
     let element_missing_id: Element<std::string::String, Extension> =
-        serde_json::from_str(json_missing_id).unwrap();
+        json::from_str(json_missing_id).unwrap();
     assert_eq!(element_missing_id.id, None);
     assert_eq!(
         element_missing_id.extension,
@@ -711,7 +708,7 @@ fn test_deserialize_element_object() {
     // Object with only value
     let json_only_value_obj = r#"{"value":"test_value_only"}"#;
     let element_only_value: Element<std::string::String, Extension> =
-        serde_json::from_str(json_only_value_obj).unwrap();
+        json::from_str(json_only_value_obj).unwrap();
     assert_eq!(element_only_value.id, None);
     assert_eq!(element_only_value.extension, None);
     assert_eq!(
@@ -721,8 +718,7 @@ fn test_deserialize_element_object() {
 
     // Empty object
     let json_empty_obj = r#"{}"#;
-    let element_empty_obj: Element<String, Extension> =
-        serde_json::from_str(json_empty_obj).unwrap();
+    let element_empty_obj: Element<String, Extension> = json::from_str(json_empty_obj).unwrap();
     assert_eq!(element_empty_obj.id, None);
     assert_eq!(element_empty_obj.extension, None);
     assert_eq!(element_empty_obj.value, None); // Value is None when deserializing from empty object
@@ -732,13 +728,13 @@ fn test_deserialize_element_object() {
 fn test_deserialize_element_invalid_type() {
     // Array is not a valid representation for a single Element
     let json_array = r#"[1, 2, 3]"#;
-    let result: Result<Element<i32, Extension>, _> = serde_json::from_str(json_array);
+    let result: Result<Element<i32, Extension>, _> = json::from_str(json_array);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("invalid type: sequence, expected a primitive value (string, number, boolean), an object, or null"));
 
     // Boolean when expecting i32 (primitive case)
     let json_bool = r#"true"#;
-    let result_bool: Result<Element<i32, Extension>, _> = serde_json::from_str(json_bool);
+    let result_bool: Result<Element<i32, Extension>, _> = json::from_str(json_bool);
     assert!(result_bool.is_err());
     // Error should now come directly from V::deserialize (i32 failing on bool)
     let err_string = result_bool.unwrap_err().to_string();
@@ -750,8 +746,7 @@ fn test_deserialize_element_invalid_type() {
 
     // Object containing a boolean value when expecting Element<i32, _>
     let json_obj_bool_val = r#"{"value": true}"#;
-    let result_obj_bool: Result<Element<i32, Extension>, _> =
-        serde_json::from_str(json_obj_bool_val);
+    let result_obj_bool: Result<Element<i32, Extension>, _> = json::from_str(json_obj_bool_val);
     assert!(result_obj_bool.is_err());
     // Error comes from trying to deserialize the "value": true into Option<i32>
     assert!(
@@ -763,15 +758,41 @@ fn test_deserialize_element_invalid_type() {
 
     // Define a simple struct that CANNOT deserialize from primitive types
     // Add Eq derive
-    #[derive(Deserialize, Debug, PartialEq, Eq)]
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct NonPrimitive {
         field: std::string::String,
+    }
+
+    impl Default for NonPrimitive {
+        fn default() -> Self {
+            Self {
+                field: std::string::String::new(),
+            }
+        }
+    }
+
+    impl FhirSerialize<Json> for NonPrimitive {
+        fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            self.serialize(serializer)
+        }
+    }
+
+    impl FhirDeserialize<Json> for NonPrimitive {
+        fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Self::deserialize(deserializer)
+        }
     }
 
     // Try deserializing a primitive string into Element<NonPrimitive, _>
     let json_prim_str = r#""hello""#;
     let result_prim_nonprim: Result<Element<NonPrimitive, Extension>, _> =
-        serde_json::from_str(json_prim_str);
+        json::from_str(json_prim_str);
     assert!(result_prim_nonprim.is_err());
     // Error comes from V::deserialize failing inside the visitor
     assert!(
@@ -785,7 +806,7 @@ fn test_deserialize_element_invalid_type() {
     let json_obj_nonprim = r#"{"value": {"field": "world"}}"#;
     // Use Extension
     let result_obj_nonprim: Result<Element<NonPrimitive, Extension>, _> =
-        serde_json::from_str(json_obj_nonprim);
+        json::from_str(json_obj_nonprim);
     assert!(result_obj_nonprim.is_ok());
     let element_obj_nonprim = result_obj_nonprim.unwrap();
     assert_eq!(element_obj_nonprim.id, None);
@@ -875,7 +896,7 @@ fn test_helios_fhir_serde_serialize() {
         money2: None,
         given: None,
     };
-    let json1 = serde_json::to_string(&s1).unwrap();
+    let json1 = json::to_string(&s1).unwrap();
     // Expected: name1, birthDate1 (primitive) - null fields should be omitted
     let expected1 = r#"{"name1":"Test1","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45}}"#;
     assert_eq!(json1, expected1);
@@ -903,7 +924,7 @@ fn test_helios_fhir_serde_serialize() {
         money2: None,
         given: None,
     };
-    let json2 = serde_json::to_string(&s2).unwrap();
+    let json2 = json::to_string(&s2).unwrap();
     // Expected: name1, _birthDate1 (object with id)
     let expected2 = r#"{"name1":"Test2","_birthDate1":{"id":"bd-id"},"isActive1":true,"decimal1":123.45,"money1":{"value":123.45}}"#;
 
@@ -936,7 +957,7 @@ fn test_helios_fhir_serde_serialize() {
         money2: None,
         given: None,
     };
-    let json3 = serde_json::to_string(&s3).unwrap();
+    let json3 = json::to_string(&s3).unwrap();
     // Expected: name1, birthDate1 (primitive), _birthDate1 (id), isActive1 (primitive), count
     let expected3 = r#"{"name1":"Test3","birthDate1":"1970-03-30","_birthDate1":{"id":"bd-id-3"},"isActive1":true,"decimal1":123.45,"money1":{"value":123.45}}"#;
     assert_eq!(json3, expected3);
@@ -977,7 +998,7 @@ fn test_helios_fhir_serde_serialize() {
         money2: None,
         given: None,
     };
-    let json4 = serde_json::to_string(&s4).unwrap();
+    let json4 = json::to_string(&s4).unwrap();
     // Expected: name1, _isActive1 (object with extension)
     let expected4 = r#"{"name1":"Test4","birthDate1":"1970-03-30","_isActive1":{"extension":[{"url":"http://example.com/flag","valueBoolean":true}]},"decimal1":123.45,"money1":{"value":123.45}}"#;
     assert_eq!(json4, expected4);
@@ -1005,7 +1026,7 @@ fn test_helios_fhir_serde_serialize() {
         money2: None,
         given: None,
     };
-    let json5 = serde_json::to_string(&s5).unwrap();
+    let json5 = json::to_string(&s5).unwrap();
     // Expected: Only required fields (name1, name2) and non-optional elements (birthDate1, isActive1, decimal1, money1) serialized as null
     let expected5 = r#"{"name1":"Test5","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45}}"#;
     assert_eq!(json5, expected5);
@@ -1048,7 +1069,7 @@ fn test_helios_fhir_serde_serialize() {
         money2: None,
         given: None,
     };
-    let json6 = serde_json::to_string(&s6).unwrap();
+    let json6 = json::to_string(&s6).unwrap();
     // Expected: decimal1 (primitive), _decimal1 (id), decimal2 (primitive)
     let expected6 = r#"{"name1":"Test6","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"_decimal1":{"id":"dec-id"},"decimal2":98.7,"money1":{"value":123.45}}"#;
     assert_eq!(json6, expected6);
@@ -1114,7 +1135,7 @@ fn test_helios_fhir_serde_serialize() {
         }),
         given: None,
     };
-    let json7 = serde_json::to_string(&s7).unwrap();
+    let json7 = json::to_string(&s7).unwrap();
     // Expected: money1 (object), money2 (object)
     // Note: Money always serializes as an object, so no _money1/_money2 split
     let expected7 = r#"{"name1":"Test7","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"id":"money-id","value":100.50,"currency":"USD"},"money2":{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}],"value":200}}"#;
@@ -1171,7 +1192,7 @@ fn test_helios_fhir_serde_serialize() {
             }, // Value + ID + Extension
         ]),
     };
-    let json8 = serde_json::to_string(&s8).unwrap();
+    let json8 = json::to_string(&s8).unwrap();
 
     // Expected: given (array of primitives/nulls), _given (array of objects/nulls for extensions/ids)
     // Note: Keys in the _given objects are sorted alphabetically by serde_json ("extension" before "id").
@@ -1219,7 +1240,7 @@ fn test_helios_fhir_serde_serialize() {
             },
         ]),
     };
-    let json9 = serde_json::to_string(&s9).unwrap();
+    let json9 = json::to_string(&s9).unwrap();
     // Expected: Only `given` array, no `_given`
     let expected9 = r#"{"name1":"Test9","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45},"given":["Alice","Bob"]}"#;
     assert_eq!(json9, expected9);
@@ -1265,7 +1286,7 @@ fn test_helios_fhir_serde_serialize() {
             },
         ]),
     };
-    let json10 = serde_json::to_string(&s10).unwrap();
+    let json10 = json::to_string(&s10).unwrap();
     // Expected: `given` array with nulls, `_given` array with objects
     let expected10 = r#"{"name1":"Test10","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45},"_given":[{"id":"g1"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
     assert_eq!(json10, expected10);
@@ -1316,7 +1337,7 @@ fn test_helios_fhir_serde_serialize() {
             },
         ]),
     };
-    let json11 = serde_json::to_string(&s11).unwrap();
+    let json11 = json::to_string(&s11).unwrap();
     // Expected: `given` array with null for the second item, `_given` array with object for the second item's ID
     let expected11 = r#"{"name1":"Test11","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45},"given":["First",null,"Last"],"_given":[null,{"id":"g-null"},null]}"#;
     assert_eq!(json11, expected11);
@@ -1349,10 +1370,10 @@ fn test_flatten_serialization() {
     };
 
     // Serialize to JSON
-    let json = serde_json::to_string(&test_struct).unwrap();
+    let json = json::to_string(&test_struct).unwrap();
 
     // Parse the JSON to verify structure
-    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let value: serde_json::Value = json::from_str(&json).unwrap();
 
     // The flattened fields should be at the top level
     assert_eq!(value["name"], "Test");
@@ -1402,7 +1423,7 @@ fn test_helios_fhir_serde_deserialize() {
         money2: None,
         given: None,
     };
-    let s1: FhirSerdeTestStruct = serde_json::from_str(json1).unwrap();
+    let s1: FhirSerdeTestStruct = json::from_str(json1).unwrap();
     assert_eq!(s1, expected1);
 
     // Case 2: Only extension for birthDate1
@@ -1438,7 +1459,7 @@ fn test_helios_fhir_serde_deserialize() {
         money2: None,
         given: None,
     };
-    let s2: FhirSerdeTestStruct = serde_json::from_str(json2).unwrap();
+    let s2: FhirSerdeTestStruct = json::from_str(json2).unwrap();
     assert_eq!(s2, expected2);
 
     // Case 3: Both primitive value and extension for birthDate1 and isActive1
@@ -1478,7 +1499,7 @@ fn test_helios_fhir_serde_deserialize() {
         money2: None,
         given: None,
     };
-    let s3: FhirSerdeTestStruct = serde_json::from_str(json3).unwrap();
+    let s3: FhirSerdeTestStruct = json::from_str(json3).unwrap();
     assert_eq!(s3, expected3);
 
     // Case 4: isActive1 has only extension
@@ -1518,7 +1539,7 @@ fn test_helios_fhir_serde_deserialize() {
         money2: None,
         given: None,
     };
-    let s4: FhirSerdeTestStruct = serde_json::from_str(json4).unwrap();
+    let s4: FhirSerdeTestStruct = json::from_str(json4).unwrap();
     assert_eq!(s4, expected4);
 
     // Case 5: Primitive value is null, but extension exists
@@ -1545,14 +1566,14 @@ fn test_helios_fhir_serde_deserialize() {
         money2: None,
         given: None,
     };
-    let s5: FhirSerdeTestStruct = serde_json::from_str(json5).unwrap();
+    let s5: FhirSerdeTestStruct = json::from_str(json5).unwrap();
     assert_eq!(s5, expected5);
 
     //  No Case 6 or 7
 
     // Case 8: Duplicate primitive field (should error)
     let json8 = r#"{"birthDate1":"1970-03-30", "birthDate1":"1971-04-01"}"#;
-    let res8: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json8);
+    let res8: Result<FhirSerdeTestStruct, _> = json::from_str(json8);
     assert!(res8.is_err());
     assert!(
         res8.unwrap_err()
@@ -1601,7 +1622,7 @@ fn test_helios_fhir_serde_deserialize() {
         money2: None,
         given: None,
     };
-    let s10: FhirSerdeTestStruct = serde_json::from_str(json10).unwrap();
+    let s10: FhirSerdeTestStruct = json::from_str(json10).unwrap();
     assert_eq!(s10, expected10);
 
     // Case 11: Deserialize Money (always object)
@@ -1654,7 +1675,7 @@ fn test_helios_fhir_serde_deserialize() {
         }),
         given: None,
     };
-    let s11: FhirSerdeTestStruct = serde_json::from_str(json11).unwrap();
+    let s11: FhirSerdeTestStruct = json::from_str(json11).unwrap();
     assert_eq!(s11, expected11);
 
     // Case 12: Deserialize Vec<String> (primitive and extension)
@@ -1702,7 +1723,7 @@ fn test_helios_fhir_serde_deserialize() {
             },
         ]),
     };
-    let s12: FhirSerdeTestStruct = serde_json::from_str(json12).unwrap();
+    let s12: FhirSerdeTestStruct = json::from_str(json12).unwrap();
     assert_eq!(s12, expected12);
 
     // Case 13: Deserialize Vec<String> with mismatched lengths (should handle gracefully)
@@ -1742,7 +1763,7 @@ fn test_helios_fhir_serde_deserialize() {
             },
         ]),
     };
-    let s13: FhirSerdeTestStruct = serde_json::from_str(json13).unwrap();
+    let s13: FhirSerdeTestStruct = json::from_str(json13).unwrap();
     assert_eq!(s13, expected13);
 
     // Case 14: Deserialize Vec<String> with null primitive but non-null extension element
@@ -1773,7 +1794,7 @@ fn test_helios_fhir_serde_deserialize() {
             value: None,
         }]),
     };
-    let s14: FhirSerdeTestStruct = serde_json::from_str(json14).unwrap();
+    let s14: FhirSerdeTestStruct = json::from_str(json14).unwrap();
     assert_eq!(s14, expected14);
 
     // Case 15: Deserialize Vec<String> with primitive value but null extension element (should be ok)
@@ -1804,7 +1825,7 @@ fn test_helios_fhir_serde_deserialize() {
             value: Some("Value".to_string()),
         }]),
     };
-    let s15: FhirSerdeTestStruct = serde_json::from_str(json15).unwrap();
+    let s15: FhirSerdeTestStruct = json::from_str(json15).unwrap();
     assert_eq!(s15, expected15);
 }
 
@@ -1834,18 +1855,17 @@ fn test_timing_roundtrip_serialization() {
     "#;
 
     // Parse original to compare
-    let original_value: serde_json::Value = serde_json::from_str(json_input).unwrap();
+    let original_value: serde_json::Value = json::from_str(json_input).unwrap();
 
     // Deserialize the JSON input
     let deserialized_struct: TimingTestStruct =
-        serde_json::from_str(json_input).expect("Deserialization failed");
+        json::from_str(json_input).expect("Deserialization failed");
 
     // Serialize back to JSON
-    let reserialized_json =
-        serde_json::to_string(&deserialized_struct).expect("Serialization failed");
+    let reserialized_json = json::to_string(&deserialized_struct).expect("Serialization failed");
 
     // Parse reserialized JSON to compare
-    let reserialized_value: serde_json::Value = serde_json::from_str(&reserialized_json).unwrap();
+    let reserialized_value: serde_json::Value = json::from_str(&reserialized_json).unwrap();
 
     // The _event field should be preserved in roundtrip
     let original_event = &original_value["timingTiming"]["_event"];
@@ -1891,15 +1911,15 @@ fn test_helios_fhir_serde_deserialize_extension_with_primitive_extension() {
 
     // Parse the input JSON string into a serde_json::Value for comparison later
     let original_value: serde_json::Value =
-        serde_json::from_str(json_input).expect("Parsing original JSON failed");
+        json::from_str(json_input).expect("Parsing original JSON failed");
 
     // Deserialize the JSON string into the Extension struct
     let extension_struct: Extension =
-        serde_json::from_str(json_input).expect("Deserialization into Extension struct failed");
+        json::from_str(json_input).expect("Deserialization into Extension struct failed");
 
     // Serialize the Extension struct back into a serde_json::Value
     let reserialized_value =
-        serde_json::to_value(&extension_struct).expect("Serialization back to JSON value failed");
+        json::to_value(&extension_struct).expect("Serialization back to JSON value failed");
 
     // Assert that the reserialized JSON value is identical to the original JSON value
     assert_eq!(

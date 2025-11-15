@@ -1,3 +1,4 @@
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
@@ -46,9 +47,8 @@ fn test_boolean_constant_debug() {
     );
 
     println!("=== Test 1: Checking deceased field access ===");
-    let view_definition: helios_fhir::r4::ViewDefinition =
-        serde_json::from_str(view_def_json1).unwrap();
-    let bundle: helios_fhir::r4::Bundle = serde_json::from_str(&bundle_json).unwrap();
+    let view_definition: helios_fhir::r4::ViewDefinition = json::from_str(view_def_json1).unwrap();
+    let bundle: helios_fhir::r4::Bundle = json::from_str(&bundle_json).unwrap();
 
     let sof_view = SofViewDefinition::R4(view_definition);
     let sof_bundle = SofBundle::R4(bundle.clone());
@@ -78,9 +78,8 @@ fn test_boolean_constant_debug() {
     }"#;
 
     println!("\n=== Test 2: With constant comparison ===");
-    let view_definition2: helios_fhir::r4::ViewDefinition =
-        serde_json::from_str(view_def_json2).unwrap();
-    let bundle2: helios_fhir::r4::Bundle = serde_json::from_str(&bundle_json).unwrap();
+    let view_definition2: helios_fhir::r4::ViewDefinition = json::from_str(view_def_json2).unwrap();
+    let bundle2: helios_fhir::r4::Bundle = json::from_str(&bundle_json).unwrap();
 
     let sof_view2 = SofViewDefinition::R4(view_definition2);
     let sof_bundle2 = SofBundle::R4(bundle2);

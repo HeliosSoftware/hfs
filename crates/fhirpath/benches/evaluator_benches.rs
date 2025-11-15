@@ -1,6 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use helios_fhir::FhirResource;
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_serde::json;
 use serde_json::json;
 
 fn create_simple_patient() -> FhirResource {
@@ -31,7 +32,7 @@ fn create_simple_patient() -> FhirResource {
 
     #[cfg(feature = "R4")]
     {
-        let resource: helios_fhir::r4::Resource = serde_json::from_value(patient_json).unwrap();
+        let resource: helios_fhir::r4::Resource = json::from_value(patient_json).unwrap();
         FhirResource::R4(Box::new(resource))
     }
     #[cfg(not(feature = "R4"))]
@@ -89,7 +90,7 @@ fn create_complex_patient() -> FhirResource {
 
     #[cfg(feature = "R4")]
     {
-        let resource: helios_fhir::r4::Resource = serde_json::from_value(patient_json).unwrap();
+        let resource: helios_fhir::r4::Resource = json::from_value(patient_json).unwrap();
         FhirResource::R4(Box::new(resource))
     }
     #[cfg(not(feature = "R4"))]
@@ -146,7 +147,7 @@ fn create_observation() -> FhirResource {
 
     #[cfg(feature = "R4")]
     {
-        let resource: helios_fhir::r4::Resource = serde_json::from_value(obs_json).unwrap();
+        let resource: helios_fhir::r4::Resource = json::from_value(obs_json).unwrap();
         FhirResource::R4(Box::new(resource))
     }
     #[cfg(not(feature = "R4"))]

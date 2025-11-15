@@ -1,10 +1,11 @@
 use helios_fhir::r4::{Bundle, BundleEntry, Patient};
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn test_boolean_constant_debug2() {
     // Create patient resource directly
-    let patient: Patient = serde_json::from_str(
+    let patient: Patient = json::from_str(
         r#"{
         "resourceType": "Patient",
         "id": "pt2",
@@ -39,8 +40,7 @@ fn test_boolean_constant_debug2() {
         }]
     }"#;
 
-    let view_definition: helios_fhir::r4::ViewDefinition =
-        serde_json::from_str(view_def_json).unwrap();
+    let view_definition: helios_fhir::r4::ViewDefinition = json::from_str(view_def_json).unwrap();
 
     let sof_view = SofViewDefinition::R4(view_definition);
     let sof_bundle = SofBundle::R4(bundle);

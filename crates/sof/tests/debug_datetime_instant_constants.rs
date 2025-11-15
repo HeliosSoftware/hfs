@@ -1,10 +1,11 @@
 use helios_fhir::r4::{Bundle, BundleEntry, DetectedIssue};
+use helios_serde::json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn test_datetime_constant_debug() {
     // Create DetectedIssue resource with identified dateTime
-    let detected_issue: DetectedIssue = serde_json::from_str(
+    let detected_issue: DetectedIssue = json::from_str(
         r#"{
         "resourceType": "DetectedIssue",
         "id": "di2",
@@ -59,8 +60,7 @@ fn test_datetime_constant_debug() {
         }]
     }"#;
 
-    let view_definition: helios_fhir::r4::ViewDefinition =
-        serde_json::from_str(view_def_json).unwrap();
+    let view_definition: helios_fhir::r4::ViewDefinition = json::from_str(view_def_json).unwrap();
 
     let sof_view = SofViewDefinition::R4(view_definition);
     let sof_bundle = SofBundle::R4(bundle);

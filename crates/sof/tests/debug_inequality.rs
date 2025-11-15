@@ -1,4 +1,5 @@
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_serde::json;
 
 #[test]
 fn debug_inequality_operators() {
@@ -11,7 +12,7 @@ fn debug_inequality_operators() {
 
     // Parse into FHIR resource
     let observation: helios_fhir::r4::Observation =
-        serde_json::from_value(observation_json).expect("Failed to parse observation");
+        json::from_value(observation_json).expect("Failed to parse observation");
 
     // Create context with the observation
     let context = EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(
