@@ -19,12 +19,18 @@ fn main() {
         return;
     }
 
-    println!("cargo:warning=Downloading R6 definitions from HL7 build server");
-
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/R6");
 
     // Create the resources directory if it doesn't exist
     fs::create_dir_all(&resources_dir).expect("Failed to create resources directory");
+
+    // Skip download when the repository already vendors the extracted fixtures.
+    if has_existing_payload(&resources_dir) {
+        println!("cargo:warning=Using existing R6 definitions; skipping download");
+        return;
+    }
+
+    println!("cargo:warning=Downloading R6 definitions from HL7 build server");
 
     let url = "https://build.fhir.org/definitions.json.zip";
 
@@ -109,6 +115,21 @@ fn main() {
     save_download_metadata(&resources_dir).expect("Failed to save download metadata");
 
     println!("FHIR definitions downloaded successfully");
+}
+
+fn has_existing_payload(resources_dir: &Path) -> bool {
+    match resources_dir.read_dir() {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_type().map(|ty| ty.is_file()).unwrap_or(false)),
+        Err(err) => {
+            println!(
+                "cargo:warning=Unable to inspect {:?} for cached payloads: {}",
+                resources_dir, err
+            );
+            false
+        }
+    }
 }
 
 fn download_with_retry(

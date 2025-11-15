@@ -18,12 +18,53 @@ fn main() {
         return;
     }
 
-    println!("cargo:warning=Downloading R6 test data from HL7 build server");
-
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/R6");
 
     // Create the resources directory if it doesn't exist
     fs::create_dir_all(&resources_dir).expect("Failed to create resources directory");
+
+    // Skip download when the repository already contains the extracted fixtures.
+    // This allows offline builds/tests (and prevents repeated downloads) while
+    // still letting the fallback pull fresh fixtures when the directory is empty.
+    match resources_dir.read_dir() {
+        Ok(dir_entries) => {
+            let mut has_files = false;
+            for entry in dir_entries {
+                match entry {
+                    Ok(entry) => {
+                        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                            has_files = true;
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        println!(
+                            "cargo:warning=Failed to inspect {:?}: {}",
+                            resources_dir, err
+                        );
+                    }
+                }
+            }
+
+            if has_files {
+                println!("cargo:warning=Using existing R6 test data; skipping download");
+                return;
+            } else {
+                println!(
+                    "cargo:warning=No files found in {:?}; downloading test data",
+                    resources_dir
+                );
+            }
+        }
+        Err(err) => {
+            println!(
+                "cargo:warning=Unable to list {:?}: {}; continuing with download",
+                resources_dir, err
+            );
+        }
+    }
+
+    println!("cargo:warning=Downloading R6 test data from HL7 build server");
 
     let url = "https://build.fhir.org/examples-json.zip";
 
