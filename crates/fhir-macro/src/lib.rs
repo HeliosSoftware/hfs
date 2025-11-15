@@ -623,16 +623,12 @@ fn get_option_inner_type(ty: &Type) -> Option<&Type> {
         path: Path { segments, .. },
         ..
     }) = ty
+        && let Some(segment) = segments.last()
+        && segment.ident == "Option"
+        && let PathArguments::AngleBracketed(args) = &segment.arguments
+        && let Some(GenericArgument::Type(inner_ty)) = args.args.first()
     {
-        if let Some(segment) = segments.last() {
-            if segment.ident == "Option" {
-                if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if let Some(GenericArgument::Type(inner_ty)) = args.args.first() {
-                        return Some(inner_ty);
-                    }
-                }
-            }
-        }
+        return Some(inner_ty);
     }
     None
 }
@@ -1635,256 +1631,6 @@ fn generate_serialize_impl(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use syn::{Type, parse_str};
-
-    #[test]
-    fn test_get_element_info_option_element() {
-        let ty: Type = parse_str("Option<Element<Markdown, Extension>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(is_element);
-        assert!(!is_decimal);
-        assert!(is_option);
-        assert!(!is_vec);
-    }
-
-    #[test]
-    fn test_get_element_info_option_decimal_element() {
-        let ty: Type = parse_str("Option<DecimalElement<Extension>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(!is_element);
-        assert!(is_decimal);
-        assert!(is_option);
-        assert!(!is_vec);
-    }
-
-    #[test]
-    fn test_get_element_info_option_markdown() {
-        let ty: Type = parse_str("Option<Markdown>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(is_element); // Markdown should be identified as Element
-        assert!(!is_decimal);
-        assert!(is_option); // It is an Option
-        assert!(!is_vec);
-    }
-
-    #[test]
-    fn test_get_element_info_option_vec_option_element() {
-        let ty: Type = parse_str("Option<Vec<Option<Element<bool, Extension>>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(is_element);
-        assert!(!is_decimal);
-        assert!(is_option); // Outer Option
-        assert!(is_vec); // Vec is present
-    }
-
-    #[test]
-    fn test_get_element_info_option_vec_option_decimal_element() {
-        let ty: Type = parse_str("Option<Vec<Option<DecimalElement<Extension>>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(!is_element);
-        assert!(is_decimal);
-        assert!(is_option); // Outer Option
-        assert!(is_vec); // Vec is present
-    }
-
-    #[test]
-    fn test_get_element_info_option_vec_markdown() {
-        let ty: Type = parse_str("Option<Vec<Markdown>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(is_element); // Markdown should be identified as Element
-        assert!(!is_decimal);
-        assert!(is_option); // Outer Option
-        assert!(is_vec); // Vec is present
-    }
-
-    #[test]
-    fn test_get_element_info_element() {
-        let ty: Type = parse_str("Element<String, Extension>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(is_element);
-        assert!(!is_decimal);
-        assert!(!is_option);
-        assert!(!is_vec);
-    }
-
-    #[test]
-    fn test_get_element_info_decimal_element() {
-        let ty: Type = parse_str("DecimalElement<Extension>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(!is_element);
-        assert!(is_decimal);
-        assert!(!is_option);
-        assert!(!is_vec);
-    }
-
-    #[test]
-    fn test_get_element_info_markdown() {
-        let ty: Type = parse_str("Markdown").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(is_element); // Markdown should be identified as Element
-        assert!(!is_decimal);
-        assert!(!is_option);
-        assert!(!is_vec);
-    }
-
-    #[test]
-    fn test_get_element_info_vec_option_element() {
-        // Less common, but test Vec<Option<Element>> without outer Option
-        let ty: Type = parse_str("Vec<Option<Element<bool, Extension>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(is_element);
-        assert!(!is_decimal);
-        assert!(!is_option); // No outer Option
-        assert!(is_vec); // Vec is present
-    }
-
-    #[test]
-    fn test_get_element_info_vec_option_decimal_element() {
-        let ty: Type = parse_str("Vec<Option<DecimalElement<Extension>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(!is_element);
-        assert!(is_decimal);
-        assert!(!is_option); // No outer Option
-        assert!(is_vec); // Vec is present
-    }
-
-    #[test]
-    fn test_get_element_info_vec_string() {
-        let ty: Type = parse_str("Vec<String>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        // String IS identified as Element because it's in KNOWN_ELEMENT_ALIASES
-        assert!(is_element);
-        assert!(!is_decimal);
-        assert!(!is_option);
-        assert!(is_vec);
-    }
-
-    #[test]
-    fn test_get_element_info_option_box_element() {
-        // Test with Box wrapping
-        let ty: Type = parse_str("Option<Box<Element<String, Extension>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(is_element);
-        assert!(!is_decimal);
-        assert!(is_option);
-        assert!(!is_vec);
-    }
-
-    #[test]
-    fn test_get_element_info_option_vec_option_box_element() {
-        // Test with Box inside Vec<Option<...>>
-        let ty: Type = parse_str("Option<Vec<Option<Box<Element<bool, Extension>>>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
-        assert!(is_element);
-        assert!(!is_decimal);
-        assert!(is_option); // Outer Option
-        assert!(is_vec); // Vec is present
-    }
-
-    #[test]
-    fn test_get_element_info_type_alias() {
-        // Simulate a type alias like `type Date = Element<String, Extension>;`
-        // We parse the underlying type directly here. The function should resolve it.
-        let _ty: Type = parse_str("fhir::r4::Date").unwrap(); // Prefix unused variable
-        // We can't directly test the alias resolution here without more context,
-        // but we can test if it correctly identifies an Element path.
-        // This test assumes `fhir::r4::Date` *looks like* an Element path segment.
-        // A more robust test would involve actual type resolution which is complex in macros.
-
-        // Let's test a path that *ends* with Element, simulating an alias.
-        let _ty_path: Type = parse_str("some::module::MyElementAlias").unwrap(); // Prefix unused variable
-        // Manually construct a scenario where the last segment is "Element"
-        // This is a simplification as we don't have real type info.
-        let ty_simulated_alias: Type = parse_str("Element<String, Extension>").unwrap();
-
-        // Test with a path that *doesn't* end in Element/DecimalElement
-        let ty_non_element_path: Type = parse_str("some::module::RegularStruct").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty_non_element_path);
-        assert!(!is_element);
-        assert!(!is_decimal);
-        assert!(!is_option);
-        assert!(!is_vec);
-
-        // Test with a path that *does* end in Element (simulating alias)
-        // We use the actual Element type parsed earlier for this simulation
-        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty_simulated_alias);
-        assert!(is_element);
-        assert!(!is_decimal);
-        assert!(!is_option);
-        assert!(!is_vec);
-    }
-
-    #[test]
-    fn test_is_flattened() {
-        let stream = quote! {
-            struct TestStruct {
-                #[fhir_serde(flatten)]
-                field_a: String,
-                field_b: i32,
-            }
-        };
-        let input: DeriveInput = syn::parse2(stream).unwrap();
-        if let Data::Struct(data) = input.data {
-            if let Fields::Named(fields) = data.fields {
-                let field_a = fields
-                    .named
-                    .iter()
-                    .find(|f| f.ident.as_ref().unwrap() == "field_a")
-                    .unwrap();
-                let field_b = fields
-                    .named
-                    .iter()
-                    .find(|f| f.ident.as_ref().unwrap() == "field_b")
-                    .unwrap();
-                assert!(is_flattened(field_a));
-                assert!(!is_flattened(field_b));
-            } else {
-                panic!("Expected named fields");
-            }
-        } else {
-            panic!("Expected struct");
-        }
-    }
-
-    #[test]
-    fn test_flatten_serialization() {
-        // This test verifies that the flatten attribute is correctly processed
-        // by checking the generated code for a struct with a flattened field
-
-        let stream = quote! {
-            #[derive(FhirSerde)]
-            struct TestWithFlatten {
-                regular_field: String,
-                #[fhir_serde(flatten)]
-                flattened_field: NestedStruct,
-            }
-        };
-
-        let input: DeriveInput = syn::parse2(stream).unwrap();
-        let name = &input.ident;
-        let generics = &input.generics;
-        let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-        let serialize_impl = generate_serialize_impl(
-            &input.data,
-            name,
-            &impl_generics,
-            &ty_generics,
-            &where_clause,
-            &input.attrs,
-        );
-
-        let serialize_impl_str = serialize_impl.to_string();
-
-        // Ensure flattened field serialization uses serde_json::to_value helpers
-        assert!(serialize_impl_str.contains("serde_json :: to_value"));
-
-        // Check that regular serialization uses serialize_entry when flattening is active (due to serialize_map)
-        assert!(serialize_impl_str.contains("serialize_entry"));
-    }
-}
 
 /// Generates the `serde::Deserialize` implementation for FHIR types.
 ///
@@ -3822,5 +3568,256 @@ fn extract_fhir_primitive_type_name(ty: &syn::Type) -> Option<&'static str> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::{Type, parse_str};
+
+    #[test]
+    fn test_get_element_info_option_element() {
+        let ty: Type = parse_str("Option<Element<Markdown, Extension>>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(is_element);
+        assert!(!is_decimal);
+        assert!(is_option);
+        assert!(!is_vec);
+    }
+
+    #[test]
+    fn test_get_element_info_option_decimal_element() {
+        let ty: Type = parse_str("Option<DecimalElement<Extension>>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(!is_element);
+        assert!(is_decimal);
+        assert!(is_option);
+        assert!(!is_vec);
+    }
+
+    #[test]
+    fn test_get_element_info_option_markdown() {
+        let ty: Type = parse_str("Option<Markdown>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(is_element); // Markdown should be identified as Element
+        assert!(!is_decimal);
+        assert!(is_option); // It is an Option
+        assert!(!is_vec);
+    }
+
+    #[test]
+    fn test_get_element_info_option_vec_option_element() {
+        let ty: Type = parse_str("Option<Vec<Option<Element<bool, Extension>>>>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(is_element);
+        assert!(!is_decimal);
+        assert!(is_option); // Outer Option
+        assert!(is_vec); // Vec is present
+    }
+
+    #[test]
+    fn test_get_element_info_option_vec_option_decimal_element() {
+        let ty: Type = parse_str("Option<Vec<Option<DecimalElement<Extension>>>>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(!is_element);
+        assert!(is_decimal);
+        assert!(is_option); // Outer Option
+        assert!(is_vec); // Vec is present
+    }
+
+    #[test]
+    fn test_get_element_info_option_vec_markdown() {
+        let ty: Type = parse_str("Option<Vec<Markdown>>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(is_element); // Markdown should be identified as Element
+        assert!(!is_decimal);
+        assert!(is_option); // Outer Option
+        assert!(is_vec); // Vec is present
+    }
+
+    #[test]
+    fn test_get_element_info_element() {
+        let ty: Type = parse_str("Element<String, Extension>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(is_element);
+        assert!(!is_decimal);
+        assert!(!is_option);
+        assert!(!is_vec);
+    }
+
+    #[test]
+    fn test_get_element_info_decimal_element() {
+        let ty: Type = parse_str("DecimalElement<Extension>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(!is_element);
+        assert!(is_decimal);
+        assert!(!is_option);
+        assert!(!is_vec);
+    }
+
+    #[test]
+    fn test_get_element_info_markdown() {
+        let ty: Type = parse_str("Markdown").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(is_element); // Markdown should be identified as Element
+        assert!(!is_decimal);
+        assert!(!is_option);
+        assert!(!is_vec);
+    }
+
+    #[test]
+    fn test_get_element_info_vec_option_element() {
+        // Less common, but test Vec<Option<Element>> without outer Option
+        let ty: Type = parse_str("Vec<Option<Element<bool, Extension>>>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(is_element);
+        assert!(!is_decimal);
+        assert!(!is_option); // No outer Option
+        assert!(is_vec); // Vec is present
+    }
+
+    #[test]
+    fn test_get_element_info_vec_option_decimal_element() {
+        let ty: Type = parse_str("Vec<Option<DecimalElement<Extension>>>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(!is_element);
+        assert!(is_decimal);
+        assert!(!is_option); // No outer Option
+        assert!(is_vec); // Vec is present
+    }
+
+    #[test]
+    fn test_get_element_info_vec_string() {
+        let ty: Type = parse_str("Vec<String>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        // String IS identified as Element because it's in KNOWN_ELEMENT_ALIASES
+        assert!(is_element);
+        assert!(!is_decimal);
+        assert!(!is_option);
+        assert!(is_vec);
+    }
+
+    #[test]
+    fn test_get_element_info_option_box_element() {
+        // Test with Box wrapping
+        let ty: Type = parse_str("Option<Box<Element<String, Extension>>>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(is_element);
+        assert!(!is_decimal);
+        assert!(is_option);
+        assert!(!is_vec);
+    }
+
+    #[test]
+    fn test_get_element_info_option_vec_option_box_element() {
+        // Test with Box inside Vec<Option<...>>
+        let ty: Type = parse_str("Option<Vec<Option<Box<Element<bool, Extension>>>>>").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
+        assert!(is_element);
+        assert!(!is_decimal);
+        assert!(is_option); // Outer Option
+        assert!(is_vec); // Vec is present
+    }
+
+    #[test]
+    fn test_get_element_info_type_alias() {
+        // Simulate a type alias like `type Date = Element<String, Extension>;`
+        // We parse the underlying type directly here. The function should resolve it.
+        let _ty: Type = parse_str("fhir::r4::Date").unwrap(); // Prefix unused variable
+        // We can't directly test the alias resolution here without more context,
+        // but we can test if it correctly identifies an Element path.
+        // This test assumes `fhir::r4::Date` *looks like* an Element path segment.
+        // A more robust test would involve actual type resolution which is complex in macros.
+
+        // Let's test a path that *ends* with Element, simulating an alias.
+        let _ty_path: Type = parse_str("some::module::MyElementAlias").unwrap(); // Prefix unused variable
+        // Manually construct a scenario where the last segment is "Element"
+        // This is a simplification as we don't have real type info.
+        let ty_simulated_alias: Type = parse_str("Element<String, Extension>").unwrap();
+
+        // Test with a path that *doesn't* end in Element/DecimalElement
+        let ty_non_element_path: Type = parse_str("some::module::RegularStruct").unwrap();
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty_non_element_path);
+        assert!(!is_element);
+        assert!(!is_decimal);
+        assert!(!is_option);
+        assert!(!is_vec);
+
+        // Test with a path that *does* end in Element (simulating alias)
+        // We use the actual Element type parsed earlier for this simulation
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty_simulated_alias);
+        assert!(is_element);
+        assert!(!is_decimal);
+        assert!(!is_option);
+        assert!(!is_vec);
+    }
+
+    #[test]
+    fn test_is_flattened() {
+        let stream = quote! {
+            struct TestStruct {
+                #[fhir_serde(flatten)]
+                field_a: String,
+                field_b: i32,
+            }
+        };
+        let input: DeriveInput = syn::parse2(stream).unwrap();
+        if let Data::Struct(data) = input.data {
+            if let Fields::Named(fields) = data.fields {
+                let field_a = fields
+                    .named
+                    .iter()
+                    .find(|f| f.ident.as_ref().unwrap() == "field_a")
+                    .unwrap();
+                let field_b = fields
+                    .named
+                    .iter()
+                    .find(|f| f.ident.as_ref().unwrap() == "field_b")
+                    .unwrap();
+                assert!(is_flattened(field_a));
+                assert!(!is_flattened(field_b));
+            } else {
+                panic!("Expected named fields");
+            }
+        } else {
+            panic!("Expected struct");
+        }
+    }
+
+    #[test]
+    fn test_flatten_serialization() {
+        // This test verifies that the flatten attribute is correctly processed
+        // by checking the generated code for a struct with a flattened field
+
+        let stream = quote! {
+            #[derive(FhirSerde)]
+            struct TestWithFlatten {
+                regular_field: String,
+                #[fhir_serde(flatten)]
+                flattened_field: NestedStruct,
+            }
+        };
+
+        let input: DeriveInput = syn::parse2(stream).unwrap();
+        let name = &input.ident;
+        let generics = &input.generics;
+        let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+        let serialize_impl = generate_serialize_impl(
+            &input.data,
+            name,
+            &impl_generics,
+            &ty_generics,
+            &where_clause,
+            &input.attrs,
+        );
+
+        let serialize_impl_str = serialize_impl.to_string();
+
+        // Ensure flattened field serialization uses serde_json::to_value helpers
+        assert!(serialize_impl_str.contains("serde_json :: to_value"));
+
+        // Check that regular serialization uses serialize_entry when flattening is active (due to serialize_map)
+        assert!(serialize_impl_str.contains("serialize_entry"));
     }
 }
