@@ -739,7 +739,10 @@ fn test_deserialize_element_invalid_type() {
     // Error should now come directly from V::deserialize (i32 failing on bool)
     let err_string = result_bool.unwrap_err().to_string();
     assert!(
-        err_string.contains("invalid type: boolean `true`, expected i32"),
+        err_string.contains("invalid type: boolean `true`")
+            && err_string.contains(
+                "expected an integer or string containing an integer representable as i32"
+            ),
         "Unexpected error message: {}",
         err_string // Add message for easier debugging
     );
@@ -749,11 +752,14 @@ fn test_deserialize_element_invalid_type() {
     let result_obj_bool: Result<Element<i32, Extension>, _> = json::from_str(json_obj_bool_val);
     assert!(result_obj_bool.is_err());
     // Error comes from trying to deserialize the "value": true into Option<i32>
+    let err_string = result_obj_bool.unwrap_err().to_string();
     assert!(
-        result_obj_bool
-            .unwrap_err()
-            .to_string()
-            .contains("invalid type: boolean `true`, expected i32")
+        err_string.contains("invalid type: boolean `true`")
+            && err_string.contains(
+                "expected an integer or string containing an integer representable as i32"
+            ),
+        "Unexpected error message: {}",
+        err_string
     );
 
     // Define a simple struct that CANNOT deserialize from primitive types

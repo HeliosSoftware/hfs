@@ -39,6 +39,7 @@
 //! # {
 //! use helios_sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
 //! use helios_fhir::FhirVersion;
+//! use helios_serde::json;
 //!
 //! # #[cfg(feature = "R4")]
 //! # {
@@ -216,6 +217,8 @@ pub use traits::{BundleTrait, ResourceTrait, ViewDefinitionTrait};
 /// use helios_sof::{SofViewDefinition, ContentType};
 /// # #[cfg(feature = "R4")]
 /// use helios_fhir::r4::ViewDefinition;
+/// # #[cfg(feature = "R4")]
+/// use helios_serde::json;
 ///
 /// # #[cfg(feature = "R4")]
 /// # {
@@ -309,6 +312,8 @@ impl SofViewDefinition {
 /// use helios_sof::SofBundle;
 /// # #[cfg(feature = "R4")]
 /// use helios_fhir::r4::Bundle;
+/// # #[cfg(feature = "R4")]
+/// use helios_serde::json;
 ///
 /// # #[cfg(feature = "R4")]
 /// # {
@@ -944,6 +949,8 @@ pub struct ProcessedResult {
 ///
 /// ```rust
 /// use helios_sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
+/// # #[cfg(feature = "R4")]
+/// use helios_serde::json;
 ///
 /// # #[cfg(feature = "R4")]
 /// # {
