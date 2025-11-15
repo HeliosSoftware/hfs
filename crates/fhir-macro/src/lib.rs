@@ -83,40 +83,6 @@ use syn::{
     Type, TypePath, parse_macro_input, punctuated::Punctuated, token,
 };
 
-/// Generates a borrowed IdAndExtensionHelper for serialization only.
-///
-/// This helper is used during serialization to handle FHIR's `_fieldName` pattern.
-/// It has borrowed fields with lifetime `<'a>` and only includes serialization.
-fn generate_id_and_extension_helper() -> proc_macro2::TokenStream {
-    quote! {
-        // Helper struct for serializing the id/extension part from _fieldName
-        #[allow(dead_code)]
-        #[derive(Clone)]
-        struct IdAndExtensionHelper<'a> {
-            id: &'a Option<std::string::String>,
-            extension: &'a Option<Vec<Extension>>,
-        }
-
-        impl<'a> ::helios_serde::FhirSerialize<::helios_serde::Json> for IdAndExtensionHelper<'a> {
-            fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                use serde::ser::SerializeStruct;
-                let mut state = serializer.serialize_struct("IdAndExtensionHelper", 2)?;
-                if self.id.is_some() {
-                    state.serialize_field("id", self.id)?;
-                }
-                if let Some(ref ext) = self.extension {
-                    let ctx = ::helios_serde::SerializationContext::json(ext);
-                    state.serialize_field("extension", &ctx)?;
-                }
-                state.end()
-            }
-        }
-    }
-}
-
 /// Generates an owned IdAndExtensionHelper with full deserialization support.
 ///
 /// This helper is used for deserialization to handle FHIR's `_fieldName` pattern.
@@ -1106,7 +1072,6 @@ fn generate_serialize_impl(
                         if is_element || is_decimal_element {
                             // For Element types, we need special handling for the _fieldName pattern
                             let underscore_variant_key = format!("_{}", variant_key);
-                            let _helper_def = generate_id_and_extension_helper();
 
                             match_arms.push(quote! {
                                 // Removed 'ref' from pattern
@@ -1373,8 +1338,6 @@ fn generate_serialize_impl(
                                 quote! { state.serialize_field }
                             };
 
-                            let _helper_def = generate_id_and_extension_helper();
-
                             quote! {
                                 // Handle Vec<Element> by splitting into primitive and extension arrays
                                 if let Some(vec_value) = #vec_access { // Use the adjusted access logic
@@ -1446,8 +1409,6 @@ fn generate_serialize_impl(
                             // Handles Option<Element> (but not Vec)
                             if has_flattened_fields {
                                 // For SerializeMap
-                                let _helper_def = generate_id_and_extension_helper();
-
                                 quote! {
                                     if let Some(field) = &#field_access {
                                         if let Some(value) = field.value.as_ref() {
@@ -1477,8 +1438,6 @@ fn generate_serialize_impl(
                                 }
                             } else {
                                 // For SerializeStruct
-                                let _helper_def = generate_id_and_extension_helper();
-
                                 quote! {
                                     if let Some(field) = &#field_access {
                                         if let Some(value) = field.value.as_ref() {
@@ -1510,8 +1469,6 @@ fn generate_serialize_impl(
                         } else if !is_vec && is_fhir_element {
                             if has_flattened_fields {
                                 // For SerializeMap
-                                let _helper_def = generate_id_and_extension_helper();
-
                                 quote! {
                                     if let Some(value) = #field_access.value.as_ref() {
                                         // Wrap value in serialization context
@@ -1539,8 +1496,6 @@ fn generate_serialize_impl(
                                 }
                             } else {
                                 // For SerializeStruct
-                                let _helper_def = generate_id_and_extension_helper();
-
                                 quote! {
                                     if let Some(value) = #field_access.value.as_ref() {
                                         // Wrap value in serialization context
@@ -2005,9 +1960,8 @@ fn generate_deserialize_impl(
 ) -> proc_macro2::TokenStream {
     let struct_name = format_ident!("Temp{}", name);
 
-    let mut temp_struct_attributes = Vec::new();
     let mut constructor_attributes = Vec::new();
-    let mut deserialize_impl = proc_macro2::TokenStream::new();
+    let deserialize_impl: proc_macro2::TokenStream;
 
     match *data {
         Data::Enum(ref data) => {
@@ -2519,42 +2473,6 @@ fn generate_deserialize_impl(
                         let underscore_field_name_literal =
                             format!("_{}", effective_field_name_str);
 
-                        // Base attribute for the regular field (primitive value)
-                        let base_attribute = if is_flattened(field) {
-                            quote! {
-                                #[serde(default)]
-                                #field_name_ident: #temp_primitive_type_quote,
-                            }
-                        } else {
-                            quote! {
-                                #[serde(default, rename = #effective_field_name_str)]
-                                #field_name_ident: #temp_primitive_type_quote,
-                            }
-                        };
-
-                        // Conditionally add the underscore field attribute if it's an element type
-                        let underscore_attribute = if is_fhir_element {
-                            quote! {
-                                // Use default for Option types in the temp struct
-                                #[serde(default, rename = #underscore_field_name_literal)]
-                                #field_name_ident_ext: #temp_extension_type,
-                            }
-                        } else {
-                            quote! {} // Empty if not an element
-                        };
-
-                        // Combine the attributes for the temp struct
-                        let flatten_attr = if is_flattened(field) {
-                            quote! { #[serde(flatten)] }
-                        } else {
-                            quote! {}
-                        };
-                        let temp_struct_attribute = quote! {
-                            #flatten_attr // Add flatten attribute if needed
-                            #base_attribute
-                            #underscore_attribute
-                        };
-
                         let constructor_attribute = if is_fhir_element {
                             if is_vec {
                                 // Handle Vec<Element> or Option<Vec<Element>> first
@@ -2754,7 +2672,6 @@ fn generate_deserialize_impl(
                             }
                         }; // Semicolon ends the let constructor_attribute binding
 
-                        temp_struct_attributes.push(temp_struct_attribute);
                         constructor_attributes.push(constructor_attribute); // Push the result
 
                         // Collect field info for generating FhirDeserialize impl

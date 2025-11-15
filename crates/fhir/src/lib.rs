@@ -48,13 +48,12 @@ use helios_serde::{
 };
 use rust_decimal::Decimal;
 use serde::{
-    Deserialize, Serialize,
-    de::{self, DeserializeSeed, Deserializer, MapAccess, Visitor},
+    de::{self, DeserializeSeed, Deserializer},
     ser::{SerializeStruct, Serializer},
+    Deserialize, Serialize,
 };
 use std::cmp::Ordering;
 use std::fmt;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// Custom deserializer that is more forgiving of null values in JSON.
@@ -1769,70 +1768,6 @@ pub trait FhirComplexTypeProvider {
         Self::get_complex_type_names()
             .iter()
             .any(|&complex_type| complex_type.eq_ignore_ascii_case(type_name))
-    }
-}
-
-// --- Internal Visitor for Element Object Deserialization ---
-
-/// Internal visitor struct for deserializing Element objects from JSON maps.
-///
-/// This visitor handles the complex deserialization logic for Element<V, E> when
-/// the JSON input is an object containing id, extension, and value fields.
-struct ElementObjectVisitor<V, E>(PhantomData<(V, E)>);
-
-impl<'de, V, E> Visitor<'de> for ElementObjectVisitor<V, E>
-where
-    V: Deserialize<'de>,
-    E: Deserialize<'de>,
-{
-    type Value = Element<V, E>;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("an Element object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut id: Option<String> = None;
-        let mut extension: Option<Vec<E>> = None;
-        let mut value: Option<V> = None;
-
-        // Manually deserialize fields from the map
-        while let Some(key) = map.next_key::<String>()? {
-            match key.as_str() {
-                "id" => {
-                    if id.is_some() {
-                        return Err(de::Error::duplicate_field("id"));
-                    }
-                    id = Some(map.next_value()?);
-                }
-                "extension" => {
-                    if extension.is_some() {
-                        return Err(de::Error::duplicate_field("extension"));
-                    }
-                    extension = Some(map.next_value()?);
-                }
-                "value" => {
-                    if value.is_some() {
-                        return Err(de::Error::duplicate_field("value"));
-                    }
-                    // Deserialize directly into Option<V>
-                    value = Some(map.next_value()?);
-                }
-                // Ignore any unknown fields encountered
-                _ => {
-                    let _ = map.next_value::<de::IgnoredAny>()?;
-                }
-            }
-        }
-
-        Ok(Element {
-            id,
-            extension,
-            value,
-        })
     }
 }
 
