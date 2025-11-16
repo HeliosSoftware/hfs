@@ -524,25 +524,6 @@ macro_rules! impl_fhir_integer {
 
 impl_fhir_integer!(i8, i16, i32, i64, i128, u8, u16, u32, u64, u128);
 
-// FhirSerialize/Deserialize for serde_json::Value (used in element primitives)
-impl FhirSerialize<Json> for serde_json::Value {
-    fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        Serialize::serialize(self, serializer)
-    }
-}
-
-impl FhirDeserialize<Json> for serde_json::Value {
-    fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        <serde_json::Value as serde::Deserialize>::deserialize(deserializer)
-    }
-}
-
 // FhirSerialize impl for Option<T>
 impl<T> FhirSerialize<Json> for Option<T>
 where
