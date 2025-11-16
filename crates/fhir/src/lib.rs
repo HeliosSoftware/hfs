@@ -1432,7 +1432,7 @@ pub mod parameters;
 // Re-export commonly used types from parameters module
 pub use parameters::{ParameterValueAccessor, VersionIndependentParameters};
 
-// Removed the FhirSerde trait definition
+mod serde_helpers;
 
 /// Multi-version FHIR resource container supporting version-agnostic operations.
 ///

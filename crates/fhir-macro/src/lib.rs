@@ -812,9 +812,15 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                     // Import SerializeMap trait if we have flattened fields
                     let import_serialize_map = if has_flattened_fields {
-                        quote! { use serde::ser::SerializeMap; }
+                        quote! {
+                            use serde::ser::SerializeMap;
+                            use crate::serde_helpers;
+                        }
                     } else {
-                        quote! { use serde::ser::SerializeStruct; }
+                        quote! {
+                            use serde::ser::SerializeStruct;
+                            use crate::serde_helpers;
+                        }
                     };
 
                     let mut field_serializers = Vec::new();
@@ -1131,9 +1137,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             if has_flattened_fields {
                                 // For SerializeMap
                                 quote! {
-                                    // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
+                                    if !#field_access.is_empty() {
                                         // Use serialize_entry for SerializeMap
                                         state.serialize_entry(&#effective_field_name_str, &#field_access)?;
                                     }
@@ -1141,9 +1145,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             } else {
                                 // For SerializeStruct
                                 quote! {
-                                    // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
+                                    if !#field_access.is_empty() {
                                         // Use serialize_field for SerializeStruct
                                         state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                     }
@@ -1154,9 +1156,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             if has_flattened_fields {
                                 // For SerializeMap
                                 quote! {
-                                    // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
+                                    if crate::serde_helpers::has_non_empty_content(&#field_access) {
                                         // Use serialize_entry for SerializeMap
                                         state.serialize_entry(&#effective_field_name_str, &#field_access)?;
                                     }
@@ -1164,9 +1164,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             } else {
                                 // For SerializeStruct
                                 quote! {
-                                    // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
+                                    if crate::serde_helpers::has_non_empty_content(&#field_access) {
                                         // Use serialize_field for SerializeStruct
                                         state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                     }
@@ -1177,7 +1175,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         field_counts.push(field_counting_code);
                         field_serializers.push(field_serializing_code);
                     }
-                    // Use the has_flattened_fields variable defined at the top of the function
                     if has_flattened_fields {
                         // If we have flattened fields, use serialize_map instead of serialize_struct
                         quote! {
