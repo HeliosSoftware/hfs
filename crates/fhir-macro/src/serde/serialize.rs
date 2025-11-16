@@ -187,6 +187,15 @@ pub(crate) fn generate_serialize_impl(
                 Fields::Named(ref fields) => {
                     // Check if any fields have the flatten attribute - define this at the top level
                     let has_flattened_fields = fields.named.iter().any(is_flattened);
+                    let needs_empty_helper = fields.named.iter().any(|field| {
+                        if is_flattened(field) {
+                            return false;
+                        }
+                        let (is_element, is_decimal_element, is_option, is_vec) =
+                            get_element_info(&field.ty);
+                        let is_fhir_element = is_element || is_decimal_element;
+                        !is_option && !is_vec && !is_fhir_element
+                    });
                     let needs_primitive_helper = fields.named.iter().any(|field| {
                         let field_ty = &field.ty;
                         let (is_element, is_decimal_element, _, _) = get_element_info(field_ty);
@@ -202,6 +211,11 @@ pub(crate) fn generate_serialize_impl(
 
                     let primitive_helper_definition = if needs_primitive_helper {
                         generate_id_and_extension_helper_ref()
+                    } else {
+                        TokenStream::new()
+                    };
+                    let empty_helper_definition = if needs_empty_helper {
+                        empty_check_helper_definition_tokens()
                     } else {
                         TokenStream::new()
                     };
@@ -1171,28 +1185,20 @@ pub(crate) fn generate_serialize_impl(
                                 }
                             }
                         } else {
-                            // For non-Option types, check if it's a struct with all None/null fields
+                            // For non-Option types, check if serialization would produce content
                             if has_flattened_fields {
                                 // For SerializeMap
                                 quote! {
-                                    // Wrap value in serialization context for checking
                                     let ctx = ::helios_serde::SerializationContext::json(&#field_access);
-                                    // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&ctx).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
-                                        // Use serialize_entry for SerializeMap
+                                    if !__helios_serde_is_empty::<_, S::Error>(&ctx)? {
                                         state.serialize_entry(&#effective_field_name_str, &ctx)?;
                                     }
                                 }
                             } else {
                                 // For SerializeStruct
                                 quote! {
-                                    // Wrap value in serialization context for checking
                                     let ctx = ::helios_serde::SerializationContext::json(&#field_access);
-                                    // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&ctx).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
-                                        // Use serialize_field for SerializeStruct
+                                    if !__helios_serde_is_empty::<_, S::Error>(&ctx)? {
                                         state.serialize_field(&#effective_field_name_str, &ctx)?;
                                     }
                                 }
@@ -1207,6 +1213,7 @@ pub(crate) fn generate_serialize_impl(
                         // If we have flattened fields, use serialize_map instead of serialize_struct
                         quote! {
                             #primitive_helper_definition
+                            #empty_helper_definition
                             #flatten_helper_definition
                             let mut count = 0;
                             #(#field_counts)*
@@ -1219,6 +1226,7 @@ pub(crate) fn generate_serialize_impl(
                         // If no flattened fields, use serialize_struct as before
                         quote! {
                             #primitive_helper_definition
+                            #empty_helper_definition
                             let mut count = 0;
                             #(#field_counts)*
                             #import_serialize_map
@@ -1233,6 +1241,444 @@ pub(crate) fn generate_serialize_impl(
             }
         }
         Data::Union(_) => panic!("Enums and Unions not supported by FhirSerde"),
+    }
+}
+
+fn empty_check_helper_definition_tokens() -> TokenStream {
+    quote! {
+        #[allow(non_camel_case_types)]
+        fn __helios_serde_is_empty<T, E>(value: &T) -> Result<bool, E>
+        where
+            T: serde::Serialize,
+            E: serde::ser::Error,
+        {
+            use ::core::marker::PhantomData;
+
+            #[allow(non_camel_case_types)]
+            struct __HeliosEmptySerializer<'a, E> {
+                is_empty: &'a mut bool,
+                _marker: PhantomData<E>,
+            }
+
+            impl<'a, E> __HeliosEmptySerializer<'a, E>
+            where
+                E: serde::ser::Error,
+            {
+                fn mark_non_empty(&mut self) {
+                    *self.is_empty = false;
+                }
+
+                fn child(&mut self) -> __HeliosEmptySerializer<'_, E> {
+                    __HeliosEmptySerializer {
+                        is_empty: self.is_empty,
+                        _marker: PhantomData,
+                    }
+                }
+            }
+
+            impl<'a, E> serde::ser::Serializer for __HeliosEmptySerializer<'a, E>
+            where
+                E: serde::ser::Error,
+            {
+                type Ok = ();
+                type Error = E;
+                type SerializeSeq = __HeliosEmptySeqSerializer<'a, E>;
+                type SerializeTuple = __HeliosEmptySeqSerializer<'a, E>;
+                type SerializeTupleStruct = __HeliosEmptySeqSerializer<'a, E>;
+                type SerializeTupleVariant = __HeliosEmptySeqSerializer<'a, E>;
+                type SerializeMap = __HeliosEmptyMapSerializer<'a, E>;
+                type SerializeStruct = __HeliosEmptyStructSerializer<'a, E>;
+                type SerializeStructVariant = __HeliosEmptyStructSerializer<'a, E>;
+
+                fn serialize_bool(mut self, _v: bool) -> Result<(), E> {
+                    self.mark_non_empty();
+                    Ok(())
+                }
+
+                fn serialize_i8(self, _v: i8) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_i16(self, _v: i16) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_i32(self, _v: i32) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_i64(self, _v: i64) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_i128(self, _v: i128) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_u8(self, _v: u8) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_u16(self, _v: u16) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_u32(self, _v: u32) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_u64(self, _v: u64) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_u128(self, _v: u128) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_f32(self, _v: f32) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_f64(self, _v: f64) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_char(self, _v: char) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_str(self, _v: &str) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_bytes(self, _v: &[u8]) -> Result<(), E> {
+                    self.serialize_bool(true)
+                }
+
+                fn serialize_none(self) -> Result<(), E> {
+                    Ok(())
+                }
+
+                fn serialize_some<T>(mut self, value: &T) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    value.serialize(self.child())
+                }
+
+                fn serialize_unit(self) -> Result<(), E> {
+                    Ok(())
+                }
+
+                fn serialize_unit_struct(self, _name: &'static str) -> Result<(), E> {
+                    Ok(())
+                }
+
+                fn serialize_unit_variant(
+                    mut self,
+                    _name: &'static str,
+                    _variant_index: u32,
+                    _variant: &'static str,
+                ) -> Result<(), E> {
+                    self.mark_non_empty();
+                    Ok(())
+                }
+
+                fn serialize_newtype_struct<T>(mut self, _name: &'static str, value: &T) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    value.serialize(self.child())
+                }
+
+                fn serialize_newtype_variant<T>(
+                    mut self,
+                    _name: &'static str,
+                    _variant_index: u32,
+                    _variant: &'static str,
+                    value: &T,
+                ) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    self.mark_non_empty();
+                    value.serialize(self.child())
+                }
+
+                fn serialize_seq(mut self, _len: Option<usize>) -> Result<Self::SerializeSeq, E> {
+                    self.mark_non_empty();
+                    Ok(__HeliosEmptySeqSerializer {
+                        is_empty: self.is_empty,
+                        _marker: PhantomData,
+                    })
+                }
+
+                fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, E> {
+                    self.serialize_seq(Some(len))
+                }
+
+                fn serialize_tuple_struct(
+                    self,
+                    _name: &'static str,
+                    len: usize,
+                ) -> Result<Self::SerializeTupleStruct, E> {
+                    self.serialize_seq(Some(len))
+                }
+
+                fn serialize_tuple_variant(
+                    mut self,
+                    _name: &'static str,
+                    _variant_index: u32,
+                    _variant: &'static str,
+                    _len: usize,
+                ) -> Result<Self::SerializeTupleVariant, E> {
+                    self.mark_non_empty();
+                    Ok(__HeliosEmptySeqSerializer {
+                        is_empty: self.is_empty,
+                        _marker: PhantomData,
+                    })
+                }
+
+                fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, E> {
+                    Ok(__HeliosEmptyMapSerializer {
+                        is_empty: self.is_empty,
+                        wrote_entry: false,
+                        _marker: PhantomData,
+                    })
+                }
+
+                fn serialize_struct(
+                    self,
+                    _name: &'static str,
+                    _len: usize,
+                ) -> Result<Self::SerializeStruct, E> {
+                    Ok(__HeliosEmptyStructSerializer {
+                        is_empty: self.is_empty,
+                        wrote_field: false,
+                        _marker: PhantomData,
+                    })
+                }
+
+                fn serialize_struct_variant(
+                    mut self,
+                    _name: &'static str,
+                    _variant_index: u32,
+                    _variant: &'static str,
+                    _len: usize,
+                ) -> Result<Self::SerializeStructVariant, E> {
+                    self.mark_non_empty();
+                    Ok(__HeliosEmptyStructSerializer {
+                        is_empty: self.is_empty,
+                        wrote_field: true,
+                        _marker: PhantomData,
+                    })
+                }
+            }
+
+            #[allow(non_camel_case_types)]
+            struct __HeliosEmptySeqSerializer<'a, E> {
+                is_empty: &'a mut bool,
+                _marker: PhantomData<E>,
+            }
+
+            impl<'a, E> serde::ser::SerializeSeq for __HeliosEmptySeqSerializer<'a, E>
+            where
+                E: serde::ser::Error,
+            {
+                type Ok = ();
+                type Error = E;
+
+                fn serialize_element<T>(&mut self, value: &T) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    value.serialize(__HeliosEmptySerializer {
+                        is_empty: self.is_empty,
+                        _marker: PhantomData,
+                    })
+                }
+
+                fn end(self) -> Result<(), E> {
+                    Ok(())
+                }
+            }
+
+            impl<'a, E> serde::ser::SerializeTuple for __HeliosEmptySeqSerializer<'a, E>
+            where
+                E: serde::ser::Error,
+            {
+                type Ok = ();
+                type Error = E;
+
+                fn serialize_element<T>(&mut self, value: &T) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    serde::ser::SerializeSeq::serialize_element(self, value)
+                }
+
+                fn end(self) -> Result<(), E> {
+                    Ok(())
+                }
+            }
+
+            impl<'a, E> serde::ser::SerializeTupleStruct for __HeliosEmptySeqSerializer<'a, E>
+            where
+                E: serde::ser::Error,
+            {
+                type Ok = ();
+                type Error = E;
+
+                fn serialize_field<T>(&mut self, value: &T) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    serde::ser::SerializeSeq::serialize_element(self, value)
+                }
+
+                fn end(self) -> Result<(), E> {
+                    Ok(())
+                }
+            }
+
+            impl<'a, E> serde::ser::SerializeTupleVariant for __HeliosEmptySeqSerializer<'a, E>
+            where
+                E: serde::ser::Error,
+            {
+                type Ok = ();
+                type Error = E;
+
+                fn serialize_field<T>(&mut self, value: &T) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    serde::ser::SerializeSeq::serialize_element(self, value)
+                }
+
+                fn end(self) -> Result<(), E> {
+                    Ok(())
+                }
+            }
+
+            #[allow(non_camel_case_types)]
+            struct __HeliosEmptyMapSerializer<'a, E> {
+                is_empty: &'a mut bool,
+                wrote_entry: bool,
+                _marker: PhantomData<E>,
+            }
+
+            impl<'a, E> serde::ser::SerializeMap for __HeliosEmptyMapSerializer<'a, E>
+            where
+                E: serde::ser::Error,
+            {
+                type Ok = ();
+                type Error = E;
+
+                fn serialize_key<T>(&mut self, key: &T) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    if !self.wrote_entry {
+                        self.wrote_entry = true;
+                        *self.is_empty = false;
+                    }
+                    key.serialize(__HeliosEmptySerializer {
+                        is_empty: self.is_empty,
+                        _marker: PhantomData,
+                    })
+                }
+
+                fn serialize_value<T>(&mut self, value: &T) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    value.serialize(__HeliosEmptySerializer {
+                        is_empty: self.is_empty,
+                        _marker: PhantomData,
+                    })
+                }
+
+                fn serialize_entry<K, V>(&mut self, key: &K, value: &V) -> Result<(), E>
+                where
+                    K: ?Sized + serde::Serialize,
+                    V: ?Sized + serde::Serialize,
+                {
+                    self.serialize_key(key)?;
+                    self.serialize_value(value)
+                }
+
+                fn end(self) -> Result<(), E> {
+                    Ok(())
+                }
+            }
+
+            #[allow(non_camel_case_types)]
+            struct __HeliosEmptyStructSerializer<'a, E> {
+                is_empty: &'a mut bool,
+                wrote_field: bool,
+                _marker: PhantomData<E>,
+            }
+
+            impl<'a, E> __HeliosEmptyStructSerializer<'a, E> {
+                fn touch(&mut self) {
+                    if !self.wrote_field {
+                        self.wrote_field = true;
+                        *self.is_empty = false;
+                    }
+                }
+            }
+
+            impl<'a, E> serde::ser::SerializeStruct for __HeliosEmptyStructSerializer<'a, E>
+            where
+                E: serde::ser::Error,
+            {
+                type Ok = ();
+                type Error = E;
+
+                fn serialize_field<T>(&mut self, _key: &'static str, value: &T) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    self.touch();
+                    value.serialize(__HeliosEmptySerializer {
+                        is_empty: self.is_empty,
+                        _marker: PhantomData,
+                    })
+                }
+
+                fn end(self) -> Result<(), E> {
+                    Ok(())
+                }
+            }
+
+            impl<'a, E> serde::ser::SerializeStructVariant
+                for __HeliosEmptyStructSerializer<'a, E>
+            where
+                E: serde::ser::Error,
+            {
+                type Ok = ();
+                type Error = E;
+
+                fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<(), E>
+                where
+                    T: ?Sized + serde::Serialize,
+                {
+                    serde::ser::SerializeStruct::serialize_field(self, key, value)
+                }
+
+                fn end(self) -> Result<(), E> {
+                    Ok(())
+                }
+            }
+
+            let mut is_empty = true;
+            let serializer = __HeliosEmptySerializer {
+                is_empty: &mut is_empty,
+                _marker: PhantomData,
+            };
+            value.serialize(serializer)?;
+            Ok(is_empty)
+        }
     }
 }
 
