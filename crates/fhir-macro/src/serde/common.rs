@@ -81,6 +81,60 @@ pub(crate) fn generate_id_and_extension_helper_owned() -> proc_macro2::TokenStre
     }
 }
 
+/// Generates a borrowed IdAndExtensionHelperRef for serialization.
+///
+/// This helper avoids allocating new `String`/`Vec` instances by holding references
+/// to the existing `id` and `extension` data when producing the `_fieldName` objects.
+pub(crate) fn generate_id_and_extension_helper_ref() -> proc_macro2::TokenStream {
+    quote! {
+        #[allow(non_camel_case_types)]
+        struct IdAndExtensionHelperRef<'a, Id, Ext> {
+            id: Option<&'a Id>,
+            extension: Option<&'a Ext>,
+        }
+
+        impl<'a, Id, Ext> IdAndExtensionHelperRef<'a, Id, Ext> {
+            fn new(id: Option<&'a Id>, extension: Option<&'a Ext>) -> Option<Self> {
+                if id.is_none() && extension.is_none() {
+                    None
+                } else {
+                    Some(Self { id, extension })
+                }
+            }
+        }
+
+        impl<'a, Id, Ext> serde::Serialize for IdAndExtensionHelperRef<'a, Id, Ext>
+        where
+            Id: serde::Serialize,
+            for<'b> ::helios_serde::SerializationContext<&'b Ext, ::helios_serde::Json>: serde::Serialize,
+        {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeMap;
+                let mut len = 0;
+                if self.id.is_some() {
+                    len += 1;
+                }
+                if self.extension.is_some() {
+                    len += 1;
+                }
+
+                let mut map = serializer.serialize_map(Some(len))?;
+                if let Some(id) = self.id {
+                    map.serialize_entry("id", id)?;
+                }
+                if let Some(extension) = self.extension {
+                    let ctx = ::helios_serde::SerializationContext::json(extension);
+                    map.serialize_entry("extension", &ctx)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
 /// Determines the effective field name for FHIR serialization.
 ///
 /// This function extracts the field name that should be used during JSON serialization,

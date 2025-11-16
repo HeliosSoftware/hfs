@@ -1,5 +1,5 @@
-use super::common::{get_effective_field_name, is_flattened};
-use crate::util::get_element_info;
+use super::common::{generate_id_and_extension_helper_ref, get_effective_field_name, is_flattened};
+use crate::util::{get_element_info, get_option_inner_type, get_vec_inner_type};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Data, Fields, Ident, Lit, Meta, punctuated::Punctuated, token};
@@ -60,6 +60,7 @@ pub(crate) fn generate_serialize_impl(
         Data::Enum(ref data) => {
             // Regular enum serialization (not internally-tagged)
             let mut match_arms = Vec::new();
+            let mut needs_primitive_helper = false;
 
             for variant in &data.variants {
                 let variant_name = &variant.ident;
@@ -97,41 +98,22 @@ pub(crate) fn generate_serialize_impl(
                         let (is_element, is_decimal_element, _, _) = get_element_info(field_ty);
 
                         if is_element || is_decimal_element {
+                            needs_primitive_helper = true;
                             // For Element types, we need special handling for the _fieldName pattern
                             let underscore_variant_key = format!("_{}", variant_key);
 
                             match_arms.push(quote! {
-                                // Removed 'ref' from pattern
                                 #name #ty_generics::#variant_name(value) => {
-                                    let has_extension = value.id.is_some() || value.extension.is_some();
-                                    let primitive_json = if let Some(inner_value) = value.value.as_ref() {
+                                    if let Some(inner_value) = value.value.as_ref() {
                                         let ctx = ::helios_serde::SerializationContext::json(inner_value);
-                                        Some(serde_json::to_value(&ctx).map_err(|e| serde::ser::Error::custom(format!("Failed to serialize primitive value: {}", e)))?)
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(json_val) = primitive_json {
-                                        state.serialize_entry(#variant_key, &json_val)?;
+                                        state.serialize_entry(#variant_key, &ctx)?;
                                     }
-                                    if has_extension {
-                                        // Create JSON object for id/extension
-                                        let mut ext_obj = serde_json::Map::new();
-                                        if let Some(ref id) = value.id {
-                                            ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-                                        }
-                                        if let Some(ref extension) = value.extension {
-                                            let ctx = ::helios_serde::SerializationContext::json(extension);
-                                            match serde_json::to_value(&ctx) {
-                                                Ok(json_val) => {
-                                                    ext_obj.insert("extension".to_string(), json_val);
-                                                },
-                                                Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
-                                            }
-                                        }
-                                        let ext_json = serde_json::Value::Object(ext_obj);
-                                        state.serialize_entry(#underscore_variant_key, &ext_json)?;
+                                    if let Some(ext_value) = IdAndExtensionHelperRef::new(
+                                        value.id.as_ref(),
+                                        value.extension.as_ref(),
+                                    ) {
+                                        state.serialize_entry(#underscore_variant_key, &ext_value)?;
                                     }
-                                    // Don't return Result here, just continue
                                 }
                             });
                         } else {
@@ -173,8 +155,15 @@ pub(crate) fn generate_serialize_impl(
                 }
             }
 
+            let primitive_helper_definition = if needs_primitive_helper {
+                generate_id_and_extension_helper_ref()
+            } else {
+                TokenStream::new()
+            };
+
             // Generate the enum serialization implementation
             quote! {
+                #primitive_helper_definition
                 // Count the number of fields to serialize (always 1 for an enum variant)
                 let count = 1;
 
@@ -198,12 +187,23 @@ pub(crate) fn generate_serialize_impl(
                 Fields::Named(ref fields) => {
                     // Check if any fields have the flatten attribute - define this at the top level
                     let has_flattened_fields = fields.named.iter().any(is_flattened);
+                    let needs_primitive_helper = fields.named.iter().any(|field| {
+                        let field_ty = &field.ty;
+                        let (is_element, is_decimal_element, _, _) = get_element_info(field_ty);
+                        is_element || is_decimal_element
+                    });
 
                     // Import SerializeMap trait if we have flattened fields
                     let import_serialize_map = if has_flattened_fields {
                         quote! { use serde::ser::SerializeMap; }
                     } else {
                         quote! { use serde::ser::SerializeStruct; }
+                    };
+
+                    let primitive_helper_definition = if needs_primitive_helper {
+                        generate_id_and_extension_helper_ref()
+                    } else {
+                        TokenStream::new()
                     };
 
                     let flatten_helper_definition = if has_flattened_fields {
@@ -814,30 +814,20 @@ pub(crate) fn generate_serialize_impl(
                         // Access through self since FhirSerialize operates on the raw type
                         let field_access = quote! { self.#field_name_ident };
 
-                        let extension_field_ident =
-                            format_ident!("is_{}_extension", field_name_ident);
-
                         // Check if field has flatten attribute
                         let field_is_flattened = is_flattened(field);
 
                         let field_counting_code = if field_is_flattened {
-                            // For flattened fields, we don't increment the count
-                            // as they will be flattened into the parent object
-                            quote! {
-                                // No count increment for flattened fields
-                                #[allow(unused_variables)]
-                                let mut #extension_field_ident = false;
-                            }
+                            // Flattened fields merge into the parent, so they do not affect count directly.
+                            quote! {}
                         } else if is_option && !is_vec && is_fhir_element {
                             quote! {
-                                let mut #extension_field_ident = false;
                                 if let Some(field) = &#field_access {
                                     if field.value.is_some() {
                                         count += 1;
                                     }
                                     if field.id.is_some() || field.extension.is_some() {
                                         count += 1;
-                                        #extension_field_ident = true;
                                     }
                                 }
                             }
@@ -851,10 +841,23 @@ pub(crate) fn generate_serialize_impl(
                             quote! {
                                 if let Some(vec_value) = #vec_access {
                                     if !vec_value.is_empty() {
-                                        // Count primitive array
-                                        count += 1;
-                                        // Count extension array if any elements have extensions
-                                        if vec_value.iter().any(|element| element.id.is_some() || element.extension.is_some()) {
+                                        let mut has_primitive_values = false;
+                                        let mut has_extension_values = false;
+                                        for element in vec_value.iter() {
+                                            if element.value.is_some() {
+                                                has_primitive_values = true;
+                                            }
+                                            if element.id.is_some() || element.extension.is_some() {
+                                                has_extension_values = true;
+                                            }
+                                            if has_primitive_values && has_extension_values {
+                                                break;
+                                            }
+                                        }
+                                        if has_primitive_values {
+                                            count += 1;
+                                        }
+                                        if has_extension_values {
                                             count += 1;
                                         }
                                     }
@@ -862,13 +865,25 @@ pub(crate) fn generate_serialize_impl(
                             }
                         } else if !is_vec && is_fhir_element {
                             quote! {
-                                let mut #extension_field_ident = false;
                                 if #field_access.value.is_some() {
                                     count += 1;
                                 }
                                 if #field_access.id.is_some() || #field_access.extension.is_some() {
                                     count += 1;
-                                    #extension_field_ident = true;
+                                }
+                            }
+                        } else if is_vec {
+                            if is_option {
+                                quote! {
+                                    if #field_access.as_ref().map_or(false, |inner| !inner.is_empty()) {
+                                        count += 1;
+                                    }
+                                }
+                            } else {
+                                quote! {
+                                    if !#field_access.is_empty() {
+                                        count += 1;
+                                    }
                                 }
                             }
                         } else {
@@ -929,69 +944,99 @@ pub(crate) fn generate_serialize_impl(
                                 quote! { state.serialize_field }
                             };
 
-                            quote! {
-                                // Handle Vec<Element> by splitting into primitive and extension arrays
-                                if let Some(vec_value) = #vec_access { // Use the adjusted access logic
-                                    if !vec_value.is_empty() {
-                                        // Create primitive array
-                                        let mut primitive_array = Vec::with_capacity(vec_value.len());
-                                        // Create extension array
-                                        let mut extension_array = Vec::with_capacity(vec_value.len());
-                                        // Track if we need to include _fieldName
-                                        let mut has_extensions = false;
+                            let vec_inner_ty = if is_option {
+                                get_option_inner_type(field_ty)
+                                    .and_then(get_vec_inner_type)
+                                    .expect("Option<Vec<T>> type expected for FHIR element vector")
+                            } else {
+                                get_vec_inner_type(field_ty)
+                                    .expect("Vec<T> type expected for FHIR element vector")
+                            };
+                            let primitive_seq_ident =
+                                format_ident!("__helios_{}_primitive_values", field_name_ident);
+                            let extension_seq_ident =
+                                format_ident!("__helios_{}_primitive_extensions", field_name_ident);
 
-                                        // Process each element
-                                        for element in vec_value.iter() {
-                                            // Add primitive value or null
-                                            match &element.value {
-                                                Some(value) => {
-                                                    // Wrap value in serialization context
-                                                    let ctx = ::helios_serde::SerializationContext::json(value);
-                                                    match serde_json::to_value(&ctx) {
-                                                        Ok(json_val) => primitive_array.push(json_val),
-                                                        Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize primitive value: {}", e))),
-                                                    }
-                                                },
-                                                None => primitive_array.push(serde_json::Value::Null),
-                                            }
+                            let helper_defs = quote! {
+                                #[allow(non_camel_case_types)]
+                                struct #primitive_seq_ident<'a>(&'a [#vec_inner_ty]);
 
-                                            // Check if this element has id or extension (pure context system)
-                                            if element.id.is_some() || element.extension.is_some() {
-                                                has_extensions = true;
-
-                                                // Create JSON object for id/extension
-                                                let mut ext_obj = serde_json::Map::new();
-                                                if let Some(ref id) = element.id {
-                                                    ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-                                                }
-                                                if let Some(ref extension) = element.extension {
-                                                    let ctx = ::helios_serde::SerializationContext::json(extension);
-                                                    match serde_json::to_value(&ctx) {
-                                                        Ok(json_val) => {
-                                                            ext_obj.insert("extension".to_string(), json_val);
-                                                        },
-                                                        Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
-                                                    }
-                                                }
-                                                extension_array.push(serde_json::Value::Object(ext_obj));
+                                impl<'a> serde::Serialize for #primitive_seq_ident<'a> {
+                                    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                                    where
+                                        S: serde::Serializer,
+                                    {
+                                        use serde::ser::SerializeSeq;
+                                        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                                        for element in self.0 {
+                                            if let Some(value) = element.value.as_ref() {
+                                                let ctx = ::helios_serde::SerializationContext::json(value);
+                                                seq.serialize_element(&ctx)?;
                                             } else {
-                                                // No id or extension
-                                                extension_array.push(serde_json::Value::Null);
+                                                seq.serialize_element(&())?;
+                                            }
+                                        }
+                                        seq.end()
+                                    }
+                                }
+
+                                #[allow(non_camel_case_types)]
+                                struct #extension_seq_ident<'a>(&'a [#vec_inner_ty]);
+
+                                impl<'a> serde::Serialize for #extension_seq_ident<'a> {
+                                    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                                    where
+                                        S: serde::Serializer,
+                                    {
+                                        use serde::ser::SerializeSeq;
+                                        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                                        for element in self.0 {
+                                            if let Some(ext_value) =
+                                                IdAndExtensionHelperRef::new(
+                                                    element.id.as_ref(),
+                                                    element.extension.as_ref(),
+                                                )
+                                            {
+                                                seq.serialize_element(&ext_value)?;
+                                            } else {
+                                                seq.serialize_element(&())?;
+                                            }
+                                        }
+                                        seq.end()
+                                    }
+                                }
+                            };
+
+                            quote! {
+                                #helper_defs
+                                if let Some(vec_value) = #vec_access {
+                                    if !vec_value.is_empty() {
+                                        let mut has_primitive_values = false;
+                                        let mut has_extension_values = false;
+                                        for element in vec_value.iter() {
+                                            if element.value.is_some() {
+                                                has_primitive_values = true;
+                                            }
+                                            if element.id.is_some() || element.extension.is_some() {
+                                                has_extension_values = true;
+                                            }
+                                            if has_primitive_values && has_extension_values {
+                                                break;
                                             }
                                         }
 
-                                        // Check if the primitive array contains any non-null values
-                                        let should_serialize_primitive_array = primitive_array.iter().any(|v| !v.is_null());
-
-                                        // Serialize primitive array only if it has non-null values
-                                        if should_serialize_primitive_array {
-                                            #serialize_call(&#effective_field_name_str, &primitive_array)?;
+                                        if has_primitive_values {
+                                            #serialize_call(
+                                                &#effective_field_name_str,
+                                                &#primitive_seq_ident(vec_value.as_slice()),
+                                            )?;
                                         }
 
-                                        // Serialize extension array if needed, using the correct method
-                                        if has_extensions {
-                                            // Use the existing underscore_field_name_str variable which lives longer
-                                            #serialize_call(&#underscore_field_name_str, &extension_array)?;
+                                        if has_extension_values {
+                                            #serialize_call(
+                                                &#underscore_field_name_str,
+                                                &#extension_seq_ident(vec_value.as_slice()),
+                                            )?;
                                         }
                                     }
                                 }
@@ -1003,27 +1048,14 @@ pub(crate) fn generate_serialize_impl(
                                 quote! {
                                     if let Some(field) = &#field_access {
                                         if let Some(value) = field.value.as_ref() {
-                                            // Wrap value in serialization context
                                             let ctx = ::helios_serde::SerializationContext::json(value);
-                                            // Use serialize_entry for SerializeMap
                                             state.serialize_entry(&#effective_field_name_str, &ctx)?;
                                         }
-                                        if #extension_field_ident {
-                                            // Create JSON object for id/extension
-                                            let mut ext_obj = serde_json::Map::new();
-                                            if let Some(ref id) = field.id {
-                                                ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-                                            }
-                                            if let Some(ref extension) = field.extension {
-                                                let ctx = ::helios_serde::SerializationContext::json(extension);
-                                                match serde_json::to_value(&ctx) {
-                                                    Ok(json_val) => {
-                                                        ext_obj.insert("extension".to_string(), json_val);
-                                                    },
-                                                    Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
-                                                }
-                                            }
-                                            state.serialize_entry(&#underscore_field_name_str, &serde_json::Value::Object(ext_obj))?;
+                                        if let Some(ext_value) = IdAndExtensionHelperRef::new(
+                                            field.id.as_ref(),
+                                            field.extension.as_ref(),
+                                        ) {
+                                            state.serialize_entry(&#underscore_field_name_str, &ext_value)?;
                                         }
                                     }
                                 }
@@ -1032,27 +1064,14 @@ pub(crate) fn generate_serialize_impl(
                                 quote! {
                                     if let Some(field) = &#field_access {
                                         if let Some(value) = field.value.as_ref() {
-                                            // Wrap value in serialization context
                                             let ctx = ::helios_serde::SerializationContext::json(value);
-                                            // Use serialize_field for SerializeStruct
                                             state.serialize_field(&#effective_field_name_str, &ctx)?;
                                         }
-                                        if #extension_field_ident {
-                                            // Create JSON object for id/extension
-                                            let mut ext_obj = serde_json::Map::new();
-                                            if let Some(ref id) = field.id {
-                                                ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-                                            }
-                                            if let Some(ref extension) = field.extension {
-                                                let ctx = ::helios_serde::SerializationContext::json(extension);
-                                                match serde_json::to_value(&ctx) {
-                                                    Ok(json_val) => {
-                                                        ext_obj.insert("extension".to_string(), json_val);
-                                                    },
-                                                    Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
-                                                }
-                                            }
-                                            state.serialize_field(&#underscore_field_name_str, &serde_json::Value::Object(ext_obj))?;
+                                        if let Some(ext_value) = IdAndExtensionHelperRef::new(
+                                            field.id.as_ref(),
+                                            field.extension.as_ref(),
+                                        ) {
+                                            state.serialize_field(&#underscore_field_name_str, &ext_value)?;
                                         }
                                     }
                                 }
@@ -1062,54 +1081,28 @@ pub(crate) fn generate_serialize_impl(
                                 // For SerializeMap
                                 quote! {
                                     if let Some(value) = #field_access.value.as_ref() {
-                                        // Wrap value in serialization context
                                         let ctx = ::helios_serde::SerializationContext::json(value);
-                                        // Use serialize_entry for SerializeMap
                                         state.serialize_entry(&#effective_field_name_str, &ctx)?;
                                     }
-                                    if #extension_field_ident {
-                                        // Create JSON object for id/extension
-                                        let mut ext_obj = serde_json::Map::new();
-                                        if let Some(ref id) = #field_access.id {
-                                            ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-                                        }
-                                        if let Some(ref extension) = #field_access.extension {
-                                            let ctx = ::helios_serde::SerializationContext::json(extension);
-                                            match serde_json::to_value(&ctx) {
-                                                Ok(json_val) => {
-                                                    ext_obj.insert("extension".to_string(), json_val);
-                                                },
-                                                Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
-                                            }
-                                        }
-                                        state.serialize_entry(#underscore_field_name_str, &serde_json::Value::Object(ext_obj))?;
+                                    if let Some(ext_value) = IdAndExtensionHelperRef::new(
+                                        #field_access.id.as_ref(),
+                                        #field_access.extension.as_ref(),
+                                    ) {
+                                        state.serialize_entry(#underscore_field_name_str, &ext_value)?;
                                     }
                                 }
                             } else {
                                 // For SerializeStruct
                                 quote! {
                                     if let Some(value) = #field_access.value.as_ref() {
-                                        // Wrap value in serialization context
                                         let ctx = ::helios_serde::SerializationContext::json(value);
-                                        // Use serialize_field for SerializeStruct
                                         state.serialize_field(&#effective_field_name_str, &ctx)?;
                                     }
-                                    if #extension_field_ident {
-                                        // Create JSON object for id/extension
-                                        let mut ext_obj = serde_json::Map::new();
-                                        if let Some(ref id) = #field_access.id {
-                                            ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-                                        }
-                                        if let Some(ref extension) = #field_access.extension {
-                                            let ctx = ::helios_serde::SerializationContext::json(extension);
-                                            match serde_json::to_value(&ctx) {
-                                                Ok(json_val) => {
-                                                    ext_obj.insert("extension".to_string(), json_val);
-                                                },
-                                                Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension: {}", e))),
-                                            }
-                                        }
-                                        state.serialize_field(&#underscore_field_name_str, &serde_json::Value::Object(ext_obj))?;
+                                    if let Some(ext_value) = IdAndExtensionHelperRef::new(
+                                        #field_access.id.as_ref(),
+                                        #field_access.extension.as_ref(),
+                                    ) {
+                                        state.serialize_field(#underscore_field_name_str, &ext_value)?;
                                     }
                                 }
                             }
@@ -1140,26 +1133,40 @@ pub(crate) fn generate_serialize_impl(
                             // Regular Vec handling (not Element)
                             if has_flattened_fields {
                                 // For SerializeMap
-                                quote! {
-                                    // Wrap value in serialization context for checking
-                                    let ctx = ::helios_serde::SerializationContext::json(&#field_access);
-                                    // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&ctx).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
-                                        // Use serialize_entry for SerializeMap
-                                        state.serialize_entry(&#effective_field_name_str, &ctx)?;
+                                if is_option {
+                                    quote! {
+                                        if let Some(inner_vec) = #field_access.as_ref() {
+                                            if !inner_vec.is_empty() {
+                                                let ctx = ::helios_serde::SerializationContext::json(inner_vec);
+                                                state.serialize_entry(&#effective_field_name_str, &ctx)?;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    quote! {
+                                        if !#field_access.is_empty() {
+                                            let ctx = ::helios_serde::SerializationContext::json(&#field_access);
+                                            state.serialize_entry(&#effective_field_name_str, &ctx)?;
+                                        }
                                     }
                                 }
                             } else {
                                 // For SerializeStruct
-                                quote! {
-                                    // Wrap value in serialization context for checking
-                                    let ctx = ::helios_serde::SerializationContext::json(&#field_access);
-                                    // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&ctx).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
-                                        // Use serialize_field for SerializeStruct
-                                        state.serialize_field(&#effective_field_name_str, &ctx)?;
+                                if is_option {
+                                    quote! {
+                                        if let Some(inner_vec) = #field_access.as_ref() {
+                                            if !inner_vec.is_empty() {
+                                                let ctx = ::helios_serde::SerializationContext::json(inner_vec);
+                                                state.serialize_field(&#effective_field_name_str, &ctx)?;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    quote! {
+                                        if !#field_access.is_empty() {
+                                            let ctx = ::helios_serde::SerializationContext::json(&#field_access);
+                                            state.serialize_field(&#effective_field_name_str, &ctx)?;
+                                        }
                                     }
                                 }
                             }
@@ -1199,6 +1206,7 @@ pub(crate) fn generate_serialize_impl(
                     if has_flattened_fields {
                         // If we have flattened fields, use serialize_map instead of serialize_struct
                         quote! {
+                            #primitive_helper_definition
                             #flatten_helper_definition
                             let mut count = 0;
                             #(#field_counts)*
@@ -1210,6 +1218,7 @@ pub(crate) fn generate_serialize_impl(
                     } else {
                         // If no flattened fields, use serialize_struct as before
                         quote! {
+                            #primitive_helper_definition
                             let mut count = 0;
                             #(#field_counts)*
                             #import_serialize_map
