@@ -367,8 +367,8 @@ pub(crate) fn generate_deserialize_impl(data: &Data, name: &Ident) -> TokenStrea
 
                             // Determine the base primitive type (e.g., bool, String, rust_decimal::Decimal)
                             let primitive_type_ident = if is_decimal_element {
-                                // For DecimalElement, use serde_json::Value in temp struct to preserve original string
-                                quote! { serde_json::Value }
+                                // DecimalElement stores crate::PreciseDecimal values directly
+                                quote! { crate::PreciseDecimal }
                             } else {
                                 // is_element is true here
                                 if let Type::Path(type_path) = base_type {
@@ -454,55 +454,8 @@ pub(crate) fn generate_deserialize_impl(data: &Data, name: &Ident) -> TokenStrea
                             if is_vec {
                                 // Handle Vec<Element> or Option<Vec<Element>> first
                                 // Generate different construction logic based on whether it's decimal
-                                let construction_logic = if is_decimal_element {
-                                    // Logic specifically for Vec<DecimalElement> or Option<Vec<DecimalElement>>
+                                let construction_logic = {
                                     let element_type = {
-                                        // Determine DecimalElement<E> type
-                                        let vec_inner_type = if is_option {
-                                            get_option_inner_type(field_ty)
-                                        } else {
-                                            Some(field_ty)
-                                        }
-                                        .and_then(get_vec_inner_type)
-                                        .expect("Vec inner type not found for DecimalElement");
-                                        quote! { #vec_inner_type }
-                                    };
-                                    quote! { { // Block expression starts
-                                        // Handle Option for primitives and extensions
-                                        let primitives = temp_struct.#field_name_ident.unwrap_or_default(); // Vec<Option<Primitive>>
-                                        let extensions = temp_struct.#field_name_ident_ext.unwrap_or_default(); // Vec<Option<IdAndExtensionHelper>>
-                                        let len = primitives.len().max(extensions.len());
-                                        let mut result_vec = Vec::with_capacity(len);
-                                        for i in 0..len {
-                                            // Get Option<Primitive> by flattening the Option<Option<Primitive>> from the vec
-                                            let prim_val_opt = primitives.get(i).cloned().flatten();
-                                            let ext_helper_opt = extensions.get(i).cloned().flatten(); // Keep flatten here
-                                            if prim_val_opt.is_some() || ext_helper_opt.is_some() {
-                                                // Deserialize the Option<serde_json::Value> into Option<PreciseDecimal>
-                                                let precise_decimal_value = match prim_val_opt {
-                                                    Some(json_val) if !json_val.is_null() => {
-                                                        use serde::de::{DeserializeSeed, IntoDeserializer};
-                                                        let ctx = ::helios_serde::DeserializationContext::<crate::PreciseDecimal, ::helios_serde::Json>::json();
-                                                        ctx.deserialize(json_val.into_deserializer())
-                                                            .map(Some)
-                                                            .map_err(serde::de::Error::custom)? // Map error here
-                                                    },
-                                                    _ => None, // Treat None or JSON null as None
-                                                };
-                                                result_vec.push(#element_type {
-                                                    value: precise_decimal_value,
-                                                    id: ext_helper_opt.as_ref().and_then(|h| h.id.clone()),
-                                                    extension: ext_helper_opt.as_ref().and_then(|h| h.extension.clone()),
-                                                });
-                                            }
-                                            // Note: Skipping adding element if both parts are null/None
-                                        }
-                                        result_vec // Return the vec directly
-                                    } } // Block expression ends
-                                } else {
-                                    // Logic specifically for Vec<Element<V, E>> or Option<Vec<Element<V, E>>> (non-decimal)
-                                    let element_type = {
-                                        // Determine Element<V, E> type
                                         let vec_inner_type = if is_option {
                                             get_option_inner_type(field_ty)
                                         } else {
@@ -513,27 +466,24 @@ pub(crate) fn generate_deserialize_impl(data: &Data, name: &Ident) -> TokenStrea
                                         quote! { #vec_inner_type }
                                     };
                                     quote! { { // Block expression starts
-                                        // Handle Option for primitives and extensions
                                         let primitives = temp_struct.#field_name_ident.unwrap_or_default(); // Vec<Option<Primitive>>
                                         let extensions = temp_struct.#field_name_ident_ext.unwrap_or_default(); // Vec<Option<IdAndExtensionHelper>>
                                         let len = primitives.len().max(extensions.len());
                                         let mut result_vec = Vec::with_capacity(len);
                                         for i in 0..len {
-                                            // Get Option<Primitive> by flattening the Option<Option<Primitive>> from the vec
                                             let prim_val_opt = primitives.get(i).cloned().flatten();
                                             let ext_helper_opt = extensions.get(i).cloned().flatten(); // Keep flatten here
                                             if prim_val_opt.is_some() || ext_helper_opt.is_some() {
                                                 result_vec.push(#element_type {
-                                                    value: prim_val_opt, // Assign Option<V> directly
+                                                    value: prim_val_opt,
                                                     id: ext_helper_opt.as_ref().and_then(|h| h.id.clone()),
                                                     extension: ext_helper_opt.as_ref().and_then(|h| h.extension.clone()),
                                                 });
                                             }
-                                            // Note: Skipping adding element if both parts are null/None
                                         }
                                         result_vec
                                     } } // Block expression ends
-                                }; // End of outer if/else determining construction_logic
+                                }; // End of outer block
 
                                 // Assign the correct construction_logic based on is_option
                                 if is_option {
@@ -551,62 +501,6 @@ pub(crate) fn generate_deserialize_impl(data: &Data, name: &Ident) -> TokenStrea
                                     quote! {
                                         // No '?' needed here as the block returns Vec<Element> directly
                                         #field_name_ident: #construction_logic,
-                                    }
-                                }
-                            } else if is_decimal_element {
-                                // Handle single DecimalElement or Option<DecimalElement>
-                                if is_option {
-                                    // Logic for Option<DecimalElement>
-                                    let construction_logic = quote! { { // Block expression starts
-                                        // Deserialize PreciseDecimal from Option<serde_json::Value>
-                                        let precise_decimal_value = match temp_struct.#field_name_ident {
-                                            Some(json_val) if !json_val.is_null() => {
-                                                use serde::de::{DeserializeSeed, IntoDeserializer};
-                                                let ctx = ::helios_serde::DeserializationContext::<crate::PreciseDecimal, ::helios_serde::Json>::json();
-                                                ctx.deserialize(json_val.into_deserializer())
-                                                    .map(Some)
-                                                    .map_err(serde::de::Error::custom)? // Map error here
-                                            },
-                                        _ => None, // Treat None or JSON null as None
-                                        };
-                                        // Construct the DecimalElement (no Ok() needed)
-                                        crate::DecimalElement {
-                                            value: precise_decimal_value,
-                                            id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
-                                            extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
-                                        }
-                                    } }; // Block expression ends
-                                    // Wrap in Some() only if value or extension exists
-                                    quote! {
-                                         #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
-                                             // No '?' needed here as the block returns DecimalElement directly
-                                             Some(#construction_logic)
-                                         } else {
-                                             None // If neither field present, result is None
-                                         },
-                                    }
-                                } else {
-                                    // Logic for non-optional DecimalElement
-                                    quote! {
-                                        #field_name_ident: { // Block expression starts
-                                            // Deserialize PreciseDecimal from Option<serde_json::Value>
-                                            let precise_decimal_value = match temp_struct.#field_name_ident {
-                                                Some(json_val) if !json_val.is_null() => {
-                                                    use serde::de::{DeserializeSeed, IntoDeserializer};
-                                                    let ctx = ::helios_serde::DeserializationContext::<crate::PreciseDecimal, ::helios_serde::Json>::json();
-                                                    ctx.deserialize(json_val.into_deserializer())
-                                                        .map(Some)
-                                                        .map_err(serde::de::Error::custom)? // Map error here
-                                                },
-                                                _ => None, // Treat None or JSON null as None
-                                            };
-                                            // Construct the DecimalElement (no Ok() needed)
-                                            crate::DecimalElement {
-                                                value: precise_decimal_value,
-                                                id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
-                                                extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
-                                            }
-                                        }, // No '?' needed after block
                                     }
                                 }
                             } else if is_option {
