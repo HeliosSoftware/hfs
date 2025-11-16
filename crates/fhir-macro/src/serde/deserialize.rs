@@ -340,12 +340,15 @@ pub(crate) fn generate_deserialize_impl(data: &Data, name: &Ident) -> TokenStrea
                         field_type: TokenStream,
                         field_type_ext: Option<TokenStream>,
                         is_flattened: bool,
+                        tmp_ident: syn::Ident,
+                        tmp_ident_ext: Option<syn::Ident>,
                     }
                     let mut field_infos = Vec::new();
 
                     for field in fields.named.iter() {
                         let field_name_ident = field.ident.as_ref().unwrap(); // Keep original ident for access
                         let field_name_ident_ext = format_ident!("{}_ext", field_name_ident);
+                        let tmp_ident = format_ident!("tmp_{}", field_name_ident);
                         let field_ty = &field.ty;
                         let effective_field_name_str = get_effective_field_name(field);
                         let _underscore_field_name_str =
@@ -650,6 +653,12 @@ pub(crate) fn generate_deserialize_impl(data: &Data, name: &Ident) -> TokenStrea
 
                         // Collect field info for generating FhirDeserialize impl
                         let is_field_flattened = is_flattened(field);
+                        let tmp_ident_ext = if is_fhir_element {
+                            Some(format_ident!("tmp_{}", field_name_ident_ext))
+                        } else {
+                            None
+                        };
+
                         field_infos.push(FieldInfo {
                             field_ident: field_name_ident.clone(),
                             field_ident_ext: if is_fhir_element {
@@ -670,98 +679,191 @@ pub(crate) fn generate_deserialize_impl(data: &Data, name: &Ident) -> TokenStrea
                                 None
                             },
                             is_flattened: is_field_flattened,
+                            tmp_ident,
+                            tmp_ident_ext,
                         });
                     }
 
-                    // Generate field deserialization code using FhirDeserialize/DeserializeSeed for each field
-                    let mut field_deserializations = Vec::new();
+                    // We mirror serde_derive's generated layout: materialise a temporary struct,
+                    // stream JSON fields into locals via a Visitor, then build the TmpStruct and
+                    // finally map it into the actual FHIR type. This keeps behaviour consistent
+                    // with serde's derive while still routing every field through our
+                    // DeserializationContext bridge.
                     let mut temp_struct_field_names = Vec::new();
                     let mut temp_struct_field_decls = Vec::new();
+                    let mut temp_struct_field_values = Vec::new();
+                    let mut field_var_decls = Vec::new();
+                    let mut match_arms = Vec::new();
+                    let mut flatten_storage_decls = Vec::new();
+                    let mut flatten_key_checks = Vec::new();
+                    let mut flatten_postprocess = Vec::new();
 
-                    for field_info in &field_infos {
+                    for (index, field_info) in field_infos.iter().enumerate() {
                         let field_ident = &field_info.field_ident;
-                        let json_name = &field_info.json_name;
                         let field_type = &field_info.field_type;
+                        let tmp_ident = &field_info.tmp_ident;
 
                         temp_struct_field_names.push(field_ident.clone());
                         temp_struct_field_decls.push(quote! {
                             #field_ident: #field_type,
                         });
+                        temp_struct_field_values.push(quote! {
+                            #tmp_ident.unwrap_or_default()
+                        });
 
-                        // Deserialize main field using FhirDeserialize
-                        if field_info.is_flattened {
-                            let underscore_prefix = format!("_{}", json_name);
-                            field_deserializations.push(quote! {
-                                let #field_ident = {
-                                    let mut flattened_map = serde_json::Map::new();
-                                    for (key, value) in &obj {
-                                        if key.starts_with(#json_name) || key.starts_with(#underscore_prefix) {
-                                            flattened_map.insert(key.clone(), value.clone());
-                                        }
+                        field_var_decls.push(quote! {
+                            let mut #tmp_ident: Option<#field_type> = None;
+                        });
+
+                        if !field_info.is_flattened {
+                            let json_name = &field_info.json_name;
+                            match_arms.push(quote! {
+                                #json_name => {
+                                    if #tmp_ident.is_some() {
+                                        return Err(serde::de::Error::duplicate_field(#json_name));
                                     }
-                                    if flattened_map.is_empty() {
-                                        Default::default()
-                                    } else {
-                                        use serde::de::{DeserializeSeed, IntoDeserializer};
-                                        let ctx = ::helios_serde::DeserializationContext::<#field_type, ::helios_serde::Json>::json();
-                                        ctx.deserialize(serde_json::Value::Object(flattened_map).into_deserializer())
-                                            .map_err(|e| de::Error::custom(format!("Failed to deserialize flattened field '{}': {}", #json_name, e)))?
-                                    }
-                                };
-                            });
-                        } else {
-                            field_deserializations.push(quote! {
-                                let #field_ident = if let Some(field_value) = obj.get(#json_name) {
-                                    use serde::de::{DeserializeSeed, IntoDeserializer};
                                     let ctx = ::helios_serde::DeserializationContext::<#field_type, ::helios_serde::Json>::json();
-                                    ctx.deserialize(field_value.clone().into_deserializer())
-                                        .map_err(|e| de::Error::custom(format!("Failed to deserialize field '{}': {}", #json_name, e)))?
-                                } else {
-                                    // Field not present, use default (should be None for Option types)
-                                    Default::default()
-                                };
+                                    #tmp_ident = Some(map.next_value_seed(ctx)?);
+                                    continue;
+                                }
                             });
                         }
 
-                        // If there's an extension field, deserialize it too
-                        if let Some(ref field_ident_ext) = field_info.field_ident_ext {
-                            if let (Some(json_name_ext), Some(field_type_ext)) =
-                                (&field_info.json_name_ext, &field_info.field_type_ext)
-                            {
+                        if let Some(field_ident_ext) = &field_info.field_ident_ext {
+                            if let (
+                                Some(json_name_ext),
+                                Some(field_type_ext),
+                                Some(tmp_ident_ext),
+                            ) = (
+                                &field_info.json_name_ext,
+                                &field_info.field_type_ext,
+                                &field_info.tmp_ident_ext,
+                            ) {
                                 temp_struct_field_names.push(field_ident_ext.clone());
                                 temp_struct_field_decls.push(quote! {
                                     #field_ident_ext: #field_type_ext,
                                 });
-
-                                field_deserializations.push(quote! {
-                                    let #field_ident_ext = if let Some(field_value) = obj.get(#json_name_ext) {
-                                        use serde::de::{DeserializeSeed, IntoDeserializer};
+                                temp_struct_field_values.push(quote! {
+                                    #tmp_ident_ext.unwrap_or_default()
+                                });
+                                field_var_decls.push(quote! {
+                                    let mut #tmp_ident_ext: Option<#field_type_ext> = None;
+                                });
+                                match_arms.push(quote! {
+                                    #json_name_ext => {
+                                        if #tmp_ident_ext.is_some() {
+                                            return Err(serde::de::Error::duplicate_field(#json_name_ext));
+                                        }
                                         let ctx = ::helios_serde::DeserializationContext::<#field_type_ext, ::helios_serde::Json>::json();
-                                        ctx.deserialize(field_value.clone().into_deserializer())
-                                            .map_err(|e| de::Error::custom(format!("Failed to deserialize field '{}': {}", #json_name_ext, e)))?
-                                    } else {
-                                        // Field not present, use default
-                                        Default::default()
-                                    };
+                                        #tmp_ident_ext = Some(map.next_value_seed(ctx)?);
+                                        continue;
+                                    }
                                 });
                             }
+                        }
+
+                        if field_info.is_flattened {
+                            let storage_ident = format_ident!("flatten_storage_{}", index);
+                            let base_name = field_info.json_name.clone();
+                            flatten_storage_decls.push(quote! {
+                                let mut #storage_ident: Option<
+                                    serde_json::Map<std::string::String, serde_json::Value>
+                                > = None;
+                            });
+                            flatten_key_checks.push(quote! {
+                                if !handled && matches_flatten_key(&key, #base_name) {
+                                    let entry = #storage_ident.get_or_insert_with(serde_json::Map::new);
+                                    if entry.insert(key.clone(), value.clone()).is_some() {
+                                        return Err(serde::de::Error::custom(format!(
+                                            "duplicate field '{}'",
+                                            key
+                                        )));
+                                    }
+                                    handled = true;
+                                }
+                            });
+                            flatten_postprocess.push(quote! {
+                                if let Some(map) = #storage_ident {
+                                    if #tmp_ident.is_some() {
+                                        return Err(serde::de::Error::duplicate_field(#base_name));
+                                    }
+                                    let ctx = ::helios_serde::DeserializationContext::<#field_type, ::helios_serde::Json>::json();
+                                    let owned = serde_json::Value::Object(map);
+                                    let parsed = ctx
+                                        .deserialize(serde::de::IntoDeserializer::into_deserializer(owned))
+                                        .map_err(|e| serde::de::Error::custom(format!(
+                                            "Failed to deserialize flattened field '{}': {}",
+                                            #base_name, e
+                                        )))?;
+                                    #tmp_ident = Some(parsed);
+                                }
+                            });
                         }
                     }
 
                     let id_extension_helper_def = generate_id_and_extension_helper_owned();
+                    let temp_struct = quote! {
+                        struct #struct_name {
+                            #(#temp_struct_field_decls)*
+                        }
+                    };
 
-                    // Pure FhirDeserialize approach: manually deserialize each field using DeserializationContext
+                    let has_flatten = !flatten_storage_decls.is_empty();
+                    let flatten_helpers = if has_flatten {
+                        quote! {
+                            fn matches_flatten_key(name: &str, base: &str) -> bool {
+                                fn tail_is_upper(tail: &str) -> bool {
+                                    tail.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+                                }
+                                if let Some(rest) = name.strip_prefix(base) {
+                                    if tail_is_upper(rest) {
+                                        return true;
+                                    }
+                                }
+                                if let Some(rest) = name.strip_prefix('_') {
+                                    if let Some(rest) = rest.strip_prefix(base) {
+                                        if tail_is_upper(rest) {
+                                            return true;
+                                        }
+                                    }
+                                }
+                                false
+                            }
+                        }
+                    } else {
+                        TokenStream::new()
+                    };
+
+                    let fallback_arm = if has_flatten {
+                        quote! {
+                            {
+                                let value: serde_json::Value = map.next_value()?;
+                                let mut handled = false;
+                                #(#flatten_key_checks)*
+                                if !handled {
+                                    let _ = value;
+                                }
+                            }
+                        }
+                    } else {
+                        quote! {
+                            {
+                                let _: serde::de::IgnoredAny = map.next_value()?;
+                            }
+                        }
+                    };
+
                     deserialize_impl = quote! {
-                        // Define the helper struct at the top level of the deserialize function
                         #id_extension_helper_def
 
-                        use serde::de::{self, MapAccess, Visitor};
-                        use serde_json;
+                        #temp_struct
+
+                        #flatten_helpers
 
                         struct StructVisitor;
 
-                        impl<'de> Visitor<'de> for StructVisitor {
-                            type Value = #name;
+                        impl<'de> serde::de::Visitor<'de> for StructVisitor {
+                            type Value = #struct_name;
 
                             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                                 formatter.write_str(concat!("struct ", stringify!(#name)))
@@ -769,38 +871,30 @@ pub(crate) fn generate_deserialize_impl(data: &Data, name: &Ident) -> TokenStrea
 
                             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
                             where
-                                A: MapAccess<'de>,
+                                A: serde::de::MapAccess<'de>,
                             {
-                                // Buffer entire map to serde_json::Value with duplicate detection
-                                let mut obj = serde_json::Map::new();
+                                use serde::de::DeserializeSeed;
+                                #(#field_var_decls)*
+                                #(#flatten_storage_decls)*
+
                                 while let Some(key) = map.next_key::<::std::string::String>()? {
-                                    let value: serde_json::Value = map.next_value()?;
-                                    if obj.insert(key.clone(), value).is_some() {
-                                        return Err(de::Error::custom(format!(
-                                            "duplicate field `{}`",
-                                            key
-                                        )));
+                                    match key.as_str() {
+                                        #(#match_arms)*
+                                        _ => #fallback_arm,
                                     }
                                 }
 
-                                // Manually deserialize each field using FhirDeserialize via DeserializationContext
-                                #(#field_deserializations)*
+                                #(#flatten_postprocess)*
 
-                                // Build temp struct manually from deserialized fields (plain declarations, no serde attributes)
-                                #[allow(non_snake_case)]
-                                struct #struct_name {
-                                    #(#temp_struct_field_decls)*
-                                }
-
-                                let temp_struct = #struct_name {
-                                    #(#temp_struct_field_names),*
-                                };
-
-                                Ok(#name{#(#constructor_attributes)*})
+                                Ok(#struct_name {
+                                    #(#temp_struct_field_names: #temp_struct_field_values),*
+                                })
                             }
                         }
 
-                        deserializer.deserialize_map(StructVisitor)
+                        let temp_struct = deserializer.deserialize_map(StructVisitor)?;
+
+                        Ok(#name{#(#constructor_attributes)*})
                     };
                 }
                 Fields::Unnamed(_) => panic!("Tuple structs not supported by FhirSerde"),
