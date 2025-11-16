@@ -206,6 +206,594 @@ pub(crate) fn generate_serialize_impl(
                         quote! { use serde::ser::SerializeStruct; }
                     };
 
+                    let flatten_helper_definition = if has_flattened_fields {
+                        quote! {
+                            #[inline(always)]
+                            fn __helios_serde_flatten_into_map<S, T>(
+                                state: &mut S,
+                                value: &T,
+                                field_name: &'static str,
+                            ) -> Result<(), S::Error>
+                            where
+                                S: serde::ser::SerializeMap,
+                                T: serde::Serialize,
+                            {
+                                struct __HeliosFlattenSerializer<'a, S> {
+                                    state: &'a mut S,
+                                    field_name: &'static str,
+                                }
+
+                                impl<'a, S> __HeliosFlattenSerializer<'a, S>
+                                where
+                                    S: serde::ser::SerializeMap,
+                                {
+                                    fn unsupported(&self, kind: &str) -> S::Error {
+                                        serde::ser::Error::custom(format!(
+                                            "Flattened field '{}' serialized as {}, but flatten requires an object",
+                                            self.field_name,
+                                            kind
+                                        ))
+                                    }
+                                }
+
+                                impl<'a, S> serde::ser::Serializer for __HeliosFlattenSerializer<'a, S>
+                                where
+                                    S: serde::ser::SerializeMap,
+                                {
+                                    type Ok = ();
+                                    type Error = S::Error;
+                                    type SerializeSeq = serde::ser::Impossible<Self::Ok, Self::Error>;
+                                    type SerializeTuple = serde::ser::Impossible<Self::Ok, Self::Error>;
+                                    type SerializeTupleStruct = serde::ser::Impossible<Self::Ok, Self::Error>;
+                                    type SerializeTupleVariant = serde::ser::Impossible<Self::Ok, Self::Error>;
+                                    type SerializeMap = __HeliosFlattenMap<'a, S>;
+                                    type SerializeStruct = __HeliosFlattenStruct<'a, S>;
+                                    type SerializeStructVariant = __HeliosFlattenStructVariant<'a, S>;
+
+                                    fn serialize_bool(self, _: bool) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("a boolean"))
+                                    }
+
+                                    fn serialize_i8(self, _: i8) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("an integer"))
+                                    }
+
+                                    fn serialize_i16(self, _: i16) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("an integer"))
+                                    }
+
+                                    fn serialize_i32(self, _: i32) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("an integer"))
+                                    }
+
+                                    fn serialize_i64(self, _: i64) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("an integer"))
+                                    }
+
+                                    fn serialize_u8(self, _: u8) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("an integer"))
+                                    }
+
+                                    fn serialize_u16(self, _: u16) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("an integer"))
+                                    }
+
+                                    fn serialize_u32(self, _: u32) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("an integer"))
+                                    }
+
+                                    fn serialize_u64(self, _: u64) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("an integer"))
+                                    }
+
+                                    fn serialize_f32(self, _: f32) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("a float"))
+                                    }
+
+                                    fn serialize_f64(self, _: f64) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("a float"))
+                                    }
+
+                                    fn serialize_char(self, _: char) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("a char"))
+                                    }
+
+                                    fn serialize_str(self, _: &str) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("a string"))
+                                    }
+
+                                    fn serialize_bytes(self, _: &[u8]) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("bytes"))
+                                    }
+
+                                    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("None"))
+                                    }
+
+                                    fn serialize_some<U>(self, value: &U) -> Result<Self::Ok, Self::Error>
+                                    where
+                                        U: ?Sized + serde::Serialize,
+                                    {
+                                        value.serialize(self)
+                                    }
+
+                                    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("unit"))
+                                    }
+
+                                    fn serialize_unit_struct(
+                                        self,
+                                        _: &'static str,
+                                    ) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("unit struct"))
+                                    }
+
+                                    fn serialize_unit_variant(
+                                        self,
+                                        _: &'static str,
+                                        _: u32,
+                                        _: &'static str,
+                                    ) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("unit variant"))
+                                    }
+
+                                    fn serialize_newtype_struct<U>(
+                                        self,
+                                        _: &'static str,
+                                        value: &U,
+                                    ) -> Result<Self::Ok, Self::Error>
+                                    where
+                                        U: ?Sized + serde::Serialize,
+                                    {
+                                        value.serialize(self)
+                                    }
+
+                                    fn serialize_newtype_variant<U>(
+                                        self,
+                                        _: &'static str,
+                                        _: u32,
+                                        _: &'static str,
+                                        value: &U,
+                                    ) -> Result<Self::Ok, Self::Error>
+                                    where
+                                        U: ?Sized + serde::Serialize,
+                                    {
+                                        value.serialize(self)
+                                    }
+
+                                    fn serialize_seq(
+                                        self,
+                                        _: Option<usize>,
+                                    ) -> Result<Self::SerializeSeq, Self::Error> {
+                                        Err(self.unsupported("a sequence"))
+                                    }
+
+                                    fn serialize_tuple(
+                                        self,
+                                        _: usize,
+                                    ) -> Result<Self::SerializeTuple, Self::Error> {
+                                        Err(self.unsupported("a tuple"))
+                                    }
+
+                                    fn serialize_tuple_struct(
+                                        self,
+                                        _: &'static str,
+                                        _: usize,
+                                    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+                                        Err(self.unsupported("a tuple struct"))
+                                    }
+
+                                    fn serialize_tuple_variant(
+                                        self,
+                                        _: &'static str,
+                                        _: u32,
+                                        _: &'static str,
+                                        _: usize,
+                                    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+                                        Err(self.unsupported("a tuple variant"))
+                                    }
+
+                                    fn serialize_map(
+                                        self,
+                                        _: Option<usize>,
+                                    ) -> Result<Self::SerializeMap, Self::Error> {
+                                        Ok(__HeliosFlattenMap {
+                                            state: self.state,
+                                            field_name: self.field_name,
+                                            pending_key: None,
+                                        })
+                                    }
+
+                                    fn serialize_struct(
+                                        self,
+                                        _: &'static str,
+                                        _: usize,
+                                    ) -> Result<Self::SerializeStruct, Self::Error> {
+                                        Ok(__HeliosFlattenStruct {
+                                            state: self.state,
+                                        })
+                                    }
+
+                                    fn serialize_struct_variant(
+                                        self,
+                                        _: &'static str,
+                                        _: u32,
+                                        _: &'static str,
+                                        _: usize,
+                                    ) -> Result<Self::SerializeStructVariant, Self::Error> {
+                                        Ok(__HeliosFlattenStructVariant {
+                                            state: self.state,
+                                        })
+                                    }
+                                }
+
+                                struct __HeliosFlattenMap<'a, S> {
+                                    state: &'a mut S,
+                                    field_name: &'static str,
+                                    pending_key: Option<::std::string::String>,
+                                }
+
+                                impl<'a, S> __HeliosFlattenMap<'a, S>
+                                where
+                                    S: serde::ser::SerializeMap,
+                                {
+                                    fn take_key(&mut self) -> Result<::std::string::String, S::Error> {
+                                        self.pending_key.take().ok_or_else(|| {
+                                            serde::ser::Error::custom(format!(
+                                                "Flattened field '{}' attempted to serialize a value before a key",
+                                                self.field_name
+                                            ))
+                                        })
+                                    }
+                                }
+
+                                impl<'a, S> serde::ser::SerializeMap for __HeliosFlattenMap<'a, S>
+                                where
+                                    S: serde::ser::SerializeMap,
+                                {
+                                    type Ok = ();
+                                    type Error = S::Error;
+
+                                    fn serialize_key<K>(&mut self, key: &K) -> Result<(), Self::Error>
+                                    where
+                                        K: ?Sized + serde::Serialize,
+                                    {
+                                        let mut slot = None;
+                                        let serializer = __HeliosFlattenKeySerializer::<S::Error> {
+                                            slot: &mut slot,
+                                            field_name: self.field_name,
+                                            _marker: ::core::marker::PhantomData,
+                                        };
+                                        key.serialize(serializer)?;
+                                        if self.pending_key.is_some() {
+                                            return Err(serde::ser::Error::custom(format!(
+                                                "Flattened field '{}' serialized a new key before providing a value",
+                                                self.field_name
+                                            )));
+                                        }
+                                        self.pending_key = slot;
+                                        Ok(())
+                                    }
+
+                                    fn serialize_value<V>(&mut self, value: &V) -> Result<(), Self::Error>
+                                    where
+                                        V: ?Sized + serde::Serialize,
+                                    {
+                                        let key = self.take_key()?;
+                                        self.state.serialize_entry(&key, value)
+                                    }
+
+                                    fn serialize_entry<K, V>(
+                                        &mut self,
+                                        key: &K,
+                                        value: &V,
+                                    ) -> Result<(), Self::Error>
+                                    where
+                                        K: ?Sized + serde::Serialize,
+                                        V: ?Sized + serde::Serialize,
+                                    {
+                                        self.state.serialize_entry(key, value)
+                                    }
+
+                                    fn end(self) -> Result<Self::Ok, Self::Error> {
+                                        if self.pending_key.is_some() {
+                                            Err(serde::ser::Error::custom(format!(
+                                                "Flattened field '{}' serialized a key without a value",
+                                                self.field_name
+                                            )))
+                                        } else {
+                                            Ok(())
+                                        }
+                                    }
+                                }
+
+                                struct __HeliosFlattenStruct<'a, S> {
+                                    state: &'a mut S,
+                                }
+
+                                impl<'a, S> serde::ser::SerializeStruct for __HeliosFlattenStruct<'a, S>
+                                where
+                                    S: serde::ser::SerializeMap,
+                                {
+                                    type Ok = ();
+                                    type Error = S::Error;
+
+                                    fn serialize_field<T>(
+                                        &mut self,
+                                        key: &'static str,
+                                        value: &T,
+                                    ) -> Result<(), Self::Error>
+                                    where
+                                        T: ?Sized + serde::Serialize,
+                                    {
+                                        self.state.serialize_entry(key, value)
+                                    }
+
+                                    fn end(self) -> Result<Self::Ok, Self::Error> {
+                                        Ok(())
+                                    }
+                                }
+
+                                struct __HeliosFlattenStructVariant<'a, S> {
+                                    state: &'a mut S,
+                                }
+
+                                impl<'a, S> serde::ser::SerializeStructVariant
+                                    for __HeliosFlattenStructVariant<'a, S>
+                                where
+                                    S: serde::ser::SerializeMap,
+                                {
+                                    type Ok = ();
+                                    type Error = S::Error;
+
+                                    fn serialize_field<T>(
+                                        &mut self,
+                                        key: &'static str,
+                                        value: &T,
+                                    ) -> Result<(), Self::Error>
+                                    where
+                                        T: ?Sized + serde::Serialize,
+                                    {
+                                        self.state.serialize_entry(key, value)
+                                    }
+
+                                    fn end(self) -> Result<Self::Ok, Self::Error> {
+                                        Ok(())
+                                    }
+                                }
+
+                                struct __HeliosFlattenKeySerializer<'a, E> {
+                                    slot: &'a mut Option<::std::string::String>,
+                                    field_name: &'static str,
+                                    _marker: ::core::marker::PhantomData<E>,
+                                }
+
+                                impl<'a, E> __HeliosFlattenKeySerializer<'a, E>
+                                where
+                                    E: serde::ser::Error,
+                                {
+                                    fn store(&mut self, value: ::std::string::String) -> Result<(), E> {
+                                        if self.slot.is_some() {
+                                            return Err(serde::ser::Error::custom(format!(
+                                                "Flattened field '{}' attempted to serialize multiple key fragments",
+                                                self.field_name
+                                            )));
+                                        }
+                                        *self.slot = Some(value);
+                                        Ok(())
+                                    }
+
+                                    fn unsupported(&self, kind: &str) -> E {
+                                        serde::ser::Error::custom(format!(
+                                            "Flattened field '{}' used unsupported key type {}",
+                                            self.field_name,
+                                            kind
+                                        ))
+                                    }
+                                }
+
+                                impl<'a, E> serde::ser::Serializer for __HeliosFlattenKeySerializer<'a, E>
+                                where
+                                    E: serde::ser::Error,
+                                {
+                                    type Ok = ();
+                                    type Error = E;
+                                    type SerializeSeq = serde::ser::Impossible<Self::Ok, Self::Error>;
+                                    type SerializeTuple = serde::ser::Impossible<Self::Ok, Self::Error>;
+                                    type SerializeTupleStruct = serde::ser::Impossible<Self::Ok, Self::Error>;
+                                    type SerializeTupleVariant = serde::ser::Impossible<Self::Ok, Self::Error>;
+                                    type SerializeMap = serde::ser::Impossible<Self::Ok, Self::Error>;
+                                    type SerializeStruct = serde::ser::Impossible<Self::Ok, Self::Error>;
+                                    type SerializeStructVariant =
+                                        serde::ser::Impossible<Self::Ok, Self::Error>;
+
+                                    fn serialize_bool(self, _: bool) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("bool"))
+                                    }
+
+                                    fn serialize_i8(self, _: i8) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("integer"))
+                                    }
+
+                                    fn serialize_i16(self, _: i16) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("integer"))
+                                    }
+
+                                    fn serialize_i32(self, _: i32) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("integer"))
+                                    }
+
+                                    fn serialize_i64(self, _: i64) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("integer"))
+                                    }
+
+                                    fn serialize_u8(self, _: u8) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("integer"))
+                                    }
+
+                                    fn serialize_u16(self, _: u16) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("integer"))
+                                    }
+
+                                    fn serialize_u32(self, _: u32) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("integer"))
+                                    }
+
+                                    fn serialize_u64(self, _: u64) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("integer"))
+                                    }
+
+                                    fn serialize_f32(self, _: f32) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("float"))
+                                    }
+
+                                    fn serialize_f64(self, _: f64) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("float"))
+                                    }
+
+                                    fn serialize_char(
+                                        mut self,
+                                        value: char,
+                                    ) -> Result<Self::Ok, Self::Error> {
+                                        let mut buf = [0u8; 4];
+                                        self.store(value.encode_utf8(&mut buf).to_string())
+                                    }
+
+                                    fn serialize_str(
+                                        mut self,
+                                        value: &str,
+                                    ) -> Result<Self::Ok, Self::Error> {
+                                        self.store(value.to_owned())
+                                    }
+
+                                    fn serialize_bytes(self, _: &[u8]) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("bytes"))
+                                    }
+
+                                    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("None"))
+                                    }
+
+                                    fn serialize_some<U>(
+                                        self,
+                                        value: &U,
+                                    ) -> Result<Self::Ok, Self::Error>
+                                    where
+                                        U: ?Sized + serde::Serialize,
+                                    {
+                                        value.serialize(self)
+                                    }
+
+                                    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("unit"))
+                                    }
+
+                                    fn serialize_unit_struct(
+                                        self,
+                                        _: &'static str,
+                                    ) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("unit struct"))
+                                    }
+
+                                    fn serialize_unit_variant(
+                                        self,
+                                        _: &'static str,
+                                        _: u32,
+                                        _: &'static str,
+                                    ) -> Result<Self::Ok, Self::Error> {
+                                        Err(self.unsupported("unit variant"))
+                                    }
+
+                                    fn serialize_newtype_struct<U>(
+                                        self,
+                                        _: &'static str,
+                                        value: &U,
+                                    ) -> Result<Self::Ok, Self::Error>
+                                    where
+                                        U: ?Sized + serde::Serialize,
+                                    {
+                                        value.serialize(self)
+                                    }
+
+                                    fn serialize_newtype_variant<U>(
+                                        self,
+                                        _: &'static str,
+                                        _: u32,
+                                        _: &'static str,
+                                        value: &U,
+                                    ) -> Result<Self::Ok, Self::Error>
+                                    where
+                                        U: ?Sized + serde::Serialize,
+                                    {
+                                        value.serialize(self)
+                                    }
+
+                                    fn serialize_seq(
+                                        self,
+                                        _: Option<usize>,
+                                    ) -> Result<Self::SerializeSeq, Self::Error> {
+                                        Err(self.unsupported("sequence"))
+                                    }
+
+                                    fn serialize_tuple(
+                                        self,
+                                        _: usize,
+                                    ) -> Result<Self::SerializeTuple, Self::Error> {
+                                        Err(self.unsupported("tuple"))
+                                    }
+
+                                    fn serialize_tuple_struct(
+                                        self,
+                                        _: &'static str,
+                                        _: usize,
+                                    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+                                        Err(self.unsupported("tuple struct"))
+                                    }
+
+                                    fn serialize_tuple_variant(
+                                        self,
+                                        _: &'static str,
+                                        _: u32,
+                                        _: &'static str,
+                                        _: usize,
+                                    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+                                        Err(self.unsupported("tuple variant"))
+                                    }
+
+                                    fn serialize_map(
+                                        self,
+                                        _: Option<usize>,
+                                    ) -> Result<Self::SerializeMap, Self::Error> {
+                                        Err(self.unsupported("map"))
+                                    }
+
+                                    fn serialize_struct(
+                                        self,
+                                        _: &'static str,
+                                        _: usize,
+                                    ) -> Result<Self::SerializeStruct, Self::Error> {
+                                        Err(self.unsupported("struct"))
+                                    }
+
+                                    fn serialize_struct_variant(
+                                        self,
+                                        _: &'static str,
+                                        _: u32,
+                                        _: &'static str,
+                                        _: usize,
+                                    ) -> Result<Self::SerializeStructVariant, Self::Error> {
+                                        Err(self.unsupported("struct variant"))
+                                    }
+                                }
+
+                                let serializer = __HeliosFlattenSerializer { state, field_name };
+                                value.serialize(serializer)
+                            }
+                        }
+                    } else {
+                        TokenStream::new()
+                    };
+
                     let mut field_serializers = Vec::new();
                     let mut field_counts = Vec::new();
                     for field in fields.named.iter() {
@@ -306,45 +894,21 @@ pub(crate) fn generate_serialize_impl(
                                 quote! {
                                     if let Some(flattened_field) = &#field_access {
                                         let ctx = ::helios_serde::SerializationContext::json(flattened_field);
-                                        let flattened_value = serde_json::to_value(&ctx).map_err(|e| {
-                                            serde::ser::Error::custom(format!(
-                                                "Failed to serialize flattened field '{}': {}",
-                                                #effective_field_name_str,
-                                                e
-                                            ))
-                                        })?;
-                                        if let serde_json::Value::Object(obj) = flattened_value {
-                                            for (k, v) in obj {
-                                                state.serialize_entry(&k, &v)?;
-                                            }
-                                        } else {
-                                            return Err(serde::ser::Error::custom(format!(
-                                                "Flattened field '{}' did not serialize to an object",
-                                                #effective_field_name_str
-                                            )));
-                                        }
+                                        __helios_serde_flatten_into_map(
+                                            &mut state,
+                                            &ctx,
+                                            #effective_field_name_str,
+                                        )?;
                                     }
                                 }
                             } else {
                                 quote! {
                                     let ctx = ::helios_serde::SerializationContext::json(&#field_access);
-                                    let flattened_value = serde_json::to_value(&ctx).map_err(|e| {
-                                        serde::ser::Error::custom(format!(
-                                            "Failed to serialize flattened field '{}': {}",
-                                            #effective_field_name_str,
-                                            e
-                                        ))
-                                    })?;
-                                    if let serde_json::Value::Object(obj) = flattened_value {
-                                        for (k, v) in obj {
-                                            state.serialize_entry(&k, &v)?;
-                                        }
-                                    } else {
-                                        return Err(serde::ser::Error::custom(format!(
-                                            "Flattened field '{}' did not serialize to an object",
-                                            #effective_field_name_str
-                                        )));
-                                    }
+                                    __helios_serde_flatten_into_map(
+                                        &mut state,
+                                        &ctx,
+                                        #effective_field_name_str,
+                                    )?;
                                 }
                             };
                             // For flattened fields, manually merge serialized entries into the parent SerializeMap
@@ -635,6 +1199,7 @@ pub(crate) fn generate_serialize_impl(
                     if has_flattened_fields {
                         // If we have flattened fields, use serialize_map instead of serialize_struct
                         quote! {
+                            #flatten_helper_definition
                             let mut count = 0;
                             #(#field_counts)*
                             #import_serialize_map
@@ -756,8 +1321,8 @@ mod tests {
 
         let serialize_impl_str = serialize_impl.to_string();
 
-        // Ensure flattened field serialization uses serde_json::to_value helpers
-        assert!(serialize_impl_str.contains("serde_json :: to_value"));
+        // Ensure flattened field serialization uses the inline streaming helper
+        assert!(serialize_impl_str.contains("__helios_serde_flatten_into_map"));
 
         // Check that regular serialization uses serialize_entry when flattening is active (due to serialize_map)
         assert!(serialize_impl_str.contains("serialize_entry"));
