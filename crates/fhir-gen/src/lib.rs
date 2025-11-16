@@ -330,7 +330,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     let mut all_resources = Vec::new();
     let mut all_complex_types = Vec::new();
 
-    // First pass: collect all bundles and extract global information
+    // First pass: parse all JSON files and collect all StructureDefinitions
     let bundles: Vec<_> = visit_dirs(&version_dir)?
         .into_iter()
         .filter_map(|file_path| match parse_structure_definitions(&file_path) {
@@ -342,8 +342,29 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         })
         .collect();
 
-    // Extract global information from all bundles
+    // Collect and extract all elements for cycle detection
+    let mut all_elements = Vec::new();
+    let mut all_struct_defs = Vec::new();
+
     for bundle in &bundles {
+        if let Some(entries) = bundle.entry.as_ref() {
+            for entry in entries {
+                if let Some(resource) = &entry.resource {
+                    if let Resource::StructureDefinition(def) = resource {
+                        if is_valid_structure_definition(def) {
+                            all_struct_defs.push(def);
+                            if let Some(snapshot) = &def.snapshot {
+                                if let Some(elements) = &snapshot.element {
+                                    all_elements.extend(elements.iter());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Extract global information
         if let Some((hierarchy, resources, complex_types)) = extract_bundle_info(bundle) {
             global_type_hierarchy.extend(hierarchy);
             all_resources.extend(resources);
@@ -351,10 +372,27 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         }
     }
 
-    // Second pass: generate code for each bundle
-    for bundle in bundles {
-        generate_code(bundle, &version_path, false)?; // false = don't generate global constructs
+    // Sort StructureDefinitions by name for deterministic output
+    all_struct_defs.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Detect cycles across all elements
+    let cycles = detect_struct_cycles(&all_elements);
+
+    // Generate code for each StructureDefinition in sorted order
+    for def in all_struct_defs {
+        let content = structure_definition_to_rust(def, &cycles);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&version_path)?;
+        write!(file, "{}", content)?;
     }
+
+    // Sort for deterministic output
+    all_resources.sort();
+    all_resources.dedup();
+    all_complex_types.sort();
+    all_complex_types.dedup();
 
     // Generate global constructs once at the end
     generate_global_constructs(
@@ -671,90 +709,6 @@ fn generate_global_constructs(
         writeln!(file, "        ]")?;
         writeln!(file, "    }}")?;
         writeln!(file, "}}")?;
-    }
-
-    Ok(())
-}
-
-/// Generates Rust code from a Bundle of FHIR StructureDefinitions.
-///
-/// This is the main code generation function that processes all StructureDefinitions
-/// in a Bundle and writes the corresponding Rust code to a file.
-///
-/// # Arguments
-///
-/// * `bundle` - FHIR Bundle containing StructureDefinitions and other resources
-/// * `output_path` - Path to the output Rust file
-///
-/// # Returns
-///
-/// Returns `Ok(())` on success, or an `io::Error` if file operations fail.
-///
-/// # Process Overview
-///
-/// 1. **First Pass**: Collects all ElementDefinitions and detects circular dependencies
-/// 2. **Second Pass**: Generates Rust code for each valid StructureDefinition
-/// 3. **Final Step**: Generates a unified Resource enum and helper implementations
-///
-/// # Generated Code Includes
-///
-/// - Struct definitions for complex types and resources
-/// - Enum definitions for choice types (polymorphic elements)
-/// - A Resource enum containing all resource types
-/// - From<T> implementations for primitive type conversions
-/// - Proper derive macros for serialization and FHIR-specific functionality
-fn generate_code(
-    bundle: Bundle,
-    output_path: impl AsRef<Path>,
-    _generate_globals: bool,
-) -> io::Result<()> {
-    // First collect all ElementDefinitions across all StructureDefinitions
-    let mut all_elements = Vec::new();
-
-    if let Some(entries) = bundle.entry.as_ref() {
-        // First pass: collect all elements
-        for entry in entries {
-            if let Some(resource) = &entry.resource {
-                if let Resource::StructureDefinition(def) = resource {
-                    if is_valid_structure_definition(def) {
-                        if let Some(snapshot) = &def.snapshot {
-                            if let Some(elements) = &snapshot.element {
-                                all_elements.extend(elements.iter());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Detect cycles using all collected elements
-        let element_refs: Vec<&ElementDefinition> = all_elements;
-        let cycles = detect_struct_cycles(&element_refs);
-
-        // Second pass: generate code
-        for entry in entries {
-            if let Some(resource) = &entry.resource {
-                match resource {
-                    Resource::StructureDefinition(def) => {
-                        if is_valid_structure_definition(def) {
-                            let content = structure_definition_to_rust(def, &cycles);
-                            let mut file = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(output_path.as_ref())?;
-                            write!(file, "{}", content)?;
-                        }
-                    }
-                    Resource::SearchParameter(_param) => {
-                        // TODO: Generate code for search parameter
-                    }
-                    Resource::OperationDefinition(_op) => {
-                        // TODO: Generate code for operation definition
-                    }
-                    _ => {} // Skip other resource types for now
-                }
-            }
-        }
     }
 
     Ok(())
@@ -2179,8 +2133,11 @@ fn process_elements(
         }
     }
 
-    // Process each group
-    for (path, group) in element_groups {
+    // Process each group in sorted order for deterministic output
+    let mut sorted_groups: Vec<_> = element_groups.into_iter().collect();
+    sorted_groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (path, group) in sorted_groups {
         let type_name = generate_type_name(&path);
 
         // Skip if we've already processed this type
