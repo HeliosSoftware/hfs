@@ -328,9 +328,51 @@ impl CompositeStorage {
     /// Synchronizes a resource change to secondary backends.
     async fn sync_to_secondaries(&self, event: SyncEvent) -> StorageResult<()> {
         if let Some(ref sync_manager) = self.sync_manager {
-            sync_manager.sync(&event, &self.secondaries).await?;
+            let statuses = sync_manager.sync(&event, &self.secondaries).await?;
+            let failures: Vec<_> = statuses.into_iter().filter(|s| !s.success).collect();
+
+            for failure in &failures {
+                warn!(
+                    backend_id = %failure.backend_id,
+                    tenant_id = %event.tenant_id().as_str(),
+                    resource_type = event.resource_type(),
+                    resource_id = event.resource_id(),
+                    version = event.version(),
+                    retry_count = failure.retry_count,
+                    error = failure.error.as_deref().unwrap_or("unknown"),
+                    "Secondary sync failed"
+                );
+            }
+
+            if !failures.is_empty() {
+                return Err(StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "composite-sync".to_string(),
+                    message: format!("Secondary sync failed for {} backend(s)", failures.len()),
+                }));
+            }
         }
         Ok(())
+    }
+
+    /// Returns true when primary-backed search should be bypassed in favor of a
+    /// dedicated search backend.
+    fn force_search_backend_for_primary(&self) -> bool {
+        self.config
+            .primary()
+            .map(|primary| primary.kind == crate::core::BackendKind::S3)
+            .unwrap_or(false)
+            && self.preferred_search_backend().is_some()
+    }
+
+    /// Returns the preferred search backend provider if one is configured.
+    fn preferred_search_backend(&self) -> Option<(&str, &DynSearchProvider)> {
+        self.config
+            .backends_with_role(super::config::BackendRole::Search)
+            .find_map(|backend| {
+                self.search_providers
+                    .get(&backend.id)
+                    .map(|provider| (backend.id.as_str(), provider))
+            })
     }
 
     /// Routes and executes a search query.
@@ -340,6 +382,12 @@ impl CompositeStorage {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        // Some primaries (notably S3) intentionally do not implement search.
+        // In these cases all search requests must run on the dedicated search backend.
+        if self.force_search_backend_for_primary() {
+            return self.execute_primary_search(tenant, query).await;
+        }
+
         // Route the query
         let decision = self
             .router
@@ -387,20 +435,14 @@ impl CompositeStorage {
     ) -> StorageResult<SearchResult> {
         // Prefer the Search backend when one is configured, since the primary
         // may have offloaded search indexing to it.
-        if let Some(search_backend) = self
-            .config
-            .backends_with_role(super::config::BackendRole::Search)
-            .next()
-        {
-            if let Some(provider) = self.search_providers.get(&search_backend.id) {
-                let result = provider.search(tenant, query).await;
-                self.update_health(
-                    &search_backend.id,
-                    result.is_ok(),
-                    result.as_ref().err().map(|e| e.to_string()),
-                );
-                return result;
-            }
+        if let Some((backend_id, provider)) = self.preferred_search_backend() {
+            let result = provider.search(tenant, query).await;
+            self.update_health(
+                backend_id,
+                result.is_ok(),
+                result.as_ref().err().map(|e| e.to_string()),
+            );
+            return result;
         }
 
         // Fall back to primary
@@ -541,6 +583,12 @@ impl CompositeStorage {
                     .sync_to_secondaries(SyncEvent::Create {
                         resource_type: resource_type.to_string(),
                         resource_id: resource_id.to_string(),
+                        version: resource_json
+                            .get("meta")
+                            .and_then(|m| m.get("versionId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("1")
+                            .to_string(),
                         content: resource_json.clone(),
                         tenant_id: tenant.tenant_id().clone(),
                         fhir_version,
@@ -615,6 +663,7 @@ impl ResourceStorage for CompositeStorage {
             .sync_to_secondaries(SyncEvent::Create {
                 resource_type: resource_type.to_string(),
                 resource_id: stored.id().to_string(),
+                version: stored.version_id().to_string(),
                 content: stored.content().clone(),
                 tenant_id: tenant.tenant_id().clone(),
                 fhir_version,
@@ -656,6 +705,7 @@ impl ResourceStorage for CompositeStorage {
             SyncEvent::Create {
                 resource_type: resource_type.to_string(),
                 resource_id: id.to_string(),
+                version: stored.version_id().to_string(),
                 content: stored.content().clone(),
                 tenant_id: tenant.tenant_id().clone(),
                 fhir_version,
@@ -792,16 +842,28 @@ impl SearchProvider for CompositeStorage {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
-        // For count, we can just use primary
-        // A more sophisticated implementation might route based on features
-        if let Some(provider) = self
-            .search_providers
-            .get(self.config.primary_id().unwrap_or("primary"))
-        {
-            provider.search_count(tenant, query).await
+        if let Some((backend_id, provider)) = self.preferred_search_backend() {
+            let result = provider.search_count(tenant, query).await;
+            self.update_health(
+                backend_id,
+                result.is_ok(),
+                result.as_ref().err().map(|e| e.to_string()),
+            );
+            return result;
+        }
+
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        if let Some(provider) = self.search_providers.get(primary_id) {
+            let result = provider.search_count(tenant, query).await;
+            self.update_health(
+                primary_id,
+                result.is_ok(),
+                result.as_ref().err().map(|e| e.to_string()),
+            );
+            result
         } else {
             Err(StorageError::Backend(BackendError::UnsupportedCapability {
-                backend_name: "composite".to_string(),
+                backend_name: primary_id.to_string(),
                 capability: "search_count".to_string(),
             }))
         }
@@ -835,6 +897,7 @@ impl ConditionalStorage for CompositeStorage {
                 .sync_to_secondaries(SyncEvent::Create {
                     resource_type: resource_type.to_string(),
                     resource_id: stored.id().to_string(),
+                    version: stored.version_id().to_string(),
                     content: stored.content().clone(),
                     tenant_id: tenant.tenant_id().clone(),
                     fhir_version,
@@ -882,6 +945,7 @@ impl ConditionalStorage for CompositeStorage {
                     .sync_to_secondaries(SyncEvent::Create {
                         resource_type: resource_type.to_string(),
                         resource_id: stored.id().to_string(),
+                        version: stored.version_id().to_string(),
                         content: stored.content().clone(),
                         tenant_id: tenant.tenant_id().clone(),
                         fhir_version,

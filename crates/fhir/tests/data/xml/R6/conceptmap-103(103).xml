@@ -21,8 +21,8 @@
       <br/>
       <p>
         <b>Group 1 </b>Mapping from 
-        <code>http://snomed.info/sct</code> to 
-        <code>http://hl7.org/fhir/sid/icd-10-cm</code>
+        <code>http://snomed.info/sct</code> (SNOMED CT International Edition) to 
+        <code>http://hl7.org/fhir/sid/icd-10-cm</code> (International Classification of Diseases, 10th Revision, Clinical Modification (ICD-10-CM))
       </p>
       <table class="grid">
         <tr>

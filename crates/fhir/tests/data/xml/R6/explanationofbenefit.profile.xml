@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ExplanationOfBenefit"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -1642,7 +1642,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The nature of the accident
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-ActIncidentCode.html">ActIncidentCode</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-v3-ActIncidentCode.html">ActIncidentCode</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -5575,7 +5575,7 @@
   <name value="ExplanationOfBenefit"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2025-12-17T09:50:17+00:00"/>
   <publisher value="HL7 International / Financial Management"/>
   <contact>
     <telecom>

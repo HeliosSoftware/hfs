@@ -17,7 +17,7 @@
       <br/>
       <p>
         <b>Group 1 </b>Mapping from 
-        <a href="http://terminology.hl7.org/7.0.0/CodeSystem-allergyintolerance-verification.html">AllergyIntolerance Verification Status</a> to 
+        <a href="http://terminology.hl7.org/7.0.1/CodeSystem-allergyintolerance-verification.html">AllergyIntolerance Verification Status</a> to 
         <a href="codesystem-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <table class="grid">

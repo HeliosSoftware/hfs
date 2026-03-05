@@ -172,6 +172,7 @@ The Helios FHIR Server supports multiple storage backend configurations. Choose 
 | **PostgreSQL** | Built-in full-text search (tsvector/tsquery) | Production OLTP deployments |
 | **PostgreSQL + Elasticsearch** | Elasticsearch-powered search with PostgreSQL CRUD | Production deployments needing RDBMS + robust search |
 | **S3** | Object storage for CRUD, versioning, history, and bulk operations (no search) | Archival, bulk analytics, cost-effective storage |
+| **S3 + Elasticsearch** | Elasticsearch-powered search with S3 object storage as canonical source | Object-storage-first deployments needing robust FHIR search |
 
 ### Running the Server
 
@@ -202,13 +203,23 @@ HFS_S3_BUCKET=my-fhir-bucket \
 AWS_PROFILE=your-aws-profile \
 AWS_REGION=us-east-1 \
   ./hfs
+
+# S3 + Elasticsearch (S3 is canonical, Elasticsearch handles all search)
+HFS_STORAGE_BACKEND=s3-elasticsearch \
+HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
+HFS_S3_TENANCY_MODE=prefix-per-tenant \
+HFS_S3_BUCKET=hfs \
+HFS_S3_ENDPOINT_URL=http://localhost:9000 \
+HFS_S3_ALLOW_HTTP=true \
+HFS_S3_FORCE_PATH_STYLE=true \
+  ./hfs
 ```
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, or `s3` |
+| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `s3`, or `s3-elasticsearch` |
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `HFS_DATABASE_URL` | `fhir.db` | Database URL (SQLite path or PostgreSQL connection string) |
@@ -219,8 +230,19 @@ AWS_REGION=us-east-1 \
 | `HFS_ELASTICSEARCH_USERNAME` | *(none)* | ES basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | ES basic auth password |
 | `HFS_S3_BUCKET` | `hfs` | S3 bucket name (prefix-per-tenant mode) |
+| `HFS_S3_TENANCY_MODE` | `prefix-per-tenant` | S3 tenant isolation mode (`prefix-per-tenant` or `bucket-per-tenant`) |
+| `HFS_S3_TENANT_BUCKET_MAP` | *(none)* | Per-tenant bucket mapping (`tenant=bucket,tenant2=bucket2`) for bucket-per-tenant mode |
+| `HFS_S3_DEFAULT_SYSTEM_BUCKET` | *(none)* | Optional fallback bucket for non-tenant/system artifacts |
 | `HFS_S3_REGION` | *(AWS provider chain)* | AWS region override |
+| `HFS_S3_PREFIX` | *(none)* | Optional global key prefix inside bucket(s) |
+| `HFS_S3_ENDPOINT_URL` | *(none)* | Custom S3 endpoint (for MinIO/local S3-compatible storage) |
+| `HFS_S3_FORCE_PATH_STYLE` | `false` | Use path-style addressing (`http://host/bucket/key`) |
+| `HFS_S3_ALLOW_HTTP` | `false` | Allow plain HTTP endpoints for local/dev environments |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
+| `HFS_S3_ES_REINDEX_ON_STARTUP` | `false` | Rebuild Elasticsearch index from S3 current objects at startup (`s3-elasticsearch` mode) |
+| `HFS_S3_ES_REINDEX_BATCH_SIZE` | `500` | Batch size for startup S3->ES reindex |
+| `HFS_S3_ES_REINDEX_CLEAR_EXISTING` | `false` | Clear tenant/type ES indices before reindex replay |
+| `HFS_S3_ES_REINDEX_RESOURCE_TYPES` | *(none)* | Optional comma-separated resource type filter for reindex |
 
 For detailed backend setup instructions (building from source, Docker commands, and search offloading architecture), see the [persistence crate documentation](crates/persistence/README.md#building--running-storage-backends).
 
@@ -432,4 +454,3 @@ The Helios FHIR Server is licensed under the [MIT License](LICENSE).
 ---
 
 HL7® and FHIR® are registered trademarks of Health Level Seven International.
-

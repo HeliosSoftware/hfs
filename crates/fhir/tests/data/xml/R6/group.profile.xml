@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Group"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -1183,7 +1183,7 @@
   <name value="Group"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2025-12-17T09:50:17+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -1191,7 +1191,7 @@
       <value value="http://www.hl7.org/Special/committees/fiwg"/>
     </telecom>
   </contact>
-  <description value="Represents a defined collection of entities that may be discussed or acted upon collectively but which are not typically expected to act collectively.  These collections are also not typically formally or legally recognized.&#xA;&#xA;NOTE: Group may be used to define families or households, which in some circumstances may act collectively or have a degree of legal or formal recognition.  This should be considered an exception.  When Group is used for types of entities other than Patient or RelatedPerson, the expectation remains that the Group will not act collectively or have formal recognition - use Organization if these behaviors are needed.&#xA;&#xA;For example, it is possible for a 'family' Group to be a performer of an Observation or owner of a Task.  However, this is not permitted for a Group made up of Practitioners, PractitionerRoles or Organizations.  Organization or CareTeam would need to be used instead.  A Group of Practitioners could, however, be a subject of an Observation."/>
+  <description value="Represents a defined collection of entities that may be discussed or acted upon collectively but which are not typically expected to act collectively*. These collections are also not typically formally or legally recognized.\r\n\r\n*NOTE: Group may be used to define families or households, which in some circumstances may act collectively or have a degree of legal or formal recognition. This should be considered an exception. When Group is used for types of entities other than Patient or RelatedPerson, the expectation remains that the Group will not act collectively or have formal recognition - use Organization if these behaviors are needed. See more discussion [below](group.html#group-usage)"/>
   <jurisdiction>
     <coding>
       <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>

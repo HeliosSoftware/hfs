@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Measure"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -461,7 +461,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Jurisdiction of the authority that maintains the measure (if applicable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -1068,7 +1068,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">process | outcome | structure | patient-reported-outcome
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-measure-type.html">MeasureType</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-measure-type.html">MeasureType</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -1195,7 +1195,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">proportion | ratio | continuous-variable | cohort | composite
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-measure-scoring.html">Measure Scoring</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-measure-scoring.html">Measure Scoring</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1264,7 +1264,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">opportunity | all-or-nothing | linear | weighted
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-composite-measure-scoring.html">CompositeMeasureScoring</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-composite-measure-scoring.html">CompositeMeasureScoring</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1389,7 +1389,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">increase | decrease
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-measure-improvement-notation.html">MeasureImprovementNotation</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-measure-improvement-notation.html">MeasureImprovementNotation</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1518,7 +1518,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">initial-population | numerator | numerator-exclusion | denominator | denominator-exclusion | denominator-exception | measure-population | measure-population-exclusion | measure-observation
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-measure-population.html">MeasurePopulationType</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-measure-population.html">MeasurePopulationType</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1622,7 +1622,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Aggregation method for a measure score (e.g. sum, average, median, minimum, maximum, count)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-measure-aggregate-method.html">Measure Aggregate Method</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-measure-aggregate-method.html">Measure Aggregate Method</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -2043,7 +2043,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">supplemental-data | risk-adjustment-factor
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-measure-data-usage.html">MeasureDataUsage</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-measure-data-usage.html">MeasureDataUsage</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -2158,7 +2158,7 @@
   <name value="Measure"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2025-12-17T09:50:17+00:00"/>
   <publisher value="HL7 International / Clinical Quality Information"/>
   <contact>
     <telecom>

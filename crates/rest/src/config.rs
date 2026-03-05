@@ -66,6 +66,9 @@ pub enum StorageBackendMode {
     /// AWS S3 object storage for CRUD, versioning, history, and bulk operations.
     /// Requires AWS credentials via the standard provider chain. No search support.
     S3,
+    /// AWS S3 for CRUD + Elasticsearch for search.
+    /// Requires running Elasticsearch and AWS credentials via the standard provider chain.
+    S3Elasticsearch,
 }
 
 impl fmt::Display for StorageBackendMode {
@@ -78,6 +81,7 @@ impl fmt::Display for StorageBackendMode {
                 write!(f, "postgres-elasticsearch")
             }
             StorageBackendMode::S3 => write!(f, "s3"),
+            StorageBackendMode::S3Elasticsearch => write!(f, "s3-elasticsearch"),
         }
     }
 }
@@ -94,8 +98,11 @@ impl FromStr for StorageBackendMode {
                 Ok(StorageBackendMode::PostgresElasticsearch)
             }
             "s3" | "objectstore" => Ok(StorageBackendMode::S3),
+            "s3-elasticsearch" | "s3-es" | "objectstore-elasticsearch" | "objectstore-es" => {
+                Ok(StorageBackendMode::S3Elasticsearch)
+            }
             _ => Err(format!(
-                "Invalid storage backend '{}'. Valid values: sqlite, sqlite-elasticsearch, postgres, postgres-elasticsearch, s3",
+                "Invalid storage backend '{}'. Valid values: sqlite, sqlite-elasticsearch, postgres, postgres-elasticsearch, s3, s3-elasticsearch",
                 s
             )),
         }
@@ -304,12 +311,12 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_MAX_PAGE_SIZE", default_value = "1000")]
     pub max_page_size: usize,
 
-    /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres, postgres-elasticsearch, or s3.
+    /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres, postgres-elasticsearch, s3, or s3-elasticsearch.
     #[arg(long, env = "HFS_STORAGE_BACKEND", default_value = "sqlite")]
     pub storage_backend: String,
 
     /// Elasticsearch node URLs (comma-separated).
-    /// Used when storage_backend is sqlite-elasticsearch or postgres-elasticsearch.
+    /// Used when storage_backend is sqlite-elasticsearch, postgres-elasticsearch, or s3-elasticsearch.
     #[arg(
         long,
         env = "HFS_ELASTICSEARCH_NODES",
@@ -641,6 +648,20 @@ mod tests {
             "S3".parse::<StorageBackendMode>().unwrap(),
             StorageBackendMode::S3
         );
+        assert_eq!(
+            "s3-elasticsearch".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::S3Elasticsearch
+        );
+        assert_eq!(
+            "s3-es".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::S3Elasticsearch
+        );
+        assert_eq!(
+            "objectstore-elasticsearch"
+                .parse::<StorageBackendMode>()
+                .unwrap(),
+            StorageBackendMode::S3Elasticsearch
+        );
         assert!("invalid".parse::<StorageBackendMode>().is_err());
     }
 
@@ -657,6 +678,10 @@ mod tests {
             "postgres-elasticsearch"
         );
         assert_eq!(StorageBackendMode::S3.to_string(), "s3");
+        assert_eq!(
+            StorageBackendMode::S3Elasticsearch.to_string(),
+            "s3-elasticsearch"
+        );
     }
 
     #[test]

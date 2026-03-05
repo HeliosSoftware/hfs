@@ -11,7 +11,7 @@ use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
 use crate::core::ResourceStorage;
-use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
+use crate::error::{BackendError, StorageError, StorageResult};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::tenant::TenantContext;
@@ -103,6 +103,35 @@ fn collect_strings(value: &Value, parts: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// Ensures the JSON resource payload has the expected `resourceType` and `id`.
+fn normalize_resource_shape(resource_type: &str, id: &str, mut resource: Value) -> Value {
+    if let Some(obj) = resource.as_object_mut() {
+        obj.insert(
+            "resourceType".to_string(),
+            Value::String(resource_type.to_string()),
+        );
+        obj.insert("id".to_string(), Value::String(id.to_string()));
+    }
+    resource
+}
+
+/// Returns the requested version encoded in `resource.meta.versionId`, if any.
+fn requested_version(resource: &Value) -> Option<u64> {
+    resource
+        .get("meta")
+        .and_then(|m| m.get("versionId"))
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+/// Parses `version_id` from an ES `_source` object.
+fn source_version(source: &Value) -> Option<u64> {
+    source
+        .get("version_id")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<u64>().ok())
 }
 
 /// Builds an ES document from a FHIR resource and its extracted search values.
@@ -271,17 +300,8 @@ impl ResourceStorage for ElasticsearchBackend {
             .map(String::from)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let version_id = "1";
-
-        // Ensure the resource has correct type and id
-        let mut resource = resource;
-        if let Some(obj) = resource.as_object_mut() {
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-            obj.insert("id".to_string(), Value::String(id.clone()));
-        }
+        let resource = normalize_resource_shape(resource_type, &id, resource);
+        let version_id = requested_version(&resource).unwrap_or(1).to_string();
 
         // Extract search parameters
         let extracted_values = self
@@ -294,7 +314,7 @@ impl ResourceStorage for ElasticsearchBackend {
             tenant_id,
             resource_type,
             &id,
-            version_id,
+            &version_id,
             &resource,
             fhir_version,
             &extracted_values,
@@ -328,7 +348,7 @@ impl ResourceStorage for ElasticsearchBackend {
         Ok(StoredResource::from_storage(
             resource_type,
             &id,
-            version_id,
+            &version_id,
             tenant.tenant_id().clone(),
             resource,
             now,
@@ -347,6 +367,8 @@ impl ResourceStorage for ElasticsearchBackend {
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
         let tenant_id = tenant.tenant_id().as_str();
+        let resource = normalize_resource_shape(resource_type, id, resource);
+        let requested_version = requested_version(&resource);
 
         // Check if document exists
         let index = self.index_name(tenant_id, resource_type);
@@ -358,29 +380,48 @@ impl ResourceStorage for ElasticsearchBackend {
             .send()
             .await;
 
-        let (version_id, is_new) = match existing {
+        let mut existing_source = None;
+        let existing_version = match existing {
             Ok(resp) if resp.status_code().is_success() => {
                 let body = resp.json::<Value>().await.unwrap_or_default();
-                let current_version: u64 = body
-                    .get("_source")
-                    .and_then(|s| s.get("version_id"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                ((current_version + 1).to_string(), false)
+                existing_source = body.get("_source").cloned();
+                existing_source.as_ref().and_then(source_version)
             }
-            _ => ("1".to_string(), true),
+            _ => None,
         };
 
-        // Ensure resource has correct type and id
-        let mut resource = resource;
-        if let Some(obj) = resource.as_object_mut() {
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-            obj.insert("id".to_string(), Value::String(id.to_string()));
+        // Idempotency guard: if this is a replay or stale event, keep current state.
+        if let (Some(existing), Some(requested)) = (existing_version, requested_version) {
+            if requested <= existing {
+                if let Some(ref source) = existing_source {
+                    if let Some(stored) = parse_stored_resource(source, tenant)? {
+                        return Ok((stored, false));
+                    }
+                }
+
+                let now = Utc::now();
+                return Ok((
+                    StoredResource::from_storage(
+                        resource_type,
+                        id,
+                        existing.to_string(),
+                        tenant.tenant_id().clone(),
+                        resource,
+                        now,
+                        now,
+                        None,
+                        fhir_version,
+                    ),
+                    false,
+                ));
+            }
         }
+
+        let version_id = requested_version
+            .or(existing_version.map(|v| v.saturating_add(1)))
+            .unwrap_or(1)
+            .to_string();
+        let is_new = existing_version.is_none();
 
         // Extract search parameters
         let extracted_values = self
@@ -504,14 +545,7 @@ impl ResourceStorage for ElasticsearchBackend {
         let version_id = new_version.to_string();
         let fhir_version = current.fhir_version();
 
-        let mut resource = resource;
-        if let Some(obj) = resource.as_object_mut() {
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-        }
+        let resource = normalize_resource_shape(resource_type, id, resource);
 
         let extracted_values = self
             .search_extractor()
@@ -584,10 +618,8 @@ impl ResourceStorage for ElasticsearchBackend {
         let status = response.status_code();
         if !status.is_success() {
             if status.as_u16() == 404 {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
+                // Idempotent delete semantics for sync replay safety.
+                return Ok(());
             }
             let body = response.text().await.unwrap_or_default();
             return Err(internal_error(format!(
@@ -608,11 +640,7 @@ impl ResourceStorage for ElasticsearchBackend {
 
         let index_pattern = match resource_type {
             Some(rt) => self.index_name(tenant_id, rt),
-            None => format!(
-                "{}_{}_*",
-                self.config().index_prefix,
-                tenant_id.to_lowercase()
-            ),
+            None => format!("{}_*", self.tenant_index_prefix(tenant_id)),
         };
 
         let query = json!({

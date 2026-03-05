@@ -276,9 +276,38 @@ impl ElasticsearchBackend {
         format!(
             "{}_{}_{}",
             self.config.index_prefix,
-            tenant_id.to_lowercase(),
-            resource_type.to_lowercase()
+            Self::sanitize_index_segment(tenant_id),
+            Self::sanitize_index_segment(resource_type)
         )
+    }
+
+    /// Returns the per-tenant index prefix (`{index_prefix}_{tenant}`).
+    pub(crate) fn tenant_index_prefix(&self, tenant_id: &str) -> String {
+        format!(
+            "{}_{}",
+            self.config.index_prefix,
+            Self::sanitize_index_segment(tenant_id)
+        )
+    }
+
+    /// Sanitizes a segment for Elasticsearch index naming.
+    fn sanitize_index_segment(segment: &str) -> String {
+        let mut out = String::with_capacity(segment.len());
+        for ch in segment.chars() {
+            let lower = ch.to_ascii_lowercase();
+            if lower.is_ascii_lowercase() || lower.is_ascii_digit() || lower == '-' {
+                out.push(lower);
+            } else {
+                out.push('-');
+            }
+        }
+
+        let trimmed = out.trim_matches('-');
+        if trimmed.is_empty() {
+            return "default".to_string();
+        }
+
+        trimmed.to_string()
     }
 
     /// Returns the ES document ID for a resource.

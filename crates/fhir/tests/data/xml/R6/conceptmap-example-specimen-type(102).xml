@@ -16,14 +16,14 @@
       <a name="102"> </a>
       <a name="hc102"> </a>
       <p>Mapping from 
-        <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0487.html">hl7VS-specimenType</a> to 
+        <a href="http://terminology.hl7.org/7.0.1/ValueSet-v2-0487.html">hl7VS-specimenType</a> to 
         <a href="https://browser.ihtsdotools.org/">All Codes SCT ValueSet</a>
       </p>
       <br/>
       <p>
         <b>Group 1 </b>Mapping from 
-        <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0487.html">specimenType</a> to 
-        <code>http://snomed.info/sct</code>
+        <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0487.html">specimenType</a> to 
+        <code>http://snomed.info/sct</code> (SNOMED CT International Edition)
       </p>
       <table class="grid">
         <tr>
@@ -43,7 +43,7 @@
         <tr>
           <td colspan="2">
             <b>Codes</b> from 
-            <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0487.html" title="http://terminology.hl7.org/CodeSystem/v2-0487">specimenType</a>
+            <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0487.html" title="http://terminology.hl7.org/CodeSystem/v2-0487">specimenType</a>
           </td>
           <td/>
           <td colspan="2">

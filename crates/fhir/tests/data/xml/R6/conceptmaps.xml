@@ -3,7 +3,7 @@
 <Bundle xmlns="http://hl7.org/fhir">
   <id value="conceptmaps"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
   </meta>
   <type value="collection"/>
   <entry>
@@ -21,13 +21,13 @@
             <a name="hccm-administrative-gender-v2"> </a>
             <p>Mapping from 
               <a href="valueset-administrative-gender.html">AdministrativeGender</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0001.html">hl7VS-administrativeSex</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v2-0001.html">hl7VS-administrativeSex</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-administrative-gender.html">AdministrativeGender</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0001.html">administrativeSex</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0001.html">administrativeSex</a>
             </p>
 
             <table class="grid">
@@ -56,7 +56,7 @@
 
                 <td colspan="2">
                   <b>Codes</b> from 
-                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0001.html" title="http://terminology.hl7.org/CodeSystem/v2-0001">administrativeSex</a>
+                  <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0001.html" title="http://terminology.hl7.org/CodeSystem/v2-0001">administrativeSex</a>
                 </td>
 
                 <td/>
@@ -150,7 +150,7 @@
         <title value="v2 map for AdministrativeGender"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -223,13 +223,13 @@
             <a name="hccm-administrative-gender-v3"> </a>
             <p>Mapping from 
               <a href="valueset-administrative-gender.html">AdministrativeGender</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AdministrativeGender.html">AdministrativeGender</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v3-AdministrativeGender.html">AdministrativeGender</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-administrative-gender.html">AdministrativeGender</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AdministrativeGender.html">AdministrativeGender</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-AdministrativeGender.html">AdministrativeGender</a>
             </p>
 
             <table class="grid">
@@ -293,7 +293,7 @@
         <title value="v3 map for AdministrativeGender"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -360,13 +360,13 @@
             <a name="hccm-document-reference-status-v3"> </a>
             <p>Mapping from 
               <a href="valueset-document-reference-status.html">DocumentReferenceStatus</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-ActStatus.html">ActStatus</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v3-ActStatus.html">ActStatus</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-document-reference-status.html">DocumentReferenceStatus</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ActStatus.html">ActStatus</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-ActStatus.html">ActStatus</a>
             </p>
 
             <table class="grid">
@@ -420,7 +420,7 @@
         <title value="v3 map for DocumentReferenceStatus"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -480,13 +480,13 @@
             <a name="hccm-name-use-v2"> </a>
             <p>Mapping from 
               <a href="valueset-name-use.html">NameUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0200.html">hl7VS-nameType</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v2-0200.html">hl7VS-nameType</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-name-use.html">NameUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0200.html">nameType2</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0200.html">nameType2</a>
             </p>
 
             <table class="grid">
@@ -515,7 +515,7 @@
 
                 <td colspan="2">
                   <b>Codes</b> from 
-                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0200.html" title="http://terminology.hl7.org/CodeSystem/v2-0200">nameType2</a>
+                  <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0200.html" title="http://terminology.hl7.org/CodeSystem/v2-0200">nameType2</a>
                 </td>
 
                 <td/>
@@ -657,7 +657,7 @@
         <title value="v2 map for NameUse"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -761,13 +761,13 @@
             <a name="hccm-name-use-v3"> </a>
             <p>Mapping from 
               <a href="valueset-name-use.html">NameUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-EntityNameUseR2.html">EntityNameUseR2</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v3-EntityNameUseR2.html">EntityNameUseR2</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-name-use.html">NameUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-EntityNameUseR2.html">EntityNameUseR2</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-EntityNameUseR2.html">EntityNameUseR2</a>
             </p>
 
             <table class="grid">
@@ -861,7 +861,7 @@
         <title value="v3 map for NameUse"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -959,13 +959,13 @@
             <a name="hccm-address-use-v2"> </a>
             <p>Mapping from 
               <a href="valueset-address-use.html">AddressUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0190.html">hl7VS-addressType</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v2-0190.html">hl7VS-addressType</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-address-use.html">AddressUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0190.html">addressType</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0190.html">addressType</a>
             </p>
 
             <table class="grid">
@@ -1052,7 +1052,7 @@
         <title value="v2 map for AddressUse"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -1137,13 +1137,13 @@
             <a name="hccm-address-use-v3"> </a>
             <p>Mapping from 
               <a href="valueset-address-use.html">AddressUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v3-AddressUse.html">AddressUse</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-address-use.html">AddressUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-AddressUse.html">AddressUse</a>
             </p>
 
             <table class="grid">
@@ -1172,7 +1172,7 @@
 
                 <td colspan="2">
                   <b>Codes</b> from 
-                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html" title="http://terminology.hl7.org/CodeSystem/v3-AddressUse">AddressUse</a>
+                  <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-AddressUse.html" title="http://terminology.hl7.org/CodeSystem/v3-AddressUse">AddressUse</a>
                 </td>
 
                 <td/>
@@ -1266,7 +1266,7 @@
         <title value="v3 map for AddressUse"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -1349,13 +1349,13 @@
             <a name="hccm-address-type-v3"> </a>
             <p>Mapping from 
               <a href="valueset-address-type.html">AddressType</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v3-AddressUse.html">AddressUse</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-address-type.html">AddressType</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-AddressUse.html">AddressUse</a>
             </p>
 
             <table class="grid">
@@ -1399,7 +1399,7 @@
         <title value="v3 map for AddressType"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -1462,13 +1462,13 @@
             <a name="hccm-contact-point-system-v2"> </a>
             <p>Mapping from 
               <a href="valueset-contact-point-system.html">ContactPointSystem</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0202.html">hl7VS-telecommunicationEquipmentType</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v2-0202.html">hl7VS-telecommunicationEquipmentType</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-contact-point-system.html">ContactPointSystem</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0202.html">telecommunicationEquipmentType</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0202.html">telecommunicationEquipmentType</a>
             </p>
 
             <table class="grid">
@@ -1555,7 +1555,7 @@
         <title value="v2 map for ContactPointSystem"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -1641,13 +1641,13 @@
             <a name="hccm-contact-point-use-v2"> </a>
             <p>Mapping from 
               <a href="valueset-contact-point-use.html">ContactPointUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0201.html">hl7VS-telecommunicationUseCode</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v2-0201.html">hl7VS-telecommunicationUseCode</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-contact-point-use.html">ContactPointUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0201.html">telecommunicationUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0201.html">telecommunicationUse</a>
             </p>
 
             <table class="grid">
@@ -1676,7 +1676,7 @@
 
                 <td colspan="2">
                   <b>Codes</b> from 
-                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0201.html" title="http://terminology.hl7.org/CodeSystem/v2-0201">telecommunicationUse</a>
+                  <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0201.html" title="http://terminology.hl7.org/CodeSystem/v2-0201">telecommunicationUse</a>
                 </td>
 
                 <td/>
@@ -1770,7 +1770,7 @@
         <title value="v2 map for ContactPointUse"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -1851,13 +1851,13 @@
             <a name="hccm-contact-point-use-v3"> </a>
             <p>Mapping from 
               <a href="valueset-contact-point-use.html">ContactPointUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v3-AddressUse.html">AddressUse</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-contact-point-use.html">ContactPointUse</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-AddressUse.html">AddressUse</a>
             </p>
 
             <table class="grid">
@@ -1886,7 +1886,7 @@
 
                 <td colspan="2">
                   <b>Codes</b> from 
-                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html" title="http://terminology.hl7.org/CodeSystem/v3-AddressUse">AddressUse</a>
+                  <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-AddressUse.html" title="http://terminology.hl7.org/CodeSystem/v3-AddressUse">AddressUse</a>
                 </td>
 
                 <td/>
@@ -1996,7 +1996,7 @@
         <title value="v3 map for ContactPointUse"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2025-11-27T16:48:47+00:00"/>
+        <date value="2025-12-17T09:50:17+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -2089,7 +2089,7 @@
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-detectedissue-severity.html">Detected Issue Severity</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ObservationValue.html">ObservationValue</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-ObservationValue.html">ObservationValue</a>
             </p>
 
             <table class="grid">
@@ -2203,7 +2203,7 @@
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-composition-status.html">Composition Status</a> to 
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ActStatus.html">ActStatus</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-ActStatus.html">ActStatus</a>
             </p>
 
             <table class="grid">
@@ -2322,7 +2322,7 @@
       <ConceptMap>
         <id value="101"/>
         <meta>
-          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+          <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -2342,7 +2342,7 @@
         
               <a href="valueset-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -2354,7 +2354,7 @@
         
               <a href="codesystem-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -2557,7 +2557,7 @@
       <ConceptMap>
         <id value="103"/>
         <meta>
-          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+          <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -2585,9 +2585,9 @@
         
               <b>Group 1 </b>Mapping from 
         
-              <code>http://snomed.info/sct</code> to 
+              <code>http://snomed.info/sct</code> (SNOMED CT International Edition) to 
         
-              <code>http://hl7.org/fhir/sid/icd-10-cm</code>
+              <code>http://hl7.org/fhir/sid/icd-10-cm</code> (International Classification of Diseases, 10th Revision, Clinical Modification (ICD-10-CM))
       
             </p>
       
@@ -2722,7 +2722,7 @@
       <ConceptMap>
         <id value="102"/>
         <meta>
-          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+          <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -2740,7 +2740,7 @@
       
             <p>Mapping from 
         
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0487.html">hl7VS-specimenType</a> to 
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v2-0487.html">hl7VS-specimenType</a> to 
         
               <a href="https://browser.ihtsdotools.org/">All Codes SCT ValueSet</a>
       
@@ -2752,9 +2752,9 @@
         
               <b>Group 1 </b>Mapping from 
         
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0487.html">specimenType</a> to 
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0487.html">specimenType</a> to 
         
-              <code>http://snomed.info/sct</code>
+              <code>http://snomed.info/sct</code> (SNOMED CT International Edition)
       
             </p>
       
@@ -2794,7 +2794,7 @@
             
                   <b>Codes</b> from 
             
-                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0487.html" title="http://terminology.hl7.org/CodeSystem/v2-0487">specimenType</a>
+                  <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v2-0487.html" title="http://terminology.hl7.org/CodeSystem/v2-0487">specimenType</a>
           
                 </td>
           
@@ -11325,7 +11325,7 @@
       <ConceptMap>
         <id value="example2"/>
         <meta>
-          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+          <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -11491,7 +11491,7 @@
       <ConceptMap>
         <id value="example-metadata"/>
         <meta>
-          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+          <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -11511,7 +11511,7 @@
         
               <a href="valueset-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -11523,7 +11523,7 @@
         
               <a href="codesystem-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -11750,7 +11750,7 @@
       <ConceptMap>
         <id value="example-metadata-2"/>
         <meta>
-          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+          <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -11770,7 +11770,7 @@
         
               <a href="valueset-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/ValueSet-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -11782,7 +11782,7 @@
         
               <a href="codesystem-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.1/CodeSystem-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -12013,7 +12013,7 @@
       <ConceptMap>
         <id value="example-priority"/>
         <meta>
-          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+          <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -12259,7 +12259,7 @@
       <ConceptMap>
         <id value="message-adt-a04-to-bundle"/>
         <meta>
-          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+          <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
         </meta>
         <text>
           <status value="generated"/>

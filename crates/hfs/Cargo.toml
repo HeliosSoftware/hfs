@@ -52,6 +52,7 @@ tracing = "0.1"
 
 # Error handling
 anyhow = "1.0"
+parking_lot = "0.12"
 
 # Vendor OpenSSL when cross-compiling for Linux ARM64 (the macOS runner
 # doesn't have target-platform OpenSSL dev libs).  Cargo feature unification

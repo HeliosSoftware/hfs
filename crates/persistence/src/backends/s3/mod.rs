@@ -12,10 +12,14 @@ mod client;
 mod config;
 mod keyspace;
 mod models;
+#[cfg(feature = "elasticsearch")]
+mod reindex_es;
 mod storage;
 
 pub use backend::S3Backend;
 pub use config::{S3BackendConfig, S3TenancyMode};
+#[cfg(feature = "elasticsearch")]
+pub use reindex_es::{S3ToElasticsearchReindexOptions, S3ToElasticsearchReindexReport};
 
 #[cfg(test)]
 mod tests;

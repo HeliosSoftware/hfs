@@ -521,16 +521,100 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### How Search Offloading Works
 
-When `HFS_STORAGE_BACKEND` is set to `sqlite-elasticsearch` or `postgres-elasticsearch`, the server:
+When `HFS_STORAGE_BACKEND` is set to `sqlite-elasticsearch`, `postgres-elasticsearch`, or `s3-elasticsearch`, the server:
 
-1. Creates the primary backend (SQLite or PostgreSQL) with search indexing **disabled**
-2. Creates an Elasticsearch backend sharing the primary backend's search parameter registry
+1. Creates the primary backend (SQLite, PostgreSQL, or S3)
+2. Creates an Elasticsearch backend with a shared SearchParameter registry
 3. Wraps both in a `CompositeStorage` that routes:
    - All **writes** (create, update, delete, conditional ops, transactions) → primary backend, then syncs to ES
    - All **reads** (read, vread, history) → primary backend
    - All **search** operations → Elasticsearch
 
-This avoids data duplication in the primary backend's search tables while providing Elasticsearch's superior search capabilities.
+For SQL primaries (SQLite/PostgreSQL), primary search indexing is disabled to avoid duplicate indexing. For S3 primary, search is never attempted on S3; all search and count queries are delegated to Elasticsearch.
+
+Write sync to Elasticsearch is idempotent and version-aware:
+- Replayed events are safe (same version is ignored)
+- Stale events are ignored (lower version than current ES document)
+- Delete replay is idempotent (missing ES document is treated as converged)
+
+Partial sync failures do not roll back successful primary writes. Failures are logged with tenant/resource/backend metadata, and operators can repair drift via the S3->ES reindex utility.
+
+## S3 + Elasticsearch (`s3-elasticsearch`)
+
+`s3-elasticsearch` is the object-storage-first polyglot mode:
+- **Source of truth:** S3 (`create`, `read`, `update`, `delete`, `vread`, `_history`)
+- **Search engine:** Elasticsearch (`search`, `search_count`, `_text`, `_content`, include/revinclude search lookups)
+- **No S3 search scanning:** S3 `SearchProvider` remains unsupported and is not used in this mode
+
+### Startup Configuration
+
+```bash
+HFS_STORAGE_BACKEND=s3-elasticsearch \
+HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
+HFS_ELASTICSEARCH_INDEX_PREFIX=hfs \
+HFS_S3_TENANCY_MODE=prefix-per-tenant \
+HFS_S3_BUCKET=hfs \
+HFS_S3_ENDPOINT_URL=http://localhost:9000 \
+HFS_S3_ALLOW_HTTP=true \
+HFS_S3_FORCE_PATH_STYLE=true \
+  ./hfs
+```
+
+### Reindex / Repair
+
+Use startup-triggered rebuild to repair Elasticsearch from S3 current objects:
+
+```bash
+HFS_STORAGE_BACKEND=s3-elasticsearch \
+HFS_S3_ES_REINDEX_ON_STARTUP=true \
+HFS_S3_ES_REINDEX_BATCH_SIZE=500 \
+HFS_S3_ES_REINDEX_CLEAR_EXISTING=false \
+HFS_S3_ES_REINDEX_RESOURCE_TYPES=Patient,Observation \
+  ./hfs
+```
+
+Notes:
+- Reindex currently runs for the configured default tenant (`HFS_DEFAULT_TENANT`)
+- Tombstoned S3 resources trigger idempotent deletes in Elasticsearch
+- ES refresh timing can delay immediate visibility; integration tests use explicit refresh + retry
+
+### Local Dev Recipe (MinIO + Elasticsearch)
+
+```bash
+# MinIO
+docker run -d --name hfs-minio -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin \
+  -e MINIO_ROOT_PASSWORD=minioadmin \
+  minio/minio:RELEASE.2025-02-28T09-55-16Z \
+  server /data --console-address :9001
+
+# Elasticsearch
+docker run -d --name hfs-es -p 9200:9200 \
+  -e discovery.type=single-node \
+  -e xpack.security.enabled=false \
+  -e ES_JAVA_OPTS=\"-Xms512m -Xmx512m\" \
+  elasticsearch:8.15.0
+
+# Start HFS in S3+ES mode
+HFS_STORAGE_BACKEND=s3-elasticsearch \
+HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
+HFS_S3_TENANCY_MODE=prefix-per-tenant \
+HFS_S3_BUCKET=hfs \
+HFS_S3_ENDPOINT_URL=http://localhost:9000 \
+HFS_S3_ALLOW_HTTP=true \
+HFS_S3_FORCE_PATH_STYLE=true \
+AWS_ACCESS_KEY_ID=minioadmin \
+AWS_SECRET_ACCESS_KEY=minioadmin \
+AWS_REGION=us-east-1 \
+  ./target/release/hfs
+```
+
+Implementation notes and milestone records:
+- `crates/persistence/docs/s3-elasticsearch/M1.md`
+- `crates/persistence/docs/s3-elasticsearch/M2.md`
+- `crates/persistence/docs/s3-elasticsearch/M3.md`
+- `crates/persistence/docs/s3-elasticsearch/M4.md`
+- `crates/persistence/docs/s3-elasticsearch/IMPLEMENTATION.md`
 
 ## Elasticsearch Backend
 

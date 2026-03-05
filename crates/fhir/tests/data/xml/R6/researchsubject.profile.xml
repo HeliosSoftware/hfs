@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ResearchSubject"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -208,7 +208,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">candidate | in-prescreening | in-screening | eligible | ineligible | on-study | on-study-intervention | in-follow-up | off-study
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-research-subject-state.html">ResearchSubjectState</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-research-subject-state.html">ResearchSubjectState</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -268,7 +268,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">State change reason
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-state-change-reason.html">StateChangeReason</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-state-change-reason.html">StateChangeReason</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -309,7 +309,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-research-subject-milestone.html">ResearchSubjectMilestone</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-research-subject-milestone.html">ResearchSubjectMilestone</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -350,7 +350,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-state-change-reason.html">StateChangeReason</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-state-change-reason.html">StateChangeReason</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
             <br/>
@@ -428,7 +428,7 @@
   <name value="ResearchSubject"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2025-12-17T09:50:17+00:00"/>
   <publisher value="HL7 International / Biomedical Research and Regulation"/>
   <contact>
     <telecom>

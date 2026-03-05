@@ -84,6 +84,10 @@ fn test_index_name() {
         backend.index_name("tenant-1", "Observation"),
         "hfs_tenant-1_observation"
     );
+    assert_eq!(
+        backend.index_name("acme/research", "Observation"),
+        "hfs_acme-research_observation"
+    );
 }
 
 // ============================================================================
@@ -949,6 +953,94 @@ mod es_integration {
         assert_eq!(resource.content()["name"][0]["family"], "Second");
     }
 
+    #[tokio::test]
+    async fn es_integration_create_or_update_ignores_stale_version() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                "versioned-id",
+                json!({
+                    "resourceType": "Patient",
+                    "meta": {"versionId": "5"},
+                    "name": [{"family": "Newest"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                "versioned-id",
+                json!({
+                    "resourceType": "Patient",
+                    "meta": {"versionId": "4"},
+                    "name": [{"family": "Stale"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let current = backend
+            .read(&tenant, "Patient", "versioned-id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version_id(), "5");
+        assert_eq!(current.content()["name"][0]["family"], "Newest");
+    }
+
+    #[tokio::test]
+    async fn es_integration_create_or_update_replay_same_version_is_idempotent() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                "replay-id",
+                json!({
+                    "resourceType": "Patient",
+                    "meta": {"versionId": "9"},
+                    "name": [{"family": "Initial"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                "replay-id",
+                json!({
+                    "resourceType": "Patient",
+                    "meta": {"versionId": "9"},
+                    "name": [{"family": "ReplayAttempt"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let current = backend
+            .read(&tenant, "Patient", "replay-id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version_id(), "9");
+        assert_eq!(current.content()["name"][0]["family"], "Initial");
+    }
+
     // ========================================================================
     // Delete Tests
     // ========================================================================
@@ -980,12 +1072,12 @@ mod es_integration {
     }
 
     #[tokio::test]
-    async fn es_integration_delete_nonexistent_fails() {
+    async fn es_integration_delete_nonexistent_is_idempotent() {
         let backend = create_backend().await;
         let tenant = create_tenant("test-tenant");
 
         let result = backend.delete(&tenant, "Patient", "nonexistent").await;
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     // ========================================================================
@@ -1130,9 +1222,9 @@ mod es_integration {
             .await
             .unwrap();
 
-        // Tenant B cannot delete tenant A's resource
+        // Tenant B delete is idempotent against its own tenant namespace.
         let result = backend.delete(&tenant_b, "Patient", created.id()).await;
-        assert!(result.is_err());
+        assert!(result.is_ok());
 
         // Resource still exists for tenant A
         assert!(

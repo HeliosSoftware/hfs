@@ -39,7 +39,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
 use crate::core::ResourceStorage;
-use crate::error::{StorageError, StorageResult};
+use crate::error::{ResourceError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use crate::types::StoredResource;
 
@@ -54,6 +54,8 @@ pub enum SyncEvent {
         resource_type: String,
         /// Resource ID.
         resource_id: String,
+        /// Resource version.
+        version: String,
         /// Resource content.
         content: Value,
         /// Tenant ID.
@@ -125,6 +127,15 @@ impl SyncEvent {
             SyncEvent::Update { tenant_id, .. } => tenant_id,
             SyncEvent::Delete { tenant_id, .. } => tenant_id,
             SyncEvent::BulkSync { tenant_id, .. } => tenant_id,
+        }
+    }
+
+    /// Returns the resource version for this event (if applicable).
+    pub fn version(&self) -> Option<&str> {
+        match self {
+            SyncEvent::Create { version, .. } => Some(version),
+            SyncEvent::Update { version, .. } => Some(version),
+            SyncEvent::Delete { .. } | SyncEvent::BulkSync { .. } => None,
         }
     }
 }
@@ -433,6 +444,26 @@ impl SyncManager {
         backend: &dyn ResourceStorage,
         retry_config: &RetryConfig,
     ) -> StorageResult<()> {
+        fn inject_version(mut content: Value, version: &str) -> Value {
+            let Some(obj) = content.as_object_mut() else {
+                return content;
+            };
+
+            let meta = obj
+                .entry("meta")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+
+            if !meta.is_object() {
+                *meta = Value::Object(serde_json::Map::new());
+            }
+
+            if let Some(meta_obj) = meta.as_object_mut() {
+                meta_obj.insert("versionId".to_string(), Value::String(version.to_string()));
+            }
+
+            content
+        }
+
         let mut delay = retry_config.initial_delay;
         let mut attempts = 0;
 
@@ -442,6 +473,8 @@ impl SyncManager {
             let result = match event {
                 SyncEvent::Create {
                     resource_type,
+                    resource_id,
+                    version,
                     content,
                     tenant_id,
                     fhir_version,
@@ -449,14 +482,22 @@ impl SyncManager {
                 } => {
                     let tenant =
                         TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
+                    let content = inject_version(content.clone(), version);
                     backend
-                        .create(&tenant, resource_type, content.clone(), *fhir_version)
+                        .create_or_update(
+                            &tenant,
+                            resource_type,
+                            resource_id,
+                            content,
+                            *fhir_version,
+                        )
                         .await
                         .map(|_| ())
                 }
                 SyncEvent::Update {
                     resource_type,
                     resource_id,
+                    version,
                     content,
                     tenant_id,
                     fhir_version,
@@ -464,15 +505,13 @@ impl SyncManager {
                 } => {
                     let tenant =
                         TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
-
-                    // For secondary backends, we do a create_or_update
-                    // since we don't track versions in secondaries
+                    let content = inject_version(content.clone(), version);
                     backend
                         .create_or_update(
                             &tenant,
                             resource_type,
                             resource_id,
-                            content.clone(),
+                            content,
                             *fhir_version,
                         )
                         .await
@@ -485,7 +524,12 @@ impl SyncManager {
                 } => {
                     let tenant =
                         TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
-                    backend.delete(&tenant, resource_type, resource_id).await
+                    match backend.delete(&tenant, resource_type, resource_id).await {
+                        Ok(()) => Ok(()),
+                        Err(StorageError::Resource(ResourceError::NotFound { .. }))
+                        | Err(StorageError::Resource(ResourceError::Gone { .. })) => Ok(()),
+                        Err(err) => Err(err),
+                    }
                 }
                 SyncEvent::BulkSync {
                     resources,
@@ -661,14 +705,147 @@ pub struct ReconciliationResult {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use async_trait::async_trait;
+    use chrono::Utc;
     use helios_fhir::FhirVersion;
+    use serde_json::json;
+
+    use crate::core::ResourceStorage;
+    use crate::error::ResourceError;
+    use crate::types::StoredResource;
+
+    #[derive(Default)]
+    struct MockSyncBackend {
+        captured_version: Mutex<Option<String>>,
+        delete_calls: Mutex<u64>,
+        missing_on_delete: bool,
+    }
+
+    impl MockSyncBackend {
+        fn missing_delete() -> Self {
+            Self {
+                missing_on_delete: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ResourceStorage for MockSyncBackend {
+        fn backend_name(&self) -> &'static str {
+            "mock-sync"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            Err(StorageError::Backend(
+                crate::error::BackendError::UnsupportedCapability {
+                    backend_name: "mock-sync".to_string(),
+                    capability: "create".to_string(),
+                },
+            ))
+        }
+
+        async fn create_or_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            let version = resource
+                .get("meta")
+                .and_then(|m| m.get("versionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("1")
+                .to_string();
+            *self
+                .captured_version
+                .lock()
+                .expect("version mutex poisoned") = Some(version.clone());
+
+            Ok((
+                StoredResource::from_storage(
+                    resource_type,
+                    id,
+                    version,
+                    tenant.tenant_id().clone(),
+                    resource,
+                    Utc::now(),
+                    Utc::now(),
+                    None,
+                    fhir_version,
+                ),
+                false,
+            ))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            Err(StorageError::Backend(
+                crate::error::BackendError::UnsupportedCapability {
+                    backend_name: "mock-sync".to_string(),
+                    capability: "update".to_string(),
+                },
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<()> {
+            *self
+                .delete_calls
+                .lock()
+                .expect("delete calls mutex poisoned") += 1;
+            if self.missing_on_delete {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+    }
 
     #[test]
     fn test_sync_event_accessors() {
         let event = SyncEvent::Create {
             resource_type: "Patient".to_string(),
             resource_id: "123".to_string(),
+            version: "1".to_string(),
             content: serde_json::json!({}),
             tenant_id: TenantId::new("test"),
             fhir_version: FhirVersion::default(),
@@ -676,6 +853,7 @@ mod tests {
 
         assert_eq!(event.resource_type(), "Patient");
         assert_eq!(event.resource_id(), Some("123"));
+        assert_eq!(event.version(), Some("1"));
         assert_eq!(event.tenant_id().as_str(), "test");
     }
 
@@ -705,5 +883,59 @@ mod tests {
         let config = SyncConfig::default();
         let manager = SyncManager::new(config);
         assert!(manager.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_sync_create_injects_version_into_resource() {
+        let backend = MockSyncBackend::default();
+        let event = SyncEvent::Create {
+            resource_type: "Patient".to_string(),
+            resource_id: "p-1".to_string(),
+            version: "7".to_string(),
+            content: json!({
+                "resourceType": "Patient",
+                "id": "p-1"
+            }),
+            tenant_id: TenantId::new("tenant-a"),
+            fhir_version: FhirVersion::default(),
+        };
+
+        let retry = RetryConfig::default();
+        let result = SyncManager::sync_event_to_backend(&event, &backend, &retry).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            backend
+                .captured_version
+                .lock()
+                .expect("version mutex poisoned")
+                .as_deref(),
+            Some("7")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_delete_missing_resource_is_idempotent() {
+        let backend = Arc::new(MockSyncBackend::missing_delete());
+        let event = SyncEvent::Delete {
+            resource_type: "Patient".to_string(),
+            resource_id: "p-404".to_string(),
+            tenant_id: TenantId::new("tenant-a"),
+        };
+
+        let mut backends: HashMap<String, Arc<dyn ResourceStorage + Send + Sync>> = HashMap::new();
+        backends.insert("es".to_string(), backend);
+
+        let manager = SyncManager::new(SyncConfig {
+            mode: SyncMode::Synchronous,
+            ..Default::default()
+        });
+
+        let statuses = manager
+            .sync(&event, &backends)
+            .await
+            .expect("sync should succeed");
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].success);
+        assert!(statuses[0].error.is_none());
     }
 }

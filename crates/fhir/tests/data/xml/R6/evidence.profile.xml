@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Evidence"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2025-12-17T09:50:17.012+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -589,7 +589,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">documentation | justification | citation | predecessor | successor | derived-from | depends-on | composed-of | part-of | amends | amended-with | appends | appended-with | cites | cited-by | comments-on | comment-in | contains | contained-in | corrects | correction-in | replaces | replaced-with | retracts | retracted-by | signs | similar-to | supports | supported-with | transforms | transformed-into | transformed-with | documents | specification-of | created-with | cite-as | reprint | reprint-of | summarizes
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-artifact-relationship-type.html">Artifact Relationship Type</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-artifact-relationship-type.html">Artifact Relationship Type</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -855,7 +855,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Sub-classification of the role of the variable
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-variable-role-subtype.html">EvidenceVariableRoleSubtype</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-variable-role-subtype.html">EvidenceVariableRoleSubtype</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -940,7 +940,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">low | moderate | high | exact
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-directness.html">EvidenceDirectness</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-directness.html">EvidenceDirectness</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -961,7 +961,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The design of the synthesis (combination of studies) that produced this evidence
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-synthesis-type.html">StatisticSynthesisType</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-synthesis-type.html">StatisticSynthesisType</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
             <br/>
@@ -1066,7 +1066,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Type of statistic, e.g., relative risk
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-statistic-type.html">StatisticStatisticType</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-statistic-type.html">StatisticStatisticType</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1368,7 +1368,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The type of attribute estimate, e.g., confidence interval or p value
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-attribute-estimate-type.html">StatisticAttributeEstimateType</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-attribute-estimate-type.html">StatisticAttributeEstimateType</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1492,7 +1492,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Model specification
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-statistic-model-code.html">Statistic Model Code</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-statistic-model-code.html">Statistic Model Code</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1838,7 +1838,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Aspect of certainty being rated
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-certainty-type.html">Evidence Certainty Type</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-certainty-type.html">Evidence Certainty Type</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1860,7 +1860,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Assessment or judgement of the aspect
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-certainty-rating.html">StatisticCertaintyRating</a> (
+            <a href="http://terminology.hl7.org/7.0.1/ValueSet-certainty-rating.html">StatisticCertaintyRating</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1937,7 +1937,7 @@
   <name value="Evidence"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2025-12-17T09:50:17+00:00"/>
   <publisher value="HL7 International / Clinical Decision Support"/>
   <contact>
     <telecom>
