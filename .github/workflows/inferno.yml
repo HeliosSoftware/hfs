@@ -273,7 +273,12 @@ jobs:
       - name: Load Inferno test data into HFS
         if: matrix.backend != 's3-elasticsearch' || env.HFS_S3_BUCKET != ''
         run: |
-          ./crates/hfs/tests/inferno/install.sh
+          ./crates/hfs/tests/inferno/install.sh || {
+            echo "=== HFS log output ==="
+            cat "$HFS_LOG"
+            echo "=== end of log ==="
+            exit 1
+          }
 
       - name: Wait for Inferno to be ready
         if: matrix.backend != 's3-elasticsearch' || env.HFS_S3_BUCKET != ''
