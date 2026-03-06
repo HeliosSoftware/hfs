@@ -200,14 +200,14 @@ jobs:
       - name: Install AWS CLI
         if: matrix.backend == 's3-elasticsearch' && env.HFS_S3_BUCKET != ''
         run: |
-          if ! command -v aws &>/dev/null; then
+          if ! command -v aws &>/dev/null && ! /tmp/aws-bin/aws --version &>/dev/null; then
             curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-            unzip -q /tmp/awscliv2.zip -d /tmp
+            unzip -qo /tmp/awscliv2.zip -d /tmp
             /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin
-            echo "/tmp/aws-bin" >> $GITHUB_PATH
             rm -rf /tmp/awscliv2.zip /tmp/aws
           fi
-          aws --version || /tmp/aws-bin/aws --version
+          echo "/tmp/aws-bin" >> $GITHUB_PATH
+          /tmp/aws-bin/aws --version
 
       - name: Empty S3 prefix
         if: matrix.backend == 's3-elasticsearch' && env.HFS_S3_BUCKET != ''
