@@ -385,6 +385,7 @@ async fn start_s3(config: ServerConfig) -> anyhow::Result<()> {
 
     let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
     let region = std::env::var("HFS_S3_REGION").ok();
+    let prefix = std::env::var("HFS_S3_PREFIX").ok();
     let validate_buckets = std::env::var("HFS_S3_VALIDATE_BUCKETS")
         .map(|s| s.to_lowercase() != "false" && s != "0")
         .unwrap_or(true);
@@ -392,6 +393,7 @@ async fn start_s3(config: ServerConfig) -> anyhow::Result<()> {
     info!(
         bucket = %bucket,
         region = ?region,
+        prefix = ?prefix,
         validate_buckets = validate_buckets,
         "Initializing S3 backend"
     );
@@ -401,6 +403,7 @@ async fn start_s3(config: ServerConfig) -> anyhow::Result<()> {
             bucket: bucket.clone(),
         },
         region,
+        prefix,
         validate_buckets_on_startup: validate_buckets,
         ..Default::default()
     };
@@ -442,6 +445,7 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
 
     let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
     let region = std::env::var("HFS_S3_REGION").ok();
+    let prefix = std::env::var("HFS_S3_PREFIX").ok();
     let validate_buckets = std::env::var("HFS_S3_VALIDATE_BUCKETS")
         .map(|s| s.to_lowercase() != "false" && s != "0")
         .unwrap_or(true);
@@ -449,6 +453,7 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
     info!(
         bucket = %bucket,
         region = ?region,
+        prefix = ?prefix,
         validate_buckets = validate_buckets,
         "Initializing S3 backend"
     );
@@ -458,6 +463,7 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
             bucket: bucket.clone(),
         },
         region,
+        prefix,
         validate_buckets_on_startup: validate_buckets,
         ..Default::default()
     };

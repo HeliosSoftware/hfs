@@ -229,6 +229,7 @@ AWS_REGION=us-east-1 \
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | ES basic auth password |
 | `HFS_S3_BUCKET` | `hfs` | S3 bucket name (prefix-per-tenant mode) |
 | `HFS_S3_REGION` | *(AWS provider chain)* | AWS region override |
+| `HFS_S3_PREFIX` | *(none)* | Optional key prefix prepended to all S3 object keys |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
 
 For detailed backend setup instructions (building from source, Docker commands, and search offloading architecture), see the [persistence crate documentation](crates/persistence/README.md#building--running-storage-backends).
