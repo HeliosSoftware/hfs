@@ -23,6 +23,9 @@ R4B = ["helios-fhir/R4B", "helios-rest/R4B"]
 R5 = ["helios-fhir/R5", "helios-rest/R5"]
 R6 = ["helios-fhir/R6", "helios-rest/R6"]
 
+# Build options
+skip-r6-download = []
+
 # Database backends
 sqlite = ["helios-rest/sqlite"]
 postgres = ["helios-rest/postgres"]

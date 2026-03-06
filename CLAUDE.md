@@ -77,6 +77,8 @@ cd crates/pysof && uv run pytest python-tests/ -v
 cargo fmt --all
 
 # Lint code (with CI-compatible flags)
+# Note: --all-features is safe here — it enables the `skip-r6-download` feature
+# in all crates (fhir, fhir-gen, hfs), preventing R6 spec downloads from build.fhir.org.
 cargo clippy --all-targets --all-features -- -D warnings \
   -A clippy::items_after_test_module \
   -A clippy::large_enum_variant \

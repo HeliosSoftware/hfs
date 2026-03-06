@@ -11,8 +11,9 @@ fn main() {
         return;
     }
 
-    // Skip download if DOCS_RS env var is set (docs.rs builds)
-    if std::env::var("DOCS_RS").is_ok() {
+    // Skip R6 download if skip-r6-download feature is enabled or DOCS_RS env var is set
+    // This allows docs.rs builds and `cargo clippy --all-features` to succeed without downloading
+    if cfg!(feature = "skip-r6-download") || std::env::var("DOCS_RS").is_ok() {
         return;
     }
 
