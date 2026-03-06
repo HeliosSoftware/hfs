@@ -172,6 +172,7 @@ The Helios FHIR Server supports multiple storage backend configurations. Choose 
 | **PostgreSQL** | Built-in full-text search (tsvector/tsquery) | Production OLTP deployments |
 | **PostgreSQL + Elasticsearch** | Elasticsearch-powered search with PostgreSQL CRUD | Production deployments needing RDBMS + robust search |
 | **S3** | Object storage for CRUD, versioning, history, and bulk operations (no search) | Archival, bulk analytics, cost-effective storage |
+| **S3 + Elasticsearch** | Elasticsearch-powered search with S3 CRUD | Large-scale storage with full FHIR search |
 
 ### Running the Server
 
@@ -202,13 +203,21 @@ HFS_S3_BUCKET=my-fhir-bucket \
 AWS_PROFILE=your-aws-profile \
 AWS_REGION=us-east-1 \
   ./hfs
+
+# S3 + Elasticsearch
+HFS_STORAGE_BACKEND=s3-elasticsearch \
+HFS_S3_BUCKET=my-fhir-bucket \
+HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
+AWS_PROFILE=your-aws-profile \
+AWS_REGION=us-east-1 \
+  ./hfs
 ```
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, or `s3` |
+| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `s3`, or `s3-elasticsearch` |
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `HFS_DATABASE_URL` | `fhir.db` | Database URL (SQLite path or PostgreSQL connection string) |

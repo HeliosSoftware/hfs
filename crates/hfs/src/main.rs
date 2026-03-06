@@ -11,8 +11,9 @@
 //! | PostgreSQL | `postgres` | Full-featured RDBMS with JSONB storage and tsvector search |
 //! | PostgreSQL + Elasticsearch | `postgres,elasticsearch` | PostgreSQL for CRUD, Elasticsearch for search |
 //! | S3 | `s3` | AWS S3 object storage for CRUD, versioning, history, and bulk ops (no search) |
+//! | S3 + Elasticsearch | `s3,elasticsearch` | S3 for CRUD, Elasticsearch for search |
 //!
-//! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, or `s3`.
+//! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
 use clap::Parser;
 use helios_rest::{ServerConfig, StorageBackendMode, create_app_with_config, init_logging};
@@ -91,6 +92,9 @@ async fn main() -> anyhow::Result<()> {
         }
         StorageBackendMode::S3 => {
             start_s3(config).await?;
+        }
+        StorageBackendMode::S3Elasticsearch => {
+            start_s3_elasticsearch(config).await?;
         }
     }
 
@@ -420,6 +424,134 @@ async fn start_s3(_config: ServerConfig) -> anyhow::Result<()> {
     anyhow::bail!(
         "The s3 backend requires the 's3' feature. \
          Build with: cargo build -p helios-hfs --features s3"
+    )
+}
+
+/// Starts the server with S3 + Elasticsearch composite backend.
+#[cfg(all(feature = "s3", feature = "elasticsearch"))]
+async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use helios_persistence::backends::elasticsearch::{
+        ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig,
+    };
+    use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
+    use helios_persistence::composite::{CompositeConfig, CompositeStorage};
+    use helios_persistence::core::BackendKind;
+
+    let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
+    let region = std::env::var("HFS_S3_REGION").ok();
+    let validate_buckets = std::env::var("HFS_S3_VALIDATE_BUCKETS")
+        .map(|s| s.to_lowercase() != "false" && s != "0")
+        .unwrap_or(true);
+
+    info!(
+        bucket = %bucket,
+        region = ?region,
+        validate_buckets = validate_buckets,
+        "Initializing S3 backend"
+    );
+
+    let s3_config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::PrefixPerTenant {
+            bucket: bucket.clone(),
+        },
+        region,
+        validate_buckets_on_startup: validate_buckets,
+        ..Default::default()
+    };
+
+    let s3 = Arc::new(S3Backend::new(s3_config).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to initialize S3 backend (bucket={}, region={:?}): {}",
+            bucket,
+            std::env::var("AWS_REGION").ok(),
+            e
+        )
+    })?);
+
+    // Build Elasticsearch configuration from server config
+    let es_nodes: Vec<String> = config
+        .elasticsearch_nodes
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let es_auth = match (
+        &config.elasticsearch_username,
+        &config.elasticsearch_password,
+    ) {
+        (Some(username), Some(password)) => Some(ElasticsearchAuth::Basic {
+            username: username.clone(),
+            password: password.clone(),
+        }),
+        _ => None,
+    };
+
+    let es_config = ElasticsearchConfig {
+        nodes: es_nodes.clone(),
+        index_prefix: config.elasticsearch_index_prefix.clone(),
+        auth: es_auth,
+        fhir_version: config.default_fhir_version,
+        ..Default::default()
+    };
+
+    info!(
+        nodes = ?es_nodes,
+        index_prefix = %config.elasticsearch_index_prefix,
+        "Initializing Elasticsearch backend"
+    );
+
+    // S3 has no search parameter registry, so ES creates its own standalone registry.
+    let es = Arc::new(ElasticsearchBackend::new(es_config)?);
+
+    // Build composite configuration
+    let composite_config = CompositeConfig::builder()
+        .primary("s3", BackendKind::S3)
+        .search_backend("es", BackendKind::Elasticsearch)
+        .build()?;
+
+    // Build backends map for CompositeStorage
+    let mut backends = HashMap::new();
+    backends.insert(
+        "s3".to_string(),
+        s3.clone() as helios_persistence::composite::DynStorage,
+    );
+    backends.insert(
+        "es".to_string(),
+        es.clone() as helios_persistence::composite::DynStorage,
+    );
+
+    // Build search providers map
+    let mut search_providers = HashMap::new();
+    search_providers.insert(
+        "s3".to_string(),
+        s3.clone() as helios_persistence::composite::DynSearchProvider,
+    );
+    search_providers.insert(
+        "es".to_string(),
+        es.clone() as helios_persistence::composite::DynSearchProvider,
+    );
+
+    // Create composite storage with full primary capabilities
+    let composite = CompositeStorage::new(composite_config, backends)?
+        .with_search_providers(search_providers)
+        .with_full_primary(s3);
+
+    info!("Composite storage initialized: S3 (primary) + Elasticsearch (search)");
+
+    let app = create_app_with_config(composite, config.clone());
+    serve(app, &config).await
+}
+
+/// Fallback when s3+elasticsearch features are not both enabled.
+#[cfg(not(all(feature = "s3", feature = "elasticsearch")))]
+async fn start_s3_elasticsearch(_config: ServerConfig) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "The s3-elasticsearch backend requires both 's3' and 'elasticsearch' features. \
+         Build with: cargo build -p helios-hfs --features s3,elasticsearch"
     )
 }
 

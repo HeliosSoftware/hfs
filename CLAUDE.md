@@ -258,6 +258,8 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | SQLite + Elasticsearch | `sqlite-elasticsearch` or `sqlite-es` | SQLite for CRUD, ES for search |
 | PostgreSQL | `postgres` or `pg` or `postgresql` | PostgreSQL only |
 | PostgreSQL + Elasticsearch | `postgres-elasticsearch` or `pg-es` | PG for CRUD, ES for search |
+| S3 | `s3` | AWS S3 object storage for CRUD, versioning, history, bulk ops (no search) |
+| S3 + Elasticsearch | `s3-elasticsearch` or `s3-es` | S3 for CRUD, ES for search |
 
 ### Multi-tenancy
 ```bash

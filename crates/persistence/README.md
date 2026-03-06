@@ -382,7 +382,7 @@ Backends can serve as primary (CRUD, versioning, transactions) or secondary (opt
 | Cassandra + Elasticsearch | Cassandra | Elasticsearch (search) | Planned | Write-heavy + search |
 | MongoDB alone | MongoDB | — | Planned | Document-centric |
 | S3 alone | S3 | — | ✓ Implemented (storage-focused) | Archival/bulk/history storage |
-| S3 + Elasticsearch | S3 | Elasticsearch (search) | Planned | Large-scale + search |
+| S3 + Elasticsearch | S3 | Elasticsearch (search) | ✓ Implemented | Large-scale + search |
 
 ### Backend Selection Guide
 
@@ -521,7 +521,7 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### How Search Offloading Works
 
-When `HFS_STORAGE_BACKEND` is set to `sqlite-elasticsearch` or `postgres-elasticsearch`, the server:
+When `HFS_STORAGE_BACKEND` is set to `sqlite-elasticsearch`, `postgres-elasticsearch`, or `s3-elasticsearch`, the server:
 
 1. Creates the primary backend (SQLite or PostgreSQL) with search indexing **disabled**
 2. Creates an Elasticsearch backend sharing the primary backend's search parameter registry
@@ -1017,7 +1017,7 @@ The composite storage layer enables polyglot persistence by coordinating multipl
 | PostgreSQL-only | PostgreSQL | None | ✓ Implemented | Production OLTP |
 | PostgreSQL + ES | PostgreSQL | Elasticsearch | ✓ Implemented | OLTP + advanced search |
 | PostgreSQL + Neo4j | PostgreSQL | Neo4j | Planned | Graph-heavy queries |
-| S3 + ES | S3 | Elasticsearch | Planned | Large-scale, cheap storage |
+| S3 + ES | S3 | Elasticsearch | ✓ Implemented | Large-scale, cheap storage |
 
 ### Quick Start
 
