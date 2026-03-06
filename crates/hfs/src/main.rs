@@ -408,7 +408,7 @@ async fn start_s3(config: ServerConfig) -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let backend = S3Backend::new(s3_config).map_err(|e| {
+    let backend = S3Backend::from_env_async(s3_config).await.map_err(|e| {
         anyhow::anyhow!(
             "Failed to initialize S3 backend (bucket={}, region={:?}): {}",
             bucket,
@@ -468,7 +468,7 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let s3 = Arc::new(S3Backend::new(s3_config).map_err(|e| {
+    let s3 = Arc::new(S3Backend::from_env_async(s3_config).await.map_err(|e| {
         anyhow::anyhow!(
             "Failed to initialize S3 backend (bucket={}, region={:?}): {}",
             bucket,
