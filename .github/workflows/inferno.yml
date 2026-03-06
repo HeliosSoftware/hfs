@@ -12,7 +12,7 @@ env:
   # Remote Docker host (set via GitHub repository secrets or variables; leave unset for local Docker)
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
-  # S3 backend configuration (optional; S3 tests are skipped when not set)
+  # S3+Elasticsearch backend configuration (optional; s3-elasticsearch tests are skipped when not set)
   HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}
 
 jobs:
@@ -63,7 +63,7 @@ jobs:
             us_core_v700,
             us_core_v800,
           ]
-        backend: [sqlite, sqlite-elasticsearch, postgres, s3]
+        backend: [sqlite, sqlite-elasticsearch, postgres, s3-elasticsearch]
         include:
           - { suite_id: us_core_v311, version_label: "v3.1.1" }
           - { suite_id: us_core_v400, version_label: "v4.0.0" }
@@ -140,7 +140,7 @@ jobs:
           echo "OMITTED_TESTS=[${OMITTED}]" >> $GITHUB_ENV
 
       - name: Start Elasticsearch
-        if: matrix.backend == 'sqlite-elasticsearch'
+        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
         run: |
           ES_CONTAINER="es-${{ matrix.suite_id }}-${{ matrix.backend }}"
           docker rm -f $ES_CONTAINER 2>/dev/null || true
@@ -198,7 +198,7 @@ jobs:
           exit 1
 
       - name: Start HFS server
-        if: matrix.backend != 's3' || env.HFS_S3_BUCKET != ''
+        if: matrix.backend != 's3-elasticsearch' || env.HFS_S3_BUCKET != ''
         run: |
           HFS_LOG="/tmp/hfs-${{ matrix.suite_id }}-${{ matrix.backend }}.log"
           echo "HFS_LOG=$HFS_LOG" >> $GITHUB_ENV
@@ -215,10 +215,11 @@ jobs:
             HFS_PG_USER=helios \
             HFS_PG_PASSWORD=helios \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
-          elif [ "${{ matrix.backend }}" = "s3" ]; then
-            HFS_STORAGE_BACKEND=s3 \
+          elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
+            HFS_STORAGE_BACKEND=s3-elasticsearch \
             HFS_S3_BUCKET=${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }} \
             HFS_S3_VALIDATE_BUCKETS=false \
+            HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
             AWS_REGION=${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }} \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
