@@ -194,6 +194,9 @@ HFS_STORAGE_BACKEND=postgres HFS_DATABASE_URL="postgresql://user:pass@localhost/
 # With SQLite + Elasticsearch
 HFS_STORAGE_BACKEND=sqlite-es HFS_ELASTICSEARCH_NODES="http://localhost:9200" cargo run --bin hfs
 
+# With S3 (requires --features s3)
+HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket cargo run --bin hfs --features s3
+
 # With environment overrides
 HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 ```
@@ -262,6 +265,21 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | PostgreSQL + Elasticsearch | `postgres-elasticsearch` or `pg-es` | PG for CRUD, ES for search |
 | S3 | `s3` | AWS S3 object storage for CRUD, versioning, history, bulk ops (no search) |
 | S3 + Elasticsearch | `s3-elasticsearch` or `s3-es` | S3 for CRUD, ES for search |
+
+#### S3 Backend
+Requires building with the `s3` feature:
+```bash
+cargo build -p helios-hfs --features s3
+HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run --bin hfs --features s3
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_S3_BUCKET` | `hfs` | S3 bucket name (prefix-per-tenant mode) |
+| `HFS_S3_REGION` | (AWS chain) | AWS region override |
+| `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket existence on startup |
+
+Standard AWS credential chain applies (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, instance profiles, etc.). For S3-compatible endpoints (e.g., MinIO), configure `S3BackendConfig` directly with `endpoint_url` and `force_path_style`.
 
 ### Multi-tenancy
 ```bash

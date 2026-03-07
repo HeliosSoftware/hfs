@@ -11,7 +11,7 @@
 //! | PostgreSQL | `postgres` | Full-featured RDBMS with JSONB storage and tsvector search |
 //! | PostgreSQL + Elasticsearch | `postgres,elasticsearch` | PostgreSQL for CRUD, Elasticsearch for search |
 //! | S3 | `s3` | AWS S3 object storage for CRUD, versioning, history, and bulk ops (no search) |
-//! | S3 + Elasticsearch | `s3,elasticsearch` | S3 for CRUD, Elasticsearch for search |
+//! | S3 + Elasticsearch | `s3,elasticsearch` | S3 for CRUD/history, Elasticsearch for search |
 //!
 //! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
@@ -430,6 +430,34 @@ async fn start_s3(_config: ServerConfig) -> anyhow::Result<()> {
     )
 }
 
+/// Builds a search parameter registry independently (for backends that don't own one).
+#[cfg(feature = "elasticsearch")]
+fn build_search_registry(
+    fhir_version: helios_fhir::FhirVersion,
+    data_dir: Option<&std::path::Path>,
+) -> std::sync::Arc<parking_lot::RwLock<helios_persistence::search::SearchParameterRegistry>> {
+    use helios_persistence::search::{SearchParameterLoader, SearchParameterRegistry};
+
+    let registry = std::sync::Arc::new(parking_lot::RwLock::new(SearchParameterRegistry::new()));
+    let loader = SearchParameterLoader::new(fhir_version);
+    {
+        let mut reg = registry.write();
+        if let Ok(params) = loader.load_embedded() {
+            for p in params {
+                let _ = reg.register(p);
+            }
+        }
+        let dir = data_dir.unwrap_or_else(|| std::path::Path::new("./data"));
+        if let Ok(params) = loader.load_from_spec_file(dir) {
+            for p in params {
+                let _ = reg.register(p);
+            }
+        }
+    }
+    registry
+}
+
+
 /// Starts the server with S3 + Elasticsearch composite backend.
 #[cfg(all(feature = "s3", feature = "elasticsearch"))]
 async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
@@ -443,6 +471,7 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
     use helios_persistence::composite::{CompositeConfig, CompositeStorage};
     use helios_persistence::core::BackendKind;
 
+    // --- S3 backend (primary) ---
     let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
     let region = std::env::var("HFS_S3_REGION").ok();
     let prefix = std::env::var("HFS_S3_PREFIX").ok();
@@ -455,7 +484,7 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
         region = ?region,
         prefix = ?prefix,
         validate_buckets = validate_buckets,
-        "Initializing S3 backend"
+        "Initializing S3 backend (primary)"
     );
 
     let s3_config = S3BackendConfig {
@@ -477,7 +506,7 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
         )
     })?);
 
-    // Build Elasticsearch configuration from server config
+    // --- Elasticsearch backend (search) ---
     let es_nodes: Vec<String> = config
         .elasticsearch_nodes
         .split(',')
@@ -507,19 +536,23 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
     info!(
         nodes = ?es_nodes,
         index_prefix = %config.elasticsearch_index_prefix,
-        "Initializing Elasticsearch backend"
+        "Initializing Elasticsearch backend (search)"
     );
 
-    // S3 has no search parameter registry, so ES creates its own standalone registry.
-    let es = Arc::new(ElasticsearchBackend::new(es_config)?);
+    // Build search registry independently — S3 has no internal registry
+    let search_registry =
+        build_search_registry(config.default_fhir_version, config.data_dir.as_deref());
+    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
+        es_config,
+        search_registry,
+    )?);
 
-    // Build composite configuration
+    // --- Composite wiring ---
     let composite_config = CompositeConfig::builder()
         .primary("s3", BackendKind::S3)
         .search_backend("es", BackendKind::Elasticsearch)
         .build()?;
 
-    // Build backends map for CompositeStorage
     let mut backends = HashMap::new();
     backends.insert(
         "s3".to_string(),
@@ -530,7 +563,6 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
         es.clone() as helios_persistence::composite::DynStorage,
     );
 
-    // Build search providers map
     let mut search_providers = HashMap::new();
     search_providers.insert(
         "s3".to_string(),
@@ -541,7 +573,6 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
         es.clone() as helios_persistence::composite::DynSearchProvider,
     );
 
-    // Create composite storage with full primary capabilities
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
         .with_full_primary(s3);

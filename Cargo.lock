@@ -2798,6 +2798,7 @@ dependencies = [
  "helios-persistence",
  "helios-rest",
  "openssl",
+ "parking_lot",
  "reqwest",
  "tokio",
  "tracing",

@@ -66,7 +66,7 @@ pub enum StorageBackendMode {
     /// AWS S3 object storage for CRUD, versioning, history, and bulk operations.
     /// Requires AWS credentials via the standard provider chain. No search support.
     S3,
-    /// AWS S3 for CRUD + Elasticsearch for search.
+    /// AWS S3 for CRUD/history + Elasticsearch for search.
     /// Requires AWS credentials and a running Elasticsearch instance.
     S3Elasticsearch,
 }

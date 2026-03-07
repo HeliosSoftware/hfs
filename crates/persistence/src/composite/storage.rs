@@ -478,7 +478,8 @@ impl CompositeStorage {
         }
 
         // Collect results
-        let mut primary_result = None;
+        let mut primary_result: Option<SearchResult> = None;
+        let mut primary_unsupported = false;
         let mut auxiliary_results = Vec::new();
 
         while let Some(result) = tasks.join_next().await {
@@ -491,16 +492,40 @@ impl CompositeStorage {
                     );
 
                     if id == primary_id {
-                        primary_result = Some(search_result?);
+                        match search_result {
+                            Ok(r) => primary_result = Some(r),
+                            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                                ..
+                            })) => {
+                                // Primary doesn't support this search feature (e.g. S3 has no
+                                // full-text search). An auxiliary backend (e.g. Elasticsearch)
+                                // will handle it — promote its result to primary below.
+                                primary_unsupported = true;
+                            }
+                            Err(e) => return Err(e),
+                        }
                     } else if let Ok(res) = search_result {
                         auxiliary_results.push((id, res));
                     }
-                    // Ignore auxiliary failures - graceful degradation
+                    // Ignore other auxiliary failures - graceful degradation
                 }
                 Err(e) => {
                     warn!(error = %e, "Task join error during parallel search");
                 }
             }
+        }
+
+        // When primary lacks search capability and auxiliary has results, promote the
+        // first auxiliary result to primary so the merger can return it directly.
+        if primary_unsupported && primary_result.is_none() {
+            if !auxiliary_results.is_empty() {
+                let (_, promoted) = auxiliary_results.remove(0);
+                return Ok((promoted, auxiliary_results));
+            }
+            return Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: primary_id,
+                capability: "search".to_string(),
+            }));
         }
 
         let primary = primary_result.ok_or_else(|| {
