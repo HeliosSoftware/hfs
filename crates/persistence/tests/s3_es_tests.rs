@@ -355,7 +355,13 @@ async fn s3_es_test_create_then_search() {
         !results.resources.items.is_empty(),
         "expected at least one result for family={family}"
     );
-    assert!(results.resources.items.iter().any(|r| r.id() == created.id()));
+    assert!(
+        results
+            .resources
+            .items
+            .iter()
+            .any(|r| r.id() == created.id())
+    );
 }
 
 /// Update a Patient, then verify search returns updated fields.
@@ -409,7 +415,11 @@ async fn s3_es_test_update_then_search() {
         .await
         .expect("search by new family should succeed");
     assert!(
-        results.resources.items.iter().any(|r| r.id() == created.id()),
+        results
+            .resources
+            .items
+            .iter()
+            .any(|r| r.id() == created.id()),
         "updated resource should appear in search"
     );
 }
@@ -461,7 +471,11 @@ async fn s3_es_test_delete_then_search() {
         .await
         .expect("search after delete should not error");
     assert!(
-        results.resources.items.iter().all(|r| r.id() != created.id()),
+        results
+            .resources
+            .items
+            .iter()
+            .all(|r| r.id() != created.id()),
         "deleted resource should not appear in search"
     );
 }
@@ -757,4 +771,3 @@ async fn s3_es_test_read_after_delete_returns_gone() {
         "read after delete should return Gone, got: {result:?}"
     );
 }
-

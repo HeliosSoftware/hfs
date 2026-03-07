@@ -457,7 +457,6 @@ fn build_search_registry(
     registry
 }
 
-
 /// Starts the server with S3 + Elasticsearch composite backend.
 #[cfg(all(feature = "s3", feature = "elasticsearch"))]
 async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
