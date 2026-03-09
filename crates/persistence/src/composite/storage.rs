@@ -1606,7 +1606,122 @@ impl CapabilityProvider for CompositeStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::BackendKind;
+    use crate::core::{BackendKind, CapabilityProvider};
+    use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+
+    /// Minimal mock storage for unit testing CompositeStorage.
+    struct MockStorage;
+
+    #[async_trait::async_trait]
+    impl ResourceStorage for MockStorage {
+        fn backend_name(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn create(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            let id = uuid::Uuid::new_v4().to_string();
+            Ok(StoredResource::new(
+                resource_type,
+                &id,
+                tenant.tenant_id().clone(),
+                resource,
+                fhir_version,
+            ))
+        }
+
+        async fn create_or_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            Ok((
+                StoredResource::new(
+                    resource_type,
+                    id,
+                    tenant.tenant_id().clone(),
+                    resource,
+                    fhir_version,
+                ),
+                true,
+            ))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            tenant: &TenantContext,
+            current: &StoredResource,
+            resource: Value,
+        ) -> StorageResult<StoredResource> {
+            Ok(StoredResource::new(
+                current.resource_type(),
+                current.id(),
+                tenant.tenant_id().clone(),
+                resource,
+                current.fhir_version(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+    }
+
+    fn make_tenant() -> TenantContext {
+        TenantContext::new(TenantId::new("test"), TenantPermissions::full_access())
+    }
+
+    fn make_composite_no_secondary() -> CompositeStorage {
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), Arc::new(MockStorage) as DynStorage);
+        CompositeStorage::new(config, backends).unwrap()
+    }
+
+    fn make_composite_with_secondary() -> CompositeStorage {
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), Arc::new(MockStorage) as DynStorage);
+        backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
+        CompositeStorage::new(config, backends).unwrap()
+    }
 
     fn test_config() -> CompositeConfig {
         CompositeConfig::builder()
@@ -1616,18 +1731,483 @@ mod tests {
             .unwrap()
     }
 
+    // ── BackendHealth ──────────────────────────────────────────────
+
     #[test]
     fn test_backend_health_default() {
         let health = BackendHealth::default();
         assert!(health.healthy);
         assert_eq!(health.failure_count, 0);
         assert!(health.last_error.is_none());
+        assert!(health.last_success.is_none());
     }
+
+    #[test]
+    fn test_backend_health_clone() {
+        let health = BackendHealth {
+            healthy: false,
+            last_success: None,
+            failure_count: 5,
+            last_error: Some("timeout".to_string()),
+        };
+        let cloned = health.clone();
+        assert!(!cloned.healthy);
+        assert_eq!(cloned.failure_count, 5);
+        assert_eq!(cloned.last_error.as_deref(), Some("timeout"));
+    }
+
+    // ── CompositeConfig ────────────────────────────────────────────
 
     #[test]
     fn test_composite_config() {
         let config = test_config();
         assert_eq!(config.primary_id(), Some("sqlite"));
         assert_eq!(config.secondaries().count(), 1);
+    }
+
+    // ── CompositeStorage::new() ────────────────────────────────────
+
+    #[test]
+    fn test_new_success() {
+        let composite = make_composite_no_secondary();
+        assert_eq!(composite.backend_name(), "composite");
+    }
+
+    #[test]
+    fn test_new_missing_primary_backend_in_map() {
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .build()
+            .unwrap();
+        // Deliberately omit the primary from the backends map
+        let backends: HashMap<String, DynStorage> = HashMap::new();
+        let result = CompositeStorage::new(config, backends);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_with_secondary() {
+        let composite = make_composite_with_secondary();
+        assert!(composite.secondary("es").is_some());
+        assert!(composite.secondary("nonexistent").is_none());
+    }
+
+    // ── Accessors ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_config_accessor() {
+        let composite = make_composite_no_secondary();
+        assert_eq!(composite.config().primary_id(), Some("primary"));
+    }
+
+    #[test]
+    fn test_primary_accessor() {
+        let composite = make_composite_no_secondary();
+        assert_eq!(composite.primary().backend_name(), "mock");
+    }
+
+    #[test]
+    fn test_secondaries_accessor() {
+        let composite = make_composite_with_secondary();
+        assert_eq!(composite.secondaries().len(), 1);
+        assert!(composite.secondaries().contains_key("es"));
+    }
+
+    #[test]
+    fn test_secondaries_empty_when_no_secondary() {
+        let composite = make_composite_no_secondary();
+        assert!(composite.secondaries().is_empty());
+    }
+
+    #[test]
+    fn test_secondary_accessor_present() {
+        let composite = make_composite_with_secondary();
+        assert!(composite.secondary("es").is_some());
+    }
+
+    #[test]
+    fn test_secondary_accessor_absent() {
+        let composite = make_composite_no_secondary();
+        assert!(composite.secondary("missing").is_none());
+    }
+
+    // ── Health tracking ───────────────────────────────────────────
+
+    #[test]
+    fn test_backend_health_initially_healthy() {
+        let composite = make_composite_no_secondary();
+        let health = composite.backend_health("primary").unwrap();
+        assert!(health.healthy);
+    }
+
+    #[test]
+    fn test_backend_health_missing_id_returns_none() {
+        let composite = make_composite_no_secondary();
+        assert!(composite.backend_health("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_is_backend_healthy_true() {
+        let composite = make_composite_no_secondary();
+        assert!(composite.is_backend_healthy("primary"));
+    }
+
+    #[test]
+    fn test_is_backend_healthy_unknown_returns_false() {
+        let composite = make_composite_no_secondary();
+        assert!(!composite.is_backend_healthy("nonexistent"));
+    }
+
+    #[test]
+    fn test_update_health_success_resets_failures() {
+        let composite = make_composite_no_secondary();
+        // First, record a few failures
+        composite.update_health("primary", false, Some("err1".to_string()));
+        composite.update_health("primary", false, Some("err2".to_string()));
+        let health = composite.backend_health("primary").unwrap();
+        assert_eq!(health.failure_count, 2);
+
+        // Now record a success — should reset
+        composite.update_health("primary", true, None);
+        let health = composite.backend_health("primary").unwrap();
+        assert!(health.healthy);
+        assert_eq!(health.failure_count, 0);
+        assert!(health.last_error.is_none());
+        assert!(health.last_success.is_some());
+    }
+
+    #[test]
+    fn test_update_health_failure_increments_count() {
+        let composite = make_composite_no_secondary();
+        composite.update_health("primary", false, Some("timeout".to_string()));
+        let health = composite.backend_health("primary").unwrap();
+        assert_eq!(health.failure_count, 1);
+        assert_eq!(health.last_error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn test_update_health_marks_unhealthy_after_threshold() {
+        let composite = make_composite_no_secondary();
+        // Default failure_threshold is 3
+        let threshold = composite.config.health_config.failure_threshold;
+        for i in 0..threshold {
+            composite.update_health("primary", false, Some(format!("error {}", i)));
+        }
+        let health = composite.backend_health("primary").unwrap();
+        assert!(!health.healthy);
+        assert_eq!(health.failure_count, threshold);
+    }
+
+    #[test]
+    fn test_update_health_ignores_unknown_backend() {
+        let composite = make_composite_no_secondary();
+        // Should not panic on unknown backend ID
+        composite.update_health("nonexistent", false, Some("err".to_string()));
+    }
+
+    // ── sync_to_secondaries when sync_manager is None ─────────────
+
+    #[tokio::test]
+    async fn test_sync_to_secondaries_no_sync_manager_returns_ok() {
+        let composite = make_composite_no_secondary();
+        // No sync manager (no secondaries) → should return Ok immediately
+        let result = composite
+            .sync_to_secondaries(super::super::sync::SyncEvent::Delete {
+                resource_type: "Patient".to_string(),
+                resource_id: "1".to_string(),
+                tenant_id: TenantId::new("test"),
+            })
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // ── routing_error_to_storage_error ────────────────────────────
+
+    #[test]
+    fn test_routing_error_no_primary_backend() {
+        let composite = make_composite_no_secondary();
+        let err = composite.routing_error_to_storage_error(RoutingError::NoPrimaryBackend);
+        match err {
+            StorageError::Backend(BackendError::Unavailable { backend_name, .. }) => {
+                assert_eq!(backend_name, "primary");
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_routing_error_no_capable_backend() {
+        use super::super::analyzer::QueryFeature;
+        let composite = make_composite_no_secondary();
+        let err = composite.routing_error_to_storage_error(RoutingError::NoCapableBackend {
+            feature: QueryFeature::FullTextSearch,
+        });
+        match err {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name,
+                capability,
+            }) => {
+                assert_eq!(backend_name, "composite");
+                assert!(!capability.is_empty());
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_routing_error_backend_unavailable() {
+        let composite = make_composite_no_secondary();
+        let err = composite.routing_error_to_storage_error(RoutingError::BackendUnavailable {
+            backend_id: "my-backend".to_string(),
+        });
+        match err {
+            StorageError::Backend(BackendError::ConnectionFailed { backend_name, .. }) => {
+                assert_eq!(backend_name, "my-backend");
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    // ── CapabilityProvider ────────────────────────────────────────
+
+    #[test]
+    fn test_capabilities_backend_name() {
+        let composite = make_composite_no_secondary();
+        let caps = composite.capabilities();
+        assert_eq!(caps.backend_name, "composite");
+    }
+
+    #[test]
+    fn test_backend_name_is_composite() {
+        let composite = make_composite_no_secondary();
+        assert_eq!(composite.backend_name(), "composite");
+    }
+
+    // ── "No capability" error paths ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_conditional_create_no_capability() {
+        use crate::core::ConditionalStorage;
+        let composite = make_composite_no_secondary();
+        let tenant = make_tenant();
+        let result = composite
+            .conditional_create(
+                &tenant,
+                "Patient",
+                serde_json::json!({}),
+                "identifier=foo",
+                FhirVersion::default(),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_versioned_storage_vread_no_capability() {
+        use crate::core::VersionedStorage;
+        let composite = make_composite_no_secondary();
+        let tenant = make_tenant();
+        let result = composite.vread(&tenant, "Patient", "1", "1").await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StorageError::Backend(BackendError::UnsupportedCapability { capability, .. }) => {
+                assert!(capability.contains("VersionedStorage"));
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_instance_history_no_capability() {
+        use crate::core::InstanceHistoryProvider;
+        use crate::core::history::HistoryParams;
+        let composite = make_composite_no_secondary();
+        let tenant = make_tenant();
+        let result = composite
+            .history_instance(&tenant, "Patient", "1", &HistoryParams::default())
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StorageError::Backend(BackendError::UnsupportedCapability { capability, .. }) => {
+                assert!(capability.contains("InstanceHistoryProvider"));
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bundle_provider_process_batch_no_capability() {
+        use crate::core::BundleProvider;
+        let composite = make_composite_no_secondary();
+        let tenant = make_tenant();
+        let result = composite.process_batch(&tenant, vec![]).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StorageError::Backend(BackendError::UnsupportedCapability { capability, .. }) => {
+                assert!(capability.contains("BundleProvider"));
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bundle_provider_process_transaction_no_capability() {
+        use crate::core::BundleProvider;
+        let composite = make_composite_no_secondary();
+        let tenant = make_tenant();
+        let result = composite.process_transaction(&tenant, vec![]).await;
+        assert!(result.is_err());
+    }
+
+    // ── search_count when no search provider ──────────────────────
+
+    #[tokio::test]
+    async fn test_search_count_no_search_provider_returns_error() {
+        use crate::core::SearchProvider;
+        use crate::types::SearchQuery;
+        let composite = make_composite_no_secondary();
+        let tenant = make_tenant();
+        let query = SearchQuery::new("Patient");
+        let result = composite.search_count(&tenant, &query).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StorageError::Backend(BackendError::UnsupportedCapability { capability, .. }) => {
+                assert!(capability.contains("search_count"));
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    // ── with_search_providers ─────────────────────────────────────
+
+    #[test]
+    fn test_with_search_providers() {
+        let composite = make_composite_no_secondary();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "primary".to_string(),
+            Arc::new(MockStorage) as DynSearchProvider,
+        );
+        let composite = composite.with_search_providers(providers);
+        // Should have one search provider now
+        assert!(composite.search_providers.contains_key("primary"));
+    }
+
+    // ── extract_reference_values (static method) ──────────────────
+
+    #[test]
+    fn test_extract_reference_values_object_with_reference() {
+        let obj = serde_json::json!({"reference": "Patient/123"});
+        let mut refs = Vec::new();
+        CompositeStorage::extract_reference_values(&obj, &mut refs);
+        assert_eq!(refs, vec!["Patient/123"]);
+    }
+
+    #[test]
+    fn test_extract_reference_values_object_without_reference() {
+        let obj = serde_json::json!({"display": "John Smith"});
+        let mut refs = Vec::new();
+        CompositeStorage::extract_reference_values(&obj, &mut refs);
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_reference_values_array() {
+        let arr = serde_json::json!([
+            {"reference": "Patient/1"},
+            {"reference": "Patient/2"},
+            {"display": "no ref here"}
+        ]);
+        let mut refs = Vec::new();
+        CompositeStorage::extract_reference_values(&arr, &mut refs);
+        assert_eq!(refs.len(), 2);
+        assert!(refs.contains(&"Patient/1".to_string()));
+        assert!(refs.contains(&"Patient/2".to_string()));
+    }
+
+    #[test]
+    fn test_extract_reference_values_primitive_ignored() {
+        let val = serde_json::json!("just a string");
+        let mut refs = Vec::new();
+        CompositeStorage::extract_reference_values(&val, &mut refs);
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_reference_values_null_ignored() {
+        let val = serde_json::Value::Null;
+        let mut refs = Vec::new();
+        CompositeStorage::extract_reference_values(&val, &mut refs);
+        assert!(refs.is_empty());
+    }
+
+    // ── CRUD delegation to primary ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_delegates_to_primary() {
+        use crate::core::ResourceStorage;
+        let composite = make_composite_no_secondary();
+        let tenant = make_tenant();
+        let result = composite
+            .create(
+                &tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await;
+        assert!(result.is_ok());
+        let stored = result.unwrap();
+        assert_eq!(stored.resource_type(), "Patient");
+    }
+
+    #[tokio::test]
+    async fn test_read_delegates_to_primary() {
+        use crate::core::ResourceStorage;
+        let composite = make_composite_no_secondary();
+        let tenant = make_tenant();
+        let result = composite.read(&tenant, "Patient", "1").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none()); // MockStorage always returns None
+    }
+
+    #[tokio::test]
+    async fn test_count_delegates_to_primary() {
+        use crate::core::ResourceStorage;
+        let composite = make_composite_no_secondary();
+        let tenant = make_tenant();
+        let result = composite.count(&tenant, Some("Patient")).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_delegates_to_primary() {
+        use crate::core::ResourceStorage;
+        let composite = make_composite_no_secondary();
+        let tenant = make_tenant();
+        let result = composite.delete(&tenant, "Patient", "1").await;
+        assert!(result.is_ok());
+    }
+
+    // SearchProvider impl for MockStorage (must live inside test module).
+    #[async_trait::async_trait]
+    impl SearchProvider for MockStorage {
+        async fn search(
+            &self,
+            _tenant: &TenantContext,
+            _query: &crate::types::SearchQuery,
+        ) -> StorageResult<SearchResult> {
+            use crate::types::Page;
+            Ok(SearchResult::new(Page::empty()))
+        }
+
+        async fn search_count(
+            &self,
+            _tenant: &TenantContext,
+            _query: &crate::types::SearchQuery,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
     }
 }

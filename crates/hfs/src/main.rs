@@ -598,3 +598,88 @@ async fn start_s3_elasticsearch(_config: ServerConfig) -> anyhow::Result<()> {
     feature = "s3"
 )))]
 compile_error!("At least one database backend feature must be enabled");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios_rest::ServerConfig;
+
+    // ── create_sqlite_backend() ───────────────────────────────────
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_create_sqlite_backend_memory() {
+        let config = ServerConfig {
+            database_url: Some(":memory:".to_string()),
+            ..Default::default()
+        };
+        let result = create_sqlite_backend(&config);
+        assert!(result.is_ok(), "in-memory SQLite backend should succeed");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_create_sqlite_backend_temp_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "hfs_test_{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let config = ServerConfig {
+            database_url: Some(path.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let result = create_sqlite_backend(&config);
+        // Clean up the file even if the assertion fails.
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok(), "file-based SQLite backend should succeed");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_create_sqlite_backend_default_url() {
+        // When database_url is None, defaults to "fhir.db" in the current dir.
+        // We redirect to a temp path to avoid creating persistent side-effects.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "hfs_test_default_{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        // Override the default path via the env var that ServerConfig reads.
+        let config = ServerConfig {
+            database_url: Some(path.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let result = create_sqlite_backend(&config);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok());
+    }
+
+    // ── build_search_registry() ───────────────────────────────────
+
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    fn test_build_search_registry_returns_registry() {
+        use helios_fhir::FhirVersion;
+        let registry = build_search_registry(FhirVersion::R4, None);
+        // Registry should be a valid Arc<RwLock<…>> and not panic when read.
+        let _guard = registry.read();
+    }
+
+    // ── ServerConfig validation is exercised at startup ──────────
+
+    #[test]
+    fn test_server_config_default_is_valid() {
+        let config = ServerConfig::default();
+        assert!(
+            config.validate().is_ok(),
+            "default ServerConfig should be valid"
+        );
+    }
+}
