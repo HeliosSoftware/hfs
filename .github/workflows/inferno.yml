@@ -50,6 +50,9 @@ jobs:
     name: Inferno US Core ${{ matrix.version_label }} Tests (${{ matrix.backend }})
     needs: build
     runs-on: [self-hosted, Linux]
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -197,6 +200,13 @@ jobs:
           docker logs $PG_CONTAINER
           exit 1
 
+      - name: Configure AWS credentials
+        if: matrix.backend == 's3-elasticsearch' && env.HFS_S3_BUCKET != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+
       - name: Install AWS CLI
         if: matrix.backend == 's3-elasticsearch' && env.HFS_S3_BUCKET != ''
         run: |
@@ -213,11 +223,6 @@ jobs:
 
       - name: Empty S3 prefix
         if: matrix.backend == 's3-elasticsearch' && env.HFS_S3_BUCKET != ''
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
         run: |
           BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}"
           PREFIX="ci/${{ matrix.suite_id }}/"
@@ -249,10 +254,6 @@ jobs:
             HFS_S3_PREFIX=ci/${{ matrix.suite_id }}/ \
             HFS_S3_VALIDATE_BUCKETS=false \
             HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
-            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
-            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
-            AWS_SESSION_TOKEN=${{ secrets.AWS_SESSION_TOKEN }} \
-            AWS_REGION=${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }} \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
