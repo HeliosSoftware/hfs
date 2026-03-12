@@ -189,9 +189,12 @@ jobs:
           for i in {1..30}; do
             if docker exec $PG_CONTAINER pg_isready -U helios > /dev/null 2>&1; then
               PG_PORT=$(docker port $PG_CONTAINER 5432 | head -1 | sed 's/.*://')
-              echo "PostgreSQL is ready on port $PG_PORT"
-              echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
-              exit 0
+              # Verify external TCP connectivity to the mapped port, not just internal readiness
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PostgreSQL is ready on port $PG_PORT"
+                echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
+                exit 0
+              fi
             fi
             echo "Attempt $i/30: PostgreSQL not ready yet..."
             sleep 2
