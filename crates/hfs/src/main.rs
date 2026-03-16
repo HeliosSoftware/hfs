@@ -206,7 +206,8 @@ async fn start_sqlite_elasticsearch(config: ServerConfig) -> anyhow::Result<()> 
     // Create composite storage with full primary capabilities
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(sqlite);
+        .with_full_primary(sqlite)
+        .start_sync_workers();
 
     info!("Composite storage initialized: SQLite (primary) + Elasticsearch (search)");
 
@@ -361,7 +362,8 @@ async fn start_postgres_elasticsearch(config: ServerConfig) -> anyhow::Result<()
     // Create composite storage with full primary capabilities
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(pg);
+        .with_full_primary(pg)
+        .start_sync_workers();
 
     info!("Composite storage initialized: PostgreSQL (primary) + Elasticsearch (search)");
 
@@ -574,7 +576,8 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
 
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(s3);
+        .with_full_primary(s3)
+        .start_sync_workers();
 
     info!("Composite storage initialized: S3 (primary) + Elasticsearch (search)");
 
