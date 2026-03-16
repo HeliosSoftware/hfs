@@ -56,7 +56,7 @@ use crate::types::{
     IncludeDirective, Pagination, ReverseChainedParameter, SearchQuery, StoredResource,
 };
 
-use super::config::CompositeConfig;
+use super::config::{CompositeConfig, SyncMode};
 use super::merger::{MergeOptions, ResultMerger};
 use super::router::{QueryRouter, RoutingDecision, RoutingError};
 use super::sync::{SyncEvent, SyncManager};
@@ -230,6 +230,25 @@ impl CompositeStorage {
     /// Search providers allow specialized search backends like Elasticsearch.
     pub fn with_search_providers(mut self, providers: HashMap<String, DynSearchProvider>) -> Self {
         self.search_providers = providers;
+        self
+    }
+
+    /// Starts the background sync worker for secondary backends.
+    ///
+    /// Must be called from within a Tokio runtime. When the sync mode is
+    /// `Asynchronous` or `Hybrid`, this spawns a background task that
+    /// processes sync events without blocking write requests. Without this,
+    /// every write falls back to synchronous secondary indexing which can
+    /// cause timeouts on large transaction bundles.
+    pub fn start_sync_workers(mut self) -> Self {
+        if let Some(ref mut manager) = self.sync_manager {
+            if matches!(
+                self.config.sync_config.mode,
+                SyncMode::Asynchronous | SyncMode::Hybrid { .. }
+            ) {
+                manager.start_async_worker(self.secondaries.clone());
+            }
+        }
         self
     }
 
