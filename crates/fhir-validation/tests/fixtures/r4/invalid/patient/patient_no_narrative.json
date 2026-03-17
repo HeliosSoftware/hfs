@@ -1,0 +1,15 @@
+
+{
+  "resourceType": "Patient",
+  "id": "patient-nested-contained",
+  "name": [
+    {
+      "use": "official",
+      "family": "Nested",
+      "given": ["Contained"]
+    }
+  ],
+  "managingOrganization": {
+    "reference": "Org1"
+  }
+}
