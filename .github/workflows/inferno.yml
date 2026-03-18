@@ -217,7 +217,7 @@ jobs:
             if ! /tmp/aws-bin/aws --version &>/dev/null; then
               curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
               unzip -qo /tmp/awscliv2.zip -d /tmp
-              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
               rm -rf /tmp/awscliv2.zip /tmp/aws
             fi
             echo "/tmp/aws-bin" >> $GITHUB_PATH
