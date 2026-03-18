@@ -1,0 +1,25 @@
+[package]
+name = "helios-cds-hooks"
+version.workspace = true
+edition.workspace = true
+description = "CDS Hooks protocol types and service traits for building clinical decision support services conforming to the HL7 CDS Hooks specification."
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/cds-hooks"
+readme = "README.md"
+keywords = ["helios-software", "hl7", "fhir", "cds-hooks", "clinical-decision-support"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+async-trait = "0.1"
+thiserror = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full"] }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

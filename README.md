@@ -297,13 +297,19 @@ result = pysof.run_view_definition(
 **Distribution:**
 - Cross-platform wheel distribution for Linux, Windows, and macOS available on [PyPi](https://pypi.org/project/pysof/)
 
-### 7. [`helios-fhir-macro`](crates/fhir-macro) - Procedural Macros
+### 7. [`helios-cds-hooks`](crates/cds-hooks) - CDS Hooks Protocol Types
+Rust types and traits for building [CDS Hooks](https://cds-hooks.hl7.org/) clinical decision support services.
+- Complete protocol types for discovery, requests, responses, cards, suggestions, and feedback
+- Strongly-typed context structs for all 10 hooks in the CDS Hooks Library
+- Async `CdsHooksService` trait compatible with any Rust web framework
+
+### 8. [`helios-fhir-macro`](crates/fhir-macro) - Procedural Macros
 Helper macros for code generation used by other components.
 
-### 8. [`helios-fhirpath-support`](crates/fhirpath-support) - Shared Utilities
+### 9. [`helios-fhirpath-support`](crates/fhirpath-support) - Shared Utilities
 Common types and traits for FHIRPath evaluation.
 
-### 9. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
+### 10. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
 Storage backend abstraction supporting multiple database technologies optimized for different FHIR workloads.
 
 ## Design Principles
