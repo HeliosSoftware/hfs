@@ -41,12 +41,21 @@ impl BundleProvider for S3Backend {
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
     ) -> Result<BundleResult, TransactionError> {
-        let mut results = Vec::with_capacity(entries.len());
-        let mut compensations: Vec<CompensationAction> = Vec::new();
+        let mut results: Vec<Option<BundleEntryResult>> = vec![None; entries.len()];
+        let mut compensations: Vec<(usize, CompensationAction)> = Vec::new();
         let mut reference_map: HashMap<String, String> = HashMap::new();
         let mut entries = entries;
 
+        // Phase 1: Process POST entries sequentially to build the reference map.
+        // Later entries may use urn:uuid: references to resources created here.
+        let mut concurrent_indices = Vec::new();
+
         for (idx, entry) in entries.iter_mut().enumerate() {
+            if entry.method != BundleMethod::Post {
+                concurrent_indices.push(idx);
+                continue;
+            }
+
             if let Some(resource) = entry.resource.as_mut() {
                 resolve_bundle_references(resource, &reference_map);
             }
@@ -55,8 +64,9 @@ impl BundleProvider for S3Backend {
                 Ok(v) => v,
                 Err(err) => {
                     let base = format!("entry failed: {err}");
+                    let comps = compensations.into_iter().map(|(_, c)| c).collect();
                     let message = self
-                        .rollback_compensations(tenant, compensations)
+                        .rollback_compensations(tenant, comps)
                         .await
                         .map(|_| base.clone())
                         .unwrap_or_else(|rollback_err| {
@@ -71,8 +81,9 @@ impl BundleProvider for S3Backend {
 
             if result.status >= 400 {
                 let base = format!("entry failed with status {}", result.status);
+                let comps = compensations.into_iter().map(|(_, c)| c).collect();
                 let message = self
-                    .rollback_compensations(tenant, compensations)
+                    .rollback_compensations(tenant, comps)
                     .await
                     .map(|_| base.clone())
                     .unwrap_or_else(|rollback_err| {
@@ -84,27 +95,84 @@ impl BundleProvider for S3Backend {
                 });
             }
 
-            if entry.method == BundleMethod::Post {
-                if let (Some(full_url), Some(location)) = (&entry.full_url, &result.location) {
-                    let resolved = location
-                        .split("/_history")
-                        .next()
-                        .unwrap_or(location)
-                        .to_string();
-                    reference_map.insert(full_url.clone(), resolved);
+            if let (Some(full_url), Some(location)) = (&entry.full_url, &result.location) {
+                let resolved = location
+                    .split("/_history")
+                    .next()
+                    .unwrap_or(location)
+                    .to_string();
+                reference_map.insert(full_url.clone(), resolved);
+            }
+
+            if let Some(c) = compensation {
+                compensations.push((idx, c));
+            }
+            results[idx] = Some(result);
+        }
+
+        // Phase 2: Resolve urn:uuid references in remaining entries.
+        if !reference_map.is_empty() {
+            for &idx in &concurrent_indices {
+                if let Some(resource) = entries[idx].resource.as_mut() {
+                    resolve_bundle_references(resource, &reference_map);
                 }
             }
+        }
 
-            if let Some(compensation) = compensation {
-                compensations.push(compensation);
+        // Phase 3: Process non-POST entries concurrently.
+        if !concurrent_indices.is_empty() {
+            let futs: Vec<_> = concurrent_indices
+                .iter()
+                .map(|&idx| self.execute_bundle_entry(tenant, &entries[idx]))
+                .collect();
+
+            let outcomes = futures::future::join_all(futs).await;
+
+            for (&idx, outcome) in concurrent_indices.iter().zip(outcomes) {
+                match outcome {
+                    Ok((result, compensation)) => {
+                        if result.status >= 400 {
+                            let base = format!("entry failed with status {}", result.status);
+                            let comps = compensations.into_iter().map(|(_, c)| c).collect();
+                            let message = self
+                                .rollback_compensations(tenant, comps)
+                                .await
+                                .map(|_| base.clone())
+                                .unwrap_or_else(|rollback_err| {
+                                    format!("{base}; rollback failed: {rollback_err}")
+                                });
+                            return Err(TransactionError::BundleError {
+                                index: idx,
+                                message,
+                            });
+                        }
+                        if let Some(c) = compensation {
+                            compensations.push((idx, c));
+                        }
+                        results[idx] = Some(result);
+                    }
+                    Err(err) => {
+                        let base = format!("entry failed: {err}");
+                        let comps = compensations.into_iter().map(|(_, c)| c).collect();
+                        let message = self
+                            .rollback_compensations(tenant, comps)
+                            .await
+                            .map(|_| base.clone())
+                            .unwrap_or_else(|rollback_err| {
+                                format!("{base}; rollback failed: {rollback_err}")
+                            });
+                        return Err(TransactionError::BundleError {
+                            index: idx,
+                            message,
+                        });
+                    }
+                }
             }
-
-            results.push(result);
         }
 
         Ok(BundleResult {
             bundle_type: BundleType::Transaction,
-            entries: results,
+            entries: results.into_iter().map(|r| r.unwrap()).collect(),
         })
     }
 

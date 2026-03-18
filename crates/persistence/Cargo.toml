@@ -51,6 +51,7 @@ regex = "1"
 parking_lot = "0.12"
 json-patch = "3"
 humantime = "2"
+futures = "0.3"
 
 # SQLite backend
 rusqlite = { version = "0.33", features = ["bundled", "serde_json"], optional = true }
