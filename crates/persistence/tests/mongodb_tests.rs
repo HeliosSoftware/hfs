@@ -1818,14 +1818,15 @@ async fn mongodb_integration_search_parameter_registry_updates_when_offloaded() 
         .await
         .unwrap();
 
-    let registry = backend.search_registry().read();
-    let param = registry.get_param("Patient", "mongo-offloaded-code");
-    assert!(
-        param.is_some(),
-        "Active SearchParameter should register when offloaded"
-    );
-    assert_eq!(param.unwrap().status, SearchParameterStatus::Active);
-    drop(registry);
+    {
+        let registry = backend.search_registry().read();
+        let param = registry.get_param("Patient", "mongo-offloaded-code");
+        assert!(
+            param.is_some(),
+            "Active SearchParameter should register when offloaded"
+        );
+        assert_eq!(param.unwrap().status, SearchParameterStatus::Active);
+    }
 
     let search_index_count =
         search_index_entry_count(&backend, &tenant, "SearchParameter", created.id()).await;
