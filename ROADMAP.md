@@ -21,6 +21,7 @@ These capabilities are available today in the current release.
 - [PostgreSQL as a primary store](crates/persistence/README.md#postgresql)
 - [PostgreSQL as a primary store with Elasticsearch as a query secondary](crates/persistence/README.md#postgresql--elasticsearch)
 - [S3 as a primary store](crates/persistence/README.md#s3)
+- [S3 as a primary store with Elasticsearch as a query secondary](crates/persistence/README.md#s3--elasticsearch)
 
 **Analytics & Tooling**
 - [SQL on FHIR](crates/sof/README.md) — CLI and HTTP server
@@ -40,7 +41,6 @@ Work that is currently underway or planned for the near term.
 | **Standards** | [Authentication & Authorization](https://github.com/HeliosSoftware/hfs/discussions/45) | 🔵 Design |
 | **Documentation** | Project documentation website | 🔵 Design |
 | **Persistence** | MongoDB as a primary store | 🟡 In progress |
-| **Persistence** | S3 as a primary store with Elasticsearch as a query secondary | 🟡 In progress |
 
 ### Discussion Documents
 
