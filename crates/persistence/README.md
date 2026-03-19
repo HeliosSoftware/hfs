@@ -382,7 +382,7 @@ Backends can serve as primary (CRUD, versioning, transactions) or secondary (opt
 | Cassandra + Elasticsearch | Cassandra | Elasticsearch (search) | Planned | Write-heavy + search |
 | MongoDB alone | MongoDB | — | Planned | Document-centric |
 | S3 alone | S3 | — | ✓ Implemented (storage-focused) | Archival/bulk/history storage |
-| S3 + Elasticsearch | S3 | Elasticsearch (search) | Planned | Large-scale + search |
+| S3 + Elasticsearch | S3 | Elasticsearch (search) | ✓ Implemented | Large-scale + search |
 
 ### Backend Selection Guide
 
@@ -519,12 +519,116 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
   ./target/release/hfs
 ```
 
+### S3 + Elasticsearch
+
+S3 handles CRUD, versioning, history, and bulk operations. Elasticsearch handles all search operations. Combines S3's cost-effective, durable object storage with Elasticsearch's search capabilities for large-scale deployments.
+
+- CRUD persistence via S3 objects (current pointer + immutable history versions)
+- Versioning (`vread`, optimistic locking via version checks)
+- Instance, type, and system history via immutable history objects
+- Batch bundles and best-effort transaction bundles
+- Bulk export (NDJSON parts + manifest in S3)
+- Bulk submit with rollback change log
+- Full-text search with relevance scoring (`_text`, `_content`) via Elasticsearch
+- All FHIR search parameter types (string, token, date, number, quantity, reference, URI, composite)
+- Advanced text search with stemming, boolean operators, and proximity matching (`:text-advanced`)
+- Tenant isolation (`PrefixPerTenant` or `BucketPerTenant`)
+
+**Prerequisites:** An AWS S3 bucket (or S3-compatible service) and a running Elasticsearch 8.x instance.
+
+```bash
+# Build with S3 and Elasticsearch support
+cargo build --bin hfs --features s3,elasticsearch --release
+
+# Start Elasticsearch (example using Docker)
+docker run -d --name es -p 9200:9200 \
+  -e "discovery.type=single-node" \
+  -e "xpack.security.enabled=false" \
+  elasticsearch:8.15.0
+
+# Start the server (AWS S3)
+HFS_STORAGE_BACKEND=s3-elasticsearch \
+HFS_S3_BUCKET=my-fhir-bucket \
+HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
+  ./target/release/hfs
+```
+
+#### S3 Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_S3_BUCKET` | `hfs` | S3 bucket name |
+| `HFS_S3_REGION` | (provider chain) | AWS region override |
+| `HFS_S3_PREFIX` | (none) | Optional global key prefix |
+| `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate buckets on startup via `HeadBucket` |
+
+AWS credentials are resolved via the standard AWS provider chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, EC2 instance metadata, shared credentials file, SSO, etc.).
+
+#### S3-Compatible Endpoints (MinIO, etc.)
+
+For S3-compatible services, configure the endpoint programmatically via `S3BackendConfig`:
+
+```rust
+use helios_persistence::backends::s3::{S3BackendConfig, S3TenancyMode};
+
+let config = S3BackendConfig {
+    tenancy_mode: S3TenancyMode::PrefixPerTenant {
+        bucket: "minio-bucket".to_string(),
+    },
+    endpoint_url: Some("http://127.0.0.1:9000".to_string()),
+    allow_http: true,
+    force_path_style: true,
+    ..Default::default()
+};
+```
+
+When `endpoint_url` is set, the backend automatically defaults `force_path_style` to `true` and `region` to `us-east-1` if not otherwise specified.
+
+#### Key Differences from SQLite/PG + ES
+
+Unlike SQLite and PostgreSQL, the S3 backend has no built-in search parameter registry. When composing S3 + Elasticsearch, the ES backend creates its own standalone registry with minimal embedded search parameters (`_id`, `_lastUpdated`, `_tag`, `_profile`, `_security`). For full search capability, use `with_shared_registry()` with parameters loaded from spec files.
+
+```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
+use helios_persistence::backends::s3::{S3Backend, S3BackendConfig};
+use helios_persistence::composite::{CompositeConfig, CompositeStorage, DynStorage, DynSearchProvider};
+use helios_persistence::core::BackendKind;
+
+// Create S3 backend
+let s3_config = S3BackendConfig::default();
+let s3 = Arc::new(S3Backend::from_env_async(s3_config).await?);
+
+// Create ES backend (standalone registry — S3 has no registry to share)
+let es_config = ElasticsearchConfig::default();
+let es = Arc::new(ElasticsearchBackend::new(es_config)?);
+
+// Build composite
+let composite_config = CompositeConfig::builder()
+    .primary("s3", BackendKind::S3)
+    .search_backend("es", BackendKind::Elasticsearch)
+    .build()?;
+
+let mut backends = HashMap::new();
+backends.insert("s3".to_string(), s3.clone() as DynStorage);
+backends.insert("es".to_string(), es.clone() as DynStorage);
+
+let mut search_providers = HashMap::new();
+search_providers.insert("s3".to_string(), s3.clone() as DynSearchProvider);
+search_providers.insert("es".to_string(), es.clone() as DynSearchProvider);
+
+let composite = CompositeStorage::new(composite_config, backends)?
+    .with_search_providers(search_providers)
+    .with_full_primary(s3);
+```
+
 ### How Search Offloading Works
 
-When `HFS_STORAGE_BACKEND` is set to `sqlite-elasticsearch` or `postgres-elasticsearch`, the server:
+When `HFS_STORAGE_BACKEND` is set to `sqlite-elasticsearch`, `postgres-elasticsearch`, or `s3-elasticsearch`, the server:
 
-1. Creates the primary backend (SQLite or PostgreSQL) with search indexing **disabled**
-2. Creates an Elasticsearch backend sharing the primary backend's search parameter registry
+1. Creates the primary backend (SQLite, PostgreSQL, or S3). For SQLite/PG, search indexing is **disabled**; S3 has no search indexing to disable.
+2. Creates an Elasticsearch backend. For SQLite/PG, it shares the primary backend's search parameter registry; for S3, it creates its own standalone registry.
 3. Wraps both in a `CompositeStorage` that routes:
    - All **writes** (create, update, delete, conditional ops, transactions) → primary backend, then syncs to ES
    - All **reads** (read, vread, history) → primary backend
@@ -1017,7 +1121,7 @@ The composite storage layer enables polyglot persistence by coordinating multipl
 | PostgreSQL-only | PostgreSQL | None | ✓ Implemented | Production OLTP |
 | PostgreSQL + ES | PostgreSQL | Elasticsearch | ✓ Implemented | OLTP + advanced search |
 | PostgreSQL + Neo4j | PostgreSQL | Neo4j | Planned | Graph-heavy queries |
-| S3 + ES | S3 | Elasticsearch | Planned | Large-scale, cheap storage |
+| S3 + ES | S3 | Elasticsearch | ✓ Implemented | Large-scale, cheap storage |
 
 ### Quick Start
 

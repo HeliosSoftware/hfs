@@ -66,6 +66,9 @@ pub enum StorageBackendMode {
     /// AWS S3 object storage for CRUD, versioning, history, and bulk operations.
     /// Requires AWS credentials via the standard provider chain. No search support.
     S3,
+    /// AWS S3 for CRUD/history + Elasticsearch for search.
+    /// Requires AWS credentials and a running Elasticsearch instance.
+    S3Elasticsearch,
 }
 
 impl fmt::Display for StorageBackendMode {
@@ -78,6 +81,7 @@ impl fmt::Display for StorageBackendMode {
                 write!(f, "postgres-elasticsearch")
             }
             StorageBackendMode::S3 => write!(f, "s3"),
+            StorageBackendMode::S3Elasticsearch => write!(f, "s3-elasticsearch"),
         }
     }
 }
@@ -94,8 +98,9 @@ impl FromStr for StorageBackendMode {
                 Ok(StorageBackendMode::PostgresElasticsearch)
             }
             "s3" | "objectstore" => Ok(StorageBackendMode::S3),
+            "s3-elasticsearch" | "s3-es" => Ok(StorageBackendMode::S3Elasticsearch),
             _ => Err(format!(
-                "Invalid storage backend '{}'. Valid values: sqlite, sqlite-elasticsearch, postgres, postgres-elasticsearch, s3",
+                "Invalid storage backend '{}'. Valid values: sqlite, sqlite-elasticsearch, postgres, postgres-elasticsearch, s3, s3-elasticsearch",
                 s
             )),
         }
@@ -304,7 +309,7 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_MAX_PAGE_SIZE", default_value = "1000")]
     pub max_page_size: usize,
 
-    /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres, postgres-elasticsearch, or s3.
+    /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres, postgres-elasticsearch, s3, or s3-elasticsearch.
     #[arg(long, env = "HFS_STORAGE_BACKEND", default_value = "sqlite")]
     pub storage_backend: String,
 
@@ -641,6 +646,18 @@ mod tests {
             "S3".parse::<StorageBackendMode>().unwrap(),
             StorageBackendMode::S3
         );
+        assert_eq!(
+            "s3-elasticsearch".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::S3Elasticsearch
+        );
+        assert_eq!(
+            "s3-es".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::S3Elasticsearch
+        );
+        assert_eq!(
+            "S3-ES".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::S3Elasticsearch
+        );
         assert!("invalid".parse::<StorageBackendMode>().is_err());
     }
 
@@ -657,6 +674,10 @@ mod tests {
             "postgres-elasticsearch"
         );
         assert_eq!(StorageBackendMode::S3.to_string(), "s3");
+        assert_eq!(
+            StorageBackendMode::S3Elasticsearch.to_string(),
+            "s3-elasticsearch"
+        );
     }
 
     #[test]
@@ -674,5 +695,215 @@ mod tests {
         assert_eq!(config.routing_mode, TenantRoutingMode::HeaderOnly);
         assert!(!config.strict_validation);
         assert_eq!(config.jwt_tenant_claim, "tenant_id");
+    }
+
+    // ── validate() – max_body_size == 0 ───────────────────────────
+
+    #[test]
+    fn test_validate_max_body_size_zero() {
+        let config = ServerConfig {
+            max_body_size: 0,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("body size")));
+    }
+
+    // ── validate() – request_timeout == 0 ────────────────────────
+
+    #[test]
+    fn test_validate_request_timeout_zero() {
+        let config = ServerConfig {
+            request_timeout: 0,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("timeout")));
+    }
+
+    // ── validate() – default_page_size == 0 ──────────────────────
+
+    #[test]
+    fn test_validate_default_page_size_zero() {
+        let config = ServerConfig {
+            default_page_size: 0,
+            max_page_size: 100,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("page size")));
+    }
+
+    // ── validate() – multiple errors at once ─────────────────────
+
+    #[test]
+    fn test_validate_multiple_errors() {
+        let config = ServerConfig {
+            max_body_size: 0,
+            request_timeout: 0,
+            default_page_size: 0,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        // At least the three errors above should be present
+        assert!(errors.len() >= 3);
+    }
+
+    // ── full_base_url() ───────────────────────────────────────────
+
+    #[test]
+    fn test_full_base_url() {
+        let config = ServerConfig {
+            base_url: "https://fhir.example.com".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.full_base_url(), "https://fhir.example.com");
+    }
+
+    #[test]
+    fn test_full_base_url_default() {
+        let config = ServerConfig::default();
+        assert_eq!(config.full_base_url(), "http://localhost:8080");
+    }
+
+    // ── multitenancy() accessor ───────────────────────────────────
+
+    #[test]
+    fn test_multitenancy_accessor() {
+        let config = ServerConfig::default();
+        let mt = config.multitenancy();
+        assert_eq!(mt.routing_mode, TenantRoutingMode::HeaderOnly);
+    }
+
+    // ── StorageBackendMode::default() ─────────────────────────────
+
+    #[test]
+    fn test_storage_backend_mode_default() {
+        let mode = StorageBackendMode::default();
+        assert_eq!(mode, StorageBackendMode::Sqlite);
+    }
+
+    // ── TenantRoutingMode::default() ──────────────────────────────
+
+    #[test]
+    fn test_tenant_routing_mode_default() {
+        let mode = TenantRoutingMode::default();
+        assert_eq!(mode, TenantRoutingMode::HeaderOnly);
+    }
+
+    // ── Alias parsing variations ──────────────────────────────────
+
+    #[test]
+    fn test_tenant_routing_mode_aliases() {
+        // headeronly / header
+        assert_eq!(
+            "headeronly".parse::<TenantRoutingMode>().unwrap(),
+            TenantRoutingMode::HeaderOnly
+        );
+        assert_eq!(
+            "header".parse::<TenantRoutingMode>().unwrap(),
+            TenantRoutingMode::HeaderOnly
+        );
+        // urlpath / url / path
+        assert_eq!(
+            "urlpath".parse::<TenantRoutingMode>().unwrap(),
+            TenantRoutingMode::UrlPath
+        );
+        assert_eq!(
+            "url".parse::<TenantRoutingMode>().unwrap(),
+            TenantRoutingMode::UrlPath
+        );
+        assert_eq!(
+            "path".parse::<TenantRoutingMode>().unwrap(),
+            TenantRoutingMode::UrlPath
+        );
+        // combined
+        assert_eq!(
+            "combined".parse::<TenantRoutingMode>().unwrap(),
+            TenantRoutingMode::Both
+        );
+    }
+
+    #[test]
+    fn test_tenant_routing_mode_invalid() {
+        assert!("unknown_mode".parse::<TenantRoutingMode>().is_err());
+    }
+
+    // ── MultitenancyConfig struct field behaviour (without env) ──
+
+    #[test]
+    fn test_multitenancy_config_strict_validation_field() {
+        // Test the struct directly, avoiding env-var parallelism issues.
+        let config = MultitenancyConfig {
+            routing_mode: TenantRoutingMode::UrlPath,
+            strict_validation: true,
+            jwt_tenant_claim: "custom_claim".to_string(),
+        };
+        assert_eq!(config.routing_mode, TenantRoutingMode::UrlPath);
+        assert!(config.strict_validation);
+        assert_eq!(config.jwt_tenant_claim, "custom_claim");
+    }
+
+    #[test]
+    fn test_multitenancy_config_from_env_routing_mode_parsed() {
+        // Parse the routing mode value the same way from_env does, without
+        // touching global env state.
+        let result: Result<TenantRoutingMode, _> = "url_path".parse();
+        assert_eq!(result.unwrap(), TenantRoutingMode::UrlPath);
+    }
+
+    #[test]
+    fn test_multitenancy_strict_validation_string_parsing() {
+        // Mirror the logic inside MultitenancyConfig::from_env.
+        let parse_strict = |s: &str| -> bool { s.to_lowercase() == "true" || s == "1" };
+        assert!(parse_strict("true"));
+        assert!(parse_strict("TRUE"));
+        assert!(parse_strict("1"));
+        assert!(!parse_strict("false"));
+        assert!(!parse_strict("0"));
+        assert!(!parse_strict("yes"));
+    }
+
+    // ── storage_backend_mode() – invalid value ────────────────────
+
+    #[test]
+    fn test_storage_backend_mode_invalid_returns_error() {
+        let config = ServerConfig {
+            storage_backend: "unknown_backend".to_string(),
+            ..Default::default()
+        };
+        assert!(config.storage_backend_mode().is_err());
+    }
+
+    // ── display for StorageBackendMode ────────────────────────────
+
+    #[test]
+    fn test_storage_backend_mode_display_all_variants() {
+        // Already partially tested, but ensure every variant round-trips
+        for (variant, expected) in [
+            (StorageBackendMode::Sqlite, "sqlite"),
+            (
+                StorageBackendMode::SqliteElasticsearch,
+                "sqlite-elasticsearch",
+            ),
+            (StorageBackendMode::Postgres, "postgres"),
+            (
+                StorageBackendMode::PostgresElasticsearch,
+                "postgres-elasticsearch",
+            ),
+            (StorageBackendMode::S3, "s3"),
+            (StorageBackendMode::S3Elasticsearch, "s3-elasticsearch"),
+        ] {
+            assert_eq!(variant.to_string(), expected);
+            assert_eq!(expected.parse::<StorageBackendMode>().unwrap(), variant);
+        }
     }
 }

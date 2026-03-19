@@ -12,7 +12,7 @@ env:
   # Remote Docker host (set via GitHub repository secrets or variables; leave unset for local Docker)
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
-  # S3 backend configuration (optional; S3 tests are skipped when not set)
+  # S3+Elasticsearch backend configuration (optional; s3-elasticsearch tests are skipped when not set)
   HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}
 
 jobs:
@@ -50,9 +50,12 @@ jobs:
     name: Inferno US Core ${{ matrix.version_label }} Tests (${{ matrix.backend }})
     needs: build
     runs-on: [self-hosted, Linux]
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 2
       matrix:
         suite_id:
           [
@@ -63,7 +66,7 @@ jobs:
             us_core_v700,
             us_core_v800,
           ]
-        backend: [sqlite, sqlite-elasticsearch, postgres, s3]
+        backend: [sqlite, sqlite-elasticsearch, postgres, s3-elasticsearch]
         include:
           - { suite_id: us_core_v311, version_label: "v3.1.1" }
           - { suite_id: us_core_v400, version_label: "v4.0.0" }
@@ -83,6 +86,13 @@ jobs:
 
       - name: Make HFS binary executable
         run: chmod +x target/debug/hfs
+
+      - name: Validate backend configuration
+        run: |
+          if [ "${{ matrix.backend }}" = "s3-elasticsearch" ] && [ -z "$HFS_S3_BUCKET" ]; then
+            echo "::error::s3-elasticsearch backend requires HFS_S3_BUCKET to be configured"
+            exit 1
+          fi
 
       - name: Determine runner IP
         run: |
@@ -140,7 +150,7 @@ jobs:
           echo "OMITTED_TESTS=[${OMITTED}]" >> $GITHUB_ENV
 
       - name: Start Elasticsearch
-        if: matrix.backend == 'sqlite-elasticsearch'
+        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
         run: |
           ES_CONTAINER="es-${{ matrix.suite_id }}-${{ matrix.backend }}"
           docker rm -f $ES_CONTAINER 2>/dev/null || true
@@ -186,9 +196,12 @@ jobs:
           for i in {1..30}; do
             if docker exec $PG_CONTAINER pg_isready -U helios > /dev/null 2>&1; then
               PG_PORT=$(docker port $PG_CONTAINER 5432 | head -1 | sed 's/.*://')
-              echo "PostgreSQL is ready on port $PG_PORT"
-              echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
-              exit 0
+              # Verify external TCP connectivity to the mapped port, not just internal readiness
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PostgreSQL is ready on port $PG_PORT"
+                echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
+                exit 0
+              fi
             fi
             echo "Attempt $i/30: PostgreSQL not ready yet..."
             sleep 2
@@ -197,8 +210,37 @@ jobs:
           docker logs $PG_CONTAINER
           exit 1
 
+      - name: Configure AWS credentials
+        if: matrix.backend == 's3-elasticsearch'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install AWS CLI
+        if: matrix.backend == 's3-elasticsearch'
+        run: |
+          if ! command -v aws &>/dev/null; then
+            if ! /tmp/aws-bin/aws --version &>/dev/null; then
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -qo /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
+              rm -rf /tmp/awscliv2.zip /tmp/aws
+            fi
+            echo "/tmp/aws-bin" >> $GITHUB_PATH
+          fi
+          aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
+      - name: Empty S3 prefix
+        if: matrix.backend == 's3-elasticsearch'
+        run: |
+          BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}"
+          PREFIX="ci/${{ matrix.suite_id }}/"
+          echo "Emptying s3://$BUCKET/$PREFIX"
+          aws s3 rm "s3://$BUCKET/$PREFIX" --recursive
+          echo "Prefix emptied"
+
       - name: Start HFS server
-        if: matrix.backend != 's3' || env.HFS_S3_BUCKET != ''
         run: |
           HFS_LOG="/tmp/hfs-${{ matrix.suite_id }}-${{ matrix.backend }}.log"
           echo "HFS_LOG=$HFS_LOG" >> $GITHUB_ENV
@@ -215,11 +257,12 @@ jobs:
             HFS_PG_USER=helios \
             HFS_PG_PASSWORD=helios \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
-          elif [ "${{ matrix.backend }}" = "s3" ]; then
-            HFS_STORAGE_BACKEND=s3 \
+          elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
+            HFS_STORAGE_BACKEND=s3-elasticsearch \
             HFS_S3_BUCKET=${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }} \
+            HFS_S3_PREFIX=ci/${{ matrix.suite_id }}/ \
             HFS_S3_VALIDATE_BUCKETS=false \
-            AWS_REGION=${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }} \
+            HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
@@ -254,7 +297,12 @@ jobs:
 
       - name: Load Inferno test data into HFS
         run: |
-          ./crates/hfs/tests/inferno/install.sh
+          ./crates/hfs/tests/inferno/install.sh || {
+            echo "=== HFS log output ==="
+            cat "$HFS_LOG"
+            echo "=== end of log ==="
+            exit 1
+          }
 
       - name: Wait for Inferno to be ready
         run: |

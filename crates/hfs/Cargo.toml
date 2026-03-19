@@ -53,6 +53,9 @@ clap = { version = "4.0", features = ["derive", "env"] }
 # Logging
 tracing = "0.1"
 
+# Sync primitives (used by build_search_registry for the elasticsearch composite backend)
+parking_lot = "0.12"
+
 # Error handling
 anyhow = "1.0"
 
