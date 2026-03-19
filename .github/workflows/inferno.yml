@@ -87,6 +87,13 @@ jobs:
       - name: Make HFS binary executable
         run: chmod +x target/debug/hfs
 
+      - name: Validate backend configuration
+        run: |
+          if [ "${{ matrix.backend }}" = "s3-elasticsearch" ] && [ -z "$HFS_S3_BUCKET" ]; then
+            echo "::error::s3-elasticsearch backend requires HFS_S3_BUCKET to be configured"
+            exit 1
+          fi
+
       - name: Determine runner IP
         run: |
           # Get the runner's IP so the persistent Inferno container can reach HFS on this runner.
@@ -204,14 +211,14 @@ jobs:
           exit 1
 
       - name: Configure AWS credentials
-        if: matrix.backend == 's3-elasticsearch' && env.HFS_S3_BUCKET != ''
+        if: matrix.backend == 's3-elasticsearch'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
 
       - name: Install AWS CLI
-        if: matrix.backend == 's3-elasticsearch' && env.HFS_S3_BUCKET != ''
+        if: matrix.backend == 's3-elasticsearch'
         run: |
           if ! command -v aws &>/dev/null; then
             if ! /tmp/aws-bin/aws --version &>/dev/null; then
@@ -225,7 +232,7 @@ jobs:
           aws --version 2>/dev/null || /tmp/aws-bin/aws --version
 
       - name: Empty S3 prefix
-        if: matrix.backend == 's3-elasticsearch' && env.HFS_S3_BUCKET != ''
+        if: matrix.backend == 's3-elasticsearch'
         run: |
           BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}"
           PREFIX="ci/${{ matrix.suite_id }}/"
@@ -234,7 +241,6 @@ jobs:
           echo "Prefix emptied"
 
       - name: Start HFS server
-        if: matrix.backend != 's3-elasticsearch' || env.HFS_S3_BUCKET != ''
         run: |
           HFS_LOG="/tmp/hfs-${{ matrix.suite_id }}-${{ matrix.backend }}.log"
           echo "HFS_LOG=$HFS_LOG" >> $GITHUB_ENV
@@ -265,7 +271,6 @@ jobs:
           echo "HFS_PID=$(cat /tmp/hfs.pid)" >> $GITHUB_ENV
 
       - name: Wait for HFS to be ready
-        if: matrix.backend != 's3-elasticsearch' || env.HFS_S3_BUCKET != ''
         run: |
           echo "Waiting for HFS to start..."
           for i in {1..30}; do
@@ -291,7 +296,6 @@ jobs:
           exit 1
 
       - name: Load Inferno test data into HFS
-        if: matrix.backend != 's3-elasticsearch' || env.HFS_S3_BUCKET != ''
         run: |
           ./crates/hfs/tests/inferno/install.sh || {
             echo "=== HFS log output ==="
@@ -301,7 +305,6 @@ jobs:
           }
 
       - name: Wait for Inferno to be ready
-        if: matrix.backend != 's3-elasticsearch' || env.HFS_S3_BUCKET != ''
         run: |
           echo "Waiting for persistent Inferno container to respond..."
           for i in {1..30}; do
@@ -316,11 +319,9 @@ jobs:
           exit 1
 
       - name: Create results directory
-        if: matrix.backend != 's3-elasticsearch' || env.HFS_S3_BUCKET != ''
         run: mkdir -p inferno-results
 
       - name: Run Inferno tests
-        if: matrix.backend != 's3-elasticsearch' || env.HFS_S3_BUCKET != ''
         run: |
           # Create a test session for US Core ${{ matrix.version_label }}
           # Retry to handle Inferno's SQLite "database is locked" errors under concurrent load
@@ -434,7 +435,6 @@ jobs:
           done
 
       - name: Check test results
-        if: matrix.backend != 's3-elasticsearch' || env.HFS_S3_BUCKET != ''
         run: |
           if [ ! -f inferno-results/results.json ]; then
             echo "No results file found"
