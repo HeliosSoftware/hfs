@@ -1000,7 +1000,7 @@ impl MongoBackend {
             .map(|(name, value)| {
                 let param_type = self
                     .lookup_param_type(&registry, resource_type, name)
-                    .unwrap_or_else(|| match name.as_str() {
+                    .unwrap_or(match name.as_str() {
                         "_id" => SearchParamType::Token,
                         "_lastUpdated" => SearchParamType::Date,
                         "_tag" | "_profile" | "_security" => SearchParamType::Token,

@@ -2624,6 +2624,7 @@ impl MongoBackend {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn delete_with_match_resource_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
