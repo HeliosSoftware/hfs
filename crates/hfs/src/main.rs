@@ -10,10 +10,13 @@
 //! | SQLite + Elasticsearch | `sqlite,elasticsearch` | SQLite for CRUD, Elasticsearch for search |
 //! | PostgreSQL | `postgres` | Full-featured RDBMS with JSONB storage and tsvector search |
 //! | PostgreSQL + Elasticsearch | `postgres,elasticsearch` | PostgreSQL for CRUD, Elasticsearch for search |
+//! | MongoDB | `mongodb` | Document database with native JSON resource storage |
+//! | MongoDB + Elasticsearch | `mongodb,elasticsearch` | MongoDB for CRUD, Elasticsearch for search |
 //! | S3 | `s3` | AWS S3 object storage for CRUD, versioning, history, and bulk ops (no search) |
 //! | S3 + Elasticsearch | `s3,elasticsearch` | S3 for CRUD/history, Elasticsearch for search |
 //!
-//! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `s3`, or `s3-elasticsearch`.
+//! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`,
+//! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
 use clap::Parser;
 use helios_rest::{ServerConfig, StorageBackendMode, create_app_with_config, init_logging};
@@ -21,6 +24,9 @@ use tracing::info;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+
+#[cfg(feature = "mongodb")]
+use helios_persistence::backends::mongodb::MongoBackend;
 
 /// Creates and initializes a SQLite backend from the server configuration.
 #[cfg(feature = "sqlite")]
@@ -42,6 +48,39 @@ fn create_sqlite_backend(config: &ServerConfig) -> anyhow::Result<SqliteBackend>
     backend.init_schema()?;
 
     Ok(backend)
+}
+
+/// Starts the server with MongoDB backend.
+#[cfg(feature = "mongodb")]
+async fn start_mongodb(config: ServerConfig) -> anyhow::Result<()> {
+    let backend = if let Some(ref url) = config.database_url {
+        if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
+            info!(url = %url, "Initializing MongoDB backend from connection string");
+            MongoBackend::from_connection_string(url)?
+        } else {
+            info!(
+                "Initializing MongoDB backend from environment variables (database_url is not MongoDB URI)"
+            );
+            MongoBackend::from_env()?
+        }
+    } else {
+        info!("Initializing MongoDB backend from environment variables");
+        MongoBackend::from_env()?
+    };
+
+    backend.init_schema().await?;
+
+    let app = create_app_with_config(backend, config.clone());
+    serve(app, &config).await
+}
+
+/// Fallback when mongodb feature is not enabled.
+#[cfg(not(feature = "mongodb"))]
+async fn start_mongodb(_config: ServerConfig) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "The mongodb backend requires the 'mongodb' feature. \
+         Build with: cargo build -p helios-hfs --features mongodb"
+    )
 }
 
 /// Starts the Axum HTTP server.
@@ -89,6 +128,12 @@ async fn main() -> anyhow::Result<()> {
         }
         StorageBackendMode::PostgresElasticsearch => {
             start_postgres_elasticsearch(config).await?;
+        }
+        StorageBackendMode::MongoDB => {
+            start_mongodb(config).await?;
+        }
+        StorageBackendMode::MongoDBElasticsearch => {
+            start_mongodb_elasticsearch(config).await?;
         }
         StorageBackendMode::S3 => {
             start_s3(config).await?;
@@ -143,6 +188,12 @@ async fn start_sqlite_elasticsearch(config: ServerConfig) -> anyhow::Result<()> 
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+
+    if es_nodes.is_empty() {
+        anyhow::bail!(
+            "sqlite-elasticsearch mode requires at least one Elasticsearch node in HFS_ELASTICSEARCH_NODES"
+        );
+    }
 
     let es_auth = match (
         &config.elasticsearch_username,
@@ -300,6 +351,12 @@ async fn start_postgres_elasticsearch(config: ServerConfig) -> anyhow::Result<()
         .filter(|s| !s.is_empty())
         .collect();
 
+    if es_nodes.is_empty() {
+        anyhow::bail!(
+            "postgres-elasticsearch mode requires at least one Elasticsearch node in HFS_ELASTICSEARCH_NODES"
+        );
+    }
+
     let es_auth = match (
         &config.elasticsearch_username,
         &config.elasticsearch_password,
@@ -377,6 +434,135 @@ async fn start_postgres_elasticsearch(_config: ServerConfig) -> anyhow::Result<(
     anyhow::bail!(
         "The postgres-elasticsearch backend requires both 'postgres' and 'elasticsearch' features. \
          Build with: cargo build -p helios-hfs --features postgres,elasticsearch"
+    )
+}
+
+/// Starts the server with MongoDB + Elasticsearch composite backend.
+#[cfg(all(feature = "mongodb", feature = "elasticsearch"))]
+async fn start_mongodb_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use helios_persistence::backends::elasticsearch::{
+        ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig,
+    };
+    use helios_persistence::composite::{CompositeConfig, CompositeStorage};
+    use helios_persistence::core::BackendKind;
+
+    // Create MongoDB backend
+    let backend = if let Some(ref url) = config.database_url {
+        if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
+            info!(url = %url, "Initializing MongoDB backend from connection string");
+            MongoBackend::from_connection_string(url)?
+        } else {
+            info!(
+                "Initializing MongoDB backend from environment variables (database_url is not MongoDB URI)"
+            );
+            MongoBackend::from_env()?
+        }
+    } else {
+        info!("Initializing MongoDB backend from environment variables");
+        MongoBackend::from_env()?
+    };
+
+    backend.init_schema().await?;
+
+    // Offload search to Elasticsearch
+    let mut backend = backend;
+    backend.set_search_offloaded(true);
+    let mongo = Arc::new(backend);
+    info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
+
+    // Build Elasticsearch configuration from server config
+    let es_nodes: Vec<String> = config
+        .elasticsearch_nodes
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if es_nodes.is_empty() {
+        anyhow::bail!(
+            "mongodb-elasticsearch mode requires at least one Elasticsearch node in HFS_ELASTICSEARCH_NODES"
+        );
+    }
+
+    let es_auth = match (
+        &config.elasticsearch_username,
+        &config.elasticsearch_password,
+    ) {
+        (Some(username), Some(password)) => Some(ElasticsearchAuth::Basic {
+            username: username.clone(),
+            password: password.clone(),
+        }),
+        _ => None,
+    };
+
+    let es_config = ElasticsearchConfig {
+        nodes: es_nodes.clone(),
+        index_prefix: config.elasticsearch_index_prefix.clone(),
+        auth: es_auth,
+        fhir_version: config.default_fhir_version,
+        ..Default::default()
+    };
+
+    info!(
+        nodes = ?es_nodes,
+        index_prefix = %config.elasticsearch_index_prefix,
+        "Initializing Elasticsearch backend"
+    );
+
+    // Create ES backend sharing MongoDB's search parameter registry
+    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
+        es_config,
+        mongo.search_registry().clone(),
+    )?);
+
+    // Build composite configuration
+    let composite_config = CompositeConfig::builder()
+        .primary("mongodb", BackendKind::MongoDB)
+        .search_backend("es", BackendKind::Elasticsearch)
+        .build()?;
+
+    // Build backends map for CompositeStorage
+    let mut backends = HashMap::new();
+    backends.insert(
+        "mongodb".to_string(),
+        mongo.clone() as helios_persistence::composite::DynStorage,
+    );
+    backends.insert(
+        "es".to_string(),
+        es.clone() as helios_persistence::composite::DynStorage,
+    );
+
+    // Build search providers map
+    let mut search_providers = HashMap::new();
+    search_providers.insert(
+        "mongodb".to_string(),
+        mongo.clone() as helios_persistence::composite::DynSearchProvider,
+    );
+    search_providers.insert(
+        "es".to_string(),
+        es.clone() as helios_persistence::composite::DynSearchProvider,
+    );
+
+    // Create composite storage with full primary capabilities
+    let composite = CompositeStorage::new(composite_config, backends)?
+        .with_search_providers(search_providers)
+        .with_full_primary(mongo);
+
+    info!("Composite storage initialized: MongoDB (primary) + Elasticsearch (search)");
+
+    let app = create_app_with_config(composite, config.clone());
+    serve(app, &config).await
+}
+
+/// Fallback when mongodb+elasticsearch features are not both enabled.
+#[cfg(not(all(feature = "mongodb", feature = "elasticsearch")))]
+async fn start_mongodb_elasticsearch(_config: ServerConfig) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "The mongodb-elasticsearch backend requires both 'mongodb' and 'elasticsearch' features. \
+         Build with: cargo build -p helios-hfs --features mongodb,elasticsearch"
     )
 }
 

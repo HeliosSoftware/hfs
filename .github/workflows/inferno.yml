@@ -37,7 +37,7 @@ jobs:
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
 
       - name: Build HFS
-        run: cargo build -p helios-hfs --features R4,sqlite,elasticsearch,postgres,s3
+        run: cargo build -p helios-hfs --features R4,sqlite,elasticsearch,postgres,mongodb
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v4
@@ -66,7 +66,7 @@ jobs:
             us_core_v700,
             us_core_v800,
           ]
-        backend: [sqlite, sqlite-elasticsearch, postgres, s3-elasticsearch]
+        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
         include:
           - { suite_id: us_core_v311, version_label: "v3.1.1" }
           - { suite_id: us_core_v400, version_label: "v4.0.0" }
@@ -148,6 +148,50 @@ jobs:
           esac
 
           echo "OMITTED_TESTS=[${OMITTED}]" >> $GITHUB_ENV
+
+      - name: Start MongoDB replica set
+        if: matrix.backend == 'mongodb'
+        run: |
+          MONGO_CONTAINER="mongo-${{ matrix.suite_id }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+
+          echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
+
+          READY=0
+          for i in {1..30}; do
+            if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' > /dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            echo "Attempt $i/30: MongoDB not ready yet..."
+            sleep 2
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "MongoDB failed to start"
+            docker logs "$MONGO_CONTAINER"
+            exit 1
+          fi
+
+          docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status(); } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] }); }' > /dev/null 2>&1
+
+          echo "Waiting for MongoDB replica set primary..."
+          for i in {1..60}; do
+            PRIMARY_STATE=$(docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status().myState } catch (e) { 0 }' | tr -d '\r\n ')
+            if [ "$PRIMARY_STATE" = "1" ]; then
+              MONGO_PORT=$(docker port "$MONGO_CONTAINER" 27017 | head -1 | sed 's/.*://')
+              echo "MongoDB replica set is ready on port $MONGO_PORT"
+              echo "MONGO_PORT=$MONGO_PORT" >> $GITHUB_ENV
+              exit 0
+            fi
+            echo "Attempt $i/60: MongoDB replica set not primary yet..."
+            sleep 2
+          done
+
+          echo "MongoDB replica set failed to become primary"
+          docker logs "$MONGO_CONTAINER"
+          exit 1
 
       - name: Start Elasticsearch
         if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
@@ -256,6 +300,12 @@ jobs:
             HFS_PG_DBNAME=helios \
             HFS_PG_USER=helios \
             HFS_PG_PASSWORD=helios \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb" ]; then
+            MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            HFS_STORAGE_BACKEND=mongodb \
+            HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_inferno_${{ matrix.suite_id }}_${{ github.run_id }}_${{ github.run_attempt }}" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=s3-elasticsearch \
@@ -536,5 +586,8 @@ jobs:
 
           echo "Stopping PostgreSQL..."
           docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
+
+          echo "Stopping MongoDB..."
+          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Cleanup complete"

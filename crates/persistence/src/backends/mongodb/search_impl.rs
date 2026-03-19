@@ -1,0 +1,1042 @@
+//! Search and conditional-operation implementation for MongoDB backend.
+
+use std::collections::HashSet;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use helios_fhir::FhirVersion;
+use mongodb::{
+    Cursor,
+    bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
+};
+use regex::escape as regex_escape;
+use serde_json::Value;
+
+use crate::core::{
+    ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
+    ConditionalUpdateResult, PatchFormat, ResourceStorage, SearchProvider, SearchResult,
+};
+use crate::error::{BackendError, SearchError, StorageError, StorageResult};
+use crate::tenant::TenantContext;
+use crate::types::{
+    CursorDirection, CursorValue, Page, PageCursor, PageInfo, SearchModifier, SearchParamType,
+    SearchParameter, SearchPrefix, SearchQuery, SearchValue, StoredResource,
+};
+
+use super::MongoBackend;
+
+fn internal_error(message: String) -> StorageError {
+    StorageError::Backend(BackendError::Internal {
+        backend_name: "mongodb".to_string(),
+        message,
+        source: None,
+    })
+}
+
+fn serialization_error(message: String) -> StorageError {
+    StorageError::Backend(BackendError::SerializationError { message })
+}
+
+fn bson_to_chrono(dt: &BsonDateTime) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap_or_else(Utc::now)
+}
+
+fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
+    BsonDateTime::from_millis(dt.timestamp_millis())
+}
+
+fn parse_date_for_query(value: &str) -> Option<DateTime<Utc>> {
+    let normalized = if value.contains('T') {
+        if value.contains('Z') || value.contains('+') || value.matches('-').count() > 2 {
+            value.to_string()
+        } else {
+            format!("{}+00:00", value)
+        }
+    } else if value.len() == 10 {
+        format!("{}T00:00:00+00:00", value)
+    } else if value.len() == 7 {
+        format!("{}-01T00:00:00+00:00", value)
+    } else if value.len() == 4 {
+        format!("{}-01-01T00:00:00+00:00", value)
+    } else {
+        value.to_string()
+    };
+
+    DateTime::parse_from_rfc3339(&normalized)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Document>> {
+    let mut docs = Vec::new();
+    while cursor
+        .advance()
+        .await
+        .map_err(|e| internal_error(format!("Failed to advance MongoDB cursor: {}", e)))?
+    {
+        let doc = cursor.deserialize_current().map_err(|e| {
+            internal_error(format!("Failed to deserialize MongoDB document: {}", e))
+        })?;
+        docs.push(doc);
+    }
+    Ok(docs)
+}
+
+fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
+    params
+        .split('&')
+        .filter_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+#[async_trait]
+impl SearchProvider for MongoBackend {
+    async fn search(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        self.validate_query_support(query)?;
+
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let cursor = if let Some(cursor_str) = &query.cursor {
+            Some(PageCursor::decode(cursor_str).map_err(|_| {
+                StorageError::Search(SearchError::InvalidCursor {
+                    cursor: cursor_str.clone(),
+                })
+            })?)
+        } else {
+            None
+        };
+
+        if cursor.is_some() && !query.sort.is_empty() {
+            return Err(StorageError::Search(SearchError::QueryParseError {
+                message:
+                    "MongoDB cursor pagination currently supports only default _lastUpdated sort"
+                        .to_string(),
+            }));
+        }
+
+        let previous_mode = cursor
+            .as_ref()
+            .is_some_and(|c| c.direction() == CursorDirection::Previous);
+
+        let matched_ids = self
+            .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
+            .await?;
+
+        let filter = self.build_resource_filter(
+            tenant_id,
+            &query.resource_type,
+            query,
+            matched_ids.as_ref(),
+            cursor.as_ref(),
+        )?;
+
+        let sort = self.build_sort_document(query, previous_mode)?;
+        let page_size = query.count.unwrap_or(100).max(1) as usize;
+
+        let mut find_action = resources
+            .find(filter)
+            .sort(sort)
+            .limit((page_size + 1) as i64);
+
+        if cursor.is_none() {
+            if let Some(offset) = query.offset {
+                find_action = find_action.skip(offset as u64);
+            }
+        }
+
+        let docs = collect_documents(
+            find_action
+                .await
+                .map_err(|e| internal_error(format!("Failed to execute MongoDB search: {}", e)))?,
+        )
+        .await?;
+
+        let mut resources = docs
+            .into_iter()
+            .map(|doc| self.document_to_stored_resource(tenant, &query.resource_type, doc))
+            .collect::<StorageResult<Vec<_>>>()?;
+
+        if previous_mode {
+            resources.reverse();
+        }
+
+        let has_next = resources.len() > page_size;
+        if has_next {
+            let _ = resources.pop();
+        }
+
+        let has_previous = cursor.is_some() || query.offset.unwrap_or(0) > 0;
+
+        let next_cursor = if has_next {
+            resources.last().map(|resource| {
+                PageCursor::new(
+                    vec![CursorValue::String(resource.last_modified().to_rfc3339())],
+                    resource.id(),
+                )
+                .encode()
+            })
+        } else {
+            None
+        };
+
+        let previous_cursor = if has_previous {
+            resources.first().map(|resource| {
+                PageCursor::previous(
+                    vec![CursorValue::String(resource.last_modified().to_rfc3339())],
+                    resource.id(),
+                )
+                .encode()
+            })
+        } else {
+            None
+        };
+
+        let total = if query.total.is_some() {
+            Some(self.search_count(tenant, query).await?)
+        } else {
+            None
+        };
+
+        let page_info = PageInfo {
+            next_cursor,
+            previous_cursor,
+            total,
+            has_next,
+            has_previous,
+        };
+
+        Ok(SearchResult {
+            resources: Page::new(resources, page_info),
+            included: Vec::new(),
+            total,
+        })
+    }
+
+    async fn search_count(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<u64> {
+        self.validate_query_support(query)?;
+
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let matched_ids = self
+            .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
+            .await?;
+
+        let filter = self.build_resource_filter(
+            tenant_id,
+            &query.resource_type,
+            query,
+            matched_ids.as_ref(),
+            None,
+        )?;
+
+        resources
+            .count_documents(filter)
+            .await
+            .map_err(|e| internal_error(format!("Failed to count MongoDB search results: {}", e)))
+    }
+}
+
+#[async_trait]
+impl ConditionalStorage for MongoBackend {
+    async fn conditional_create(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        search_params: &str,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<ConditionalCreateResult> {
+        let matches = self
+            .find_matching_resources(tenant, resource_type, search_params)
+            .await?;
+
+        match matches.len() {
+            0 => {
+                let created = self
+                    .create(tenant, resource_type, resource, fhir_version)
+                    .await?;
+                Ok(ConditionalCreateResult::Created(created))
+            }
+            1 => Ok(ConditionalCreateResult::Exists(
+                matches.into_iter().next().expect("single match must exist"),
+            )),
+            n => Ok(ConditionalCreateResult::MultipleMatches(n)),
+        }
+    }
+
+    async fn conditional_update(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        search_params: &str,
+        upsert: bool,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<ConditionalUpdateResult> {
+        let matches = self
+            .find_matching_resources(tenant, resource_type, search_params)
+            .await?;
+
+        match matches.len() {
+            0 => {
+                if upsert {
+                    let created = self
+                        .create(tenant, resource_type, resource, fhir_version)
+                        .await?;
+                    Ok(ConditionalUpdateResult::Created(created))
+                } else {
+                    Ok(ConditionalUpdateResult::NoMatch)
+                }
+            }
+            1 => {
+                let current = matches.into_iter().next().expect("single match must exist");
+                let updated = self.update(tenant, &current, resource).await?;
+                Ok(ConditionalUpdateResult::Updated(updated))
+            }
+            n => Ok(ConditionalUpdateResult::MultipleMatches(n)),
+        }
+    }
+
+    async fn conditional_delete(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params: &str,
+    ) -> StorageResult<ConditionalDeleteResult> {
+        let matches = self
+            .find_matching_resources(tenant, resource_type, search_params)
+            .await?;
+
+        match matches.len() {
+            0 => Ok(ConditionalDeleteResult::NoMatch),
+            1 => {
+                let current = matches.into_iter().next().expect("single match must exist");
+                self.delete(tenant, resource_type, current.id()).await?;
+                Ok(ConditionalDeleteResult::Deleted)
+            }
+            n => Ok(ConditionalDeleteResult::MultipleMatches(n)),
+        }
+    }
+
+    async fn conditional_patch(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params: &str,
+        patch: &PatchFormat,
+    ) -> StorageResult<ConditionalPatchResult> {
+        let _ = (tenant, resource_type, search_params, patch);
+        Err(StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: "mongodb".to_string(),
+            capability: "conditional_patch".to_string(),
+        }))
+    }
+}
+
+impl MongoBackend {
+    fn validate_query_support(&self, query: &SearchQuery) -> StorageResult<()> {
+        if query.parameters.iter().any(|param| !param.chain.is_empty()) {
+            return Err(StorageError::Search(
+                SearchError::ChainedSearchNotSupported {
+                    chain: "forward chain".to_string(),
+                },
+            ));
+        }
+
+        if !query.reverse_chains.is_empty() {
+            return Err(StorageError::Search(SearchError::ReverseChainNotSupported));
+        }
+
+        if !query.includes.is_empty() {
+            return Err(StorageError::Search(SearchError::IncludeNotSupported {
+                operation: "_include/_revinclude".to_string(),
+            }));
+        }
+
+        for param in &query.parameters {
+            if matches!(
+                param.modifier,
+                Some(SearchModifier::Above)
+                    | Some(SearchModifier::Below)
+                    | Some(SearchModifier::In)
+                    | Some(SearchModifier::NotIn)
+            ) {
+                return Err(StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: param
+                        .modifier
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    param_type: param.param_type.to_string(),
+                }));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn matching_resource_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        query: &SearchQuery,
+    ) -> StorageResult<Option<HashSet<String>>> {
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let mut matched: Option<HashSet<String>> = None;
+
+        for param in &query.parameters {
+            if matches!(param.name.as_str(), "_id" | "_lastUpdated") {
+                continue;
+            }
+
+            let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+
+            let ids = search_index
+                .distinct("resource_id", filter)
+                .await
+                .map_err(|e| internal_error(format!("Failed to query search_index: {}", e)))?
+                .into_iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect::<HashSet<_>>();
+
+            if ids.is_empty() {
+                return Ok(Some(HashSet::new()));
+            }
+
+            matched = Some(match matched {
+                Some(current) => current
+                    .intersection(&ids)
+                    .cloned()
+                    .collect::<HashSet<String>>(),
+                None => ids,
+            });
+
+            if matched.as_ref().is_some_and(|set| set.is_empty()) {
+                return Ok(matched);
+            }
+        }
+
+        Ok(matched)
+    }
+
+    fn build_search_index_filter(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+    ) -> StorageResult<Document> {
+        if param.values.is_empty() {
+            return Err(StorageError::Search(SearchError::QueryParseError {
+                message: format!("Search parameter '{}' has no values", param.name),
+            }));
+        }
+
+        let mut filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "param_name": &param.name,
+        };
+
+        let value_filters = param
+            .values
+            .iter()
+            .map(|value| self.build_index_value_filter(param, value))
+            .collect::<StorageResult<Vec<_>>>()?;
+
+        if value_filters.len() == 1 {
+            if let Some(single) = value_filters.into_iter().next() {
+                for (key, value) in single {
+                    filter.insert(key, value);
+                }
+            }
+            return Ok(filter);
+        }
+
+        let combine_with_and = matches!(
+            param.param_type,
+            SearchParamType::Date | SearchParamType::Number
+        );
+        let operator = if combine_with_and { "$and" } else { "$or" };
+        filter.insert(
+            operator,
+            Bson::Array(value_filters.into_iter().map(Bson::Document).collect()),
+        );
+
+        Ok(filter)
+    }
+
+    fn build_index_value_filter(
+        &self,
+        param: &SearchParameter,
+        value: &SearchValue,
+    ) -> StorageResult<Document> {
+        match param.name.as_str() {
+            "_text" | "_content" => {
+                return Err(StorageError::Search(SearchError::TextSearchNotAvailable));
+            }
+            "_id" | "_lastUpdated" => {
+                return Err(StorageError::Search(SearchError::QueryParseError {
+                    message: format!(
+                        "Special parameter '{}' should be resolved against resources, not search_index",
+                        param.name
+                    ),
+                }));
+            }
+            _ => {}
+        }
+
+        match param.param_type {
+            SearchParamType::String => self.build_string_filter(param, value),
+            SearchParamType::Token => self.build_token_filter(param, value),
+            SearchParamType::Date => self.build_date_filter(value, "value_date"),
+            SearchParamType::Number => self.build_number_filter(value),
+            SearchParamType::Reference => self.build_reference_filter(param, value),
+            SearchParamType::Uri => self.build_uri_filter(param, value),
+            SearchParamType::Quantity => Err(StorageError::Search(
+                SearchError::UnsupportedParameterType {
+                    param_type: "quantity".to_string(),
+                },
+            )),
+            SearchParamType::Composite => {
+                Err(StorageError::Search(SearchError::InvalidComposite {
+                    message: "Composite search is not supported in MongoDB Phase 4".to_string(),
+                }))
+            }
+            SearchParamType::Special => Err(StorageError::Search(
+                SearchError::UnsupportedParameterType {
+                    param_type: format!("special parameter {}", param.name),
+                },
+            )),
+        }
+    }
+
+    fn build_string_filter(
+        &self,
+        param: &SearchParameter,
+        value: &SearchValue,
+    ) -> StorageResult<Document> {
+        if value.prefix != SearchPrefix::Eq {
+            return Err(StorageError::Search(SearchError::QueryParseError {
+                message: format!(
+                    "Unsupported prefix '{}' for string parameter '{}'",
+                    value.prefix, param.name
+                ),
+            }));
+        }
+
+        let lowered = value.value.to_lowercase();
+        match param.modifier.as_ref() {
+            None => Ok(doc! {
+                "value_string": {
+                    "$regex": format!("^{}", regex_escape(&lowered))
+                }
+            }),
+            Some(SearchModifier::Exact) => Ok(doc! { "value_string": lowered }),
+            Some(SearchModifier::Contains) => Ok(doc! {
+                "value_string": {
+                    "$regex": regex_escape(&lowered)
+                }
+            }),
+            Some(other) => Err(StorageError::Search(SearchError::UnsupportedModifier {
+                modifier: other.to_string(),
+                param_type: "string".to_string(),
+            })),
+        }
+    }
+
+    fn build_token_filter(
+        &self,
+        param: &SearchParameter,
+        value: &SearchValue,
+    ) -> StorageResult<Document> {
+        if value.prefix != SearchPrefix::Eq {
+            return Err(StorageError::Search(SearchError::QueryParseError {
+                message: format!(
+                    "Unsupported prefix '{}' for token parameter '{}'",
+                    value.prefix, param.name
+                ),
+            }));
+        }
+
+        match param.modifier.as_ref() {
+            None | Some(SearchModifier::CodeOnly) => {}
+            Some(other) => {
+                return Err(StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: other.to_string(),
+                    param_type: "token".to_string(),
+                }));
+            }
+        }
+
+        if let Some((system, code)) = value.value.split_once('|') {
+            if system.is_empty() {
+                Ok(doc! { "value_token_code": code })
+            } else if code.is_empty() {
+                Ok(doc! { "value_token_system": system })
+            } else {
+                Ok(doc! {
+                    "value_token_system": system,
+                    "value_token_code": code,
+                })
+            }
+        } else {
+            Ok(doc! { "value_token_code": &value.value })
+        }
+    }
+
+    fn build_reference_filter(
+        &self,
+        param: &SearchParameter,
+        value: &SearchValue,
+    ) -> StorageResult<Document> {
+        if value.prefix != SearchPrefix::Eq {
+            return Err(StorageError::Search(SearchError::QueryParseError {
+                message: format!(
+                    "Unsupported prefix '{}' for reference parameter '{}'",
+                    value.prefix, param.name
+                ),
+            }));
+        }
+
+        if let Some(modifier) = &param.modifier {
+            return Err(StorageError::Search(SearchError::UnsupportedModifier {
+                modifier: modifier.to_string(),
+                param_type: "reference".to_string(),
+            }));
+        }
+
+        if value.value.contains('/') {
+            return Ok(doc! { "value_reference": &value.value });
+        }
+
+        Ok(doc! {
+            "$or": [
+                { "value_reference": &value.value },
+                {
+                    "value_reference": {
+                        "$regex": format!("/{}$", regex_escape(&value.value))
+                    }
+                }
+            ]
+        })
+    }
+
+    fn build_uri_filter(
+        &self,
+        param: &SearchParameter,
+        value: &SearchValue,
+    ) -> StorageResult<Document> {
+        if value.prefix != SearchPrefix::Eq {
+            return Err(StorageError::Search(SearchError::QueryParseError {
+                message: format!(
+                    "Unsupported prefix '{}' for uri parameter '{}'",
+                    value.prefix, param.name
+                ),
+            }));
+        }
+
+        match param.modifier.as_ref() {
+            None | Some(SearchModifier::Exact) => Ok(doc! { "value_uri": &value.value }),
+            Some(SearchModifier::Contains) => Ok(doc! {
+                "value_uri": {
+                    "$regex": regex_escape(&value.value)
+                }
+            }),
+            Some(other) => Err(StorageError::Search(SearchError::UnsupportedModifier {
+                modifier: other.to_string(),
+                param_type: "uri".to_string(),
+            })),
+        }
+    }
+
+    fn build_date_filter(&self, value: &SearchValue, field: &str) -> StorageResult<Document> {
+        let parsed = parse_date_for_query(&value.value).ok_or_else(|| {
+            StorageError::Search(SearchError::QueryParseError {
+                message: format!("Invalid date value '{}'", value.value),
+            })
+        })?;
+
+        let bson_date = chrono_to_bson(parsed);
+
+        match value.prefix {
+            SearchPrefix::Ap => {
+                let lower = chrono_to_bson(parsed - chrono::Duration::hours(12));
+                let upper = chrono_to_bson(parsed + chrono::Duration::hours(12));
+                Ok(doc! {
+                    field: {
+                        "$gte": lower,
+                        "$lte": upper,
+                    }
+                })
+            }
+            _ => {
+                let op = Self::prefix_to_mongo_operator(value.prefix)?;
+                Ok(doc! {
+                    field: {
+                        op: bson_date,
+                    }
+                })
+            }
+        }
+    }
+
+    fn build_number_filter(&self, value: &SearchValue) -> StorageResult<Document> {
+        let parsed = value.value.parse::<f64>().map_err(|e| {
+            StorageError::Search(SearchError::QueryParseError {
+                message: format!("Invalid number value '{}': {}", value.value, e),
+            })
+        })?;
+
+        match value.prefix {
+            SearchPrefix::Ap => {
+                let delta = (parsed.abs() * 0.1).max(0.1);
+                Ok(doc! {
+                    "value_number": {
+                        "$gte": parsed - delta,
+                        "$lte": parsed + delta,
+                    }
+                })
+            }
+            _ => {
+                let op = Self::prefix_to_mongo_operator(value.prefix)?;
+                Ok(doc! {
+                    "value_number": {
+                        op: parsed,
+                    }
+                })
+            }
+        }
+    }
+
+    fn prefix_to_mongo_operator(prefix: SearchPrefix) -> StorageResult<&'static str> {
+        match prefix {
+            SearchPrefix::Eq => Ok("$eq"),
+            SearchPrefix::Ne => Ok("$ne"),
+            SearchPrefix::Gt | SearchPrefix::Sa => Ok("$gt"),
+            SearchPrefix::Lt | SearchPrefix::Eb => Ok("$lt"),
+            SearchPrefix::Ge => Ok("$gte"),
+            SearchPrefix::Le => Ok("$lte"),
+            SearchPrefix::Ap => Ok("$eq"),
+        }
+    }
+
+    fn build_resource_filter(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        query: &SearchQuery,
+        matched_ids: Option<&HashSet<String>>,
+        cursor: Option<&PageCursor>,
+    ) -> StorageResult<Document> {
+        let mut conditions = vec![doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "is_deleted": false,
+        }];
+
+        if let Some(ids) = matched_ids {
+            let id_values = ids.iter().cloned().map(Bson::String).collect::<Vec<_>>();
+            conditions.push(doc! {
+                "id": { "$in": Bson::Array(id_values) }
+            });
+        }
+
+        for param in &query.parameters {
+            match param.name.as_str() {
+                "_id" => {
+                    conditions.push(self.build_resource_id_condition(param)?);
+                }
+                "_lastUpdated" => {
+                    conditions.extend(self.build_resource_last_updated_conditions(param)?);
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(cursor) = cursor {
+            conditions.push(self.build_cursor_condition(cursor)?);
+        }
+
+        if conditions.len() == 1 {
+            return Ok(conditions.remove(0));
+        }
+
+        Ok(doc! {
+            "$and": Bson::Array(conditions.into_iter().map(Bson::Document).collect())
+        })
+    }
+
+    fn build_resource_id_condition(&self, param: &SearchParameter) -> StorageResult<Document> {
+        let mut ids = Vec::new();
+
+        for value in &param.values {
+            if value.prefix != SearchPrefix::Eq {
+                return Err(StorageError::Search(SearchError::QueryParseError {
+                    message: format!("Unsupported prefix '{}' for _id parameter", value.prefix),
+                }));
+            }
+            ids.push(value.value.clone());
+        }
+
+        if ids.len() == 1 {
+            return Ok(doc! { "id": ids.remove(0) });
+        }
+
+        Ok(doc! {
+            "id": { "$in": Bson::Array(ids.into_iter().map(Bson::String).collect()) }
+        })
+    }
+
+    fn build_resource_last_updated_conditions(
+        &self,
+        param: &SearchParameter,
+    ) -> StorageResult<Vec<Document>> {
+        param
+            .values
+            .iter()
+            .map(|value| self.build_date_filter(value, "last_updated"))
+            .collect()
+    }
+
+    fn build_cursor_condition(&self, cursor: &PageCursor) -> StorageResult<Document> {
+        let timestamp = match cursor.sort_values().first() {
+            Some(CursorValue::String(value)) => DateTime::parse_from_rfc3339(value)
+                .map_err(|_| {
+                    StorageError::Search(SearchError::InvalidCursor {
+                        cursor: cursor.encode(),
+                    })
+                })?
+                .with_timezone(&Utc),
+            _ => {
+                return Err(StorageError::Search(SearchError::InvalidCursor {
+                    cursor: cursor.encode(),
+                }));
+            }
+        };
+
+        let ts = chrono_to_bson(timestamp);
+        let id = cursor.resource_id().to_string();
+
+        if cursor.direction() == CursorDirection::Previous {
+            Ok(doc! {
+                "$or": [
+                    { "last_updated": { "$gt": ts } },
+                    { "last_updated": ts, "id": { "$gt": id } }
+                ]
+            })
+        } else {
+            Ok(doc! {
+                "$or": [
+                    { "last_updated": { "$lt": ts } },
+                    { "last_updated": ts, "id": { "$lt": id } }
+                ]
+            })
+        }
+    }
+
+    fn build_sort_document(
+        &self,
+        query: &SearchQuery,
+        previous_mode: bool,
+    ) -> StorageResult<Document> {
+        if query.sort.is_empty() {
+            return Ok(if previous_mode {
+                doc! { "last_updated": 1_i32, "id": 1_i32 }
+            } else {
+                doc! { "last_updated": -1_i32, "id": -1_i32 }
+            });
+        }
+
+        let mut sort = Document::new();
+
+        for directive in &query.sort {
+            let field = match directive.parameter.as_str() {
+                "_lastUpdated" => "last_updated",
+                "_id" | "id" => "id",
+                other => {
+                    return Err(StorageError::Search(
+                        SearchError::UnsupportedParameterType {
+                            param_type: format!("sort parameter '{}'", other),
+                        },
+                    ));
+                }
+            };
+
+            let mut dir = if directive.direction == crate::types::SortDirection::Descending {
+                -1_i32
+            } else {
+                1_i32
+            };
+
+            if previous_mode {
+                dir = -dir;
+            }
+
+            sort.insert(field, dir);
+        }
+
+        if !sort.contains_key("id") {
+            sort.insert("id", if previous_mode { 1_i32 } else { -1_i32 });
+        }
+
+        Ok(sort)
+    }
+
+    fn document_to_stored_resource(
+        &self,
+        tenant: &TenantContext,
+        fallback_resource_type: &str,
+        doc: Document,
+    ) -> StorageResult<StoredResource> {
+        let resource_type = doc
+            .get_str("resource_type")
+            .ok()
+            .unwrap_or(fallback_resource_type)
+            .to_string();
+
+        let id = doc
+            .get_str("id")
+            .map_err(|e| internal_error(format!("Missing resource id in search result: {}", e)))?
+            .to_string();
+
+        let version_id = doc
+            .get_str("version_id")
+            .map_err(|e| internal_error(format!("Missing version_id in search result: {}", e)))?
+            .to_string();
+
+        let payload = doc.get_document("data").map_err(|e| {
+            internal_error(format!("Missing resource payload in search result: {}", e))
+        })?;
+
+        let content = bson::from_bson::<Value>(Bson::Document(payload.clone())).map_err(|e| {
+            serialization_error(format!("Failed to deserialize resource payload: {}", e))
+        })?;
+
+        let now = Utc::now();
+        let created_at = doc
+            .get_datetime("created_at")
+            .map(bson_to_chrono)
+            .unwrap_or(now);
+
+        let last_updated = doc
+            .get_datetime("last_updated")
+            .map(bson_to_chrono)
+            .unwrap_or(created_at);
+
+        let deleted_at = match doc.get("deleted_at") {
+            Some(Bson::DateTime(value)) => Some(bson_to_chrono(value)),
+            _ => None,
+        };
+
+        let fhir_version = doc
+            .get_str("fhir_version")
+            .ok()
+            .and_then(FhirVersion::from_storage)
+            .unwrap_or_default();
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            version_id,
+            tenant.tenant_id().clone(),
+            content,
+            created_at,
+            last_updated,
+            deleted_at,
+            fhir_version,
+        ))
+    }
+
+    async fn find_matching_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params_str: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
+        let parsed_params = parse_simple_search_params(search_params_str);
+
+        if parsed_params.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let search_params = self.build_search_parameters(resource_type, &parsed_params);
+
+        let query = SearchQuery {
+            resource_type: resource_type.to_string(),
+            parameters: search_params,
+            count: Some(1000),
+            ..Default::default()
+        };
+
+        let result = <Self as SearchProvider>::search(self, tenant, &query).await?;
+        Ok(result.resources.items)
+    }
+
+    fn build_search_parameters(
+        &self,
+        resource_type: &str,
+        params: &[(String, String)],
+    ) -> Vec<SearchParameter> {
+        let registry = self.search_registry().read();
+
+        params
+            .iter()
+            .map(|(name, value)| {
+                let param_type = self
+                    .lookup_param_type(&registry, resource_type, name)
+                    .unwrap_or_else(|| match name.as_str() {
+                        "_id" => SearchParamType::Token,
+                        "_lastUpdated" => SearchParamType::Date,
+                        "_tag" | "_profile" | "_security" => SearchParamType::Token,
+                        "identifier" => SearchParamType::Token,
+                        "patient" | "subject" | "encounter" | "performer" | "author"
+                        | "requester" | "recorder" | "asserter" | "practitioner"
+                        | "organization" | "location" | "device" => SearchParamType::Reference,
+                        _ => SearchParamType::String,
+                    });
+
+                SearchParameter {
+                    name: name.clone(),
+                    param_type,
+                    modifier: None,
+                    values: vec![SearchValue::parse(value)],
+                    chain: vec![],
+                    components: vec![],
+                }
+            })
+            .collect()
+    }
+
+    fn lookup_param_type(
+        &self,
+        registry: &crate::search::SearchParameterRegistry,
+        resource_type: &str,
+        param_name: &str,
+    ) -> Option<SearchParamType> {
+        if let Some(def) = registry.get_param(resource_type, param_name) {
+            return Some(def.param_type);
+        }
+
+        if let Some(def) = registry.get_param("Resource", param_name) {
+            return Some(def.param_type);
+        }
+
+        None
+    }
+}

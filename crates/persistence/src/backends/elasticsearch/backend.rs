@@ -577,6 +577,7 @@ impl ElasticsearchBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_config_defaults() {
@@ -625,5 +626,50 @@ mod tests {
         let backend = ElasticsearchBackend::new(config).unwrap();
         assert_eq!(backend.kind(), BackendKind::Elasticsearch);
         assert_eq!(backend.name(), "elasticsearch");
+    }
+
+    #[test]
+    fn test_with_shared_registry_reuses_arc() {
+        let config = ElasticsearchConfig::default();
+        let shared_registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
+
+        let backend =
+            ElasticsearchBackend::with_shared_registry(config, shared_registry.clone()).unwrap();
+
+        assert!(Arc::ptr_eq(backend.search_registry(), &shared_registry));
+    }
+
+    #[test]
+    fn test_with_shared_registry_reflects_runtime_updates() {
+        let config = ElasticsearchConfig::default();
+        let shared_registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
+        let backend =
+            ElasticsearchBackend::with_shared_registry(config, shared_registry.clone()).unwrap();
+
+        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let definition = loader
+            .parse_resource(&json!({
+                "resourceType": "SearchParameter",
+                "id": "mongo-shared-param",
+                "url": "http://example.org/fhir/SearchParameter/mongo-shared-param",
+                "name": "MongoSharedParam",
+                "status": "active",
+                "code": "mongo-shared-code",
+                "base": ["Patient"],
+                "type": "token",
+                "expression": "Patient.identifier"
+            }))
+            .expect("parse shared SearchParameter definition");
+
+        shared_registry
+            .write()
+            .register(definition)
+            .expect("register shared SearchParameter");
+
+        let registry = backend.search_registry().read();
+        assert!(
+            registry.get_param("Patient", "mongo-shared-code").is_some(),
+            "shared registry updates should be visible to Elasticsearch backend"
+        );
     }
 }

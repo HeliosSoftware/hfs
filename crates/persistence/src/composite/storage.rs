@@ -53,7 +53,8 @@ use crate::core::{
 use crate::error::{BackendError, StorageError, StorageResult, TransactionError};
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, Pagination, ReverseChainedParameter, SearchQuery, StoredResource,
+    IncludeDirective, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
+    SearchQuery, SearchValue, StoredResource,
 };
 
 use super::config::{CompositeConfig, SyncMode};
@@ -157,6 +158,68 @@ impl Default for BackendHealth {
 }
 
 impl CompositeStorage {
+    fn has_dedicated_search_backend(&self) -> bool {
+        self.config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            .is_some()
+    }
+
+    fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
+        params
+            .split('&')
+            .filter_map(|pair| {
+                let parts: Vec<&str> = pair.splitn(2, '=').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn infer_conditional_param_type(name: &str) -> SearchParamType {
+        match name {
+            "_id" => SearchParamType::Token,
+            "_lastUpdated" => SearchParamType::Date,
+            "_tag" | "_profile" | "_security" | "identifier" => SearchParamType::Token,
+            "patient" | "subject" | "encounter" | "performer" | "author" | "requester"
+            | "recorder" | "asserter" | "practitioner" | "organization" | "location" | "device" => {
+                SearchParamType::Reference
+            }
+            _ => SearchParamType::String,
+        }
+    }
+
+    async fn find_conditional_matches(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
+        let parsed_params = Self::parse_simple_search_params(search_params);
+        if parsed_params.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = SearchQuery::new(resource_type);
+        query.count = Some(1000);
+        for (name, value) in parsed_params {
+            query = query.with_parameter(SearchParameter {
+                name: name.clone(),
+                param_type: Self::infer_conditional_param_type(&name),
+                modifier: None,
+                values: vec![SearchValue::parse(&value)],
+                chain: vec![],
+                components: vec![],
+            });
+        }
+
+        let result = self.search(tenant, &query).await?;
+        Ok(result.resources.items)
+    }
+
     /// Creates a new composite storage with the given configuration and backends.
     ///
     /// # Arguments
@@ -836,8 +899,18 @@ impl SearchProvider for CompositeStorage {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
-        // For count, we can just use primary
-        // A more sophisticated implementation might route based on features
+        // Prefer dedicated Search backend when configured, matching `search` routing.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.search_count(tenant, query).await;
+            }
+        }
+
+        // Fall back to primary provider.
         if let Some(provider) = self
             .search_providers
             .get(self.config.primary_id().unwrap_or("primary"))
@@ -862,6 +935,40 @@ impl ConditionalStorage for CompositeStorage {
         search_params: &str,
         fhir_version: FhirVersion,
     ) -> StorageResult<ConditionalCreateResult> {
+        if self.has_dedicated_search_backend() {
+            let matches = self
+                .find_conditional_matches(tenant, resource_type, search_params)
+                .await?;
+
+            return match matches.len() {
+                0 => {
+                    let created = self
+                        .primary
+                        .create(tenant, resource_type, resource, fhir_version)
+                        .await?;
+
+                    if let Err(e) = self
+                        .sync_to_secondaries(SyncEvent::Create {
+                            resource_type: resource_type.to_string(),
+                            resource_id: created.id().to_string(),
+                            content: created.content().clone(),
+                            tenant_id: tenant.tenant_id().clone(),
+                            fhir_version,
+                        })
+                        .await
+                    {
+                        warn!(error = %e, "Failed to sync conditional_create to secondaries");
+                    }
+
+                    Ok(ConditionalCreateResult::Created(created))
+                }
+                1 => Ok(ConditionalCreateResult::Exists(
+                    matches.into_iter().next().expect("single match must exist"),
+                )),
+                n => Ok(ConditionalCreateResult::MultipleMatches(n)),
+            };
+        }
+
         let storage = self.conditional_storage.as_ref().ok_or_else(|| {
             StorageError::Backend(BackendError::UnsupportedCapability {
                 backend_name: "composite".to_string(),
@@ -901,6 +1008,64 @@ impl ConditionalStorage for CompositeStorage {
         upsert: bool,
         fhir_version: FhirVersion,
     ) -> StorageResult<ConditionalUpdateResult> {
+        if self.has_dedicated_search_backend() {
+            let matches = self
+                .find_conditional_matches(tenant, resource_type, search_params)
+                .await?;
+
+            return match matches.len() {
+                0 => {
+                    if upsert {
+                        let created = self
+                            .primary
+                            .create(tenant, resource_type, resource, fhir_version)
+                            .await?;
+
+                        if let Err(e) = self
+                            .sync_to_secondaries(SyncEvent::Create {
+                                resource_type: resource_type.to_string(),
+                                resource_id: created.id().to_string(),
+                                content: created.content().clone(),
+                                tenant_id: tenant.tenant_id().clone(),
+                                fhir_version,
+                            })
+                            .await
+                        {
+                            warn!(
+                                error = %e,
+                                "Failed to sync conditional_update create to secondaries"
+                            );
+                        }
+
+                        Ok(ConditionalUpdateResult::Created(created))
+                    } else {
+                        Ok(ConditionalUpdateResult::NoMatch)
+                    }
+                }
+                1 => {
+                    let current = matches.into_iter().next().expect("single match must exist");
+                    let updated = self.primary.update(tenant, &current, resource).await?;
+
+                    if let Err(e) = self
+                        .sync_to_secondaries(SyncEvent::Update {
+                            resource_type: resource_type.to_string(),
+                            resource_id: updated.id().to_string(),
+                            content: updated.content().clone(),
+                            tenant_id: tenant.tenant_id().clone(),
+                            version: updated.version_id().to_string(),
+                            fhir_version: updated.fhir_version(),
+                        })
+                        .await
+                    {
+                        warn!(error = %e, "Failed to sync conditional_update to secondaries");
+                    }
+
+                    Ok(ConditionalUpdateResult::Updated(updated))
+                }
+                n => Ok(ConditionalUpdateResult::MultipleMatches(n)),
+            };
+        }
+
         let storage = self.conditional_storage.as_ref().ok_or_else(|| {
             StorageError::Backend(BackendError::UnsupportedCapability {
                 backend_name: "composite".to_string(),
@@ -962,6 +1127,36 @@ impl ConditionalStorage for CompositeStorage {
         resource_type: &str,
         search_params: &str,
     ) -> StorageResult<ConditionalDeleteResult> {
+        if self.has_dedicated_search_backend() {
+            let matches = self
+                .find_conditional_matches(tenant, resource_type, search_params)
+                .await?;
+
+            return match matches.len() {
+                0 => Ok(ConditionalDeleteResult::NoMatch),
+                1 => {
+                    let current = matches.into_iter().next().expect("single match must exist");
+                    self.primary
+                        .delete(tenant, resource_type, current.id())
+                        .await?;
+
+                    if let Err(e) = self
+                        .sync_to_secondaries(SyncEvent::Delete {
+                            resource_type: resource_type.to_string(),
+                            resource_id: current.id().to_string(),
+                            tenant_id: tenant.tenant_id().clone(),
+                        })
+                        .await
+                    {
+                        warn!(error = %e, "Failed to sync conditional_delete to secondaries");
+                    }
+
+                    Ok(ConditionalDeleteResult::Deleted)
+                }
+                n => Ok(ConditionalDeleteResult::MultipleMatches(n)),
+            };
+        }
+
         let storage = self.conditional_storage.as_ref().ok_or_else(|| {
             StorageError::Backend(BackendError::UnsupportedCapability {
                 backend_name: "composite".to_string(),
@@ -1626,12 +1821,125 @@ impl CapabilityProvider for CompositeStorage {
 mod tests {
     use super::*;
     use crate::core::{BackendKind, CapabilityProvider};
+    use crate::error::{BackendError, StorageError, StorageResult};
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+    use crate::types::{
+        SearchParamType, SearchParameter, SearchQuery, SearchValue, StoredResource,
+    };
+    use async_trait::async_trait;
+    use helios_fhir::FhirVersion;
+    use serde_json::{Value, json};
+
+    #[derive(Debug)]
+    struct FailingSearchBackend {
+        backend_name: &'static str,
+        error_message: &'static str,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for FailingSearchBackend {
+        fn backend_name(&self) -> &'static str {
+            self.backend_name
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: self.backend_name.to_string(),
+                capability: "create".to_string(),
+            }))
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: self.backend_name.to_string(),
+                capability: "create_or_update".to_string(),
+            }))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: self.backend_name.to_string(),
+                capability: "update".to_string(),
+            }))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: self.backend_name.to_string(),
+                capability: "delete".to_string(),
+            }))
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+    }
+
+    #[async_trait]
+    impl SearchProvider for FailingSearchBackend {
+        async fn search(
+            &self,
+            _tenant: &TenantContext,
+            _query: &SearchQuery,
+        ) -> StorageResult<SearchResult> {
+            Err(StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: self.backend_name.to_string(),
+                message: self.error_message.to_string(),
+            }))
+        }
+
+        async fn search_count(
+            &self,
+            _tenant: &TenantContext,
+            _query: &SearchQuery,
+        ) -> StorageResult<u64> {
+            Err(StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: self.backend_name.to_string(),
+                message: self.error_message.to_string(),
+            }))
+        }
+    }
 
     /// Minimal mock storage for unit testing CompositeStorage.
     struct MockStorage;
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl ResourceStorage for MockStorage {
         fn backend_name(&self) -> &'static str {
             "mock"
@@ -1782,6 +2090,280 @@ mod tests {
         let config = test_config();
         assert_eq!(config.primary_id(), Some("sqlite"));
         assert_eq!(config.secondaries().count(), 1);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_search_prefers_configured_search_backend() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use crate::backends::sqlite::SqliteBackend;
+        use crate::core::{ResourceStorage, SearchProvider};
+        use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+        use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+
+        let primary = Arc::new(SqliteBackend::in_memory().expect("create primary sqlite backend"));
+        primary.init_schema().expect("init primary sqlite schema");
+
+        let search = Arc::new(SqliteBackend::in_memory().expect("create search sqlite backend"));
+        search.init_schema().expect("init search sqlite schema");
+
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+
+        // Seed distinct data so we can tell which provider answered the query.
+        primary
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "primary-only-patient",
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed primary patient");
+
+        search
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "search-only-patient",
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed search patient");
+
+        let composite_config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("search", BackendKind::Sqlite)
+            .build()
+            .expect("build composite config");
+
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary.clone() as DynStorage);
+        backends.insert("search".to_string(), search.clone() as DynStorage);
+
+        let mut search_providers = HashMap::new();
+        search_providers.insert("primary".to_string(), primary.clone() as DynSearchProvider);
+        search_providers.insert("search".to_string(), search.clone() as DynSearchProvider);
+
+        let composite = CompositeStorage::new(composite_config, backends)
+            .expect("create composite storage")
+            .with_search_providers(search_providers)
+            .with_full_primary(primary.clone());
+
+        let read_result = composite
+            .read(&tenant, "Patient", "primary-only-patient")
+            .await
+            .expect("composite read should succeed");
+        assert!(
+            read_result.is_some(),
+            "Read path should use primary backend data"
+        );
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("search-only-patient")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = composite
+            .search(&tenant, &query)
+            .await
+            .expect("composite search should succeed");
+
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(result.resources.items[0].id(), "search-only-patient");
+
+        let count = composite
+            .search_count(&tenant, &query)
+            .await
+            .expect("composite search_count should succeed");
+        assert_eq!(count, 1);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_search_backend_preserves_tenant_isolation() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use crate::backends::sqlite::SqliteBackend;
+        use crate::core::{ResourceStorage, SearchProvider};
+        use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+
+        let primary = Arc::new(SqliteBackend::in_memory().expect("create primary sqlite backend"));
+        primary.init_schema().expect("init primary sqlite schema");
+
+        let search = Arc::new(SqliteBackend::in_memory().expect("create search sqlite backend"));
+        search.init_schema().expect("init search sqlite schema");
+
+        let tenant_a =
+            TenantContext::new(TenantId::new("tenant-a"), TenantPermissions::full_access());
+        let tenant_b =
+            TenantContext::new(TenantId::new("tenant-b"), TenantPermissions::full_access());
+
+        search
+            .create(
+                &tenant_a,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tenant-a-patient",
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed tenant A search patient");
+
+        search
+            .create(
+                &tenant_b,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tenant-b-patient",
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed tenant B search patient");
+
+        let composite_config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("search", BackendKind::Sqlite)
+            .build()
+            .expect("build composite config");
+
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary.clone() as DynStorage);
+        backends.insert("search".to_string(), search.clone() as DynStorage);
+
+        let mut search_providers = HashMap::new();
+        search_providers.insert("primary".to_string(), primary.clone() as DynSearchProvider);
+        search_providers.insert("search".to_string(), search.clone() as DynSearchProvider);
+
+        let composite = CompositeStorage::new(composite_config, backends)
+            .expect("create composite storage")
+            .with_search_providers(search_providers)
+            .with_full_primary(primary.clone());
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("tenant-a-patient")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let tenant_a_result = composite
+            .search(&tenant_a, &query)
+            .await
+            .expect("tenant A composite search should succeed");
+        assert_eq!(tenant_a_result.resources.len(), 1);
+        assert_eq!(tenant_a_result.resources.items[0].id(), "tenant-a-patient");
+
+        let tenant_b_result = composite
+            .search(&tenant_b, &query)
+            .await
+            .expect("tenant B composite search should succeed");
+        assert!(
+            tenant_b_result.resources.is_empty(),
+            "delegated search must not leak tenant A data to tenant B"
+        );
+    }
+
+    #[test]
+    fn test_search_backend_failure_marks_backend_unhealthy() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use crate::composite::config::HealthConfig;
+
+        let primary = Arc::new(FailingSearchBackend {
+            backend_name: "primary",
+            error_message: "primary should not be used",
+        });
+        let search = Arc::new(FailingSearchBackend {
+            backend_name: "search",
+            error_message: "simulated search outage",
+        });
+
+        let composite_config = CompositeConfig::builder()
+            .primary("primary", BackendKind::MongoDB)
+            .search_backend("search", BackendKind::Elasticsearch)
+            .with_health_config(HealthConfig {
+                failure_threshold: 1,
+                ..HealthConfig::default()
+            })
+            .build()
+            .expect("build composite config");
+
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary.clone() as DynStorage);
+        backends.insert("search".to_string(), search.clone() as DynStorage);
+
+        let mut search_providers = HashMap::new();
+        search_providers.insert("primary".to_string(), primary.clone() as DynSearchProvider);
+        search_providers.insert("search".to_string(), search.clone() as DynSearchProvider);
+
+        let composite = CompositeStorage::new(composite_config, backends)
+            .expect("create composite storage")
+            .with_search_providers(search_providers);
+
+        let tenant = TenantContext::new(
+            TenantId::new("tenant-failure"),
+            TenantPermissions::full_access(),
+        );
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("failure-patient")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        let err = runtime
+            .block_on(composite.search(&tenant, &query))
+            .expect_err("delegated search should fail when search backend is down");
+
+        assert!(matches!(
+            err,
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name,
+                message,
+            }) if backend_name == "search" && message.contains("simulated search outage")
+        ));
+
+        let health = composite
+            .backend_health("search")
+            .expect("search backend health should exist");
+        assert!(
+            !health.healthy,
+            "search backend should be marked unhealthy after failure"
+        );
+        assert_eq!(health.failure_count, 1);
+        assert_eq!(
+            health.last_error.as_deref(),
+            Some("connection failed to search: simulated search outage")
+        );
     }
 
     // ── CompositeStorage::new() ────────────────────────────────────

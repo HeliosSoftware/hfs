@@ -63,6 +63,11 @@ pub enum StorageBackendMode {
     /// PostgreSQL for CRUD + Elasticsearch for search.
     /// Requires running PostgreSQL and Elasticsearch instances.
     PostgresElasticsearch,
+    /// MongoDB only. Requires a running MongoDB instance.
+    MongoDB,
+    /// MongoDB for CRUD + Elasticsearch for search.
+    /// Requires running MongoDB and Elasticsearch instances.
+    MongoDBElasticsearch,
     /// AWS S3 object storage for CRUD, versioning, history, and bulk operations.
     /// Requires AWS credentials via the standard provider chain. No search support.
     S3,
@@ -80,6 +85,8 @@ impl fmt::Display for StorageBackendMode {
             StorageBackendMode::PostgresElasticsearch => {
                 write!(f, "postgres-elasticsearch")
             }
+            StorageBackendMode::MongoDB => write!(f, "mongodb"),
+            StorageBackendMode::MongoDBElasticsearch => write!(f, "mongodb-elasticsearch"),
             StorageBackendMode::S3 => write!(f, "s3"),
             StorageBackendMode::S3Elasticsearch => write!(f, "s3-elasticsearch"),
         }
@@ -97,10 +104,14 @@ impl FromStr for StorageBackendMode {
             "postgres-elasticsearch" | "postgres-es" | "pg-elasticsearch" | "pg-es" => {
                 Ok(StorageBackendMode::PostgresElasticsearch)
             }
+            "mongodb" | "mongo" => Ok(StorageBackendMode::MongoDB),
+            "mongodb-elasticsearch" | "mongodb-es" | "mongo-elasticsearch" | "mongo-es" => {
+                Ok(StorageBackendMode::MongoDBElasticsearch)
+            }
             "s3" | "objectstore" => Ok(StorageBackendMode::S3),
             "s3-elasticsearch" | "s3-es" => Ok(StorageBackendMode::S3Elasticsearch),
             _ => Err(format!(
-                "Invalid storage backend '{}'. Valid values: sqlite, sqlite-elasticsearch, postgres, postgres-elasticsearch, s3, s3-elasticsearch",
+                "Invalid storage backend '{}'. Valid values: sqlite, sqlite-elasticsearch, postgres, postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, s3-elasticsearch",
                 s
             )),
         }
@@ -309,12 +320,14 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_MAX_PAGE_SIZE", default_value = "1000")]
     pub max_page_size: usize,
 
-    /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres, postgres-elasticsearch, s3, or s3-elasticsearch.
+    /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres,
+    /// postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, or s3-elasticsearch.
     #[arg(long, env = "HFS_STORAGE_BACKEND", default_value = "sqlite")]
     pub storage_backend: String,
 
     /// Elasticsearch node URLs (comma-separated).
-    /// Used when storage_backend is sqlite-elasticsearch or postgres-elasticsearch.
+    /// Used when storage_backend is sqlite-elasticsearch, postgres-elasticsearch,
+    /// or mongodb-elasticsearch.
     #[arg(
         long,
         env = "HFS_ELASTICSEARCH_NODES",
@@ -635,6 +648,34 @@ mod tests {
             StorageBackendMode::PostgresElasticsearch
         );
         assert_eq!(
+            "mongodb".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::MongoDB
+        );
+        assert_eq!(
+            "mongo".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::MongoDB
+        );
+        assert_eq!(
+            "MONGODB".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::MongoDB
+        );
+        assert_eq!(
+            "mongodb-elasticsearch"
+                .parse::<StorageBackendMode>()
+                .unwrap(),
+            StorageBackendMode::MongoDBElasticsearch
+        );
+        assert_eq!(
+            "mongo-es".parse::<StorageBackendMode>().unwrap(),
+            StorageBackendMode::MongoDBElasticsearch
+        );
+        assert_eq!(
+            "mongodb_elasticsearch"
+                .parse::<StorageBackendMode>()
+                .unwrap(),
+            StorageBackendMode::MongoDBElasticsearch
+        );
+        assert_eq!(
             "s3".parse::<StorageBackendMode>().unwrap(),
             StorageBackendMode::S3
         );
@@ -672,6 +713,11 @@ mod tests {
         assert_eq!(
             StorageBackendMode::PostgresElasticsearch.to_string(),
             "postgres-elasticsearch"
+        );
+        assert_eq!(StorageBackendMode::MongoDB.to_string(), "mongodb");
+        assert_eq!(
+            StorageBackendMode::MongoDBElasticsearch.to_string(),
+            "mongodb-elasticsearch"
         );
         assert_eq!(StorageBackendMode::S3.to_string(), "s3");
         assert_eq!(
@@ -898,6 +944,11 @@ mod tests {
             (
                 StorageBackendMode::PostgresElasticsearch,
                 "postgres-elasticsearch",
+            ),
+            (StorageBackendMode::MongoDB, "mongodb"),
+            (
+                StorageBackendMode::MongoDBElasticsearch,
+                "mongodb-elasticsearch",
             ),
             (StorageBackendMode::S3, "s3"),
             (StorageBackendMode::S3Elasticsearch, "s3-elasticsearch"),
