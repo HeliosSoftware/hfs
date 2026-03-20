@@ -41,8 +41,8 @@ pub mod postgres;
 // #[cfg(feature = "cassandra")]
 // pub mod cassandra;
 //
-// #[cfg(feature = "mongodb")]
-// pub mod mongodb;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 //
 // #[cfg(feature = "neo4j")]
 // pub mod neo4j;
