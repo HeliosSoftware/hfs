@@ -315,9 +315,6 @@ The matrix below shows which FHIR operations each backend supports. This reflect
 > **Note:** Documentation links reference [build.fhir.org](https://build.fhir.org), which contains the current FHIR development version. Some features marked as planned are new and may be labeled "Trial Use" in the specification.
 
 **Legend:** ✓ Implemented | ◐ Partial | ○ Planned | ✗ Not planned | † Requires external service
-
-> **MongoDB Status:** MongoDB primary support is fully implemented and tested: CRUD operations, versioning (vread), history providers (instance/type/system), optimistic locking, tenant isolation, native search (string, token, reference, date, number, URI parameters), conditional operations (create/update/delete), cursor and offset pagination, multi-field sorting, and transaction bundles with urn:uuid reference resolution on replica sets. MongoDB + Elasticsearch composite mode is fully implemented and tested with write-primary/read-primary/search-secondary routing. See [`docs/mongodb-manual-testing.md`](../../docs/mongodb-manual-testing.md) for comprehensive test results.
-
 | Feature                                                                     | SQLite | PostgreSQL | MongoDB | Cassandra | Neo4j | Elasticsearch | S3  |
 | --------------------------------------------------------------------------- | ------ | ---------- | ------- | --------- | ----- | ------------- | --- |
 | **Core Operations**                                                         |
@@ -566,9 +563,6 @@ MongoDB runtime configuration also supports:
 - `HFS_MONGODB_DATABASE` to select the database name (default: `helios`)
 - `HFS_MONGODB_MAX_CONNECTIONS` to control the driver pool size (default: `10`)
 - `HFS_MONGODB_CONNECT_TIMEOUT_MS` to control the connection timeout (default: `5000`)
-
-For a step-by-step API verification checklist, see
-[`docs/mongodb-manual-testing.md`](../../docs/mongodb-manual-testing.md).
 
 ### MongoDB + Elasticsearch
 
@@ -1134,7 +1128,6 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] MongoDB Phase 4 native search, pagination/sorting, and conditional create/update/delete
 - [x] MongoDB Phase 5 composite MongoDB + Elasticsearch integration and runtime wiring
 - [x] MongoDB Phase 6 runtime wiring verification, documentation sync, and release-readiness validation
-- [x] MongoDB manual testing completed: all core features verified working (see docs/mongodb-manual-testing.md)
 - [ ] Neo4j backend (graph queries, Cypher)
 
 ### Phase 6: Composite Storage ✓
