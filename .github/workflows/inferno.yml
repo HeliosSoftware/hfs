@@ -37,7 +37,7 @@ jobs:
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
 
       - name: Build HFS
-        run: cargo build -p helios-hfs --features R4,sqlite,elasticsearch,postgres,mongodb
+        run: cargo build -p helios-hfs --features R4,sqlite,elasticsearch,postgres,mongodb,s3
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v4
