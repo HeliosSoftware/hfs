@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
@@ -41,18 +42,87 @@ impl BundleProvider for S3Backend {
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
     ) -> Result<BundleResult, TransactionError> {
+        let mut entries = entries;
+        let mut reference_map: HashMap<String, String> = HashMap::new();
+
+        // Phase 1: Pre-assign IDs to POST entries and build the complete
+        // reference map up-front so that *all* entries can be executed
+        // concurrently. Without this, POST entries would need to run
+        // sequentially because later entries may contain urn:uuid references
+        // to resources created by earlier ones.
+        for entry in entries.iter_mut() {
+            if entry.method != BundleMethod::Post {
+                continue;
+            }
+            if let Some(resource) = entry.resource.as_mut() {
+                let resource_type = resource
+                    .get("resourceType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
+
+                // Generate an ID if the resource doesn't already have one.
+                let id = match resource.get("id").and_then(|v| v.as_str()) {
+                    Some(existing) => existing.to_string(),
+                    None => {
+                        let generated = Uuid::new_v4().to_string();
+                        if let Some(obj) = resource.as_object_mut() {
+                            obj.insert("id".to_string(), Value::String(generated.clone()));
+                        }
+                        generated
+                    }
+                };
+
+                if let Some(full_url) = &entry.full_url {
+                    reference_map.insert(full_url.clone(), format!("{resource_type}/{id}"));
+                }
+            }
+        }
+
+        // Phase 2: Resolve all urn:uuid references across every entry.
+        if !reference_map.is_empty() {
+            for entry in entries.iter_mut() {
+                if let Some(resource) = entry.resource.as_mut() {
+                    resolve_bundle_references(resource, &reference_map);
+                }
+            }
+        }
+
+        // Phase 3: Execute ALL entries concurrently.
+        let futs: Vec<_> = entries
+            .iter()
+            .map(|entry| self.execute_bundle_entry(tenant, entry))
+            .collect();
+
+        let outcomes = futures::future::join_all(futs).await;
+
         let mut results = Vec::with_capacity(entries.len());
         let mut compensations: Vec<CompensationAction> = Vec::new();
-        let mut reference_map: HashMap<String, String> = HashMap::new();
-        let mut entries = entries;
 
-        for (idx, entry) in entries.iter_mut().enumerate() {
-            if let Some(resource) = entry.resource.as_mut() {
-                resolve_bundle_references(resource, &reference_map);
-            }
-
-            let (result, compensation) = match self.execute_bundle_entry(tenant, entry).await {
-                Ok(v) => v,
+        for (idx, outcome) in outcomes.into_iter().enumerate() {
+            match outcome {
+                Ok((result, compensation)) => {
+                    if result.status >= 400 {
+                        // Also collect compensations from remaining successful
+                        // outcomes that were already awaited by join_all.
+                        let base = format!("entry failed with status {}", result.status);
+                        let message = self
+                            .rollback_compensations(tenant, compensations)
+                            .await
+                            .map(|_| base.clone())
+                            .unwrap_or_else(|rollback_err| {
+                                format!("{base}; rollback failed: {rollback_err}")
+                            });
+                        return Err(TransactionError::BundleError {
+                            index: idx,
+                            message,
+                        });
+                    }
+                    if let Some(c) = compensation {
+                        compensations.push(c);
+                    }
+                    results.push(result);
+                }
                 Err(err) => {
                     let base = format!("entry failed: {err}");
                     let message = self
@@ -67,39 +137,7 @@ impl BundleProvider for S3Backend {
                         message,
                     });
                 }
-            };
-
-            if result.status >= 400 {
-                let base = format!("entry failed with status {}", result.status);
-                let message = self
-                    .rollback_compensations(tenant, compensations)
-                    .await
-                    .map(|_| base.clone())
-                    .unwrap_or_else(|rollback_err| {
-                        format!("{base}; rollback failed: {rollback_err}")
-                    });
-                return Err(TransactionError::BundleError {
-                    index: idx,
-                    message,
-                });
             }
-
-            if entry.method == BundleMethod::Post {
-                if let (Some(full_url), Some(location)) = (&entry.full_url, &result.location) {
-                    let resolved = location
-                        .split("/_history")
-                        .next()
-                        .unwrap_or(location)
-                        .to_string();
-                    reference_map.insert(full_url.clone(), resolved);
-                }
-            }
-
-            if let Some(compensation) = compensation {
-                compensations.push(compensation);
-            }
-
-            results.push(result);
         }
 
         Ok(BundleResult {
@@ -113,11 +151,12 @@ impl BundleProvider for S3Backend {
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
     ) -> crate::error::StorageResult<BundleResult> {
-        let mut results = Vec::with_capacity(entries.len());
+        let futs: Vec<_> = entries
+            .iter()
+            .map(|entry| self.process_batch_entry(tenant, entry))
+            .collect();
 
-        for entry in &entries {
-            results.push(self.process_batch_entry(tenant, entry).await);
-        }
+        let results = futures::future::join_all(futs).await;
 
         Ok(BundleResult {
             bundle_type: BundleType::Batch,

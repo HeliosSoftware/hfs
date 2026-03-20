@@ -172,6 +172,7 @@ The Helios FHIR Server supports multiple storage backend configurations. Choose 
 | **PostgreSQL** | Built-in full-text search (tsvector/tsquery) | Production OLTP deployments |
 | **PostgreSQL + Elasticsearch** | Elasticsearch-powered search with PostgreSQL CRUD | Production deployments needing RDBMS + robust search |
 | **S3** | Object storage for CRUD, versioning, history, and bulk operations (no search) | Archival, bulk analytics, cost-effective storage |
+| **S3 + Elasticsearch** | Elasticsearch-powered search with S3 CRUD | Large-scale storage with full FHIR search |
 
 ### Running the Server
 
@@ -202,13 +203,21 @@ HFS_S3_BUCKET=my-fhir-bucket \
 AWS_PROFILE=your-aws-profile \
 AWS_REGION=us-east-1 \
   ./hfs
+
+# S3 + Elasticsearch
+HFS_STORAGE_BACKEND=s3-elasticsearch \
+HFS_S3_BUCKET=my-fhir-bucket \
+HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
+AWS_PROFILE=your-aws-profile \
+AWS_REGION=us-east-1 \
+  ./hfs
 ```
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, or `s3` |
+| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `s3`, or `s3-elasticsearch` |
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `HFS_DATABASE_URL` | `fhir.db` | Database URL (SQLite path or PostgreSQL connection string) |
@@ -220,6 +229,7 @@ AWS_REGION=us-east-1 \
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | ES basic auth password |
 | `HFS_S3_BUCKET` | `hfs` | S3 bucket name (prefix-per-tenant mode) |
 | `HFS_S3_REGION` | *(AWS provider chain)* | AWS region override |
+| `HFS_S3_PREFIX` | *(none)* | Optional key prefix prepended to all S3 object keys |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
 
 For detailed backend setup instructions (building from source, Docker commands, and search offloading architecture), see the [persistence crate documentation](crates/persistence/README.md#building--running-storage-backends).
@@ -297,13 +307,19 @@ result = pysof.run_view_definition(
 **Distribution:**
 - Cross-platform wheel distribution for Linux, Windows, and macOS available on [PyPi](https://pypi.org/project/pysof/)
 
-### 7. [`helios-fhir-macro`](crates/fhir-macro) - Procedural Macros
+### 7. [`helios-cds-hooks`](crates/cds-hooks) - CDS Hooks Protocol Types
+Rust types and traits for building [CDS Hooks](https://cds-hooks.hl7.org/) clinical decision support services.
+- Complete protocol types for discovery, requests, responses, cards, suggestions, and feedback
+- Strongly-typed context structs for all 10 hooks in the CDS Hooks Library
+- Async `CdsHooksService` trait compatible with any Rust web framework
+
+### 8. [`helios-fhir-macro`](crates/fhir-macro) - Procedural Macros
 Helper macros for code generation used by other components.
 
-### 8. [`helios-fhirpath-support`](crates/fhirpath-support) - Shared Utilities
+### 9. [`helios-fhirpath-support`](crates/fhirpath-support) - Shared Utilities
 Common types and traits for FHIRPath evaluation.
 
-### 9. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
+### 10. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
 Storage backend abstraction supporting multiple database technologies optimized for different FHIR workloads.
 
 ## Design Principles

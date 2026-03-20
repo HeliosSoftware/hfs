@@ -1,6 +1,5 @@
 # Helios FHIR Server — Roadmap
 
->
 > This document outlines the development direction for the Helios FHIR Server. It is organized into three horizons — **Now**, **Next**, and **Later** — to set expectations without overpromising timelines. Items may shift between horizons as priorities evolve based on community feedback, production needs, and contributor availability.
 >
 > Want to influence the roadmap? Join our [weekly developer meeting](#community) or comment on a [GitHub Discussion](https://github.com/HeliosSoftware/hfs/discussions).
@@ -16,13 +15,18 @@ These capabilities are available today in the current release.
 - [FHIR REST API server](crates/hfs/README.md) with CRUD operations, search, history, and batch/transaction support
 
 **Persistence**
+
 - [SQLite as a primary store](crates/persistence/README.md#sqlite-default)
 - [SQLite as a primary store with Elasticsearch as a query secondary](crates/persistence/README.md#sqlite--elasticsearch)
 - [PostgreSQL as a primary store](crates/persistence/README.md#postgresql)
 - [PostgreSQL as a primary store with Elasticsearch as a query secondary](crates/persistence/README.md#postgresql--elasticsearch)
+- [MongoDB as a primary store](crates/persistence/README.md#mongodb)
+- [MongoDB as a primary store with Elasticsearch as a query secondary](crates/persistence/README.md#mongodb--elasticsearch)
 - [S3 as a primary store](crates/persistence/README.md#s3)
+- [S3 as a primary store with Elasticsearch as a query secondary](crates/persistence/README.md#s3--elasticsearch)
 
 **Analytics & Tooling**
+
 - [SQL on FHIR](crates/sof/README.md) — CLI and HTTP server
 - [FHIRPath expression engine](crates/fhirpath/README.md) — CLI and HTTP server
 - [Python bindings (pysof)](crates/pysof/README.md)
@@ -39,8 +43,6 @@ Work that is currently underway or planned for the near term.
 | **Standards** | FHIR Validation engine | 🔵 Design |
 | **Standards** | [Authentication & Authorization](https://github.com/HeliosSoftware/hfs/discussions/45) | 🔵 Design |
 | **Documentation** | Project documentation website | 🔵 Design |
-| **Persistence** | MongoDB as a primary store | 🟡 In progress |
-| **Persistence** | S3 as a primary store with Elasticsearch as a query secondary | 🟡 In progress |
 
 ### Discussion Documents
 
@@ -58,18 +60,21 @@ We are actively developing community discussion documents on the following topic
 These items are well-understood and will be picked up once current work completes.
 
 ### FHIR Server Capabilities
+
 - **Bulk Data API** — Import and export (`$export` / `$import` operations)
 - **FHIR Subscriptions** — Topic-based notification support
 - **Terminology Server** — CodeSystem `$lookup`, ValueSet `$expand`, ConceptMap `$translate`
 - **SMART on FHIR** — Full launch framework and scoped access
-- **SQL on FHIR** — [SQL on FHIR operations](https://sql-on-fhir.org/ig/latest/operations.html) - using read-only database connections 
+- **SQL on FHIR** — [SQL on FHIR operations](https://sql-on-fhir.org/ig/latest/operations.html) - using read-only database connections
 
 ### Persistence Backends
+
 - Cassandra as a primary store
 - ClickHouse as a primary store
 - Cassandra with Elasticsearch as a query secondary
 
 ### Developer Experience
+
 - **Administrative UI** — Web-based management console for server configuration and monitoring
 - **MCP Server for FHIR API** — Model Context Protocol integration for the FHIR REST API
 - **MCP Server for SQL on FHIR** — Model Context Protocol integration for analytics workflows
@@ -82,11 +87,14 @@ These items are well-understood and will be picked up once current work complete
 Longer-term ideas we are exploring. These are not yet committed and may evolve significantly based on community input.
 
 ### Advanced Persistence
+
 - Neo4j as a primary store
 - PostgreSQL with Neo4j as a graph query secondary
 
 ### Persistence Advisor
+
 An intelligent recommendation engine for storage configuration:
+
 - Analyze a FHIR query and recommend an optimal persistence configuration
 - Leverage historical benchmark data to inform recommendations
 - Web UI for interactive configuration guidance

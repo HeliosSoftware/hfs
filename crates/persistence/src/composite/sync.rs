@@ -39,7 +39,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
 use crate::core::ResourceStorage;
-use crate::error::{StorageError, StorageResult};
+use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use crate::types::StoredResource;
 
@@ -421,9 +421,12 @@ impl SyncManager {
                 })
                 .collect())
         } else {
-            // No async worker, fall back to sync
-            warn!("Async sync requested but no worker started, falling back to sync");
-            self.sync_synchronous(event, backends).await
+            Err(StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: "sync".to_string(),
+                message: "Async sync mode is configured but the async worker was never started. \
+                          Call start_async_worker() before processing events."
+                    .to_string(),
+            }))
         }
     }
 

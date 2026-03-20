@@ -396,10 +396,16 @@ where
                                 .to_string(),
                         ),
                         404 => S3ClientError::NotFound,
-                        _ if message.is_empty() => S3ClientError::Internal(format!(
-                            "S3 error (HTTP {status}, code={code})"
-                        )),
-                        _ => S3ClientError::Internal(message),
+                        _ => {
+                            let detail = if message.is_empty() {
+                                format!("{:?}", service_err.err())
+                            } else {
+                                message
+                            };
+                            S3ClientError::Internal(format!(
+                                "S3 error (HTTP {status}, code={code}): {detail}"
+                            ))
+                        }
                     }
                 }
             }

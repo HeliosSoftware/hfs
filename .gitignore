@@ -17,3 +17,6 @@ AGENTS.md
 *.db
 *.db-shm
 *.db-wal
+
+# Test artifacts
+/test-artifacts

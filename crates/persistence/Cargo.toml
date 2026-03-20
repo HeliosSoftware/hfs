@@ -51,6 +51,7 @@ regex = "1"
 parking_lot = "0.12"
 json-patch = "3"
 humantime = "2"
+futures = "0.3"
 
 # SQLite backend
 rusqlite = { version = "0.33", features = ["bundled", "serde_json"], optional = true }
@@ -95,7 +96,7 @@ tokio-test = "0.4"
 tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 testcontainers = "0.26"
-testcontainers-modules = { version = "0.14", features = ["postgres", "elastic_search"] }
+testcontainers-modules = { version = "0.14", features = ["postgres", "elastic_search", "minio"] }
 paste = "1.0"
 
 # Configuration advisor binary
