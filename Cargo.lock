@@ -2713,6 +2713,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-cds-hooks-server"
+version = "0.1.47"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "helios-cds-hooks",
+ "http 1.4.0",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "helios-fhir"
 version = "0.1.47"
 dependencies = [

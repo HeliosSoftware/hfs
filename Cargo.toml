@@ -18,6 +18,7 @@ default-members = [
 	"crates/rest",
 	"crates/sof",
 	"crates/cds-hooks",
+	"crates/cds-hooks-server",
 ]
 resolver = "2"
 
