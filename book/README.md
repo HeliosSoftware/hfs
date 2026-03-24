@@ -37,4 +37,4 @@ Adding a new page: create a `.md` file under `src/` and add an entry to `src/SUM
 
 ## Deployment
 
-The site is deployed to GitHub Pages automatically when changes to `book/src/` or `book/book.toml` are pushed to `main`. The site is served at `https://heliosso.github.io/hfs/`.
+The site is deployed to GitHub Pages automatically when changes to `book/src/` or `book/book.toml` are pushed to `main`. The site is served at `https://heliosSoftware.github.io/hfs/`.
