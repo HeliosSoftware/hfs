@@ -1,0 +1,369 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>FHIR Basics - Helios FHIR Server</title>
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="ch01-introduction.html"><strong aria-hidden="true">1.</strong> Introduction</a></li><li class="chapter-item expanded "><a href="ch02-installation.html"><strong aria-hidden="true">2.</strong> Installation</a></li><li class="chapter-item expanded "><a href="ch03-quickstart.html"><strong aria-hidden="true">3.</strong> Quick Start</a></li><li class="chapter-item expanded "><a href="ch04-fhir-basics.html" class="active"><strong aria-hidden="true">4.</strong> FHIR Basics</a></li><li class="chapter-item expanded "><a href="ch05-fhirpath.html"><strong aria-hidden="true">5.</strong> FHIRPath Expressions</a></li><li class="chapter-item expanded "><a href="ch06-sql-on-fhir.html"><strong aria-hidden="true">6.</strong> SQL-on-FHIR</a></li><li class="chapter-item expanded "><a href="ch07-architecture.html"><strong aria-hidden="true">7.</strong> Architecture Overview</a></li><li class="chapter-item expanded "><a href="ch08-versions.html"><strong aria-hidden="true">8.</strong> Multi-Version FHIR Support</a></li><li class="chapter-item expanded "><a href="ch09-pysof.html"><strong aria-hidden="true">9.</strong> Python Bindings (pysof)</a></li><li class="chapter-item expanded "><a href="ch10-codegen.html"><strong aria-hidden="true">10.</strong> Code Generation</a></li><li class="chapter-item expanded "><a href="ch11-recipes.html"><strong aria-hidden="true">11.</strong> Use Cases and Recipes</a></li><li class="chapter-item expanded "><a href="ch12-embedding.html"><strong aria-hidden="true">12.</strong> Embedding HFS as a Library</a></li><li class="chapter-item expanded "><a href="ch13-dev-setup.html"><strong aria-hidden="true">13.</strong> Development Setup</a></li><li class="chapter-item expanded "><a href="ch14-contributing.html"><strong aria-hidden="true">14.</strong> Contributing Guidelines</a></li><li class="chapter-item expanded affix "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Appendices</li><li class="chapter-item expanded "><a href="appendix-a-cli.html"><strong aria-hidden="true">15.</strong> CLI Reference</a></li><li class="chapter-item expanded "><a href="appendix-b-fhirpath-functions.html"><strong aria-hidden="true">16.</strong> FHIRPath Function Reference</a></li><li class="chapter-item expanded "><a href="appendix-c-glossary.html"><strong aria-hidden="true">17.</strong> Glossary</a></li><li class="chapter-item expanded "><a href="appendix-d-changelog.html"><strong aria-hidden="true">18.</strong> Changelog</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Helios FHIR Server</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs/edit/main/book/src/src/ch04-fhir-basics.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="fhir-basics"><a class="header" href="#fhir-basics">FHIR Basics</a></h1>
+<p>This chapter covers the minimum FHIR knowledge needed to work with HFS tools. For a full introduction to the FHIR standard, see <a href="https://hl7.org/fhir">hl7.org/fhir</a>.</p>
+<hr />
+<h2 id="resources-and-resource-types"><a class="header" href="#resources-and-resource-types">Resources and Resource Types</a></h2>
+<p>A <strong>FHIR resource</strong> is a typed, self-describing JSON document representing a clinical or administrative entity. Every resource has a <code>resourceType</code> field that identifies its type.</p>
+<p>Common resource types:</p>
+<div class="table-wrapper"><table><thead><tr><th>Resource type</th><th>Represents</th></tr></thead><tbody>
+<tr><td><code>Patient</code></td><td>A person receiving care</td></tr>
+<tr><td><code>Observation</code></td><td>A measurement or assessment (vitals, lab results)</td></tr>
+<tr><td><code>Condition</code></td><td>A diagnosis or clinical problem</td></tr>
+<tr><td><code>MedicationRequest</code></td><td>A medication prescription</td></tr>
+<tr><td><code>Encounter</code></td><td>A clinical visit or episode</td></tr>
+<tr><td><code>Practitioner</code></td><td>A healthcare provider</td></tr>
+<tr><td><code>Organization</code></td><td>A care delivery organization</td></tr>
+</tbody></table>
+</div>
+<p>Each resource type defines a specific set of fields, data types, and cardinality rules in the FHIR specification.</p>
+<hr />
+<h2 id="fhir-versions-r4-r4b-r5-r6"><a class="header" href="#fhir-versions-r4-r4b-r5-r6">FHIR Versions: R4, R4B, R5, R6</a></h2>
+<p>FHIR has evolved through several versions. HFS supports all four currently relevant versions:</p>
+<div class="table-wrapper"><table><thead><tr><th>Version</th><th>Release</th><th>Key characteristics</th></tr></thead><tbody>
+<tr><td><strong>R4</strong> (4.0.1)</td><td>2019</td><td>Normative; most widely deployed</td></tr>
+<tr><td><strong>R4B</strong> (4.3.0)</td><td>2022</td><td>Normative; introduces clinical reasoning changes</td></tr>
+<tr><td><strong>R5</strong> (5.0.0)</td><td>2023</td><td>Current standard; significant model refinements</td></tr>
+<tr><td><strong>R6</strong> (6.0.0-ballot2)</td><td>In progress</td><td>Latest ballot; cutting-edge features</td></tr>
+</tbody></table>
+</div>
+<p>Most production systems use R4 or R5. R4B is common in the US for specific profiles. R6 is for early adopters and testing.</p>
+<p>HFS defaults to <strong>R4</strong> when no feature flags are specified. See <a href="ch08-versions.html">Multi-Version FHIR Support</a> for how to enable multiple versions.</p>
+<hr />
+<h2 id="json-representation-of-fhir-data"><a class="header" href="#json-representation-of-fhir-data">JSON Representation of FHIR Data</a></h2>
+<p>FHIR resources are serialized as JSON objects. Here is a minimal <code>Patient</code> resource:</p>
+<pre><code class="language-json">{
+  "resourceType": "Patient",
+  "id": "example-patient",
+  "name": [
+    {
+      "use": "official",
+      "family": "Smith",
+      "given": ["John", "Robert"]
+    }
+  ],
+  "gender": "male",
+  "birthDate": "1980-04-14",
+  "telecom": [
+    {
+      "system": "phone",
+      "value": "555-867-5309",
+      "use": "mobile"
+    },
+    {
+      "system": "email",
+      "value": "john.smith@example.com"
+    }
+  ],
+  "address": [
+    {
+      "use": "home",
+      "line": ["123 Main St"],
+      "city": "Springfield",
+      "state": "IL",
+      "postalCode": "62701"
+    }
+  ]
+}
+</code></pre>
+<p>Key structural features:</p>
+<ul>
+<li><strong><code>resourceType</code></strong> — mandatory field identifying the type</li>
+<li><strong><code>id</code></strong> — server-assigned or client-provided identifier</li>
+<li><strong>Arrays</strong> — many fields (name, telecom, address) are arrays to accommodate multiple values</li>
+<li><strong>Coded fields</strong> — fields like <code>gender</code>, <code>system</code>, and <code>use</code> use defined value sets</li>
+<li><strong>Extensions</strong> — any field can carry extensions for data not in the base spec</li>
+</ul>
+<hr />
+<h2 id="bundles-and-ndjson"><a class="header" href="#bundles-and-ndjson">Bundles and NDJSON</a></h2>
+<h3 id="bundles"><a class="header" href="#bundles">Bundles</a></h3>
+<p>A <strong>Bundle</strong> is a FHIR resource that wraps a collection of other resources. It is the standard container for exchanging multiple resources in a single HTTP request or file.</p>
+<pre><code class="language-json">{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "Patient",
+        "id": "p1",
+        "name": [{"family": "Smith"}]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Patient",
+        "id": "p2",
+        "name": [{"family": "Jones"}]
+      }
+    }
+  ]
+}
+</code></pre>
+<p>Bundle <code>type</code> values commonly seen with HFS:</p>
+<ul>
+<li><code>collection</code> — an unordered set of resources</li>
+<li><code>transaction</code> — resources to process atomically</li>
+<li><code>batch</code> — resources to process independently</li>
+<li><code>searchset</code> — the result of a search operation</li>
+</ul>
+<h3 id="ndjson-newline-delimited-json"><a class="header" href="#ndjson-newline-delimited-json">NDJSON (Newline-Delimited JSON)</a></h3>
+<p><strong>NDJSON</strong> (<code>.ndjson</code>) is an alternative to Bundle for large exports. Each line is a complete, self-contained JSON resource with no wrapper:</p>
+<pre><code class="language-ndjson">{"resourceType":"Patient","id":"p1","name":[{"family":"Smith"}]}
+{"resourceType":"Patient","id":"p2","name":[{"family":"Jones"}]}
+{"resourceType":"Observation","id":"o1","subject":{"reference":"Patient/p1"}}
+</code></pre>
+<p>NDJSON is preferred for bulk data exports (e.g., the FHIR <code>$export</code> operation) because it is memory-efficient to stream. <code>sof-cli</code> auto-detects NDJSON by file extension (<code>.ndjson</code>) or by inspecting file content.</p>
+<h3 id="when-to-use-each"><a class="header" href="#when-to-use-each">When to use each</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Format</th><th>Use for</th></tr></thead><tbody>
+<tr><td>Bundle (JSON)</td><td>REST API payloads, transactions, small datasets</td></tr>
+<tr><td>NDJSON</td><td>Bulk exports, large datasets, streaming pipelines</td></tr>
+</tbody></table>
+</div>
+<p>Both are accepted by <code>sof-cli</code> with <code>--bundle</code> and by <code>fhirpath-cli</code> with <code>-r</code>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="ch03-quickstart.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="ch05-fhirpath.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="ch03-quickstart.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="ch05-fhirpath.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>

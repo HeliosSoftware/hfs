@@ -1,0 +1,357 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Multi-Version FHIR Support - Helios FHIR Server</title>
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="ch01-introduction.html"><strong aria-hidden="true">1.</strong> Introduction</a></li><li class="chapter-item expanded "><a href="ch02-installation.html"><strong aria-hidden="true">2.</strong> Installation</a></li><li class="chapter-item expanded "><a href="ch03-quickstart.html"><strong aria-hidden="true">3.</strong> Quick Start</a></li><li class="chapter-item expanded "><a href="ch04-fhir-basics.html"><strong aria-hidden="true">4.</strong> FHIR Basics</a></li><li class="chapter-item expanded "><a href="ch05-fhirpath.html"><strong aria-hidden="true">5.</strong> FHIRPath Expressions</a></li><li class="chapter-item expanded "><a href="ch06-sql-on-fhir.html"><strong aria-hidden="true">6.</strong> SQL-on-FHIR</a></li><li class="chapter-item expanded "><a href="ch07-architecture.html"><strong aria-hidden="true">7.</strong> Architecture Overview</a></li><li class="chapter-item expanded "><a href="ch08-versions.html" class="active"><strong aria-hidden="true">8.</strong> Multi-Version FHIR Support</a></li><li class="chapter-item expanded "><a href="ch09-pysof.html"><strong aria-hidden="true">9.</strong> Python Bindings (pysof)</a></li><li class="chapter-item expanded "><a href="ch10-codegen.html"><strong aria-hidden="true">10.</strong> Code Generation</a></li><li class="chapter-item expanded "><a href="ch11-recipes.html"><strong aria-hidden="true">11.</strong> Use Cases and Recipes</a></li><li class="chapter-item expanded "><a href="ch12-embedding.html"><strong aria-hidden="true">12.</strong> Embedding HFS as a Library</a></li><li class="chapter-item expanded "><a href="ch13-dev-setup.html"><strong aria-hidden="true">13.</strong> Development Setup</a></li><li class="chapter-item expanded "><a href="ch14-contributing.html"><strong aria-hidden="true">14.</strong> Contributing Guidelines</a></li><li class="chapter-item expanded affix "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Appendices</li><li class="chapter-item expanded "><a href="appendix-a-cli.html"><strong aria-hidden="true">15.</strong> CLI Reference</a></li><li class="chapter-item expanded "><a href="appendix-b-fhirpath-functions.html"><strong aria-hidden="true">16.</strong> FHIRPath Function Reference</a></li><li class="chapter-item expanded "><a href="appendix-c-glossary.html"><strong aria-hidden="true">17.</strong> Glossary</a></li><li class="chapter-item expanded "><a href="appendix-d-changelog.html"><strong aria-hidden="true">18.</strong> Changelog</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Helios FHIR Server</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs/edit/main/book/src/src/ch08-versions.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="multi-version-fhir-support"><a class="header" href="#multi-version-fhir-support">Multi-Version FHIR Support</a></h1>
+<p>HFS is built around the assumption that real-world systems need to handle multiple FHIR versions simultaneously. The workspace supports R4, R4B, R5, and R6 through Cargo feature flags and version-agnostic runtime abstractions.</p>
+<hr />
+<h2 id="feature-flags"><a class="header" href="#feature-flags">Feature Flags</a></h2>
+<p>Each FHIR version is gated behind a Cargo feature flag. The default build compiles <strong>R4 only</strong>.</p>
+<h3 id="enabling-versions-at-build-time"><a class="header" href="#enabling-versions-at-build-time">Enabling versions at build time</a></h3>
+<pre><code class="language-bash"># Default: R4 only
+cargo build
+
+# All versions
+cargo build --features R4,R4B,R5,R6
+
+# Specific combination
+cargo build --features R4,R5
+
+# Single crate with specific versions
+cargo build -p helios-fhirpath --features R4B,R5
+</code></pre>
+<h3 id="running-tests-with-all-versions"><a class="header" href="#running-tests-with-all-versions">Running tests with all versions</a></h3>
+<pre><code class="language-bash">cargo test --features R4,R4B,R5,R6
+</code></pre>
+<h3 id="the-skip-r6-download-feature"><a class="header" href="#the-skip-r6-download-feature">The <code>skip-r6-download</code> feature</a></h3>
+<p>When running <code>cargo clippy --all-features</code>, add the <code>skip-r6-download</code> feature to prevent <code>helios-fhir-gen</code> from downloading the R6 StructureDefinition files from <code>https://build.fhir.org/</code> during the build. This makes CI linting safe and fast:</p>
+<pre><code class="language-bash">cargo clippy --all-targets --all-features -- -D warnings
+</code></pre>
+<p>(<code>--all-features</code> automatically activates <code>skip-r6-download</code>.)</p>
+<hr />
+<h2 id="auto-detection-of-fhir-version"><a class="header" href="#auto-detection-of-fhir-version">Auto-Detection of FHIR Version</a></h2>
+<p>Several tools can automatically detect the FHIR version from their input data, so you don't need to always specify it explicitly.</p>
+<h3 id="fhirpath-server"><a class="header" href="#fhirpath-server">fhirpath-server</a></h3>
+<p>The root endpoint (<code>POST /</code>) inspects the resource's <code>meta.profile</code>, <code>fhirVersion</code>, or structural markers to select the appropriate version model automatically. Use version-specific endpoints when you need explicit control:</p>
+<pre><code>POST /r4    → always use R4
+POST /r4b   → always use R4B
+POST /r5    → always use R5
+POST /r6    → always use R6
+</code></pre>
+<h3 id="fhirpath-cli"><a class="header" href="#fhirpath-cli">fhirpath-cli</a></h3>
+<p>Pass <code>--fhir-version</code> to override auto-detection:</p>
+<pre><code class="language-bash">fhirpath-cli --fhir-version R5 -e "Patient.name.family" -r patient.json
+</code></pre>
+<h3 id="sof-cli"><a class="header" href="#sof-cli">sof-cli</a></h3>
+<pre><code class="language-bash">sof-cli --fhir-version R4B -v view.json -b data.json
+</code></pre>
+<h3 id="evaluationcontext-library-api"><a class="header" href="#evaluationcontext-library-api">EvaluationContext (library API)</a></h3>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use helios_fhirpath::evaluator::EvaluationContext;
+use helios_fhir::FhirVersion;
+
+// Version auto-detected from resources
+let ctx = EvaluationContext::new(fhir_resources);
+
+// Explicit version
+let ctx = EvaluationContext::new_with_version(fhir_resources, FhirVersion::R5);
+
+// Empty context with explicit version (no resource)
+let ctx = EvaluationContext::new_empty(FhirVersion::R4);
+<span class="boring">}</span></code></pre></pre>
+<hr />
+<h2 id="version-aware-type-checking"><a class="header" href="#version-aware-type-checking">Version-Aware Type Checking</a></h2>
+<h3 id="the-fhirversion-enum"><a class="header" href="#the-fhirversion-enum">The <code>FhirVersion</code> enum</a></h3>
+<p><code>helios-fhir</code> exports a <code>FhirVersion</code> enum used throughout the workspace to carry version information at runtime:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub enum FhirVersion {
+    R4,
+    R4B,
+    R5,
+    R6,
+}
+<span class="boring">}</span></code></pre></pre>
+<h3 id="version-agnostic-enum-wrappers"><a class="header" href="#version-agnostic-enum-wrappers">Version-agnostic enum wrappers</a></h3>
+<p>Rather than generic type parameters, the workspace uses enum wrappers to handle multiple versions in a single code path. This avoids monomorphization explosion and keeps the API ergonomic:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub enum SofViewDefinition {
+    R4(fhir::r4::ViewDefinition),
+    R4B(fhir::r4b::ViewDefinition),
+    R5(fhir::r5::ViewDefinition),
+    R6(fhir::r6::ViewDefinition),
+}
+
+pub enum SofBundle {
+    R4(fhir::r4::Bundle),
+    R4B(fhir::r4b::Bundle),
+    R5(fhir::r5::Bundle),
+    R6(fhir::r6::Bundle),
+}
+<span class="boring">}</span></code></pre></pre>
+<p>Traits like <code>ViewDefinitionTrait</code> and <code>BundleTrait</code> abstract over these enums so application code does not need to pattern-match on the version.</p>
+<h3 id="oftype-with-namespace-qualification"><a class="header" href="#oftype-with-namespace-qualification"><code>ofType()</code> with namespace qualification</a></h3>
+<p>FHIRPath type checks are version-aware. Use the <code>FHIR.</code> namespace prefix for FHIR resource and data types:</p>
+<pre><code class="language-fhirpath"># Check if a value is a FHIR Quantity (any version)
+value.ofType(FHIR.Quantity)
+
+# Check a choice type
+Observation.value.ofType(FHIR.boolean)
+
+# Type-based navigation (is / as)
+value is FHIR.Quantity
+value as FHIR.Quantity
+</code></pre>
+<p>The <code>FhirResourceTypeProvider</code> trait is implemented for each version's <code>Resource</code> enum and is used by the FHIRPath evaluator to validate resource type names at evaluation time. Resource type lists are generated at compile time from the actual FHIR specification — they are never hardcoded.</p>
+<h3 id="version-in-hfs-server"><a class="header" href="#version-in-hfs-server">Version in HFS server</a></h3>
+<p>Set the default FHIR version the server uses when a client does not specify:</p>
+<pre><code class="language-bash">HFS_DEFAULT_FHIR_VERSION=R5 hfs
+</code></pre>
+<p>Valid values: <code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code>. Default is <code>R4</code>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="ch07-architecture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="ch09-pysof.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="ch07-architecture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="ch09-pysof.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>

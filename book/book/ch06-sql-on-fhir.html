@@ -1,0 +1,456 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>SQL-on-FHIR - Helios FHIR Server</title>
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="ch01-introduction.html"><strong aria-hidden="true">1.</strong> Introduction</a></li><li class="chapter-item expanded "><a href="ch02-installation.html"><strong aria-hidden="true">2.</strong> Installation</a></li><li class="chapter-item expanded "><a href="ch03-quickstart.html"><strong aria-hidden="true">3.</strong> Quick Start</a></li><li class="chapter-item expanded "><a href="ch04-fhir-basics.html"><strong aria-hidden="true">4.</strong> FHIR Basics</a></li><li class="chapter-item expanded "><a href="ch05-fhirpath.html"><strong aria-hidden="true">5.</strong> FHIRPath Expressions</a></li><li class="chapter-item expanded "><a href="ch06-sql-on-fhir.html" class="active"><strong aria-hidden="true">6.</strong> SQL-on-FHIR</a></li><li class="chapter-item expanded "><a href="ch07-architecture.html"><strong aria-hidden="true">7.</strong> Architecture Overview</a></li><li class="chapter-item expanded "><a href="ch08-versions.html"><strong aria-hidden="true">8.</strong> Multi-Version FHIR Support</a></li><li class="chapter-item expanded "><a href="ch09-pysof.html"><strong aria-hidden="true">9.</strong> Python Bindings (pysof)</a></li><li class="chapter-item expanded "><a href="ch10-codegen.html"><strong aria-hidden="true">10.</strong> Code Generation</a></li><li class="chapter-item expanded "><a href="ch11-recipes.html"><strong aria-hidden="true">11.</strong> Use Cases and Recipes</a></li><li class="chapter-item expanded "><a href="ch12-embedding.html"><strong aria-hidden="true">12.</strong> Embedding HFS as a Library</a></li><li class="chapter-item expanded "><a href="ch13-dev-setup.html"><strong aria-hidden="true">13.</strong> Development Setup</a></li><li class="chapter-item expanded "><a href="ch14-contributing.html"><strong aria-hidden="true">14.</strong> Contributing Guidelines</a></li><li class="chapter-item expanded affix "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Appendices</li><li class="chapter-item expanded "><a href="appendix-a-cli.html"><strong aria-hidden="true">15.</strong> CLI Reference</a></li><li class="chapter-item expanded "><a href="appendix-b-fhirpath-functions.html"><strong aria-hidden="true">16.</strong> FHIRPath Function Reference</a></li><li class="chapter-item expanded "><a href="appendix-c-glossary.html"><strong aria-hidden="true">17.</strong> Glossary</a></li><li class="chapter-item expanded "><a href="appendix-d-changelog.html"><strong aria-hidden="true">18.</strong> Changelog</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Helios FHIR Server</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs/edit/main/book/src/src/ch06-sql-on-fhir.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="sql-on-fhir"><a class="header" href="#sql-on-fhir">SQL-on-FHIR</a></h1>
+<p>The <code>helios-sof</code> crate implements the <a href="https://build.fhir.org/ig/FHIR/sql-on-fhir-v2">SQL-on-FHIR specification</a>. It transforms FHIR resources into flat tabular data using declarative <strong>ViewDefinitions</strong> and ships two executables (<code>sof-cli</code> and <code>sof-server</code>).</p>
+<hr />
+<h2 id="what-is-sql-on-fhir-and-viewdefinitions"><a class="header" href="#what-is-sql-on-fhir-and-viewdefinitions">What Is SQL-on-FHIR and ViewDefinitions?</a></h2>
+<p>FHIR data is deeply nested and polymorphic — a single <code>Patient</code> resource might have an array of names, each with an array of given names, all with multiple use codes. SQL-on-FHIR solves the problem of getting this data into flat tabular form (rows and columns) that SQL engines, pandas, and BI tools can consume natively.</p>
+<p>A <strong>ViewDefinition</strong> is a JSON document that describes how to flatten a FHIR resource type into a table. It specifies:</p>
+<ul>
+<li>Which resource type to flatten (<code>from.resourceType</code>)</li>
+<li>Which columns to extract, each with a name and a FHIRPath expression (<code>select[].column[]</code>)</li>
+<li>Optional <code>forEach</code> clauses to iterate over repeated elements</li>
+</ul>
+<hr />
+<h2 id="writing-your-first-viewdefinition"><a class="header" href="#writing-your-first-viewdefinition">Writing Your First ViewDefinition</a></h2>
+<p>Here is a complete ViewDefinition that extracts key demographics from <code>Patient</code> resources:</p>
+<pre><code class="language-json">{
+  "resourceType": "ViewDefinition",
+  "id": "patient-demographics",
+  "name": "PatientDemographics",
+  "title": "Basic Patient Demographics",
+  "description": "Flattened patient demographic data",
+  "from": {
+    "resourceType": "Patient"
+  },
+  "select": [
+    {
+      "column": [
+        {"name": "id",           "path": "getResourceKey()"},
+        {"name": "birth_date",   "path": "birthDate"},
+        {"name": "gender",       "path": "gender"},
+        {"name": "first_name",   "path": "name.where(use='official').given.first()"},
+        {"name": "last_name",    "path": "name.where(use='official').family"},
+        {"name": "ssn",          "path": "identifier.where(system='http://hl7.org/fhir/sid/us-ssn').value"},
+        {"name": "email",        "path": "telecom.where(system='email').value"},
+        {"name": "phone",        "path": "telecom.where(system='phone' and use='mobile').value"},
+        {"name": "address_line", "path": "address.where(use='home').line.join(', ')"},
+        {"name": "city",         "path": "address.where(use='home').city"},
+        {"name": "state",        "path": "address.where(use='home').state"},
+        {"name": "postal_code",  "path": "address.where(use='home').postalCode"}
+      ]
+    }
+  ]
+}
+</code></pre>
+<p>Save this as <code>patient-view.json</code> and run:</p>
+<pre><code class="language-bash">sof-cli --view patient-view.json --bundle patients.json
+</code></pre>
+<p>Output (CSV):</p>
+<pre><code>id,birth_date,gender,first_name,last_name,ssn,email,phone,...
+p1,1980-04-14,male,John,Smith,,john@example.com,555-1234,...
+</code></pre>
+<hr />
+<h2 id="using-sof-cli-for-batch-transforms"><a class="header" href="#using-sof-cli-for-batch-transforms">Using sof-cli for Batch Transforms</a></h2>
+<pre><code>sof-cli [OPTIONS]
+</code></pre>
+<h3 id="core-flags"><a class="header" href="#core-flags">Core flags</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>-v, --view &lt;FILE&gt;</code></td><td>Path to ViewDefinition JSON (or stdin)</td></tr>
+<tr><td><code>-b, --bundle &lt;FILE&gt;</code></td><td>Path to FHIR Bundle or NDJSON file (or stdin)</td></tr>
+<tr><td><code>-s, --source &lt;URL&gt;</code></td><td>URL-based data source (local, http, s3, gs, azure)</td></tr>
+<tr><td><code>-f, --format &lt;FMT&gt;</code></td><td>Output format: <code>csv</code>, <code>json</code>, <code>ndjson</code>, <code>parquet</code> (default: <code>csv</code>)</td></tr>
+<tr><td><code>--no-headers</code></td><td>Omit CSV header row</td></tr>
+<tr><td><code>-o, --output &lt;FILE&gt;</code></td><td>Write to file instead of stdout</td></tr>
+<tr><td><code>--since &lt;RFC3339&gt;</code></td><td>Filter resources modified after this time</td></tr>
+<tr><td><code>--limit &lt;N&gt;</code></td><td>Limit results to N rows (1–10000)</td></tr>
+<tr><td><code>--fhir-version &lt;VER&gt;</code></td><td>FHIR version: <code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code> (default: <code>R4</code>)</td></tr>
+</tbody></table>
+</div>
+<h3 id="parquet-specific-flags"><a class="header" href="#parquet-specific-flags">Parquet-specific flags</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--parquet-row-group-size &lt;MB&gt;</code></td><td>256</td><td>Row group size in MB (64–1024)</td></tr>
+<tr><td><code>--parquet-page-size &lt;KB&gt;</code></td><td>1024</td><td>Page size in KB (64–8192)</td></tr>
+<tr><td><code>--parquet-compression &lt;ALG&gt;</code></td><td>snappy</td><td><code>none</code>, <code>snappy</code>, <code>gzip</code>, <code>lz4</code>, <code>brotli</code>, <code>zstd</code></td></tr>
+<tr><td><code>--max-file-size &lt;MB&gt;</code></td><td>1000</td><td>Max file size; creates numbered files when exceeded</td></tr>
+</tbody></table>
+</div>
+<h3 id="streaming-ndjson-flags"><a class="header" href="#streaming-ndjson-flags">Streaming NDJSON flags</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--chunk-size &lt;N&gt;</code></td><td>1000</td><td>Resources per chunk for streaming NDJSON</td></tr>
+<tr><td><code>--skip-invalid</code></td><td>false</td><td>Skip invalid JSON lines instead of failing</td></tr>
+</tbody></table>
+</div>
+<h3 id="examples"><a class="header" href="#examples">Examples</a></h3>
+<pre><code class="language-bash"># CSV from a Bundle file
+sof-cli -v patient-view.json -b patients.json
+
+# CSV without headers
+sof-cli -v view.json -b data.json --no-headers
+
+# JSON output to file
+sof-cli -v obs-view.json -b lab-results.json -f json -o output.json
+
+# NDJSON (one row object per line)
+sof-cli -v view.json -b data.json -f ndjson
+
+# Parquet with Zstd compression
+sof-cli -v view.json -b data.json -f parquet --parquet-compression zstd -o output.parquet
+
+# Large NDJSON — streaming mode
+sof-cli -v view.json -b large-data.ndjson --chunk-size 500
+
+# Filter by time window
+sof-cli -v view.json -b data.json --since 2024-01-01T00:00:00Z --limit 500
+
+# Read ViewDefinition from stdin
+cat view.json | sof-cli -b data.json -f csv
+</code></pre>
+<hr />
+<h2 id="output-formats"><a class="header" href="#output-formats">Output Formats</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Format</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>csv</code></td><td>Comma-separated values with optional header row</td></tr>
+<tr><td><code>json</code></td><td>Pretty-printed JSON array of row objects</td></tr>
+<tr><td><code>ndjson</code></td><td>One JSON row object per line (newline-delimited)</td></tr>
+<tr><td><code>parquet</code></td><td>Columnar binary format; Snappy compression by default</td></tr>
+</tbody></table>
+</div>
+<h3 id="parquet-type-mapping"><a class="header" href="#parquet-type-mapping">Parquet Type Mapping</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>FHIR type</th><th>Arrow / Parquet type</th></tr></thead><tbody>
+<tr><td><code>boolean</code></td><td><code>BOOLEAN</code></td></tr>
+<tr><td><code>string</code>, <code>code</code>, <code>uri</code></td><td><code>UTF8</code></td></tr>
+<tr><td><code>integer</code></td><td><code>INT32</code></td></tr>
+<tr><td><code>decimal</code></td><td><code>FLOAT64</code></td></tr>
+<tr><td><code>dateTime</code>, <code>date</code></td><td><code>UTF8</code></td></tr>
+<tr><td>Arrays</td><td>Arrow <code>List</code> type</td></tr>
+</tbody></table>
+</div>
+<p>All fields are <code>OPTIONAL</code>. Snappy compression is the default.</p>
+<hr />
+<h2 id="using-the-sof-server-http-api"><a class="header" href="#using-the-sof-server-http-api">Using the sof-server HTTP API</a></h2>
+<pre><code class="language-bash"># Start with defaults (port 8080)
+sof-server
+
+# Custom port
+SOF_SERVER_PORT=9090 sof-server
+</code></pre>
+<h3 id="endpoint"><a class="header" href="#endpoint">Endpoint</a></h3>
+<p><code>POST /ViewDefinition/$viewdefinition-run</code></p>
+<p>Request body (JSON):</p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>_format</code></td><td>string</td><td>Output format: <code>csv</code>, <code>ndjson</code>, <code>json</code>, <code>parquet</code></td></tr>
+<tr><td><code>header</code></td><td>boolean</td><td>Include CSV header row (<code>true</code> / <code>false</code>)</td></tr>
+<tr><td><code>viewResource</code></td><td>object</td><td>ViewDefinition resource</td></tr>
+<tr><td><code>resource</code></td><td>array</td><td>FHIR resources to transform</td></tr>
+<tr><td><code>patient</code></td><td>string</td><td>Filter by patient reference</td></tr>
+<tr><td><code>_limit</code></td><td>integer</td><td>Limit results (1–10000)</td></tr>
+<tr><td><code>_since</code></td><td>string</td><td>Filter by modification time (RFC3339)</td></tr>
+</tbody></table>
+</div>
+<p>Parameter precedence: <strong>request body &gt; query params &gt; <code>Accept</code> header</strong></p>
+<h3 id="example"><a class="header" href="#example">Example</a></h3>
+<pre><code class="language-bash">curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "_format": "csv",
+    "viewResource": {
+      "resourceType": "ViewDefinition",
+      "from": {"resourceType": "Patient"},
+      "select": [{"column": [
+        {"name": "id", "path": "getResourceKey()"},
+        {"name": "family", "path": "name.first().family"}
+      ]}]
+    },
+    "resource": [
+      {"resourceType": "Patient", "id": "p1", "name": [{"family": "Smith"}]},
+      {"resourceType": "Patient", "id": "p2", "name": [{"family": "Jones"}]}
+    ]
+  }'
+</code></pre>
+<h3 id="server-environment-variables"><a class="header" href="#server-environment-variables">Server environment variables</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>SOF_SERVER_PORT</code></td><td><code>8080</code></td><td>Server port</td></tr>
+<tr><td><code>SOF_SERVER_HOST</code></td><td><code>127.0.0.1</code></td><td>Host to bind</td></tr>
+<tr><td><code>SOF_LOG_LEVEL</code></td><td><code>info</code></td><td>Log level</td></tr>
+<tr><td><code>SOF_MAX_BODY_SIZE</code></td><td><code>10485760</code></td><td>Max request body (bytes)</td></tr>
+<tr><td><code>SOF_REQUEST_TIMEOUT</code></td><td><code>30</code></td><td>Request timeout (seconds)</td></tr>
+<tr><td><code>SOF_ENABLE_CORS</code></td><td><code>true</code></td><td>Enable CORS</td></tr>
+<tr><td><code>SOF_CORS_ORIGINS</code></td><td><code>*</code></td><td>Allowed CORS origins</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="reading-from-cloud-storage"><a class="header" href="#reading-from-cloud-storage">Reading from Cloud Storage</a></h2>
+<p>The <code>--source</code> flag (aliased <code>-s</code>) accepts URL-based data sources. This is distinct from <code>--bundle</code> (<code>-b</code>), which accepts local file paths only.</p>
+<h3 id="supported-protocols"><a class="header" href="#supported-protocols">Supported protocols</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Protocol</th><th>Example</th></tr></thead><tbody>
+<tr><td>Local (absolute)</td><td><code>sof-cli -v view.json -s /data/patients.ndjson</code></td></tr>
+<tr><td>Local (relative)</td><td><code>sof-cli -v view.json -s ./data/patients.json</code></td></tr>
+<tr><td>File URI</td><td><code>sof-cli -v view.json -s file:///data/patients.json</code></td></tr>
+<tr><td>HTTP/HTTPS</td><td><code>sof-cli -v view.json -s https://example.com/fhir/bundle.json</code></td></tr>
+<tr><td>Amazon S3</td><td><code>sof-cli -v view.json -s s3://my-bucket/fhir-data/patients.ndjson</code></td></tr>
+<tr><td>Google Cloud Storage</td><td><code>sof-cli -v view.json -s gs://my-bucket/fhir-data/patients.json</code></td></tr>
+<tr><td>Azure Blob Storage</td><td><code>sof-cli -v view.json -s azure://my-container/fhir-data/patients.ndjson</code></td></tr>
+</tbody></table>
+</div>
+<pre><code class="language-bash"># S3 example
+sof-cli -v patient-view.json \
+  -s s3://my-fhir-bucket/exports/patients.ndjson \
+  -f parquet -o patients.parquet
+
+# GCS example
+sof-cli -v obs-view.json \
+  -s gs://my-fhir-bucket/observations.ndjson \
+  -f csv -o observations.csv
+
+# Azure example
+sof-cli -v view.json \
+  -s azure://my-container/data/bundle.json \
+  -f json
+</code></pre>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="ch05-fhirpath.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="ch07-architecture.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="ch05-fhirpath.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="ch07-architecture.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>

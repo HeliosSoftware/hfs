@@ -1,0 +1,397 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>CLI Reference - Helios FHIR Server</title>
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="ch01-introduction.html"><strong aria-hidden="true">1.</strong> Introduction</a></li><li class="chapter-item expanded "><a href="ch02-installation.html"><strong aria-hidden="true">2.</strong> Installation</a></li><li class="chapter-item expanded "><a href="ch03-quickstart.html"><strong aria-hidden="true">3.</strong> Quick Start</a></li><li class="chapter-item expanded "><a href="ch04-fhir-basics.html"><strong aria-hidden="true">4.</strong> FHIR Basics</a></li><li class="chapter-item expanded "><a href="ch05-fhirpath.html"><strong aria-hidden="true">5.</strong> FHIRPath Expressions</a></li><li class="chapter-item expanded "><a href="ch06-sql-on-fhir.html"><strong aria-hidden="true">6.</strong> SQL-on-FHIR</a></li><li class="chapter-item expanded "><a href="ch07-architecture.html"><strong aria-hidden="true">7.</strong> Architecture Overview</a></li><li class="chapter-item expanded "><a href="ch08-versions.html"><strong aria-hidden="true">8.</strong> Multi-Version FHIR Support</a></li><li class="chapter-item expanded "><a href="ch09-pysof.html"><strong aria-hidden="true">9.</strong> Python Bindings (pysof)</a></li><li class="chapter-item expanded "><a href="ch10-codegen.html"><strong aria-hidden="true">10.</strong> Code Generation</a></li><li class="chapter-item expanded "><a href="ch11-recipes.html"><strong aria-hidden="true">11.</strong> Use Cases and Recipes</a></li><li class="chapter-item expanded "><a href="ch12-embedding.html"><strong aria-hidden="true">12.</strong> Embedding HFS as a Library</a></li><li class="chapter-item expanded "><a href="ch13-dev-setup.html"><strong aria-hidden="true">13.</strong> Development Setup</a></li><li class="chapter-item expanded "><a href="ch14-contributing.html"><strong aria-hidden="true">14.</strong> Contributing Guidelines</a></li><li class="chapter-item expanded affix "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Appendices</li><li class="chapter-item expanded "><a href="appendix-a-cli.html" class="active"><strong aria-hidden="true">15.</strong> CLI Reference</a></li><li class="chapter-item expanded "><a href="appendix-b-fhirpath-functions.html"><strong aria-hidden="true">16.</strong> FHIRPath Function Reference</a></li><li class="chapter-item expanded "><a href="appendix-c-glossary.html"><strong aria-hidden="true">17.</strong> Glossary</a></li><li class="chapter-item expanded "><a href="appendix-d-changelog.html"><strong aria-hidden="true">18.</strong> Changelog</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Helios FHIR Server</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs/edit/main/book/src/src/appendix-a-cli.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="appendix-a--cli-reference"><a class="header" href="#appendix-a--cli-reference">Appendix A — CLI Reference</a></h1>
+<p>Complete reference for all HFS command-line binaries.</p>
+<hr />
+<h2 id="hfs--fhir-rest-server"><a class="header" href="#hfs--fhir-rest-server">hfs — FHIR REST Server</a></h2>
+<pre><code class="language-bash">hfs
+</code></pre>
+<p>No command-line flags. All configuration is via environment variables.</p>
+<h3 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h3>
+<p>See the full reference in <a href="configuration/environment-variables.html">Environment Variables</a>. Key variables:</p>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>HFS_SERVER_PORT</code></td><td><code>8080</code></td><td>Port to listen on</td></tr>
+<tr><td><code>HFS_SERVER_HOST</code></td><td><code>127.0.0.1</code></td><td>Host to bind</td></tr>
+<tr><td><code>HFS_LOG_LEVEL</code></td><td><code>info</code></td><td><code>error</code>, <code>warn</code>, <code>info</code>, <code>debug</code>, <code>trace</code></td></tr>
+<tr><td><code>HFS_STORAGE_BACKEND</code></td><td><code>sqlite</code></td><td><code>sqlite</code>, <code>sqlite-es</code>, <code>postgres</code>, <code>pg-es</code>, <code>s3</code>, <code>s3-es</code></td></tr>
+<tr><td><code>HFS_DATABASE_URL</code></td><td><code>fhir.db</code></td><td>SQLite path or PostgreSQL connection string</td></tr>
+<tr><td><code>HFS_DEFAULT_FHIR_VERSION</code></td><td><code>R4</code></td><td><code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code></td></tr>
+<tr><td><code>HFS_DEFAULT_TENANT</code></td><td><code>default</code></td><td>Default tenant ID</td></tr>
+<tr><td><code>HFS_TENANT_ROUTING_MODE</code></td><td><code>header_only</code></td><td><code>header_only</code>, <code>url_path</code>, <code>both</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="api-endpoints"><a class="header" href="#api-endpoints">API endpoints</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Interaction</th><th>Method</th><th>Path</th></tr></thead><tbody>
+<tr><td>Capabilities</td><td><code>GET</code></td><td><code>/metadata</code></td></tr>
+<tr><td>Read</td><td><code>GET</code></td><td><code>/[type]/[id]</code></td></tr>
+<tr><td>Version read</td><td><code>GET</code></td><td><code>/[type]/[id]/_history/[vid]</code></td></tr>
+<tr><td>Update</td><td><code>PUT</code></td><td><code>/[type]/[id]</code></td></tr>
+<tr><td>Patch</td><td><code>PATCH</code></td><td><code>/[type]/[id]</code></td></tr>
+<tr><td>Delete</td><td><code>DELETE</code></td><td><code>/[type]/[id]</code></td></tr>
+<tr><td>Create</td><td><code>POST</code></td><td><code>/[type]</code></td></tr>
+<tr><td>Search (GET)</td><td><code>GET</code></td><td><code>/[type]?params</code></td></tr>
+<tr><td>Search (POST)</td><td><code>POST</code></td><td><code>/[type]/_search</code></td></tr>
+<tr><td>Instance history</td><td><code>GET</code></td><td><code>/[type]/[id]/_history</code></td></tr>
+<tr><td>Type history</td><td><code>GET</code></td><td><code>/[type]/_history</code></td></tr>
+<tr><td>System history</td><td><code>GET</code></td><td><code>/_history</code></td></tr>
+<tr><td>Batch / transaction</td><td><code>POST</code></td><td><code>/</code></td></tr>
+<tr><td>Health</td><td><code>GET</code></td><td><code>/health</code></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="fhirpath-cli--fhirpath-expression-evaluator"><a class="header" href="#fhirpath-cli--fhirpath-expression-evaluator">fhirpath-cli — FHIRPath Expression Evaluator</a></h2>
+<pre><code class="language-bash">fhirpath-cli [OPTIONS] -e &lt;EXPRESSION&gt;
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>-e, --expression &lt;EXPR&gt;</code></td><td>FHIRPath expression to evaluate <strong>(required)</strong></td></tr>
+<tr><td><code>-r, --resource &lt;FILE&gt;</code></td><td>Path to FHIR resource JSON file, or <code>-</code> to read from stdin</td></tr>
+<tr><td><code>-c, --context &lt;EXPR&gt;</code></td><td>Context expression to scope evaluation</td></tr>
+<tr><td><code>--var &lt;NAME=VALUE&gt;</code></td><td>Set an environment variable (repeatable)</td></tr>
+<tr><td><code>--fhir-version &lt;VER&gt;</code></td><td>FHIR version: <code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code> (default: <code>R4</code>)</td></tr>
+<tr><td><code>--parse-debug-tree</code></td><td>Print the parse tree and exit</td></tr>
+<tr><td><code>--terminology-server &lt;URL&gt;</code></td><td>Override the default terminology server</td></tr>
+<tr><td><code>-h, --help</code></td><td>Print help</td></tr>
+</tbody></table>
+</div>
+<h3 id="examples"><a class="header" href="#examples">Examples</a></h3>
+<pre><code class="language-bash">fhirpath-cli -e "Patient.name.family" -r patient.json
+fhirpath-cli -c "Patient.name" -e "family" -r patient.json
+fhirpath-cli -e "value &gt; %threshold" -r obs.json --var threshold=5.0
+cat patient.json | fhirpath-cli -e "Patient.name.family" -r -
+fhirpath-cli -e "Patient.name.first()" --parse-debug-tree
+fhirpath-cli --fhir-version R5 -e "Patient.name.family" -r r5-patient.json
+</code></pre>
+<hr />
+<h2 id="fhirpath-server--fhirpath-http-server"><a class="header" href="#fhirpath-server--fhirpath-http-server">fhirpath-server — FHIRPath HTTP Server</a></h2>
+<pre><code class="language-bash">fhirpath-server
+</code></pre>
+<p>No command-line flags. All configuration is via environment variables.</p>
+<h3 id="environment-variables-1"><a class="header" href="#environment-variables-1">Environment variables</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>FHIRPATH_SERVER_PORT</code></td><td><code>3000</code></td><td>Port to listen on</td></tr>
+<tr><td><code>FHIRPATH_SERVER_HOST</code></td><td><code>127.0.0.1</code></td><td>Host to bind</td></tr>
+<tr><td><code>FHIRPATH_LOG_LEVEL</code></td><td><code>info</code></td><td>Log level</td></tr>
+<tr><td><code>FHIRPATH_ENABLE_CORS</code></td><td><code>true</code></td><td>Enable CORS</td></tr>
+<tr><td><code>FHIRPATH_CORS_ORIGINS</code></td><td><code>*</code></td><td>Allowed CORS origins</td></tr>
+<tr><td><code>FHIRPATH_TERMINOLOGY_SERVER</code></td><td><em>(none)</em></td><td>Terminology server URL</td></tr>
+</tbody></table>
+</div>
+<h3 id="endpoints"><a class="header" href="#endpoints">Endpoints</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>POST</code></td><td><code>/</code></td><td>Evaluate (auto-detect version)</td></tr>
+<tr><td><code>POST</code></td><td><code>/r4</code></td><td>Evaluate as R4</td></tr>
+<tr><td><code>POST</code></td><td><code>/r4b</code></td><td>Evaluate as R4B</td></tr>
+<tr><td><code>POST</code></td><td><code>/r5</code></td><td>Evaluate as R5</td></tr>
+<tr><td><code>POST</code></td><td><code>/r6</code></td><td>Evaluate as R6</td></tr>
+<tr><td><code>GET</code></td><td><code>/health</code></td><td>Health check</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="sof-cli--sql-on-fhir-cli"><a class="header" href="#sof-cli--sql-on-fhir-cli">sof-cli — SQL-on-FHIR CLI</a></h2>
+<pre><code class="language-bash">sof-cli [OPTIONS]
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Short</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--view &lt;FILE&gt;</code></td><td><code>-v</code></td><td><em>(stdin)</em></td><td>Path to ViewDefinition JSON file</td></tr>
+<tr><td><code>--bundle &lt;FILE&gt;</code></td><td><code>-b</code></td><td><em>(stdin)</em></td><td>Path to FHIR Bundle or NDJSON file</td></tr>
+<tr><td><code>--source &lt;URL&gt;</code></td><td><code>-s</code></td><td>—</td><td>URL-based data source (<code>file://</code>, <code>http://</code>, <code>s3://</code>, <code>gs://</code>, <code>azure://</code>)</td></tr>
+<tr><td><code>--format &lt;FMT&gt;</code></td><td><code>-f</code></td><td><code>csv</code></td><td>Output format: <code>csv</code>, <code>json</code>, <code>ndjson</code>, <code>parquet</code></td></tr>
+<tr><td><code>--no-headers</code></td><td></td><td>false</td><td>Omit CSV header row</td></tr>
+<tr><td><code>--output &lt;FILE&gt;</code></td><td><code>-o</code></td><td><em>(stdout)</em></td><td>Output file path</td></tr>
+<tr><td><code>--since &lt;RFC3339&gt;</code></td><td></td><td>—</td><td>Filter resources modified after this time</td></tr>
+<tr><td><code>--limit &lt;N&gt;</code></td><td></td><td>—</td><td>Limit results (1–10000)</td></tr>
+<tr><td><code>--fhir-version &lt;VER&gt;</code></td><td></td><td><code>R4</code></td><td>FHIR version: <code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code></td></tr>
+<tr><td><code>--chunk-size &lt;N&gt;</code></td><td></td><td>1000</td><td>Chunk size for NDJSON streaming</td></tr>
+<tr><td><code>--skip-invalid</code></td><td></td><td>false</td><td>Skip invalid JSON lines instead of failing</td></tr>
+<tr><td><code>--parquet-row-group-size &lt;MB&gt;</code></td><td></td><td>256</td><td>Parquet row group size (64–1024 MB)</td></tr>
+<tr><td><code>--parquet-page-size &lt;KB&gt;</code></td><td></td><td>1024</td><td>Parquet page size (64–8192 KB)</td></tr>
+<tr><td><code>--parquet-compression &lt;ALG&gt;</code></td><td></td><td><code>snappy</code></td><td><code>none</code>, <code>snappy</code>, <code>gzip</code>, <code>lz4</code>, <code>brotli</code>, <code>zstd</code></td></tr>
+<tr><td><code>--max-file-size &lt;MB&gt;</code></td><td></td><td>1000</td><td>Max Parquet output file size; splits when exceeded</td></tr>
+<tr><td><code>-h, --help</code></td><td></td><td></td><td>Print help</td></tr>
+</tbody></table>
+</div>
+<h3 id="notes"><a class="header" href="#notes">Notes</a></h3>
+<ul>
+<li><code>--bundle</code> / <code>-b</code> and <code>--source</code> / <code>-s</code> are mutually exclusive</li>
+<li>Either <code>--view</code> or <code>--bundle</code> may be read from stdin, but not both simultaneously</li>
+<li><code>--source</code> accepts <code>file://</code>, relative paths, absolute paths, <code>http://</code>, <code>https://</code>, <code>s3://</code>, <code>gs://</code>, <code>azure://</code></li>
+</ul>
+<hr />
+<h2 id="sof-server--sql-on-fhir-http-server"><a class="header" href="#sof-server--sql-on-fhir-http-server">sof-server — SQL-on-FHIR HTTP Server</a></h2>
+<pre><code class="language-bash">sof-server
+</code></pre>
+<p>No command-line flags. All configuration is via environment variables.</p>
+<h3 id="environment-variables-2"><a class="header" href="#environment-variables-2">Environment variables</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>SOF_SERVER_PORT</code></td><td><code>8080</code></td><td>Port to listen on</td></tr>
+<tr><td><code>SOF_SERVER_HOST</code></td><td><code>127.0.0.1</code></td><td>Host to bind</td></tr>
+<tr><td><code>SOF_LOG_LEVEL</code></td><td><code>info</code></td><td>Log level</td></tr>
+<tr><td><code>SOF_MAX_BODY_SIZE</code></td><td><code>10485760</code></td><td>Max request body (bytes)</td></tr>
+<tr><td><code>SOF_REQUEST_TIMEOUT</code></td><td><code>30</code></td><td>Request timeout (seconds)</td></tr>
+<tr><td><code>SOF_ENABLE_CORS</code></td><td><code>true</code></td><td>Enable CORS</td></tr>
+<tr><td><code>SOF_CORS_ORIGINS</code></td><td><code>*</code></td><td>Allowed CORS origins</td></tr>
+</tbody></table>
+</div>
+<h3 id="endpoint"><a class="header" href="#endpoint">Endpoint</a></h3>
+<p><code>POST /ViewDefinition/$viewdefinition-run</code></p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>_format</code></td><td>string</td><td><code>csv</code>, <code>json</code>, <code>ndjson</code>, <code>parquet</code></td></tr>
+<tr><td><code>header</code></td><td>boolean</td><td>Include CSV header (<code>true</code> / <code>false</code>)</td></tr>
+<tr><td><code>viewResource</code></td><td>object</td><td>ViewDefinition resource</td></tr>
+<tr><td><code>resource</code></td><td>array</td><td>FHIR resources to transform</td></tr>
+<tr><td><code>patient</code></td><td>string</td><td>Filter by patient reference</td></tr>
+<tr><td><code>_limit</code></td><td>integer</td><td>Limit results (1–10000)</td></tr>
+<tr><td><code>_since</code></td><td>string</td><td>Filter by modification time (RFC3339)</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="config-advisor--storage-configuration-advisor"><a class="header" href="#config-advisor--storage-configuration-advisor">config-advisor — Storage Configuration Advisor</a></h2>
+<pre><code class="language-bash">config-advisor
+</code></pre>
+<p>An interactive CLI tool that helps you choose the optimal storage backend configuration for your workload. No flags. Responds to user input with recommendations and explanations.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="ch14-contributing.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="appendix-b-fhirpath-functions.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="ch14-contributing.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="appendix-b-fhirpath-functions.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>
