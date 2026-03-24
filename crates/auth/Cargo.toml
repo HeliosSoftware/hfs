@@ -1,0 +1,46 @@
+[package]
+name = "helios-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Authentication and authorization for the Helios FHIR Server"
+
+[features]
+default = []
+redis = ["dep:redis"]
+
+[dependencies]
+# JWT validation
+jsonwebtoken = "9"
+
+# HTTP client for JWKS endpoint
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# In-memory caching (JTI + JWKS)
+moka = { version = "0.12", features = ["future"] }
+
+# Redis (optional, for distributed JTI cache and JWKS coordination)
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
+
+# SMART scope permissions
+bitflags = "2"
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
+async-trait = "0.1"
+
+# Time
+chrono.workspace = true
+
+# Logging
+tracing = "0.1"
+
+# Error handling
+thiserror = "2"

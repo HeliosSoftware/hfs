@@ -133,18 +133,21 @@ impl TenantSourceExtractor for HeaderTenantExtractor {
     }
 }
 
-/// Extracts tenant from JWT token claim.
+/// Extracts tenant from a validated JWT's [`Principal`] in request extensions.
 ///
-/// This is a stub implementation for future JWT-based tenant resolution.
+/// The auth middleware inserts a [`Principal`] into request extensions after
+/// successful token validation. This extractor reads the tenant ID from
+/// the principal's configured claim.
 #[derive(Debug, Default)]
 pub struct JwtTenantExtractor;
 
 impl TenantSourceExtractor for JwtTenantExtractor {
-    fn extract(&self, _parts: &Parts, _config: &MultitenancyConfig) -> Option<TenantId> {
-        // TODO: Implement JWT-based tenant extraction
-        // This will read the Authorization header, verify the JWT,
-        // and extract the tenant claim specified in config.jwt_tenant_claim
-        None
+    fn extract(&self, parts: &Parts, _config: &MultitenancyConfig) -> Option<TenantId> {
+        parts
+            .extensions
+            .get::<helios_auth::Principal>()
+            .and_then(|p| p.tenant_id())
+            .map(TenantId::new)
     }
 
     fn source_type(&self) -> TenantSource {

@@ -5,10 +5,11 @@
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, ResourceStorage,
@@ -48,11 +49,23 @@ pub async fn batch_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     prefer: PreferHeader,
-    Json(bundle): Json<Value>,
+    request: Request,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + BundleProvider + Send + Sync,
 {
+    // Extract the Principal from request extensions (set by auth middleware).
+    // If present, per-entry scope checks will be enforced.
+    let principal = request.extensions().get::<Principal>().cloned();
+
+    // Parse the body as JSON
+    let bundle: Value = serde_json::from_slice(
+        &axum::body::to_bytes(request.into_body(), state.config().max_body_size)
+            .await
+            .map_err(|_| RestError::BadRequest {
+                message: "Failed to read request body".to_string(),
+            })?,
+    )?;
     // Validate it's a Bundle
     let resource_type = bundle
         .get("resourceType")
@@ -77,8 +90,10 @@ where
             })?;
 
     match bundle_type {
-        "batch" => process_batch(&state, tenant, &prefer, &bundle).await,
-        "transaction" => process_transaction(&state, tenant, &prefer, &bundle).await,
+        "batch" => process_batch(&state, tenant, &prefer, &bundle, principal.as_ref()).await,
+        "transaction" => {
+            process_transaction(&state, tenant, &prefer, &bundle, principal.as_ref()).await
+        }
         _ => Err(RestError::BadRequest {
             message: format!(
                 "Bundle type must be 'batch' or 'transaction', got '{}'",
@@ -94,6 +109,7 @@ async fn process_batch<S>(
     tenant: TenantExtractor,
     prefer: &PreferHeader,
     bundle: &Value,
+    principal: Option<&Principal>,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
@@ -113,7 +129,7 @@ where
     let mut response_entries = Vec::with_capacity(entries.len());
 
     for (index, entry) in entries.iter().enumerate() {
-        let result = process_batch_entry(state, &tenant, entry, index).await;
+        let result = process_batch_entry(state, &tenant, entry, index, principal).await;
         response_entries.push(bundle_entry_result_to_json(&result, base_url, prefer));
     }
 
@@ -144,6 +160,7 @@ async fn process_transaction<S>(
     tenant: TenantExtractor,
     prefer: &PreferHeader,
     bundle: &Value,
+    principal: Option<&Principal>,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + BundleProvider + Send + Sync,
@@ -166,6 +183,23 @@ where
     for (index, entry) in json_entries.iter().enumerate() {
         match parse_bundle_entry(entry) {
             Ok((bundle_entry, full_url)) => {
+                // Enforce per-entry scope authorization for transactions.
+                // Transactions are atomic so any denied entry rejects the whole bundle.
+                if let Some(principal) = principal {
+                    let (resource_type, _) =
+                        parse_request_url(&bundle_entry.url).map_err(|e| RestError::BadRequest {
+                            message: format!("Entry {}: {}", index, e),
+                        })?;
+                    let operation = bundle_method_to_fhir_operation(&bundle_entry.method);
+                    SmartScopePolicy::check(principal, &resource_type, operation).map_err(
+                        |_| RestError::Forbidden {
+                            message: format!(
+                                "Insufficient scope for {} on {} (transaction entry {})",
+                                operation, resource_type, index
+                            ),
+                        },
+                    )?;
+                }
                 indexed_entries.push((index, bundle_entry, full_url));
             }
             Err(e) => {
@@ -238,6 +272,7 @@ async fn process_batch_entry<S>(
     tenant: &TenantExtractor,
     entry: &Value,
     index: usize,
+    principal: Option<&Principal>,
 ) -> BundleEntryResult
 where
     S: ResourceStorage + Send + Sync,
@@ -259,6 +294,26 @@ where
             return create_error_result(400, &e);
         }
     };
+
+    // Enforce per-entry scope authorization
+    if let Some(principal) = principal {
+        let operation = match method {
+            "GET" => FhirOperation::Read,
+            "POST" => FhirOperation::Create,
+            "PUT" | "PATCH" => FhirOperation::Update,
+            "DELETE" => FhirOperation::Delete,
+            _ => FhirOperation::Read, // will be caught by unsupported method below
+        };
+        if SmartScopePolicy::check(principal, &resource_type, operation).is_err() {
+            return create_error_result(
+                403,
+                &format!(
+                    "Insufficient scope for {} on {} (batch entry {})",
+                    operation, resource_type, index
+                ),
+            );
+        }
+    }
 
     match method {
         "GET" => {
@@ -456,6 +511,16 @@ fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), St
         },
         full_url,
     ))
+}
+
+/// Maps a [`BundleMethod`] to a [`FhirOperation`] for scope checking.
+fn bundle_method_to_fhir_operation(method: &BundleMethod) -> FhirOperation {
+    match method {
+        BundleMethod::Get => FhirOperation::Read,
+        BundleMethod::Post => FhirOperation::Create,
+        BundleMethod::Put | BundleMethod::Patch => FhirOperation::Update,
+        BundleMethod::Delete => FhirOperation::Delete,
+    }
 }
 
 /// Returns a processing order for bundle methods per FHIR spec.

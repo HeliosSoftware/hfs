@@ -30,11 +30,15 @@ mongodb = ["helios-persistence/mongodb"]
 elasticsearch = ["helios-persistence/elasticsearch"]
 s3 = ["helios-persistence/s3"]
 
+# Auth feature (pass through to helios-auth)
+redis = ["helios-auth/redis"]
+
 [dependencies]
 # Core dependencies
 helios-fhir = { path = "../fhir", version = "0.1.47" }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false }
 helios-serde = { path = "../serde", version = "0.1.47", default-features = false, optional = true }
+helios-auth = { path = "../auth", version = "0.1.47" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

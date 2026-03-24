@@ -18,8 +18,15 @@
 //! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`,
 //! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
+use std::sync::Arc;
+
 use clap::Parser;
-use helios_rest::{ServerConfig, StorageBackendMode, create_app_with_config, init_logging};
+use helios_auth::{
+    AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache, NoopAuditEventSink,
+};
+use helios_rest::{
+    AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth, init_logging,
+};
 use tracing::info;
 
 #[cfg(feature = "sqlite")]
@@ -52,7 +59,11 @@ fn create_sqlite_backend(config: &ServerConfig) -> anyhow::Result<SqliteBackend>
 
 /// Starts the server with MongoDB backend.
 #[cfg(feature = "mongodb")]
-async fn start_mongodb(config: ServerConfig) -> anyhow::Result<()> {
+async fn start_mongodb(
+    config: ServerConfig,
+    auth_config: AuthConfig,
+    auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     let backend = if let Some(ref url) = config.database_url {
         if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
             info!(url = %url, "Initializing MongoDB backend from connection string");
@@ -70,13 +81,17 @@ async fn start_mongodb(config: ServerConfig) -> anyhow::Result<()> {
 
     backend.init_schema().await?;
 
-    let app = create_app_with_config(backend, config.clone());
+    let app = create_app_with_auth(backend, config.clone(), auth_config, auth_state);
     serve(app, &config).await
 }
 
 /// Fallback when mongodb feature is not enabled.
 #[cfg(not(feature = "mongodb"))]
-async fn start_mongodb(_config: ServerConfig) -> anyhow::Result<()> {
+async fn start_mongodb(
+    _config: ServerConfig,
+    _auth_config: AuthConfig,
+    _auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     anyhow::bail!(
         "The mongodb backend requires the 'mongodb' feature. \
          Build with: cargo build -p helios-hfs --features mongodb"
@@ -90,6 +105,76 @@ async fn serve(app: axum::Router, config: &ServerConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Initializes the authentication subsystem from environment configuration.
+///
+/// Returns the auth config and optional middleware state. If auth is disabled,
+/// returns `(config, None)`.
+async fn init_auth() -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareState>>)> {
+    let auth_config = AuthConfig::from_env();
+
+    if !auth_config.enabled {
+        info!("Authentication is DISABLED");
+        return Ok((auth_config, None));
+    }
+
+    let jwks_url = auth_config.jwks_url.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("HFS_AUTH_JWKS_URL is required when HFS_AUTH_ENABLED=true")
+    })?;
+
+    // Require issuer validation to prevent cross-service token reuse
+    if auth_config.expected_issuer.is_none() {
+        anyhow::bail!("HFS_AUTH_ISSUER is required when HFS_AUTH_ENABLED=true");
+    }
+
+    // Create JTI cache
+    let jti_cache: Arc<dyn JtiCache> = match auth_config.jti_backend.as_str() {
+        #[cfg(feature = "redis")]
+        "redis" => {
+            let redis_url = auth_config.redis_url.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("HFS_AUTH_REDIS_URL is required when HFS_AUTH_JTI_BACKEND=redis")
+            })?;
+            info!(redis_url = %redis_url, "Using Redis JTI cache");
+            Arc::new(helios_auth::RedisJtiCache::new(redis_url)?)
+        }
+        #[cfg(not(feature = "redis"))]
+        "redis" => {
+            anyhow::bail!(
+                "Redis JTI backend requires the 'redis' feature. \
+                 Build with: cargo build -p helios-hfs --features redis"
+            );
+        }
+        _ => {
+            info!("Using in-memory JTI cache");
+            Arc::new(InMemoryJtiCache::new())
+        }
+    };
+
+    // Create JWKS cache
+    let jwks_cache = Arc::new(JwksCache::new(
+        jwks_url,
+        auth_config.jwks_min_refresh_interval,
+    ));
+    jwks_cache.initial_fetch().await?;
+
+    // Create auth provider
+    let provider = JwksBearerAuthProvider::new(jwks_cache, jti_cache, &auth_config);
+
+    info!(
+        jwks_url = %jwks_url,
+        issuer = ?auth_config.expected_issuer,
+        audience = ?auth_config.expected_audience,
+        "Authentication ENABLED"
+    );
+
+    let auth_state = Arc::new(AuthMiddlewareState {
+        provider: Arc::new(provider),
+        config: Arc::new(auth_config.clone()),
+        audit_sink: Arc::new(NoopAuditEventSink),
+    });
+
+    Ok((auth_config, Some(auth_state)))
 }
 
 #[tokio::main]
@@ -108,38 +193,42 @@ async fn main() -> anyhow::Result<()> {
         .storage_backend_mode()
         .map_err(|e| anyhow::anyhow!("Invalid storage backend configuration: {}", e))?;
 
+    // Initialize authentication
+    let (auth_config, auth_state) = init_auth().await?;
+
     info!(
         port = config.port,
         host = %config.host,
         fhir_version = ?config.default_fhir_version,
         storage_backend = %backend_mode,
+        auth_enabled = auth_config.enabled,
         "Starting Helios FHIR Server"
     );
 
     match backend_mode {
         StorageBackendMode::Sqlite => {
-            start_sqlite(config).await?;
+            start_sqlite(config, auth_config, auth_state).await?;
         }
         StorageBackendMode::SqliteElasticsearch => {
-            start_sqlite_elasticsearch(config).await?;
+            start_sqlite_elasticsearch(config, auth_config, auth_state).await?;
         }
         StorageBackendMode::Postgres => {
-            start_postgres(config).await?;
+            start_postgres(config, auth_config, auth_state).await?;
         }
         StorageBackendMode::PostgresElasticsearch => {
-            start_postgres_elasticsearch(config).await?;
+            start_postgres_elasticsearch(config, auth_config, auth_state).await?;
         }
         StorageBackendMode::MongoDB => {
-            start_mongodb(config).await?;
+            start_mongodb(config, auth_config, auth_state).await?;
         }
         StorageBackendMode::MongoDBElasticsearch => {
-            start_mongodb_elasticsearch(config).await?;
+            start_mongodb_elasticsearch(config, auth_config, auth_state).await?;
         }
         StorageBackendMode::S3 => {
-            start_s3(config).await?;
+            start_s3(config, auth_config, auth_state).await?;
         }
         StorageBackendMode::S3Elasticsearch => {
-            start_s3_elasticsearch(config).await?;
+            start_s3_elasticsearch(config, auth_config, auth_state).await?;
         }
     }
 
@@ -148,15 +237,23 @@ async fn main() -> anyhow::Result<()> {
 
 /// Starts the server with SQLite-only backend.
 #[cfg(feature = "sqlite")]
-async fn start_sqlite(config: ServerConfig) -> anyhow::Result<()> {
+async fn start_sqlite(
+    config: ServerConfig,
+    auth_config: AuthConfig,
+    auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     let backend = create_sqlite_backend(&config)?;
-    let app = create_app_with_config(backend, config.clone());
+    let app = create_app_with_auth(backend, config.clone(), auth_config, auth_state);
     serve(app, &config).await
 }
 
 /// Fallback when sqlite feature is not enabled.
 #[cfg(not(feature = "sqlite"))]
-async fn start_sqlite(_config: ServerConfig) -> anyhow::Result<()> {
+async fn start_sqlite(
+    _config: ServerConfig,
+    _auth_config: AuthConfig,
+    _auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     anyhow::bail!(
         "The sqlite backend requires the 'sqlite' feature. \
          Build with: cargo build -p helios-hfs --features sqlite"
@@ -165,7 +262,11 @@ async fn start_sqlite(_config: ServerConfig) -> anyhow::Result<()> {
 
 /// Starts the server with SQLite + Elasticsearch composite backend.
 #[cfg(all(feature = "sqlite", feature = "elasticsearch"))]
-async fn start_sqlite_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
+async fn start_sqlite_elasticsearch(
+    config: ServerConfig,
+    auth_config: AuthConfig,
+    auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -262,13 +363,17 @@ async fn start_sqlite_elasticsearch(config: ServerConfig) -> anyhow::Result<()> 
 
     info!("Composite storage initialized: SQLite (primary) + Elasticsearch (search)");
 
-    let app = create_app_with_config(composite, config.clone());
+    let app = create_app_with_auth(composite, config.clone(), auth_config, auth_state);
     serve(app, &config).await
 }
 
 /// Fallback when elasticsearch feature is not enabled.
 #[cfg(not(all(feature = "sqlite", feature = "elasticsearch")))]
-async fn start_sqlite_elasticsearch(_config: ServerConfig) -> anyhow::Result<()> {
+async fn start_sqlite_elasticsearch(
+    _config: ServerConfig,
+    _auth_config: AuthConfig,
+    _auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     anyhow::bail!(
         "The sqlite-elasticsearch backend requires the 'elasticsearch' feature. \
          Build with: cargo build -p helios-hfs --features sqlite,elasticsearch"
@@ -277,7 +382,11 @@ async fn start_sqlite_elasticsearch(_config: ServerConfig) -> anyhow::Result<()>
 
 /// Starts the server with PostgreSQL backend.
 #[cfg(feature = "postgres")]
-async fn start_postgres(config: ServerConfig) -> anyhow::Result<()> {
+async fn start_postgres(
+    config: ServerConfig,
+    auth_config: AuthConfig,
+    auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     use helios_persistence::backends::postgres::PostgresBackend;
 
     let backend = if let Some(ref url) = config.database_url {
@@ -295,13 +404,17 @@ async fn start_postgres(config: ServerConfig) -> anyhow::Result<()> {
 
     backend.init_schema().await?;
 
-    let app = create_app_with_config(backend, config.clone());
+    let app = create_app_with_auth(backend, config.clone(), auth_config, auth_state);
     serve(app, &config).await
 }
 
 /// Fallback when postgres feature is not enabled.
 #[cfg(not(feature = "postgres"))]
-async fn start_postgres(_config: ServerConfig) -> anyhow::Result<()> {
+async fn start_postgres(
+    _config: ServerConfig,
+    _auth_config: AuthConfig,
+    _auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     anyhow::bail!(
         "The postgres backend requires the 'postgres' feature. \
          Build with: cargo build -p helios-hfs --features postgres"
@@ -310,7 +423,11 @@ async fn start_postgres(_config: ServerConfig) -> anyhow::Result<()> {
 
 /// Starts the server with PostgreSQL + Elasticsearch composite backend.
 #[cfg(all(feature = "postgres", feature = "elasticsearch"))]
-async fn start_postgres_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
+async fn start_postgres_elasticsearch(
+    config: ServerConfig,
+    auth_config: AuthConfig,
+    auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -424,13 +541,17 @@ async fn start_postgres_elasticsearch(config: ServerConfig) -> anyhow::Result<()
 
     info!("Composite storage initialized: PostgreSQL (primary) + Elasticsearch (search)");
 
-    let app = create_app_with_config(composite, config.clone());
+    let app = create_app_with_auth(composite, config.clone(), auth_config, auth_state);
     serve(app, &config).await
 }
 
 /// Fallback when postgres+elasticsearch features are not both enabled.
 #[cfg(not(all(feature = "postgres", feature = "elasticsearch")))]
-async fn start_postgres_elasticsearch(_config: ServerConfig) -> anyhow::Result<()> {
+async fn start_postgres_elasticsearch(
+    _config: ServerConfig,
+    _auth_config: AuthConfig,
+    _auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     anyhow::bail!(
         "The postgres-elasticsearch backend requires both 'postgres' and 'elasticsearch' features. \
          Build with: cargo build -p helios-hfs --features postgres,elasticsearch"
@@ -439,7 +560,11 @@ async fn start_postgres_elasticsearch(_config: ServerConfig) -> anyhow::Result<(
 
 /// Starts the server with MongoDB + Elasticsearch composite backend.
 #[cfg(all(feature = "mongodb", feature = "elasticsearch"))]
-async fn start_mongodb_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
+async fn start_mongodb_elasticsearch(
+    config: ServerConfig,
+    auth_config: AuthConfig,
+    auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -553,13 +678,17 @@ async fn start_mongodb_elasticsearch(config: ServerConfig) -> anyhow::Result<()>
 
     info!("Composite storage initialized: MongoDB (primary) + Elasticsearch (search)");
 
-    let app = create_app_with_config(composite, config.clone());
+    let app = create_app_with_auth(composite, config.clone(), auth_config, auth_state);
     serve(app, &config).await
 }
 
 /// Fallback when mongodb+elasticsearch features are not both enabled.
 #[cfg(not(all(feature = "mongodb", feature = "elasticsearch")))]
-async fn start_mongodb_elasticsearch(_config: ServerConfig) -> anyhow::Result<()> {
+async fn start_mongodb_elasticsearch(
+    _config: ServerConfig,
+    _auth_config: AuthConfig,
+    _auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     anyhow::bail!(
         "The mongodb-elasticsearch backend requires both 'mongodb' and 'elasticsearch' features. \
          Build with: cargo build -p helios-hfs --features mongodb,elasticsearch"
@@ -568,7 +697,11 @@ async fn start_mongodb_elasticsearch(_config: ServerConfig) -> anyhow::Result<()
 
 /// Starts the server with AWS S3 backend.
 #[cfg(feature = "s3")]
-async fn start_s3(config: ServerConfig) -> anyhow::Result<()> {
+async fn start_s3(
+    config: ServerConfig,
+    auth_config: AuthConfig,
+    auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
 
     let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
@@ -605,13 +738,17 @@ async fn start_s3(config: ServerConfig) -> anyhow::Result<()> {
         )
     })?;
 
-    let app = create_app_with_config(backend, config.clone());
+    let app = create_app_with_auth(backend, config.clone(), auth_config, auth_state);
     serve(app, &config).await
 }
 
 /// Fallback when s3 feature is not enabled.
 #[cfg(not(feature = "s3"))]
-async fn start_s3(_config: ServerConfig) -> anyhow::Result<()> {
+async fn start_s3(
+    _config: ServerConfig,
+    _auth_config: AuthConfig,
+    _auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     anyhow::bail!(
         "The s3 backend requires the 's3' feature. \
          Build with: cargo build -p helios-hfs --features s3"
@@ -647,7 +784,11 @@ fn build_search_registry(
 
 /// Starts the server with S3 + Elasticsearch composite backend.
 #[cfg(all(feature = "s3", feature = "elasticsearch"))]
-async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
+async fn start_s3_elasticsearch(
+    config: ServerConfig,
+    auth_config: AuthConfig,
+    auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -767,13 +908,17 @@ async fn start_s3_elasticsearch(config: ServerConfig) -> anyhow::Result<()> {
 
     info!("Composite storage initialized: S3 (primary) + Elasticsearch (search)");
 
-    let app = create_app_with_config(composite, config.clone());
+    let app = create_app_with_auth(composite, config.clone(), auth_config, auth_state);
     serve(app, &config).await
 }
 
 /// Fallback when s3+elasticsearch features are not both enabled.
 #[cfg(not(all(feature = "s3", feature = "elasticsearch")))]
-async fn start_s3_elasticsearch(_config: ServerConfig) -> anyhow::Result<()> {
+async fn start_s3_elasticsearch(
+    _config: ServerConfig,
+    _auth_config: AuthConfig,
+    _auth_state: Option<Arc<AuthMiddlewareState>>,
+) -> anyhow::Result<()> {
     anyhow::bail!(
         "The s3-elasticsearch backend requires both 's3' and 'elasticsearch' features. \
          Build with: cargo build -p helios-hfs --features s3,elasticsearch"

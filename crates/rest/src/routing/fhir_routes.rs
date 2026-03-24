@@ -192,6 +192,10 @@ where
         .route("/health", get(handlers::health_handler::<S>))
         .route("/_liveness", get(handlers::health::liveness_handler))
         .route("/_readiness", get(handlers::health::readiness_handler::<S>))
+        .route(
+            "/.well-known/smart-configuration",
+            get(handlers::smart_discovery::smart_configuration_handler::<S>),
+        )
         .route("/_history", get(handlers::history_system_handler::<S>))
         .route("/", post(handlers::batch_handler::<S>))
         // Type-level routes
