@@ -766,7 +766,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: test_report
-          path: ./book/book/sof-test-report/
+          path: ./book/book/
           merge-multiple: true
 
       - name: Upload artifact
