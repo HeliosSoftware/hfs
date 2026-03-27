@@ -39,7 +39,7 @@ Work that is currently underway or planned for the near term.
 
 | Area | Item | Status |
 |------|------|--------|
-| **Compliance** | Audit logging (AuditEvent resource support) | 🔵 Design |
+| **Compliance** | [Audit logging (AuditEvent resource support)](https://github.com/HeliosSoftware/hfs/discussions/50) | 🔵 Design |
 | **Standards** | FHIR Validation engine | 🔵 Design |
 | **Standards** | [Authentication & Authorization](https://github.com/HeliosSoftware/hfs/discussions/45) | 🔵 Design |
 | **Documentation** | Project documentation website | 🔵 Design |
@@ -51,7 +51,7 @@ We are actively developing community discussion documents on the following topic
 - **[Authentication & Authorization](https://github.com/HeliosSoftware/hfs/discussions/45)** — Scoping the approach to identity, access control, and SMART on FHIR integration
 - **Terminology** — Defining how code systems, value sets, and concept maps will be managed
 - **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
-- **Audit** — Designing the audit trail architecture and AuditEvent generation
+- **[Audit](https://github.com/HeliosSoftware/hfs/discussions/50)** — Designing the audit trail architecture and AuditEvent generation
 
 ---
 

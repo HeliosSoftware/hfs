@@ -1,0 +1,13 @@
+[book]
+title = "Helios FHIR Server"
+authors = ["Helios Software"]
+language = "en"
+src = "src"
+
+[output.html]
+site-url = "/hfs/"
+git-repository-url = "https://github.com/HeliosSoftware/hfs"
+git-repository-icon = "fa-github"
+edit-url-template = "https://github.com/HeliosSoftware/hfs/edit/main/book/src/{path}"
+
+[preprocessor.links]
