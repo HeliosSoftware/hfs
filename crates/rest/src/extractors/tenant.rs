@@ -138,6 +138,35 @@ where
     ) -> Result<Self, Self::Rejection> {
         let config = state.config();
 
+        // If auth is enabled and a Principal with a tenant_id is present,
+        // use the JWT tenant authoritatively. When strict validation is enabled,
+        // verify that the JWT tenant matches any header/URL tenant to prevent
+        // confusion between URL context and actual data access.
+        if let Some(principal) = parts.extensions.get::<helios_auth::Principal>() {
+            if let Some(jwt_tenant) = principal.tenant_id() {
+                if config.multitenancy.strict_validation {
+                    let resolver = TenantResolver::new(&config.multitenancy);
+                    let resolved =
+                        resolver.resolve(parts, &config.multitenancy, &config.default_tenant);
+                    // If a non-default source provided a tenant, it must match the JWT
+                    if !resolved.is_default() && resolved.tenant_id_str() != jwt_tenant {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "Tenant mismatch: JWT tenant '{}' does not match request tenant '{}'",
+                                jwt_tenant,
+                                resolved.tenant_id_str()
+                            ),
+                        ));
+                    }
+                }
+                return Ok(TenantExtractor::new(
+                    jwt_tenant,
+                    crate::tenant::TenantSource::JwtClaim,
+                ));
+            }
+        }
+
         // Create resolver based on configuration
         let resolver = TenantResolver::new(&config.multitenancy);
 
