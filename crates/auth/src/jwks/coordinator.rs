@@ -1,6 +1,6 @@
 use redis::AsyncCommands;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::error::AuthError;
 

@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use redis::AsyncCommands;
 
 use super::JtiCache;
 use crate::error::AuthError;

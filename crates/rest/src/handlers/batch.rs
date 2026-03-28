@@ -186,10 +186,11 @@ where
                 // Enforce per-entry scope authorization for transactions.
                 // Transactions are atomic so any denied entry rejects the whole bundle.
                 if let Some(principal) = principal {
-                    let (resource_type, _) =
-                        parse_request_url(&bundle_entry.url).map_err(|e| RestError::BadRequest {
+                    let (resource_type, _) = parse_request_url(&bundle_entry.url).map_err(|e| {
+                        RestError::BadRequest {
                             message: format!("Entry {}: {}", index, e),
-                        })?;
+                        }
+                    })?;
                     let operation = bundle_method_to_fhir_operation(&bundle_entry.method);
                     SmartScopePolicy::check(principal, &resource_type, operation).map_err(
                         |_| RestError::Forbidden {
