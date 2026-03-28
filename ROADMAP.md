@@ -25,6 +25,14 @@ These capabilities are available today in the current release.
 - [S3 as a primary store](crates/persistence/README.md#s3)
 - [S3 as a primary store with Elasticsearch as a query secondary](crates/persistence/README.md#s3--elasticsearch)
 
+**Authentication & Authorization**
+
+- [SMART on FHIR authentication, authorization, and IdP integration](https://github.com/HeliosSoftware/hfs/discussions/45)
+
+**Clinical Decision Support**
+
+- [CDS Hooks](crates/cds-hooks/README.md) — HL7 CDS Hooks v3.0.0 protocol types, all 10 hook contexts, and async `CdsHooksService` trait
+
 **Analytics & Tooling**
 
 - [SQL on FHIR](crates/sof/README.md) — CLI and HTTP server
@@ -41,14 +49,12 @@ Work that is currently underway or planned for the near term.
 |------|------|--------|
 | **Compliance** | [Audit logging (AuditEvent resource support)](https://github.com/HeliosSoftware/hfs/discussions/50) | 🔵 Design |
 | **Standards** | FHIR Validation engine | 🔵 Design |
-| **Standards** | [Authentication & Authorization](https://github.com/HeliosSoftware/hfs/discussions/45) | 🔵 Design |
 | **Documentation** | Project documentation website | 🔵 Design |
 
 ### Discussion Documents
 
 We are actively developing community discussion documents on the following topics to gather feedback before implementation begins. These will be published as GitHub Discussions:
 
-- **[Authentication & Authorization](https://github.com/HeliosSoftware/hfs/discussions/45)** — Scoping the approach to identity, access control, and SMART on FHIR integration
 - **Terminology** — Defining how code systems, value sets, and concept maps will be managed
 - **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
 - **[Audit](https://github.com/HeliosSoftware/hfs/discussions/50)** — Designing the audit trail architecture and AuditEvent generation
@@ -64,7 +70,7 @@ These items are well-understood and will be picked up once current work complete
 - **Bulk Data API** — Import and export (`$export` / `$import` operations)
 - **FHIR Subscriptions** — Topic-based notification support
 - **Terminology Server** — CodeSystem `$lookup`, ValueSet `$expand`, ConceptMap `$translate`
-- **SMART on FHIR** — Full launch framework and scoped access
+- **SMART on FHIR** — Full launch framework (standalone launch, EHR launch) and fine-grained scoped access
 - **SQL on FHIR** — [SQL on FHIR operations](https://sql-on-fhir.org/ig/latest/operations.html) - using read-only database connections
 
 ### Persistence Backends
