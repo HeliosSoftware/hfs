@@ -1,0 +1,80 @@
+{
+  "id": "fhir",
+  "realm": "fhir",
+  "displayName": "FHIR Realm",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "bruteForceProtected": false,
+  "accessTokenLifespan": 300,
+  "clientScopes": [
+    {
+      "name": "system/*.cruds",
+      "description": "Full system-level SMART access on all resource types",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "system/Patient.rs",
+      "description": "Read and search Patient resources",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "system/Observation.r",
+      "description": "Read-only access to Observation resources",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "hfs-backend-client",
+      "name": "HFS Backend Service (full access)",
+      "description": "Service account client for SMART Backend Services — full CRUD+search access",
+      "enabled": true,
+      "publicClient": false,
+      "bearerOnly": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "hfs-backend-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": ["system/*.cruds"],
+      "optionalClientScopes": ["system/Patient.rs", "system/Observation.r"]
+    },
+    {
+      "clientId": "hfs-readonly-client",
+      "name": "HFS Read-only Client",
+      "description": "Service account client limited to reading Patient resources",
+      "enabled": true,
+      "publicClient": false,
+      "bearerOnly": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "hfs-readonly-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": ["system/Patient.rs"],
+      "optionalClientScopes": ["system/Observation.r"]
+    }
+  ]
+}

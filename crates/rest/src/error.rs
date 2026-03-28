@@ -105,6 +105,12 @@ pub enum RestError {
         message: String,
     },
 
+    /// Unauthorized — missing or invalid authentication (HTTP 401).
+    Unauthorized {
+        /// Error message.
+        message: String,
+    },
+
     /// Access denied (HTTP 403).
     Forbidden {
         /// Error message.
@@ -188,6 +194,9 @@ impl fmt::Display for RestError {
             RestError::UnprocessableEntity { message } => {
                 write!(f, "Unprocessable entity: {}", message)
             }
+            RestError::Unauthorized { message } => {
+                write!(f, "Unauthorized: {}", message)
+            }
             RestError::Forbidden { message } => {
                 write!(f, "Forbidden: {}", message)
             }
@@ -267,6 +276,18 @@ impl IntoResponse for RestError {
                 "processing",
                 message.clone(),
             ),
+            RestError::Unauthorized { message } => {
+                let operation_outcome = create_operation_outcome("error", "login", message);
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(
+                        axum::http::header::WWW_AUTHENTICATE,
+                        axum::http::HeaderValue::from_static("Bearer"),
+                    )],
+                    Json(operation_outcome),
+                )
+                    .into_response();
+            }
             RestError::Forbidden { message } => {
                 (StatusCode::FORBIDDEN, "forbidden", message.clone())
             }
@@ -344,6 +365,25 @@ pub fn create_operation_outcome_multi(issues: Vec<(String, String, String)>) -> 
         "resourceType": "OperationOutcome",
         "issue": issues
     })
+}
+
+// Implement conversion from AuthError
+
+impl From<helios_auth::AuthError> for RestError {
+    fn from(err: helios_auth::AuthError) -> Self {
+        match err {
+            helios_auth::AuthError::Forbidden {
+                resource_type,
+                operation,
+            } => RestError::Forbidden {
+                message: format!("Insufficient scope for {} on {}", operation, resource_type),
+            },
+            helios_auth::AuthError::InternalError(msg) => RestError::InternalError { message: msg },
+            other => RestError::Unauthorized {
+                message: other.to_string(),
+            },
+        }
+    }
 }
 
 // Implement conversions from storage errors
