@@ -174,10 +174,16 @@ impl AuthProvider for JwksBearerAuthProvider {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        // 11. Build custom claims map (excluding standard claims)
+        // 11. Extract SMART launch context patient ID (present in patient/* scope tokens)
+        let patient_id = claims
+            .get("patient")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // 12. Build custom claims map (excluding standard claims)
         let custom_claims = if let serde_json::Value::Object(map) = claims {
             let standard = [
-                "sub", "iss", "exp", "iat", "nbf", "aud", "jti", "scope", "scp",
+                "sub", "iss", "exp", "iat", "nbf", "aud", "jti", "scope", "scp", "patient",
             ];
             map.into_iter()
                 .filter(|(k, _)| !standard.contains(&k.as_str()) && k != &self.tenant_claim)
@@ -195,6 +201,7 @@ impl AuthProvider for JwksBearerAuthProvider {
             scopes,
             jti,
             expires_at,
+            patient_id,
             custom_claims,
         })
     }

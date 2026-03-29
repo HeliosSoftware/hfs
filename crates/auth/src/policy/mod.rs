@@ -53,6 +53,20 @@ mod tests {
             scopes: ScopeSet::parse(scope_str),
             jti: None,
             expires_at: Utc::now() + chrono::Duration::hours(1),
+            patient_id: None,
+            custom_claims: serde_json::Map::new(),
+        }
+    }
+
+    fn make_patient_principal(scope_str: &str, patient_id: &str) -> Principal {
+        Principal {
+            subject: "patient-user".to_string(),
+            issuer: "https://idp.example.com".to_string(),
+            tenant_id: Some("tenant-1".to_string()),
+            scopes: ScopeSet::parse(scope_str),
+            jti: None,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            patient_id: Some(patient_id.to_string()),
             custom_claims: serde_json::Map::new(),
         }
     }
@@ -102,5 +116,73 @@ mod tests {
     fn test_empty_scopes_deny_all() {
         let principal = make_principal("");
         assert!(SmartScopePolicy::check(&principal, "Patient", FhirOperation::Read).is_err());
+    }
+
+    // --- user/* context ---
+
+    #[test]
+    fn test_user_scope_read_permitted() {
+        let principal = make_principal("user/Patient.rs");
+        assert!(SmartScopePolicy::check(&principal, "Patient", FhirOperation::Read).is_ok());
+        assert!(SmartScopePolicy::check(&principal, "Patient", FhirOperation::Search).is_ok());
+    }
+
+    #[test]
+    fn test_user_scope_write_denied() {
+        let principal = make_principal("user/Patient.rs");
+        assert!(SmartScopePolicy::check(&principal, "Patient", FhirOperation::Create).is_err());
+        assert!(SmartScopePolicy::check(&principal, "Patient", FhirOperation::Update).is_err());
+        assert!(SmartScopePolicy::check(&principal, "Patient", FhirOperation::Delete).is_err());
+    }
+
+    #[test]
+    fn test_user_wildcard_full_access() {
+        let principal = make_principal("user/*.cruds");
+        assert!(SmartScopePolicy::check(&principal, "Patient", FhirOperation::Create).is_ok());
+        assert!(SmartScopePolicy::check(&principal, "Observation", FhirOperation::Read).is_ok());
+        assert!(SmartScopePolicy::check(&principal, "Condition", FhirOperation::Search).is_ok());
+    }
+
+    #[test]
+    fn test_user_scope_wrong_resource_denied() {
+        let principal = make_principal("user/Patient.rs");
+        assert!(SmartScopePolicy::check(&principal, "Observation", FhirOperation::Read).is_err());
+    }
+
+    // --- patient/* context ---
+
+    #[test]
+    fn test_patient_scope_read_permitted() {
+        let principal = make_patient_principal("patient/Patient.r", "Patient/123");
+        assert!(SmartScopePolicy::check(&principal, "Patient", FhirOperation::Read).is_ok());
+        assert_eq!(principal.patient_id(), Some("Patient/123"));
+    }
+
+    #[test]
+    fn test_patient_scope_search_denied_without_s() {
+        let principal = make_patient_principal("patient/Observation.r", "Patient/123");
+        assert!(SmartScopePolicy::check(&principal, "Observation", FhirOperation::Read).is_ok());
+        assert!(SmartScopePolicy::check(&principal, "Observation", FhirOperation::Search).is_err());
+    }
+
+    #[test]
+    fn test_patient_scope_multi_resource() {
+        let principal =
+            make_patient_principal("patient/Patient.r patient/Observation.rs", "Patient/123");
+        assert!(SmartScopePolicy::check(&principal, "Patient", FhirOperation::Read).is_ok());
+        assert!(SmartScopePolicy::check(&principal, "Observation", FhirOperation::Search).is_ok());
+        assert!(SmartScopePolicy::check(&principal, "Condition", FhirOperation::Read).is_err());
+    }
+
+    #[test]
+    fn test_patient_id_present_on_patient_context() {
+        let principal = make_patient_principal("patient/Patient.r", "Patient/abc");
+        assert_eq!(principal.patient_id(), Some("Patient/abc"));
+    }
+
+    #[test]
+    fn test_patient_id_absent_on_system_context() {
+        let principal = make_principal("system/Patient.rs");
+        assert_eq!(principal.patient_id(), None);
     }
 }

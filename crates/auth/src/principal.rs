@@ -20,6 +20,10 @@ pub struct Principal {
     pub jti: Option<String>,
     /// Token expiration time.
     pub expires_at: DateTime<Utc>,
+    /// The SMART launch context patient ID, present when the token was issued
+    /// with a `patient/*` scope context (SMART App Launch patient context).
+    /// Used by request handlers to restrict results to the patient's compartment.
+    pub patient_id: Option<String>,
     /// Additional claims from the JWT not captured in other fields.
     pub custom_claims: serde_json::Map<String, serde_json::Value>,
 }
@@ -38,5 +42,13 @@ impl Principal {
     /// Returns the tenant ID if present in the token.
     pub fn tenant_id(&self) -> Option<&str> {
         self.tenant_id.as_deref()
+    }
+
+    /// Returns the SMART launch context patient ID if present.
+    ///
+    /// Non-`None` when the token was issued in patient context (e.g., via SMART App Launch).
+    /// Handlers use this to restrict FHIR search results to the patient's compartment.
+    pub fn patient_id(&self) -> Option<&str> {
+        self.patient_id.as_deref()
     }
 }

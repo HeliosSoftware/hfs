@@ -10,6 +10,22 @@
   "resetPasswordAllowed": false,
   "bruteForceProtected": false,
   "accessTokenLifespan": 300,
+  "roles": {
+    "realm": [
+      {
+        "name": "fhir-admin",
+        "description": "Full read/write/delete access to all FHIR resources (user/*.cruds)"
+      },
+      {
+        "name": "fhir-reader",
+        "description": "Read and search access to all FHIR resources (user/*.rs)"
+      },
+      {
+        "name": "fhir-patient",
+        "description": "Patient self-access to own records (patient/* scopes)"
+      }
+    ]
+  },
   "clientScopes": [
     {
       "name": "system/*.cruds",
@@ -36,6 +52,66 @@
       "attributes": {
         "include.in.token.scope": "true",
         "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "user/*.cruds",
+      "description": "Full user-level SMART access on all resource types (fhir-admin role)",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Full access to read, write, and delete all FHIR resources on your behalf"
+      }
+    },
+    {
+      "name": "user/*.rs",
+      "description": "Read and search access to all FHIR resource types (fhir-reader role)",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Read and search all FHIR resources on your behalf"
+      }
+    },
+    {
+      "name": "user/Patient.rs",
+      "description": "Read and search Patient resources on behalf of the user",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Read and search Patient resources on your behalf"
+      }
+    },
+    {
+      "name": "user/Observation.rs",
+      "description": "Read and search Observation resources on behalf of the user",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Read and search Observation resources on your behalf"
+      }
+    },
+    {
+      "name": "patient/Patient.r",
+      "description": "Read the patient's own Patient record (fhir-patient role)",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Read your own Patient record"
+      }
+    },
+    {
+      "name": "patient/Observation.rs",
+      "description": "Read and search the patient's own Observation resources (fhir-patient role)",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Read and search your own Observation records"
       }
     }
   ],
@@ -75,6 +151,42 @@
       "protocol": "openid-connect",
       "defaultClientScopes": ["system/Patient.rs"],
       "optionalClientScopes": ["system/Observation.r"]
+    },
+    {
+      "clientId": "hfs-ui",
+      "name": "HFS FHIR UI",
+      "description": "Public SPA client for the HFS browser UI — uses Authorization Code + PKCE, no client secret",
+      "enabled": true,
+      "publicClient": true,
+      "bearerOnly": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "http://localhost:5173/callback",
+        "http://localhost:5173/*",
+        "https://ui.example.com/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:5173",
+        "https://ui.example.com"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:5173/*##https://ui.example.com/*"
+      },
+      "defaultClientScopes": ["openid", "profile", "email"],
+      "optionalClientScopes": [
+        "user/*.cruds",
+        "user/*.rs",
+        "user/Patient.rs",
+        "user/Observation.rs",
+        "patient/Patient.r",
+        "patient/Observation.rs"
+      ]
     }
   ]
 }
