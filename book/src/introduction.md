@@ -1,23 +1,24 @@
-# Helios FHIR Server
+# Introduction
 
 The Helios FHIR Server is an implementation of the [HL7® FHIR®](https://hl7.org/fhir) standard, built in Rust for high performance and optimized for clinical analytics workloads. It provides modular components that can be run as standalone command-line tools, integrated as microservices, or embedded directly into your data analytics pipeline.
 
-## Why Helios?
+## Who This Book Is For
 
-- **Blazing Fast**: Built in Rust for maximum performance and minimal resource usage
-- **Analytics-First**: Optimized for clinical data analytics and research workloads
-- **Modular Design**: Use only what you need — from FHIRPath expressions to a full FHIR server
-- **Multi-Version Support**: Work with R4, R4B, R5, and R6 data in the same application
-- **Developer Friendly**: Excellent error messages, comprehensive tooling, and CLI tools
+This book is for developers and data engineers who want to work with FHIR data using Helios. You do not need prior FHIR experience — the early chapters introduce the standard from first principles. Familiarity with at least one systems or scripting language will help, but no Rust knowledge is required to run and configure the server.
 
-## What People Build with Helios
+If you are already familiar with FHIR and want to get started quickly, jump to [Installation](ch02-installation.md) and then the [Quick Start](ch03-quickstart.md).
 
-- **Clinical Research Platforms**: Transform FHIR data into research-ready datasets using SQL-on-FHIR
-- **Real-time Analytics Dashboards**: Process streaming FHIR data for operational insights
-- **Data Quality Tools**: Validate and profile FHIR data using FHIRPath expressions
-- **ETL Pipelines**: Extract and transform FHIR data for data warehouses and lakes
-- **Healthcare APIs**: Build high-performance FHIR-compliant REST APIs
-- **Healthcare Analytics**: Analyze patient cohorts at scale
+## What This Book Covers
+
+**Part I — Getting Started** walks through the core concepts, installation, and a hands-on quick start that has a running server with real data in under five minutes.
+
+**Part II — Core Features** covers the main capabilities: FHIRPath expression evaluation, SQL-on-FHIR ViewDefinitions, and the REST API.
+
+**Part III — Advanced Topics** explores the architecture, multi-version FHIR support, Python bindings, code generation, and embedding Helios as a library.
+
+**Part IV — Operations** covers development setup, recipes for common tasks, and contributing to the project.
+
+The **Appendices** provide a CLI reference, a complete FHIRPath function index, a glossary, and the changelog.
 
 ## Components
 
