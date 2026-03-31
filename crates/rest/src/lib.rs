@@ -278,12 +278,24 @@ where
         info!("Authentication is ENABLED");
     }
 
+    let (app_audit_sink, app_audit_source_observer) = audit_state
+        .as_ref()
+        .map(|audit| {
+            (
+                Some(Arc::clone(&audit.sink)),
+                audit.config.source_observer.clone(),
+            )
+        })
+        .unwrap_or((None, "Device/hfs".to_string()));
+
     // Create application state
-    let state = AppState::with_auth(
+    let state = AppState::with_auth_and_audit(
         Arc::new(storage),
         config.clone(),
         auth_config,
         auth_state.clone(),
+        app_audit_sink,
+        app_audit_source_observer,
     );
 
     // Build the router with all FHIR routes

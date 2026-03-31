@@ -21,6 +21,7 @@ use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::TenantExtractor;
+use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::prefer::PreferHeader;
 use crate::responses::headers::ResourceHeaders;
@@ -131,7 +132,16 @@ where
         "Resource patched"
     );
 
-    build_patch_response(&stored, headers, &prefer)
+    build_patch_response(&stored, headers, &prefer).map(|mut response| {
+        response
+            .extensions_mut()
+            .insert(helios_audit::AuditResponseContext {
+                resource_type: Some(resource_type.clone()),
+                resource_id: Some(stored.id().to_string()),
+                patient_reference: extract_patient_from_resource(&resource_type, stored.content()),
+            });
+        response
+    })
 }
 
 /// Conditional patch handler.
@@ -187,7 +197,19 @@ where
     match result {
         ConditionalPatchResult::Patched(stored) => {
             let headers = ResourceHeaders::from_stored(&stored, &state);
-            build_patch_response(&stored, headers, &prefer)
+            build_patch_response(&stored, headers, &prefer).map(|mut response| {
+                response
+                    .extensions_mut()
+                    .insert(helios_audit::AuditResponseContext {
+                        resource_type: Some(resource_type.clone()),
+                        resource_id: Some(stored.id().to_string()),
+                        patient_reference: extract_patient_from_resource(
+                            &resource_type,
+                            stored.content(),
+                        ),
+                    });
+                response
+            })
         }
         ConditionalPatchResult::NoMatch => Err(RestError::NotFound {
             resource_type,
