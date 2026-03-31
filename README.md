@@ -441,10 +441,15 @@ Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
 The Helios FHIR Server is licensed under the [MIT License](LICENSE).
 
-# Support
+# Community
 
-- **Issues**: [GitHub Issues](https://github.com/HeliosSoftware/hfs/issues)
-- **Website**: [heliossoftware.com](https://heliossoftware.com)
+We welcome contributors and feedback at every level — from opening issues to joining design discussions.
+
+- **📋 GitHub Discussions:** [github.com/HeliosSoftware/hfs/discussions](https://github.com/HeliosSoftware/hfs/discussions)
+- **🐛 Issues:** [github.com/HeliosSoftware/hfs/issues](https://github.com/HeliosSoftware/hfs/issues)
+- **🗓️ Weekly Developer Meeting:** Open to all. We review roadmap progress, discuss design decisions, and plan upcoming work. Details and updates are posted to [this GitHub Discussion](https://github.com/HeliosSoftware/hfs/discussions/40).
+- **💼 LinkedIn Group:** [linkedin.com/groups/8618077](https://www.linkedin.com/groups/8618077/) — Over 2,500 members
+- **🌐 Website:** [heliossoftware.com](https://heliossoftware.com)
 
 ---
 

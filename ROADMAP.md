@@ -55,7 +55,7 @@ Work that is currently underway or planned for the near term.
 
 We are actively developing community discussion documents on the following topics to gather feedback before implementation begins. These will be published as GitHub Discussions:
 
-- **Terminology** — Defining how code systems, value sets, and concept maps will be managed
+- **[Terminology](https://github.com/HeliosSoftware/hfs/discussions/54)** — Defining how code systems, value sets, and concept maps will be managed
 - **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
 - **[Audit](https://github.com/HeliosSoftware/hfs/discussions/50)** — Designing the audit trail architecture and AuditEvent generation
 
@@ -123,6 +123,7 @@ We welcome contributors and feedback at every level — from opening issues to j
 - **📋 GitHub Discussions:** [github.com/HeliosSoftware/hfs/discussions](https://github.com/HeliosSoftware/hfs/discussions)
 - **🐛 Issues:** [github.com/HeliosSoftware/hfs/issues](https://github.com/HeliosSoftware/hfs/issues)
 - **🗓️ Weekly Developer Meeting:** — Open to all. We review roadmap progress, discuss design decisions, and plan upcoming work. Details and updates are posted to [this GitHub Discussion](https://github.com/HeliosSoftware/hfs/discussions/40).
+- **💼 LinkedIn Group:** [linkedin.com/groups/8618077](https://www.linkedin.com/groups/8618077/) — Over 2,500 members
 
 ### How to Get Involved
 
