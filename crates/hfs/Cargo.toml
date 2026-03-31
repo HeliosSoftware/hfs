@@ -44,6 +44,7 @@ helios-fhir = { path = "../fhir", version = "0.1.47" }
 helios-rest = { path = "../rest", version = "0.1.47", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false }
 helios-auth = { path = "../auth", version = "0.1.47" }
+helios-audit = { path = "../audit", version = "0.1.47" }
 
 # Web framework
 axum = "0.8"
