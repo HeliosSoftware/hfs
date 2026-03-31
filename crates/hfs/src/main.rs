@@ -21,9 +21,10 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use helios_auth::{
-    AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache, NoopAuditEventSink,
+use helios_audit::{
+    AuditBackend, AuditBridge, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter,
 };
+use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
 use helios_rest::{
     AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth, init_logging,
 };
@@ -63,6 +64,7 @@ async fn start_mongodb(
     config: ServerConfig,
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
+    audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     let backend = if let Some(ref url) = config.database_url {
         if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
@@ -81,7 +83,13 @@ async fn start_mongodb(
 
     backend.init_schema().await?;
 
-    let app = create_app_with_auth(backend, config.clone(), auth_config, auth_state);
+    let app = create_app_with_auth(
+        backend,
+        config.clone(),
+        auth_config,
+        auth_state,
+        audit_state,
+    );
     serve(app, &config).await
 }
 
@@ -91,6 +99,7 @@ async fn start_mongodb(
     _config: ServerConfig,
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
+    _audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The mongodb backend requires the 'mongodb' feature. \
@@ -109,9 +118,14 @@ async fn serve(app: axum::Router, config: &ServerConfig) -> anyhow::Result<()> {
 
 /// Initializes the authentication subsystem from environment configuration.
 ///
+/// When audit is enabled, the auth middleware uses an `AuditBridge` to record
+/// authentication events. Otherwise, a no-op sink is used.
+///
 /// Returns the auth config and optional middleware state. If auth is disabled,
 /// returns `(config, None)`.
-async fn init_auth() -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareState>>)> {
+async fn init_auth_with_audit(
+    audit_sink: Arc<dyn AuditSink>,
+) -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareState>>)> {
     let auth_config = AuthConfig::from_env();
 
     if !auth_config.enabled {
@@ -168,13 +182,59 @@ async fn init_auth() -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareSta
         "Authentication ENABLED"
     );
 
+    let audit_config = AuditConfig::from_env();
+    let audit_bridge: Arc<dyn helios_auth::AuditEventSink> =
+        Arc::new(AuditBridge::new(audit_sink, &audit_config));
+
     let auth_state = Arc::new(AuthMiddlewareState {
         provider: Arc::new(provider),
         config: Arc::new(auth_config.clone()),
-        audit_sink: Arc::new(NoopAuditEventSink),
+        audit_sink: audit_bridge,
     });
 
     Ok((auth_config, Some(auth_state)))
+}
+
+/// Initializes the audit subsystem from environment configuration.
+///
+/// Returns the audit sink (for use as auth bridge) and optional middleware state.
+/// If audit is disabled, returns `(NullSink, None)`.
+async fn init_audit() -> anyhow::Result<(Arc<dyn AuditSink>, Option<Arc<AuditMiddlewareState>>)> {
+    let config = AuditConfig::from_env();
+
+    let sink: Arc<dyn AuditSink> = match config.backend {
+        AuditBackend::None => {
+            info!("Audit logging is DISABLED");
+            Arc::new(helios_audit::NullSink)
+        }
+        AuditBackend::File => {
+            let path = config.file_path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("HFS_AUDIT_FILE_PATH is required when HFS_AUDIT_BACKEND=file")
+            })?;
+            info!(path = %path, "Audit logging to file");
+            Arc::new(helios_audit::FileSink::new(path).await?)
+        }
+        AuditBackend::Database => {
+            // Database sink requires a storage implementation to be provided
+            // by the caller. For now, fall back to file or null.
+            anyhow::bail!(
+                "Database audit backend is not yet wired into the HFS startup. \
+                 Use HFS_AUDIT_BACKEND=file or HFS_AUDIT_BACKEND=none for now."
+            );
+        }
+    };
+
+    let audit_state = if config.backend != AuditBackend::None {
+        Some(Arc::new(AuditMiddlewareState {
+            sink: Arc::clone(&sink),
+            config: config.clone(),
+            exclusion_filter: ExclusionFilter::default_exclusions(),
+        }))
+    } else {
+        None
+    };
+
+    Ok((sink, audit_state))
 }
 
 #[tokio::main]
@@ -193,8 +253,11 @@ async fn main() -> anyhow::Result<()> {
         .storage_backend_mode()
         .map_err(|e| anyhow::anyhow!("Invalid storage backend configuration: {}", e))?;
 
-    // Initialize authentication
-    let (auth_config, auth_state) = init_auth().await?;
+    // Initialize audit subsystem
+    let (audit_sink, audit_state) = init_audit().await?;
+
+    // Initialize authentication (with audit bridge if audit is enabled)
+    let (auth_config, auth_state) = init_auth_with_audit(audit_sink).await?;
 
     info!(
         port = config.port,
@@ -202,33 +265,34 @@ async fn main() -> anyhow::Result<()> {
         fhir_version = ?config.default_fhir_version,
         storage_backend = %backend_mode,
         auth_enabled = auth_config.enabled,
+        audit_backend = %AuditConfig::from_env().backend,
         "Starting Helios FHIR Server"
     );
 
     match backend_mode {
         StorageBackendMode::Sqlite => {
-            start_sqlite(config, auth_config, auth_state).await?;
+            start_sqlite(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::SqliteElasticsearch => {
-            start_sqlite_elasticsearch(config, auth_config, auth_state).await?;
+            start_sqlite_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::Postgres => {
-            start_postgres(config, auth_config, auth_state).await?;
+            start_postgres(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::PostgresElasticsearch => {
-            start_postgres_elasticsearch(config, auth_config, auth_state).await?;
+            start_postgres_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::MongoDB => {
-            start_mongodb(config, auth_config, auth_state).await?;
+            start_mongodb(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::MongoDBElasticsearch => {
-            start_mongodb_elasticsearch(config, auth_config, auth_state).await?;
+            start_mongodb_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::S3 => {
-            start_s3(config, auth_config, auth_state).await?;
+            start_s3(config, auth_config, auth_state, audit_state).await?;
         }
         StorageBackendMode::S3Elasticsearch => {
-            start_s3_elasticsearch(config, auth_config, auth_state).await?;
+            start_s3_elasticsearch(config, auth_config, auth_state, audit_state).await?;
         }
     }
 
@@ -241,9 +305,16 @@ async fn start_sqlite(
     config: ServerConfig,
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
+    audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     let backend = create_sqlite_backend(&config)?;
-    let app = create_app_with_auth(backend, config.clone(), auth_config, auth_state);
+    let app = create_app_with_auth(
+        backend,
+        config.clone(),
+        auth_config,
+        auth_state,
+        audit_state,
+    );
     serve(app, &config).await
 }
 
@@ -253,6 +324,7 @@ async fn start_sqlite(
     _config: ServerConfig,
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
+    _audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The sqlite backend requires the 'sqlite' feature. \
@@ -266,6 +338,7 @@ async fn start_sqlite_elasticsearch(
     config: ServerConfig,
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
+    audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -363,7 +436,13 @@ async fn start_sqlite_elasticsearch(
 
     info!("Composite storage initialized: SQLite (primary) + Elasticsearch (search)");
 
-    let app = create_app_with_auth(composite, config.clone(), auth_config, auth_state);
+    let app = create_app_with_auth(
+        composite,
+        config.clone(),
+        auth_config,
+        auth_state,
+        audit_state,
+    );
     serve(app, &config).await
 }
 
@@ -373,6 +452,7 @@ async fn start_sqlite_elasticsearch(
     _config: ServerConfig,
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
+    _audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The sqlite-elasticsearch backend requires the 'elasticsearch' feature. \
@@ -386,6 +466,7 @@ async fn start_postgres(
     config: ServerConfig,
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
+    audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     use helios_persistence::backends::postgres::PostgresBackend;
 
@@ -404,7 +485,13 @@ async fn start_postgres(
 
     backend.init_schema().await?;
 
-    let app = create_app_with_auth(backend, config.clone(), auth_config, auth_state);
+    let app = create_app_with_auth(
+        backend,
+        config.clone(),
+        auth_config,
+        auth_state,
+        audit_state,
+    );
     serve(app, &config).await
 }
 
@@ -414,6 +501,7 @@ async fn start_postgres(
     _config: ServerConfig,
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
+    _audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The postgres backend requires the 'postgres' feature. \
@@ -427,6 +515,7 @@ async fn start_postgres_elasticsearch(
     config: ServerConfig,
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
+    audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -541,7 +630,13 @@ async fn start_postgres_elasticsearch(
 
     info!("Composite storage initialized: PostgreSQL (primary) + Elasticsearch (search)");
 
-    let app = create_app_with_auth(composite, config.clone(), auth_config, auth_state);
+    let app = create_app_with_auth(
+        composite,
+        config.clone(),
+        auth_config,
+        auth_state,
+        audit_state,
+    );
     serve(app, &config).await
 }
 
@@ -551,6 +646,7 @@ async fn start_postgres_elasticsearch(
     _config: ServerConfig,
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
+    _audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The postgres-elasticsearch backend requires both 'postgres' and 'elasticsearch' features. \
@@ -564,6 +660,7 @@ async fn start_mongodb_elasticsearch(
     config: ServerConfig,
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
+    audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -678,7 +775,13 @@ async fn start_mongodb_elasticsearch(
 
     info!("Composite storage initialized: MongoDB (primary) + Elasticsearch (search)");
 
-    let app = create_app_with_auth(composite, config.clone(), auth_config, auth_state);
+    let app = create_app_with_auth(
+        composite,
+        config.clone(),
+        auth_config,
+        auth_state,
+        audit_state,
+    );
     serve(app, &config).await
 }
 
@@ -688,6 +791,7 @@ async fn start_mongodb_elasticsearch(
     _config: ServerConfig,
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
+    _audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The mongodb-elasticsearch backend requires both 'mongodb' and 'elasticsearch' features. \
@@ -701,6 +805,7 @@ async fn start_s3(
     config: ServerConfig,
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
+    audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
 
@@ -738,7 +843,13 @@ async fn start_s3(
         )
     })?;
 
-    let app = create_app_with_auth(backend, config.clone(), auth_config, auth_state);
+    let app = create_app_with_auth(
+        backend,
+        config.clone(),
+        auth_config,
+        auth_state,
+        audit_state,
+    );
     serve(app, &config).await
 }
 
@@ -748,6 +859,7 @@ async fn start_s3(
     _config: ServerConfig,
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
+    _audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The s3 backend requires the 's3' feature. \
@@ -788,6 +900,7 @@ async fn start_s3_elasticsearch(
     config: ServerConfig,
     auth_config: AuthConfig,
     auth_state: Option<Arc<AuthMiddlewareState>>,
+    audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -908,7 +1021,13 @@ async fn start_s3_elasticsearch(
 
     info!("Composite storage initialized: S3 (primary) + Elasticsearch (search)");
 
-    let app = create_app_with_auth(composite, config.clone(), auth_config, auth_state);
+    let app = create_app_with_auth(
+        composite,
+        config.clone(),
+        auth_config,
+        auth_state,
+        audit_state,
+    );
     serve(app, &config).await
 }
 
@@ -918,6 +1037,7 @@ async fn start_s3_elasticsearch(
     _config: ServerConfig,
     _auth_config: AuthConfig,
     _auth_state: Option<Arc<AuthMiddlewareState>>,
+    _audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "The s3-elasticsearch backend requires both 's3' and 'elasticsearch' features. \
