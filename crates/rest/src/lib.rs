@@ -237,18 +237,28 @@ where
         + Sync
         + 'static,
 {
-    create_app_with_auth(storage, config, helios_auth::AuthConfig::default(), None)
+    create_app_with_auth(
+        storage,
+        config,
+        helios_auth::AuthConfig::default(),
+        None,
+        None,
+    )
 }
 
 /// Creates the Axum application with custom configuration and optional authentication.
 ///
 /// When `auth_state` is `Some`, authentication and authorization middleware
 /// are added to the middleware stack.
+///
+/// When `audit_state` is `Some`, audit middleware is added to record FHIR
+/// operation events as `AuditEvent` resources.
 pub fn create_app_with_auth<S>(
     storage: S,
     config: ServerConfig,
     auth_config: helios_auth::AuthConfig,
     auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
 ) -> Router
 where
     S: ResourceStorage
@@ -278,6 +288,16 @@ where
 
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
+
+    // Apply audit middleware if enabled (inner layer = runs after auth)
+    let router = if let Some(audit) = audit_state {
+        router.layer(axum::middleware::from_fn_with_state(
+            audit,
+            helios_audit::middleware::audit_middleware,
+        ))
+    } else {
+        router
+    };
 
     // Apply auth middleware if enabled (outermost = runs first)
     let router = if let Some(ref auth) = auth_state {
