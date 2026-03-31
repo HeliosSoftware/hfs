@@ -8,23 +8,26 @@ This crate records security, privacy, and operational activity as typed FHIR `Au
 
 - **FHIR-Native Audit Records**: Builds real `AuditEvent` resources using `helios-fhir`
 - **IHE BALP Profile Selection**: Chooses BALP read/create/update/delete/query/auth profiles based on action and patient context
+- **Interaction-Aware Classification**: Detects FHIR query/search/history interactions instead of mapping by HTTP verb alone
 - **Pluggable Sinks**: No-op, append-only NDJSON file, or database-backed persistence
 - **Axum Middleware**: Captures FHIR REST interactions after the request completes
 - **Auth Bridge**: Adapts `helios_auth::AuditEventSink` into full FHIR `AuditEvent` records
 - **Patient Resolution**: Resolves patient context from resource paths, request bodies, and search parameters
+- **Write Context Enrichment**: Supports response-extension context for create/update/patch IDs and patient references
+- **Durable File Writes**: Flushes file sink writes after each recorded event
 - **Fire-and-Forget Semantics**: Audit failures are logged via `tracing`, never returned to the caller
 
 ## Quick Start
 
 ```rust
-use helios_audit::{AuditEventBuilder, AuditSink, FileSink};
+use helios_audit::{AuditAction, AuditEventBuilder, AuditSink, FileSink};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let sink = FileSink::new("./audit/audit.ndjson").await?;
 
     let event = AuditEventBuilder::new("Device/hfs")
-        .action("R")
+        .action(AuditAction::Read)
         .outcome("0")
         .resource("Patient", "123")
         .patient("Patient/123")
@@ -38,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-The file sink writes newline-delimited JSON, one `AuditEvent` per line.
+The file sink writes newline-delimited JSON, one `AuditEvent` per line, and flushes each write in `record()`.
 
 ## Architecture
 
@@ -61,20 +64,37 @@ The crate is split into four core pieces:
 
 ### REST Interactions
 
-The middleware maps HTTP methods to FHIR audit actions:
+The middleware uses interaction-aware detection (`detect_interaction`) instead of mapping by HTTP method alone:
 
-| HTTP Method | Audit Action |
-|-------------|--------------|
-| `GET`, `HEAD` | `R` |
-| `POST` | `C` |
-| `PUT`, `PATCH` | `U` |
-| `DELETE` | `D` |
-| Other methods | `E` |
+| Request Pattern | Audit Action |
+|-----------------|--------------|
+| `GET`/`HEAD` type search or history (`/Patient`, `/Patient/_history`) | `Query` (`E`) |
+| `GET`/`HEAD` system history (`/_history`) | `Query` (`E`) |
+| `GET`/`HEAD` instance history (`/Patient/123/_history`) | `Query` (`E`) |
+| `GET`/`HEAD` instance read (`/Patient/123`) | `Read` (`R`) |
+| `POST` with `/_search` | `Query` (`E`) |
+| `POST /[type]` create | `Create` (`C`) |
+| `POST /` batch/transaction envelope | `Execute` (`E`) |
+| `PUT`/`PATCH` | `Update` (`U`) |
+| `DELETE` | `Delete` (`D`) |
+| Other methods | `Execute` (`E`) |
 
 Response status is translated into a coarse outcome:
 
 - `status < 400` -> outcome `0`
 - `status >= 400` -> outcome `8`
+
+For query events, BALP profile selection uses query profiles (`IHE.BasicAudit.Query` / `IHE.BasicAudit.PatientQuery`) and RESTful interaction subtype `search`.
+
+### Write Context Enrichment (`AuditResponseContext`)
+
+`audit_middleware` can enrich events from `response.extensions()` using `AuditResponseContext`:
+
+- `resource_type`: fallback resource type when route/path extraction is insufficient
+- `resource_id`: post-handler ID (for create/upsert flows where ID is not known pre-request)
+- `patient_reference`: post-handler patient context derived from the resulting resource
+
+This lets create/update/patch audits include the final resource identity and patient linkage even when the request path or pre-request context is incomplete.
 
 ### Patient Resolution Waterfall
 
@@ -138,6 +158,8 @@ tail -f ./audit/audit.ndjson
 
 HFS creates an `AuditBridge` for auth events and installs the audit middleware into the REST stack when audit is enabled.
 
+When using `helios-rest` with batch/transaction handlers, the outer middleware skips `POST /` envelopes and batch/transaction handlers emit per-entry audit events.
+
 ## Configuration
 
 All configuration is via `HFS_AUDIT_*` environment variables:
@@ -178,5 +200,5 @@ helios-audit = { version = "0.1", features = ["R4"] }
 ## Current Limitations
 
 - The `DatabaseSink` exists in this crate, but the current `hfs` startup wiring only enables `none` and `file`
-- Middleware records events after the handler runs and does not inspect the response body
+- Middleware records events after the handler runs and does not directly inspect response bodies (enrichment comes from response extensions)
 - Audit recording is intentionally infallible; write failures are logged, not surfaced to API clients
