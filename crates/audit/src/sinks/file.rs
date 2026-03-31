@@ -71,6 +71,10 @@ impl AuditSink for FileSink {
         }
         if let Err(e) = writer.write_all(b"\n").await {
             tracing::error!(error = %e, path = %self.path.display(), "Failed to write newline");
+            return;
+        }
+        if let Err(e) = writer.flush().await {
+            tracing::error!(error = %e, path = %self.path.display(), "Failed to flush audit event");
         }
     }
 
@@ -89,20 +93,20 @@ impl AuditSink for FileSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::balp::AuditAction;
     use crate::builder::AuditEventBuilder;
 
     #[tokio::test]
-    async fn test_write_single_event() {
+    async fn test_write_single_event_without_explicit_flush() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.ndjson");
 
         let sink = FileSink::new(&path).await.unwrap();
         let event = AuditEventBuilder::new("Device/hfs")
-            .action("R")
+            .action(AuditAction::Read)
             .outcome("0")
             .build();
         sink.record(event).await;
-        sink.flush().await;
 
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -135,7 +139,7 @@ mod tests {
 
         let sink = FileSink::new(&path).await.unwrap();
         let event = AuditEventBuilder::new("Device/hfs")
-            .action("C")
+            .action(AuditAction::Create)
             .outcome("0")
             .resource("Patient", "123")
             .build();

@@ -77,6 +77,7 @@ impl AuditSink for DatabaseSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::balp::AuditAction;
     use crate::builder::AuditEventBuilder;
     use tokio::sync::Mutex;
 
@@ -115,7 +116,7 @@ mod tests {
         );
 
         let event = AuditEventBuilder::new("Device/hfs")
-            .action("R")
+            .action(AuditAction::Read)
             .outcome("0")
             .build();
         sink.record(event).await;
@@ -136,7 +137,7 @@ mod tests {
         );
 
         let event = AuditEventBuilder::new("Device/hfs")
-            .action("C")
+            .action(AuditAction::Create)
             .outcome("0")
             .resource("Patient", "123")
             .build();

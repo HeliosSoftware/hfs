@@ -6,7 +6,7 @@
 
 use helios_fhir::r4::{AuditEvent, AuditEventAgent, AuditEventEntity, AuditEventSource, Meta};
 
-use crate::balp::{self, code_systems};
+use crate::balp::{self, AuditAction, code_systems};
 use crate::helpers::*;
 
 /// Builder for constructing BALP-compliant `AuditEvent` resources.
@@ -15,7 +15,7 @@ use crate::helpers::*;
 ///
 /// ```rust,ignore
 /// let event = AuditEventBuilder::new("Device/hfs")
-///     .action("R")
+///     .action(AuditAction::Read)
 ///     .outcome("0")
 ///     .resource("Patient", "123")
 ///     .patient("Patient/123")
@@ -23,7 +23,7 @@ use crate::helpers::*;
 ///     .build();
 /// ```
 pub struct AuditEventBuilder {
-    action: Option<String>,
+    action: Option<AuditAction>,
     outcome: Option<String>,
     outcome_desc: Option<String>,
     resource_type: Option<String>,
@@ -54,9 +54,9 @@ impl AuditEventBuilder {
         }
     }
 
-    /// Set the FHIR action code (`"C"`, `"R"`, `"U"`, `"D"`, `"E"`).
-    pub fn action(mut self, action: &str) -> Self {
-        self.action = Some(action.to_string());
+    /// Set the FHIR audit action.
+    pub fn action(mut self, action: AuditAction) -> Self {
+        self.action = Some(action);
         self
     }
 
@@ -103,7 +103,7 @@ impl AuditEventBuilder {
     /// Build the typed `AuditEvent`.
     pub fn build(self) -> AuditEvent {
         let has_patient = self.patient_reference.is_some();
-        let audit_action = balp::action_from_code(self.action.as_deref().unwrap_or("R"));
+        let audit_action = self.action.unwrap_or(AuditAction::Read);
         let profile_url = balp::select_profile(audit_action, has_patient);
 
         // Entities
@@ -131,13 +131,14 @@ impl AuditEventBuilder {
         }
 
         // Build the subtype coding (maps action code to restful-interaction)
-        let subtype = self.action.as_deref().map(|a| {
+        let subtype = self.action.map(|a| {
             let interaction = match a {
-                "C" => "create",
-                "R" => "read",
-                "U" => "update",
-                "D" => "delete",
-                _ => "execute",
+                AuditAction::Create => "create",
+                AuditAction::Read => "read",
+                AuditAction::Update => "update",
+                AuditAction::Delete => "delete",
+                AuditAction::Query => "search",
+                AuditAction::Execute => "execute",
             };
             vec![coding(code_systems::RESTFUL_INTERACTION, interaction)]
         });
@@ -150,7 +151,7 @@ impl AuditEventBuilder {
             }),
             r#type: coding(code_systems::AUDIT_EVENT_TYPE, "rest"),
             subtype,
-            action: self.action.map(code),
+            action: self.action.map(|a| code(a.to_code())),
             recorded: instant_now(),
             outcome: self.outcome.map(code),
             outcome_desc: self.outcome_desc.map(fhir_string),
@@ -197,7 +198,7 @@ mod tests {
     #[test]
     fn test_read_with_patient_selects_patient_read_profile() {
         let event = AuditEventBuilder::new("Device/hfs")
-            .action("R")
+            .action(AuditAction::Read)
             .patient("Patient/123")
             .build();
         let profiles = event.meta.as_ref().unwrap().profile.as_ref().unwrap();
@@ -210,7 +211,9 @@ mod tests {
 
     #[test]
     fn test_create_without_patient_selects_create_profile() {
-        let event = AuditEventBuilder::new("Device/hfs").action("C").build();
+        let event = AuditEventBuilder::new("Device/hfs")
+            .action(AuditAction::Create)
+            .build();
         let profiles = event.meta.as_ref().unwrap().profile.as_ref().unwrap();
         assert_eq!(profiles[0].value.as_deref(), Some(balp::profiles::CREATE));
     }
@@ -218,7 +221,7 @@ mod tests {
     #[test]
     fn test_action_and_outcome_set() {
         let event = AuditEventBuilder::new("Device/hfs")
-            .action("R")
+            .action(AuditAction::Read)
             .outcome("0")
             .build();
         assert_eq!(
@@ -316,7 +319,9 @@ mod tests {
 
     #[test]
     fn test_subtype_for_read() {
-        let event = AuditEventBuilder::new("Device/hfs").action("R").build();
+        let event = AuditEventBuilder::new("Device/hfs")
+            .action(AuditAction::Read)
+            .build();
         let subtypes = event.subtype.as_ref().unwrap();
         assert_eq!(
             subtypes[0].code.as_ref().and_then(|c| c.value.as_deref()),
@@ -326,12 +331,32 @@ mod tests {
 
     #[test]
     fn test_subtype_for_create() {
-        let event = AuditEventBuilder::new("Device/hfs").action("C").build();
+        let event = AuditEventBuilder::new("Device/hfs")
+            .action(AuditAction::Create)
+            .build();
         let subtypes = event.subtype.as_ref().unwrap();
         assert_eq!(
             subtypes[0].code.as_ref().and_then(|c| c.value.as_deref()),
             Some("create")
         );
+    }
+
+    #[test]
+    fn test_subtype_for_query() {
+        let event = AuditEventBuilder::new("Device/hfs")
+            .action(AuditAction::Query)
+            .build();
+        let subtypes = event.subtype.as_ref().unwrap();
+        assert_eq!(
+            subtypes[0].code.as_ref().and_then(|c| c.value.as_deref()),
+            Some("search")
+        );
+        assert_eq!(
+            event.action.as_ref().and_then(|a| a.value.as_deref()),
+            Some("E")
+        );
+        let profiles = event.meta.as_ref().unwrap().profile.as_ref().unwrap();
+        assert_eq!(profiles[0].value.as_deref(), Some(balp::profiles::QUERY));
     }
 
     #[test]

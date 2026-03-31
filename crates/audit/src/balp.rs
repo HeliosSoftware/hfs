@@ -48,12 +48,14 @@ pub mod code_systems {
 pub enum AuditAction {
     /// C — Create
     Create,
-    /// R — Read/Query
+    /// R — Read
     Read,
     /// U — Update
     Update,
     /// D — Delete
     Delete,
+    /// E — Query (BALP Query profile uses execute action code)
+    Query,
     /// E — Execute (auth events, operations)
     Execute,
 }
@@ -66,20 +68,56 @@ impl AuditAction {
             Self::Read => "R",
             Self::Update => "U",
             Self::Delete => "D",
+            Self::Query => "E",
             Self::Execute => "E",
         }
     }
 }
 
-/// Map an HTTP method to a BALP audit action.
-pub fn action_for_method(method: &str) -> AuditAction {
-    match method.to_uppercase().as_str() {
-        "POST" => AuditAction::Create,
-        "GET" | "HEAD" => AuditAction::Read,
+/// Detect the BALP audit action from method + FHIR interaction context.
+pub fn detect_interaction(
+    method: &str,
+    path: &str,
+    resource_type: Option<&str>,
+    resource_id: Option<&str>,
+) -> AuditAction {
+    let method = method.to_ascii_uppercase();
+
+    if matches!(method.as_str(), "GET" | "HEAD") {
+        // GET/HEAD on a resource type endpoint is typically search/type-history.
+        if resource_type.is_some() && resource_id.is_none() {
+            return AuditAction::Query;
+        }
+
+        // History interactions are query-like, including instance history.
+        if resource_id.is_some() && is_history_path(path) {
+            return AuditAction::Query;
+        }
+
+        if resource_id.is_some() {
+            return AuditAction::Read;
+        }
+
+        // System history (`GET /_history`) is also query-like.
+        if resource_type.is_none() && is_history_path(path) {
+            return AuditAction::Query;
+        }
+
+        return AuditAction::Execute;
+    }
+
+    match method.as_str() {
+        "POST" if path.contains("_search") => AuditAction::Query,
+        "POST" if resource_type.is_some() => AuditAction::Create,
+        "POST" => AuditAction::Execute,
         "PUT" | "PATCH" => AuditAction::Update,
         "DELETE" => AuditAction::Delete,
         _ => AuditAction::Execute,
     }
+}
+
+fn is_history_path(path: &str) -> bool {
+    path == "/_history" || path.contains("/_history")
 }
 
 /// Parse a single-character FHIR action code back to an [`AuditAction`].
@@ -104,6 +142,8 @@ pub fn select_profile(action: AuditAction, has_patient: bool) -> &'static str {
         (AuditAction::Update, false) => profiles::UPDATE,
         (AuditAction::Delete, true) => profiles::PATIENT_DELETE,
         (AuditAction::Delete, false) => profiles::DELETE,
+        (AuditAction::Query, true) => profiles::PATIENT_QUERY,
+        (AuditAction::Query, false) => profiles::QUERY,
         (AuditAction::Execute, true) => profiles::PATIENT_READ, // Fallback
         (AuditAction::Execute, false) => profiles::AUTH_TOKEN_USE,
     }
@@ -113,47 +153,90 @@ pub fn select_profile(action: AuditAction, has_patient: bool) -> &'static str {
 mod tests {
     use super::*;
 
-    // ── action_for_method ────────────────────────────────────────────────
+    // ── detect_interaction ───────────────────────────────────────────────
 
     #[test]
-    fn test_get_maps_to_read() {
-        assert_eq!(action_for_method("GET"), AuditAction::Read);
+    fn test_detect_type_search_get_as_query() {
+        assert_eq!(
+            detect_interaction("GET", "/Patient", Some("Patient"), None),
+            AuditAction::Query
+        );
     }
 
     #[test]
-    fn test_head_maps_to_read() {
-        assert_eq!(action_for_method("HEAD"), AuditAction::Read);
+    fn test_detect_type_history_get_as_query() {
+        assert_eq!(
+            detect_interaction("GET", "/Patient/_history", Some("Patient"), None),
+            AuditAction::Query
+        );
     }
 
     #[test]
-    fn test_post_maps_to_create() {
-        assert_eq!(action_for_method("POST"), AuditAction::Create);
+    fn test_detect_system_history_get_as_query() {
+        assert_eq!(
+            detect_interaction("GET", "/_history", None, None),
+            AuditAction::Query
+        );
     }
 
     #[test]
-    fn test_put_maps_to_update() {
-        assert_eq!(action_for_method("PUT"), AuditAction::Update);
+    fn test_detect_instance_history_get_as_query() {
+        assert_eq!(
+            detect_interaction("GET", "/Patient/123/_history", Some("Patient"), Some("123")),
+            AuditAction::Query
+        );
     }
 
     #[test]
-    fn test_patch_maps_to_update() {
-        assert_eq!(action_for_method("PATCH"), AuditAction::Update);
+    fn test_detect_read_get_as_read() {
+        assert_eq!(
+            detect_interaction("GET", "/Patient/123", Some("Patient"), Some("123")),
+            AuditAction::Read
+        );
     }
 
     #[test]
-    fn test_delete_maps_to_delete() {
-        assert_eq!(action_for_method("DELETE"), AuditAction::Delete);
+    fn test_detect_post_search_as_query() {
+        assert_eq!(
+            detect_interaction("POST", "/Patient/_search", Some("Patient"), None),
+            AuditAction::Query
+        );
     }
 
     #[test]
-    fn test_unknown_method_maps_to_execute() {
-        assert_eq!(action_for_method("OPTIONS"), AuditAction::Execute);
+    fn test_detect_post_create_as_create() {
+        assert_eq!(
+            detect_interaction("POST", "/Patient", Some("Patient"), None),
+            AuditAction::Create
+        );
     }
 
     #[test]
-    fn test_case_insensitive() {
-        assert_eq!(action_for_method("get"), AuditAction::Read);
-        assert_eq!(action_for_method("Post"), AuditAction::Create);
+    fn test_detect_post_root_as_execute_for_batch_transaction() {
+        assert_eq!(
+            detect_interaction("POST", "/", None, None),
+            AuditAction::Execute
+        );
+    }
+
+    #[test]
+    fn test_detect_unknown_method_as_execute() {
+        assert_eq!(
+            detect_interaction("OPTIONS", "/Patient", Some("Patient"), None),
+            AuditAction::Execute
+        );
+    }
+
+    #[test]
+    fn test_detect_interaction_case_insensitive_method() {
+        assert_eq!(
+            detect_interaction("get", "/Patient/123", Some("Patient"), Some("123")),
+            AuditAction::Read
+        );
+        assert_eq!(
+            detect_interaction("Post", "/Patient", Some("Patient"), None),
+            AuditAction::Create
+        );
     }
 
     // ── action_from_code ─────────────────────────────────────────────────
@@ -169,6 +252,12 @@ mod tests {
         ] {
             assert_eq!(action_from_code(action.to_code()), action);
         }
+    }
+
+    #[test]
+    fn test_query_uses_execute_code_but_parses_as_execute() {
+        assert_eq!(AuditAction::Query.to_code(), "E");
+        assert_eq!(action_from_code("E"), AuditAction::Execute);
     }
 
     // ── select_profile ───────────────────────────────────────────────────
@@ -213,6 +302,19 @@ mod tests {
     }
 
     #[test]
+    fn test_query_without_patient_uses_query_profile() {
+        assert_eq!(select_profile(AuditAction::Query, false), profiles::QUERY);
+    }
+
+    #[test]
+    fn test_query_with_patient_uses_patient_query_profile() {
+        assert_eq!(
+            select_profile(AuditAction::Query, true),
+            profiles::PATIENT_QUERY
+        );
+    }
+
+    #[test]
     fn test_execute_without_patient_uses_auth_profile() {
         assert_eq!(
             select_profile(AuditAction::Execute, false),
@@ -228,6 +330,7 @@ mod tests {
         assert_eq!(AuditAction::Read.to_code(), "R");
         assert_eq!(AuditAction::Update.to_code(), "U");
         assert_eq!(AuditAction::Delete.to_code(), "D");
+        assert_eq!(AuditAction::Query.to_code(), "E");
         assert_eq!(AuditAction::Execute.to_code(), "E");
     }
 }

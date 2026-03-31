@@ -43,11 +43,12 @@ pub mod sink;
 pub mod sinks;
 
 // Re-exports for convenience
+pub use balp::AuditAction;
 pub use bridge::AuditBridge;
 pub use builder::AuditEventBuilder;
 pub use config::{AuditBackend, AuditConfig};
 pub use error::{AuditError, AuditResult};
 pub use exclusion::ExclusionFilter;
-pub use middleware::AuditMiddlewareState;
+pub use middleware::{AuditMiddlewareState, AuditResponseContext};
 pub use sink::AuditSink;
 pub use sinks::{DatabaseSink, FileSink, NullSink};

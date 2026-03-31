@@ -11,6 +11,7 @@ use helios_auth::audit::AuditEventSink as AuthAuditEventSink;
 use helios_auth::error::AuthError;
 use helios_auth::principal::Principal;
 
+use crate::balp::AuditAction;
 use crate::builder::AuditEventBuilder;
 use crate::config::AuditConfig;
 use crate::exclusion::ExclusionFilter;
@@ -41,7 +42,7 @@ impl AuthAuditEventSink for AuditBridge {
             return;
         }
         let event = AuditEventBuilder::new(&self.source_observer)
-            .action("E")
+            .action(AuditAction::Execute)
             .outcome("0")
             .agent(principal.subject(), None, true)
             .build();
@@ -53,7 +54,7 @@ impl AuthAuditEventSink for AuditBridge {
             return;
         }
         let event = AuditEventBuilder::new(&self.source_observer)
-            .action("E")
+            .action(AuditAction::Execute)
             .outcome("8")
             .outcome_desc(error.to_string())
             .build();
@@ -67,7 +68,7 @@ impl AuthAuditEventSink for AuditBridge {
         operation: &str,
     ) {
         let event = AuditEventBuilder::new(&self.source_observer)
-            .action("E")
+            .action(AuditAction::Execute)
             .outcome("8")
             .outcome_desc(format!("Forbidden: {operation} on {resource_type}"))
             .agent(principal.subject(), None, true)

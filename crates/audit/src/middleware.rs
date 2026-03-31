@@ -27,6 +27,17 @@ pub struct AuditMiddlewareState {
     pub exclusion_filter: ExclusionFilter,
 }
 
+/// Optional audit context attached by handlers to enrich middleware audit events.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct AuditResponseContext {
+    /// Final resource type after handler processing.
+    pub resource_type: Option<String>,
+    /// Final resource ID after handler processing (e.g., create-assigned IDs).
+    pub resource_id: Option<String>,
+    /// Resolved patient reference from the resulting resource.
+    pub patient_reference: Option<String>,
+}
+
 /// Axum middleware function that records audit events for FHIR operations.
 ///
 /// Register with:
@@ -48,6 +59,12 @@ pub async fn audit_middleware(
 
     // Extract pre-request context
     let resource_type = extract_resource_type(&path);
+
+    // Batch/transaction requests are audited per-entry in the batch handler.
+    if method == "POST" && resource_type.is_none() {
+        return next.run(request).await;
+    }
+
     let resource_id = extract_resource_id(&path);
     let query_params = request.uri().query().map(parse_query_params);
     let principal = request.extensions().get::<Principal>().cloned();
@@ -55,24 +72,47 @@ pub async fn audit_middleware(
     // Execute the actual handler
     let response = next.run(request).await;
     let status = response.status().as_u16();
+    let audit_ctx = response.extensions().get::<AuditResponseContext>().cloned();
 
     // Fire-and-forget audit recording
     let sink = Arc::clone(&state.sink);
     let source_observer = state.config.source_observer.clone();
 
     tokio::spawn(async move {
-        let action = balp::action_for_method(&method);
+        let mut resource_type = resource_type;
+        let mut resource_id = resource_id;
+        let mut patient_ref_from_response = None;
+
+        if let Some(ctx) = &audit_ctx {
+            if resource_id.is_none() {
+                resource_id = ctx.resource_id.clone();
+            }
+            if resource_type.is_none() {
+                resource_type = ctx.resource_type.clone();
+            }
+            patient_ref_from_response = ctx.patient_reference.clone();
+        }
+
+        let action = balp::detect_interaction(
+            &method,
+            &path,
+            resource_type.as_deref(),
+            resource_id.as_deref(),
+        );
         let outcome = if status < 400 { "0" } else { "8" };
 
-        let patient_ref = PatientResolver::resolve(
+        let mut patient_ref = PatientResolver::resolve(
             resource_type.as_deref().unwrap_or(""),
             resource_id.as_deref(),
             None, // body not available post-response
             query_params.as_deref(),
         );
+        if patient_ref_from_response.is_some() {
+            patient_ref = patient_ref_from_response;
+        }
 
         let mut builder = AuditEventBuilder::new(&source_observer)
-            .action(action.to_code())
+            .action(action)
             .outcome(outcome);
 
         if let Some(rt) = &resource_type {
@@ -230,5 +270,23 @@ mod tests {
         let params = parse_query_params("");
         // Empty string produces one entry with empty key
         assert!(params.is_empty() || params[0].0.is_empty());
+    }
+
+    #[test]
+    fn test_audit_response_context_roundtrip_response_extensions() {
+        let mut response = Response::new(axum::body::Body::empty());
+        let ctx = AuditResponseContext {
+            resource_type: Some("Observation".to_string()),
+            resource_id: Some("obs-1".to_string()),
+            patient_reference: Some("Patient/123".to_string()),
+        };
+        response.extensions_mut().insert(ctx.clone());
+
+        let extracted = response
+            .extensions()
+            .get::<AuditResponseContext>()
+            .cloned()
+            .unwrap();
+        assert_eq!(extracted, ctx);
     }
 }
