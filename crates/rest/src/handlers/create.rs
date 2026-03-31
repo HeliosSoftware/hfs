@@ -65,6 +65,14 @@ pub async fn create_handler<S>(
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
+    // AuditEvent resources are immutable — block write operations
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "POST".to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
+
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version();
 
