@@ -61,6 +61,14 @@ pub async fn patch_handler<S>(
 where
     S: ResourceStorage + Send + Sync,
 {
+    // AuditEvent resources are immutable — block write operations
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "PATCH".to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
+
     debug!(
         resource_type = %resource_type,
         id = %id,
