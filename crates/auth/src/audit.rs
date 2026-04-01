@@ -23,6 +23,9 @@ pub trait AuditEventSink: Send + Sync + 'static {
         resource_type: &str,
         operation: &str,
     );
+
+    /// Called when an authenticated principal is granted access by policy.
+    async fn record_authz_grant(&self, principal: &Principal, resource_type: &str, operation: &str);
 }
 
 /// No-op audit sink that discards all events.
@@ -38,6 +41,14 @@ impl AuditEventSink for NoopAuditEventSink {
     async fn record_auth_failure(&self, _error: &AuthError, _path: &str, _method: &str) {}
 
     async fn record_authz_denial(
+        &self,
+        _principal: &Principal,
+        _resource_type: &str,
+        _operation: &str,
+    ) {
+    }
+
+    async fn record_authz_grant(
         &self,
         _principal: &Principal,
         _resource_type: &str,

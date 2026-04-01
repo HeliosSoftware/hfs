@@ -16,6 +16,8 @@ pub enum AuditBackend {
     File,
     /// Persist via the FHIR storage backend (SQLite / PostgreSQL / S3).
     Database,
+    /// AWS CloudWatch Logs (requires `cloudwatch` feature).
+    CloudWatch,
 }
 
 impl fmt::Display for AuditBackend {
@@ -24,6 +26,7 @@ impl fmt::Display for AuditBackend {
             Self::None => write!(f, "none"),
             Self::File => write!(f, "file"),
             Self::Database => write!(f, "database"),
+            Self::CloudWatch => write!(f, "cloudwatch"),
         }
     }
 }
@@ -43,6 +46,12 @@ pub struct AuditConfig {
     /// FHIR Reference used as `AuditEvent.source.observer`
     /// (e.g. `"Device/hfs"`).
     pub source_observer: String,
+    /// CloudWatch Logs log group name (required when `backend = CloudWatch`).
+    pub cloudwatch_log_group: Option<String>,
+    /// CloudWatch Logs log stream name (defaults to `"hfs-audit"`).
+    pub cloudwatch_log_stream: Option<String>,
+    /// AWS region override for CloudWatch Logs.
+    pub cloudwatch_region: Option<String>,
 }
 
 impl AuditConfig {
@@ -55,6 +64,7 @@ impl AuditConfig {
         {
             "file" => AuditBackend::File,
             "database" | "db" => AuditBackend::Database,
+            "cloudwatch" | "cloudwatch-logs" | "cwl" => AuditBackend::CloudWatch,
             _ => AuditBackend::None,
         };
 
@@ -78,6 +88,9 @@ impl AuditConfig {
             exclusions,
             source_observer: env::var("HFS_AUDIT_SOURCE_OBSERVER")
                 .unwrap_or_else(|_| "Device/hfs".to_string()),
+            cloudwatch_log_group: env::var("HFS_AUDIT_CLOUDWATCH_LOG_GROUP").ok(),
+            cloudwatch_log_stream: env::var("HFS_AUDIT_CLOUDWATCH_LOG_STREAM").ok(),
+            cloudwatch_region: env::var("HFS_AUDIT_CLOUDWATCH_REGION").ok(),
         }
     }
 }
@@ -90,6 +103,9 @@ impl Default for AuditConfig {
             database_url: None,
             exclusions: Vec::new(),
             source_observer: "Device/hfs".to_string(),
+            cloudwatch_log_group: None,
+            cloudwatch_log_stream: None,
+            cloudwatch_region: None,
         }
     }
 }

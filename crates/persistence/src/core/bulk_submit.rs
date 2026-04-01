@@ -58,6 +58,80 @@ use crate::core::storage::ResourceStorage;
 use crate::error::StorageResult;
 use crate::tenant::TenantContext;
 
+/// Audit event helpers for bulk submit operations.
+#[cfg(feature = "audit")]
+pub mod audit {
+    use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
+
+    use super::SubmissionId;
+
+    /// Record an audit event for a bulk submit lifecycle event.
+    ///
+    /// Call this at submission start, completion, abort, or rollback.
+    pub async fn record_submit_event(
+        sink: &dyn AuditSink,
+        source_observer: &str,
+        agent: Option<&str>,
+        submission_id: &SubmissionId,
+        phase: &str,
+        outcome: &str,
+        outcome_desc: Option<&str>,
+    ) {
+        let mut builder = AuditEventBuilder::new(source_observer)
+            .event_type(
+                "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                "import",
+            )
+            .action(AuditAction::Execute)
+            .outcome(outcome)
+            .detail("submission-id", &submission_id.submission_id)
+            .detail("submitter", &submission_id.submitter)
+            .detail("phase", phase);
+        if let Some(a) = agent {
+            builder = builder.agent(a, None, true);
+        }
+        if let Some(d) = outcome_desc {
+            builder = builder.outcome_desc(d);
+        }
+        sink.record(builder.build()).await;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use helios_audit::sinks::NullSink;
+
+        use super::*;
+        use crate::core::bulk_submit::SubmissionId;
+
+        #[tokio::test]
+        async fn test_submit_event_includes_phase() {
+            let sink = NullSink;
+            let id = SubmissionId::new("client-a", "sub-123");
+            record_submit_event(&sink, "Device/hfs", None, &id, "start", "0", None).await;
+        }
+
+        #[test]
+        fn test_submit_event_has_details() {
+            let id = SubmissionId::new("client-a", "sub-123");
+            let event = AuditEventBuilder::new("Device/hfs")
+                .event_type(
+                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                    "import",
+                )
+                .action(AuditAction::Execute)
+                .outcome("0")
+                .detail("submission-id", &id.submission_id)
+                .detail("submitter", &id.submitter)
+                .detail("phase", "complete")
+                .build();
+            let entities = event.entity.as_ref().unwrap();
+            let details = entities[0].detail.as_ref().unwrap();
+            assert_eq!(details.len(), 3);
+            assert_eq!(details[2].r#type.value.as_deref(), Some("phase"));
+        }
+    }
+}
+
 /// Unique identifier for a bulk submission.
 ///
 /// A submission is identified by the combination of a submitter identifier

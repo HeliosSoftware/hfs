@@ -76,6 +76,22 @@ impl AuthAuditEventSink for AuditBridge {
             .build();
         self.sink.record(event).await;
     }
+
+    async fn record_authz_grant(
+        &self,
+        principal: &Principal,
+        resource_type: &str,
+        operation: &str,
+    ) {
+        let event = AuditEventBuilder::new(&self.source_observer)
+            .action(AuditAction::Execute)
+            .outcome("0")
+            .outcome_desc(format!("Granted: {operation} on {resource_type}"))
+            .agent(principal.subject(), None, true)
+            .resource(resource_type, "")
+            .build();
+        self.sink.record(event).await;
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +192,32 @@ mod tests {
                 .and_then(|s| s.value.as_deref())
                 .unwrap()
                 .contains("Forbidden")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authz_grant_records_event() {
+        let sink = Arc::new(CollectorSink::new());
+        let config = AuditConfig::default();
+        let bridge = AuditBridge::new(Arc::clone(&sink) as Arc<dyn AuditSink>, &config);
+
+        bridge
+            .record_authz_grant(&test_principal(), "Patient", "read")
+            .await;
+
+        let events = sink.events.lock().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].outcome.as_ref().and_then(|o| o.value.as_deref()),
+            Some("0")
+        );
+        assert!(
+            events[0]
+                .outcome_desc
+                .as_ref()
+                .and_then(|s| s.value.as_deref())
+                .unwrap()
+                .contains("Granted")
         );
     }
 

@@ -34,6 +34,10 @@ pub struct AuditEventBuilder {
     agent_requestor: bool,
     source_observer: String,
     query_string: Option<String>,
+    entity_details: Vec<(String, String)>,
+    extra_entities: Vec<AuditEventEntity>,
+    event_type_system: Option<String>,
+    event_type_code: Option<String>,
 }
 
 impl AuditEventBuilder {
@@ -51,6 +55,10 @@ impl AuditEventBuilder {
             agent_requestor: true,
             source_observer: source_observer.into(),
             query_string: None,
+            entity_details: Vec::new(),
+            extra_entities: Vec::new(),
+            event_type_system: None,
+            event_type_code: None,
         }
     }
 
@@ -100,11 +108,45 @@ impl AuditEventBuilder {
         self
     }
 
+    /// Add a key-value detail to the primary resource entity.
+    ///
+    /// Details are serialized as `AuditEventEntityDetail` items. If no
+    /// resource entity is set, a standalone entity is created to carry them.
+    pub fn detail(mut self, name: &str, value: impl Into<String>) -> Self {
+        self.entity_details.push((name.to_string(), value.into()));
+        self
+    }
+
+    /// Add a pre-built entity beyond the standard resource and patient pair.
+    pub fn entity(mut self, entity: AuditEventEntity) -> Self {
+        self.extra_entities.push(entity);
+        self
+    }
+
+    /// Override the event type coding (default: `audit-event-type` / `rest`).
+    pub fn event_type(mut self, system: &str, code: &str) -> Self {
+        self.event_type_system = Some(system.to_string());
+        self.event_type_code = Some(code.to_string());
+        self
+    }
+
     /// Build the typed `AuditEvent`.
     pub fn build(self) -> AuditEvent {
         let has_patient = self.patient_reference.is_some();
         let audit_action = self.action.unwrap_or(AuditAction::Read);
         let profile_url = balp::select_profile(audit_action, has_patient);
+
+        // Build entity details from accumulated (name, value) pairs
+        let details = if self.entity_details.is_empty() {
+            None
+        } else {
+            Some(
+                self.entity_details
+                    .iter()
+                    .map(|(n, v)| entity_detail(n, v))
+                    .collect(),
+            )
+        };
 
         // Entities
         let mut entities = Vec::new();
@@ -115,9 +157,18 @@ impl AuditEventBuilder {
                 entities.push(AuditEventEntity {
                     what: Some(reference(&format!("{rt}/{rid}"))),
                     r#type: Some(coding(code_systems::AUDIT_ENTITY_TYPE, "2")),
+                    detail: details.clone(),
                     ..Default::default()
                 });
             }
+        }
+
+        // If there are details but no resource entity, create a standalone entity
+        if entities.is_empty() && details.is_some() {
+            entities.push(AuditEventEntity {
+                detail: details,
+                ..Default::default()
+            });
         }
 
         // Entity: patient (if resolved)
@@ -129,6 +180,9 @@ impl AuditEventBuilder {
                 ..Default::default()
             });
         }
+
+        // Extra entities added via entity()
+        entities.extend(self.extra_entities);
 
         // Build the subtype coding (maps action code to restful-interaction)
         let subtype = self.action.map(|a| {
@@ -143,13 +197,20 @@ impl AuditEventBuilder {
             vec![coding(code_systems::RESTFUL_INTERACTION, interaction)]
         });
 
+        // Event type: use override if set, otherwise default to "rest"
+        let type_system = self
+            .event_type_system
+            .as_deref()
+            .unwrap_or(code_systems::AUDIT_EVENT_TYPE);
+        let type_code = self.event_type_code.as_deref().unwrap_or("rest");
+
         AuditEvent {
             id: Some(fhir_string(uuid::Uuid::new_v4().to_string())),
             meta: Some(Meta {
                 profile: Some(vec![canonical(profile_url)]),
                 ..Default::default()
             }),
-            r#type: coding(code_systems::AUDIT_EVENT_TYPE, "rest"),
+            r#type: coding(type_system, type_code),
             subtype,
             action: self.action.map(|a| code(a.to_code())),
             recorded: instant_now(),
@@ -374,5 +435,78 @@ mod tests {
             .resource("Patient", "")
             .build();
         assert!(event.entity.is_none());
+    }
+
+    #[test]
+    fn test_detail_attached_to_resource_entity() {
+        let event = AuditEventBuilder::new("Device/hfs")
+            .resource("Patient", "123")
+            .detail("job-id", "abc-def")
+            .detail("count", "42")
+            .build();
+        let entities = event.entity.as_ref().unwrap();
+        let details = entities[0].detail.as_ref().unwrap();
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].r#type.value.as_deref(), Some("job-id"));
+        assert_eq!(details[1].r#type.value.as_deref(), Some("count"));
+    }
+
+    #[test]
+    fn test_detail_without_resource_creates_standalone_entity() {
+        let event = AuditEventBuilder::new("Device/hfs")
+            .detail("phase", "start")
+            .build();
+        let entities = event.entity.as_ref().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert!(entities[0].what.is_none());
+        let details = entities[0].detail.as_ref().unwrap();
+        assert_eq!(details[0].r#type.value.as_deref(), Some("phase"));
+    }
+
+    #[test]
+    fn test_custom_entity_appended() {
+        use helios_fhir::r4::AuditEventEntity;
+
+        let custom = AuditEventEntity {
+            what: Some(reference("Job/export-1")),
+            ..Default::default()
+        };
+        let event = AuditEventBuilder::new("Device/hfs")
+            .resource("Patient", "123")
+            .entity(custom)
+            .build();
+        let entities = event.entity.as_ref().unwrap();
+        assert_eq!(entities.len(), 2);
+        assert_eq!(
+            entities[1]
+                .what
+                .as_ref()
+                .and_then(|w| w.reference.as_ref())
+                .and_then(|s| s.value.as_deref()),
+            Some("Job/export-1")
+        );
+    }
+
+    #[test]
+    fn test_event_type_override() {
+        let event = AuditEventBuilder::new("Device/hfs")
+            .event_type(
+                "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                "export",
+            )
+            .build();
+        assert_eq!(
+            event.r#type.code.as_ref().and_then(|c| c.value.as_deref()),
+            Some("export")
+        );
+    }
+
+    #[test]
+    fn test_event_type_default_is_rest() {
+        let event = AuditEventBuilder::new("Device/hfs").build();
+        assert_eq!(
+            event.r#type.code.as_ref().and_then(|c| c.value.as_deref()),
+            Some("rest")
+        );
     }
 }

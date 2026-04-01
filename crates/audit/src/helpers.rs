@@ -6,8 +6,8 @@
 
 use chrono::Utc;
 use helios_fhir::r4::{
-    Boolean, Canonical, Code, CodeableConcept, Coding, Instant, Reference, String as FhirString,
-    Uri,
+    AuditEventEntityDetail, AuditEventEntityDetailValue, Boolean, Canonical, Code, CodeableConcept,
+    Coding, Instant, Reference, String as FhirString, Uri,
 };
 use helios_fhir::{Element, PrecisionInstant};
 
@@ -99,6 +99,15 @@ pub fn coding_display(system: &str, code_value: &str, display: &str) -> Coding {
 pub fn reference(value: &str) -> Reference {
     Reference {
         reference: Some(fhir_string(value)),
+        ..Default::default()
+    }
+}
+
+/// Create an `AuditEventEntityDetail` with a string value.
+pub fn entity_detail(name: &str, value: &str) -> AuditEventEntityDetail {
+    AuditEventEntityDetail {
+        r#type: fhir_string(name),
+        value: Some(AuditEventEntityDetailValue::String(fhir_string(value))),
         ..Default::default()
     }
 }
@@ -197,5 +206,17 @@ mod tests {
         let c = coding("sys", "code");
         let cc = codeable_concept(c);
         assert_eq!(cc.coding.as_ref().map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn test_entity_detail_string_value() {
+        let d = entity_detail("job-id", "abc-123");
+        assert_eq!(d.r#type.value.as_deref(), Some("job-id"));
+        match d.value {
+            Some(AuditEventEntityDetailValue::String(ref s)) => {
+                assert_eq!(s.value.as_deref(), Some("abc-123"));
+            }
+            _ => panic!("Expected String variant"),
+        }
     }
 }

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use clap::Parser;
 use helios_audit::{
     AuditBackend, AuditBridge, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter,
+    lifecycle,
 };
 use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
 use helios_rest::{
@@ -83,6 +84,7 @@ async fn start_mongodb(
 
     backend.init_schema().await?;
 
+    let serve_audit_state = audit_state.clone();
     let app = create_app_with_auth(
         backend,
         config.clone(),
@@ -90,7 +92,7 @@ async fn start_mongodb(
         auth_state,
         audit_state,
     );
-    serve(app, &config).await
+    serve(app, &config, serve_audit_state).await
 }
 
 /// Fallback when mongodb feature is not enabled.
@@ -108,11 +110,25 @@ async fn start_mongodb(
 }
 
 /// Starts the Axum HTTP server.
-async fn serve(app: axum::Router, config: &ServerConfig) -> anyhow::Result<()> {
+async fn serve(
+    app: axum::Router,
+    config: &ServerConfig,
+    audit_state: Option<Arc<AuditMiddlewareState>>,
+) -> anyhow::Result<()> {
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Shutdown signal received, draining connections");
+            if let Some(state) = audit_state {
+                lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
+                state.sink.flush().await;
+            }
+        })
+        .await?;
     Ok(())
 }
 
@@ -222,6 +238,34 @@ async fn init_audit() -> anyhow::Result<(Arc<dyn AuditSink>, Option<Arc<AuditMid
                  Use HFS_AUDIT_BACKEND=file or HFS_AUDIT_BACKEND=none for now."
             );
         }
+        #[cfg(feature = "cloudwatch")]
+        AuditBackend::CloudWatch => {
+            let log_group = config.cloudwatch_log_group.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "HFS_AUDIT_CLOUDWATCH_LOG_GROUP is required when HFS_AUDIT_BACKEND=cloudwatch"
+                )
+            })?;
+            let log_stream = config
+                .cloudwatch_log_stream
+                .as_deref()
+                .unwrap_or("hfs-audit");
+            info!(log_group = %log_group, log_stream = %log_stream, "Audit logging to CloudWatch Logs");
+            Arc::new(
+                helios_audit::CloudWatchLogsSink::new(
+                    log_group.to_string(),
+                    log_stream.to_string(),
+                    config.cloudwatch_region.clone(),
+                )
+                .await,
+            )
+        }
+        #[cfg(not(feature = "cloudwatch"))]
+        AuditBackend::CloudWatch => {
+            anyhow::bail!(
+                "CloudWatch audit backend requires the `cloudwatch` feature. \
+                 Build with: cargo build --features cloudwatch"
+            );
+        }
     };
 
     let audit_state = if config.backend != AuditBackend::None {
@@ -259,15 +303,32 @@ async fn main() -> anyhow::Result<()> {
     // Initialize authentication (with audit bridge if audit is enabled)
     let (auth_config, auth_state) = init_auth_with_audit(audit_sink).await?;
 
+    let audit_config = AuditConfig::from_env();
+
     info!(
         port = config.port,
         host = %config.host,
         fhir_version = ?config.default_fhir_version,
         storage_backend = %backend_mode,
         auth_enabled = auth_config.enabled,
-        audit_backend = %AuditConfig::from_env().backend,
+        audit_backend = %audit_config.backend,
         "Starting Helios FHIR Server"
     );
+
+    // Record startup audit event with server configuration
+    if let Some(ref state) = audit_state {
+        lifecycle::record_startup(
+            &*state.sink,
+            &state.config.source_observer,
+            vec![
+                ("storage-backend", backend_mode.to_string()),
+                ("fhir-version", format!("{:?}", config.default_fhir_version)),
+                ("auth-enabled", auth_config.enabled.to_string()),
+                ("audit-backend", audit_config.backend.to_string()),
+            ],
+        )
+        .await;
+    }
 
     match backend_mode {
         StorageBackendMode::Sqlite => {
@@ -308,6 +369,7 @@ async fn start_sqlite(
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     let backend = create_sqlite_backend(&config)?;
+    let serve_audit_state = audit_state.clone();
     let app = create_app_with_auth(
         backend,
         config.clone(),
@@ -315,7 +377,7 @@ async fn start_sqlite(
         auth_state,
         audit_state,
     );
-    serve(app, &config).await
+    serve(app, &config, serve_audit_state).await
 }
 
 /// Fallback when sqlite feature is not enabled.
@@ -443,7 +505,7 @@ async fn start_sqlite_elasticsearch(
         auth_state,
         audit_state,
     );
-    serve(app, &config).await
+    serve(app, &config, serve_audit_state).await
 }
 
 /// Fallback when elasticsearch feature is not enabled.
@@ -485,6 +547,7 @@ async fn start_postgres(
 
     backend.init_schema().await?;
 
+    let serve_audit_state = audit_state.clone();
     let app = create_app_with_auth(
         backend,
         config.clone(),
@@ -492,7 +555,7 @@ async fn start_postgres(
         auth_state,
         audit_state,
     );
-    serve(app, &config).await
+    serve(app, &config, serve_audit_state).await
 }
 
 /// Fallback when postgres feature is not enabled.
@@ -637,7 +700,7 @@ async fn start_postgres_elasticsearch(
         auth_state,
         audit_state,
     );
-    serve(app, &config).await
+    serve(app, &config, serve_audit_state).await
 }
 
 /// Fallback when postgres+elasticsearch features are not both enabled.
@@ -782,7 +845,7 @@ async fn start_mongodb_elasticsearch(
         auth_state,
         audit_state,
     );
-    serve(app, &config).await
+    serve(app, &config, serve_audit_state).await
 }
 
 /// Fallback when mongodb+elasticsearch features are not both enabled.
@@ -843,6 +906,7 @@ async fn start_s3(
         )
     })?;
 
+    let serve_audit_state = audit_state.clone();
     let app = create_app_with_auth(
         backend,
         config.clone(),
@@ -850,7 +914,7 @@ async fn start_s3(
         auth_state,
         audit_state,
     );
-    serve(app, &config).await
+    serve(app, &config, serve_audit_state).await
 }
 
 /// Fallback when s3 feature is not enabled.
@@ -1028,7 +1092,7 @@ async fn start_s3_elasticsearch(
         auth_state,
         audit_state,
     );
-    serve(app, &config).await
+    serve(app, &config, serve_audit_state).await
 }
 
 /// Fallback when s3+elasticsearch features are not both enabled.

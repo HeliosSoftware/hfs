@@ -13,6 +13,7 @@ use helios_auth::principal::Principal;
 use crate::balp;
 use crate::builder::AuditEventBuilder;
 use crate::config::AuditConfig;
+use crate::correlation::{self, AuditCorrelation, BundleAuditEntry};
 use crate::exclusion::ExclusionFilter;
 use crate::patient::PatientResolver;
 use crate::sink::AuditSink;
@@ -25,6 +26,35 @@ pub struct AuditMiddlewareState {
     pub config: AuditConfig,
     /// Pre-built exclusion filter.
     pub exclusion_filter: ExclusionFilter,
+}
+
+impl AuditMiddlewareState {
+    /// Record correlated audit events for each entry in a batch or transaction bundle.
+    ///
+    /// This produces one `AuditEvent` per entry, all sharing the same `bundle-id`
+    /// detail so they can be traced together.  The outer HTTP-level event recorded
+    /// by the middleware is still emitted independently.
+    pub async fn record_bundle_entries(
+        &self,
+        correlation: &AuditCorrelation,
+        entries: Vec<BundleAuditEntry>,
+        agent: Option<&str>,
+    ) {
+        let events: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                correlation::build_entry_event(
+                    correlation,
+                    &self.config.source_observer,
+                    i,
+                    entry,
+                    agent,
+                )
+            })
+            .collect();
+        self.sink.record_batch(events).await;
+    }
 }
 
 /// Optional audit context attached by handlers to enrich middleware audit events.

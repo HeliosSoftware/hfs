@@ -146,6 +146,10 @@ pub async fn authz_middleware(
                     operation = %operation,
                     "Authorization granted"
                 );
+                auth_state
+                    .audit_sink
+                    .record_authz_grant(&principal, &resource_type, &operation.to_string())
+                    .await;
             }
             Err(err) => {
                 warn!(

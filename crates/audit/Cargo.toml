@@ -15,6 +15,9 @@ R4B = ["helios-fhir/R4B"]
 R5 = ["helios-fhir/R5"]
 R6 = ["helios-fhir/R6"]
 
+# Cloud audit backends
+cloudwatch = ["dep:aws-sdk-cloudwatchlogs", "dep:aws-config"]
+
 [dependencies]
 # FHIR models
 helios-fhir = { path = "../fhir" }
@@ -44,6 +47,10 @@ uuid = { version = "1", features = ["v4"] }
 
 # HTTP framework (middleware)
 axum = "0.8"
+
+# AWS CloudWatch Logs (optional)
+aws-sdk-cloudwatchlogs = { version = "1", optional = true }
+aws-config = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

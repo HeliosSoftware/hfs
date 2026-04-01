@@ -12,6 +12,99 @@ use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
+/// Audit event helpers for purge operations.
+#[cfg(feature = "audit")]
+pub mod audit {
+    use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
+
+    /// Record an audit event for a purge (permanent deletion) operation.
+    pub async fn record_purge_event(
+        sink: &dyn AuditSink,
+        source_observer: &str,
+        agent: Option<&str>,
+        resource_type: &str,
+        resource_id: Option<&str>,
+        count: u64,
+        patient_ref: Option<&str>,
+    ) {
+        let mut builder = AuditEventBuilder::new(source_observer)
+            .event_type(
+                "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                "purge",
+            )
+            .action(AuditAction::Delete)
+            .outcome("0")
+            .detail("count", count.to_string());
+        if let Some(id) = resource_id {
+            builder = builder.resource(resource_type, id);
+        } else {
+            builder = builder.detail("resource-type", resource_type);
+        }
+        if let Some(a) = agent {
+            builder = builder.agent(a, None, true);
+        }
+        if let Some(p) = patient_ref {
+            builder = builder.patient(p);
+        }
+        sink.record(builder.build()).await;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use helios_audit::{AuditAction, AuditEventBuilder};
+
+        #[test]
+        fn test_purge_event_action_is_delete() {
+            let event = AuditEventBuilder::new("Device/hfs")
+                .event_type(
+                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                    "purge",
+                )
+                .action(AuditAction::Delete)
+                .outcome("0")
+                .resource("Patient", "123")
+                .detail("count", "1")
+                .build();
+            assert_eq!(
+                event.action.as_ref().and_then(|a| a.value.as_deref()),
+                Some("D")
+            );
+        }
+
+        #[test]
+        fn test_purge_event_includes_count() {
+            let event = AuditEventBuilder::new("Device/hfs")
+                .action(AuditAction::Delete)
+                .outcome("0")
+                .resource("Observation", "obs-1")
+                .detail("count", "15")
+                .build();
+            let details = event.entity.as_ref().unwrap()[0].detail.as_ref().unwrap();
+            assert_eq!(details[0].r#type.value.as_deref(), Some("count"));
+        }
+
+        #[test]
+        fn test_purge_with_patient_has_patient_entity() {
+            let event = AuditEventBuilder::new("Device/hfs")
+                .action(AuditAction::Delete)
+                .outcome("0")
+                .resource("Observation", "obs-1")
+                .patient("Patient/456")
+                .build();
+            let entities = event.entity.as_ref().unwrap();
+            assert_eq!(entities.len(), 2);
+            assert_eq!(
+                entities[1]
+                    .what
+                    .as_ref()
+                    .and_then(|w| w.reference.as_ref())
+                    .and_then(|s| s.value.as_deref()),
+                Some("Patient/456")
+            );
+        }
+    }
+}
+
 /// Core storage trait for FHIR resources.
 ///
 /// This trait defines the fundamental CRUD (Create, Read, Update, Delete) operations
