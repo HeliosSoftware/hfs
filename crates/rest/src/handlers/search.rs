@@ -28,6 +28,7 @@ use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::responses::format_resource_response;
 use crate::responses::subsetting::{SummaryMode, apply_elements, apply_summary};
 use crate::state::AppState;
+use crate::terminology::TerminologyServiceClient;
 
 /// Query parameters for search (used in the SearchQuery struct in handlers).
 #[derive(Debug, Deserialize, Default)]
@@ -177,6 +178,11 @@ where
         state.default_page_size(),
         state.max_page_size(),
     );
+
+    // Pre-process :in / :not-in modifiers via the terminology server (if configured).
+    if let Some(ts_url) = state.terminology_server_url() {
+        params = expand_terminology_params(params, ts_url).await;
+    }
 
     // Convert REST params to persistence SearchQuery
     let query = build_search_query_from_map(resource_type, &params)?;
@@ -424,6 +430,104 @@ mod urlencoding {
     }
 }
 
+/// Pre-processes search params that contain `:in` or `:not-in` modifiers by
+/// expanding the referenced ValueSet via the terminology server.
+///
+/// **`:in` modifier** — The ValueSet at the given URL is expanded.  The
+/// parameter is replaced with a plain token parameter whose value is the
+/// expanded codes joined by commas (FHIR OR semantics).
+/// Example: `code:in=http://example.org/vs` → `code=http://cs|A,http://cs|B`
+///
+/// **`:not-in` modifier** — The ValueSet is expanded for informational
+/// purposes, but `:not-in` cannot be expressed as a single SQLite search
+/// parameter.  A warning is logged and the parameter is dropped (fail-open).
+///
+/// All other parameters pass through unchanged. On individual expansion
+/// failures the problematic parameter is skipped with a warning so a single
+/// bad ValueSet URL does not abort the entire search.
+async fn expand_terminology_params(
+    params: HashMap<String, String>,
+    ts_url: &str,
+) -> HashMap<String, String> {
+    let client = TerminologyServiceClient::new(ts_url.to_string());
+    let mut result: HashMap<String, String> = HashMap::with_capacity(params.len());
+
+    for (key, value) in params {
+        if let Some(param_name) = key.strip_suffix(":in") {
+            // Expand the ValueSet and join codes with commas for OR token search.
+            match client.expand_value_set(&value).await {
+                Ok(codes) if !codes.is_empty() => {
+                    let token_list = codes
+                        .iter()
+                        .map(|c| c.as_token())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    debug!(
+                        param = %param_name,
+                        vs_url = %value,
+                        codes = %codes.len(),
+                        "Expanded ValueSet for :in modifier"
+                    );
+                    result.insert(param_name.to_string(), token_list);
+                }
+                Ok(_) => {
+                    // Empty expansion — no code can match; use a sentinel value
+                    // that will match nothing in the token index.
+                    warn!(
+                        param = %key,
+                        vs_url = %value,
+                        "ValueSet $expand returned empty expansion for :in modifier; \
+                         injecting sentinel value so no resources match"
+                    );
+                    result.insert(
+                        param_name.to_string(),
+                        "__hts_empty_expansion__".to_string(),
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        param = %key,
+                        vs_url = %value,
+                        error = %e,
+                        "ValueSet $expand failed for :in modifier; skipping parameter (fail-open)"
+                    );
+                    // Omit the param — searches continue without this filter.
+                }
+            }
+        } else if let Some(param_name) = key.strip_suffix(":not-in") {
+            // :not-in requires negated filtering which the SQLite backend does
+            // not support natively.  Expand the set for logging, then skip.
+            match client.expand_value_set(&value).await {
+                Ok(codes) => {
+                    warn!(
+                        param = %param_name,
+                        vs_url = %value,
+                        expanded_codes = %codes.len(),
+                        "search :not-in modifier: ValueSet expanded but negated \
+                         value-set filtering is not supported by the SQLite backend; \
+                         this parameter will be ignored (results may include codes \
+                         that are in the set)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        param = %param_name,
+                        vs_url = %value,
+                        error = %e,
+                        "search :not-in modifier: ValueSet $expand failed; \
+                         parameter ignored (fail-open)"
+                    );
+                }
+            }
+            // Do not insert into result — parameter is dropped.
+        } else {
+            result.insert(key, value);
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +577,55 @@ mod tests {
         apply_pagination_limits(&mut params, 20, 100);
 
         assert_eq!(params.get("_count"), Some(&"20".to_string()));
+    }
+
+    // ─── expand_terminology_params ───────────────────────────────────────────
+
+    /// Verifies that non-terminology params pass through unchanged.
+    #[tokio::test]
+    async fn test_expand_terminology_params_passthrough() {
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), "Smith".to_string());
+        params.insert("_count".to_string(), "10".to_string());
+
+        // Use a URL that won't be reachable — but only :in/:not-in keys trigger calls.
+        let result = expand_terminology_params(params.clone(), "http://localhost:9999").await;
+
+        assert_eq!(result.get("name"), Some(&"Smith".to_string()));
+        assert_eq!(result.get("_count"), Some(&"10".to_string()));
+    }
+
+    /// Verifies that a :not-in param is dropped (not forwarded to storage).
+    ///
+    /// This test uses a URL that won't be reachable; the function should log a
+    /// warning and drop the param gracefully (fail-open).
+    #[tokio::test]
+    async fn test_expand_terminology_params_not_in_dropped_on_network_error() {
+        let mut params = HashMap::new();
+        params.insert(
+            "code:not-in".to_string(),
+            "http://example.org/vs".to_string(),
+        );
+        params.insert("name".to_string(), "Smith".to_string());
+
+        let result = expand_terminology_params(params, "http://127.0.0.1:19999").await;
+
+        // :not-in param is dropped, other params survive
+        assert!(!result.contains_key("code:not-in"));
+        assert!(!result.contains_key("code"));
+        assert_eq!(result.get("name"), Some(&"Smith".to_string()));
+    }
+
+    /// Verifies that a :in param is dropped on network error (fail-open).
+    #[tokio::test]
+    async fn test_expand_terminology_params_in_dropped_on_network_error() {
+        let mut params = HashMap::new();
+        params.insert("code:in".to_string(), "http://example.org/vs".to_string());
+
+        let result = expand_terminology_params(params, "http://127.0.0.1:19999").await;
+
+        // The :in key is gone; no code key was injected either (fail-open)
+        assert!(!result.contains_key("code:in"));
+        assert!(!result.contains_key("code"));
     }
 }

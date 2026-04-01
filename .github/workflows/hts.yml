@@ -1,0 +1,63 @@
+name: HTS Terminology Service CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "crates/hts/**"
+      - ".github/workflows/hts.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/hts/**"
+      - ".github/workflows/hts.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  check:
+    name: Check helios-hts
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        if: runner.os != 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Configure Rust linker (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
+
+      - name: cargo check
+        run: cargo check -p helios-hts
+
+      - name: cargo clippy
+        run: >
+          cargo clippy -p helios-hts --all-targets --all-features --
+          -D warnings
+          -A clippy::items_after_test_module
+          -A clippy::large_enum_variant
+          -A clippy::question_mark
+          -A clippy::collapsible_match
+          -A clippy::collapsible_if
+          -A clippy::field_reassign_with_default
+          -A clippy::doc-overindented-list-items
+          -A clippy::doc-lazy-continuation
+
+      - name: cargo test
+        run: cargo test -p helios-hts
