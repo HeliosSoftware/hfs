@@ -146,6 +146,7 @@ The project is a Rust workspace with 12 crates (`pysof` excluded from default-me
 | `sof-cli` | helios-sof | SQL-on-FHIR CLI tool |
 | `sof-server` | helios-sof | SQL-on-FHIR HTTP server |
 | `config-advisor` | helios-persistence | Storage configuration advisor |
+| `hts` | helios-hts | FHIR Terminology Service (HTS) |
 
 ### Key Design Patterns
 
@@ -496,6 +497,70 @@ export CARGO_BUILD_JOBS=4
 - FHIR examples in `crates/fhir/tests/data/`
 - Search parameter definitions in `data/search-parameters-{r4,r4b,r5,r6}.json`
 - ViewDefinition examples in test files
+
+## HTS Server Configuration
+
+### Running HTS
+```bash
+# Default (SQLite, port 8090)
+cargo run --bin hts
+
+# Custom database path and port
+HTS_DATABASE_URL=./my-terminology.db HTS_SERVER_PORT=9090 cargo run --bin hts
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HTS_SERVER_PORT` | 8090 | Server port |
+| `HTS_SERVER_HOST` | 127.0.0.1 | Host to bind |
+| `HTS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
+| `HTS_DATABASE_URL` | ./data/hts.db | SQLite database file path |
+| `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite`; `postgres` planned) |
+| `HTS_ENABLE_CORS` | true | Enable CORS |
+| `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
+
+### API Endpoints
+
+| Operation | Method | URL |
+|-----------|--------|-----|
+| health | GET | `/health` |
+| capabilities | GET | `/metadata` |
+| $lookup | POST | `/CodeSystem/$lookup` |
+| $validate-code (CS) | POST | `/CodeSystem/$validate-code` |
+| $subsumes | POST | `/CodeSystem/$subsumes` |
+| $expand | POST | `/ValueSet/$expand` |
+| $validate-code (VS) | POST | `/ValueSet/$validate-code` |
+| $translate | POST | `/ConceptMap/$translate` |
+| $closure | POST | `/ConceptMap/$closure` |
+| import bundle | POST | `/import` |
+| CRUD | GET/POST/PUT/DELETE | `/CodeSystem/:id`, `/ValueSet/:id`, `/ConceptMap/:id` |
+
+### Quick Examples
+```bash
+# Import a FHIR Bundle containing CodeSystem/ValueSet/ConceptMap resources
+curl -X POST http://localhost:8090/import \
+  -H "Content-Type: application/fhir+json" \
+  -d @bundle.json
+
+# Lookup a concept
+curl -X POST http://localhost:8090/CodeSystem/\$lookup \
+  -H "Content-Type: application/fhir+json" \
+  -d '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"http://example.org/cs"},{"name":"code","valueCode":"ABC"}]}'
+
+# Expand a value set
+curl -X POST http://localhost:8090/ValueSet/\$expand \
+  -H "Content-Type: application/fhir+json" \
+  -d '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"http://example.org/vs"}]}'
+```
+
+### HFS Integration
+Set `HFS_TERMINOLOGY_SERVER=http://localhost:8090` on the HFS process to enable:
+- FHIR search `:in` modifier (expands ValueSet, filters by code)
+- FHIRPath `memberOf()` / `subsumes()` delegation via `FHIRPATH_TERMINOLOGY_SERVER`
+
+---
 
 ## Docker
 

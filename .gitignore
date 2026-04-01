@@ -9,6 +9,8 @@ package-lock.json
 .prettierrc
 off
 AGENTS.md
+hts/plan-hts.md
+hts/to-do-hts.md
 
 # Build script download markers
 .download_marker
