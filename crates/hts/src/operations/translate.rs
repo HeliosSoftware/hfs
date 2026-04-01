@@ -7,7 +7,10 @@
 //! # FHIR specification
 //! <https://hl7.org/fhir/conceptmap-operation-translate.html>
 
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{RawQuery, State},
+};
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
@@ -16,19 +19,18 @@ use crate::state::AppState;
 use crate::traits::{ConceptMapOperations, TerminologyBackend};
 use crate::types::TranslateRequest;
 
-use super::params::{extract_parameter_array, find_str_param};
+use super::params::{
+    extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
+};
 
-/// POST /ConceptMap/$translate
-pub async fn translate_handler<B: TerminologyBackend>(
-    State(state): State<AppState<B>>,
-    Json(body): Json<Value>,
+async fn process_translate<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
 ) -> Result<Json<Value>, HtsError> {
-    let params = extract_parameter_array(&body)?;
-
     let code = find_str_param(&params, "code")
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: code".into()))?;
 
-    // `reverse` arrives as valueBoolean; extract_any_string_value converts it to "true"/"false".
+    // `reverse` arrives as valueBoolean (POST) or plain string "true"/"false" (GET).
     let reverse = find_str_param(&params, "reverse")
         .map(|s| s == "true")
         .unwrap_or(false);
@@ -81,6 +83,25 @@ pub async fn translate_handler<B: TerminologyBackend>(
         "resourceType": "Parameters",
         "parameter": parameter
     })))
+}
+
+/// POST /ConceptMap/$translate
+pub async fn translate_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HtsError> {
+    let params = extract_parameter_array(&body)?;
+    process_translate(&state, params).await
+}
+
+/// GET /ConceptMap/$translate?code=...&system=...
+pub async fn get_translate_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, HtsError> {
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    process_translate(&state, params).await
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

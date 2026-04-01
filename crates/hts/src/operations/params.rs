@@ -4,7 +4,7 @@
 //! bodies whose `resourceType` is `"Parameters"`. These helpers encapsulate
 //! the common patterns so each handler stays focused on business logic.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::error::HtsError;
 
@@ -86,6 +86,30 @@ fn extract_any_string_value(param: &Value) -> Option<String> {
     }
 
     None
+}
+
+// ── GET / query-string helpers ─────────────────────────────────────────────────
+
+/// Parse a raw URL query string (e.g. `"system=http%3A...&code=ABC"`) into a
+/// list of `(name, value)` pairs, with percent-decoding applied.
+///
+/// Repeated parameters (`?property=parent&property=child`) each produce a
+/// separate entry, so `collect_str_params` works correctly for GET requests.
+pub fn parse_query_string(raw: &str) -> Vec<(String, String)> {
+    form_urlencoded::parse(raw.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+/// Convert `(name, value)` pairs (from a GET query string) into a FHIR
+/// `parameter` array compatible with `find_str_param` / `collect_str_params`.
+///
+/// Each pair becomes `{"name": name, "valueString": value}`.
+pub fn query_params_to_fhir_params(pairs: Vec<(String, String)>) -> Vec<Value> {
+    pairs
+        .into_iter()
+        .map(|(name, value)| json!({"name": name, "valueString": value}))
+        .collect()
 }
 
 // ── Building helpers ───────────────────────────────────────────────────────────

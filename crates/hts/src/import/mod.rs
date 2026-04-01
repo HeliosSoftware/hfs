@@ -29,28 +29,6 @@ impl ImportStats {
     }
 }
 
-/// Trait for import pipeline implementations.
-///
-/// Each importer handles a specific content type and data format.
-/// The MVP P0 implementation is [`fhir_bundle::FhirBundleImporter`].
-/// Additional importers (SNOMED RF2, LOINC CSV) will be added in Phase 13.
-#[allow(dead_code)]
-#[async_trait]
-pub trait Importer: Send + Sync {
-    /// Human-readable name of this importer (used in logs).
-    fn name(&self) -> &'static str;
-
-    /// Returns `true` if this importer can process the given `Content-Type`.
-    fn can_handle(&self, content_type: &str) -> bool;
-
-    /// Import raw bytes into the terminology store using the given tenant context.
-    ///
-    /// Returns [`ImportStats`] with counts of successfully imported resources plus
-    /// any non-fatal errors. Fatal errors (e.g. broken DB connection) are returned
-    /// as `Err`.
-    async fn import(&self, ctx: &TenantContext, data: &[u8]) -> Result<ImportStats, HtsError>;
-}
-
 /// Backend capability for FHIR Bundle import.
 ///
 /// Separate from [`crate::traits::TerminologyBackend`] so that backends can opt

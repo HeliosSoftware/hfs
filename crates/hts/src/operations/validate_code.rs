@@ -15,7 +15,10 @@
 //! # FHIR specifications
 //! - CodeSystem: <https://hl7.org/fhir/codesystem-operation-validate-code.html>
 //! - ValueSet:   <https://hl7.org/fhir/valueset-operation-validate-code.html>
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{RawQuery, State},
+};
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
@@ -24,15 +27,14 @@ use crate::state::AppState;
 use crate::traits::{CodeSystemOperations, TerminologyBackend, ValueSetOperations};
 use crate::types::ValidateCodeRequest;
 
-use super::params::{extract_parameter_array, find_str_param};
+use super::params::{
+    extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
+};
 
-/// POST /CodeSystem/$validate-code
-pub async fn validate_code_handler<B: TerminologyBackend>(
-    State(state): State<AppState<B>>,
-    Json(body): Json<Value>,
+async fn process_validate_code<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
 ) -> Result<Json<Value>, HtsError> {
-    let params = extract_parameter_array(&body)?;
-
     // FHIR R4/R5 spec: the parameter is `url` (CodeSystem canonical URL).
     // `system` is not accepted — clients must use `url`.
     let system = find_str_param(&params, "url").ok_or_else(|| {
@@ -57,7 +59,6 @@ pub async fn validate_code_handler<B: TerminologyBackend>(
     let ctx = TenantContext::system();
     let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
 
-    // ── Build FHIR Parameters response ─────────────────────────────────────────
     let mut parameter: Vec<Value> = vec![json!({"name": "result", "valueBoolean": resp.result})];
 
     if let Some(msg) = resp.message {
@@ -74,19 +75,31 @@ pub async fn validate_code_handler<B: TerminologyBackend>(
     })))
 }
 
-// ── ValueSet/$validate-code ────────────────────────────────────────────────────
-
-/// POST /ValueSet/$validate-code
-///
-/// Accepts a FHIR Parameters resource with `url` (ValueSet canonical URL),
-/// `code`, and optional `system` / `display`. Returns a FHIR Parameters
-/// resource with `result`, optional `message`, and optional `display`.
-pub async fn vs_validate_code_handler<B: TerminologyBackend>(
+/// POST /CodeSystem/$validate-code
+pub async fn validate_code_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HtsError> {
     let params = extract_parameter_array(&body)?;
+    process_validate_code(&state, params).await
+}
 
+/// GET /CodeSystem/$validate-code?url=...&code=...
+pub async fn get_validate_code_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, HtsError> {
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    process_validate_code(&state, params).await
+}
+
+// ── ValueSet/$validate-code ────────────────────────────────────────────────────
+
+async fn process_vs_validate_code<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Json<Value>, HtsError> {
     // ValueSet/$validate-code uses `url` for the ValueSet canonical URL.
     let url = find_str_param(&params, "url").ok_or_else(|| {
         HtsError::InvalidRequest("Missing required parameter: url (ValueSet canonical URL)".into())
@@ -110,7 +123,6 @@ pub async fn vs_validate_code_handler<B: TerminologyBackend>(
     let ctx = TenantContext::system();
     let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
 
-    // ── Build FHIR Parameters response ────────────────────────────────────────
     let mut parameter: Vec<Value> = vec![json!({"name": "result", "valueBoolean": resp.result})];
 
     if let Some(msg) = resp.message {
@@ -125,6 +137,25 @@ pub async fn vs_validate_code_handler<B: TerminologyBackend>(
         "resourceType": "Parameters",
         "parameter": parameter
     })))
+}
+
+/// POST /ValueSet/$validate-code
+pub async fn vs_validate_code_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HtsError> {
+    let params = extract_parameter_array(&body)?;
+    process_vs_validate_code(&state, params).await
+}
+
+/// GET /ValueSet/$validate-code?url=...&code=...
+pub async fn get_vs_validate_code_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, HtsError> {
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    process_vs_validate_code(&state, params).await
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

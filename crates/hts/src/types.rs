@@ -1,4 +1,8 @@
-// Types are defined incrementally across phases; later phases will use them all.
+//! Domain types shared across HTS operations and storage backends.
+//!
+//! These structs model the request/response contracts for all FHIR terminology
+//! operations: `$lookup`, `$validate-code`, `$subsumes`, `$expand`,
+//! `$translate`, and `$closure`.
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};

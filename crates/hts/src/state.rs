@@ -1,6 +1,3 @@
-// AppState fields and methods will be used by operation handlers in Phases 4–10.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 #[cfg(feature = "sqlite")]
@@ -18,7 +15,7 @@ use crate::traits::TerminologyBackend;
 /// `B` is the concrete terminology backend (e.g., `SqliteTerminologyBackend`).
 /// The backend is wrapped in `Arc` so it can be cheaply cloned across threads.
 ///
-/// Phase 9 adds two optional fields:
+/// Two optional fields support the CRUD API:
 /// - `resource_store`: a `helios-persistence` `SqliteBackend` for raw FHIR JSON
 ///   storage (CRUD, versioning, ETag). Uses the same SQLite file as `backend`.
 /// - `hts_pool`: a cloned r2d2 pool pointing at the HTS SQLite database, used
@@ -28,19 +25,21 @@ pub struct AppState<B: TerminologyBackend> {
     /// The backing terminology store.
     pub backend: Arc<B>,
 
-    /// helios-persistence raw resource store (Phase 9: CRUD API).
+    /// Raw FHIR resource store for versioned CRUD over the same SQLite file.
     #[cfg(feature = "sqlite")]
     pub resource_store: Option<Arc<SqliteBackend>>,
 
-    /// r2d2 pool for HTS normalized tables (Phase 9: CRUD re-indexing).
+    /// r2d2 pool for the HTS normalized tables; used by CRUD handlers to
+    /// re-index terminology after a create, update, or delete.
     #[cfg(feature = "sqlite")]
     pub hts_pool: Option<Arc<Pool<SqliteConnectionManager>>>,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
     /// Wrap `backend` in an `Arc` and return a ready-to-use state.
+    ///
     /// `resource_store` and `hts_pool` start as `None`; call
-    /// [`with_resource_store`] and [`with_hts_pool`] to enable Phase 9 CRUD.
+    /// [`with_resource_store`] and [`with_hts_pool`] to enable the CRUD API.
     pub fn new(backend: B) -> Self {
         Self {
             backend: Arc::new(backend),
@@ -68,14 +67,6 @@ impl<B: TerminologyBackend> AppState<B> {
     /// Access the terminology backend directly (avoids cloning the `Arc`).
     pub fn backend(&self) -> &B {
         &self.backend
-    }
-
-    /// Borrow the raw resource store, returning an error if not initialised.
-    #[cfg(feature = "sqlite")]
-    pub fn require_resource_store(&self) -> Result<&SqliteBackend, HtsError> {
-        self.resource_store
-            .as_deref()
-            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))
     }
 
     /// Clone the HTS pool Arc, returning an error if not initialised.

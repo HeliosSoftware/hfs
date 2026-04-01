@@ -7,7 +7,10 @@
 //! # FHIR specification
 //! <https://hl7.org/fhir/valueset-operation-expand.html>
 
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{RawQuery, State},
+};
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
@@ -16,15 +19,14 @@ use crate::state::AppState;
 use crate::traits::{TerminologyBackend, ValueSetOperations};
 use crate::types::ExpandRequest;
 
-use super::params::{extract_parameter_array, find_str_param};
+use super::params::{
+    extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
+};
 
-/// POST /ValueSet/$expand
-pub async fn expand_handler<B: TerminologyBackend>(
-    State(state): State<AppState<B>>,
-    Json(body): Json<Value>,
+async fn process_expand<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
 ) -> Result<Json<Value>, HtsError> {
-    let params = extract_parameter_array(&body)?;
-
     let url = find_str_param(&params, "url").ok_or_else(|| {
         HtsError::InvalidRequest("Missing required parameter: url (ValueSet canonical URL)".into())
     })?;
@@ -92,6 +94,25 @@ pub async fn expand_handler<B: TerminologyBackend>(
         "resourceType": "ValueSet",
         "expansion": expansion,
     })))
+}
+
+/// POST /ValueSet/$expand
+pub async fn expand_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HtsError> {
+    let params = extract_parameter_array(&body)?;
+    process_expand(&state, params).await
+}
+
+/// GET /ValueSet/$expand?url=...
+pub async fn get_expand_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, HtsError> {
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    process_expand(&state, params).await
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

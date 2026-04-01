@@ -1,21 +1,11 @@
-mod backend;
-mod config;
-mod error;
-mod import;
-mod operations;
-mod server;
-mod state;
-mod traits;
-mod types;
-
 use clap::Parser;
-use config::HtsConfig;
+use helios_hts::config::HtsConfig;
 use tracing::info;
 
 #[cfg(feature = "sqlite")]
-use backend::SqliteTerminologyBackend;
+use helios_hts::backend::SqliteTerminologyBackend;
 #[cfg(feature = "sqlite")]
-use state::AppState;
+use helios_hts::state::AppState;
 
 fn init_logging(log_level: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
@@ -55,7 +45,7 @@ async fn run(config: HtsConfig) -> anyhow::Result<()> {
 
     // ── helios-persistence raw resource store ────────────────────────────────
     // Shares the same SQLite file; uses separate tables (resources, resource_history).
-    // Provides versioning, ETags, and soft-delete semantics for Phase 9 CRUD.
+    // Provides versioning, ETags, and soft-delete semantics for the CRUD API.
     let resource_store = SqliteBackend::open(&config.database_url)
         .map_err(|e| anyhow::anyhow!("Failed to open resource store: {e}"))?;
     resource_store
@@ -68,7 +58,7 @@ async fn run(config: HtsConfig) -> anyhow::Result<()> {
         .with_resource_store(resource_store)
         .with_hts_pool(hts_pool);
 
-    let app = server::create_app(&config, state);
+    let app = helios_hts::server::create_app(&config, state);
 
     let addr = config.socket_addr();
     info!(address = %addr, "HTS listening");

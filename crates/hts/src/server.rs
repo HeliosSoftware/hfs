@@ -13,14 +13,17 @@ use crate::operations::crud::{
     delete_concept_map, delete_value_set, read_code_system, read_concept_map, read_value_set,
     update_code_system, update_concept_map, update_value_set,
 };
-use crate::operations::expand::expand_handler;
+use crate::operations::expand::{expand_handler, get_expand_handler};
 use crate::operations::health::health_handler;
 use crate::operations::import_bundle::import_handler;
-use crate::operations::lookup::lookup_handler;
+use crate::operations::lookup::{get_lookup_handler, lookup_handler};
 use crate::operations::metadata::metadata_handler;
-use crate::operations::subsumes::subsumes_handler;
-use crate::operations::translate::translate_handler;
-use crate::operations::validate_code::{validate_code_handler, vs_validate_code_handler};
+use crate::operations::subsumes::{get_subsumes_handler, subsumes_handler};
+use crate::operations::translate::{get_translate_handler, translate_handler};
+use crate::operations::validate_code::{
+    get_validate_code_handler, get_vs_validate_code_handler, validate_code_handler,
+    vs_validate_code_handler,
+};
 use crate::state::AppState;
 use crate::traits::TerminologyBackend;
 
@@ -34,28 +37,39 @@ where
     Router::new()
         // ── Utility ──────────────────────────────────────────────────────────
         .route("/health", get(health_handler))
-        // ── Phase 10: TerminologyCapabilities ─────────────────────────────────
+        // ── Capabilities ─────────────────────────────────────────────────────
         .route("/metadata", get(metadata_handler::<B>))
-        // ── Phase 4: CodeSystem operations ───────────────────────────────────
-        .route("/CodeSystem/$lookup", post(lookup_handler::<B>))
+        // ── CodeSystem operations ─────────────────────────────────────────────
+        .route(
+            "/CodeSystem/$lookup",
+            get(get_lookup_handler::<B>).post(lookup_handler::<B>),
+        )
         .route(
             "/CodeSystem/$validate-code",
-            post(validate_code_handler::<B>),
+            get(get_validate_code_handler::<B>).post(validate_code_handler::<B>),
         )
-        // ── Phase 5: $subsumes ───────────────────────────────────────────────
-        .route("/CodeSystem/$subsumes", post(subsumes_handler::<B>))
-        // ── Phase 6: FHIR Bundle import ───────────────────────────────────────
+        .route(
+            "/CodeSystem/$subsumes",
+            get(get_subsumes_handler::<B>).post(subsumes_handler::<B>),
+        )
+        // ── Bundle import ─────────────────────────────────────────────────────
         .route("/import", post(import_handler::<B>))
-        // ── Phase 7: ValueSet operations ──────────────────────────────────────
-        .route("/ValueSet/$expand", post(expand_handler::<B>))
+        // ── ValueSet operations ───────────────────────────────────────────────
+        .route(
+            "/ValueSet/$expand",
+            get(get_expand_handler::<B>).post(expand_handler::<B>),
+        )
         .route(
             "/ValueSet/$validate-code",
-            post(vs_validate_code_handler::<B>),
+            get(get_vs_validate_code_handler::<B>).post(vs_validate_code_handler::<B>),
         )
-        // ── Phase 8: ConceptMap operations ────────────────────────────────────
-        .route("/ConceptMap/$translate", post(translate_handler::<B>))
+        // ── ConceptMap operations ─────────────────────────────────────────────
+        .route(
+            "/ConceptMap/$translate",
+            get(get_translate_handler::<B>).post(translate_handler::<B>),
+        )
         .route("/ConceptMap/$closure", post(closure_handler::<B>))
-        // ── Phase 9: Resource CRUD API ────────────────────────────────────────
+        // ── Resource CRUD ─────────────────────────────────────────────────────
         .route("/CodeSystem", post(create_code_system::<B>))
         .route(
             "/CodeSystem/{id}",

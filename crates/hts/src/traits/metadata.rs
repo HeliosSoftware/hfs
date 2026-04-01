@@ -1,4 +1,7 @@
-// Trait methods are called by the /metadata handler added in Phase 10.
+//! Introspection trait for terminology backends.
+//!
+//! [`TerminologyMetadata`] exposes the static metadata used by the `/metadata`
+//! endpoint to build a FHIR `TerminologyCapabilities` resource.
 #![allow(dead_code)]
 
 /// Introspection trait for terminology backends.

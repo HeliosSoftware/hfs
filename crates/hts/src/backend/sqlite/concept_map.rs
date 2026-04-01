@@ -1,7 +1,5 @@
 //! SQLite implementation of [`ConceptMapOperations`].
 //!
-//! Phase 8: `$translate` and `$closure`.
-//!
 //! **`$translate`** queries `concept_map_elements` (and optionally filters by
 //! `concept_maps.url` and/or source/target system). Supports reverse mode
 //! (`reverse = true`) which swaps source↔target lookup direction.

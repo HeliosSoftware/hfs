@@ -181,7 +181,7 @@ where
 
     // Pre-process :in / :not-in modifiers via the terminology server (if configured).
     if let Some(ts_url) = state.terminology_server_url() {
-        params = expand_terminology_params(params, ts_url).await;
+        params = expand_terminology_params(params, ts_url).await?;
     }
 
     // Convert REST params to persistence SearchQuery
@@ -438,9 +438,10 @@ mod urlencoding {
 /// expanded codes joined by commas (FHIR OR semantics).
 /// Example: `code:in=http://example.org/vs` → `code=http://cs|A,http://cs|B`
 ///
-/// **`:not-in` modifier** — The ValueSet is expanded for informational
-/// purposes, but `:not-in` cannot be expressed as a single SQLite search
-/// parameter.  A warning is logged and the parameter is dropped (fail-open).
+/// **`:not-in` modifier** — Returns `Err(RestError::NotImplemented)` so the
+/// caller can surface an explicit 501 to the client.  Silently dropping a
+/// negation filter would return incorrect results (all resources instead of
+/// the expected subset), which is worse than an honest error.
 ///
 /// All other parameters pass through unchanged. On individual expansion
 /// failures the problematic parameter is skipped with a warning so a single
@@ -448,7 +449,7 @@ mod urlencoding {
 async fn expand_terminology_params(
     params: HashMap<String, String>,
     ts_url: &str,
-) -> HashMap<String, String> {
+) -> Result<HashMap<String, String>, RestError> {
     let client = TerminologyServiceClient::new(ts_url.to_string());
     let mut result: HashMap<String, String> = HashMap::with_capacity(params.len());
 
@@ -495,37 +496,22 @@ async fn expand_terminology_params(
                 }
             }
         } else if let Some(param_name) = key.strip_suffix(":not-in") {
-            // :not-in requires negated filtering which the SQLite backend does
-            // not support natively.  Expand the set for logging, then skip.
-            match client.expand_value_set(&value).await {
-                Ok(codes) => {
-                    warn!(
-                        param = %param_name,
-                        vs_url = %value,
-                        expanded_codes = %codes.len(),
-                        "search :not-in modifier: ValueSet expanded but negated \
-                         value-set filtering is not supported by the SQLite backend; \
-                         this parameter will be ignored (results may include codes \
-                         that are in the set)"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        param = %param_name,
-                        vs_url = %value,
-                        error = %e,
-                        "search :not-in modifier: ValueSet $expand failed; \
-                         parameter ignored (fail-open)"
-                    );
-                }
-            }
-            // Do not insert into result — parameter is dropped.
+            // :not-in requires negated value-set filtering which the current
+            // SQLite search backend does not support.  Return an explicit error
+            // rather than silently dropping the parameter — a silent drop would
+            // return all resources when the client expects a filtered subset.
+            return Err(RestError::NotImplemented {
+                feature: format!(
+                    "search modifier ':not-in' is not supported (param: {param_name}, \
+                     ValueSet: {value}); use ':in' or remove this modifier"
+                ),
+            });
         } else {
             result.insert(key, value);
         }
     }
 
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -589,18 +575,19 @@ mod tests {
         params.insert("_count".to_string(), "10".to_string());
 
         // Use a URL that won't be reachable — but only :in/:not-in keys trigger calls.
-        let result = expand_terminology_params(params.clone(), "http://localhost:9999").await;
+        let result = expand_terminology_params(params.clone(), "http://localhost:9999")
+            .await
+            .unwrap();
 
         assert_eq!(result.get("name"), Some(&"Smith".to_string()));
         assert_eq!(result.get("_count"), Some(&"10".to_string()));
     }
 
-    /// Verifies that a :not-in param is dropped (not forwarded to storage).
-    ///
-    /// This test uses a URL that won't be reachable; the function should log a
-    /// warning and drop the param gracefully (fail-open).
+    /// Verifies that a `:not-in` parameter returns `NotImplemented` rather than
+    /// silently dropping the filter (which would return incorrect results).
     #[tokio::test]
-    async fn test_expand_terminology_params_not_in_dropped_on_network_error() {
+    async fn test_expand_terminology_params_not_in_returns_not_implemented() {
+        use crate::error::RestError;
         let mut params = HashMap::new();
         params.insert(
             "code:not-in".to_string(),
@@ -610,10 +597,8 @@ mod tests {
 
         let result = expand_terminology_params(params, "http://127.0.0.1:19999").await;
 
-        // :not-in param is dropped, other params survive
-        assert!(!result.contains_key("code:not-in"));
-        assert!(!result.contains_key("code"));
-        assert_eq!(result.get("name"), Some(&"Smith".to_string()));
+        // :not-in must return an explicit error, not silently drop the filter.
+        assert!(matches!(result, Err(RestError::NotImplemented { .. })));
     }
 
     /// Verifies that a :in param is dropped on network error (fail-open).
@@ -622,7 +607,9 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("code:in".to_string(), "http://example.org/vs".to_string());
 
-        let result = expand_terminology_params(params, "http://127.0.0.1:19999").await;
+        let result = expand_terminology_params(params, "http://127.0.0.1:19999")
+            .await
+            .unwrap();
 
         // The :in key is gone; no code key was injected either (fail-open)
         assert!(!result.contains_key("code:in"));
