@@ -26,7 +26,7 @@ use helios_persistence::tenant::TenantContext;
 /// [`AppState`]: crate::state::AppState
 #[derive(Clone)]
 pub struct SqliteTerminologyBackend {
-    // Used by operation impls (Phases 4–7) and the metadata trait.
+    // Shared across all operation impls and the metadata trait.
     #[allow(dead_code)]
     pool: Pool<SqliteConnectionManager>,
 }
@@ -103,8 +103,7 @@ impl SqliteTerminologyBackend {
     }
 
     /// Borrow the underlying r2d2 connection pool.
-    #[allow(dead_code)]
-    pub(crate) fn pool(&self) -> &Pool<SqliteConnectionManager> {
+    pub fn pool(&self) -> &Pool<SqliteConnectionManager> {
         &self.pool
     }
 }

@@ -1,4 +1,7 @@
-// Trait methods will be called by operation handlers added in Phase 7.
+//! Trait definition for FHIR ConceptMap operations.
+//!
+//! Backends implement [`ConceptMapOperations`] to provide concept translation
+//! (`$translate`) and transitive closure computation (`$closure`).
 #![allow(dead_code)]
 
 use async_trait::async_trait;

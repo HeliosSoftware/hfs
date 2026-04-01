@@ -1,7 +1,5 @@
 //! SQLite implementation of [`ValueSetOperations`].
 //!
-//! Phase 7: `$expand` and `ValueSet/$validate-code`.
-//!
 //! **Expansion strategy:**
 //! - Lazy: expansion is computed on the first `$expand` call and cached in
 //!   `value_set_expansions`.

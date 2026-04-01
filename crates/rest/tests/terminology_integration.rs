@@ -185,13 +185,12 @@ async fn test_in_modifier_passthrough_when_no_terminology_server() {
     );
 }
 
-/// When a `:not-in` parameter is used, HFS calls $expand (to log the size of
-/// the set) but drops the parameter before querying the backend (fail-open).
-/// The search should succeed and return results as if the filter wasn't there.
+/// When a `:not-in` parameter is used, HFS returns 501 Not Implemented rather
+/// than silently dropping the filter (which would return incorrect results).
 #[tokio::test]
-async fn test_not_in_modifier_is_dropped() {
+async fn test_not_in_modifier_returns_not_implemented() {
     let expansion = make_expansion("http://example.org/cs", &["X", "Y"]);
-    let (ts_url, requests) = start_mock_hts(expansion).await;
+    let (ts_url, _requests) = start_mock_hts(expansion).await;
 
     let server = create_hfs_with_terminology_server(&ts_url);
 
@@ -200,16 +199,9 @@ async fn test_not_in_modifier_is_dropped() {
         .add_query_param("code:not-in", "http://example.org/vs")
         .await;
 
-    // Search should succeed (200) even though the filter was dropped.
-    assert_eq!(response.status_code(), StatusCode::OK);
-
-    // HTS should have been called to expand the set.
-    let reqs = requests.lock().unwrap();
-    assert_eq!(
-        reqs.len(),
-        1,
-        "Expected one $expand call for :not-in logging"
-    );
+    // :not-in must return an explicit error rather than silently returning
+    // all resources as if the filter wasn't applied.
+    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
 }
 
 /// When the HTS is unreachable, `:in` parameters are dropped (fail-open) and

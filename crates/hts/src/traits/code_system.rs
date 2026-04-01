@@ -1,4 +1,7 @@
-// Trait methods will be called by operation handlers added in Phases 4–5.
+//! Trait definition for FHIR CodeSystem operations.
+//!
+//! Backends implement [`CodeSystemOperations`] to provide concept lookup,
+//! code validation, and subsumption testing over their stored code systems.
 #![allow(dead_code)]
 
 use async_trait::async_trait;

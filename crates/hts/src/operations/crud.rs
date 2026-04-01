@@ -1,4 +1,4 @@
-//! Phase 9: Resource CRUD API
+//! Resource CRUD API for CodeSystem, ValueSet, and ConceptMap.
 //!
 //! Handlers for GET / POST / PUT / DELETE on CodeSystem, ValueSet, and
 //! ConceptMap resources.
@@ -34,8 +34,10 @@ mod inner {
     use crate::import::ImportStats;
     use crate::import::fhir_bundle::{
         delete_code_system as hts_delete_cs, delete_concept_map as hts_delete_cm,
-        delete_value_set as hts_delete_vs, import_code_system as hts_import_cs,
-        import_concept_map as hts_import_cm, import_value_set as hts_import_vs,
+        delete_value_set as hts_delete_vs, get_code_system_url as hts_get_cs_url,
+        import_code_system as hts_import_cs, import_concept_map as hts_import_cm,
+        import_value_set as hts_import_vs,
+        invalidate_expansion_cache_for_system as hts_invalidate_expansion_cache,
     };
     use crate::state::AppState;
     use crate::traits::TerminologyBackend;
@@ -212,8 +214,16 @@ mod inner {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
             // Delete old normalized rows (ON DELETE CASCADE propagates to children).
+            // For CodeSystem: also invalidate cached value set expansions that
+            // drew from this system's URL — they are no longer valid after the
+            // system content changes.
             match resource_type {
-                "CodeSystem" => hts_delete_cs(&conn, &resource_id)?,
+                "CodeSystem" => {
+                    if let Some(url) = hts_get_cs_url(&conn, &resource_id)? {
+                        hts_invalidate_expansion_cache(&conn, &url)?;
+                    }
+                    hts_delete_cs(&conn, &resource_id)?;
+                }
                 "ValueSet" => hts_delete_vs(&conn, &resource_id)?,
                 "ConceptMap" => hts_delete_cm(&conn, &resource_id)?,
                 _ => {}
@@ -273,7 +283,14 @@ mod inner {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
             match resource_type {
-                "CodeSystem" => hts_delete_cs(&conn, &resource_id),
+                "CodeSystem" => {
+                    // Invalidate cached expansions derived from this system
+                    // before removing the system itself.
+                    if let Some(url) = hts_get_cs_url(&conn, &resource_id)? {
+                        hts_invalidate_expansion_cache(&conn, &url)?;
+                    }
+                    hts_delete_cs(&conn, &resource_id)
+                }
                 "ValueSet" => hts_delete_vs(&conn, &resource_id),
                 "ConceptMap" => hts_delete_cm(&conn, &resource_id),
                 _ => Ok(()),

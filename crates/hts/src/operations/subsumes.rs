@@ -10,7 +10,10 @@
 ///
 /// # FHIR specification
 /// <https://hl7.org/fhir/codesystem-operation-subsumes.html>
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{RawQuery, State},
+};
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
@@ -19,15 +22,14 @@ use crate::state::AppState;
 use crate::traits::{CodeSystemOperations, TerminologyBackend};
 use crate::types::{SubsumesRequest, SubsumptionOutcome};
 
-use super::params::{extract_parameter_array, find_str_param};
+use super::params::{
+    extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
+};
 
-/// POST /CodeSystem/$subsumes
-pub async fn subsumes_handler<B: TerminologyBackend>(
-    State(state): State<AppState<B>>,
-    Json(body): Json<Value>,
+async fn process_subsumes<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
 ) -> Result<Json<Value>, HtsError> {
-    let params = extract_parameter_array(&body)?;
-
     let system = find_str_param(&params, "system")
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: system".into()))?;
 
@@ -60,6 +62,25 @@ pub async fn subsumes_handler<B: TerminologyBackend>(
             {"name": "outcome", "valueCode": outcome_str}
         ]
     })))
+}
+
+/// POST /CodeSystem/$subsumes
+pub async fn subsumes_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HtsError> {
+    let params = extract_parameter_array(&body)?;
+    process_subsumes(&state, params).await
+}
+
+/// GET /CodeSystem/$subsumes?system=...&codeA=...&codeB=...
+pub async fn get_subsumes_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, HtsError> {
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    process_subsumes(&state, params).await
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

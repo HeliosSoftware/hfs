@@ -1,4 +1,7 @@
-// Trait methods will be called by operation handlers added in Phase 6.
+//! Trait definition for FHIR ValueSet operations.
+//!
+//! Backends implement [`ValueSetOperations`] to provide value set expansion
+//! (`$expand`) and code validation (`$validate-code`).
 #![allow(dead_code)]
 
 use async_trait::async_trait;

@@ -15,64 +15,18 @@ use r2d2_sqlite::SqliteConnectionManager;
 #[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 
-use async_trait::async_trait;
-use helios_persistence::tenant::TenantContext;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::HtsError;
-use crate::import::{ImportStats, Importer};
-
-// ── FhirBundleImporter ─────────────────────────────────────────────────────────
-
-/// Imports FHIR Bundles containing `CodeSystem`, `ValueSet`, and/or `ConceptMap`
-/// resources into the SQLite terminology store.
-///
-/// Constructed from an r2d2 connection pool and implements the [`Importer`]
-/// trait so it can be used both directly and through the `POST /import` HTTP handler.
-/// Future Phase 13 importers (SNOMED RF2, LOINC CSV) will follow the same pattern.
-#[allow(dead_code)]
-#[cfg(feature = "sqlite")]
-pub struct FhirBundleImporter {
-    pool: Pool<SqliteConnectionManager>,
-}
-
-#[cfg(feature = "sqlite")]
-impl FhirBundleImporter {
-    /// Create a new importer that will use the given connection pool.
-    #[allow(dead_code)]
-    pub fn new(pool: Pool<SqliteConnectionManager>) -> Self {
-        Self { pool }
-    }
-}
-
-#[cfg(feature = "sqlite")]
-#[async_trait]
-impl Importer for FhirBundleImporter {
-    fn name(&self) -> &'static str {
-        "fhir-bundle"
-    }
-
-    fn can_handle(&self, content_type: &str) -> bool {
-        content_type.contains("application/fhir+json") || content_type.contains("application/json")
-    }
-
-    async fn import(&self, _ctx: &TenantContext, data: &[u8]) -> Result<ImportStats, HtsError> {
-        let pool = self.pool.clone();
-        let data_vec = data.to_vec();
-
-        tokio::task::spawn_blocking(move || import_bundle_sync(&pool, &data_vec))
-            .await
-            .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
-    }
-}
+use crate::import::ImportStats;
 
 // ── Core import logic (synchronous, runs in spawn_blocking) ───────────────────
 
 /// Parse a FHIR Bundle from raw bytes and insert its resources into SQLite.
 ///
-/// This is `pub(crate)` so `SqliteTerminologyBackend::import_bundle` can delegate
-/// to it without going through the full `Importer` trait.
+/// Called by `SqliteTerminologyBackend::import_bundle` and the `POST /import`
+/// HTTP handler.
 #[cfg(feature = "sqlite")]
 pub(crate) fn import_bundle_sync(
     pool: &Pool<SqliteConnectionManager>,
@@ -384,7 +338,7 @@ pub(crate) fn import_value_set(
     let status = vs["status"].as_str().unwrap_or("active");
 
     // Store the raw compose element as JSON; expansion is deferred to the first
-    // $expand call (Phase 7 lazy-expansion strategy).
+    // $expand call using a lazy-expansion strategy.
     let compose_json = vs["compose"]
         .as_object()
         .map(|_| serde_json::to_string(&vs["compose"]).unwrap_or_default());
@@ -482,7 +436,41 @@ pub(crate) fn import_concept_map(
     Ok(())
 }
 
-// ── Normalized-table delete helpers (used by Phase 9 CRUD handlers) ───────────
+// ── Normalized-table delete helpers (used by CRUD handlers) ───────────────────
+
+/// Look up a CodeSystem's canonical URL by its FHIR resource `id`.
+///
+/// Returns `Ok(None)` when no code system with that `id` exists.
+#[cfg(feature = "sqlite")]
+pub(crate) fn get_code_system_url(conn: &Connection, id: &str) -> Result<Option<String>, HtsError> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT url FROM code_systems WHERE id = ?1",
+        rusqlite::params![id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Delete all cached value set expansion rows that were derived from the given
+/// code system URL.
+///
+/// Called before a CodeSystem is updated or deleted to prevent stale cached
+/// expansions from being returned by subsequent `$expand` calls.
+/// The expansion will be recomputed on the next `$expand` invocation.
+#[cfg(feature = "sqlite")]
+pub(crate) fn invalidate_expansion_cache_for_system(
+    conn: &Connection,
+    system_url: &str,
+) -> Result<(), HtsError> {
+    conn.execute(
+        "DELETE FROM value_set_expansions WHERE system_url = ?1",
+        rusqlite::params![system_url],
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(())
+}
 
 /// Delete a CodeSystem and all its normalized data (concepts, hierarchy,
 /// properties, designations) by its FHIR resource `id`.

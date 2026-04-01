@@ -1,6 +1,15 @@
 use axum::{Json, extract::State, response::IntoResponse};
 use serde_json::{Value, json};
 
+#[cfg(feature = "R4")]
+use helios_fhir::r4::{
+    TerminologyCapabilities, TerminologyCapabilitiesClosure, TerminologyCapabilitiesCodeSystem,
+    TerminologyCapabilitiesExpansion, TerminologyCapabilitiesImplementation,
+    TerminologyCapabilitiesSoftware, TerminologyCapabilitiesTranslation,
+    TerminologyCapabilitiesValidateCode,
+};
+use helios_fhir::{Element, PrecisionDateTime};
+
 use crate::import::BundleImportBackend;
 use crate::state::AppState;
 use crate::traits::{TerminologyBackend, TerminologyMetadata};
@@ -23,59 +32,111 @@ where
 
 /// Build the `TerminologyCapabilities` JSON value from backend metadata.
 ///
-/// Separated from the handler so it can be tested independently without
-/// needing a running Axum server.
+/// Constructs a typed `TerminologyCapabilities` (FHIR R4) model and serializes it
+/// to JSON. Separated from the handler so it can be tested without a running server.
+#[cfg(feature = "R4")]
 pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Value {
-    let code_systems: Vec<Value> = backend
+    let code_systems: Vec<TerminologyCapabilitiesCodeSystem> = backend
         .supported_systems()
         .into_iter()
-        .map(|url| {
-            json!({
-                "uri": url,
-                "subsumption": backend.supports_subsumption()
-            })
+        .map(|url| TerminologyCapabilitiesCodeSystem {
+            uri: Some(Element {
+                value: Some(url),
+                ..Default::default()
+            }),
+            subsumption: Some(Element {
+                value: Some(backend.supports_subsumption()),
+                ..Default::default()
+            }),
+            ..Default::default()
         })
         .collect();
 
-    json!({
-        "resourceType": "TerminologyCapabilities",
-        "status": "active",
-        "experimental": false,
-        "kind": "terminology",
-        "software": {
-            "name": HTS_NAME,
-            "version": HTS_VERSION
+    let caps = TerminologyCapabilities {
+        status: Element {
+            value: Some("active".to_string()),
+            ..Default::default()
         },
-        "implementation": {
-            "description": "Helios Terminology Service SQLite backend"
+        kind: Element {
+            value: Some("terminology".to_string()),
+            ..Default::default()
         },
-        "codeSearch": "all",
-        "codeSystem": code_systems,
-        "expansion": {
-            "hierarchical": false,
-            "paging": true,
-            "incomplete": false
+        // Use a fixed publication date; this value identifies the capability document itself.
+        date: Element {
+            value: Some(PrecisionDateTime::from_date(2026, 4, 1)),
+            ..Default::default()
         },
-        "validateCode": {
-            "translations": false
-        },
-        "translation": {
-            "needsMap": true
-        },
-        "closure": {
-            "translation": false
-        },
-        // List all six supported FHIR terminology operations.
-        // Each entry names an operation that the service will respond to.
-        "operationSupported": [
-            { "name": "$lookup",        "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup" },
-            { "name": "$validate-code", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code" },
-            { "name": "$subsumes",      "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-subsumes" },
-            { "name": "$expand",        "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand" },
-            { "name": "$translate",     "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate" },
-            { "name": "$closure",       "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-closure" }
-        ]
-    })
+        experimental: Some(Element {
+            value: Some(false),
+            ..Default::default()
+        }),
+        software: Some(TerminologyCapabilitiesSoftware {
+            name: Element {
+                value: Some(HTS_NAME.to_string()),
+                ..Default::default()
+            },
+            version: Some(Element {
+                value: Some(HTS_VERSION.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        implementation: Some(TerminologyCapabilitiesImplementation {
+            description: Element {
+                value: Some("Helios Terminology Service SQLite backend".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        code_search: Some(Element {
+            value: Some("all".to_string()),
+            ..Default::default()
+        }),
+        code_system: Some(code_systems),
+        expansion: Some(TerminologyCapabilitiesExpansion {
+            hierarchical: Some(Element {
+                value: Some(false),
+                ..Default::default()
+            }),
+            paging: Some(Element {
+                value: Some(true),
+                ..Default::default()
+            }),
+            incomplete: Some(Element {
+                value: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        validate_code: Some(TerminologyCapabilitiesValidateCode {
+            translations: Element {
+                value: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        translation: Some(TerminologyCapabilitiesTranslation {
+            needs_map: Element {
+                value: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        closure: Some(TerminologyCapabilitiesClosure {
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let mut value = serde_json::to_value(&caps).unwrap_or_else(|_| json!({}));
+    // `resourceType` is not emitted by the FhirSerde struct serializer; add it explicitly.
+    value["resourceType"] = json!("TerminologyCapabilities");
+    value
+}
+
+#[cfg(not(feature = "R4"))]
+pub fn build_terminology_capabilities(_backend: &impl TerminologyMetadata) -> Value {
+    json!({ "resourceType": "TerminologyCapabilities", "status": "active", "kind": "terminology" })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -108,37 +169,18 @@ mod tests {
     }
 
     #[test]
+    fn kind_is_terminology() {
+        let caps = build_terminology_capabilities(&backend());
+        assert_eq!(caps["kind"], "terminology");
+    }
+
+    #[test]
     fn software_name_and_version_present() {
         let caps = build_terminology_capabilities(&backend());
         assert_eq!(caps["software"]["name"], HTS_NAME);
         // version is the crate version from CARGO_PKG_VERSION — just check it's a non-empty string.
         let ver = caps["software"]["version"].as_str().unwrap_or("");
         assert!(!ver.is_empty(), "software.version must not be empty");
-    }
-
-    #[test]
-    fn all_six_operations_listed() {
-        let caps = build_terminology_capabilities(&backend());
-        let ops = caps["operationSupported"]
-            .as_array()
-            .expect("operationSupported must be an array");
-        let op_names: Vec<&str> = ops.iter().filter_map(|o| o["name"].as_str()).collect();
-
-        let expected = [
-            "$lookup",
-            "$validate-code",
-            "$subsumes",
-            "$expand",
-            "$translate",
-            "$closure",
-        ];
-        for name in &expected {
-            assert!(
-                op_names.contains(name),
-                "operation {name} missing from operationSupported"
-            );
-        }
-        assert_eq!(op_names.len(), 6, "expected exactly 6 operations");
     }
 
     #[test]
@@ -253,7 +295,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(body["resourceType"], "TerminologyCapabilities");
-        let ops = body["operationSupported"].as_array().unwrap();
-        assert_eq!(ops.len(), 6);
+        assert_eq!(body["status"], "active");
+        assert_eq!(body["kind"], "terminology");
     }
 }

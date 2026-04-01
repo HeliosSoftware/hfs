@@ -1,12 +1,15 @@
-/// Handler for `POST /CodeSystem/$lookup`.
+/// Handlers for `GET` and `POST /CodeSystem/$lookup`.
 ///
-/// Accepts a FHIR Parameters resource, extracts `system`, `code`, and optional
-/// fields, delegates to the terminology backend, and returns the result as a
-/// FHIR Parameters resource.
+/// Accepts a FHIR Parameters resource (POST) or URL query string (GET),
+/// extracts `system`, `code`, and optional fields, delegates to the
+/// terminology backend, and returns the result as a FHIR Parameters resource.
 ///
 /// # FHIR specification
 /// <https://hl7.org/fhir/codesystem-operation-lookup.html>
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{RawQuery, State},
+};
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
@@ -16,16 +19,14 @@ use crate::traits::TerminologyBackend;
 use crate::types::LookupRequest;
 
 use super::params::{
-    collect_str_params, extract_parameter_array, find_str_param, property_value_part,
+    collect_str_params, extract_parameter_array, find_str_param, parse_query_string,
+    property_value_part, query_params_to_fhir_params,
 };
 
-/// POST /CodeSystem/$lookup
-pub async fn lookup_handler<B: TerminologyBackend>(
-    State(state): State<AppState<B>>,
-    Json(body): Json<Value>,
+async fn process_lookup<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
 ) -> Result<Json<Value>, HtsError> {
-    let params = extract_parameter_array(&body)?;
-
     let system = find_str_param(&params, "system")
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: system".into()))?;
 
@@ -89,6 +90,25 @@ pub async fn lookup_handler<B: TerminologyBackend>(
         "resourceType": "Parameters",
         "parameter": parameter
     })))
+}
+
+/// POST /CodeSystem/$lookup
+pub async fn lookup_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HtsError> {
+    let params = extract_parameter_array(&body)?;
+    process_lookup(&state, params).await
+}
+
+/// GET /CodeSystem/$lookup?system=...&code=...
+pub async fn get_lookup_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, HtsError> {
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    process_lookup(&state, params).await
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
