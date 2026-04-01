@@ -22,9 +22,6 @@ cloudwatch = ["dep:aws-sdk-cloudwatchlogs", "dep:aws-config"]
 # FHIR models
 helios-fhir = { path = "../fhir" }
 
-# Auth trait (AuditEventSink bridge)
-helios-auth = { path = "../auth" }
-
 # Serialization
 serde.workspace = true
 serde_json.workspace = true

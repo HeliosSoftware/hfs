@@ -17,8 +17,11 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use helios_audit::{
+    AuditAction, AuditAgent, AuditConfig, AuditEventBuilder, AuditSink, ExclusionFilter,
+};
 use helios_auth::{
-    AuditEventSink, AuthConfig, AuthError, AuthProvider, FhirOperation, Principal, SmartScopePolicy,
+    AuthConfig, AuthError, AuthProvider, FhirOperation, Principal, SmartScopePolicy,
 };
 use tracing::{debug, warn};
 
@@ -29,7 +32,11 @@ pub struct AuthMiddlewareState {
     /// Auth configuration.
     pub config: Arc<AuthConfig>,
     /// Audit event sink.
-    pub audit_sink: Arc<dyn AuditEventSink>,
+    pub audit_sink: Arc<dyn AuditSink>,
+    /// Source observer reference for audit events.
+    pub audit_source_observer: String,
+    /// Exclusion filter for audit events.
+    pub audit_exclusion_filter: ExclusionFilter,
 }
 
 /// Paths that are exempt from authentication.
@@ -81,10 +88,17 @@ pub async fn auth_middleware(
     let auth_header = match auth_header {
         Some(h) => h.to_string(),
         None => {
-            auth_state
-                .audit_sink
-                .record_auth_failure(&AuthError::MissingToken, &path, &method)
-                .await;
+            if !auth_state
+                .audit_exclusion_filter
+                .is_excluded(&path, &method)
+            {
+                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                    .action(AuditAction::Execute)
+                    .outcome("8")
+                    .outcome_desc(AuthError::MissingToken.to_string())
+                    .build();
+                auth_state.audit_sink.record(event).await;
+            }
             return unauthorized_response("Missing Authorization header");
         }
     };
@@ -97,19 +111,36 @@ pub async fn auth_middleware(
                 iss = %principal.issuer(),
                 "Authentication successful"
             );
-            auth_state
-                .audit_sink
-                .record_auth_success(&principal, &path, &method)
-                .await;
+            if !auth_state
+                .audit_exclusion_filter
+                .is_excluded(&path, &method)
+            {
+                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                    .action(AuditAction::Execute)
+                    .outcome("0")
+                    .agent(principal.subject(), None, true)
+                    .build();
+                auth_state.audit_sink.record(event).await;
+            }
+            request
+                .extensions_mut()
+                .insert(AuditAgent(principal.subject().to_string()));
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
         Err(err) => {
             warn!(error = %err, path = %path, "Authentication failed");
-            auth_state
-                .audit_sink
-                .record_auth_failure(&err, &path, &method)
-                .await;
+            if !auth_state
+                .audit_exclusion_filter
+                .is_excluded(&path, &method)
+            {
+                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                    .action(AuditAction::Execute)
+                    .outcome("8")
+                    .outcome_desc(err.to_string())
+                    .build();
+                auth_state.audit_sink.record(event).await;
+            }
             unauthorized_response(&err.to_string())
         }
     }
@@ -146,10 +177,14 @@ pub async fn authz_middleware(
                     operation = %operation,
                     "Authorization granted"
                 );
-                auth_state
-                    .audit_sink
-                    .record_authz_grant(&principal, &resource_type, &operation.to_string())
-                    .await;
+                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                    .action(AuditAction::Execute)
+                    .outcome("0")
+                    .outcome_desc(format!("Granted: {operation} on {resource_type}"))
+                    .agent(principal.subject(), None, true)
+                    .resource(&resource_type, "")
+                    .build();
+                auth_state.audit_sink.record(event).await;
             }
             Err(err) => {
                 warn!(
@@ -158,10 +193,14 @@ pub async fn authz_middleware(
                     operation = %operation,
                     "Authorization denied"
                 );
-                auth_state
-                    .audit_sink
-                    .record_authz_denial(&principal, &resource_type, &operation.to_string())
-                    .await;
+                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                    .action(AuditAction::Execute)
+                    .outcome("8")
+                    .outcome_desc(format!("Forbidden: {operation} on {resource_type}"))
+                    .agent(principal.subject(), None, true)
+                    .resource(&resource_type, "")
+                    .build();
+                auth_state.audit_sink.record(event).await;
                 return forbidden_response(&err.to_string());
             }
         }

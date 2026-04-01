@@ -2795,7 +2795,6 @@ dependencies = [
  "aws-sdk-cloudwatchlogs",
  "axum",
  "chrono",
- "helios-auth",
  "helios-fhir",
  "serde",
  "serde_json",

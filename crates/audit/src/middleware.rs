@@ -8,7 +8,6 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::middleware::Next;
 use axum::response::Response;
-use helios_auth::principal::Principal;
 
 use crate::balp;
 use crate::builder::AuditEventBuilder;
@@ -57,6 +56,14 @@ impl AuditMiddlewareState {
     }
 }
 
+/// Agent identifier for audit events.
+///
+/// Set this in request extensions (e.g., from the auth middleware) so the
+/// audit middleware can record who performed the action.  This decouples
+/// the audit crate from the auth crate's `Principal` type.
+#[derive(Clone, Debug)]
+pub struct AuditAgent(pub String);
+
 /// Optional audit context attached by handlers to enrich middleware audit events.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct AuditResponseContext {
@@ -97,7 +104,7 @@ pub async fn audit_middleware(
 
     let resource_id = extract_resource_id(&path);
     let query_params = request.uri().query().map(parse_query_params);
-    let principal = request.extensions().get::<Principal>().cloned();
+    let agent = request.extensions().get::<AuditAgent>().cloned();
 
     // Execute the actual handler
     let response = next.run(request).await;
@@ -153,8 +160,8 @@ pub async fn audit_middleware(
         if let Some(pr) = patient_ref {
             builder = builder.patient(pr);
         }
-        if let Some(p) = &principal {
-            builder = builder.agent(p.subject(), None, true);
+        if let Some(a) = &agent {
+            builder = builder.agent(&a.0, None, true);
         }
 
         sink.record(builder.build()).await;

@@ -31,7 +31,6 @@
 //! | `HFS_AUDIT_EXCLUDE_PATHS` | — | Comma-separated paths to skip |
 
 pub mod balp;
-pub mod bridge;
 pub mod builder;
 pub mod config;
 pub mod correlation;
@@ -46,13 +45,12 @@ pub mod sinks;
 
 // Re-exports for convenience
 pub use balp::AuditAction;
-pub use bridge::AuditBridge;
 pub use builder::AuditEventBuilder;
 pub use config::{AuditBackend, AuditConfig};
 pub use correlation::{AuditCorrelation, BundleAuditEntry};
 pub use error::{AuditError, AuditResult};
 pub use exclusion::ExclusionFilter;
-pub use middleware::{AuditMiddlewareState, AuditResponseContext};
+pub use middleware::{AuditAgent, AuditMiddlewareState, AuditResponseContext};
 pub use sink::AuditSink;
 #[cfg(feature = "cloudwatch")]
 pub use sinks::CloudWatchLogsSink;

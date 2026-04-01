@@ -22,8 +22,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use helios_audit::{
-    AuditBackend, AuditBridge, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter,
-    lifecycle,
+    AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };
 use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
 use helios_rest::{
@@ -199,13 +198,13 @@ async fn init_auth_with_audit(
     );
 
     let audit_config = AuditConfig::from_env();
-    let audit_bridge: Arc<dyn helios_auth::AuditEventSink> =
-        Arc::new(AuditBridge::new(audit_sink, &audit_config));
 
     let auth_state = Arc::new(AuthMiddlewareState {
         provider: Arc::new(provider),
         config: Arc::new(auth_config.clone()),
-        audit_sink: audit_bridge,
+        audit_sink,
+        audit_source_observer: audit_config.source_observer.clone(),
+        audit_exclusion_filter: ExclusionFilter::new(audit_config.exclusions.clone()),
     });
 
     Ok((auth_config, Some(auth_state)))

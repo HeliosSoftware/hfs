@@ -32,7 +32,6 @@ pub mod provider;
 pub mod scope;
 
 // Re-export commonly used types
-pub use audit::{AuditEventSink, NoopAuditEventSink};
 pub use config::AuthConfig;
 pub use discovery::SmartConfiguration;
 pub use error::{AuthError, FhirOperation};
