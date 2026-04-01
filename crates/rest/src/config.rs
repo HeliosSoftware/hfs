@@ -22,6 +22,7 @@
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
 //! | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name for tenant (future use) |
+//! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions |
 //!
 //! # Example
 //!
@@ -347,6 +348,19 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
     pub elasticsearch_password: Option<String>,
 
+    /// URL of the Helios Terminology Service (HTS) for terminology operations.
+    ///
+    /// When set, HFS delegates the following operations to the HTS:
+    /// - FHIR search `:in` modifier  → `POST /ValueSet/$expand`
+    /// - FHIR search `:not-in` modifier → `POST /ValueSet/$expand` (expansion-based)
+    /// - FHIRPath `memberOf()` → `POST /ValueSet/$validate-code` (via env var passthrough)
+    /// - FHIRPath `subsumes()` → `POST /CodeSystem/$subsumes` (via env var passthrough)
+    ///
+    /// Leave unset (default: none) to disable terminology integration.
+    /// Example: `http://localhost:8090`
+    #[arg(long, env = "HFS_TERMINOLOGY_SERVER")]
+    pub terminology_server: Option<String>,
+
     /// Multitenancy configuration (loaded from environment variables).
     #[arg(skip)]
     pub multitenancy: MultitenancyConfig,
@@ -387,6 +401,7 @@ impl Default for ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
         }
     }
@@ -477,6 +492,7 @@ impl ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
         }
     }

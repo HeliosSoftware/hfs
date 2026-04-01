@@ -111,6 +111,14 @@ impl<S: ResourceStorage> AppState<S> {
     pub fn return_gone(&self) -> bool {
         self.config.return_gone
     }
+
+    /// Returns the configured terminology server URL, if any.
+    ///
+    /// When `Some`, the search handler will use this URL to expand ValueSets
+    /// for `:in` and `:not-in` search modifiers.
+    pub fn terminology_server_url(&self) -> Option<&str> {
+        self.config.terminology_server.as_deref()
+    }
 }
 
 #[cfg(test)]

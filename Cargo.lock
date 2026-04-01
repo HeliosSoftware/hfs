@@ -2818,6 +2818,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-hts"
+version = "0.1.47"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "deadpool-postgres",
+ "helios-fhir",
+ "helios-persistence",
+ "r2d2",
+ "r2d2_sqlite",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-postgres",
+ "tower",
+ "tower-http 0.6.8",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "helios-persistence"
 version = "0.1.47"
 dependencies = [
@@ -2882,6 +2910,7 @@ dependencies = [
  "jsonpath-rust",
  "mime",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
