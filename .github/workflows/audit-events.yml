@@ -239,9 +239,11 @@ jobs:
             -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
             -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
             -e KC_HEALTH_ENABLED=true \
-            quay.io/keycloak/keycloak:26.1 start-dev --import-realm > /dev/null
+            --entrypoint /bin/sh \
+            quay.io/keycloak/keycloak:26.1 \
+            -ec 'mkdir -p /opt/keycloak/data/import && cp /tmp/realm.json /opt/keycloak/data/import/realm.json && exec /opt/keycloak/bin/kc.sh start-dev --import-realm' > /dev/null
 
-          docker cp docker/keycloak/realm.json "$KC_CONTAINER":/opt/keycloak/data/import/realm.json
+          docker cp docker/keycloak/realm.json "$KC_CONTAINER":/tmp/realm.json
           docker start "$KC_CONTAINER" > /dev/null
 
           echo "KC_CONTAINER=$KC_CONTAINER" >> $GITHUB_ENV
