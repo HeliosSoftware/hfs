@@ -6,10 +6,10 @@
 use std::sync::Arc;
 
 use axum::{
+    Json,
     extract::{Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
 use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
@@ -941,8 +941,8 @@ mod tests {
 
     use async_trait::async_trait;
     use helios_audit::AuditSink;
-    use helios_fhir::r4::{AuditEvent, AuditEventEntityDetailValue};
     use helios_fhir::FhirVersion;
+    use helios_fhir::r4::{AuditEvent, AuditEventEntityDetailValue};
     use helios_persistence::error::StorageResult;
     use helios_persistence::tenant::TenantContext;
     use helios_persistence::types::StoredResource;
@@ -1137,9 +1137,10 @@ mod tests {
             .collect();
         assert_eq!(bundle_ids.len(), 1);
 
-        assert!(event_details.iter().all(|d| d
-            .get("bundle-type")
-            .is_some_and(|bundle_type| bundle_type == "batch")));
+        assert!(event_details.iter().all(|d| {
+            d.get("bundle-type")
+                .is_some_and(|bundle_type| bundle_type == "batch")
+        }));
 
         let entry_indexes: HashSet<String> = event_details
             .iter()
