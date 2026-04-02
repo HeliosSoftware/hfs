@@ -1,10 +1,33 @@
-//! Handler for `POST /ValueSet/$expand`.
+//! Handlers for `ValueSet/$expand` — type-level and instance-level.
 //!
-//! Accepts a FHIR Parameters resource containing `url` and optional
-//! `filter`, `count`, `offset`. Returns a FHIR ValueSet resource
-//! with an `expansion` element containing all matching codes.
+//! Expansion resolves all codes that belong to a ValueSet and returns them
+//! inside a `ValueSet.expansion.contains[]` array.  Four handler variants are
+//! provided:
 //!
-//! # FHIR specification
+//! * **Type-level POST** — `POST /ValueSet/$expand` with a FHIR `Parameters` body.
+//! * **Type-level GET** — `GET /ValueSet/$expand?url=<url>`.
+//! * **Instance-level POST** — `POST /ValueSet/{id}/$expand`.
+//! * **Instance-level GET** — `GET /ValueSet/{id}/$expand?filter=...`.
+//!
+//! ## Supported parameters
+//!
+//! | Parameter | Type | Description |
+//! |-----------|------|-------------|
+//! | `url` | uri | Canonical URL of the ValueSet (type-level) |
+//! | `filter` | string | Substring filter on code or display |
+//! | `count` | integer | Page size |
+//! | `offset` | integer | Zero-based page start |
+//! | `date` | dateTime | Point-in-time ISO-8601 date for evaluation |
+//! | `hierarchical` | boolean | Return a tree-structured expansion instead of a flat list |
+//!
+//! ## Implicit ValueSets
+//!
+//! When `url` matches a CodeSystem's `valueSet` property and no explicit
+//! ValueSet resource exists for that URL, the expansion falls back to all
+//! codes in that CodeSystem (FHIR R5 §4.8.7).
+//!
+//! ## FHIR specification
+//!
 //! <https://hl7.org/fhir/valueset-operation-expand.html>
 
 use axum::{
@@ -26,7 +49,14 @@ use super::params::{
     extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
 };
 
-/// Serialize a single `ExpansionContains` entry (and its nested children) to JSON.
+/// Serialize a single [`ExpansionContains`] entry to a FHIR-compliant JSON value.
+///
+/// Recursively serializes nested `contains` arrays, so that a hierarchical
+/// expansion (produced when `hierarchical=true`) is correctly represented as
+/// nested `contains[]` objects rather than a flat list.
+///
+/// The `display` field is omitted when absent, and `contains` is omitted when
+/// the entry has no children — keeping the output compact for flat expansions.
 fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
     let mut item = json!({
         "system": c.system,
@@ -115,7 +145,11 @@ async fn process_expand<B: TerminologyBackend>(
     }))
 }
 
-/// POST /ValueSet/$expand
+/// `POST /ValueSet/$expand`
+///
+/// Accepts a FHIR `Parameters` body.  The `url` parameter (canonical ValueSet
+/// URL) is required.  Content negotiation via `Accept` header or `_format`
+/// query parameter selects JSON or XML output.
 pub async fn expand_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
     RawQuery(raw): RawQuery,
@@ -128,7 +162,11 @@ pub async fn expand_handler<B: TerminologyBackend>(
     Ok(fhir_respond(process_expand(&state, params).await?, format))
 }
 
-/// GET /ValueSet/$expand?url=...
+/// `GET /ValueSet/$expand?url=<url>`
+///
+/// URL query parameters are mapped to FHIR `Parameters` name/value pairs and
+/// processed identically to the POST form.  `url`, `filter`, `count`, `offset`,
+/// `date`, and `hierarchical` are all accepted.
 pub async fn get_expand_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
     headers: HeaderMap,
@@ -180,7 +218,13 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
     ))
 }
 
-/// GET /ValueSet/{id}/$expand?filter=...&count=...
+/// `GET /ValueSet/{id}/$expand?filter=<text>&count=<n>`
+///
+/// Instance-level GET variant.  Resolves the ValueSet canonical URL from its
+/// FHIR logical `id` and merges it with the remaining query-string parameters
+/// before dispatching to the shared expansion pipeline.
+///
+/// Returns 404 when no ValueSet with the given `id` is found.
 pub async fn get_expand_by_id<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
     Path(id): Path<String>,

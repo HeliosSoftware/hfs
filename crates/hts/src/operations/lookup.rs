@@ -1,11 +1,26 @@
-/// Handlers for `GET` and `POST /CodeSystem/$lookup`.
-///
-/// Accepts a FHIR Parameters resource (POST) or URL query string (GET),
-/// extracts `system`, `code`, and optional fields, delegates to the
-/// terminology backend, and returns the result as a FHIR Parameters resource.
-///
-/// # FHIR specification
-/// <https://hl7.org/fhir/codesystem-operation-lookup.html>
+//! Handlers for `CodeSystem/$lookup` — both type-level and instance-level.
+//!
+//! The lookup operation returns display name, designations, and arbitrary
+//! concept properties for a single code in a given code system.  Two
+//! addressing styles are supported:
+//!
+//! * **Type-level** — `GET /CodeSystem/$lookup?system=<url>&code=<code>` /
+//!   `POST /CodeSystem/$lookup` with a FHIR `Parameters` body.
+//! * **Instance-level** — `GET /CodeSystem/{id}/$lookup?code=<code>` /
+//!   `POST /CodeSystem/{id}/$lookup` — resolves the canonical URL from the
+//!   resource `id`, then delegates to the same logic as the type-level endpoint.
+//!
+//! ## Response shape
+//!
+//! All variants return a FHIR `Parameters` resource.  The mandatory `name`
+//! parameter carries the CodeSystem's human name; optional parameters include
+//! `version`, `display`, `property` (multi-valued), and `designation`
+//! (multi-valued with language/use/value parts).
+//!
+//! ## FHIR specification
+//!
+//! <https://hl7.org/fhir/codesystem-operation-lookup.html>
+
 use axum::{
     Json,
     extract::{Path, RawQuery, State},
@@ -26,6 +41,23 @@ use super::params::{
     property_value_part, query_params_to_fhir_params,
 };
 
+/// Core lookup logic shared by all four public handlers.
+///
+/// Extracts `system`, `code`, and optional parameters (`version`,
+/// `displayLanguage`, `expression`, `property`, `date`) from the normalised
+/// `params` list, delegates to [`TerminologyBackend::lookup`], and assembles
+/// the FHIR `Parameters` response.
+///
+/// ## Parameters
+/// - `state` — application state holding the terminology backend.
+/// - `params` — normalised FHIR parameter list (name/value pairs as JSON
+///   objects).  Both POST body and GET query string params flow through this
+///   function after normalisation by their respective callers.
+///
+/// ## Returns
+/// A `serde_json::Value` representing a FHIR `Parameters` resource, or an
+/// [`HtsError`] (400 when `system`/`code` are missing, 404 when the code is
+/// not found, 501 when `expression` is supplied).
 async fn process_lookup<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
@@ -96,7 +128,12 @@ async fn process_lookup<B: TerminologyBackend>(
     }))
 }
 
-/// POST /CodeSystem/$lookup
+/// `POST /CodeSystem/$lookup`
+///
+/// Accepts a FHIR `Parameters` body.  The `system` (CodeSystem URL) and `code`
+/// parameters are required; `version`, `displayLanguage`, `property`, and
+/// `date` are optional.  Content negotiation via `Accept` header or `_format`
+/// query parameter selects JSON or XML output.
 pub async fn lookup_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
     RawQuery(raw): RawQuery,
@@ -109,7 +146,11 @@ pub async fn lookup_handler<B: TerminologyBackend>(
     Ok(fhir_respond(process_lookup(&state, params).await?, format))
 }
 
-/// GET /CodeSystem/$lookup?system=...&code=...
+/// `GET /CodeSystem/$lookup?system=<url>&code=<code>`
+///
+/// URL query parameters are mapped to FHIR `Parameters` name/value pairs and
+/// then processed identically to the POST form.  `system`, `version`,
+/// `displayLanguage`, `property`, and `date` are all accepted.
 pub async fn get_lookup_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
     headers: HeaderMap,
@@ -122,10 +163,19 @@ pub async fn get_lookup_handler<B: TerminologyBackend>(
     Ok(fhir_respond(process_lookup(&state, params).await?, format))
 }
 
-/// Inject (or replace) the `system` parameter in a params list.
+/// Inject (or replace) the `system` parameter in a FHIR params list.
 ///
-/// Removes any existing `system` entry from the caller's params so that the
-/// resource-id-resolved system URL always wins, then prepends it.
+/// Used by the instance-level handlers (`/CodeSystem/{id}/$lookup`) to ensure
+/// the canonical URL resolved from the resource `id` always takes precedence
+/// over any `system` value the caller may have supplied.
+///
+/// ## Parameters
+/// - `params` — existing parameter list (may contain a `system` entry).
+/// - `system` — canonical URL resolved from the CodeSystem's logical `id`.
+///
+/// ## Returns
+/// A new params list with the resolved `system` prepended and any prior
+/// `system` entry removed.
 fn inject_system(mut params: Vec<Value>, system: String) -> Vec<Value> {
     params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("system"));
     let mut with_system = vec![json!({"name": "system", "valueUri": system})];
@@ -133,10 +183,14 @@ fn inject_system(mut params: Vec<Value>, system: String) -> Vec<Value> {
     with_system
 }
 
-/// POST /CodeSystem/{id}/$lookup
+/// `POST /CodeSystem/{id}/$lookup`
 ///
-/// Resolves the CodeSystem canonical URL from its FHIR `id`, then delegates to
-/// the same lookup logic used by the system-level endpoint.
+/// Instance-level variant of `$lookup`.  Resolves the CodeSystem canonical URL
+/// from its FHIR logical `id`, injects it as the `system` parameter (overriding
+/// any caller-supplied value), and delegates to the same processing pipeline as
+/// the type-level endpoint.
+///
+/// Returns 404 when no CodeSystem with the given `id` is found.
 pub async fn lookup_by_id_post<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
     Path(id): Path<String>,
@@ -160,7 +214,13 @@ pub async fn lookup_by_id_post<B: TerminologyBackend>(
     ))
 }
 
-/// GET /CodeSystem/{id}/$lookup?code=...
+/// `GET /CodeSystem/{id}/$lookup?code=<code>`
+///
+/// Instance-level GET variant.  Resolves the CodeSystem canonical URL from its
+/// FHIR logical `id` and merges it with the query-string parameters before
+/// dispatching to the shared lookup pipeline.
+///
+/// Returns 404 when no CodeSystem with the given `id` is found.
 pub async fn get_lookup_by_id<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
     Path(id): Path<String>,

@@ -1,12 +1,40 @@
 //! SQLite implementation of [`ValueSetOperations`].
 //!
-//! **Expansion strategy:**
-//! - Lazy: expansion is computed on the first `$expand` call and cached in
-//!   `value_set_expansions`.
-//! - `compose.include[]` supports both explicit code lists and full-system
-//!   includes (when no `concept` array is provided).
-//! - `compose.exclude[]` removes specific codes after include is resolved.
-//! - Pagination (`count` + `offset`) is applied in-memory after expansion.
+//! ## Expansion strategy
+//!
+//! Expansion is computed lazily on the first `$expand` call and cached in the
+//! `value_set_expansions` table.  Subsequent calls for the same ValueSet are
+//! served from the cache.  The cache is invalidated (deleted) whenever the
+//! ValueSet or any referenced CodeSystem is updated or deleted.
+//!
+//! ### Compose support
+//!
+//! * `compose.include[].system` — required in every include clause.
+//! * `compose.include[].concept[]` — explicit code list; when absent, all
+//!   codes from the referenced system are included.
+//! * `compose.exclude[]` — removes specific `(system, code)` pairs after all
+//!   includes have been resolved.
+//!
+//! ### Implicit ValueSets
+//!
+//! When the requested URL does not match any `value_sets` row, the backend
+//! checks whether a CodeSystem carries `"valueSet": "<url>"`.  If found, an
+//! on-the-fly expansion of all codes in that CodeSystem is returned (FHIR R5
+//! §4.8.7).  Implicit expansions are not cached because they have no
+//! corresponding row in `value_sets`.
+//!
+//! ### Hierarchical expansion
+//!
+//! When `ExpandRequest::hierarchical` is `Some(true)`, the flat expansion is
+//! restructured into a tree using the pre-materialized `concept_hierarchy`
+//! table.  Pagination is skipped in tree mode; the full tree is always
+//! returned.
+//!
+//! ### Pagination
+//!
+//! `count` (page size) and `offset` (zero-based start) are applied in-memory
+//! after filtering.  The `total` field in the response always reflects the
+//! full (pre-pagination) count.
 
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
@@ -620,7 +648,19 @@ fn build_hierarchical_expansion(
     Ok(roots)
 }
 
-/// Recursively build an `ExpansionContains` with nested children.
+/// Recursively build an [`ExpansionContains`] node with all its nested children.
+///
+/// Looks up `key` in `items_map` to get the base node, then checks
+/// `parent_to_children` for any children of that node, recursing into each
+/// child.  Children are sorted by code before being attached, producing a
+/// deterministic tree order regardless of the order edges were stored in
+/// `concept_hierarchy`.
+///
+/// ## Parameters
+/// - `key` — `(system_url, code)` of the concept to build.
+/// - `items_map` — flat `(system_url, code)` → [`ExpansionContains`] lookup.
+/// - `parent_to_children` — adjacency map built from `concept_hierarchy` edges
+///   that are fully contained within the expansion set.
 fn build_subtree(
     key: &(String, String),
     items_map: &HashMap<(String, String), ExpansionContains>,
