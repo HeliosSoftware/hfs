@@ -141,6 +141,21 @@ let event = AuditEventBuilder::new("Device/hfs")
 
 Details are serialized as `AuditEventEntityDetail` entries on the primary entity, using FHIR's standard tagged key-value structure.
 
+### Terminology Validation Policy
+
+HFS validates emitted audit codings against canonical **CodeSystems** as strict gates:
+
+- `http://terminology.hl7.org/CodeSystem/audit-event-type`
+- `http://hl7.org/fhir/restful-interaction`
+
+Additional **ValueSets** are tracked as advisory context in external audit reports (not hard CI gates unless explicitly profiled for that use case):
+
+- `http://hl7.org/fhir/ValueSet/audit-event-sub-type`
+- `http://hl7.org/fhir/ValueSet/type-restful-interaction`
+- `http://hl7.org/fhir/ValueSet/system-restful-interaction`
+- `http://hl7.org/fhir/ValueSet/interaction-trigger`
+- `http://hl7.org/fhir/ValueSet/testscript-operation-codes`
+
 ## Architecture
 
 The crate is split into six core pieces:
