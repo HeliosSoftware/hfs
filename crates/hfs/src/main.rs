@@ -497,6 +497,7 @@ async fn start_sqlite_elasticsearch(
 
     info!("Composite storage initialized: SQLite (primary) + Elasticsearch (search)");
 
+    let serve_audit_state = audit_state.clone();
     let app = create_app_with_auth(
         composite,
         config.clone(),
@@ -692,6 +693,7 @@ async fn start_postgres_elasticsearch(
 
     info!("Composite storage initialized: PostgreSQL (primary) + Elasticsearch (search)");
 
+    let serve_audit_state = audit_state.clone();
     let app = create_app_with_auth(
         composite,
         config.clone(),
@@ -837,6 +839,7 @@ async fn start_mongodb_elasticsearch(
 
     info!("Composite storage initialized: MongoDB (primary) + Elasticsearch (search)");
 
+    let serve_audit_state = audit_state.clone();
     let app = create_app_with_auth(
         composite,
         config.clone(),
@@ -1084,6 +1087,7 @@ async fn start_s3_elasticsearch(
 
     info!("Composite storage initialized: S3 (primary) + Elasticsearch (search)");
 
+    let serve_audit_state = audit_state.clone();
     let app = create_app_with_auth(
         composite,
         config.clone(),
