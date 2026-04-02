@@ -18,7 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_audit::{
-    AuditAction, AuditAgent, AuditConfig, AuditEventBuilder, AuditSink, ExclusionFilter,
+    AuditAction, AuditAgent, AuditEventBuilder, AuditSink, ExclusionFilter,
 };
 use helios_auth::{
     AuthConfig, AuthError, AuthProvider, FhirOperation, Principal, SmartScopePolicy,
