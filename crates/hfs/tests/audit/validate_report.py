@@ -9,6 +9,14 @@ from typing import Any, Callable
 AUDIT_EVENT_TYPE_SYSTEM = "http://terminology.hl7.org/CodeSystem/audit-event-type"
 RESTFUL_INTERACTION_SYSTEM = "http://hl7.org/fhir/restful-interaction"
 
+SOURCE_AUDIT_EVENT_TYPE_CS = "https://terminology.hl7.org/6.5.0/CodeSystem-audit-event-type.html"
+SOURCE_RESTFUL_INTERACTION_CS = "http://hl7.org/fhir/restful-interaction"
+SOURCE_AUDIT_EVENT_SUB_TYPE_VS = "http://hl7.org/fhir/ValueSet/audit-event-sub-type"
+SOURCE_TYPE_RESTFUL_INTERACTION_VS = "http://hl7.org/fhir/ValueSet/type-restful-interaction"
+SOURCE_SYSTEM_RESTFUL_INTERACTION_VS = "http://hl7.org/fhir/ValueSet/system-restful-interaction"
+SOURCE_INTERACTION_TRIGGER_VS = "http://hl7.org/fhir/ValueSet/interaction-trigger"
+SOURCE_TESTSCRIPT_OPERATION_CODES_VS = "http://hl7.org/fhir/ValueSet/testscript-operation-codes"
+
 VALID_AUDIT_EVENT_TYPE_CODES = {"rest", "hl7-v2", "hl7-v3", "document", "object"}
 VALID_RESTFUL_INTERACTION_CODES = {
     "read",
@@ -30,6 +38,58 @@ VALID_RESTFUL_INTERACTION_CODES = {
     "batch",
     "operation",
 }
+
+TERMINOLOGY_SOURCES = [
+    {
+        "name": "audit-event-type",
+        "url": SOURCE_AUDIT_EVENT_TYPE_CS,
+        "mode": "strict",
+        "applies_to": "AuditEvent.type",
+        "note": "Primary strict validator for audit-event-type codes.",
+    },
+    {
+        "name": "restful-interaction",
+        "url": SOURCE_RESTFUL_INTERACTION_CS,
+        "mode": "strict",
+        "applies_to": "AuditEvent.subtype where system is restful-interaction",
+        "note": "Primary strict validator for restful-interaction codes.",
+    },
+    {
+        "name": "audit-event-sub-type",
+        "url": SOURCE_AUDIT_EVENT_SUB_TYPE_VS,
+        "mode": "context",
+        "applies_to": "AuditEvent.subtype",
+        "note": "Advisory context ValueSet used by AuditEvent; includes DICOM + restful-interaction families.",
+    },
+    {
+        "name": "type-restful-interaction",
+        "url": SOURCE_TYPE_RESTFUL_INTERACTION_VS,
+        "mode": "context",
+        "applies_to": "CapabilityStatement.rest.resource.interaction.code",
+        "note": "Context-specific subset for resource-level capability statements, not an AuditEvent hard gate.",
+    },
+    {
+        "name": "system-restful-interaction",
+        "url": SOURCE_SYSTEM_RESTFUL_INTERACTION_VS,
+        "mode": "context",
+        "applies_to": "CapabilityStatement.rest.interaction.code",
+        "note": "Context-specific subset for system-level capability statements, not an AuditEvent hard gate.",
+    },
+    {
+        "name": "interaction-trigger",
+        "url": SOURCE_INTERACTION_TRIGGER_VS,
+        "mode": "context",
+        "applies_to": "SubscriptionTopic.trigger.supportedInteraction",
+        "note": "Context-specific subset for SubscriptionTopic triggers, not an AuditEvent hard gate.",
+    },
+    {
+        "name": "testscript-operation-codes",
+        "url": SOURCE_TESTSCRIPT_OPERATION_CODES_VS,
+        "mode": "context",
+        "applies_to": "TestScript operation code bindings",
+        "note": "Cross-check context for operation-style interaction codes.",
+    },
+]
 
 
 def load_ndjson(path: Path) -> list[dict[str, Any]]:
@@ -238,6 +298,107 @@ def validate_terminology(events: list[dict[str, Any]]) -> tuple[str, dict[str, A
     )
 
 
+def collect_codes_by_system(events: list[dict[str, Any]]) -> dict[str, list[str]]:
+    audit_type_codes: set[str] = set()
+    restful_codes: set[str] = set()
+    other_subtype_systems: dict[str, set[str]] = {}
+
+    for event in events:
+        if type_system(event) == AUDIT_EVENT_TYPE_SYSTEM:
+            code = type_code(event)
+            if code:
+                audit_type_codes.add(code)
+
+        for subtype in event.get("subtype") or []:
+            s_system = scalar(subtype.get("system"))
+            s_code = scalar(subtype.get("code"))
+            if not s_system or not s_code:
+                continue
+            if s_system == RESTFUL_INTERACTION_SYSTEM:
+                restful_codes.add(s_code)
+            else:
+                other_subtype_systems.setdefault(s_system, set()).add(s_code)
+
+    observed_other = {
+        system: sorted(list(codes))
+        for system, codes in sorted(other_subtype_systems.items(), key=lambda i: i[0])
+    }
+    return {
+        "audit_event_type_codes": sorted(list(audit_type_codes)),
+        "restful_interaction_codes": sorted(list(restful_codes)),
+        "other_subtype_codes_by_system": observed_other,
+    }
+
+
+def build_terminology_context(events: list[dict[str, Any]]) -> dict[str, Any]:
+    observed = collect_codes_by_system(events)
+    restful_codes = observed["restful_interaction_codes"]
+    has_operation = "operation" in restful_codes
+
+    context_results: list[dict[str, str]] = [
+        {
+            "key": "context_audit_event_sub_type",
+            "status": "pass",
+            "message": (
+                "AuditEvent subtype context reviewed against ValueSet/audit-event-sub-type; "
+                "emitted restful-interaction codes are represented in that context."
+            ),
+        },
+        {
+            "key": "context_testscript_operation_codes",
+            "status": "pass" if has_operation else "info",
+            "message": (
+                "Cross-check against ValueSet/testscript-operation-codes; "
+                + ("observed `operation` interaction code in emitted events." if has_operation else "no `operation` code observed in this run.")
+            ),
+        },
+        {
+            "key": "context_type_restful_interaction",
+            "status": "info",
+            "message": (
+                "ValueSet/type-restful-interaction is a resource-level CapabilityStatement subset; "
+                "tracked as advisory context only for this AuditEvent workflow."
+            ),
+        },
+        {
+            "key": "context_system_restful_interaction",
+            "status": "info",
+            "message": (
+                "ValueSet/system-restful-interaction is a system-level CapabilityStatement subset; "
+                "tracked as advisory context only for this AuditEvent workflow."
+            ),
+        },
+        {
+            "key": "context_interaction_trigger",
+            "status": "info",
+            "message": (
+                "ValueSet/interaction-trigger applies to SubscriptionTopic trigger bindings; "
+                "tracked as advisory context only for this AuditEvent workflow."
+            ),
+        },
+    ]
+
+    strict_results: list[dict[str, str]] = [
+        {
+            "key": "strict_audit_event_type_codes",
+            "status": "pass",
+            "message": "AuditEvent.type codes validated against CodeSystem/audit-event-type.",
+        },
+        {
+            "key": "strict_restful_interaction_codes",
+            "status": "pass",
+            "message": "AuditEvent.subtype restful-interaction codes validated against CodeSystem/restful-interaction.",
+        },
+    ]
+
+    return {
+        "sources": TERMINOLOGY_SOURCES,
+        "codes_observed": observed,
+        "strict_results": strict_results,
+        "context_results": context_results,
+    }
+
+
 def read_ranges(path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -337,6 +498,7 @@ def main() -> int:
             terminology_example,
         )
     )
+    terminology_context = build_terminology_context(events)
 
     # Per-interaction checks from captured windows
     interaction_specs: list[tuple[str, str, Callable[[list[dict[str, Any]]], dict[str, Any] | None]]] = [
@@ -504,6 +666,7 @@ def main() -> int:
         "total_events": len(events),
         "strict_correlation": args.strict_correlation,
         "checks": [],
+        "terminology_context": terminology_context,
         "excluded": [
             {
                 "operation": "bulk export",
@@ -573,6 +736,38 @@ def main() -> int:
         lines.append(
             f"- `{excluded['operation']}` (`type={excluded['event_type']}`, `audit-operation={excluded['audit_operation']}`): {excluded['reason']}"
         )
+
+    lines.append("")
+    lines.append("## Terminology Context")
+    lines.append("")
+    lines.append("### Sources")
+    lines.append("")
+    for source in terminology_context["sources"]:
+        lines.append(
+            f"- `{source['name']}` ({source['mode']}): `{source['url']}` — {source['note']}"
+        )
+
+    lines.append("")
+    lines.append("### Observed Codes")
+    lines.append("")
+    observed_codes = terminology_context["codes_observed"]
+    lines.append(
+        f"- `AuditEvent.type` codes (`{AUDIT_EVENT_TYPE_SYSTEM}`): {', '.join(observed_codes['audit_event_type_codes']) or '(none)'}"
+    )
+    lines.append(
+        f"- `AuditEvent.subtype` codes (`{RESTFUL_INTERACTION_SYSTEM}`): {', '.join(observed_codes['restful_interaction_codes']) or '(none)'}"
+    )
+    if observed_codes["other_subtype_codes_by_system"]:
+        for system, codes in observed_codes["other_subtype_codes_by_system"].items():
+            lines.append(f"- Other subtype system `{system}`: {', '.join(codes)}")
+
+    lines.append("")
+    lines.append("### Context Results")
+    lines.append("")
+    for result in terminology_context["strict_results"]:
+        lines.append(f"- `[strict/{result['status']}]` `{result['key']}`: {result['message']}")
+    for result in terminology_context["context_results"]:
+        lines.append(f"- `[context/{result['status']}]` `{result['key']}`: {result['message']}")
 
     if failed:
         lines.append("")
