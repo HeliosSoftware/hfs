@@ -213,9 +213,10 @@ run_call "read_patient" "GET" "/Patient/${PATIENT_ID}" "200" "$(mint_full_token)
 run_call "head_patient" "HEAD" "/Patient/${PATIENT_ID}" "200" "$(mint_full_token)"
 run_call "search_patient_get" "GET" "/Patient?family=${RUN_TAG}" "200" "$(mint_full_token)"
 run_call "search_patient_post" "POST" "/Patient/_search" "200" "$(mint_full_token)" "application/x-www-form-urlencoded" "$RESULTS_DIR/payloads/search_post.form"
-run_call "history_type" "GET" "/Patient/_history" "200" "$(mint_full_token)"
-run_call "history_system" "GET" "/_history" "200" "$(mint_full_token)"
-run_call "history_instance" "GET" "/Patient/${PATIENT_ID}/_history" "200" "$(mint_full_token)"
+# Some backends return 501 for history endpoints while still emitting audit events.
+run_call "history_type" "GET" "/Patient/_history" "200,501" "$(mint_full_token)"
+run_call "history_system" "GET" "/_history" "200,501" "$(mint_full_token)"
+run_call "history_instance" "GET" "/Patient/${PATIENT_ID}/_history" "200,501" "$(mint_full_token)"
 
 run_call "create_observation" "POST" "/Observation" "201" "$(mint_full_token)" "application/fhir+json" "$RESULTS_DIR/payloads/create_observation.json"
 OBSERVATION_ID="$(jq -r '.id // empty' "$RESULTS_DIR/http/create_observation.body")"
