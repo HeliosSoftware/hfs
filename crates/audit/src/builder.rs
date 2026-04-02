@@ -152,15 +152,15 @@ impl AuditEventBuilder {
         let mut entities = Vec::new();
 
         // Entity: the FHIR resource being acted on
-        if let (Some(rt), Some(rid)) = (&self.resource_type, &self.resource_id) {
-            if !rid.is_empty() {
-                entities.push(AuditEventEntity {
-                    what: Some(reference(&format!("{rt}/{rid}"))),
-                    r#type: Some(coding(code_systems::AUDIT_ENTITY_TYPE, "2")),
-                    detail: details.clone(),
-                    ..Default::default()
-                });
-            }
+        if let (Some(rt), Some(rid)) = (&self.resource_type, &self.resource_id)
+            && !rid.is_empty()
+        {
+            entities.push(AuditEventEntity {
+                what: Some(reference(&format!("{rt}/{rid}"))),
+                r#type: Some(coding(code_systems::AUDIT_ENTITY_TYPE, "2")),
+                detail: details.clone(),
+                ..Default::default()
+            });
         }
 
         // If there are details but no resource entity, create a standalone entity
@@ -192,7 +192,9 @@ impl AuditEventBuilder {
                 AuditAction::Update => "update",
                 AuditAction::Delete => "delete",
                 AuditAction::Query => "search",
-                AuditAction::Execute => "execute",
+                // FHIR restful-interaction does not define "execute"; use "operation"
+                // for non-CRUD execution semantics.
+                AuditAction::Execute => "operation",
             };
             vec![coding(code_systems::RESTFUL_INTERACTION, interaction)]
         });
@@ -492,12 +494,24 @@ mod tests {
         let event = AuditEventBuilder::new("Device/hfs")
             .event_type(
                 "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                "export",
+                "object",
             )
             .build();
         assert_eq!(
             event.r#type.code.as_ref().and_then(|c| c.value.as_deref()),
-            Some("export")
+            Some("object")
+        );
+    }
+
+    #[test]
+    fn test_subtype_for_execute_is_operation() {
+        let event = AuditEventBuilder::new("Device/hfs")
+            .action(AuditAction::Execute)
+            .build();
+        let subtypes = event.subtype.as_ref().unwrap();
+        assert_eq!(
+            subtypes[0].code.as_ref().and_then(|c| c.value.as_deref()),
+            Some("operation")
         );
     }
 
