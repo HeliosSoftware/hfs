@@ -73,10 +73,11 @@ pub mod audit {
         let mut builder = AuditEventBuilder::new(source_observer)
             .event_type(
                 "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                "export",
+                "object",
             )
             .action(AuditAction::Execute)
             .outcome(outcome)
+            .detail("audit-operation", "bulk-export")
             .detail("job-id", job_id)
             .detail("export-level", level.to_string());
         if !resource_types.is_empty() {
@@ -116,19 +117,20 @@ pub mod audit {
         }
 
         #[test]
-        fn test_export_event_type_is_export() {
+        fn test_export_event_type_is_object_for_bulk_export() {
             let event = AuditEventBuilder::new("Device/hfs")
                 .event_type(
                     "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                    "export",
+                    "object",
                 )
                 .action(AuditAction::Execute)
                 .outcome("0")
+                .detail("audit-operation", "bulk-export")
                 .detail("job-id", "j1")
                 .build();
             assert_eq!(
                 event.r#type.code.as_ref().and_then(|c| c.value.as_deref()),
-                Some("export")
+                Some("object")
             );
         }
     }
