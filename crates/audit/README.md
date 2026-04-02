@@ -124,13 +124,14 @@ The file sink writes newline-delimited JSON, one `AuditEvent` per line, and flus
 
 ### Rich Event Context
 
-The builder supports attaching arbitrary metadata via `detail()`, custom entities via `entity()`, and non-REST event types via `event_type()`:
+The builder supports attaching arbitrary metadata via `detail()`, custom entities via `entity()`, and explicit event-type overrides via `event_type()`:
 
 ```rust,ignore
 let event = AuditEventBuilder::new("Device/hfs")
-    .event_type("http://terminology.hl7.org/CodeSystem/audit-event-type", "export")
-    .action("E")
+    .event_type("http://terminology.hl7.org/CodeSystem/audit-event-type", "object")
+    .action(AuditAction::Execute)
     .outcome("0")
+    .detail("audit-operation", "bulk-export")
     .detail("job-id", "export-abc-123")
     .detail("export-level", "system")
     .detail("resource-types", "Patient,Observation")
@@ -211,8 +212,8 @@ The `lifecycle` module records server startup and shutdown:
 
 | Event | Type | Action | Details |
 |-------|------|--------|---------|
-| Startup | `lifecycle` | `E` | `phase=startup`, `storage-backend`, `fhir-version`, `auth-enabled`, `audit-backend` |
-| Shutdown | `lifecycle` | `E` | `phase=shutdown` |
+| Startup | `object` | `E` | `audit-operation=lifecycle-startup`, `phase=startup`, `storage-backend`, `fhir-version`, `auth-enabled`, `audit-backend` |
+| Shutdown | `object` | `E` | `audit-operation=lifecycle-shutdown`, `phase=shutdown` |
 
 HFS emits a startup event immediately after the audit subsystem initializes, and a shutdown event during graceful termination (Ctrl-C / SIGINT).
 
@@ -222,10 +223,10 @@ When `helios-persistence` is built with the `audit` feature, each module provide
 
 | Operation | Event Type | Action | Key Details |
 |-----------|-----------|--------|-------------|
-| Bulk export | `export` | `E` | `job-id`, `export-level`, `resource-types` |
-| Bulk submit | `import` | `E` | `submission-id`, `submitter`, `phase` |
-| Purge | `purge` | `D` | `resource-type`, `count`, patient entity |
-| Reindex | `reindex` | `E` | `job-id`, `phase`, `resources-processed` |
+| Bulk export | `object` | `E` | `audit-operation=bulk-export`, `job-id`, `export-level`, `resource-types` |
+| Bulk submit | `object` | `E` | `audit-operation=bulk-import`, `submission-id`, `submitter`, `phase` |
+| Purge | `object` | `D` | `audit-operation=purge`, `resource-type`, `count`, patient entity |
+| Reindex | `object` | `E` | `audit-operation=reindex`, `job-id`, `phase`, `resources-processed` |
 
 These functions live in their respective persistence modules (e.g., `helios_persistence::core::bulk_export::audit::record_export_event`) and are called by the application layer at the appropriate lifecycle points.
 
