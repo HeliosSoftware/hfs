@@ -6,6 +6,32 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+AUDIT_EVENT_TYPE_SYSTEM = "http://terminology.hl7.org/CodeSystem/audit-event-type"
+RESTFUL_INTERACTION_SYSTEM = "http://hl7.org/fhir/restful-interaction"
+
+VALID_AUDIT_EVENT_TYPE_CODES = {"rest", "hl7-v2", "hl7-v3", "document", "object"}
+VALID_RESTFUL_INTERACTION_CODES = {
+    "read",
+    "vread",
+    "update",
+    "patch",
+    "delete",
+    "history",
+    "history-instance",
+    "history-type",
+    "history-system",
+    "create",
+    "search",
+    "search-type",
+    "search-system",
+    "search-compartment",
+    "capabilities",
+    "transaction",
+    "batch",
+    "operation",
+}
+
+
 def load_ndjson(path: Path) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     if not path.exists():
@@ -49,6 +75,10 @@ def scalar(value: Any) -> str:
 
 def type_code(event: dict[str, Any]) -> str:
     return scalar((event.get("type") or {}).get("code"))
+
+
+def type_system(event: dict[str, Any]) -> str:
+    return scalar((event.get("type") or {}).get("system"))
 
 
 def action(event: dict[str, Any]) -> str:
@@ -134,10 +164,14 @@ def find_example(events: list[dict[str, Any]], predicate: Callable[[dict[str, An
 
 
 def is_lifecycle_phase(event: dict[str, Any], phase: str) -> bool:
-    if type_code(event) != "lifecycle":
+    if type_system(event) != AUDIT_EVENT_TYPE_SYSTEM:
         return False
-    values = detail_map(event).get("phase", [])
-    return phase in values
+    if type_code(event) != "object":
+        return False
+    details = detail_map(event)
+    if phase not in details.get("phase", []):
+        return False
+    return f"lifecycle-{phase}" in details.get("audit-operation", [])
 
 
 def is_auth_missing_token(event: dict[str, Any]) -> bool:
@@ -155,7 +189,7 @@ def is_auth_success(event: dict[str, Any]) -> bool:
         return False
     if action(event) != "E":
         return False
-    if "execute" not in subtype_codes(event):
+    if "operation" not in subtype_codes(event):
         return False
     desc = outcome_desc(event)
     if desc:
@@ -177,6 +211,31 @@ def has_subtype(event: dict[str, Any], code: str) -> bool:
 
 def has_ref(event: dict[str, Any], ref: str) -> bool:
     return ref in entity_refs(event)
+
+
+def validate_terminology(events: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:
+    for event in events:
+        t_system = type_system(event)
+        t_code = type_code(event)
+        if t_system == AUDIT_EVENT_TYPE_SYSTEM and t_code not in VALID_AUDIT_EVENT_TYPE_CODES:
+            return (
+                f"Invalid audit-event-type code '{t_code}' for system '{AUDIT_EVENT_TYPE_SYSTEM}'",
+                event,
+            )
+
+        for subtype in event.get("subtype") or []:
+            s_system = scalar(subtype.get("system"))
+            s_code = scalar(subtype.get("code"))
+            if s_system == RESTFUL_INTERACTION_SYSTEM and s_code not in VALID_RESTFUL_INTERACTION_CODES:
+                return (
+                    f"Invalid restful-interaction code '{s_code}' for system '{RESTFUL_INTERACTION_SYSTEM}'",
+                    event,
+                )
+
+    return (
+        "All audited events use valid HL7 audit-event-type and restful-interaction codes",
+        None,
+    )
 
 
 def read_ranges(path: Path) -> list[dict[str, Any]]:
@@ -269,6 +328,15 @@ def main() -> int:
     checks.append(check("auth_success", auth_success_example is not None, "Authentication success", auth_success_example))
     checks.append(check("authz_grant", authz_grant_example is not None, "Authorization grant", authz_grant_example))
     checks.append(check("authz_denial", authz_denial_example is not None, "Authorization denial", authz_denial_example))
+    terminology_message, terminology_example = validate_terminology(events)
+    checks.append(
+        check(
+            "terminology_valid",
+            terminology_example is None,
+            terminology_message,
+            terminology_example,
+        )
+    )
 
     # Per-interaction checks from captured windows
     interaction_specs: list[tuple[str, str, Callable[[list[dict[str, Any]]], dict[str, Any] | None]]] = [
@@ -355,8 +423,8 @@ def main() -> int:
         ),
         (
             "options_execute",
-            "Other method (OPTIONS) -> Execute",
-            lambda evs: find_example(evs, lambda e: has_subtype(e, "execute") and type_code(e) == "rest" and outcome(e) == "8"),
+            "Other method (OPTIONS) -> operation",
+            lambda evs: find_example(evs, lambda e: has_subtype(e, "operation") and type_code(e) == "rest" and outcome(e) == "8"),
         ),
         (
             "delete_observation",
@@ -439,22 +507,26 @@ def main() -> int:
         "excluded": [
             {
                 "operation": "bulk export",
-                "event_type": "export",
+                "event_type": "object",
+                "audit_operation": "bulk-export",
                 "reason": "Not externally routable from the current hfs binary; persistence-layer helper exists but is not wired to public REST operations",
             },
             {
                 "operation": "bulk submit/import",
-                "event_type": "import",
+                "event_type": "object",
+                "audit_operation": "bulk-import",
                 "reason": "Not externally routable from the current hfs binary; persistence-layer helper exists but is not wired to public REST operations",
             },
             {
                 "operation": "purge",
-                "event_type": "purge",
+                "event_type": "object",
+                "audit_operation": "purge",
                 "reason": "Not externally routable from the current hfs binary; persistence-layer helper exists but is not wired to public REST operations",
             },
             {
                 "operation": "reindex",
-                "event_type": "reindex",
+                "event_type": "object",
+                "audit_operation": "reindex",
                 "reason": "Not externally routable from the current hfs binary; persistence-layer helper exists but is not wired to public REST operations",
             },
         ],
@@ -499,7 +571,7 @@ def main() -> int:
     lines.append("")
     for excluded in coverage["excluded"]:
         lines.append(
-            f"- `{excluded['operation']}` (`{excluded['event_type']}`): {excluded['reason']}"
+            f"- `{excluded['operation']}` (`type={excluded['event_type']}`, `audit-operation={excluded['audit_operation']}`): {excluded['reason']}"
         )
 
     if failed:
