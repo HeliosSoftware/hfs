@@ -393,6 +393,9 @@ jobs:
           mkdir -p audit-results
 
           BASE_URL="http://localhost:$HFS_PORT" \
+          KEYCLOAK_URL="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT" \
+          REFRESH_TOKENS_PER_CALL=true \
+          GET_TOKEN_SCRIPT="./docker/keycloak/get-token.sh" \
           FULL_TOKEN="$FULL_TOKEN" \
           READONLY_TOKEN="$READONLY_TOKEN" \
           AUDIT_FILE="$AUDIT_FILE" \

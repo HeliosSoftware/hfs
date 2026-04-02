@@ -2,10 +2,27 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:?BASE_URL is required}"
-FULL_TOKEN="${FULL_TOKEN:?FULL_TOKEN is required}"
-READONLY_TOKEN="${READONLY_TOKEN:?READONLY_TOKEN is required}"
 AUDIT_FILE="${AUDIT_FILE:?AUDIT_FILE is required}"
 RESULTS_DIR="${RESULTS_DIR:-audit-results}"
+REFRESH_TOKENS_PER_CALL="${REFRESH_TOKENS_PER_CALL:-false}"
+GET_TOKEN_SCRIPT="${GET_TOKEN_SCRIPT:-./docker/keycloak/get-token.sh}"
+KEYCLOAK_URL="${KEYCLOAK_URL:-}"
+
+if [ "$REFRESH_TOKENS_PER_CALL" = "true" ]; then
+  FULL_TOKEN="${FULL_TOKEN:-}"
+  READONLY_TOKEN="${READONLY_TOKEN:-}"
+  if [ -z "$KEYCLOAK_URL" ]; then
+    echo "ERROR: KEYCLOAK_URL is required when REFRESH_TOKENS_PER_CALL=true" >&2
+    exit 1
+  fi
+  if [ ! -x "$GET_TOKEN_SCRIPT" ]; then
+    echo "ERROR: GET_TOKEN_SCRIPT is not executable: $GET_TOKEN_SCRIPT" >&2
+    exit 1
+  fi
+else
+  FULL_TOKEN="${FULL_TOKEN:?FULL_TOKEN is required}"
+  READONLY_TOKEN="${READONLY_TOKEN:?READONLY_TOKEN is required}"
+fi
 
 mkdir -p "$RESULTS_DIR/http" "$RESULTS_DIR/events" "$RESULTS_DIR/payloads"
 RANGES_FILE="$RESULTS_DIR/interaction_ranges.tsv"
@@ -71,6 +88,22 @@ capture_event_window() {
   done
 
   echo "$current"
+}
+
+mint_full_token() {
+  if [ "$REFRESH_TOKENS_PER_CALL" = "true" ]; then
+    KEYCLOAK_URL="$KEYCLOAK_URL" "$GET_TOKEN_SCRIPT"
+  else
+    printf "%s" "$FULL_TOKEN"
+  fi
+}
+
+mint_readonly_token() {
+  if [ "$REFRESH_TOKENS_PER_CALL" = "true" ]; then
+    KEYCLOAK_URL="$KEYCLOAK_URL" "$GET_TOKEN_SCRIPT" hfs-readonly-client
+  else
+    printf "%s" "$READONLY_TOKEN"
+  fi
 }
 
 run_call() {
@@ -140,7 +173,7 @@ JSON
 run_call "missing_token_search" "GET" "/Patient" "401" ""
 run_call "invalid_token_search" "GET" "/Patient" "401" "not.a.jwt"
 
-run_call "create_patient" "POST" "/Patient" "201" "$FULL_TOKEN" "application/fhir+json" "$RESULTS_DIR/payloads/create_patient.json"
+run_call "create_patient" "POST" "/Patient" "201" "$(mint_full_token)" "application/fhir+json" "$RESULTS_DIR/payloads/create_patient.json"
 PATIENT_ID="$(jq -r '.id // empty' "$RESULTS_DIR/http/create_patient.body")"
 if [ -z "$PATIENT_ID" ]; then
   echo "ERROR: create_patient response missing id" >&2
@@ -176,15 +209,15 @@ cat > "$RESULTS_DIR/payloads/search_post.form" <<FORM
 name=${RUN_TAG}
 FORM
 
-run_call "read_patient" "GET" "/Patient/${PATIENT_ID}" "200" "$FULL_TOKEN"
-run_call "head_patient" "HEAD" "/Patient/${PATIENT_ID}" "200" "$FULL_TOKEN"
-run_call "search_patient_get" "GET" "/Patient?family=${RUN_TAG}" "200" "$FULL_TOKEN"
-run_call "search_patient_post" "POST" "/Patient/_search" "200" "$FULL_TOKEN" "application/x-www-form-urlencoded" "$RESULTS_DIR/payloads/search_post.form"
-run_call "history_type" "GET" "/Patient/_history" "200" "$FULL_TOKEN"
-run_call "history_system" "GET" "/_history" "200" "$FULL_TOKEN"
-run_call "history_instance" "GET" "/Patient/${PATIENT_ID}/_history" "200" "$FULL_TOKEN"
+run_call "read_patient" "GET" "/Patient/${PATIENT_ID}" "200" "$(mint_full_token)"
+run_call "head_patient" "HEAD" "/Patient/${PATIENT_ID}" "200" "$(mint_full_token)"
+run_call "search_patient_get" "GET" "/Patient?family=${RUN_TAG}" "200" "$(mint_full_token)"
+run_call "search_patient_post" "POST" "/Patient/_search" "200" "$(mint_full_token)" "application/x-www-form-urlencoded" "$RESULTS_DIR/payloads/search_post.form"
+run_call "history_type" "GET" "/Patient/_history" "200" "$(mint_full_token)"
+run_call "history_system" "GET" "/_history" "200" "$(mint_full_token)"
+run_call "history_instance" "GET" "/Patient/${PATIENT_ID}/_history" "200" "$(mint_full_token)"
 
-run_call "create_observation" "POST" "/Observation" "201" "$FULL_TOKEN" "application/fhir+json" "$RESULTS_DIR/payloads/create_observation.json"
+run_call "create_observation" "POST" "/Observation" "201" "$(mint_full_token)" "application/fhir+json" "$RESULTS_DIR/payloads/create_observation.json"
 OBSERVATION_ID="$(jq -r '.id // empty' "$RESULTS_DIR/http/create_observation.body")"
 if [ -z "$OBSERVATION_ID" ]; then
   echo "ERROR: create_observation response missing id" >&2
@@ -192,15 +225,15 @@ if [ -z "$OBSERVATION_ID" ]; then
   exit 1
 fi
 
-run_call "search_subject_query" "GET" "/Observation?subject=Patient/${PATIENT_ID}" "200" "$FULL_TOKEN"
-run_call "search_patient_query" "GET" "/Observation?patient=Patient/${PATIENT_ID}" "200" "$FULL_TOKEN"
-run_call "search_unresolved_query" "GET" "/Observation?code=1234-5" "200" "$FULL_TOKEN"
+run_call "search_subject_query" "GET" "/Observation?subject=Patient/${PATIENT_ID}" "200" "$(mint_full_token)"
+run_call "search_patient_query" "GET" "/Observation?patient=Patient/${PATIENT_ID}" "200" "$(mint_full_token)"
+run_call "search_unresolved_query" "GET" "/Observation?code=1234-5" "200" "$(mint_full_token)"
 
-run_call "update_patient_put" "PUT" "/Patient/${PATIENT_ID}" "200" "$FULL_TOKEN" "application/fhir+json" "$RESULTS_DIR/payloads/update_patient.json"
-run_call "patch_patient" "PATCH" "/Patient/${PATIENT_ID}" "200" "$FULL_TOKEN" "application/merge-patch+json" "$RESULTS_DIR/payloads/patch_patient.json"
+run_call "update_patient_put" "PUT" "/Patient/${PATIENT_ID}" "200" "$(mint_full_token)" "application/fhir+json" "$RESULTS_DIR/payloads/update_patient.json"
+run_call "patch_patient" "PATCH" "/Patient/${PATIENT_ID}" "200" "$(mint_full_token)" "application/merge-patch+json" "$RESULTS_DIR/payloads/patch_patient.json"
 
-run_call "readonly_denied_create" "POST" "/Observation" "403" "$READONLY_TOKEN" "application/fhir+json" "$RESULTS_DIR/payloads/create_observation.json"
-run_call "options_execute" "OPTIONS" "/Patient" "405" "$FULL_TOKEN"
+run_call "readonly_denied_create" "POST" "/Observation" "403" "$(mint_readonly_token)" "application/fhir+json" "$RESULTS_DIR/payloads/create_observation.json"
+run_call "options_execute" "OPTIONS" "/Patient" "405" "$(mint_full_token)"
 
 cat > "$RESULTS_DIR/payloads/batch_bundle.json" <<JSON
 {
@@ -244,11 +277,11 @@ cat > "$RESULTS_DIR/payloads/transaction_bundle.json" <<JSON
 }
 JSON
 
-run_call "batch_bundle" "POST" "/" "200" "$FULL_TOKEN" "application/fhir+json" "$RESULTS_DIR/payloads/batch_bundle.json"
-run_call "transaction_bundle" "POST" "/" "200" "$FULL_TOKEN" "application/fhir+json" "$RESULTS_DIR/payloads/transaction_bundle.json"
+run_call "batch_bundle" "POST" "/" "200" "$(mint_full_token)" "application/fhir+json" "$RESULTS_DIR/payloads/batch_bundle.json"
+run_call "transaction_bundle" "POST" "/" "200" "$(mint_full_token)" "application/fhir+json" "$RESULTS_DIR/payloads/transaction_bundle.json"
 
-run_call "delete_observation" "DELETE" "/Observation/${OBSERVATION_ID}" "204" "$FULL_TOKEN"
-run_call "delete_patient" "DELETE" "/Patient/${PATIENT_ID}" "204" "$FULL_TOKEN"
+run_call "delete_observation" "DELETE" "/Observation/${OBSERVATION_ID}" "204" "$(mint_full_token)"
+run_call "delete_patient" "DELETE" "/Patient/${PATIENT_ID}" "204" "$(mint_full_token)"
 
 # Persist context for the validator/report generator
 cat > "$CONTEXT_FILE" <<JSON
