@@ -17,9 +17,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use helios_audit::{
-    AuditAction, AuditAgent, AuditEventBuilder, AuditSink, ExclusionFilter,
-};
+use helios_audit::{AuditAction, AuditAgent, AuditEventBuilder, AuditSink, ExclusionFilter};
 use helios_auth::{
     AuthConfig, AuthError, AuthProvider, FhirOperation, Principal, SmartScopePolicy,
 };
