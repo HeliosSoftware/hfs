@@ -1,0 +1,2540 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Helios FHIR Server</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="ch01-introduction.html"><strong aria-hidden="true">1.</strong> Introduction</a></li><li class="chapter-item expanded "><a href="ch02-installation.html"><strong aria-hidden="true">2.</strong> Installation</a></li><li class="chapter-item expanded "><a href="ch03-quickstart.html"><strong aria-hidden="true">3.</strong> Quick Start</a></li><li class="chapter-item expanded "><a href="ch04-fhir-basics.html"><strong aria-hidden="true">4.</strong> FHIR Basics</a></li><li class="chapter-item expanded "><a href="ch05-fhirpath.html"><strong aria-hidden="true">5.</strong> FHIRPath Expressions</a></li><li class="chapter-item expanded "><a href="ch06-sql-on-fhir.html"><strong aria-hidden="true">6.</strong> SQL-on-FHIR</a></li><li class="chapter-item expanded "><a href="ch07-architecture.html"><strong aria-hidden="true">7.</strong> Architecture Overview</a></li><li class="chapter-item expanded "><a href="ch08-versions.html"><strong aria-hidden="true">8.</strong> Multi-Version FHIR Support</a></li><li class="chapter-item expanded "><a href="ch09-pysof.html"><strong aria-hidden="true">9.</strong> Python Bindings (pysof)</a></li><li class="chapter-item expanded "><a href="ch10-codegen.html"><strong aria-hidden="true">10.</strong> Code Generation</a></li><li class="chapter-item expanded "><a href="ch11-recipes.html"><strong aria-hidden="true">11.</strong> Use Cases and Recipes</a></li><li class="chapter-item expanded "><a href="ch12-embedding.html"><strong aria-hidden="true">12.</strong> Embedding HFS as a Library</a></li><li class="chapter-item expanded "><a href="ch13-dev-setup.html"><strong aria-hidden="true">13.</strong> Development Setup</a></li><li class="chapter-item expanded "><a href="ch14-contributing.html"><strong aria-hidden="true">14.</strong> Contributing Guidelines</a></li><li class="chapter-item expanded affix "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Appendices</li><li class="chapter-item expanded "><a href="appendix-a-cli.html"><strong aria-hidden="true">15.</strong> CLI Reference</a></li><li class="chapter-item expanded "><a href="appendix-b-fhirpath-functions.html"><strong aria-hidden="true">16.</strong> FHIRPath Function Reference</a></li><li class="chapter-item expanded "><a href="appendix-c-glossary.html"><strong aria-hidden="true">17.</strong> Glossary</a></li><li class="chapter-item expanded "><a href="appendix-d-changelog.html"><strong aria-hidden="true">18.</strong> Changelog</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Helios FHIR Server</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
+<h2 id="what-is-hl7-fhir"><a class="header" href="#what-is-hl7-fhir">What is HL7 FHIR?</a></h2>
+<p><strong>FHIR</strong> (Fast Healthcare Interoperability Resources) is a standard developed by <a href="https://hl7.org/fhir">HL7 International</a> for exchanging electronic health records. It defines a collection of <strong>resources</strong> — typed, self-describing JSON (or XML) documents representing clinical and administrative data such as patients, observations, medications, encounters, and more.</p>
+<p>Each resource has:</p>
+<ul>
+<li>A <code>resourceType</code> field identifying its type (e.g., <code>"Patient"</code>, <code>"Observation"</code>)</li>
+<li>A stable REST API shape: create, read, update, delete, search, history</li>
+<li>A versioned content model with support for extensions</li>
+</ul>
+<p>FHIR is used by EHR vendors, national health networks, payers, and research platforms. It is the foundation for standards such as US Core, Da Vinci, and SMART on FHIR.</p>
+<hr />
+<h2 id="what-is-the-helios-fhir-server"><a class="header" href="#what-is-the-helios-fhir-server">What is the Helios FHIR Server?</a></h2>
+<p>The <strong>Helios FHIR Server (HFS)</strong> is a production-grade implementation of the HL7® FHIR® standard, written in Rust for high performance and optimized for clinical analytics workloads. It provides modular components that can be run as standalone command-line tools, integrated as microservices, or embedded directly into a data analytics pipeline.</p>
+<p><strong>Why Helios?</strong></p>
+<ul>
+<li><strong>Blazing Fast</strong> — Built in Rust for maximum performance and minimal resource usage</li>
+<li><strong>Analytics-First</strong> — Optimized for clinical data analytics and research workloads</li>
+<li><strong>Modular Design</strong> — Use only what you need, from FHIRPath expressions to a full FHIR server</li>
+<li><strong>Multi-Version Support</strong> — Work with R4, R4B, R5, and R6 data in the same application</li>
+<li><strong>Developer Friendly</strong> — Excellent error messages, comprehensive tooling, and CLI tools</li>
+</ul>
+<p>The project ships five standalone tools:</p>
+<div class="table-wrapper"><table><thead><tr><th>Component</th><th>Binary / Package</th><th>Description</th></tr></thead><tbody>
+<tr><td>FHIR REST server</td><td><code>hfs</code></td><td>Full FHIR-compliant REST API</td></tr>
+<tr><td>FHIRPath engine</td><td><code>fhirpath-cli</code> / <code>fhirpath-server</code></td><td>Expression evaluation, CLI and HTTP</td></tr>
+<tr><td>SQL-on-FHIR</td><td><code>sof-cli</code> / <code>sof-server</code></td><td>ViewDefinition-based tabular transforms</td></tr>
+<tr><td>Python bindings</td><td><code>pysof</code> (PyPI)</td><td>SQL-on-FHIR from Python</td></tr>
+<tr><td>CDS Hooks types</td><td><code>helios-cds-hooks</code> (library)</td><td>Protocol types for clinical decision support</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="who-is-this-for"><a class="header" href="#who-is-this-for">Who Is This For?</a></h2>
+<p>HFS is designed for three primary audiences:</p>
+<p><strong>Clinical researchers and data engineers</strong>
+Building ETL pipelines that extract FHIR data from EHR systems, transform it into tabular formats (CSV, Parquet), and load it into analytics platforms or data warehouses.</p>
+<p><strong>Healthcare application developers</strong>
+Building FHIR-compliant REST APIs, integrating CDS Hooks services into EHR workflows, or embedding FHIRPath evaluation into validation pipelines.</p>
+<p><strong>Platform and infrastructure engineers</strong>
+Deploying FHIR servers with polyglot storage backends (SQLite, PostgreSQL, MongoDB, S3, Elasticsearch) and multi-tenant data isolation.</p>
+<p>You do not need to be a Rust programmer to use HFS — most workflows are covered by the CLI tools and the Python <code>pysof</code> package. The Rust API is available for teams embedding HFS into larger systems.</p>
+<hr />
+<h2 id="what-can-you-build-with-hfs"><a class="header" href="#what-can-you-build-with-hfs">What Can You Build With HFS?</a></h2>
+<p><strong>Clinical Research Platforms</strong>
+Transform FHIR data exported from EHR systems into research-ready datasets using SQL-on-FHIR ViewDefinitions. Export to CSV, JSON, NDJSON, or Parquet for downstream analysis in Python, R, or SQL.</p>
+<p><strong>Real-Time Analytics Dashboards</strong>
+Stream FHIR resources through the <code>sof-server</code> HTTP API for operational insights, filtered by patient, time window (<code>_since</code>), and resource type.</p>
+<p><strong>Data Quality and Validation Tools</strong>
+Write FHIRPath expressions that encode clinical invariants and run them over patient cohorts using <code>fhirpath-cli</code> or the HTTP server.</p>
+<p><strong>ETL Pipelines</strong>
+Use <code>pysof</code> to process large NDJSON exports in parallel with chunked streaming. Write to Parquet files for efficient columnar storage. Automate with standard Python tooling.</p>
+<p><strong>High-Performance FHIR APIs</strong>
+Deploy <code>hfs</code> backed by PostgreSQL + Elasticsearch for a production FHIR server with full search, history, versioning, and multi-tenancy. Switch storage backends with a single environment variable.</p>
+<p><strong>CDS Hooks Services</strong>
+Implement the CDS Hooks standard using <code>helios-cds-hooks</code> types and traits, compatible with any Rust async web framework.</p>
+<hr />
+<h2 id="fhir-version-support"><a class="header" href="#fhir-version-support">FHIR Version Support</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Version</th><th>Label</th><th>Status in HFS</th></tr></thead><tbody>
+<tr><td>FHIR R4 (4.0.1)</td><td>Normative</td><td>✅ Default</td></tr>
+<tr><td>FHIR R4B (4.3.0)</td><td>Normative</td><td>✅ Supported</td></tr>
+<tr><td>FHIR R5 (5.0.0)</td><td>Current standard</td><td>✅ Supported</td></tr>
+<tr><td>FHIR R6 (6.0.0-ballot2)</td><td>Latest ballot</td><td>✅ Supported</td></tr>
+</tbody></table>
+</div>
+<p>All four versions are available via Cargo feature flags. The default build compiles R4 only; use <code>--features R4,R4B,R5,R6</code> to enable all versions.</p>
+<hr />
+<p><em>HL7® and FHIR® are registered trademarks of Health Level Seven International.</em></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
+<h2 id="prerequisites-rust-lld-cargo"><a class="header" href="#prerequisites-rust-lld-cargo">Prerequisites: Rust, LLD, Cargo</a></h2>
+<p>To build HFS from source you need:</p>
+<ol>
+<li><strong>Rust</strong> (edition 2024, minimum version 1.90) — installed via <code>rustup</code></li>
+<li><strong>LLD</strong> linker — required on Linux and Windows for fast incremental builds (not required on macOS)</li>
+<li><strong>Cargo</strong> — comes with Rust automatically</li>
+</ol>
+<p>Alternatively, use <a href="ch02-installation.html#option-1-pre-built-binaries">pre-built binaries</a> or <a href="ch02-installation.html#option-2-docker">Docker</a> to skip the build entirely.</p>
+<hr />
+<h2 id="option-1-pre-built-binaries"><a class="header" href="#option-1-pre-built-binaries">Option 1: Pre-built Binaries</a></h2>
+<p>Download the latest release archive for your platform from the <a href="https://github.com/HeliosSoftware/hfs/releases">GitHub Releases</a> page. Extract it; the binaries (<code>hfs</code>, <code>fhirpath-cli</code>, <code>fhirpath-server</code>, <code>sof-cli</code>, <code>sof-server</code>) are ready to use with no build step.</p>
+<hr />
+<h2 id="option-2-docker"><a class="header" href="#option-2-docker">Option 2: Docker</a></h2>
+<p>See the <a href="getting-started/docker.html">Docker page</a> for pull-and-run instructions that require no build step.</p>
+<hr />
+<h2 id="option-3-build-from-source"><a class="header" href="#option-3-build-from-source">Option 3: Build from Source</a></h2>
+<h3 id="installing-rust-via-rustup"><a class="header" href="#installing-rust-via-rustup">Installing Rust via rustup</a></h3>
+<pre><code class="language-bash">curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+</code></pre>
+<p>Follow the on-screen prompts. After installation, open a new terminal and verify:</p>
+<pre><code class="language-bash">rustc --version   # should print 1.90 or newer
+cargo --version
+</code></pre>
+<h3 id="installing-lld"><a class="header" href="#installing-lld">Installing LLD</a></h3>
+<p>LLD is the LLVM linker. It dramatically reduces link times on Linux and Windows.</p>
+<p><strong>Linux (Ubuntu / Debian):</strong></p>
+<pre><code class="language-bash">sudo apt install clang lld
+</code></pre>
+<p><strong>Linux (Fedora / RHEL):</strong></p>
+<pre><code class="language-bash">sudo dnf install clang lld
+</code></pre>
+<p><strong>Windows:</strong>
+Download a pre-built binary from the <a href="https://github.com/llvm/llvm-project/releases">LLVM project GitHub releases</a>. Choose the <code>LLVM-*-win64.exe</code> installer and ensure <code>lld-link.exe</code> is on your <code>PATH</code>.</p>
+<p><strong>macOS:</strong>
+LLD is not required. The default Apple linker works well. No extra installation needed.</p>
+<hr />
+<h3 id="configuring-cargoconfigtoml"><a class="header" href="#configuring-cargoconfigtoml">Configuring <code>~/.cargo/config.toml</code></a></h3>
+<p>Add the following to <code>~/.cargo/config.toml</code> (create the file if it does not exist) to enable LLD on Linux and Windows and tune stack sizes:</p>
+<pre><code class="language-toml">[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]
+
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = [
+  "-C", "link-arg=-Wl,-dead_strip",
+  "-C", "link-arg=-undefined",
+  "-C", "link-arg=dynamic_lookup"
+]
+
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link.exe"
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+</code></pre>
+<hr />
+<h3 id="setting-environment-variables"><a class="header" href="#setting-environment-variables">Setting Environment Variables</a></h3>
+<p>On memory-constrained machines (less than ~8 GB RAM), limit the number of parallel compile jobs to avoid OOM errors:</p>
+<pre><code class="language-bash">export CARGO_BUILD_JOBS=4
+</code></pre>
+<hr />
+<h3 id="cloning-the-repository"><a class="header" href="#cloning-the-repository">Cloning the Repository</a></h3>
+<pre><code class="language-bash">git clone https://github.com/HeliosSoftware/hfs.git
+cd hfs
+</code></pre>
+<hr />
+<h3 id="running-your-first-build"><a class="header" href="#running-your-first-build">Running Your First Build</a></h3>
+<p><strong>Default build</strong> (R4 only, all crates except <code>pysof</code>):</p>
+<pre><code class="language-bash">cargo build --release
+</code></pre>
+<p><strong>Build with all FHIR versions:</strong></p>
+<pre><code class="language-bash">cargo build --release --features R4,R4B,R5,R6
+</code></pre>
+<p>Release binaries land in <code>target/release/</code>:</p>
+<ul>
+<li><code>hfs</code> — FHIR REST server</li>
+<li><code>fhirpath-cli</code> — FHIRPath expression evaluator</li>
+<li><code>fhirpath-server</code> — FHIRPath HTTP server</li>
+<li><code>sof-cli</code> — SQL-on-FHIR CLI</li>
+<li><code>sof-server</code> — SQL-on-FHIR HTTP server</li>
+<li><code>config-advisor</code> — Storage configuration advisor</li>
+</ul>
+<hr />
+<h3 id="troubleshooting-common-errors"><a class="header" href="#troubleshooting-common-errors">Troubleshooting Common Errors</a></h3>
+<p><strong>Build takes more than 10 minutes</strong>
+This is expected on a first build. The <code>helios-fhir</code> crate contains large auto-generated files. Subsequent builds are much faster. Use <code>--features R4</code> (the default) to avoid compiling the R4B/R5/R6 models unless you need them.</p>
+<p><strong>R6 spec download fails during build</strong>
+R6 StructureDefinition files are downloaded automatically from <code>https://build.fhir.org/</code> when the <code>R6</code> feature is enabled. This requires internet access. If you are in an air-gapped environment, use <code>--features R4,R4B,R5</code> and omit R6, or add the <code>skip-r6-download</code> feature flag.</p>
+<p><strong><code>linker 'cc' not found</code> on Linux</strong>
+Install build essentials:</p>
+<pre><code class="language-bash">sudo apt install build-essential
+</code></pre>
+<p><strong><code>error: linking with 'lld-link.exe' failed</code> on Windows</strong>
+Ensure <code>lld-link.exe</code> is on your <code>PATH</code>. Re-check the LLVM installer and open a fresh terminal.</p>
+<p><strong><code>cargo: command not found</code></strong>
+<code>rustup</code> installs Cargo into <code>~/.cargo/bin</code>. Add it to your shell path:</p>
+<pre><code class="language-bash">export PATH="$HOME/.cargo/bin:$PATH"
+</code></pre>
+<p>Add this line to your <code>~/.bashrc</code> or <code>~/.zshrc</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h1>
+<p>These examples assume the binaries are on your <code>PATH</code> (from a release archive or <code>target/release/</code> after a source build).</p>
+<hr />
+<h2 id="running-a-fhirpath-expression-from-the-cli"><a class="header" href="#running-a-fhirpath-expression-from-the-cli">Running a FHIRPath Expression from the CLI</a></h2>
+<pre><code class="language-bash"># Evaluate an expression against a JSON file
+fhirpath-cli -e "Patient.name.family" -r patient.json
+
+# Read from stdin
+echo '{"resourceType":"Patient","id":"123","name":[{"family":"Smith"}]}' \
+  | fhirpath-cli -e "Patient.name.family" -r -
+
+# Use a context expression to scope the root
+fhirpath-cli -c "Patient.name" -e "family" -r patient.json
+
+# Pass a variable
+fhirpath-cli -e "value &gt; %threshold" -r observation.json --var threshold=5.0
+
+# Show the parse tree (no resource needed)
+fhirpath-cli -e "Patient.name.given.first()" --parse-debug-tree
+
+# Specify FHIR version explicitly
+fhirpath-cli --fhir-version R5 -e "Patient.name.family" -r patient.json
+</code></pre>
+<hr />
+<h2 id="transforming-fhir-data-to-csv-with-sof-cli"><a class="header" href="#transforming-fhir-data-to-csv-with-sof-cli">Transforming FHIR Data to CSV with sof-cli</a></h2>
+<pre><code class="language-bash"># Basic transform — FHIR Bundle to CSV (default format)
+sof-cli --view patient-view.json --bundle patients.json
+
+# From an NDJSON file
+sof-cli --view patient-view.json --bundle patients.ndjson
+
+# Choose output format
+sof-cli --view view.json --bundle data.json --format csv
+sof-cli --view view.json --bundle data.json --format ndjson
+sof-cli --view view.json --bundle data.json --format json
+sof-cli --view view.json --bundle data.json --format parquet
+
+# Write to a file instead of stdout
+sof-cli --view view.json --bundle data.json --format csv -o output.csv
+
+# Filter by modification time and limit rows
+sof-cli --view view.json --bundle data.json --since 2024-01-01T00:00:00Z --limit 100
+
+# Load from S3
+sof-cli --view view.json --source s3://my-bucket/fhir-data/patients.ndjson --format csv
+
+# Memory-efficient streaming for large NDJSON files
+sof-cli --view view.json --bundle large-data.ndjson --chunk-size 500
+</code></pre>
+<hr />
+<h2 id="starting-the-sql-on-fhir-server"><a class="header" href="#starting-the-sql-on-fhir-server">Starting the SQL-on-FHIR Server</a></h2>
+<pre><code class="language-bash"># Start with defaults (port 8080)
+sof-server
+
+# Custom port
+SOF_SERVER_PORT=9090 sof-server
+</code></pre>
+<p>Send a transform request:</p>
+<pre><code class="language-bash">curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "_format": "csv",
+    "viewResource": { ... },
+    "resource": [ ... ]
+  }'
+</code></pre>
+<hr />
+<h2 id="starting-the-fhirpath-server"><a class="header" href="#starting-the-fhirpath-server">Starting the FHIRPath Server</a></h2>
+<pre><code class="language-bash"># Start with defaults (port 3000)
+fhirpath-server
+
+# Custom port and host
+FHIRPATH_SERVER_PORT=8080 FHIRPATH_SERVER_HOST=0.0.0.0 fhirpath-server
+</code></pre>
+<p>Evaluate an expression via HTTP:</p>
+<pre><code class="language-bash">curl -X POST http://localhost:3000/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expression": "Patient.name.family",
+    "resourceJson": "{\"resourceType\":\"Patient\",\"name\":[{\"family\":\"Smith\"}]}"
+  }'
+</code></pre>
+<p>Use the version-specific endpoint for explicit version control:</p>
+<pre><code class="language-bash">curl -X POST http://localhost:3000/r4 \
+  -H "Content-Type: application/json" \
+  -d '{ "expression": "...", "resourceJson": "..." }'
+</code></pre>
+<hr />
+<h2 id="starting-the-fhir-rest-server"><a class="header" href="#starting-the-fhir-rest-server">Starting the FHIR REST Server</a></h2>
+<pre><code class="language-bash"># Default: R4, SQLite (fhir.db), port 8080
+hfs
+
+# Verify the server is running
+curl http://localhost:8080/metadata | head -20
+
+# Create a Patient resource
+curl -X POST http://localhost:8080/Patient \
+  -H "Content-Type: application/fhir+json" \
+  -d '{"resourceType":"Patient","name":[{"family":"Smith","given":["John"]}]}'
+
+# Search for patients by family name
+curl "http://localhost:8080/Patient?family=Smith"
+</code></pre>
+<hr />
+<h2 id="next-steps"><a class="header" href="#next-steps">Next Steps</a></h2>
+<ul>
+<li><a href="configuration/storage-backends.html">Configure storage backends</a> for production deployments</li>
+<li><a href="ch05-fhirpath.html">FHIRPath Expressions</a> — full CLI and server reference</li>
+<li><a href="ch06-sql-on-fhir.html">SQL-on-FHIR</a> — writing ViewDefinitions, all output formats, cloud sources</li>
+<li><a href="configuration/environment-variables.html">Environment Variables</a> — tune every server setting</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="fhir-basics"><a class="header" href="#fhir-basics">FHIR Basics</a></h1>
+<p>This chapter covers the minimum FHIR knowledge needed to work with HFS tools. For a full introduction to the FHIR standard, see <a href="https://hl7.org/fhir">hl7.org/fhir</a>.</p>
+<hr />
+<h2 id="resources-and-resource-types"><a class="header" href="#resources-and-resource-types">Resources and Resource Types</a></h2>
+<p>A <strong>FHIR resource</strong> is a typed, self-describing JSON document representing a clinical or administrative entity. Every resource has a <code>resourceType</code> field that identifies its type.</p>
+<p>Common resource types:</p>
+<div class="table-wrapper"><table><thead><tr><th>Resource type</th><th>Represents</th></tr></thead><tbody>
+<tr><td><code>Patient</code></td><td>A person receiving care</td></tr>
+<tr><td><code>Observation</code></td><td>A measurement or assessment (vitals, lab results)</td></tr>
+<tr><td><code>Condition</code></td><td>A diagnosis or clinical problem</td></tr>
+<tr><td><code>MedicationRequest</code></td><td>A medication prescription</td></tr>
+<tr><td><code>Encounter</code></td><td>A clinical visit or episode</td></tr>
+<tr><td><code>Practitioner</code></td><td>A healthcare provider</td></tr>
+<tr><td><code>Organization</code></td><td>A care delivery organization</td></tr>
+</tbody></table>
+</div>
+<p>Each resource type defines a specific set of fields, data types, and cardinality rules in the FHIR specification.</p>
+<hr />
+<h2 id="fhir-versions-r4-r4b-r5-r6"><a class="header" href="#fhir-versions-r4-r4b-r5-r6">FHIR Versions: R4, R4B, R5, R6</a></h2>
+<p>FHIR has evolved through several versions. HFS supports all four currently relevant versions:</p>
+<div class="table-wrapper"><table><thead><tr><th>Version</th><th>Release</th><th>Key characteristics</th></tr></thead><tbody>
+<tr><td><strong>R4</strong> (4.0.1)</td><td>2019</td><td>Normative; most widely deployed</td></tr>
+<tr><td><strong>R4B</strong> (4.3.0)</td><td>2022</td><td>Normative; introduces clinical reasoning changes</td></tr>
+<tr><td><strong>R5</strong> (5.0.0)</td><td>2023</td><td>Current standard; significant model refinements</td></tr>
+<tr><td><strong>R6</strong> (6.0.0-ballot2)</td><td>In progress</td><td>Latest ballot; cutting-edge features</td></tr>
+</tbody></table>
+</div>
+<p>Most production systems use R4 or R5. R4B is common in the US for specific profiles. R6 is for early adopters and testing.</p>
+<p>HFS defaults to <strong>R4</strong> when no feature flags are specified. See <a href="ch08-versions.html">Multi-Version FHIR Support</a> for how to enable multiple versions.</p>
+<hr />
+<h2 id="json-representation-of-fhir-data"><a class="header" href="#json-representation-of-fhir-data">JSON Representation of FHIR Data</a></h2>
+<p>FHIR resources are serialized as JSON objects. Here is a minimal <code>Patient</code> resource:</p>
+<pre><code class="language-json">{
+  "resourceType": "Patient",
+  "id": "example-patient",
+  "name": [
+    {
+      "use": "official",
+      "family": "Smith",
+      "given": ["John", "Robert"]
+    }
+  ],
+  "gender": "male",
+  "birthDate": "1980-04-14",
+  "telecom": [
+    {
+      "system": "phone",
+      "value": "555-867-5309",
+      "use": "mobile"
+    },
+    {
+      "system": "email",
+      "value": "john.smith@example.com"
+    }
+  ],
+  "address": [
+    {
+      "use": "home",
+      "line": ["123 Main St"],
+      "city": "Springfield",
+      "state": "IL",
+      "postalCode": "62701"
+    }
+  ]
+}
+</code></pre>
+<p>Key structural features:</p>
+<ul>
+<li><strong><code>resourceType</code></strong> — mandatory field identifying the type</li>
+<li><strong><code>id</code></strong> — server-assigned or client-provided identifier</li>
+<li><strong>Arrays</strong> — many fields (name, telecom, address) are arrays to accommodate multiple values</li>
+<li><strong>Coded fields</strong> — fields like <code>gender</code>, <code>system</code>, and <code>use</code> use defined value sets</li>
+<li><strong>Extensions</strong> — any field can carry extensions for data not in the base spec</li>
+</ul>
+<hr />
+<h2 id="bundles-and-ndjson"><a class="header" href="#bundles-and-ndjson">Bundles and NDJSON</a></h2>
+<h3 id="bundles"><a class="header" href="#bundles">Bundles</a></h3>
+<p>A <strong>Bundle</strong> is a FHIR resource that wraps a collection of other resources. It is the standard container for exchanging multiple resources in a single HTTP request or file.</p>
+<pre><code class="language-json">{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "Patient",
+        "id": "p1",
+        "name": [{"family": "Smith"}]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Patient",
+        "id": "p2",
+        "name": [{"family": "Jones"}]
+      }
+    }
+  ]
+}
+</code></pre>
+<p>Bundle <code>type</code> values commonly seen with HFS:</p>
+<ul>
+<li><code>collection</code> — an unordered set of resources</li>
+<li><code>transaction</code> — resources to process atomically</li>
+<li><code>batch</code> — resources to process independently</li>
+<li><code>searchset</code> — the result of a search operation</li>
+</ul>
+<h3 id="ndjson-newline-delimited-json"><a class="header" href="#ndjson-newline-delimited-json">NDJSON (Newline-Delimited JSON)</a></h3>
+<p><strong>NDJSON</strong> (<code>.ndjson</code>) is an alternative to Bundle for large exports. Each line is a complete, self-contained JSON resource with no wrapper:</p>
+<pre><code class="language-ndjson">{"resourceType":"Patient","id":"p1","name":[{"family":"Smith"}]}
+{"resourceType":"Patient","id":"p2","name":[{"family":"Jones"}]}
+{"resourceType":"Observation","id":"o1","subject":{"reference":"Patient/p1"}}
+</code></pre>
+<p>NDJSON is preferred for bulk data exports (e.g., the FHIR <code>$export</code> operation) because it is memory-efficient to stream. <code>sof-cli</code> auto-detects NDJSON by file extension (<code>.ndjson</code>) or by inspecting file content.</p>
+<h3 id="when-to-use-each"><a class="header" href="#when-to-use-each">When to use each</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Format</th><th>Use for</th></tr></thead><tbody>
+<tr><td>Bundle (JSON)</td><td>REST API payloads, transactions, small datasets</td></tr>
+<tr><td>NDJSON</td><td>Bulk exports, large datasets, streaming pipelines</td></tr>
+</tbody></table>
+</div>
+<p>Both are accepted by <code>sof-cli</code> with <code>--bundle</code> and by <code>fhirpath-cli</code> with <code>-r</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="fhirpath-expressions"><a class="header" href="#fhirpath-expressions">FHIRPath Expressions</a></h1>
+<p>The <code>helios-fhirpath</code> crate is a complete implementation of the <a href="https://hl7.org/fhirpath/2025Jan/">FHIRPath 3.0.0-ballot specification</a>. It ships two executables (<code>fhirpath-cli</code> and <code>fhirpath-server</code>) and can be embedded as a library.</p>
+<hr />
+<h2 id="what-is-fhirpath"><a class="header" href="#what-is-fhirpath">What Is FHIRPath?</a></h2>
+<p><strong>FHIRPath</strong> is a path-based navigation and extraction language for healthcare data. It is used throughout the FHIR ecosystem for:</p>
+<ul>
+<li><strong>Resource validation</strong> — expressing invariants and co-occurrence rules</li>
+<li><strong>Search parameter definitions</strong> — specifying which elements a search parameter indexes</li>
+<li><strong>Implementation guides</strong> — encoding profile constraints and slicing discriminators</li>
+<li><strong>Clinical decision support</strong> — writing rules in CDS Hooks services</li>
+<li><strong>SQL-on-FHIR</strong> — defining column expressions in ViewDefinitions</li>
+<li><strong>Terminology integration</strong> — filtering and validating coded values</li>
+</ul>
+<h3 id="validation-example"><a class="header" href="#validation-example">Validation example</a></h3>
+<pre><code class="language-fhirpath">reference.startsWith('#').not() or
+($context.reference.substring(1) in $resource.contained.id)
+</code></pre>
+<p>This invariant ensures that a local reference points to a contained resource that actually exists.</p>
+<h3 id="search-parameter-example"><a class="header" href="#search-parameter-example">Search parameter example</a></h3>
+<pre><code class="language-fhirpath">Patient.name.given
+</code></pre>
+<p>Defines which FHIR element a search parameter indexes (the patient's given names).</p>
+<h3 id="clinical-rule-example"><a class="header" href="#clinical-rule-example">Clinical rule example</a></h3>
+<pre><code class="language-fhirpath">Observation.where(
+  code.coding.system = 'http://loinc.org' and
+  code.coding.code = '8480-6'
+).value.quantity &gt; 140
+</code></pre>
+<p>Identifies systolic blood pressure observations above 140.</p>
+<hr />
+<h2 id="basic-syntax-and-examples"><a class="header" href="#basic-syntax-and-examples">Basic Syntax and Examples</a></h2>
+<p>FHIRPath expressions navigate resource elements using dot notation, function calls, and operators.</p>
+<h3 id="path-navigation"><a class="header" href="#path-navigation">Path navigation</a></h3>
+<pre><code class="language-fhirpath"># Navigate nested elements
+Patient.name.family
+
+# Access the first element
+Patient.name.first()
+
+# Access by index
+Patient.name[0].given[0]
+</code></pre>
+<h3 id="filtering-with-where"><a class="header" href="#filtering-with-where">Filtering with <code>where()</code></a></h3>
+<pre><code class="language-fhirpath"># Filter by system code
+Patient.telecom.where(system = 'phone')
+
+# Multiple conditions
+Patient.telecom.where(system = 'phone' and use = 'mobile').value
+
+# Filter observations to a specific LOINC code
+Observation.where(code.coding.code = '8480-6')
+</code></pre>
+<h3 id="testing-existence"><a class="header" href="#testing-existence">Testing existence</a></h3>
+<pre><code class="language-fhirpath"># Does the patient have a phone number?
+Patient.telecom.where(system = 'phone').exists()
+
+# Does every name have a family name?
+Patient.name.all(family.exists())
+</code></pre>
+<h3 id="string-functions"><a class="header" href="#string-functions">String functions</a></h3>
+<pre><code class="language-fhirpath"># Concatenate given names
+Patient.name.given.join(' ')
+
+# Check format
+Patient.identifier.value.matches('^[0-9]{9}$')
+</code></pre>
+<h3 id="variables"><a class="header" href="#variables">Variables</a></h3>
+<pre><code class="language-fhirpath"># Built-in variable %threshold passed via CLI
+value &gt; %threshold
+
+# Built-in context variables
+$this    # current item in iteration
+$index   # current position in a collection
+$total   # total collection count
+</code></pre>
+<hr />
+<h2 id="using-fhirpath-cli"><a class="header" href="#using-fhirpath-cli">Using fhirpath-cli</a></h2>
+<pre><code>fhirpath-cli [OPTIONS] -e &lt;EXPRESSION&gt;
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>-e, --expression &lt;EXPR&gt;</code></td><td>FHIRPath expression to evaluate (required)</td></tr>
+<tr><td><code>-r, --resource &lt;FILE&gt;</code></td><td>Path to FHIR resource JSON file, or <code>-</code> for stdin</td></tr>
+<tr><td><code>-c, --context &lt;EXPR&gt;</code></td><td>Context expression to scope the root</td></tr>
+<tr><td><code>--var &lt;NAME=VALUE&gt;</code></td><td>Define an environment variable (repeatable)</td></tr>
+<tr><td><code>--fhir-version &lt;VER&gt;</code></td><td>FHIR version: <code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code> (default: <code>R4</code>)</td></tr>
+<tr><td><code>--parse-debug-tree</code></td><td>Print the parse tree and exit (no resource needed)</td></tr>
+<tr><td><code>--terminology-server &lt;URL&gt;</code></td><td>Override the default terminology server URL</td></tr>
+</tbody></table>
+</div>
+<p><strong>Examples:</strong></p>
+<pre><code class="language-bash"># Basic evaluation
+fhirpath-cli -e "Patient.name.family" -r patient.json
+
+# Context expression
+fhirpath-cli -c "Patient.name" -e "family" -r patient.json
+
+# Variable injection
+fhirpath-cli -e "value &gt; %threshold" -r observation.json --var threshold=5.0
+
+# Stdin input
+cat patient.json | fhirpath-cli -e "Patient.name.family" -r -
+
+# Debug parse tree (no resource file needed)
+fhirpath-cli -e "Patient.name.given.first()" --parse-debug-tree
+
+# Explicit FHIR version
+fhirpath-cli --fhir-version R5 -e "Patient.name.family" -r patient.json
+</code></pre>
+<hr />
+<h2 id="using-fhirpath-server"><a class="header" href="#using-fhirpath-server">Using fhirpath-server</a></h2>
+<p>The HTTP server is compatible with <a href="https://fhirpath-lab.com/">FHIRPath Lab</a>.</p>
+<h3 id="starting-the-server"><a class="header" href="#starting-the-server">Starting the server</a></h3>
+<pre><code class="language-bash"># Defaults: port 3000, host 127.0.0.1
+fhirpath-server
+
+# Custom configuration
+FHIRPATH_SERVER_PORT=8080 FHIRPATH_SERVER_HOST=0.0.0.0 fhirpath-server
+</code></pre>
+<h3 id="endpoints"><a class="header" href="#endpoints">Endpoints</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>URL</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>POST</code></td><td><code>/</code></td><td>Evaluate FHIRPath (auto-detects FHIR version)</td></tr>
+<tr><td><code>POST</code></td><td><code>/r4</code></td><td>R4-specific evaluation</td></tr>
+<tr><td><code>POST</code></td><td><code>/r4b</code></td><td>R4B-specific evaluation</td></tr>
+<tr><td><code>POST</code></td><td><code>/r5</code></td><td>R5-specific evaluation</td></tr>
+<tr><td><code>POST</code></td><td><code>/r6</code></td><td>R6-specific evaluation</td></tr>
+<tr><td><code>GET</code></td><td><code>/health</code></td><td>Health check</td></tr>
+</tbody></table>
+</div>
+<h3 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>FHIRPATH_SERVER_PORT</code></td><td><code>3000</code></td><td>Server port</td></tr>
+<tr><td><code>FHIRPATH_SERVER_HOST</code></td><td><code>127.0.0.1</code></td><td>Host to bind</td></tr>
+<tr><td><code>FHIRPATH_LOG_LEVEL</code></td><td><code>info</code></td><td>Log level</td></tr>
+<tr><td><code>FHIRPATH_ENABLE_CORS</code></td><td><code>true</code></td><td>Enable CORS</td></tr>
+<tr><td><code>FHIRPATH_CORS_ORIGINS</code></td><td><code>*</code></td><td>Allowed CORS origins</td></tr>
+<tr><td><code>FHIRPATH_TERMINOLOGY_SERVER</code></td><td><em>(none)</em></td><td>Terminology server URL</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="terminology-server-integration"><a class="header" href="#terminology-server-integration">Terminology Server Integration</a></h2>
+<p>FHIRPath provides access to terminology services via the <code>%terminologies</code> environment variable.</p>
+<blockquote>
+<p><strong>Warning:</strong> By default, the implementation uses public test servers (<code>https://tx.fhir.org/r4/</code> for R4/R4B, <code>https://tx.fhir.org/r5/</code> for R5). <strong>Do not use these in production</strong> — they are test servers with no SLA.</p>
+</blockquote>
+<p>Configure a production server:</p>
+<pre><code class="language-bash"># Via environment variable
+export FHIRPATH_TERMINOLOGY_SERVER=https://your-terminology-server.com/fhir
+
+# Via CLI flag
+fhirpath-cli --terminology-server https://your-terminology-server.com/fhir ...
+
+# Via server environment variable
+FHIRPATH_TERMINOLOGY_SERVER=https://your-server.com/fhir fhirpath-server
+</code></pre>
+<p>Available <code>%terminologies</code> functions:</p>
+<pre><code class="language-fhirpath"># Expand a ValueSet
+%terminologies.expand('http://hl7.org/fhir/ValueSet/administrative-gender')
+
+# Lookup code details
+%terminologies.lookup(Observation.code.coding.first())
+
+# Validate against a ValueSet
+%terminologies.validateVS(
+  'http://hl7.org/fhir/ValueSet/observation-vitalsignresult',
+  Observation.code.coding.first()
+)
+
+# Validate against a CodeSystem
+%terminologies.validateCS('http://loinc.org', Observation.code.coding.first())
+
+# Check code subsumption
+%terminologies.subsumes('http://snomed.info/sct', '73211009', '5935008')
+
+# Translate using a ConceptMap
+%terminologies.translate(
+  'http://hl7.org/fhir/ConceptMap/cm-address-use-v2',
+  Patient.address.use
+)
+
+# Check if a coding is a member of a ValueSet
+Observation.code.coding.where(
+  memberOf('http://hl7.org/fhir/ValueSet/observation-vitalsignresult')
+)
+</code></pre>
+<hr />
+<h2 id="built-in-functions-reference"><a class="header" href="#built-in-functions-reference">Built-in Functions Reference</a></h2>
+<p>The following categories are fully implemented. See <a href="appendix-b-fhirpath-functions.html">Appendix B</a> for the complete implementation matrix with status indicators.</p>
+<div class="table-wrapper"><table><thead><tr><th>Category</th><th>Example functions</th></tr></thead><tbody>
+<tr><td>Existence</td><td><code>empty()</code>, <code>exists()</code>, <code>all()</code>, <code>count()</code>, <code>distinct()</code></td></tr>
+<tr><td>Filtering &amp; Projection</td><td><code>where()</code>, <code>select()</code>, <code>ofType()</code>, <code>sort()</code>, <code>repeat()</code></td></tr>
+<tr><td>Subsetting</td><td><code>first()</code>, <code>last()</code>, <code>tail()</code>, <code>skip()</code>, <code>take()</code>, <code>single()</code></td></tr>
+<tr><td>Combining</td><td><code>union()</code>, <code>combine()</code>, <code>intersect()</code>, <code>exclude()</code></td></tr>
+<tr><td>Conversion</td><td><code>toBoolean()</code>, <code>toInteger()</code>, <code>toDecimal()</code>, <code>toString()</code>, <code>toDate()</code>, <code>toDateTime()</code></td></tr>
+<tr><td>String</td><td><code>indexOf()</code>, <code>substring()</code>, <code>startsWith()</code>, <code>endsWith()</code>, <code>contains()</code>, <code>matches()</code>, <code>replace()</code>, <code>upper()</code>, <code>lower()</code>, <code>trim()</code>, <code>split()</code>, <code>join()</code>, <code>encode()</code>, <code>decode()</code></td></tr>
+<tr><td>Math</td><td><code>abs()</code>, <code>ceiling()</code>, <code>floor()</code>, <code>round()</code>, <code>sqrt()</code>, <code>exp()</code>, <code>ln()</code>, <code>log()</code>, <code>power()</code>, <code>truncate()</code></td></tr>
+<tr><td>Date/Time</td><td><code>today()</code>, <code>now()</code>, <code>timeOfDay()</code>, <code>duration()</code>, <code>difference()</code>, component extractors (<code>yearOf()</code>, <code>monthOf()</code>, etc.)</td></tr>
+<tr><td>Tree navigation</td><td><code>children()</code>, <code>descendants()</code>, <code>extension()</code></td></tr>
+<tr><td>Utility</td><td><code>trace()</code>, <code>defineVariable()</code>, <code>iif()</code>, <code>lowBoundary()</code>, <code>highBoundary()</code>, <code>precision()</code></td></tr>
+<tr><td>Aggregates</td><td><code>aggregate()</code>, <code>sum()</code>, <code>min()</code>, <code>max()</code>, <code>avg()</code></td></tr>
+<tr><td>Type</td><td><code>is</code>, <code>as</code>, <code>ofType()</code>, <code>type()</code></td></tr>
+<tr><td>FHIR-specific</td><td><code>hasValue()</code>, <code>memberOf()</code>, <code>comparable()</code></td></tr>
+</tbody></table>
+</div><div style="break-before: page; page-break-before: always;"></div><h1 id="sql-on-fhir"><a class="header" href="#sql-on-fhir">SQL-on-FHIR</a></h1>
+<p>The <code>helios-sof</code> crate implements the <a href="https://build.fhir.org/ig/FHIR/sql-on-fhir-v2">SQL-on-FHIR specification</a>. It transforms FHIR resources into flat tabular data using declarative <strong>ViewDefinitions</strong> and ships two executables (<code>sof-cli</code> and <code>sof-server</code>).</p>
+<hr />
+<h2 id="what-is-sql-on-fhir-and-viewdefinitions"><a class="header" href="#what-is-sql-on-fhir-and-viewdefinitions">What Is SQL-on-FHIR and ViewDefinitions?</a></h2>
+<p>FHIR data is deeply nested and polymorphic — a single <code>Patient</code> resource might have an array of names, each with an array of given names, all with multiple use codes. SQL-on-FHIR solves the problem of getting this data into flat tabular form (rows and columns) that SQL engines, pandas, and BI tools can consume natively.</p>
+<p>A <strong>ViewDefinition</strong> is a JSON document that describes how to flatten a FHIR resource type into a table. It specifies:</p>
+<ul>
+<li>Which resource type to flatten (<code>from.resourceType</code>)</li>
+<li>Which columns to extract, each with a name and a FHIRPath expression (<code>select[].column[]</code>)</li>
+<li>Optional <code>forEach</code> clauses to iterate over repeated elements</li>
+</ul>
+<hr />
+<h2 id="writing-your-first-viewdefinition"><a class="header" href="#writing-your-first-viewdefinition">Writing Your First ViewDefinition</a></h2>
+<p>Here is a complete ViewDefinition that extracts key demographics from <code>Patient</code> resources:</p>
+<pre><code class="language-json">{
+  "resourceType": "ViewDefinition",
+  "id": "patient-demographics",
+  "name": "PatientDemographics",
+  "title": "Basic Patient Demographics",
+  "description": "Flattened patient demographic data",
+  "from": {
+    "resourceType": "Patient"
+  },
+  "select": [
+    {
+      "column": [
+        {"name": "id",           "path": "getResourceKey()"},
+        {"name": "birth_date",   "path": "birthDate"},
+        {"name": "gender",       "path": "gender"},
+        {"name": "first_name",   "path": "name.where(use='official').given.first()"},
+        {"name": "last_name",    "path": "name.where(use='official').family"},
+        {"name": "ssn",          "path": "identifier.where(system='http://hl7.org/fhir/sid/us-ssn').value"},
+        {"name": "email",        "path": "telecom.where(system='email').value"},
+        {"name": "phone",        "path": "telecom.where(system='phone' and use='mobile').value"},
+        {"name": "address_line", "path": "address.where(use='home').line.join(', ')"},
+        {"name": "city",         "path": "address.where(use='home').city"},
+        {"name": "state",        "path": "address.where(use='home').state"},
+        {"name": "postal_code",  "path": "address.where(use='home').postalCode"}
+      ]
+    }
+  ]
+}
+</code></pre>
+<p>Save this as <code>patient-view.json</code> and run:</p>
+<pre><code class="language-bash">sof-cli --view patient-view.json --bundle patients.json
+</code></pre>
+<p>Output (CSV):</p>
+<pre><code>id,birth_date,gender,first_name,last_name,ssn,email,phone,...
+p1,1980-04-14,male,John,Smith,,john@example.com,555-1234,...
+</code></pre>
+<hr />
+<h2 id="using-sof-cli-for-batch-transforms"><a class="header" href="#using-sof-cli-for-batch-transforms">Using sof-cli for Batch Transforms</a></h2>
+<pre><code>sof-cli [OPTIONS]
+</code></pre>
+<h3 id="core-flags"><a class="header" href="#core-flags">Core flags</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>-v, --view &lt;FILE&gt;</code></td><td>Path to ViewDefinition JSON (or stdin)</td></tr>
+<tr><td><code>-b, --bundle &lt;FILE&gt;</code></td><td>Path to FHIR Bundle or NDJSON file (or stdin)</td></tr>
+<tr><td><code>-s, --source &lt;URL&gt;</code></td><td>URL-based data source (local, http, s3, gs, azure)</td></tr>
+<tr><td><code>-f, --format &lt;FMT&gt;</code></td><td>Output format: <code>csv</code>, <code>json</code>, <code>ndjson</code>, <code>parquet</code> (default: <code>csv</code>)</td></tr>
+<tr><td><code>--no-headers</code></td><td>Omit CSV header row</td></tr>
+<tr><td><code>-o, --output &lt;FILE&gt;</code></td><td>Write to file instead of stdout</td></tr>
+<tr><td><code>--since &lt;RFC3339&gt;</code></td><td>Filter resources modified after this time</td></tr>
+<tr><td><code>--limit &lt;N&gt;</code></td><td>Limit results to N rows (1–10000)</td></tr>
+<tr><td><code>--fhir-version &lt;VER&gt;</code></td><td>FHIR version: <code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code> (default: <code>R4</code>)</td></tr>
+</tbody></table>
+</div>
+<h3 id="parquet-specific-flags"><a class="header" href="#parquet-specific-flags">Parquet-specific flags</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--parquet-row-group-size &lt;MB&gt;</code></td><td>256</td><td>Row group size in MB (64–1024)</td></tr>
+<tr><td><code>--parquet-page-size &lt;KB&gt;</code></td><td>1024</td><td>Page size in KB (64–8192)</td></tr>
+<tr><td><code>--parquet-compression &lt;ALG&gt;</code></td><td>snappy</td><td><code>none</code>, <code>snappy</code>, <code>gzip</code>, <code>lz4</code>, <code>brotli</code>, <code>zstd</code></td></tr>
+<tr><td><code>--max-file-size &lt;MB&gt;</code></td><td>1000</td><td>Max file size; creates numbered files when exceeded</td></tr>
+</tbody></table>
+</div>
+<h3 id="streaming-ndjson-flags"><a class="header" href="#streaming-ndjson-flags">Streaming NDJSON flags</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--chunk-size &lt;N&gt;</code></td><td>1000</td><td>Resources per chunk for streaming NDJSON</td></tr>
+<tr><td><code>--skip-invalid</code></td><td>false</td><td>Skip invalid JSON lines instead of failing</td></tr>
+</tbody></table>
+</div>
+<h3 id="examples"><a class="header" href="#examples">Examples</a></h3>
+<pre><code class="language-bash"># CSV from a Bundle file
+sof-cli -v patient-view.json -b patients.json
+
+# CSV without headers
+sof-cli -v view.json -b data.json --no-headers
+
+# JSON output to file
+sof-cli -v obs-view.json -b lab-results.json -f json -o output.json
+
+# NDJSON (one row object per line)
+sof-cli -v view.json -b data.json -f ndjson
+
+# Parquet with Zstd compression
+sof-cli -v view.json -b data.json -f parquet --parquet-compression zstd -o output.parquet
+
+# Large NDJSON — streaming mode
+sof-cli -v view.json -b large-data.ndjson --chunk-size 500
+
+# Filter by time window
+sof-cli -v view.json -b data.json --since 2024-01-01T00:00:00Z --limit 500
+
+# Read ViewDefinition from stdin
+cat view.json | sof-cli -b data.json -f csv
+</code></pre>
+<hr />
+<h2 id="output-formats"><a class="header" href="#output-formats">Output Formats</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Format</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>csv</code></td><td>Comma-separated values with optional header row</td></tr>
+<tr><td><code>json</code></td><td>Pretty-printed JSON array of row objects</td></tr>
+<tr><td><code>ndjson</code></td><td>One JSON row object per line (newline-delimited)</td></tr>
+<tr><td><code>parquet</code></td><td>Columnar binary format; Snappy compression by default</td></tr>
+</tbody></table>
+</div>
+<h3 id="parquet-type-mapping"><a class="header" href="#parquet-type-mapping">Parquet Type Mapping</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>FHIR type</th><th>Arrow / Parquet type</th></tr></thead><tbody>
+<tr><td><code>boolean</code></td><td><code>BOOLEAN</code></td></tr>
+<tr><td><code>string</code>, <code>code</code>, <code>uri</code></td><td><code>UTF8</code></td></tr>
+<tr><td><code>integer</code></td><td><code>INT32</code></td></tr>
+<tr><td><code>decimal</code></td><td><code>FLOAT64</code></td></tr>
+<tr><td><code>dateTime</code>, <code>date</code></td><td><code>UTF8</code></td></tr>
+<tr><td>Arrays</td><td>Arrow <code>List</code> type</td></tr>
+</tbody></table>
+</div>
+<p>All fields are <code>OPTIONAL</code>. Snappy compression is the default.</p>
+<hr />
+<h2 id="using-the-sof-server-http-api"><a class="header" href="#using-the-sof-server-http-api">Using the sof-server HTTP API</a></h2>
+<pre><code class="language-bash"># Start with defaults (port 8080)
+sof-server
+
+# Custom port
+SOF_SERVER_PORT=9090 sof-server
+</code></pre>
+<h3 id="endpoint"><a class="header" href="#endpoint">Endpoint</a></h3>
+<p><code>POST /ViewDefinition/$viewdefinition-run</code></p>
+<p>Request body (JSON):</p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>_format</code></td><td>string</td><td>Output format: <code>csv</code>, <code>ndjson</code>, <code>json</code>, <code>parquet</code></td></tr>
+<tr><td><code>header</code></td><td>boolean</td><td>Include CSV header row (<code>true</code> / <code>false</code>)</td></tr>
+<tr><td><code>viewResource</code></td><td>object</td><td>ViewDefinition resource</td></tr>
+<tr><td><code>resource</code></td><td>array</td><td>FHIR resources to transform</td></tr>
+<tr><td><code>patient</code></td><td>string</td><td>Filter by patient reference</td></tr>
+<tr><td><code>_limit</code></td><td>integer</td><td>Limit results (1–10000)</td></tr>
+<tr><td><code>_since</code></td><td>string</td><td>Filter by modification time (RFC3339)</td></tr>
+</tbody></table>
+</div>
+<p>Parameter precedence: <strong>request body &gt; query params &gt; <code>Accept</code> header</strong></p>
+<h3 id="example"><a class="header" href="#example">Example</a></h3>
+<pre><code class="language-bash">curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "_format": "csv",
+    "viewResource": {
+      "resourceType": "ViewDefinition",
+      "from": {"resourceType": "Patient"},
+      "select": [{"column": [
+        {"name": "id", "path": "getResourceKey()"},
+        {"name": "family", "path": "name.first().family"}
+      ]}]
+    },
+    "resource": [
+      {"resourceType": "Patient", "id": "p1", "name": [{"family": "Smith"}]},
+      {"resourceType": "Patient", "id": "p2", "name": [{"family": "Jones"}]}
+    ]
+  }'
+</code></pre>
+<h3 id="server-environment-variables"><a class="header" href="#server-environment-variables">Server environment variables</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>SOF_SERVER_PORT</code></td><td><code>8080</code></td><td>Server port</td></tr>
+<tr><td><code>SOF_SERVER_HOST</code></td><td><code>127.0.0.1</code></td><td>Host to bind</td></tr>
+<tr><td><code>SOF_LOG_LEVEL</code></td><td><code>info</code></td><td>Log level</td></tr>
+<tr><td><code>SOF_MAX_BODY_SIZE</code></td><td><code>10485760</code></td><td>Max request body (bytes)</td></tr>
+<tr><td><code>SOF_REQUEST_TIMEOUT</code></td><td><code>30</code></td><td>Request timeout (seconds)</td></tr>
+<tr><td><code>SOF_ENABLE_CORS</code></td><td><code>true</code></td><td>Enable CORS</td></tr>
+<tr><td><code>SOF_CORS_ORIGINS</code></td><td><code>*</code></td><td>Allowed CORS origins</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="reading-from-cloud-storage"><a class="header" href="#reading-from-cloud-storage">Reading from Cloud Storage</a></h2>
+<p>The <code>--source</code> flag (aliased <code>-s</code>) accepts URL-based data sources. This is distinct from <code>--bundle</code> (<code>-b</code>), which accepts local file paths only.</p>
+<h3 id="supported-protocols"><a class="header" href="#supported-protocols">Supported protocols</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Protocol</th><th>Example</th></tr></thead><tbody>
+<tr><td>Local (absolute)</td><td><code>sof-cli -v view.json -s /data/patients.ndjson</code></td></tr>
+<tr><td>Local (relative)</td><td><code>sof-cli -v view.json -s ./data/patients.json</code></td></tr>
+<tr><td>File URI</td><td><code>sof-cli -v view.json -s file:///data/patients.json</code></td></tr>
+<tr><td>HTTP/HTTPS</td><td><code>sof-cli -v view.json -s https://example.com/fhir/bundle.json</code></td></tr>
+<tr><td>Amazon S3</td><td><code>sof-cli -v view.json -s s3://my-bucket/fhir-data/patients.ndjson</code></td></tr>
+<tr><td>Google Cloud Storage</td><td><code>sof-cli -v view.json -s gs://my-bucket/fhir-data/patients.json</code></td></tr>
+<tr><td>Azure Blob Storage</td><td><code>sof-cli -v view.json -s azure://my-container/fhir-data/patients.ndjson</code></td></tr>
+</tbody></table>
+</div>
+<pre><code class="language-bash"># S3 example
+sof-cli -v patient-view.json \
+  -s s3://my-fhir-bucket/exports/patients.ndjson \
+  -f parquet -o patients.parquet
+
+# GCS example
+sof-cli -v obs-view.json \
+  -s gs://my-fhir-bucket/observations.ndjson \
+  -f csv -o observations.csv
+
+# Azure example
+sof-cli -v view.json \
+  -s azure://my-container/data/bundle.json \
+  -f json
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="architecture-overview"><a class="header" href="#architecture-overview">Architecture Overview</a></h1>
+<p>The Helios FHIR Server is organized as a Rust workspace with 13 modular crates. Each crate has a single, well-defined responsibility and can be used independently or composed together.</p>
+<hr />
+<h2 id="workspace-structure-and-crate-map"><a class="header" href="#workspace-structure-and-crate-map">Workspace Structure and Crate Map</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Crate</th><th>Binary / Package</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>helios-fhir</code></td><td><em>(library)</em></td><td>Core FHIR data models. Auto-generated from HL7 StructureDefinition JSON. Supports R4, R4B, R5, R6 via feature flags.</td></tr>
+<tr><td><code>helios-fhir-gen</code></td><td><code>helios-fhir-gen</code></td><td>Code generator — produces Rust structs from FHIR JSON schemas. Run when updating FHIR spec versions.</td></tr>
+<tr><td><code>helios-fhir-macro</code></td><td><em>(proc-macro)</em></td><td>Procedural macros: <code>FhirSerde</code> (serialization) and <code>FhirPath</code> (evaluation integration).</td></tr>
+<tr><td><code>helios-fhirpath</code></td><td><code>fhirpath-cli</code>, <code>fhirpath-server</code></td><td>FHIRPath 3.0.0-ballot implementation — parser (chumsky), evaluator, CLI, and HTTP server.</td></tr>
+<tr><td><code>helios-fhirpath-support</code></td><td><em>(library)</em></td><td>Bridge between the FHIRPath evaluator and FHIR types. Provides <code>EvaluationResult</code>, <code>EvaluationError</code>, <code>IntoEvaluationResult</code>.</td></tr>
+<tr><td><code>helios-serde</code></td><td><em>(library)</em></td><td>JSON (always) and XML (<code>xml</code> feature) serialization for FHIR resources.</td></tr>
+<tr><td><code>helios-serde-support</code></td><td><em>(library)</em></td><td>Shared serde helpers used by <code>helios-serde</code> and <code>helios-fhir</code>.</td></tr>
+<tr><td><code>helios-rest</code></td><td><em>(library)</em></td><td>FHIR RESTful API layer built on Axum — handlers, middleware, extractors, multi-tenancy routing.</td></tr>
+<tr><td><code>helios-persistence</code></td><td><code>config-advisor</code></td><td>Polyglot persistence — backends (SQLite, PostgreSQL, Elasticsearch, MongoDB, S3), composite storage, search registry, tenant isolation.</td></tr>
+<tr><td><code>helios-hfs</code></td><td><code>hfs</code></td><td>Main FHIR server binary. Wires <code>helios-rest</code> with storage backends and configuration.</td></tr>
+<tr><td><code>helios-sof</code></td><td><code>sof-cli</code>, <code>sof-server</code></td><td>SQL-on-FHIR — ViewDefinition processing, CLI, and HTTP server.</td></tr>
+<tr><td><code>helios-cds-hooks</code></td><td><em>(library)</em></td><td>CDS Hooks protocol types and <code>CdsHooksService</code> trait.</td></tr>
+<tr><td><code>pysof</code></td><td><code>pysof</code> (PyPI)</td><td>Python bindings for SQL-on-FHIR via PyO3 and maturin. Excluded from the default workspace build.</td></tr>
+</tbody></table>
+</div>
+<p>All crates share the same version number. <code>pysof</code> is excluded from the default <code>cargo build</code> because it requires Python and maturin.</p>
+<hr />
+<h2 id="crate-deep-dives"><a class="header" href="#crate-deep-dives">Crate Deep Dives</a></h2>
+<h3 id="helios-fhir"><a class="header" href="#helios-fhir">helios-fhir</a></h3>
+<p>The core FHIR data models library. Approximately 95% of its code is auto-generated from official HL7 StructureDefinition JSON schemas by <code>helios-fhir-gen</code>. The remaining 5% is hand-coded infrastructure:</p>
+<ul>
+<li><code>Element&lt;T&gt;</code> — generic wrapper for FHIR primitives (value + optional extension)</li>
+<li><code>DecimalElement</code> / <code>PreciseDecimal</code> — high-precision decimal handling</li>
+<li><code>FhirVersion</code> — enum (<code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code>) used throughout the workspace</li>
+<li>Choice type enums for polymorphic elements (e.g., <code>value[x]</code>)</li>
+<li>The <code>Resource</code> enum aggregating all resource types for a given version</li>
+</ul>
+<p>Feature flags gate which versions are compiled:</p>
+<pre><code class="language-toml">[features]
+default = ["R4"]
+R4  = ["helios-fhir/R4"]
+R4B = ["helios-fhir/R4B"]
+R5  = ["helios-fhir/R5"]
+R6  = ["helios-fhir/R6"]
+</code></pre>
+<h3 id="helios-fhirpath"><a class="header" href="#helios-fhirpath">helios-fhirpath</a></h3>
+<p>A complete FHIRPath 3.0.0-ballot implementation. The architecture separates:</p>
+<ul>
+<li><strong>Parser</strong> (<code>parser.rs</code>) — converts FHIRPath expressions into an AST using <a href="https://github.com/zesterer/chumsky">chumsky</a>, producing excellent error messages</li>
+<li><strong>Evaluator</strong> (<code>evaluator.rs</code>) — walks the AST against FHIR resources with a runtime context</li>
+<li><strong>Type system</strong> (<code>fhir_type_hierarchy.rs</code>) — manages FHIR and System type namespaces with version-aware resource type checking</li>
+<li><strong>Function modules</strong> — each FHIRPath function category in its own <code>*.rs</code> file</li>
+</ul>
+<p>The <code>EvaluationContext</code> is the primary runtime object:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use helios_fhirpath::evaluator::EvaluationContext;
+use helios_fhir::FhirVersion;
+
+// Version auto-detected from resources
+let context = EvaluationContext::new(fhir_resources);
+
+// Explicit version
+let context = EvaluationContext::new_with_version(fhir_resources, FhirVersion::R5);
+<span class="boring">}</span></code></pre></pre>
+<h3 id="helios-sof"><a class="header" href="#helios-sof">helios-sof</a></h3>
+<p>ViewDefinition-based transformation engine. Version-agnostic through enum wrappers:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub enum SofViewDefinition {
+    R4(fhir::r4::ViewDefinition),
+    R4B(fhir::r4b::ViewDefinition),
+    R5(fhir::r5::ViewDefinition),
+    R6(fhir::r6::ViewDefinition),
+}
+<span class="boring">}</span></code></pre></pre>
+<p>The same pattern is used for <code>SofBundle</code> and <code>SofCapabilityStatement</code>. Core function: <code>run_view_definition()</code>.</p>
+<h3 id="helios-fhir-gen"><a class="header" href="#helios-fhir-gen">helios-fhir-gen</a></h3>
+<p>The code generator that reads HL7 StructureDefinition JSON schemas and writes <code>r4.rs</code>, <code>r4b.rs</code>, <code>r5.rs</code>, <code>r6.rs</code> into <code>crates/fhir/src/</code>. You only need to run it when updating the FHIR spec version or changing code generation behavior. See <a href="ch10-codegen.html">Code Generation</a>.</p>
+<h3 id="pysof"><a class="header" href="#pysof">pysof</a></h3>
+<p>Python bindings built with <a href="https://pyo3.rs/">PyO3</a> and <a href="https://maturin.rs/">maturin</a>. Exposes the <code>helios-sof</code> API to Python with automatic multithreading via Rayon (5–7× speedup on multi-core machines). Published to <a href="https://pypi.org/project/pysof/">PyPI</a>. See <a href="ch09-pysof.html">Python Bindings</a>.</p>
+<hr />
+<h2 id="design-principles"><a class="header" href="#design-principles">Design Principles</a></h2>
+<h3 id="version-agnostic-abstraction"><a class="header" href="#version-agnostic-abstraction">Version-Agnostic Abstraction</a></h3>
+<p>Enum wrappers allow a single code path to handle all FHIR versions without runtime overhead:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub enum SofViewDefinition {
+    R4(fhir::r4::ViewDefinition),
+    R4B(fhir::r4b::ViewDefinition),
+    R5(fhir::r5::ViewDefinition),
+    R6(fhir::r6::ViewDefinition),
+}
+<span class="boring">}</span></code></pre></pre>
+<p>Traits abstract over the enum variants so callers don't need to pattern-match:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// Works for any FHIR version
+impl ViewDefinitionTrait for SofViewDefinition { ... }
+<span class="boring">}</span></code></pre></pre>
+<h3 id="persistence-trait-hierarchy"><a class="header" href="#persistence-trait-hierarchy">Persistence Trait Hierarchy</a></h3>
+<p>Storage backends implement a progressive trait hierarchy. You only implement the traits for the capabilities your backend supports:</p>
+<pre><code>ResourceStorage
+  ├── VersionedStorage
+  │     ├── InstanceHistoryProvider
+  │     ├── TypeHistoryProvider
+  │     └── SystemHistoryProvider
+  ├── SearchProvider
+  │     ├── MultiTypeSearchProvider
+  │     ├── ChainedSearchProvider
+  │     └── IncludeProvider
+  └── TransactionProvider
+        └── BundleProvider
+</code></pre>
+<p>Key traits:</p>
+<ul>
+<li><code>ResourceStorage</code> — CRUD: create, read, update, delete</li>
+<li><code>VersionedStorage</code> — ETag versioning, vread</li>
+<li><code>SearchProvider</code> — parameterized search with modifiers</li>
+<li><code>TransactionProvider</code> — atomic multi-resource transactions</li>
+</ul>
+<h3 id="tenant-first-design"><a class="header" href="#tenant-first-design">Tenant-First Design</a></h3>
+<p>Every persistence operation accepts a <code>TenantContext</code> as its first argument. Storage backends enforce tenant boundaries at the SQL/query level — there is no application-level post-filtering. This makes multi-tenancy correct by construction.</p>
+<h3 id="composite-storage"><a class="header" href="#composite-storage">Composite Storage</a></h3>
+<p>The <code>CompositeStorage</code> pattern combines two backends behind a single <code>ResourceStorage</code> interface:</p>
+<ul>
+<li>One backend handles <strong>writes and CRUD</strong> (SQLite, PostgreSQL, MongoDB, S3)</li>
+<li>The other handles <strong>search queries</strong> (Elasticsearch)</li>
+</ul>
+<p>This allows you to use best-of-breed storage for each concern without changing any application code. Configured via <code>HFS_STORAGE_BACKEND</code> (e.g., <code>sqlite-elasticsearch</code>, <code>postgres-es</code>).</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="multi-version-fhir-support"><a class="header" href="#multi-version-fhir-support">Multi-Version FHIR Support</a></h1>
+<p>HFS is built around the assumption that real-world systems need to handle multiple FHIR versions simultaneously. The workspace supports R4, R4B, R5, and R6 through Cargo feature flags and version-agnostic runtime abstractions.</p>
+<hr />
+<h2 id="feature-flags"><a class="header" href="#feature-flags">Feature Flags</a></h2>
+<p>Each FHIR version is gated behind a Cargo feature flag. The default build compiles <strong>R4 only</strong>.</p>
+<h3 id="enabling-versions-at-build-time"><a class="header" href="#enabling-versions-at-build-time">Enabling versions at build time</a></h3>
+<pre><code class="language-bash"># Default: R4 only
+cargo build
+
+# All versions
+cargo build --features R4,R4B,R5,R6
+
+# Specific combination
+cargo build --features R4,R5
+
+# Single crate with specific versions
+cargo build -p helios-fhirpath --features R4B,R5
+</code></pre>
+<h3 id="running-tests-with-all-versions"><a class="header" href="#running-tests-with-all-versions">Running tests with all versions</a></h3>
+<pre><code class="language-bash">cargo test --features R4,R4B,R5,R6
+</code></pre>
+<h3 id="the-skip-r6-download-feature"><a class="header" href="#the-skip-r6-download-feature">The <code>skip-r6-download</code> feature</a></h3>
+<p>When running <code>cargo clippy --all-features</code>, add the <code>skip-r6-download</code> feature to prevent <code>helios-fhir-gen</code> from downloading the R6 StructureDefinition files from <code>https://build.fhir.org/</code> during the build. This makes CI linting safe and fast:</p>
+<pre><code class="language-bash">cargo clippy --all-targets --all-features -- -D warnings
+</code></pre>
+<p>(<code>--all-features</code> automatically activates <code>skip-r6-download</code>.)</p>
+<hr />
+<h2 id="auto-detection-of-fhir-version"><a class="header" href="#auto-detection-of-fhir-version">Auto-Detection of FHIR Version</a></h2>
+<p>Several tools can automatically detect the FHIR version from their input data, so you don't need to always specify it explicitly.</p>
+<h3 id="fhirpath-server"><a class="header" href="#fhirpath-server">fhirpath-server</a></h3>
+<p>The root endpoint (<code>POST /</code>) inspects the resource's <code>meta.profile</code>, <code>fhirVersion</code>, or structural markers to select the appropriate version model automatically. Use version-specific endpoints when you need explicit control:</p>
+<pre><code>POST /r4    → always use R4
+POST /r4b   → always use R4B
+POST /r5    → always use R5
+POST /r6    → always use R6
+</code></pre>
+<h3 id="fhirpath-cli"><a class="header" href="#fhirpath-cli">fhirpath-cli</a></h3>
+<p>Pass <code>--fhir-version</code> to override auto-detection:</p>
+<pre><code class="language-bash">fhirpath-cli --fhir-version R5 -e "Patient.name.family" -r patient.json
+</code></pre>
+<h3 id="sof-cli"><a class="header" href="#sof-cli">sof-cli</a></h3>
+<pre><code class="language-bash">sof-cli --fhir-version R4B -v view.json -b data.json
+</code></pre>
+<h3 id="evaluationcontext-library-api"><a class="header" href="#evaluationcontext-library-api">EvaluationContext (library API)</a></h3>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use helios_fhirpath::evaluator::EvaluationContext;
+use helios_fhir::FhirVersion;
+
+// Version auto-detected from resources
+let ctx = EvaluationContext::new(fhir_resources);
+
+// Explicit version
+let ctx = EvaluationContext::new_with_version(fhir_resources, FhirVersion::R5);
+
+// Empty context with explicit version (no resource)
+let ctx = EvaluationContext::new_empty(FhirVersion::R4);
+<span class="boring">}</span></code></pre></pre>
+<hr />
+<h2 id="version-aware-type-checking"><a class="header" href="#version-aware-type-checking">Version-Aware Type Checking</a></h2>
+<h3 id="the-fhirversion-enum"><a class="header" href="#the-fhirversion-enum">The <code>FhirVersion</code> enum</a></h3>
+<p><code>helios-fhir</code> exports a <code>FhirVersion</code> enum used throughout the workspace to carry version information at runtime:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub enum FhirVersion {
+    R4,
+    R4B,
+    R5,
+    R6,
+}
+<span class="boring">}</span></code></pre></pre>
+<h3 id="version-agnostic-enum-wrappers"><a class="header" href="#version-agnostic-enum-wrappers">Version-agnostic enum wrappers</a></h3>
+<p>Rather than generic type parameters, the workspace uses enum wrappers to handle multiple versions in a single code path. This avoids monomorphization explosion and keeps the API ergonomic:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub enum SofViewDefinition {
+    R4(fhir::r4::ViewDefinition),
+    R4B(fhir::r4b::ViewDefinition),
+    R5(fhir::r5::ViewDefinition),
+    R6(fhir::r6::ViewDefinition),
+}
+
+pub enum SofBundle {
+    R4(fhir::r4::Bundle),
+    R4B(fhir::r4b::Bundle),
+    R5(fhir::r5::Bundle),
+    R6(fhir::r6::Bundle),
+}
+<span class="boring">}</span></code></pre></pre>
+<p>Traits like <code>ViewDefinitionTrait</code> and <code>BundleTrait</code> abstract over these enums so application code does not need to pattern-match on the version.</p>
+<h3 id="oftype-with-namespace-qualification"><a class="header" href="#oftype-with-namespace-qualification"><code>ofType()</code> with namespace qualification</a></h3>
+<p>FHIRPath type checks are version-aware. Use the <code>FHIR.</code> namespace prefix for FHIR resource and data types:</p>
+<pre><code class="language-fhirpath"># Check if a value is a FHIR Quantity (any version)
+value.ofType(FHIR.Quantity)
+
+# Check a choice type
+Observation.value.ofType(FHIR.boolean)
+
+# Type-based navigation (is / as)
+value is FHIR.Quantity
+value as FHIR.Quantity
+</code></pre>
+<p>The <code>FhirResourceTypeProvider</code> trait is implemented for each version's <code>Resource</code> enum and is used by the FHIRPath evaluator to validate resource type names at evaluation time. Resource type lists are generated at compile time from the actual FHIR specification — they are never hardcoded.</p>
+<h3 id="version-in-hfs-server"><a class="header" href="#version-in-hfs-server">Version in HFS server</a></h3>
+<p>Set the default FHIR version the server uses when a client does not specify:</p>
+<pre><code class="language-bash">HFS_DEFAULT_FHIR_VERSION=R5 hfs
+</code></pre>
+<p>Valid values: <code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code>. Default is <code>R4</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="python-bindings-pysof"><a class="header" href="#python-bindings-pysof">Python Bindings (pysof)</a></h1>
+<p><code>pysof</code> provides Python bindings for SQL-on-FHIR via <a href="https://pyo3.rs/">PyO3</a> and <a href="https://maturin.rs/">maturin</a>. It gives Python data pipelines native Rust performance for FHIR data transformation.</p>
+<hr />
+<h2 id="installing-via-pypi"><a class="header" href="#installing-via-pypi">Installing via PyPI</a></h2>
+<pre><code class="language-bash">pip install pysof
+</code></pre>
+<p>Pre-built wheels are available for:</p>
+<ul>
+<li>Linux (x86_64, aarch64)</li>
+<li>Windows (x86_64)</li>
+<li>macOS (x86_64, Apple Silicon / aarch64)</li>
+</ul>
+<p>No Rust toolchain is needed when installing from PyPI.</p>
+<hr />
+<h2 id="running-viewdefinitions-from-python"><a class="header" href="#running-viewdefinitions-from-python">Running ViewDefinitions from Python</a></h2>
+<h3 id="basic-usage"><a class="header" href="#basic-usage">Basic usage</a></h3>
+<pre><code class="language-python">import pysof
+
+# Load JSON strings (or dicts serialized to strings)
+result = pysof.run_view_definition(
+    view_definition=view_def_json,   # ViewDefinition as a JSON string
+    bundle=fhir_bundle_json,          # FHIR Bundle as a JSON string
+    format="csv"                      # "csv", "json", "ndjson", "parquet"
+)
+print(result)
+</code></pre>
+<h3 id="with-individual-resources-no-bundle-wrapper"><a class="header" href="#with-individual-resources-no-bundle-wrapper">With individual resources (no Bundle wrapper)</a></h3>
+<pre><code class="language-python">result = pysof.run_view_definition(
+    view_definition=view_def_json,
+    resources=[patient1_json, patient2_json],
+    format="json"
+)
+</code></pre>
+<h3 id="with-options"><a class="header" href="#with-options">With options</a></h3>
+<pre><code class="language-python">result = pysof.run_view_definition_with_options(
+    view=view_def_json,
+    bundle=fhir_bundle_json,
+    format="json",
+    limit=100,
+    fhir_version="R4"   # "R4", "R4B", "R5", "R6"
+)
+</code></pre>
+<hr />
+<h2 id="exporting-to-parquet"><a class="header" href="#exporting-to-parquet">Exporting to Parquet</a></h2>
+<pre><code class="language-python">import pysof
+
+# Returns bytes — write to file or pass to pyarrow/pandas
+parquet_bytes = pysof.run_view_definition(
+    view_definition=view_def_json,
+    bundle=bundle_json,
+    format="parquet"
+)
+
+with open("output.parquet", "wb") as f:
+    f.write(parquet_bytes)
+</code></pre>
+<p>Parquet output uses Snappy compression by default and follows Pathling type conventions. All fields are <code>OPTIONAL</code>. Arrays map to Arrow <code>List</code> types.</p>
+<hr />
+<h2 id="streaming-large-bundles"><a class="header" href="#streaming-large-bundles">Streaming Large Bundles</a></h2>
+<h3 id="chunkedprocessor"><a class="header" href="#chunkedprocessor">ChunkedProcessor</a></h3>
+<p>For large NDJSON files that do not fit in memory, use <code>ChunkedProcessor</code>:</p>
+<pre><code class="language-python">import pysof
+
+for chunk in pysof.ChunkedProcessor(
+    view_definition=view_def_json,
+    ndjson_path="large-patients.ndjson",
+    chunk_size=500      # resources per chunk (default: 1000)
+):
+    rows = chunk["rows"]   # list of row dicts
+    process(rows)
+</code></pre>
+<h3 id="process_ndjson_to_file"><a class="header" href="#process_ndjson_to_file">process_ndjson_to_file</a></h3>
+<p>The most memory-efficient path — streams directly from an NDJSON input file to an output file without loading everything into Python:</p>
+<pre><code class="language-python">import pysof
+
+stats = pysof.process_ndjson_to_file(
+    view_definition=view_def_json,
+    input_path="input.ndjson",
+    output_path="output.csv",
+    format="csv"
+)
+print(f"Processed {stats['rows_written']} rows")
+</code></pre>
+<hr />
+<h2 id="performance"><a class="header" href="#performance">Performance</a></h2>
+<p><code>pysof</code> uses <a href="https://github.com/rayon-rs/rayon">Rayon</a> for automatic multi-core parallelism, which gives a <strong>5–7× speedup</strong> on typical multi-core machines compared to single-threaded processing.</p>
+<p>Control the number of threads:</p>
+<pre><code class="language-bash">RAYON_NUM_THREADS=4 python process.py
+</code></pre>
+<p>Or from Python before the first call:</p>
+<pre><code class="language-python">import os
+os.environ["RAYON_NUM_THREADS"] = "4"
+import pysof
+</code></pre>
+<hr />
+<h2 id="building-from-source-with-maturin"><a class="header" href="#building-from-source-with-maturin">Building from Source with maturin</a></h2>
+<p>You need Python 3.x and the Rust toolchain.</p>
+<pre><code class="language-bash">cd crates/pysof
+
+# Create a virtual environment (recommended: use uv)
+uv venv --python 3.11
+uv sync --group dev
+
+# Build and install into the virtual environment
+uv run maturin develop --release
+
+# Verify the installation
+uv run python -c "import pysof; print(pysof.get_version()); print(pysof.get_supported_fhir_versions())"
+</code></pre>
+<p>To build distributable wheels:</p>
+<pre><code class="language-bash">uv run maturin build --release -o dist
+</code></pre>
+<hr />
+<h2 id="running-tests"><a class="header" href="#running-tests">Running Tests</a></h2>
+<pre><code class="language-bash">cd crates/pysof
+
+# Python tests (58 tests)
+uv run pytest python-tests/ -v
+
+# Rust unit tests (17 tests)
+cargo test
+</code></pre>
+<hr />
+<h2 id="utility-functions"><a class="header" href="#utility-functions">Utility Functions</a></h2>
+<pre><code class="language-python">import pysof
+
+# Get the library version
+pysof.get_version()         # e.g. "0.1.47"
+
+# List compiled FHIR versions
+pysof.get_supported_fhir_versions()  # e.g. ["R4"]
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="code-generation"><a class="header" href="#code-generation">Code Generation</a></h1>
+<p>The <code>helios-fhir</code> crate contains auto-generated Rust types for all FHIR resources and data types across R4, R4B, R5, and R6. These types are produced by <code>helios-fhir-gen</code> from official HL7 StructureDefinition JSON schemas.</p>
+<p>You only need to run the generator if you are <strong>updating the FHIR spec version</strong> or <strong>changing how models are generated</strong>. Normal development does not require it.</p>
+<hr />
+<h2 id="when-and-why-to-regenerate-models"><a class="header" href="#when-and-why-to-regenerate-models">When and Why to Regenerate Models</a></h2>
+<p>Regenerate the FHIR models when:</p>
+<ul>
+<li>A new FHIR specification release is available (e.g., a new R6 ballot or R5 patch)</li>
+<li>You change code generation logic in <code>helios-fhir-gen</code></li>
+<li>The R6 schema files have been updated on the HL7 build server</li>
+</ul>
+<p>Do <strong>not</strong> regenerate just to apply a patch or change application logic. The generated files are checked into the repository.</p>
+<hr />
+<h2 id="running-helios-fhir-gen"><a class="header" href="#running-helios-fhir-gen">Running helios-fhir-gen</a></h2>
+<p>Regeneration is a three-step process:</p>
+<h3 id="step-1--build-the-generator"><a class="header" href="#step-1--build-the-generator">Step 1 — Build the generator</a></h3>
+<p>Use <code>R4,R4B,R5,R6</code> feature flags explicitly. Do <strong>not</strong> use <code>--all-features</code> here (it enables <code>skip-r6-download</code>, which would prevent the R6 spec from being fetched).</p>
+<pre><code class="language-bash">cargo build -p helios-fhir-gen --features R4,R4B,R5,R6
+</code></pre>
+<blockquote>
+<p><strong>Build time:</strong> This can take 5–10 minutes because <code>helios-fhir</code> itself is a large generated crate.</p>
+</blockquote>
+<h3 id="step-2--run-the-generator"><a class="header" href="#step-2--run-the-generator">Step 2 — Run the generator</a></h3>
+<pre><code class="language-bash">./target/debug/helios-fhir-gen --all
+</code></pre>
+<p>This reads HL7 StructureDefinition JSON files for each version and writes:</p>
+<ul>
+<li><code>crates/fhir/src/r4.rs</code></li>
+<li><code>crates/fhir/src/r4b.rs</code></li>
+<li><code>crates/fhir/src/r5.rs</code></li>
+<li><code>crates/fhir/src/r6.rs</code></li>
+</ul>
+<blockquote>
+<p><strong>R6 auto-download:</strong> When <code>R6</code> is enabled, the generator automatically downloads the R6 StructureDefinition files from <code>https://build.fhir.org/</code> at build time. Internet access is required.</p>
+</blockquote>
+<h3 id="step-3--format-the-generated-files"><a class="header" href="#step-3--format-the-generated-files">Step 3 — Format the generated files</a></h3>
+<pre><code class="language-bash">cargo fmt --all
+</code></pre>
+<p>Generated files are not pre-formatted. Always run <code>cargo fmt</code> after generation before committing.</p>
+<hr />
+<h2 id="formatting-generated-code"><a class="header" href="#formatting-generated-code">Formatting Generated Code</a></h2>
+<p>After running the generator, always format:</p>
+<pre><code class="language-bash">cargo fmt --all
+</code></pre>
+<p>Then verify the build still compiles and tests pass:</p>
+<pre><code class="language-bash">cargo build --features R4,R4B,R5,R6
+cargo test --features R4,R4B,R5,R6
+</code></pre>
+<hr />
+<h2 id="how-the-generator-works"><a class="header" href="#how-the-generator-works">How the Generator Works</a></h2>
+<ol>
+<li><strong>Reads StructureDefinition JSON</strong> for each requested FHIR version from the <code>data/</code> directory (R4, R4B, R5) or downloaded from <code>build.fhir.org</code> (R6)</li>
+<li><strong>Parses the schema</strong> to extract resource types, data types, primitive types, and choice element patterns</li>
+<li><strong>Generates Rust structs</strong> with appropriate field types, option wrapping, and serde attributes</li>
+<li><strong>Writes output files</strong> to <code>crates/fhir/src/</code> — one file per FHIR version</li>
+<li><strong>Feature flags</strong> in <code>crates/fhir/Cargo.toml</code> control which generated files are compiled</li>
+</ol>
+<h3 id="what-is-generated-vs-hand-coded"><a class="header" href="#what-is-generated-vs-hand-coded">What is generated vs. hand-coded</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Source</th><th>Content</th></tr></thead><tbody>
+<tr><td>Generated (95%)</td><td>All resource structs, data type structs, primitive type wrappers, choice type enums</td></tr>
+<tr><td>Hand-coded (5%)</td><td><code>Element&lt;T&gt;</code>, <code>DecimalElement</code>, <code>PreciseDecimal</code>, <code>FhirVersion</code> enum, <code>Resource</code> collection enum</td></tr>
+</tbody></table>
+</div>
+<h3 id="the-skip-r6-download-feature-1"><a class="header" href="#the-skip-r6-download-feature-1">The <code>skip-r6-download</code> feature</a></h3>
+<p>When you run <code>cargo clippy --all-features</code>, the <code>skip-r6-download</code> feature is activated automatically. This prevents <code>helios-fhir-gen</code> from attempting to download R6 specs during the clippy run, making CI linting safe without network access or a long build.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="use-cases-and-recipes"><a class="header" href="#use-cases-and-recipes">Use Cases and Recipes</a></h1>
+<p>Concrete patterns for common HFS workflows, drawn from the CLI tools, Python bindings, and FHIRPath engine.</p>
+<hr />
+<h2 id="building-a-clinical-etl-pipeline"><a class="header" href="#building-a-clinical-etl-pipeline">Building a Clinical ETL Pipeline</a></h2>
+<p><strong>Goal:</strong> Extract patient demographics from a large NDJSON export, transform to Parquet, and load into a data warehouse.</p>
+<h3 id="step-1--write-a-viewdefinition"><a class="header" href="#step-1--write-a-viewdefinition">Step 1 — Write a ViewDefinition</a></h3>
+<pre><code class="language-json">{
+  "resourceType": "ViewDefinition",
+  "from": {"resourceType": "Patient"},
+  "select": [{
+    "column": [
+      {"name": "id",         "path": "getResourceKey()"},
+      {"name": "birth_date", "path": "birthDate"},
+      {"name": "gender",     "path": "gender"},
+      {"name": "last_name",  "path": "name.where(use='official').family"},
+      {"name": "first_name", "path": "name.where(use='official').given.first()"},
+      {"name": "zip",        "path": "address.where(use='home').postalCode"}
+    ]
+  }]
+}
+</code></pre>
+<h3 id="step-2--process-with-pysof-python"><a class="header" href="#step-2--process-with-pysof-python">Step 2 — Process with pysof (Python)</a></h3>
+<pre><code class="language-python">import pysof
+
+# Most memory-efficient: file-to-file streaming
+stats = pysof.process_ndjson_to_file(
+    view_definition=open("patient-view.json").read(),
+    input_path="export.ndjson",
+    output_path="patients.parquet",
+    format="parquet"
+)
+print(f"Wrote {stats['rows_written']} rows")
+</code></pre>
+<h3 id="step-3--for-very-large-files-chunked-processing"><a class="header" href="#step-3--for-very-large-files-chunked-processing">Step 3 — For very large files: chunked processing</a></h3>
+<pre><code class="language-python">import pysof
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+writer = None
+
+for chunk in pysof.ChunkedProcessor(
+    view_definition=open("patient-view.json").read(),
+    ndjson_path="large-export.ndjson",
+    chunk_size=1000
+):
+    table = pa.Table.from_pylist(chunk["rows"])
+    if writer is None:
+        writer = pq.ParquetWriter("patients.parquet", table.schema)
+    writer.write_table(table)
+
+if writer:
+    writer.close()
+</code></pre>
+<h3 id="step-4--alternatively-use-sof-cli"><a class="header" href="#step-4--alternatively-use-sof-cli">Step 4 — Alternatively, use sof-cli</a></h3>
+<pre><code class="language-bash">sof-cli \
+  --view patient-view.json \
+  --bundle export.ndjson \
+  --format parquet \
+  --parquet-compression zstd \
+  -o patients.parquet
+</code></pre>
+<h3 id="incremental-loads-with---since"><a class="header" href="#incremental-loads-with---since">Incremental loads with <code>--since</code></a></h3>
+<p>Re-run the pipeline for only records modified after the last run:</p>
+<pre><code class="language-bash">sof-cli \
+  --view patient-view.json \
+  --bundle export.ndjson \
+  --since 2024-06-01T00:00:00Z \
+  --format parquet \
+  -o patients-delta.parquet
+</code></pre>
+<hr />
+<h2 id="real-time-analytics-with-sof-server"><a class="header" href="#real-time-analytics-with-sof-server">Real-Time Analytics with sof-server</a></h2>
+<p><strong>Goal:</strong> Serve on-demand tabular transforms over an HTTP API for a dashboard or BI tool.</p>
+<h3 id="start-the-server"><a class="header" href="#start-the-server">Start the server</a></h3>
+<pre><code class="language-bash">SOF_SERVER_PORT=8080 sof-server
+</code></pre>
+<h3 id="send-a-transform-request"><a class="header" href="#send-a-transform-request">Send a transform request</a></h3>
+<pre><code class="language-bash">curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "_format": "json",
+    "_since": "2024-01-01T00:00:00Z",
+    "_limit": 500,
+    "viewResource": {
+      "resourceType": "ViewDefinition",
+      "from": {"resourceType": "Observation"},
+      "select": [{"column": [
+        {"name": "patient",   "path": "subject.reference"},
+        {"name": "loinc",     "path": "code.coding.where(system=\"http://loinc.org\").code.first()"},
+        {"name": "value",     "path": "value.quantity.value"},
+        {"name": "unit",      "path": "value.quantity.unit"},
+        {"name": "effective", "path": "effective.dateTime"}
+      ]}]
+    },
+    "resource": [ ... ]
+  }'
+</code></pre>
+<h3 id="parquet-output-for-analytics-tools"><a class="header" href="#parquet-output-for-analytics-tools">Parquet output for analytics tools</a></h3>
+<pre><code class="language-bash">curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/octet-stream" \
+  -d '{"_format": "parquet", "viewResource": {...}, "resource": [...]}' \
+  -o result.parquet
+</code></pre>
+<hr />
+<h2 id="data-quality-validation-with-fhirpath"><a class="header" href="#data-quality-validation-with-fhirpath">Data Quality Validation with FHIRPath</a></h2>
+<p><strong>Goal:</strong> Validate a set of FHIR resources against clinical invariants.</p>
+<h3 id="check-that-every-patient-has-a-birth-date"><a class="header" href="#check-that-every-patient-has-a-birth-date">Check that every Patient has a birth date</a></h3>
+<pre><code class="language-bash">fhirpath-cli -e "Patient.birthDate.exists()" -r patient.json
+</code></pre>
+<h3 id="validate-a-local-reference-points-to-a-contained-resource"><a class="header" href="#validate-a-local-reference-points-to-a-contained-resource">Validate a local reference points to a contained resource</a></h3>
+<pre><code class="language-bash">fhirpath-cli -e \
+  "reference.startsWith('#').not() or (\$context.reference.substring(1) in \$resource.contained.id)" \
+  -r resource.json
+</code></pre>
+<h3 id="find-observations-missing-a-subject"><a class="header" href="#find-observations-missing-a-subject">Find observations missing a subject</a></h3>
+<pre><code class="language-bash">fhirpath-cli -e "subject.exists().not()" -r observations.json
+</code></pre>
+<h3 id="validate-phone-format-with-a-regex"><a class="header" href="#validate-phone-format-with-a-regex">Validate phone format with a regex</a></h3>
+<pre><code class="language-bash">fhirpath-cli \
+  -e "Patient.telecom.where(system='phone').value.all(matches('^[0-9()+\\- ]{7,20}$'))" \
+  -r patient.json
+</code></pre>
+<h3 id="batch-validation-in-a-shell-loop"><a class="header" href="#batch-validation-in-a-shell-loop">Batch validation in a shell loop</a></h3>
+<pre><code class="language-bash">for f in data/*.json; do
+  result=$(fhirpath-cli -e "Patient.name.where(use='official').family.exists()" -r "$f")
+  if [ "$result" = "false" ]; then
+    echo "FAIL: $f is missing an official family name"
+  fi
+done
+</code></pre>
+<hr />
+<h2 id="patient-cohort-analysis"><a class="header" href="#patient-cohort-analysis">Patient Cohort Analysis</a></h2>
+<p><strong>Goal:</strong> Identify patients meeting a clinical criterion using FHIRPath.</p>
+<h3 id="find-all-systolic-blood-pressure-readings-above-140"><a class="header" href="#find-all-systolic-blood-pressure-readings-above-140">Find all systolic blood pressure readings above 140</a></h3>
+<pre><code class="language-fhirpath">Observation.where(
+  code.coding.system = 'http://loinc.org' and
+  code.coding.code = '8480-6'
+).where(value.quantity.value &gt; 140)
+</code></pre>
+<pre><code class="language-bash">fhirpath-cli \
+  -e "Observation.where(code.coding.system='http://loinc.org' and code.coding.code='8480-6').where(value.quantity.value &gt; 140)" \
+  -r observations.json
+</code></pre>
+<h3 id="extract-patients-on-active-medications"><a class="header" href="#extract-patients-on-active-medications">Extract patients on active medications</a></h3>
+<pre><code class="language-fhirpath">MedicationRequest.where(status = 'active').subject.reference
+</code></pre>
+<h3 id="find-active-diagnoses-with-a-snomed-code"><a class="header" href="#find-active-diagnoses-with-a-snomed-code">Find active diagnoses with a SNOMED code</a></h3>
+<pre><code class="language-fhirpath">Condition.where(
+  clinicalStatus.coding.code = 'active' and
+  code.coding.system = 'http://snomed.info/sct'
+).code.coding.code
+</code></pre>
+<h3 id="viewdefinition-for-a-cohort-report"><a class="header" href="#viewdefinition-for-a-cohort-report">ViewDefinition for a cohort report</a></h3>
+<p>Combine SQL-on-FHIR to produce a flat cohort table:</p>
+<pre><code class="language-json">{
+  "resourceType": "ViewDefinition",
+  "from": {"resourceType": "Condition"},
+  "select": [{
+    "column": [
+      {"name": "patient_id",    "path": "subject.reference"},
+      {"name": "condition_code","path": "code.coding.where(system='http://snomed.info/sct').code.first()"},
+      {"name": "onset",         "path": "onset.dateTime"},
+      {"name": "status",        "path": "clinicalStatus.coding.code.first()"}
+    ]
+  }]
+}
+</code></pre>
+<pre><code class="language-bash">sof-cli --view cohort-view.json --bundle conditions.ndjson --format csv -o cohort.csv
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="embedding-hfs-as-a-library"><a class="header" href="#embedding-hfs-as-a-library">Embedding HFS as a Library</a></h1>
+<p>HFS crates can be used as libraries in your own Rust projects. This chapter covers adding crates as dependencies, browsing the API docs, embedding the REST layer, and integrating the CDS Hooks types.</p>
+<hr />
+<h2 id="adding-crates-as-dependencies"><a class="header" href="#adding-crates-as-dependencies">Adding Crates as Dependencies</a></h2>
+<p>All HFS crates are published to <a href="https://crates.io">crates.io</a>. Add them to your <code>Cargo.toml</code>:</p>
+<pre><code class="language-toml">[dependencies]
+# FHIRPath evaluation
+helios-fhirpath = "0.1"
+
+# SQL-on-FHIR transforms
+helios-sof = "0.1"
+
+# FHIR REST API layer
+helios-rest = "0.1"
+
+# Core FHIR data models (R4 by default)
+helios-fhir = "0.1"
+
+# CDS Hooks protocol types
+helios-cds-hooks = "0.1"
+</code></pre>
+<p>Enable additional FHIR versions with feature flags:</p>
+<pre><code class="language-toml">[dependencies]
+helios-fhir = { version = "0.1", features = ["R4", "R5"] }
+helios-fhirpath = { version = "0.1", features = ["R4", "R5"] }
+</code></pre>
+<hr />
+<h2 id="api-documentation-with-cargo-doc"><a class="header" href="#api-documentation-with-cargo-doc">API Documentation with cargo doc</a></h2>
+<p>Generate and open the local API documentation:</p>
+<pre><code class="language-bash">cargo doc --no-deps --open
+</code></pre>
+<p>This opens a browser with documentation for all workspace crates. Each public function, struct, trait, and enum is documented.</p>
+<hr />
+<h2 id="embedding-helios-fhirpath"><a class="header" href="#embedding-helios-fhirpath">Embedding helios-fhirpath</a></h2>
+<p>The FHIRPath evaluator can be used standalone in any Rust application:</p>
+<pre><pre class="playground"><code class="language-rust">use helios_fhirpath::evaluator::{EvaluationContext, evaluate_expression};
+use helios_fhir::FhirVersion;
+
+fn main() {
+    // Parse a FHIR resource from JSON
+    let resource_json = r#"{
+        "resourceType": "Patient",
+        "id": "p1",
+        "name": [{"family": "Smith", "given": ["John"]}]
+    }"#;
+
+    // Create an evaluation context
+    let context = EvaluationContext::new_empty(FhirVersion::R4);
+
+    // Evaluate a FHIRPath expression
+    let result = evaluate_expression("Patient.name.family", resource_json, &amp;context)
+        .expect("evaluation failed");
+
+    println!("{:?}", result);  // ["Smith"]
+}</code></pre></pre>
+<hr />
+<h2 id="embedding-helios-sof"><a class="header" href="#embedding-helios-sof">Embedding helios-sof</a></h2>
+<p>Run ViewDefinition transforms in your Rust application:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use helios_sof::run_view_definition;
+
+let view_def_json = std::fs::read_to_string("patient-view.json").unwrap();
+let bundle_json   = std::fs::read_to_string("patients.json").unwrap();
+
+let csv_output = run_view_definition(&amp;view_def_json, &amp;bundle_json, "csv")
+    .expect("transform failed");
+
+println!("{}", csv_output);
+<span class="boring">}</span></code></pre></pre>
+<hr />
+<h2 id="embedding-helios-rest"><a class="header" href="#embedding-helios-rest">Embedding helios-rest</a></h2>
+<p>The <code>helios-rest</code> crate provides a complete FHIR REST API layer built on <a href="https://github.com/tokio-rs/axum">Axum</a>. You can wire it into your own Axum application:</p>
+<pre><pre class="playground"><code class="language-rust">use helios_rest::router::FhirRouter;
+use helios_persistence::sqlite::SqliteStorage;
+
+#[tokio::main]
+async fn main() {
+    let storage = SqliteStorage::new("fhir.db").await.unwrap();
+    let app = FhirRouter::new(storage).into_router();
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}</code></pre></pre>
+<p><code>helios-rest</code> handles:</p>
+<ul>
+<li>All FHIR CRUD, search, history, and batch/transaction interactions</li>
+<li>Multi-tenancy routing (header, URL path, or both)</li>
+<li>ETag versioning and conditional updates</li>
+<li>Request ID tracking and CORS</li>
+<li>FHIR <code>OperationOutcome</code> error responses</li>
+</ul>
+<p>Any <code>ResourceStorage</code> implementation can be plugged in.</p>
+<hr />
+<h2 id="cds-hooks-integration"><a class="header" href="#cds-hooks-integration">CDS Hooks Integration</a></h2>
+<p>The <code>helios-cds-hooks</code> crate provides complete protocol types and an async trait for building CDS Hooks services:</p>
+<pre><code class="language-toml">[dependencies]
+helios-cds-hooks = "0.1"
+</code></pre>
+<p>Implement <code>CdsHooksService</code> and wire it to your web framework:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use helios_cds_hooks::{CdsHooksService, CdsRequest, CdsResponse, Card};
+
+struct MyService;
+
+#[async_trait::async_trait]
+impl CdsHooksService for MyService {
+    async fn handle(&amp;self, request: CdsRequest) -&gt; CdsResponse {
+        // Evaluate clinical logic here
+        CdsResponse {
+            cards: vec![
+                Card::info("Consider reviewing medications")
+                    .with_summary("Potential drug interaction detected"),
+            ],
+        }
+    }
+}
+<span class="boring">}</span></code></pre></pre>
+<p>The crate supports all 10 hooks in the CDS Hooks Library with strongly-typed context structs (e.g., <code>PatientViewContext</code>, <code>OrderSignContext</code>). It is FHIR version agnostic.</p>
+<p>Full API documentation: <code>cargo doc -p helios-cds-hooks --no-deps --open</code></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="development-setup"><a class="header" href="#development-setup">Development Setup</a></h1>
+<p>This chapter covers building from source, running the test suite, and linting — everything you need to contribute to HFS or work on the codebase.</p>
+<hr />
+<h2 id="building-from-source"><a class="header" href="#building-from-source">Building from Source</a></h2>
+<h3 id="default-build-r4-only"><a class="header" href="#default-build-r4-only">Default build (R4 only)</a></h3>
+<pre><code class="language-bash">cargo build
+</code></pre>
+<p>Builds all default workspace members (excludes <code>pysof</code>). Compiles R4 only.</p>
+<h3 id="build-with-all-fhir-versions"><a class="header" href="#build-with-all-fhir-versions">Build with all FHIR versions</a></h3>
+<pre><code class="language-bash">cargo build --features R4,R4B,R5,R6
+</code></pre>
+<h3 id="release-binaries"><a class="header" href="#release-binaries">Release binaries</a></h3>
+<pre><code class="language-bash">cargo build --release
+cargo build --release --features R4,R4B,R5,R6
+</code></pre>
+<p>Binaries land in <code>target/release/</code>.</p>
+<h3 id="build-a-specific-crate"><a class="header" href="#build-a-specific-crate">Build a specific crate</a></h3>
+<pre><code class="language-bash">cargo build -p helios-hfs
+cargo build -p helios-fhirpath
+cargo build -p helios-sof
+cargo build -p helios-persistence --features postgres,elasticsearch
+</code></pre>
+<h3 id="python-bindings-pysof-1"><a class="header" href="#python-bindings-pysof-1">Python bindings (pysof)</a></h3>
+<p><code>pysof</code> is excluded from the default workspace build because it requires Python and maturin.</p>
+<pre><code class="language-bash">cd crates/pysof
+
+# Set up a virtual environment
+uv venv --python 3.11
+uv sync --group dev
+
+# Build and install into the venv (recommended for development)
+uv run maturin develop --release
+
+# Build distributable wheels
+uv run maturin build --release -o dist
+</code></pre>
+<blockquote>
+<p><strong>Note:</strong> Build times can exceed 10 minutes on a first build, especially with all FHIR versions, due to the large generated files in <code>helios-fhir</code>.</p>
+</blockquote>
+<hr />
+<h2 id="running-the-test-suite"><a class="header" href="#running-the-test-suite">Running the Test Suite</a></h2>
+<h3 id="all-tests-r4"><a class="header" href="#all-tests-r4">All tests (R4)</a></h3>
+<pre><code class="language-bash">cargo test
+</code></pre>
+<h3 id="all-tests-with-all-fhir-versions"><a class="header" href="#all-tests-with-all-fhir-versions">All tests with all FHIR versions</a></h3>
+<pre><code class="language-bash">cargo test --features R4,R4B,R5,R6
+</code></pre>
+<h3 id="specific-crate"><a class="header" href="#specific-crate">Specific crate</a></h3>
+<pre><code class="language-bash">cargo test -p helios-sof
+cargo test -p helios-fhirpath
+cargo test -p helios-persistence
+</code></pre>
+<h3 id="single-test-by-name-pattern"><a class="header" href="#single-test-by-name-pattern">Single test by name pattern</a></h3>
+<pre><code class="language-bash">cargo test test_name_pattern
+</code></pre>
+<h3 id="show-stdout-output"><a class="header" href="#show-stdout-output">Show stdout output</a></h3>
+<pre><code class="language-bash">cargo test -- --nocapture
+</code></pre>
+<h3 id="docker-requirement-for-integration-tests"><a class="header" href="#docker-requirement-for-integration-tests">Docker requirement for integration tests</a></h3>
+<p>PostgreSQL and Elasticsearch integration tests in <code>helios-persistence</code> use <a href="https://testcontainers.com/">testcontainers</a> to spin up real database instances in Docker. <strong>Docker must be running</strong> to execute these tests.</p>
+<p>To skip integration tests when Docker is unavailable:</p>
+<pre><code class="language-bash">cargo test --all-features -- --skip postgres_integration --skip es_integration
+</code></pre>
+<p>Testcontainers details:</p>
+<ul>
+<li>A shared container is created once per test binary via <code>tokio::sync::OnceCell</code></li>
+<li>Data isolation uses unique UUID-based prefixes and tenant IDs — not separate containers per test</li>
+<li>Elasticsearch containers cap JVM heap: <code>ES_JAVA_OPTS=-Xms256m -Xmx256m</code></li>
+</ul>
+<h3 id="python-tests-pysof"><a class="header" href="#python-tests-pysof">Python tests (pysof)</a></h3>
+<pre><code class="language-bash">cd crates/pysof
+
+# Python tests (58 tests)
+uv run pytest python-tests/ -v
+
+# Rust unit tests (17 tests)
+cargo test
+</code></pre>
+<h3 id="test-data-locations"><a class="header" href="#test-data-locations">Test data locations</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>What</th><th>Where</th></tr></thead><tbody>
+<tr><td>FHIR example resources</td><td><code>crates/fhir/tests/data/</code></td></tr>
+<tr><td>Search parameter definitions</td><td><code>data/search-parameters-{r4,r4b,r5,r6}.json</code></td></tr>
+<tr><td>FHIRPath official test cases</td><td><code>crates/fhirpath/tests/</code></td></tr>
+<tr><td>ViewDefinition examples</td><td>Inline in test files</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="linting-and-formatting"><a class="header" href="#linting-and-formatting">Linting and Formatting</a></h2>
+<h3 id="format-all-code"><a class="header" href="#format-all-code">Format all code</a></h3>
+<pre><code class="language-bash">cargo fmt --all
+</code></pre>
+<h3 id="lint-with-ci-compatible-flags"><a class="header" href="#lint-with-ci-compatible-flags">Lint with CI-compatible flags</a></h3>
+<pre><code class="language-bash">cargo clippy --all-targets --all-features -- -D warnings \
+  -A clippy::items_after_test_module \
+  -A clippy::large_enum_variant \
+  -A clippy::question_mark \
+  -A clippy::collapsible_match \
+  -A clippy::collapsible_if \
+  -A clippy::field_reassign_with_default \
+  -A clippy::doc-overindented-list-items \
+  -A clippy::doc-lazy-continuation
+</code></pre>
+<blockquote>
+<p><strong>Note:</strong> <code>--all-features</code> is safe for clippy — it enables <code>skip-r6-download</code>, preventing R6 spec downloads during the check. All lints are enforced as errors (<code>-D warnings</code>).</p>
+</blockquote>
+<h3 id="type-checking-without-building"><a class="header" href="#type-checking-without-building">Type checking without building</a></h3>
+<pre><code class="language-bash">cargo check
+</code></pre>
+<hr />
+<h2 id="pre-submission-checklist"><a class="header" href="#pre-submission-checklist">Pre-Submission Checklist</a></h2>
+<p>Before opening a pull request, run these three commands and fix any issues:</p>
+<pre><code class="language-bash"># 1. Format
+cargo fmt --all
+
+# 2. Lint (must be zero warnings)
+cargo clippy --all-targets --all-features -- -D warnings \
+  -A clippy::items_after_test_module \
+  -A clippy::large_enum_variant \
+  -A clippy::question_mark \
+  -A clippy::collapsible_match \
+  -A clippy::collapsible_if \
+  -A clippy::field_reassign_with_default \
+  -A clippy::doc-overindented-list-items \
+  -A clippy::doc-lazy-continuation
+
+# 3. Test affected crates
+cargo test -p &lt;affected-crate&gt;
+</code></pre>
+<hr />
+<h2 id="useful-debug-commands"><a class="header" href="#useful-debug-commands">Useful Debug Commands</a></h2>
+<pre><code class="language-bash"># Enable trace logging for the HFS server
+HFS_LOG_LEVEL=trace cargo run --bin hfs
+
+# Enable debug logging for the FHIRPath server
+FHIRPATH_LOG_LEVEL=debug cargo run --bin fhirpath-server
+
+# Test a FHIRPath expression interactively
+cargo run --bin fhirpath-cli -- -e "Patient.name.family" -r patient.json
+
+# Show println! output in tests
+cargo test -p helios-fhirpath -- --nocapture
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="contributing-guidelines"><a class="header" href="#contributing-guidelines">Contributing Guidelines</a></h1>
+<hr />
+<h2 id="code-style-and-conventions"><a class="header" href="#code-style-and-conventions">Code Style and Conventions</a></h2>
+<ul>
+<li><strong>Rust edition:</strong> 2024</li>
+<li><strong>Minimum supported Rust version (MSRV):</strong> 1.90</li>
+<li><strong>Version:</strong> All crates share the same version number, bumped together at release time</li>
+<li><strong>Formatting:</strong> <code>cargo fmt --all</code> before every commit</li>
+<li><strong>Linting:</strong> Zero clippy warnings with the CI flags (see <a href="ch13-dev-setup.html#linting-and-formatting">Development Setup</a>)</li>
+<li><strong>Doc-only commits:</strong> Include <code>[skip ci]</code> in the commit message when only documentation files (README, CLAUDE.md, <code>.md</code> files) have changed, to avoid unnecessary CI runs</li>
+</ul>
+<hr />
+<h2 id="opening-issues-and-pull-requests"><a class="header" href="#opening-issues-and-pull-requests">Opening Issues and Pull Requests</a></h2>
+<ul>
+<li><strong>Issues and bug reports:</strong> <a href="https://github.com/HeliosSoftware/hfs/issues">github.com/HeliosSoftware/hfs/issues</a></li>
+<li><strong>Discussions (design, questions, roadmap):</strong> <a href="https://github.com/HeliosSoftware/hfs/discussions">github.com/HeliosSoftware/hfs/discussions</a></li>
+<li><strong>Weekly developer meeting:</strong> Open to all. Details in <a href="https://github.com/HeliosSoftware/hfs/discussions/40">this GitHub Discussion</a></li>
+</ul>
+<h3 id="how-to-get-involved"><a class="header" href="#how-to-get-involved">How to get involved</a></h3>
+<ol>
+<li><strong>Comment on a discussion document</strong> — help shape the design of upcoming features</li>
+<li><strong>Claim a roadmap item</strong> — open an issue or comment on an existing one to signal interest</li>
+<li><strong>Join the weekly call</strong> — introduce yourself and find out where help is needed</li>
+<li><strong>Contribute code</strong> — fork, branch, implement, open a PR</li>
+</ol>
+<hr />
+<h2 id="common-extension-points"><a class="header" href="#common-extension-points">Common Extension Points</a></h2>
+<h3 id="adding-a-new-fhirpath-function"><a class="header" href="#adding-a-new-fhirpath-function">Adding a new FHIRPath function</a></h3>
+<ol>
+<li>Add the function implementation in the appropriate module under <code>crates/fhirpath/src/</code></li>
+<li>Update the parser in <code>parser.rs</code> if the function requires new syntax</li>
+<li>Add test cases covering the function (both unit and against the official FHIR test suite if applicable)</li>
+<li>Update the feature matrix in the crate README</li>
+</ol>
+<h3 id="adding-a-new-rest-endpoint"><a class="header" href="#adding-a-new-rest-endpoint">Adding a new REST endpoint</a></h3>
+<ol>
+<li>Add the handler in <code>crates/rest/src/handlers/</code></li>
+<li>Register the route in <code>crates/rest/src/routes.rs</code></li>
+<li>Add integration tests covering the endpoint</li>
+</ol>
+<h3 id="implementing-a-new-storage-backend"><a class="header" href="#implementing-a-new-storage-backend">Implementing a new storage backend</a></h3>
+<ol>
+<li>Implement <code>ResourceStorage</code> as the baseline (CRUD operations, TenantContext required for every call)</li>
+<li>Optionally implement <code>VersionedStorage</code>, <code>SearchProvider</code>, <code>TransactionProvider</code> for additional capabilities</li>
+<li>Register the backend in <code>CompositeStorage</code> if it can be combined with other backends</li>
+<li>Implement <code>CapabilityProvider</code> to advertise the supported FHIR interactions in the CapabilityStatement</li>
+</ol>
+<hr />
+<h2 id="release-process"><a class="header" href="#release-process">Release Process</a></h2>
+<p>HFS uses <a href="https://github.com/crate-ci/cargo-release"><code>cargo-release</code></a> for workspace-wide version bumps. All crates are bumped together.</p>
+<h3 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h3>
+<pre><code class="language-bash">cargo install cargo-release
+cargo login   # set up your crates.io token
+</code></pre>
+<h3 id="pre-release-checklist"><a class="header" href="#pre-release-checklist">Pre-release checklist</a></h3>
+<p>Before cutting a release:</p>
+<pre><code class="language-bash"># 1. Optionally regenerate FHIR models from the latest spec
+cargo build -p helios-fhir-gen --features R4,R4B,R5,R6
+./target/debug/helios-fhir-gen --all
+cargo fmt --all
+
+# 2. Run the full test suite
+cargo test --workspace --all-features
+
+# 3. Ensure CI is green on main
+</code></pre>
+<h3 id="creating-a-release"><a class="header" href="#creating-a-release">Creating a release</a></h3>
+<pre><code class="language-bash"># Dry run first — review the output carefully
+cargo release patch --dry-run   # 0.1.47 → 0.1.48
+cargo release minor --dry-run   # 0.1.47 → 0.2.0
+cargo release major --dry-run   # 0.1.47 → 1.0.0
+
+# Execute when satisfied
+cargo release patch --execute
+</code></pre>
+<p><code>cargo release</code> will:</p>
+<ol>
+<li>Update all <code>Cargo.toml</code> version fields</li>
+<li>Update internal dependency version references</li>
+<li>Create a git commit with the version bump</li>
+<li>Create a git tag</li>
+<li>Publish all crates to crates.io</li>
+<li>Push the commit and tag to GitHub</li>
+</ol>
+<h3 id="automatic-post-release-actions-github-actions"><a class="header" href="#automatic-post-release-actions-github-actions">Automatic post-release actions (GitHub Actions)</a></h3>
+<p>After the tag is pushed, CI automatically:</p>
+<ul>
+<li>Builds release binary artifacts for Linux, Windows, and macOS</li>
+<li>Creates a <a href="https://github.com/HeliosSoftware/hfs/releases">GitHub Release</a> with the artifacts attached</li>
+<li>Builds <code>pysof</code> wheels for all platforms</li>
+<li>Publishes <code>pysof</code> to PyPI (if <code>PYPI_API_TOKEN</code> is configured)</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="appendix-a--cli-reference"><a class="header" href="#appendix-a--cli-reference">Appendix A — CLI Reference</a></h1>
+<p>Complete reference for all HFS command-line binaries.</p>
+<hr />
+<h2 id="hfs--fhir-rest-server"><a class="header" href="#hfs--fhir-rest-server">hfs — FHIR REST Server</a></h2>
+<pre><code class="language-bash">hfs
+</code></pre>
+<p>No command-line flags. All configuration is via environment variables.</p>
+<h3 id="environment-variables-1"><a class="header" href="#environment-variables-1">Environment variables</a></h3>
+<p>See the full reference in <a href="configuration/environment-variables.html">Environment Variables</a>. Key variables:</p>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>HFS_SERVER_PORT</code></td><td><code>8080</code></td><td>Port to listen on</td></tr>
+<tr><td><code>HFS_SERVER_HOST</code></td><td><code>127.0.0.1</code></td><td>Host to bind</td></tr>
+<tr><td><code>HFS_LOG_LEVEL</code></td><td><code>info</code></td><td><code>error</code>, <code>warn</code>, <code>info</code>, <code>debug</code>, <code>trace</code></td></tr>
+<tr><td><code>HFS_STORAGE_BACKEND</code></td><td><code>sqlite</code></td><td><code>sqlite</code>, <code>sqlite-es</code>, <code>postgres</code>, <code>pg-es</code>, <code>s3</code>, <code>s3-es</code></td></tr>
+<tr><td><code>HFS_DATABASE_URL</code></td><td><code>fhir.db</code></td><td>SQLite path or PostgreSQL connection string</td></tr>
+<tr><td><code>HFS_DEFAULT_FHIR_VERSION</code></td><td><code>R4</code></td><td><code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code></td></tr>
+<tr><td><code>HFS_DEFAULT_TENANT</code></td><td><code>default</code></td><td>Default tenant ID</td></tr>
+<tr><td><code>HFS_TENANT_ROUTING_MODE</code></td><td><code>header_only</code></td><td><code>header_only</code>, <code>url_path</code>, <code>both</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="api-endpoints"><a class="header" href="#api-endpoints">API endpoints</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Interaction</th><th>Method</th><th>Path</th></tr></thead><tbody>
+<tr><td>Capabilities</td><td><code>GET</code></td><td><code>/metadata</code></td></tr>
+<tr><td>Read</td><td><code>GET</code></td><td><code>/[type]/[id]</code></td></tr>
+<tr><td>Version read</td><td><code>GET</code></td><td><code>/[type]/[id]/_history/[vid]</code></td></tr>
+<tr><td>Update</td><td><code>PUT</code></td><td><code>/[type]/[id]</code></td></tr>
+<tr><td>Patch</td><td><code>PATCH</code></td><td><code>/[type]/[id]</code></td></tr>
+<tr><td>Delete</td><td><code>DELETE</code></td><td><code>/[type]/[id]</code></td></tr>
+<tr><td>Create</td><td><code>POST</code></td><td><code>/[type]</code></td></tr>
+<tr><td>Search (GET)</td><td><code>GET</code></td><td><code>/[type]?params</code></td></tr>
+<tr><td>Search (POST)</td><td><code>POST</code></td><td><code>/[type]/_search</code></td></tr>
+<tr><td>Instance history</td><td><code>GET</code></td><td><code>/[type]/[id]/_history</code></td></tr>
+<tr><td>Type history</td><td><code>GET</code></td><td><code>/[type]/_history</code></td></tr>
+<tr><td>System history</td><td><code>GET</code></td><td><code>/_history</code></td></tr>
+<tr><td>Batch / transaction</td><td><code>POST</code></td><td><code>/</code></td></tr>
+<tr><td>Health</td><td><code>GET</code></td><td><code>/health</code></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="fhirpath-cli--fhirpath-expression-evaluator"><a class="header" href="#fhirpath-cli--fhirpath-expression-evaluator">fhirpath-cli — FHIRPath Expression Evaluator</a></h2>
+<pre><code class="language-bash">fhirpath-cli [OPTIONS] -e &lt;EXPRESSION&gt;
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>-e, --expression &lt;EXPR&gt;</code></td><td>FHIRPath expression to evaluate <strong>(required)</strong></td></tr>
+<tr><td><code>-r, --resource &lt;FILE&gt;</code></td><td>Path to FHIR resource JSON file, or <code>-</code> to read from stdin</td></tr>
+<tr><td><code>-c, --context &lt;EXPR&gt;</code></td><td>Context expression to scope evaluation</td></tr>
+<tr><td><code>--var &lt;NAME=VALUE&gt;</code></td><td>Set an environment variable (repeatable)</td></tr>
+<tr><td><code>--fhir-version &lt;VER&gt;</code></td><td>FHIR version: <code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code> (default: <code>R4</code>)</td></tr>
+<tr><td><code>--parse-debug-tree</code></td><td>Print the parse tree and exit</td></tr>
+<tr><td><code>--terminology-server &lt;URL&gt;</code></td><td>Override the default terminology server</td></tr>
+<tr><td><code>-h, --help</code></td><td>Print help</td></tr>
+</tbody></table>
+</div>
+<h3 id="examples-1"><a class="header" href="#examples-1">Examples</a></h3>
+<pre><code class="language-bash">fhirpath-cli -e "Patient.name.family" -r patient.json
+fhirpath-cli -c "Patient.name" -e "family" -r patient.json
+fhirpath-cli -e "value &gt; %threshold" -r obs.json --var threshold=5.0
+cat patient.json | fhirpath-cli -e "Patient.name.family" -r -
+fhirpath-cli -e "Patient.name.first()" --parse-debug-tree
+fhirpath-cli --fhir-version R5 -e "Patient.name.family" -r r5-patient.json
+</code></pre>
+<hr />
+<h2 id="fhirpath-server--fhirpath-http-server"><a class="header" href="#fhirpath-server--fhirpath-http-server">fhirpath-server — FHIRPath HTTP Server</a></h2>
+<pre><code class="language-bash">fhirpath-server
+</code></pre>
+<p>No command-line flags. All configuration is via environment variables.</p>
+<h3 id="environment-variables-2"><a class="header" href="#environment-variables-2">Environment variables</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>FHIRPATH_SERVER_PORT</code></td><td><code>3000</code></td><td>Port to listen on</td></tr>
+<tr><td><code>FHIRPATH_SERVER_HOST</code></td><td><code>127.0.0.1</code></td><td>Host to bind</td></tr>
+<tr><td><code>FHIRPATH_LOG_LEVEL</code></td><td><code>info</code></td><td>Log level</td></tr>
+<tr><td><code>FHIRPATH_ENABLE_CORS</code></td><td><code>true</code></td><td>Enable CORS</td></tr>
+<tr><td><code>FHIRPATH_CORS_ORIGINS</code></td><td><code>*</code></td><td>Allowed CORS origins</td></tr>
+<tr><td><code>FHIRPATH_TERMINOLOGY_SERVER</code></td><td><em>(none)</em></td><td>Terminology server URL</td></tr>
+</tbody></table>
+</div>
+<h3 id="endpoints-1"><a class="header" href="#endpoints-1">Endpoints</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>POST</code></td><td><code>/</code></td><td>Evaluate (auto-detect version)</td></tr>
+<tr><td><code>POST</code></td><td><code>/r4</code></td><td>Evaluate as R4</td></tr>
+<tr><td><code>POST</code></td><td><code>/r4b</code></td><td>Evaluate as R4B</td></tr>
+<tr><td><code>POST</code></td><td><code>/r5</code></td><td>Evaluate as R5</td></tr>
+<tr><td><code>POST</code></td><td><code>/r6</code></td><td>Evaluate as R6</td></tr>
+<tr><td><code>GET</code></td><td><code>/health</code></td><td>Health check</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="sof-cli--sql-on-fhir-cli"><a class="header" href="#sof-cli--sql-on-fhir-cli">sof-cli — SQL-on-FHIR CLI</a></h2>
+<pre><code class="language-bash">sof-cli [OPTIONS]
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Short</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--view &lt;FILE&gt;</code></td><td><code>-v</code></td><td><em>(stdin)</em></td><td>Path to ViewDefinition JSON file</td></tr>
+<tr><td><code>--bundle &lt;FILE&gt;</code></td><td><code>-b</code></td><td><em>(stdin)</em></td><td>Path to FHIR Bundle or NDJSON file</td></tr>
+<tr><td><code>--source &lt;URL&gt;</code></td><td><code>-s</code></td><td>—</td><td>URL-based data source (<code>file://</code>, <code>http://</code>, <code>s3://</code>, <code>gs://</code>, <code>azure://</code>)</td></tr>
+<tr><td><code>--format &lt;FMT&gt;</code></td><td><code>-f</code></td><td><code>csv</code></td><td>Output format: <code>csv</code>, <code>json</code>, <code>ndjson</code>, <code>parquet</code></td></tr>
+<tr><td><code>--no-headers</code></td><td></td><td>false</td><td>Omit CSV header row</td></tr>
+<tr><td><code>--output &lt;FILE&gt;</code></td><td><code>-o</code></td><td><em>(stdout)</em></td><td>Output file path</td></tr>
+<tr><td><code>--since &lt;RFC3339&gt;</code></td><td></td><td>—</td><td>Filter resources modified after this time</td></tr>
+<tr><td><code>--limit &lt;N&gt;</code></td><td></td><td>—</td><td>Limit results (1–10000)</td></tr>
+<tr><td><code>--fhir-version &lt;VER&gt;</code></td><td></td><td><code>R4</code></td><td>FHIR version: <code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code></td></tr>
+<tr><td><code>--chunk-size &lt;N&gt;</code></td><td></td><td>1000</td><td>Chunk size for NDJSON streaming</td></tr>
+<tr><td><code>--skip-invalid</code></td><td></td><td>false</td><td>Skip invalid JSON lines instead of failing</td></tr>
+<tr><td><code>--parquet-row-group-size &lt;MB&gt;</code></td><td></td><td>256</td><td>Parquet row group size (64–1024 MB)</td></tr>
+<tr><td><code>--parquet-page-size &lt;KB&gt;</code></td><td></td><td>1024</td><td>Parquet page size (64–8192 KB)</td></tr>
+<tr><td><code>--parquet-compression &lt;ALG&gt;</code></td><td></td><td><code>snappy</code></td><td><code>none</code>, <code>snappy</code>, <code>gzip</code>, <code>lz4</code>, <code>brotli</code>, <code>zstd</code></td></tr>
+<tr><td><code>--max-file-size &lt;MB&gt;</code></td><td></td><td>1000</td><td>Max Parquet output file size; splits when exceeded</td></tr>
+<tr><td><code>-h, --help</code></td><td></td><td></td><td>Print help</td></tr>
+</tbody></table>
+</div>
+<h3 id="notes"><a class="header" href="#notes">Notes</a></h3>
+<ul>
+<li><code>--bundle</code> / <code>-b</code> and <code>--source</code> / <code>-s</code> are mutually exclusive</li>
+<li>Either <code>--view</code> or <code>--bundle</code> may be read from stdin, but not both simultaneously</li>
+<li><code>--source</code> accepts <code>file://</code>, relative paths, absolute paths, <code>http://</code>, <code>https://</code>, <code>s3://</code>, <code>gs://</code>, <code>azure://</code></li>
+</ul>
+<hr />
+<h2 id="sof-server--sql-on-fhir-http-server"><a class="header" href="#sof-server--sql-on-fhir-http-server">sof-server — SQL-on-FHIR HTTP Server</a></h2>
+<pre><code class="language-bash">sof-server
+</code></pre>
+<p>No command-line flags. All configuration is via environment variables.</p>
+<h3 id="environment-variables-3"><a class="header" href="#environment-variables-3">Environment variables</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>SOF_SERVER_PORT</code></td><td><code>8080</code></td><td>Port to listen on</td></tr>
+<tr><td><code>SOF_SERVER_HOST</code></td><td><code>127.0.0.1</code></td><td>Host to bind</td></tr>
+<tr><td><code>SOF_LOG_LEVEL</code></td><td><code>info</code></td><td>Log level</td></tr>
+<tr><td><code>SOF_MAX_BODY_SIZE</code></td><td><code>10485760</code></td><td>Max request body (bytes)</td></tr>
+<tr><td><code>SOF_REQUEST_TIMEOUT</code></td><td><code>30</code></td><td>Request timeout (seconds)</td></tr>
+<tr><td><code>SOF_ENABLE_CORS</code></td><td><code>true</code></td><td>Enable CORS</td></tr>
+<tr><td><code>SOF_CORS_ORIGINS</code></td><td><code>*</code></td><td>Allowed CORS origins</td></tr>
+</tbody></table>
+</div>
+<h3 id="endpoint-1"><a class="header" href="#endpoint-1">Endpoint</a></h3>
+<p><code>POST /ViewDefinition/$viewdefinition-run</code></p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>_format</code></td><td>string</td><td><code>csv</code>, <code>json</code>, <code>ndjson</code>, <code>parquet</code></td></tr>
+<tr><td><code>header</code></td><td>boolean</td><td>Include CSV header (<code>true</code> / <code>false</code>)</td></tr>
+<tr><td><code>viewResource</code></td><td>object</td><td>ViewDefinition resource</td></tr>
+<tr><td><code>resource</code></td><td>array</td><td>FHIR resources to transform</td></tr>
+<tr><td><code>patient</code></td><td>string</td><td>Filter by patient reference</td></tr>
+<tr><td><code>_limit</code></td><td>integer</td><td>Limit results (1–10000)</td></tr>
+<tr><td><code>_since</code></td><td>string</td><td>Filter by modification time (RFC3339)</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="config-advisor--storage-configuration-advisor"><a class="header" href="#config-advisor--storage-configuration-advisor">config-advisor — Storage Configuration Advisor</a></h2>
+<pre><code class="language-bash">config-advisor
+</code></pre>
+<p>An interactive CLI tool that helps you choose the optimal storage backend configuration for your workload. No flags. Responds to user input with recommendations and explanations.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="appendix-b--fhirpath-function-reference"><a class="header" href="#appendix-b--fhirpath-function-reference">Appendix B — FHIRPath Function Reference</a></h1>
+<p>Implementation status for <a href="https://hl7.org/fhirpath/2025Jan/">FHIRPath 3.0.0-ballot</a> in <code>helios-fhirpath</code>.</p>
+<p><strong>Legend:</strong></p>
+<ul>
+<li>✅ Fully implemented</li>
+<li>🟡 Partially implemented (known limitations noted)</li>
+<li>❌ Not implemented</li>
+<li>🚧 In progress</li>
+<li><em>(STU)</em> — Standard for Trial Use in the specification</li>
+</ul>
+<hr />
+<h2 id="literals"><a class="header" href="#literals">Literals</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Literal</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Boolean</td><td>✅</td><td></td></tr>
+<tr><td>String</td><td>✅</td><td></td></tr>
+<tr><td>Integer</td><td>✅</td><td></td></tr>
+<tr><td>Long <em>(STU)</em></td><td>🟡</td><td>Parser support; runtime implementation gaps</td></tr>
+<tr><td>Decimal</td><td>✅</td><td></td></tr>
+<tr><td>Date</td><td>✅</td><td>Full parsing and arithmetic support</td></tr>
+<tr><td>Time</td><td>✅</td><td>Full parsing and comparison support</td></tr>
+<tr><td>DateTime</td><td>✅</td><td>Full parsing, timezone and arithmetic support</td></tr>
+<tr><td>Quantity</td><td>🟡</td><td>Basic value/unit storage; limited unit conversion</td></tr>
+<tr><td>Time-valued Quantities</td><td>🟡</td><td>Keywords parsed; conversion implementation needed</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="existence-functions"><a class="header" href="#existence-functions">Existence Functions</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>empty()</code></td><td>✅</td></tr>
+<tr><td><code>exists([criteria])</code></td><td>✅</td></tr>
+<tr><td><code>all(criteria)</code></td><td>✅</td></tr>
+<tr><td><code>allTrue()</code></td><td>✅</td></tr>
+<tr><td><code>anyTrue()</code></td><td>✅</td></tr>
+<tr><td><code>allFalse()</code></td><td>✅</td></tr>
+<tr><td><code>anyFalse()</code></td><td>✅</td></tr>
+<tr><td><code>subsetOf(other)</code></td><td>✅</td></tr>
+<tr><td><code>supersetOf(other)</code></td><td>✅</td></tr>
+<tr><td><code>count()</code></td><td>✅</td></tr>
+<tr><td><code>distinct()</code></td><td>✅</td></tr>
+<tr><td><code>isDistinct()</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="filtering-and-projection"><a class="header" href="#filtering-and-projection">Filtering and Projection</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>where(criteria)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>select(projection)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>sort([keySelector, asc|desc])</code> <em>(STU)</em></td><td>✅</td><td>Sort with optional key selector</td></tr>
+<tr><td><code>repeat(projection)</code></td><td>✅</td><td>Cycle detection included</td></tr>
+<tr><td><code>repeatAll(projection)</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+<tr><td><code>ofType(type)</code></td><td>✅</td><td>Full namespace qualification support</td></tr>
+<tr><td><code>coalesce(value, ...)</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="subsetting"><a class="header" href="#subsetting">Subsetting</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>[index]</code> indexer</td><td>✅</td></tr>
+<tr><td><code>single()</code></td><td>✅</td></tr>
+<tr><td><code>first()</code></td><td>✅</td></tr>
+<tr><td><code>last()</code></td><td>✅</td></tr>
+<tr><td><code>tail()</code></td><td>✅</td></tr>
+<tr><td><code>skip(num)</code></td><td>✅</td></tr>
+<tr><td><code>take(num)</code></td><td>✅</td></tr>
+<tr><td><code>intersect(other)</code></td><td>✅</td></tr>
+<tr><td><code>exclude(other)</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="combining"><a class="header" href="#combining">Combining</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>union(other)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>combine(other[, preserveOrder])</code></td><td>✅</td><td>Optional <code>preserveOrder</code> parameter supported</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="conversion-functions"><a class="header" href="#conversion-functions">Conversion Functions</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Implicit conversions (Integer → Decimal)</td><td>✅</td><td></td></tr>
+<tr><td><code>iif(criterion, trueResult[, otherwise])</code></td><td>✅</td><td></td></tr>
+<tr><td><code>toBoolean()</code> / <code>convertsToBoolean()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>toInteger()</code> / <code>convertsToInteger()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>toLong()</code> / <code>convertsToLong()</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+<tr><td><code>toDate([format])</code> / <code>convertsToDate()</code></td><td>✅</td><td>Optional <code>format</code> parameter</td></tr>
+<tr><td><code>toDateTime([format])</code> / <code>convertsToDateTime()</code></td><td>✅</td><td>Optional <code>format</code> parameter</td></tr>
+<tr><td><code>toDecimal()</code> / <code>convertsToDecimal()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>toQuantity([unit])</code> / <code>convertsToQuantity([unit])</code></td><td>🟡</td><td>Basic types; no unit conversion</td></tr>
+<tr><td><code>toString([format])</code> / <code>convertsToString()</code></td><td>✅</td><td>Optional <code>format</code> parameter</td></tr>
+<tr><td><code>toTime()</code> / <code>convertsToTime()</code></td><td>✅</td><td></td></tr>
+<tr><td>Date/DateTime/Time format codes (<code>yyyy</code>, <code>MM</code>, <code>dd</code>, ...) <em>(STU)</em></td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="string-manipulation"><a class="header" href="#string-manipulation">String Manipulation</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>indexOf(substring)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>lastIndexOf(substring)</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+<tr><td><code>substring(start[, length])</code></td><td>✅</td><td></td></tr>
+<tr><td><code>startsWith(prefix)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>endsWith(suffix)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>contains(substring)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>upper()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>lower()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>replace(pattern, substitution)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>matches(regex[, flags])</code></td><td>✅</td><td>Flags: <code>s</code>, <code>m</code>, <code>i</code>, <code>x</code></td></tr>
+<tr><td><code>matchesFull(regex[, flags])</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+<tr><td><code>replaceMatches(regex, substitution[, flags])</code></td><td>✅</td><td></td></tr>
+<tr><td><code>length()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>toChars()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>encode(format)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>decode(format)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>escape(target)</code> <em>(STU)</em></td><td>✅</td><td><code>html</code>, <code>json</code> targets</td></tr>
+<tr><td><code>unescape(target)</code> <em>(STU)</em></td><td>✅</td><td><code>html</code>, <code>json</code> targets</td></tr>
+<tr><td><code>split(separator)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>join([separator])</code></td><td>✅</td><td></td></tr>
+<tr><td><code>trim()</code></td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="math-functions-stu"><a class="header" href="#math-functions-stu">Math Functions <em>(STU)</em></a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>round([precision])</code></td><td>✅</td></tr>
+<tr><td><code>sqrt()</code></td><td>✅</td></tr>
+<tr><td><code>abs()</code></td><td>✅</td></tr>
+<tr><td><code>ceiling()</code></td><td>✅</td></tr>
+<tr><td><code>exp()</code></td><td>✅</td></tr>
+<tr><td><code>floor()</code></td><td>✅</td></tr>
+<tr><td><code>ln()</code></td><td>✅</td></tr>
+<tr><td><code>log(base)</code></td><td>✅</td></tr>
+<tr><td><code>power(exponent)</code></td><td>✅</td></tr>
+<tr><td><code>truncate()</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="tree-navigation"><a class="header" href="#tree-navigation">Tree Navigation</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>children()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>descendants()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>extension(url)</code></td><td>✅</td><td>Full support for object and primitive extensions with variable resolution</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="utility-functions-1"><a class="header" href="#utility-functions-1">Utility Functions</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>trace([name][, projection])</code></td><td>✅</td><td>Projection support included</td></tr>
+<tr><td><code>now()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>timeOfDay()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>today()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>defineVariable(name[, expr])</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+<tr><td><code>lowBoundary([precision])</code> <em>(STU)</em></td><td>✅</td><td>Decimal, Date, DateTime, Time</td></tr>
+<tr><td><code>highBoundary([precision])</code> <em>(STU)</em></td><td>✅</td><td>Decimal, Date, DateTime, Time</td></tr>
+<tr><td><code>precision()</code> <em>(STU)</em></td><td>✅</td><td>See precision limitation note</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="datetime-component-extraction-stu"><a class="header" href="#datetime-component-extraction-stu">Date/Time Component Extraction <em>(STU)</em></a></h2>
+<p>All component functions implemented: <code>yearOf()</code>, <code>monthOf()</code>, <code>dayOf()</code>, <code>hourOf()</code>, <code>minuteOf()</code>, <code>secondOf()</code>, <code>millisecondOf()</code> — all ✅</p>
+<hr />
+<h2 id="date-and-time-interval-functions-stu"><a class="header" href="#date-and-time-interval-functions-stu">Date and Time Interval Functions <em>(STU)</em></a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>duration(value, precision)</code></td><td>✅</td></tr>
+<tr><td><code>difference(value, precision)</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="operations"><a class="header" href="#operations">Operations</a></h2>
+<h3 id="equality"><a class="header" href="#equality">Equality</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>=</code> (equals)</td><td>✅</td><td>All types including dates and quantities</td></tr>
+<tr><td><code>~</code> (equivalent)</td><td>✅</td><td>Full equivalence checking</td></tr>
+<tr><td><code>!=</code> (not equals)</td><td>✅</td><td></td></tr>
+<tr><td><code>!~</code> (not equivalent)</td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<h3 id="comparison"><a class="header" href="#comparison">Comparison</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>&gt;</code></td><td>✅</td></tr>
+<tr><td><code>&lt;</code></td><td>✅</td></tr>
+<tr><td><code>&lt;=</code></td><td>✅</td></tr>
+<tr><td><code>&gt;=</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<h3 id="type-operators"><a class="header" href="#type-operators">Type operators</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>is</code></td><td>✅</td><td>Full namespace qualification and FHIR type hierarchy</td></tr>
+<tr><td><code>as</code></td><td>✅</td><td>Full namespace qualification and type casting</td></tr>
+</tbody></table>
+</div>
+<h3 id="collection-operators"><a class="header" href="#collection-operators">Collection operators</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>|</code> (union)</td><td>✅</td></tr>
+<tr><td><code>in</code> (membership)</td><td>✅</td></tr>
+<tr><td><code>contains</code> (containership)</td><td>✅</td></tr>
+<tr><td>Collection navigation</td><td>✅</td></tr>
+</tbody></table>
+</div>
+<h3 id="boolean-logic"><a class="header" href="#boolean-logic">Boolean logic</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>and</code></td><td>✅</td></tr>
+<tr><td><code>or</code></td><td>✅</td></tr>
+<tr><td><code>xor</code></td><td>✅</td></tr>
+<tr><td><code>implies</code></td><td>✅</td></tr>
+<tr><td><code>not()</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<h3 id="math-operators"><a class="header" href="#math-operators">Math operators</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>*</code></td><td>✅</td><td></td></tr>
+<tr><td><code>/</code></td><td>✅</td><td></td></tr>
+<tr><td><code>+</code></td><td>✅</td><td>Numeric and String</td></tr>
+<tr><td><code>-</code></td><td>✅</td><td></td></tr>
+<tr><td><code>div</code></td><td>✅</td><td>Integer division</td></tr>
+<tr><td><code>mod</code></td><td>✅</td><td>Modulo</td></tr>
+<tr><td><code>&amp;</code></td><td>✅</td><td>String concatenation</td></tr>
+<tr><td>Date/Time arithmetic</td><td>✅</td><td>Full timezone and precision handling</td></tr>
+<tr><td>Unary <code>+</code> and <code>-</code></td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="aggregates-stu"><a class="header" href="#aggregates-stu">Aggregates <em>(STU)</em></a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>aggregate(aggregator[, init])</code></td><td>✅</td><td>Full accumulator support</td></tr>
+<tr><td><code>sum()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>min()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>max()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>avg()</code></td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="environment-variables-4"><a class="header" href="#environment-variables-4">Environment Variables</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>%variable</code></td><td>✅</td></tr>
+<tr><td><code>%context</code>, <code>$this</code>, <code>$index</code>, <code>$total</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="types-and-reflection"><a class="header" href="#types-and-reflection">Types and Reflection</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Feature</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Models (namespace qualification)</td><td>✅</td><td>Full FHIR type hierarchy</td></tr>
+<tr><td><code>type()</code> reflection <em>(STU)</em></td><td>✅</td><td>Enhanced with namespace support</td></tr>
+<tr><td>Type Safety / Strict Evaluation</td><td>✅</td><td>Configurable strict mode</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="instance-selector-stu"><a class="header" href="#instance-selector-stu">Instance Selector <em>(STU)</em></a></h2>
+<p>Object creation syntax (<code>typename { element: value, ... }</code>): ✅</p>
+<hr />
+<h2 id="fhir-specific-functions"><a class="header" href="#fhir-specific-functions">FHIR-Specific Functions</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>extension(url)</code></td><td>✅</td><td>Full support with variable URL resolution</td></tr>
+<tr><td><code>hasValue()</code></td><td>✅</td><td>Tests if primitive has a value beyond extensions</td></tr>
+<tr><td><code>getValue()</code></td><td>❌</td><td>Not implemented</td></tr>
+<tr><td><code>resolve()</code></td><td>❌</td><td>Requires resource resolver integration</td></tr>
+<tr><td><code>ofType()</code> (FHIR form)</td><td>✅</td><td>Full FHIR type support</td></tr>
+<tr><td><code>elementDefinition()</code></td><td>❌</td><td>Not implemented</td></tr>
+<tr><td><code>slice()</code></td><td>❌</td><td>Not implemented</td></tr>
+<tr><td><code>checkModifiers()</code></td><td>❌</td><td>Not implemented</td></tr>
+<tr><td><code>conformsTo()</code></td><td>❌</td><td>Requires profile validation</td></tr>
+<tr><td><code>memberOf()</code></td><td>✅</td><td>Via <code>%terminologies</code> integration</td></tr>
+<tr><td><code>subsumes()</code> (function form)</td><td>❌</td><td>Use <code>%terminologies.subsumes()</code> instead</td></tr>
+<tr><td><code>subsumedBy()</code></td><td>❌</td><td>Not implemented</td></tr>
+<tr><td><code>htmlChecks()</code></td><td>❌</td><td>XHTML narrative validation; not implemented</td></tr>
+<tr><td><code>comparable()</code></td><td>✅</td><td>UCUM unit comparison</td></tr>
+<tr><td><code>weight()</code></td><td>❌</td><td>Not implemented</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="terminology-functions-terminologies"><a class="header" href="#terminology-functions-terminologies">Terminology Functions (<code>%terminologies</code>)</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>%terminologies.expand(url[, params])</code></td><td>✅</td></tr>
+<tr><td><code>%terminologies.lookup(coding[, params])</code></td><td>✅</td></tr>
+<tr><td><code>%terminologies.validateVS(url, coding[, params])</code></td><td>✅</td></tr>
+<tr><td><code>%terminologies.validateCS(system, coding[, params])</code></td><td>✅</td></tr>
+<tr><td><code>%terminologies.subsumes(system, codeA, codeB)</code></td><td>✅</td></tr>
+<tr><td><code>%terminologies.translate(url, coding[, params])</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="type-factory-factory-and-server-api-server"><a class="header" href="#type-factory-factory-and-server-api-server">Type Factory (<code>%factory</code>) and Server API (<code>%server</code>)</a></h2>
+<p>All <code>%factory.*</code> and <code>%server.*</code> functions are <strong>❌ Not Implemented</strong>.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="appendix-c--glossary"><a class="header" href="#appendix-c--glossary">Appendix C — Glossary</a></h1>
+<hr />
+<p><strong>Bundle</strong>
+A FHIR resource (<code>resourceType: "Bundle"</code>) that wraps a collection of other resources. Used for REST API payloads, transactions, search results, and bulk data exports. Bundle types include <code>collection</code>, <code>transaction</code>, <code>batch</code>, and <code>searchset</code>.</p>
+<p><strong>CapabilityStatement</strong>
+A FHIR resource that describes what a FHIR server can do — which resource types it supports, which interactions (CRUD, search, history) are available, and which search parameters are supported. Returned by <code>GET /metadata</code>.</p>
+<p><strong>CDS Hooks</strong>
+An HL7 standard for invoking clinical decision support logic at specific points in clinical workflows (e.g., patient selection, order signing). Services expose a discovery endpoint and return <strong>Cards</strong> with actionable recommendations. See <code>helios-cds-hooks</code>.</p>
+<p><strong>CompositeStorage</strong>
+An HFS pattern that combines two storage backends behind a single <code>ResourceStorage</code> interface: one for CRUD operations and one for search queries (e.g., SQLite + Elasticsearch). Configured via <code>HFS_STORAGE_BACKEND</code>.</p>
+<p><strong>ETag</strong>
+An HTTP header used for optimistic concurrency control. HFS includes an ETag with each resource response. Clients submit the ETag in an <code>If-Match</code> header on updates to prevent lost updates.</p>
+<p><strong>FHIR</strong>
+Fast Healthcare Interoperability Resources. An HL7 standard for exchanging electronic health records. Defines typed resources (Patient, Observation, etc.) with a REST API and JSON/XML serialization.</p>
+<p><strong>FHIRPath</strong>
+A path-based navigation and extraction language for FHIR resources. Used in search parameter definitions, profile constraints, CDS Hooks, and SQL-on-FHIR ViewDefinitions. HFS implements FHIRPath 3.0.0-ballot via <code>helios-fhirpath</code>.</p>
+<p><strong>FhirVersion</strong>
+A Rust enum (<code>R4</code>, <code>R4B</code>, <code>R5</code>, <code>R6</code>) used throughout the HFS workspace to carry FHIR version information at runtime.</p>
+<p><strong>HL7</strong>
+Health Level Seven International. The organization that publishes the FHIR standard.</p>
+<p><strong>maturin</strong>
+A build tool for creating Python wheels from Rust code via PyO3. Used to build and publish <code>pysof</code>.</p>
+<p><strong>NDJSON</strong>
+Newline-Delimited JSON. A file format where each line is a complete, self-contained JSON object. Preferred for large FHIR bulk data exports because it can be streamed without loading the entire file into memory.</p>
+<p><strong>OperationOutcome</strong>
+A FHIR resource returned by the server when an error occurs. Contains one or more <code>issue</code> entries with severity, code, and human-readable diagnostics.</p>
+<p><strong>pysof</strong>
+The Python package (<code>pip install pysof</code>) providing Python bindings for <code>helios-sof</code>. Built with PyO3 and maturin. Supports CSV, JSON, NDJSON, and Parquet output with automatic multi-core parallelism.</p>
+<p><strong>PyO3</strong>
+A Rust library for writing Python extension modules. Used by <code>pysof</code> to expose the <code>helios-sof</code> API to Python.</p>
+<p><strong>Rayon</strong>
+A Rust data-parallelism library. Used by <code>pysof</code> to automatically parallelize ViewDefinition processing across CPU cores.</p>
+<p><strong>Resource</strong>
+The fundamental unit of FHIR data. A self-describing JSON document with a <code>resourceType</code> field and version-specific fields. Examples: <code>Patient</code>, <code>Observation</code>, <code>MedicationRequest</code>.</p>
+<p><strong>ResourceStorage</strong>
+The base trait in <code>helios-persistence</code> that all storage backends must implement. Covers CRUD operations (create, read, update, delete) with <code>TenantContext</code> isolation.</p>
+<p><strong>SQL-on-FHIR</strong>
+An HL7 specification for flattening FHIR resources into tabular views using declarative <strong>ViewDefinitions</strong>. Implemented by <code>helios-sof</code>. See <a href="https://sql-on-fhir.org">sql-on-fhir.org</a>.</p>
+<p><strong>TenantContext</strong>
+A struct passed as the first argument to every <code>helios-persistence</code> operation. Carries the tenant identifier, ensuring data is always scoped to the correct tenant at the query level.</p>
+<p><strong>testcontainers</strong>
+A Rust library that spins up real Docker containers (PostgreSQL, Elasticsearch) for integration tests. Used in <code>helios-persistence</code> tests.</p>
+<p><strong>ViewDefinition</strong>
+A FHIR resource type defined by the SQL-on-FHIR specification. Describes how to flatten a FHIR resource type into a relational table, specifying column names and FHIRPath expressions for each column.</p>
+<p><strong>vread</strong>
+Version-specific read. A FHIR interaction (<code>GET /[type]/[id]/_history/[vid]</code>) that retrieves a specific historical version of a resource, identified by its version ID.</p>
+<p><strong>workspace</strong>
+A Cargo feature that groups multiple Rust crates into a single project. All HFS crates share a workspace root at the repository root. They share a <code>Cargo.lock</code> and can reference each other as dependencies.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="appendix-d--changelog"><a class="header" href="#appendix-d--changelog">Appendix D — Changelog</a></h1>
+<p>The Helios FHIR Server does not maintain a <code>CHANGELOG.md</code> file. Per-release notes are published as <strong>GitHub Releases</strong> and are the authoritative source for version history:</p>
+<p><strong><a href="https://github.com/HeliosSoftware/hfs/releases">github.com/HeliosSoftware/hfs/releases</a></strong></p>
+<hr />
+<h2 id="what-has-shipped"><a class="header" href="#what-has-shipped">What Has Shipped</a></h2>
+<p>The following capabilities are available in the current release. Source: <a href="https://github.com/HeliosSoftware/hfs/blob/main/ROADMAP.md">ROADMAP.md</a>.</p>
+<h3 id="fhir-rest-server"><a class="header" href="#fhir-rest-server">FHIR REST Server</a></h3>
+<ul>
+<li>FHIR REST API with CRUD operations, search, history, and batch/transaction bundle support</li>
+<li>Multi-tenancy via header (<code>X-Tenant-ID</code>) or URL path</li>
+<li>ETag versioning and conditional updates</li>
+<li>CORS support and request ID tracking</li>
+<li>FHIR CapabilityStatement (<code>/metadata</code>)</li>
+</ul>
+<h3 id="persistence-backends"><a class="header" href="#persistence-backends">Persistence Backends</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Backend</th><th>Mode</th></tr></thead><tbody>
+<tr><td>SQLite</td><td>Primary store (default)</td></tr>
+<tr><td>SQLite + Elasticsearch</td><td>SQLite for CRUD, Elasticsearch for search</td></tr>
+<tr><td>PostgreSQL</td><td>Primary store</td></tr>
+<tr><td>PostgreSQL + Elasticsearch</td><td>PostgreSQL for CRUD, Elasticsearch for search</td></tr>
+<tr><td>MongoDB</td><td>Primary store</td></tr>
+<tr><td>MongoDB + Elasticsearch</td><td>MongoDB for CRUD, Elasticsearch for search</td></tr>
+<tr><td>S3</td><td>Primary store (CRUD, versioning, history, bulk ops; no search)</td></tr>
+<tr><td>S3 + Elasticsearch</td><td>S3 for CRUD, Elasticsearch for search</td></tr>
+</tbody></table>
+</div>
+<h3 id="analytics-and-tooling"><a class="header" href="#analytics-and-tooling">Analytics and Tooling</a></h3>
+<ul>
+<li><strong>SQL-on-FHIR</strong> — <code>sof-cli</code> (CSV, JSON, NDJSON, Parquet) and <code>sof-server</code> HTTP API</li>
+<li><strong>FHIRPath engine</strong> — <code>fhirpath-cli</code> and <code>fhirpath-server</code> (FHIRPath 3.0.0-ballot, 100+ functions)</li>
+<li><strong>Python bindings</strong> — <code>pysof</code> on PyPI with streaming, chunked processing, and Parquet export</li>
+<li><strong>CDS Hooks types</strong> — <code>helios-cds-hooks</code> with all 10 hooks and typed contexts</li>
+</ul>
+<h3 id="current-version"><a class="header" href="#current-version">Current Version</a></h3>
+<pre><code class="language-bash">cargo pkgid helios-hfs   # shows current version
+</code></pre>
+<p>Or check the workspace <code>Cargo.toml</code>:</p>
+<pre><code class="language-bash">grep '^version' Cargo.toml
+</code></pre>
+<hr />
+<h2 id="what-is-in-progress"><a class="header" href="#what-is-in-progress">What Is In Progress</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Area</th><th>Item</th></tr></thead><tbody>
+<tr><td>Compliance</td><td>Audit logging (AuditEvent resource support)</td></tr>
+<tr><td>Standards</td><td>FHIR Validation engine</td></tr>
+<tr><td>Standards</td><td>Authentication &amp; Authorization (SMART on FHIR)</td></tr>
+<tr><td>Documentation</td><td>Project documentation website</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="what-is-coming-next"><a class="header" href="#what-is-coming-next">What Is Coming Next</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Area</th><th>Item</th></tr></thead><tbody>
+<tr><td>FHIR Server</td><td>Bulk Data API (<code>$export</code> / <code>$import</code>)</td></tr>
+<tr><td>FHIR Server</td><td>FHIR Subscriptions (topic-based notifications)</td></tr>
+<tr><td>FHIR Server</td><td>Terminology Server (<code>$lookup</code>, <code>$expand</code>, <code>$translate</code>)</td></tr>
+<tr><td>FHIR Server</td><td>SMART on FHIR launch framework</td></tr>
+<tr><td>Persistence</td><td>Cassandra as a primary store</td></tr>
+<tr><td>Persistence</td><td>ClickHouse as a primary store</td></tr>
+<tr><td>Developer Experience</td><td>Administrative UI</td></tr>
+<tr><td>Developer Experience</td><td>MCP Server for FHIR API</td></tr>
+<tr><td>Developer Experience</td><td>MCP Server for SQL-on-FHIR</td></tr>
+<tr><td>Developer Experience</td><td>Deployment cookbooks (AWS, Azure, GCP)</td></tr>
+</tbody></table>
+</div>
+<p>See the full <a href="https://github.com/HeliosSoftware/hfs/blob/main/ROADMAP.md">ROADMAP.md</a> for details and discussion links.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+    </div>
+    </body>
+</html>

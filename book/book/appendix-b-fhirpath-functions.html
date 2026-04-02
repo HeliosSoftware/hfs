@@ -1,0 +1,529 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>FHIRPath Function Reference - Helios FHIR Server</title>
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="ch01-introduction.html"><strong aria-hidden="true">1.</strong> Introduction</a></li><li class="chapter-item expanded "><a href="ch02-installation.html"><strong aria-hidden="true">2.</strong> Installation</a></li><li class="chapter-item expanded "><a href="ch03-quickstart.html"><strong aria-hidden="true">3.</strong> Quick Start</a></li><li class="chapter-item expanded "><a href="ch04-fhir-basics.html"><strong aria-hidden="true">4.</strong> FHIR Basics</a></li><li class="chapter-item expanded "><a href="ch05-fhirpath.html"><strong aria-hidden="true">5.</strong> FHIRPath Expressions</a></li><li class="chapter-item expanded "><a href="ch06-sql-on-fhir.html"><strong aria-hidden="true">6.</strong> SQL-on-FHIR</a></li><li class="chapter-item expanded "><a href="ch07-architecture.html"><strong aria-hidden="true">7.</strong> Architecture Overview</a></li><li class="chapter-item expanded "><a href="ch08-versions.html"><strong aria-hidden="true">8.</strong> Multi-Version FHIR Support</a></li><li class="chapter-item expanded "><a href="ch09-pysof.html"><strong aria-hidden="true">9.</strong> Python Bindings (pysof)</a></li><li class="chapter-item expanded "><a href="ch10-codegen.html"><strong aria-hidden="true">10.</strong> Code Generation</a></li><li class="chapter-item expanded "><a href="ch11-recipes.html"><strong aria-hidden="true">11.</strong> Use Cases and Recipes</a></li><li class="chapter-item expanded "><a href="ch12-embedding.html"><strong aria-hidden="true">12.</strong> Embedding HFS as a Library</a></li><li class="chapter-item expanded "><a href="ch13-dev-setup.html"><strong aria-hidden="true">13.</strong> Development Setup</a></li><li class="chapter-item expanded "><a href="ch14-contributing.html"><strong aria-hidden="true">14.</strong> Contributing Guidelines</a></li><li class="chapter-item expanded affix "><li class="spacer"></li><li class="chapter-item expanded affix "><li class="part-title">Appendices</li><li class="chapter-item expanded "><a href="appendix-a-cli.html"><strong aria-hidden="true">15.</strong> CLI Reference</a></li><li class="chapter-item expanded "><a href="appendix-b-fhirpath-functions.html" class="active"><strong aria-hidden="true">16.</strong> FHIRPath Function Reference</a></li><li class="chapter-item expanded "><a href="appendix-c-glossary.html"><strong aria-hidden="true">17.</strong> Glossary</a></li><li class="chapter-item expanded "><a href="appendix-d-changelog.html"><strong aria-hidden="true">18.</strong> Changelog</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Helios FHIR Server</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/HeliosSoftware/hfs/edit/main/book/src/src/appendix-b-fhirpath-functions.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="appendix-b--fhirpath-function-reference"><a class="header" href="#appendix-b--fhirpath-function-reference">Appendix B — FHIRPath Function Reference</a></h1>
+<p>Implementation status for <a href="https://hl7.org/fhirpath/2025Jan/">FHIRPath 3.0.0-ballot</a> in <code>helios-fhirpath</code>.</p>
+<p><strong>Legend:</strong></p>
+<ul>
+<li>✅ Fully implemented</li>
+<li>🟡 Partially implemented (known limitations noted)</li>
+<li>❌ Not implemented</li>
+<li>🚧 In progress</li>
+<li><em>(STU)</em> — Standard for Trial Use in the specification</li>
+</ul>
+<hr />
+<h2 id="literals"><a class="header" href="#literals">Literals</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Literal</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Boolean</td><td>✅</td><td></td></tr>
+<tr><td>String</td><td>✅</td><td></td></tr>
+<tr><td>Integer</td><td>✅</td><td></td></tr>
+<tr><td>Long <em>(STU)</em></td><td>🟡</td><td>Parser support; runtime implementation gaps</td></tr>
+<tr><td>Decimal</td><td>✅</td><td></td></tr>
+<tr><td>Date</td><td>✅</td><td>Full parsing and arithmetic support</td></tr>
+<tr><td>Time</td><td>✅</td><td>Full parsing and comparison support</td></tr>
+<tr><td>DateTime</td><td>✅</td><td>Full parsing, timezone and arithmetic support</td></tr>
+<tr><td>Quantity</td><td>🟡</td><td>Basic value/unit storage; limited unit conversion</td></tr>
+<tr><td>Time-valued Quantities</td><td>🟡</td><td>Keywords parsed; conversion implementation needed</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="existence-functions"><a class="header" href="#existence-functions">Existence Functions</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>empty()</code></td><td>✅</td></tr>
+<tr><td><code>exists([criteria])</code></td><td>✅</td></tr>
+<tr><td><code>all(criteria)</code></td><td>✅</td></tr>
+<tr><td><code>allTrue()</code></td><td>✅</td></tr>
+<tr><td><code>anyTrue()</code></td><td>✅</td></tr>
+<tr><td><code>allFalse()</code></td><td>✅</td></tr>
+<tr><td><code>anyFalse()</code></td><td>✅</td></tr>
+<tr><td><code>subsetOf(other)</code></td><td>✅</td></tr>
+<tr><td><code>supersetOf(other)</code></td><td>✅</td></tr>
+<tr><td><code>count()</code></td><td>✅</td></tr>
+<tr><td><code>distinct()</code></td><td>✅</td></tr>
+<tr><td><code>isDistinct()</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="filtering-and-projection"><a class="header" href="#filtering-and-projection">Filtering and Projection</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>where(criteria)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>select(projection)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>sort([keySelector, asc|desc])</code> <em>(STU)</em></td><td>✅</td><td>Sort with optional key selector</td></tr>
+<tr><td><code>repeat(projection)</code></td><td>✅</td><td>Cycle detection included</td></tr>
+<tr><td><code>repeatAll(projection)</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+<tr><td><code>ofType(type)</code></td><td>✅</td><td>Full namespace qualification support</td></tr>
+<tr><td><code>coalesce(value, ...)</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="subsetting"><a class="header" href="#subsetting">Subsetting</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>[index]</code> indexer</td><td>✅</td></tr>
+<tr><td><code>single()</code></td><td>✅</td></tr>
+<tr><td><code>first()</code></td><td>✅</td></tr>
+<tr><td><code>last()</code></td><td>✅</td></tr>
+<tr><td><code>tail()</code></td><td>✅</td></tr>
+<tr><td><code>skip(num)</code></td><td>✅</td></tr>
+<tr><td><code>take(num)</code></td><td>✅</td></tr>
+<tr><td><code>intersect(other)</code></td><td>✅</td></tr>
+<tr><td><code>exclude(other)</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="combining"><a class="header" href="#combining">Combining</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>union(other)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>combine(other[, preserveOrder])</code></td><td>✅</td><td>Optional <code>preserveOrder</code> parameter supported</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="conversion-functions"><a class="header" href="#conversion-functions">Conversion Functions</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Implicit conversions (Integer → Decimal)</td><td>✅</td><td></td></tr>
+<tr><td><code>iif(criterion, trueResult[, otherwise])</code></td><td>✅</td><td></td></tr>
+<tr><td><code>toBoolean()</code> / <code>convertsToBoolean()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>toInteger()</code> / <code>convertsToInteger()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>toLong()</code> / <code>convertsToLong()</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+<tr><td><code>toDate([format])</code> / <code>convertsToDate()</code></td><td>✅</td><td>Optional <code>format</code> parameter</td></tr>
+<tr><td><code>toDateTime([format])</code> / <code>convertsToDateTime()</code></td><td>✅</td><td>Optional <code>format</code> parameter</td></tr>
+<tr><td><code>toDecimal()</code> / <code>convertsToDecimal()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>toQuantity([unit])</code> / <code>convertsToQuantity([unit])</code></td><td>🟡</td><td>Basic types; no unit conversion</td></tr>
+<tr><td><code>toString([format])</code> / <code>convertsToString()</code></td><td>✅</td><td>Optional <code>format</code> parameter</td></tr>
+<tr><td><code>toTime()</code> / <code>convertsToTime()</code></td><td>✅</td><td></td></tr>
+<tr><td>Date/DateTime/Time format codes (<code>yyyy</code>, <code>MM</code>, <code>dd</code>, ...) <em>(STU)</em></td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="string-manipulation"><a class="header" href="#string-manipulation">String Manipulation</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>indexOf(substring)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>lastIndexOf(substring)</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+<tr><td><code>substring(start[, length])</code></td><td>✅</td><td></td></tr>
+<tr><td><code>startsWith(prefix)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>endsWith(suffix)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>contains(substring)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>upper()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>lower()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>replace(pattern, substitution)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>matches(regex[, flags])</code></td><td>✅</td><td>Flags: <code>s</code>, <code>m</code>, <code>i</code>, <code>x</code></td></tr>
+<tr><td><code>matchesFull(regex[, flags])</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+<tr><td><code>replaceMatches(regex, substitution[, flags])</code></td><td>✅</td><td></td></tr>
+<tr><td><code>length()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>toChars()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>encode(format)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>decode(format)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>escape(target)</code> <em>(STU)</em></td><td>✅</td><td><code>html</code>, <code>json</code> targets</td></tr>
+<tr><td><code>unescape(target)</code> <em>(STU)</em></td><td>✅</td><td><code>html</code>, <code>json</code> targets</td></tr>
+<tr><td><code>split(separator)</code></td><td>✅</td><td></td></tr>
+<tr><td><code>join([separator])</code></td><td>✅</td><td></td></tr>
+<tr><td><code>trim()</code></td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="math-functions-stu"><a class="header" href="#math-functions-stu">Math Functions <em>(STU)</em></a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>round([precision])</code></td><td>✅</td></tr>
+<tr><td><code>sqrt()</code></td><td>✅</td></tr>
+<tr><td><code>abs()</code></td><td>✅</td></tr>
+<tr><td><code>ceiling()</code></td><td>✅</td></tr>
+<tr><td><code>exp()</code></td><td>✅</td></tr>
+<tr><td><code>floor()</code></td><td>✅</td></tr>
+<tr><td><code>ln()</code></td><td>✅</td></tr>
+<tr><td><code>log(base)</code></td><td>✅</td></tr>
+<tr><td><code>power(exponent)</code></td><td>✅</td></tr>
+<tr><td><code>truncate()</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="tree-navigation"><a class="header" href="#tree-navigation">Tree Navigation</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>children()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>descendants()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>extension(url)</code></td><td>✅</td><td>Full support for object and primitive extensions with variable resolution</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="utility-functions"><a class="header" href="#utility-functions">Utility Functions</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>trace([name][, projection])</code></td><td>✅</td><td>Projection support included</td></tr>
+<tr><td><code>now()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>timeOfDay()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>today()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>defineVariable(name[, expr])</code> <em>(STU)</em></td><td>✅</td><td></td></tr>
+<tr><td><code>lowBoundary([precision])</code> <em>(STU)</em></td><td>✅</td><td>Decimal, Date, DateTime, Time</td></tr>
+<tr><td><code>highBoundary([precision])</code> <em>(STU)</em></td><td>✅</td><td>Decimal, Date, DateTime, Time</td></tr>
+<tr><td><code>precision()</code> <em>(STU)</em></td><td>✅</td><td>See precision limitation note</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="datetime-component-extraction-stu"><a class="header" href="#datetime-component-extraction-stu">Date/Time Component Extraction <em>(STU)</em></a></h2>
+<p>All component functions implemented: <code>yearOf()</code>, <code>monthOf()</code>, <code>dayOf()</code>, <code>hourOf()</code>, <code>minuteOf()</code>, <code>secondOf()</code>, <code>millisecondOf()</code> — all ✅</p>
+<hr />
+<h2 id="date-and-time-interval-functions-stu"><a class="header" href="#date-and-time-interval-functions-stu">Date and Time Interval Functions <em>(STU)</em></a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>duration(value, precision)</code></td><td>✅</td></tr>
+<tr><td><code>difference(value, precision)</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="operations"><a class="header" href="#operations">Operations</a></h2>
+<h3 id="equality"><a class="header" href="#equality">Equality</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>=</code> (equals)</td><td>✅</td><td>All types including dates and quantities</td></tr>
+<tr><td><code>~</code> (equivalent)</td><td>✅</td><td>Full equivalence checking</td></tr>
+<tr><td><code>!=</code> (not equals)</td><td>✅</td><td></td></tr>
+<tr><td><code>!~</code> (not equivalent)</td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<h3 id="comparison"><a class="header" href="#comparison">Comparison</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>&gt;</code></td><td>✅</td></tr>
+<tr><td><code>&lt;</code></td><td>✅</td></tr>
+<tr><td><code>&lt;=</code></td><td>✅</td></tr>
+<tr><td><code>&gt;=</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<h3 id="type-operators"><a class="header" href="#type-operators">Type operators</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>is</code></td><td>✅</td><td>Full namespace qualification and FHIR type hierarchy</td></tr>
+<tr><td><code>as</code></td><td>✅</td><td>Full namespace qualification and type casting</td></tr>
+</tbody></table>
+</div>
+<h3 id="collection-operators"><a class="header" href="#collection-operators">Collection operators</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>|</code> (union)</td><td>✅</td></tr>
+<tr><td><code>in</code> (membership)</td><td>✅</td></tr>
+<tr><td><code>contains</code> (containership)</td><td>✅</td></tr>
+<tr><td>Collection navigation</td><td>✅</td></tr>
+</tbody></table>
+</div>
+<h3 id="boolean-logic"><a class="header" href="#boolean-logic">Boolean logic</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>and</code></td><td>✅</td></tr>
+<tr><td><code>or</code></td><td>✅</td></tr>
+<tr><td><code>xor</code></td><td>✅</td></tr>
+<tr><td><code>implies</code></td><td>✅</td></tr>
+<tr><td><code>not()</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<h3 id="math-operators"><a class="header" href="#math-operators">Math operators</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>*</code></td><td>✅</td><td></td></tr>
+<tr><td><code>/</code></td><td>✅</td><td></td></tr>
+<tr><td><code>+</code></td><td>✅</td><td>Numeric and String</td></tr>
+<tr><td><code>-</code></td><td>✅</td><td></td></tr>
+<tr><td><code>div</code></td><td>✅</td><td>Integer division</td></tr>
+<tr><td><code>mod</code></td><td>✅</td><td>Modulo</td></tr>
+<tr><td><code>&amp;</code></td><td>✅</td><td>String concatenation</td></tr>
+<tr><td>Date/Time arithmetic</td><td>✅</td><td>Full timezone and precision handling</td></tr>
+<tr><td>Unary <code>+</code> and <code>-</code></td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="aggregates-stu"><a class="header" href="#aggregates-stu">Aggregates <em>(STU)</em></a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>aggregate(aggregator[, init])</code></td><td>✅</td><td>Full accumulator support</td></tr>
+<tr><td><code>sum()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>min()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>max()</code></td><td>✅</td><td></td></tr>
+<tr><td><code>avg()</code></td><td>✅</td><td></td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="environment-variables"><a class="header" href="#environment-variables">Environment Variables</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>%variable</code></td><td>✅</td></tr>
+<tr><td><code>%context</code>, <code>$this</code>, <code>$index</code>, <code>$total</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="types-and-reflection"><a class="header" href="#types-and-reflection">Types and Reflection</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Feature</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Models (namespace qualification)</td><td>✅</td><td>Full FHIR type hierarchy</td></tr>
+<tr><td><code>type()</code> reflection <em>(STU)</em></td><td>✅</td><td>Enhanced with namespace support</td></tr>
+<tr><td>Type Safety / Strict Evaluation</td><td>✅</td><td>Configurable strict mode</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="instance-selector-stu"><a class="header" href="#instance-selector-stu">Instance Selector <em>(STU)</em></a></h2>
+<p>Object creation syntax (<code>typename { element: value, ... }</code>): ✅</p>
+<hr />
+<h2 id="fhir-specific-functions"><a class="header" href="#fhir-specific-functions">FHIR-Specific Functions</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>extension(url)</code></td><td>✅</td><td>Full support with variable URL resolution</td></tr>
+<tr><td><code>hasValue()</code></td><td>✅</td><td>Tests if primitive has a value beyond extensions</td></tr>
+<tr><td><code>getValue()</code></td><td>❌</td><td>Not implemented</td></tr>
+<tr><td><code>resolve()</code></td><td>❌</td><td>Requires resource resolver integration</td></tr>
+<tr><td><code>ofType()</code> (FHIR form)</td><td>✅</td><td>Full FHIR type support</td></tr>
+<tr><td><code>elementDefinition()</code></td><td>❌</td><td>Not implemented</td></tr>
+<tr><td><code>slice()</code></td><td>❌</td><td>Not implemented</td></tr>
+<tr><td><code>checkModifiers()</code></td><td>❌</td><td>Not implemented</td></tr>
+<tr><td><code>conformsTo()</code></td><td>❌</td><td>Requires profile validation</td></tr>
+<tr><td><code>memberOf()</code></td><td>✅</td><td>Via <code>%terminologies</code> integration</td></tr>
+<tr><td><code>subsumes()</code> (function form)</td><td>❌</td><td>Use <code>%terminologies.subsumes()</code> instead</td></tr>
+<tr><td><code>subsumedBy()</code></td><td>❌</td><td>Not implemented</td></tr>
+<tr><td><code>htmlChecks()</code></td><td>❌</td><td>XHTML narrative validation; not implemented</td></tr>
+<tr><td><code>comparable()</code></td><td>✅</td><td>UCUM unit comparison</td></tr>
+<tr><td><code>weight()</code></td><td>❌</td><td>Not implemented</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="terminology-functions-terminologies"><a class="header" href="#terminology-functions-terminologies">Terminology Functions (<code>%terminologies</code>)</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Function</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>%terminologies.expand(url[, params])</code></td><td>✅</td></tr>
+<tr><td><code>%terminologies.lookup(coding[, params])</code></td><td>✅</td></tr>
+<tr><td><code>%terminologies.validateVS(url, coding[, params])</code></td><td>✅</td></tr>
+<tr><td><code>%terminologies.validateCS(system, coding[, params])</code></td><td>✅</td></tr>
+<tr><td><code>%terminologies.subsumes(system, codeA, codeB)</code></td><td>✅</td></tr>
+<tr><td><code>%terminologies.translate(url, coding[, params])</code></td><td>✅</td></tr>
+</tbody></table>
+</div>
+<hr />
+<h2 id="type-factory-factory-and-server-api-server"><a class="header" href="#type-factory-factory-and-server-api-server">Type Factory (<code>%factory</code>) and Server API (<code>%server</code>)</a></h2>
+<p>All <code>%factory.*</code> and <code>%server.*</code> functions are <strong>❌ Not Implemented</strong>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="appendix-a-cli.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="appendix-c-glossary.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="appendix-a-cli.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="appendix-c-glossary.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>
