@@ -1,0 +1,470 @@
+name: HFS Audit Event External Coverage
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  HFS_PORT: 8088
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}
+
+jobs:
+  build:
+    name: Build HFS
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Build HFS
+        run: cargo build -p helios-hfs --features R4,sqlite,elasticsearch,postgres,mongodb,s3
+
+      - name: Upload HFS binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hfs-binary
+          path: target/debug/hfs
+          retention-days: 1
+
+  audit-test:
+    name: Audit External Test (${{ matrix.backend }})
+    needs: build
+    runs-on: [self-hosted, Linux]
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hfs-binary
+          path: target/debug
+
+      - name: Make scripts executable
+        run: |
+          chmod +x target/debug/hfs
+          chmod +x crates/hfs/tests/audit/run_external_audit.sh
+          chmod +x crates/hfs/tests/audit/validate_report.py
+          chmod +x docker/keycloak/get-token.sh
+
+      - name: Determine runner IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+
+          echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> $GITHUB_ENV
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      - name: Validate backend configuration
+        run: |
+          if [ "${{ matrix.backend }}" = "s3-elasticsearch" ] && [ -z "$HFS_S3_BUCKET" ]; then
+            echo "::error::s3-elasticsearch backend requires HFS_S3_BUCKET to be configured"
+            exit 1
+          fi
+
+      - name: Start Elasticsearch
+        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        run: |
+          ES_CONTAINER="es-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$ES_CONTAINER" -p 0:9200 \
+            -e "discovery.type=single-node" \
+            -e "xpack.security.enabled=false" \
+            -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+            elasticsearch:8.15.0
+
+          echo "ES_CONTAINER=$ES_CONTAINER" >> $GITHUB_ENV
+
+          echo "Waiting for Elasticsearch to be ready..."
+          for i in {1..30}; do
+            ES_PORT=$(docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$ES_PORT" ]; then
+              if curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" > /dev/null 2>&1; then
+                echo "Elasticsearch is ready on port $ES_PORT"
+                echo "ES_PORT=$ES_PORT" >> $GITHUB_ENV
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: Elasticsearch not ready yet..."
+            sleep 2
+          done
+
+          echo "Elasticsearch failed to start"
+          docker logs "$ES_CONTAINER"
+          exit 1
+
+      - name: Start PostgreSQL
+        if: matrix.backend == 'postgres'
+        run: |
+          PG_CONTAINER="pg-audit-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PG_CONTAINER" -p 0:5432 \
+            -e POSTGRES_USER=helios \
+            -e POSTGRES_PASSWORD=helios \
+            -e POSTGRES_DB=helios \
+            postgres:16
+
+          echo "PG_CONTAINER=$PG_CONTAINER" >> $GITHUB_ENV
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..30}; do
+            if docker exec "$PG_CONTAINER" pg_isready -U helios > /dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PostgreSQL is ready on port $PG_PORT"
+                echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: PostgreSQL not ready yet..."
+            sleep 2
+          done
+
+          echo "PostgreSQL failed to start"
+          docker logs "$PG_CONTAINER"
+          exit 1
+
+      - name: Start MongoDB replica set
+        if: matrix.backend == 'mongodb'
+        run: |
+          MONGO_CONTAINER="mongo-audit-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+
+          echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
+
+          READY=0
+          for i in {1..30}; do
+            if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' > /dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            echo "Attempt $i/30: MongoDB not ready yet..."
+            sleep 2
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "MongoDB failed to start"
+            docker logs "$MONGO_CONTAINER"
+            exit 1
+          fi
+
+          docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status(); } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] }); }' > /dev/null 2>&1
+
+          echo "Waiting for MongoDB replica set primary..."
+          for i in {1..60}; do
+            PRIMARY_STATE=$(docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status().myState } catch (e) { 0 }' | tr -d '\r\n ')
+            if [ "$PRIMARY_STATE" = "1" ]; then
+              MONGO_PORT=$(docker port "$MONGO_CONTAINER" 27017 | head -1 | sed 's/.*://')
+              echo "MongoDB replica set is ready on port $MONGO_PORT"
+              echo "MONGO_PORT=$MONGO_PORT" >> $GITHUB_ENV
+              exit 0
+            fi
+            echo "Attempt $i/60: MongoDB replica set not primary yet..."
+            sleep 2
+          done
+
+          echo "MongoDB replica set failed to become primary"
+          docker logs "$MONGO_CONTAINER"
+          exit 1
+
+      - name: Configure AWS credentials
+        if: matrix.backend == 's3-elasticsearch'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install AWS CLI
+        if: matrix.backend == 's3-elasticsearch'
+        run: |
+          if ! command -v aws &>/dev/null; then
+            if ! /tmp/aws-bin/aws --version &>/dev/null; then
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -qo /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
+              rm -rf /tmp/awscliv2.zip /tmp/aws
+            fi
+            echo "/tmp/aws-bin" >> $GITHUB_PATH
+          fi
+          aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
+      - name: Empty S3 prefix
+        if: matrix.backend == 's3-elasticsearch'
+        run: |
+          BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}"
+          PREFIX="ci-audit/${{ github.run_id }}/${{ github.run_attempt }}/"
+          echo "Emptying s3://$BUCKET/$PREFIX"
+          aws s3 rm "s3://$BUCKET/$PREFIX" --recursive
+          echo "Prefix emptied"
+
+      - name: Start ephemeral Keycloak
+        run: |
+          KC_CONTAINER="kc-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$KC_CONTAINER" 2>/dev/null || true
+
+          docker create --name "$KC_CONTAINER" -p 0:8080 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            -e KC_HEALTH_ENABLED=true \
+            quay.io/keycloak/keycloak:26.1 start-dev --import-realm > /dev/null
+
+          docker cp docker/keycloak/realm.json "$KC_CONTAINER":/opt/keycloak/data/import/realm.json
+          docker start "$KC_CONTAINER" > /dev/null
+
+          echo "KC_CONTAINER=$KC_CONTAINER" >> $GITHUB_ENV
+
+      - name: Wait for Keycloak
+        run: |
+          echo "Waiting for Keycloak to be ready..."
+          for i in {1..60}; do
+            KEYCLOAK_PORT=$(docker port "$KC_CONTAINER" 8080 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$KEYCLOAK_PORT" ]; then
+              if curl -sf "http://$DOCKER_HOST_IP:$KEYCLOAK_PORT/realms/fhir" > /dev/null 2>&1; then
+                echo "Keycloak is ready on port $KEYCLOAK_PORT"
+                echo "KEYCLOAK_PORT=$KEYCLOAK_PORT" >> $GITHUB_ENV
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/60: Keycloak not ready yet..."
+            sleep 2
+          done
+
+          echo "Keycloak failed to start"
+          docker logs "$KC_CONTAINER"
+          exit 1
+
+      - name: Mint auth tokens
+        run: |
+          FULL_TOKEN=$(KEYCLOAK_URL="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT" ./docker/keycloak/get-token.sh)
+          READONLY_TOKEN=$(KEYCLOAK_URL="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT" ./docker/keycloak/get-token.sh hfs-readonly-client)
+
+          {
+            echo "FULL_TOKEN<<EOF"
+            echo "$FULL_TOKEN"
+            echo "EOF"
+            echo "READONLY_TOKEN<<EOF"
+            echo "$READONLY_TOKEN"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Start HFS server
+        run: |
+          HFS_LOG="/tmp/hfs-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}.log"
+          AUDIT_FILE="/tmp/hfs-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}.ndjson"
+
+          echo "HFS_LOG=$HFS_LOG" >> $GITHUB_ENV
+          echo "AUDIT_FILE=$AUDIT_FILE" >> $GITHUB_ENV
+
+          AUTH_JWKS_URL="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT/realms/fhir/protocol/openid-connect/certs"
+          AUTH_ISSUER="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT/realms/fhir"
+          AUTH_TOKEN_ENDPOINT="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT/realms/fhir/protocol/openid-connect/token"
+          AUTH_AUTHORIZE_ENDPOINT="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT/realms/fhir/protocol/openid-connect/auth"
+
+          if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
+            HFS_STORAGE_BACKEND=sqlite-elasticsearch \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            HFS_AUDIT_BACKEND=file \
+            HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_AUTH_ENABLED=true \
+            HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+            HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+            HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+            HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres" ]; then
+            HFS_STORAGE_BACKEND=postgres \
+            HFS_PG_HOST="$DOCKER_HOST_IP" \
+            HFS_PG_PORT="$PG_PORT" \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            HFS_AUDIT_BACKEND=file \
+            HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_AUTH_ENABLED=true \
+            HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+            HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+            HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+            HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb" ]; then
+            MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            HFS_STORAGE_BACKEND=mongodb \
+            HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_audit_${{ github.run_id }}_${{ github.run_attempt }}" \
+            HFS_AUDIT_BACKEND=file \
+            HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_AUTH_ENABLED=true \
+            HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+            HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+            HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+            HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
+            HFS_STORAGE_BACKEND=s3-elasticsearch \
+            HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
+            HFS_S3_PREFIX="ci-audit/${{ github.run_id }}/${{ github.run_attempt }}/" \
+            HFS_S3_VALIDATE_BUCKETS=false \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            HFS_AUDIT_BACKEND=file \
+            HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_AUTH_ENABLED=true \
+            HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+            HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+            HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+            HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          else
+            HFS_AUDIT_BACKEND=file \
+            HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_AUTH_ENABLED=true \
+            HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+            HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+            HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+            HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          fi
+
+          echo $! > /tmp/hfs-audit.pid
+          echo "HFS_PID=$(cat /tmp/hfs-audit.pid)" >> $GITHUB_ENV
+
+      - name: Wait for HFS to be ready
+        run: |
+          echo "Waiting for HFS to start..."
+          for i in {1..30}; do
+            if ! kill -0 $HFS_PID 2>/dev/null; then
+              echo "HFS process ($HFS_PID) exited"
+              cat "$HFS_LOG"
+              exit 1
+            fi
+            if curl -sf "http://localhost:$HFS_PORT/health" > /dev/null 2>&1; then
+              echo "HFS is ready"
+              exit 0
+            fi
+            echo "Attempt $i/30: HFS not ready yet..."
+            sleep 2
+          done
+
+          echo "HFS failed to start"
+          tail -50 "$HFS_LOG"
+          exit 1
+
+      - name: Run external interaction suite
+        run: |
+          mkdir -p audit-results
+
+          BASE_URL="http://localhost:$HFS_PORT" \
+          FULL_TOKEN="$FULL_TOKEN" \
+          READONLY_TOKEN="$READONLY_TOKEN" \
+          AUDIT_FILE="$AUDIT_FILE" \
+          RESULTS_DIR="audit-results" \
+          ./crates/hfs/tests/audit/run_external_audit.sh
+
+      - name: Stop HFS gracefully
+        if: always()
+        run: |
+          if [ -f /tmp/hfs-audit.pid ]; then
+            HFS_PID=$(cat /tmp/hfs-audit.pid)
+            kill -INT "$HFS_PID" 2>/dev/null || true
+            for _ in {1..50}; do
+              if kill -0 "$HFS_PID" 2>/dev/null; then
+                sleep 0.2
+              else
+                break
+              fi
+            done
+            kill -9 "$HFS_PID" 2>/dev/null || true
+          fi
+          sleep 1
+
+      - name: Validate audit coverage and generate report
+        run: |
+          cp "$AUDIT_FILE" audit-results/audit.ndjson || true
+          cp "$HFS_LOG" audit-results/hfs.log || true
+          docker logs "$KC_CONTAINER" > audit-results/keycloak.log 2>&1 || true
+
+          python3 ./crates/hfs/tests/audit/validate_report.py \
+            --audit-file "$AUDIT_FILE" \
+            --ranges-file audit-results/interaction_ranges.tsv \
+            --context-file audit-results/context.json \
+            --output-dir audit-results \
+            --strict-correlation
+
+      - name: Append report to workflow summary
+        if: always()
+        run: |
+          if [ -f audit-results/report.md ]; then
+            cat audit-results/report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# HFS Audit Coverage Report" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No report generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-events-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: audit-results/
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Stopping HFS..."
+          if [ -f /tmp/hfs-audit.pid ]; then
+            kill $(cat /tmp/hfs-audit.pid) 2>/dev/null || true
+            rm -f /tmp/hfs-audit.pid
+          fi
+
+          echo "Stopping Keycloak..."
+          docker rm -f "${KC_CONTAINER:-none}" 2>/dev/null || true
+
+          echo "Stopping Elasticsearch..."
+          docker rm -f "${ES_CONTAINER:-none}" 2>/dev/null || true
+
+          echo "Stopping PostgreSQL..."
+          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
+
+          echo "Stopping MongoDB..."
+          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
+
+          echo "Cleanup complete"
