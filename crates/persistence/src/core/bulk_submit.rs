@@ -80,10 +80,11 @@ pub mod audit {
         let mut builder = AuditEventBuilder::new(source_observer)
             .event_type(
                 "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                "import",
+                "object",
             )
             .action(AuditAction::Execute)
             .outcome(outcome)
+            .detail("audit-operation", "bulk-import")
             .detail("submission-id", &submission_id.submission_id)
             .detail("submitter", &submission_id.submitter)
             .detail("phase", phase);
@@ -116,18 +117,19 @@ pub mod audit {
             let event = AuditEventBuilder::new("Device/hfs")
                 .event_type(
                     "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                    "import",
+                    "object",
                 )
                 .action(AuditAction::Execute)
                 .outcome("0")
+                .detail("audit-operation", "bulk-import")
                 .detail("submission-id", &id.submission_id)
                 .detail("submitter", &id.submitter)
                 .detail("phase", "complete")
                 .build();
             let entities = event.entity.as_ref().unwrap();
             let details = entities[0].detail.as_ref().unwrap();
-            assert_eq!(details.len(), 3);
-            assert_eq!(details[2].r#type.value.as_deref(), Some("phase"));
+            assert_eq!(details.len(), 4);
+            assert_eq!(details[3].r#type.value.as_deref(), Some("phase"));
         }
     }
 }
