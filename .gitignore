@@ -9,8 +9,9 @@ package-lock.json
 .prettierrc
 off
 AGENTS.md
-hts/plan-hts.md
-hts/to-do-hts.md
+crates/hts/plan-hts.md
+crates/hts/to-do-hts.md
+crates/hts/hts-gap-analysis/
 
 # Build script download markers
 .download_marker

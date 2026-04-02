@@ -56,7 +56,8 @@ async fn run(config: HtsConfig) -> anyhow::Result<()> {
 
     let state = AppState::new(backend)
         .with_resource_store(resource_store)
-        .with_hts_pool(hts_pool);
+        .with_hts_pool(hts_pool)
+        .with_max_expansion_size(config.max_expansion_size);
 
     let app = helios_hts::server::create_app(&config, state);
 

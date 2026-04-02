@@ -63,6 +63,9 @@ impl SqliteTerminologyBackend {
 
             schema::apply(&conn)
                 .map_err(|e| HtsError::StorageError(format!("Failed to apply HTS schema: {e}")))?;
+            schema::migrate_search_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply search column migration: {e}"))
+            })?;
         }
 
         info!(db_path, "SQLite terminology backend initialized");
@@ -96,6 +99,11 @@ impl SqliteTerminologyBackend {
             })?;
             schema::apply(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply in-memory schema: {e}"))
+            })?;
+            schema::migrate_search_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to apply in-memory search column migration: {e}"
+                ))
             })?;
         }
 
@@ -136,6 +144,22 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
     /// so `$subsumes` lookups are O(1) — subsumption is fully supported.
     fn supports_subsumption(&self) -> bool {
         true
+    }
+
+    /// Look up the canonical URL for a ValueSet or ConceptMap by its FHIR `id`.
+    ///
+    /// Queries the HTS normalized table for the resource type.  Returns `None`
+    /// when the ID is unknown.
+    fn resource_url_by_id(&self, resource_type: &str, id: &str) -> Option<String> {
+        let conn = self.pool.get().ok()?;
+        let sql = match resource_type {
+            "CodeSystem" => "SELECT url FROM code_systems WHERE id = ?1",
+            "ValueSet" => "SELECT url FROM value_sets WHERE id = ?1",
+            "ConceptMap" => "SELECT url FROM concept_maps WHERE id = ?1",
+            _ => return None,
+        };
+        conn.query_row(sql, rusqlite::params![id], |row| row.get::<_, String>(0))
+            .ok()
     }
 }
 

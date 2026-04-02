@@ -9,7 +9,9 @@
 
 use axum::{
     Json,
-    extract::{RawQuery, State},
+    extract::{Path, RawQuery, State},
+    http::{HeaderMap, header},
+    response::Response,
 };
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
@@ -17,16 +19,37 @@ use serde_json::{Value, json};
 use crate::error::HtsError;
 use crate::state::AppState;
 use crate::traits::{TerminologyBackend, ValueSetOperations};
-use crate::types::ExpandRequest;
+use crate::types::{ExpandRequest, ExpansionContains};
 
+use super::format::{fhir_respond, negotiate_format};
 use super::params::{
     extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
 };
 
+/// Serialize a single `ExpansionContains` entry (and its nested children) to JSON.
+fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
+    let mut item = json!({
+        "system": c.system,
+        "code": c.code,
+    });
+    if let Some(display) = &c.display {
+        item["display"] = json!(display);
+    }
+    if !c.contains.is_empty() {
+        let nested: Vec<Value> = c
+            .contains
+            .iter()
+            .map(serialize_expansion_contains)
+            .collect();
+        item["contains"] = json!(nested);
+    }
+    item
+}
+
 async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Value, HtsError> {
     let url = find_str_param(&params, "url").ok_or_else(|| {
         HtsError::InvalidRequest("Missing required parameter: url (ValueSet canonical URL)".into())
     })?;
@@ -54,12 +77,17 @@ async fn process_expand<B: TerminologyBackend>(
                 .map(|v| v as u32)
         });
 
+    let hierarchical = find_str_param(&params, "hierarchical").map(|s| s == "true");
+
     let req = ExpandRequest {
         url: Some(url),
         value_set: None,
         filter,
         count,
         offset,
+        max_expansion_size: Some(state.max_expansion_size),
+        date: find_str_param(&params, "date"),
+        hierarchical,
     };
 
     let ctx = TenantContext::system();
@@ -69,16 +97,7 @@ async fn process_expand<B: TerminologyBackend>(
     let contains: Vec<Value> = resp
         .contains
         .iter()
-        .map(|c| {
-            let mut item = json!({
-                "system": c.system,
-                "code": c.code,
-            });
-            if let Some(display) = &c.display {
-                item["display"] = json!(display);
-            }
-            item
-        })
+        .map(serialize_expansion_contains)
         .collect();
 
     let mut expansion = json!({ "contains": contains });
@@ -90,29 +109,97 @@ async fn process_expand<B: TerminologyBackend>(
         expansion["offset"] = json!(off);
     }
 
-    Ok(Json(json!({
+    Ok(json!({
         "resourceType": "ValueSet",
         "expansion": expansion,
-    })))
+    }))
 }
 
 /// POST /ValueSet/$expand
 pub async fn expand_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let params = extract_parameter_array(&body)?;
-    process_expand(&state, params).await
+    Ok(fhir_respond(process_expand(&state, params).await?, format))
 }
 
 /// GET /ValueSet/$expand?url=...
 pub async fn get_expand_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    process_expand(&state, params).await
+    Ok(fhir_respond(process_expand(&state, params).await?, format))
+}
+
+/// Inject (or replace) the `url` parameter in a params list.
+///
+/// Removes any existing `url` entry from the caller's params so that the
+/// resource-id-resolved URL always wins, then prepends the canonical URL as a
+/// `valueUri` parameter.
+fn inject_url(mut params: Vec<Value>, url: String) -> Vec<Value> {
+    params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("url"));
+    let mut with_url = vec![json!({"name": "url", "valueUri": url})];
+    with_url.append(&mut params);
+    with_url
+}
+
+/// POST /ValueSet/{id}/$expand
+///
+/// Resolves the ValueSet canonical URL from its FHIR `id`, then delegates to
+/// the same expansion logic used by the system-level endpoint.
+pub async fn expand_by_id_post<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let url = state
+        .backend()
+        .resource_url_by_id("ValueSet", &id)
+        .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
+
+    let raw_params = body
+        .and_then(|Json(v)| extract_parameter_array(&v).ok())
+        .unwrap_or_default();
+    Ok(fhir_respond(
+        process_expand(&state, inject_url(raw_params, url)).await?,
+        format,
+    ))
+}
+
+/// GET /ValueSet/{id}/$expand?filter=...&count=...
+pub async fn get_expand_by_id<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let url = state
+        .backend()
+        .resource_url_by_id("ValueSet", &id)
+        .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
+
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    Ok(fhir_respond(
+        process_expand(&state, inject_url(params, url)).await?,
+        format,
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

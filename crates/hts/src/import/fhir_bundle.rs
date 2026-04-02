@@ -124,15 +124,27 @@ pub(crate) fn import_code_system(
 
     let version = cs["version"].as_str();
     let name = cs["name"].as_str();
+    let title = cs["title"].as_str();
     let status = cs["status"].as_str().unwrap_or("active");
     let content = cs["content"].as_str().unwrap_or("complete");
+    let resource_json = serde_json::to_string(cs).ok();
     let now = utc_now();
 
     conn.execute(
         "INSERT OR REPLACE INTO code_systems
-         (id, url, version, name, status, content, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-        rusqlite::params![id, url, version, name, status, content, now],
+         (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        rusqlite::params![
+            id,
+            url,
+            version,
+            name,
+            title,
+            status,
+            content,
+            resource_json,
+            now
+        ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -335,6 +347,7 @@ pub(crate) fn import_value_set(
 
     let version = vs["version"].as_str();
     let name = vs["name"].as_str();
+    let title = vs["title"].as_str();
     let status = vs["status"].as_str().unwrap_or("active");
 
     // Store the raw compose element as JSON; expansion is deferred to the first
@@ -343,13 +356,14 @@ pub(crate) fn import_value_set(
         .as_object()
         .map(|_| serde_json::to_string(&vs["compose"]).unwrap_or_default());
 
+    let resource_json = serde_json::to_string(vs).ok();
     let now = utc_now();
 
     conn.execute(
         "INSERT OR REPLACE INTO value_sets
-         (id, url, version, name, status, compose_json, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-        rusqlite::params![id, url, version, name, status, compose_json, now],
+         (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        rusqlite::params![id, url, version, name, title, status, compose_json, resource_json, now],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -375,6 +389,8 @@ pub(crate) fn import_concept_map(
         .ok_or_else(|| HtsError::InvalidRequest("ConceptMap.url is required".into()))?;
 
     let version = cm["version"].as_str();
+    let name = cm["name"].as_str();
+    let title = cm["title"].as_str();
     // FHIR R4 uses sourceUri/targetUri; R5 uses sourceScope/targetScope.
     let source_uri = cm["sourceUri"]
         .as_str()
@@ -383,13 +399,25 @@ pub(crate) fn import_concept_map(
         .as_str()
         .or_else(|| cm["targetScope"].as_str());
     let status = cm["status"].as_str().unwrap_or("active");
+    let resource_json = serde_json::to_string(cm).ok();
     let now = utc_now();
 
     conn.execute(
         "INSERT OR REPLACE INTO concept_maps
-         (id, url, version, source_uri, target_uri, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![id, url, version, source_uri, target_uri, status, now],
+         (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            id,
+            url,
+            version,
+            name,
+            title,
+            source_uri,
+            target_uri,
+            status,
+            resource_json,
+            now
+        ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -828,10 +856,7 @@ mod tests {
                 LookupRequest {
                     system: "http://example.org/cs".into(),
                     code: "A".into(),
-                    version: None,
-                    display_language: None,
-                    expression: None,
-                    properties: vec![],
+                    ..Default::default()
                 },
             )
             .await

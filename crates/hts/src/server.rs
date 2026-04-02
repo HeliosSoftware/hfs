@@ -1,3 +1,4 @@
+use crate::operations::batch::batch_handler;
 use axum::{
     Router,
     routing::{get, post},
@@ -13,16 +14,23 @@ use crate::operations::crud::{
     delete_concept_map, delete_value_set, read_code_system, read_concept_map, read_value_set,
     update_code_system, update_concept_map, update_value_set,
 };
-use crate::operations::expand::{expand_handler, get_expand_handler};
+use crate::operations::expand::{
+    expand_by_id_post, expand_handler, get_expand_by_id, get_expand_handler,
+};
 use crate::operations::health::health_handler;
 use crate::operations::import_bundle::import_handler;
-use crate::operations::lookup::{get_lookup_handler, lookup_handler};
+use crate::operations::lookup::{
+    get_lookup_by_id, get_lookup_handler, lookup_by_id_post, lookup_handler,
+};
 use crate::operations::metadata::metadata_handler;
+use crate::operations::search::{search_code_systems, search_concept_maps, search_value_sets};
 use crate::operations::subsumes::{get_subsumes_handler, subsumes_handler};
-use crate::operations::translate::{get_translate_handler, translate_handler};
+use crate::operations::translate::{
+    get_translate_by_id, get_translate_handler, translate_by_id_post, translate_handler,
+};
 use crate::operations::validate_code::{
-    get_validate_code_handler, get_vs_validate_code_handler, validate_code_handler,
-    vs_validate_code_handler,
+    get_validate_code_handler, get_vs_validate_by_id, get_vs_validate_code_handler,
+    validate_code_handler, vs_validate_by_id_post, vs_validate_code_handler,
 };
 use crate::state::AppState;
 use crate::traits::TerminologyBackend;
@@ -35,6 +43,8 @@ where
     let cors = build_cors(config);
 
     Router::new()
+        // ── Batch / transaction ───────────────────────────────────────────────
+        .route("/", post(batch_handler::<B>))
         // ── Utility ──────────────────────────────────────────────────────────
         .route("/health", get(health_handler))
         // ── Capabilities ─────────────────────────────────────────────────────
@@ -69,22 +79,54 @@ where
             get(get_translate_handler::<B>).post(translate_handler::<B>),
         )
         .route("/ConceptMap/$closure", post(closure_handler::<B>))
-        // ── Resource CRUD ─────────────────────────────────────────────────────
-        .route("/CodeSystem", post(create_code_system::<B>))
+        // ── Resource CRUD + Search ────────────────────────────────────────────────
+        // GET /CodeSystem searches; POST /CodeSystem creates.
+        .route(
+            "/CodeSystem",
+            get(search_code_systems::<B>).post(create_code_system::<B>),
+        )
+        // Instance-level CodeSystem operations MUST be registered before /{id} CRUD.
+        .route(
+            "/CodeSystem/{id}/$lookup",
+            get(get_lookup_by_id::<B>).post(lookup_by_id_post::<B>),
+        )
         .route(
             "/CodeSystem/{id}",
             get(read_code_system::<B>)
                 .put(update_code_system::<B>)
                 .delete(delete_code_system::<B>),
         )
-        .route("/ValueSet", post(create_value_set::<B>))
+        // GET /ValueSet searches; POST /ValueSet creates.
+        .route(
+            "/ValueSet",
+            get(search_value_sets::<B>).post(create_value_set::<B>),
+        )
+        // Instance-level operations MUST be registered before /{id} so Axum
+        // matches /ValueSet/abc/$expand before /ValueSet/{id}.
+        .route(
+            "/ValueSet/{id}/$expand",
+            get(get_expand_by_id::<B>).post(expand_by_id_post::<B>),
+        )
+        .route(
+            "/ValueSet/{id}/$validate-code",
+            get(get_vs_validate_by_id::<B>).post(vs_validate_by_id_post::<B>),
+        )
         .route(
             "/ValueSet/{id}",
             get(read_value_set::<B>)
                 .put(update_value_set::<B>)
                 .delete(delete_value_set::<B>),
         )
-        .route("/ConceptMap", post(create_concept_map::<B>))
+        // GET /ConceptMap searches; POST /ConceptMap creates.
+        .route(
+            "/ConceptMap",
+            get(search_concept_maps::<B>).post(create_concept_map::<B>),
+        )
+        // Instance-level ConceptMap operations.
+        .route(
+            "/ConceptMap/{id}/$translate",
+            get(get_translate_by_id::<B>).post(translate_by_id_post::<B>),
+        )
         .route(
             "/ConceptMap/{id}",
             get(read_concept_map::<B>)

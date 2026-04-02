@@ -22,4 +22,13 @@ pub trait TerminologyMetadata: Send + Sync {
     ///
     /// Returns `false` for backends that have not imported hierarchy data.
     fn supports_subsumption(&self) -> bool;
+
+    /// Return the canonical URL for a resource identified by its FHIR `id`.
+    ///
+    /// `resource_type` must be one of `"ValueSet"` or `"ConceptMap"`.
+    /// Returns [`None`] when no resource with that ID exists.
+    ///
+    /// Used by instance-level operation handlers (e.g. `GET /ValueSet/{id}/$expand`)
+    /// to resolve the canonical URL before delegating to system-level logic.
+    fn resource_url_by_id(&self, resource_type: &str, id: &str) -> Option<String>;
 }

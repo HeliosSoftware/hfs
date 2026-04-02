@@ -9,8 +9,8 @@ use helios_persistence::tenant::TenantContext;
 
 use crate::error::HtsError;
 use crate::types::{
-    LookupRequest, LookupResponse, SubsumesRequest, SubsumesResponse, ValidateCodeRequest,
-    ValidateCodeResponse,
+    LookupRequest, LookupResponse, ResourceSearchQuery, SubsumesRequest, SubsumesResponse,
+    ValidateCodeRequest, ValidateCodeResponse,
 };
 
 /// Operations on FHIR CodeSystem resources.
@@ -38,6 +38,17 @@ pub trait CodeSystemOperations: Send + Sync {
         ctx: &TenantContext,
         req: ValidateCodeRequest,
     ) -> Result<ValidateCodeResponse, HtsError>;
+
+    /// Search for CodeSystem resources matching the given query parameters.
+    ///
+    /// Returns a list of FHIR CodeSystem JSON values (full resource if available,
+    /// otherwise a minimal synthetic resource built from the stored columns).
+    /// Returns an empty `Vec` when no resources match.
+    async fn search(
+        &self,
+        ctx: &TenantContext,
+        query: ResourceSearchQuery,
+    ) -> Result<Vec<serde_json::Value>, HtsError>;
 
     /// Test the subsumption relationship between two codes.
     ///

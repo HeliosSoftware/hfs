@@ -107,6 +107,35 @@ pub fn apply(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA)
 }
 
+/// Add search-related columns to the existing tables.
+///
+/// `title` and `resource_json` are added to all three resource tables.
+/// `name` is added to `concept_maps` (it was absent from the original schema).
+///
+/// Uses `ALTER TABLE … ADD COLUMN` and silently ignores
+/// "duplicate column name" errors so this is safe to run on every startup.
+pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let migrations = [
+        "ALTER TABLE code_systems ADD COLUMN title TEXT",
+        "ALTER TABLE code_systems ADD COLUMN resource_json TEXT",
+        "ALTER TABLE value_sets ADD COLUMN title TEXT",
+        "ALTER TABLE value_sets ADD COLUMN resource_json TEXT",
+        "ALTER TABLE concept_maps ADD COLUMN name TEXT",
+        "ALTER TABLE concept_maps ADD COLUMN title TEXT",
+        "ALTER TABLE concept_maps ADD COLUMN resource_json TEXT",
+    ];
+    for sql in &migrations {
+        match conn.execute_batch(sql) {
+            Ok(_) => {}
+            // SQLite error 1 with "duplicate column name" means the column already
+            // exists — skip silently so this migration is idempotent.
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

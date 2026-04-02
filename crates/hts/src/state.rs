@@ -33,6 +33,11 @@ pub struct AppState<B: TerminologyBackend> {
     /// re-index terminology after a create, update, or delete.
     #[cfg(feature = "sqlite")]
     pub hts_pool: Option<Arc<Pool<SqliteConnectionManager>>>,
+
+    /// Maximum number of codes allowed in a single `$expand` response.
+    /// Requests that would exceed this limit receive `HtsError::TooCostly`.
+    /// Defaults to `10_000`; override with `HTS_MAX_EXPANSION_SIZE`.
+    pub max_expansion_size: u32,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -47,7 +52,14 @@ impl<B: TerminologyBackend> AppState<B> {
             resource_store: None,
             #[cfg(feature = "sqlite")]
             hts_pool: None,
+            max_expansion_size: 10_000,
         }
+    }
+
+    /// Override the maximum expansion size (default: 10 000).
+    pub fn with_max_expansion_size(mut self, limit: u32) -> Self {
+        self.max_expansion_size = limit;
+        self
     }
 
     /// Attach a `helios-persistence` SQLite backend for raw FHIR resource storage.

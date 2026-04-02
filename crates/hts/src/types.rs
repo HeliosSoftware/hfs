@@ -34,7 +34,7 @@ pub struct DesignationValue {
 // ─── $lookup ──────────────────────────────────────────────────────────────────
 
 /// Request for `CodeSystem/$lookup`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct LookupRequest {
     /// CodeSystem canonical URL.
     pub system: String,
@@ -48,6 +48,10 @@ pub struct LookupRequest {
     pub expression: Option<String>,
     /// Which properties to include in the response (empty = all).
     pub properties: Vec<String>,
+    /// Point-in-time date for evaluation (ISO-8601). Only resources whose
+    /// `$.date` field is ≤ this value are considered.
+    #[serde(default)]
+    pub date: Option<String>,
 }
 
 /// Response from `CodeSystem/$lookup`.
@@ -66,7 +70,7 @@ pub struct LookupResponse {
 /// Request for `CodeSystem/$validate-code` and `ValueSet/$validate-code`.
 ///
 /// Either `url` (for a ValueSet) or `system` (for a CodeSystem) should be set.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ValidateCodeRequest {
     /// ValueSet URL (used when validating against a value set).
     pub url: Option<String>,
@@ -78,6 +82,9 @@ pub struct ValidateCodeRequest {
     pub version: Option<String>,
     /// Expected display; if provided the response includes whether it matches.
     pub display: Option<String>,
+    /// Point-in-time date for evaluation (ISO-8601).
+    #[serde(default)]
+    pub date: Option<String>,
 }
 
 /// Response from `$validate-code`.
@@ -154,7 +161,7 @@ pub struct ExpansionContains {
 }
 
 /// Request for `ValueSet/$expand`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ExpandRequest {
     /// ValueSet canonical URL.
     pub url: Option<String>,
@@ -166,6 +173,17 @@ pub struct ExpandRequest {
     pub count: Option<u32>,
     /// Zero-based offset for pagination.
     pub offset: Option<u32>,
+    /// Server-side ceiling: if the full (unfiltered) expansion exceeds this
+    /// value the backend returns `HtsError::TooCostly`. `None` means no limit.
+    #[serde(skip)]
+    pub max_expansion_size: Option<u32>,
+    /// Point-in-time date for evaluation (ISO-8601).
+    #[serde(default)]
+    pub date: Option<String>,
+    /// When `true`, return a tree-structured expansion using the CodeSystem
+    /// hierarchy instead of a flat list. Pagination is not applied in tree mode.
+    #[serde(default)]
+    pub hierarchical: Option<bool>,
 }
 
 /// Response from `ValueSet/$expand`.
@@ -191,7 +209,7 @@ pub struct TranslationMatch {
 }
 
 /// Request for `ConceptMap/$translate`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TranslateRequest {
     /// ConceptMap canonical URL (optional; if absent, all maps are searched).
     pub url: Option<String>,
@@ -208,6 +226,9 @@ pub struct TranslateRequest {
     /// If `true`, reverse the mapping direction (look up target → source).
     #[serde(default)]
     pub reverse: bool,
+    /// Point-in-time date for evaluation (ISO-8601).
+    #[serde(default)]
+    pub date: Option<String>,
 }
 
 /// Response from `ConceptMap/$translate`.
@@ -217,6 +238,32 @@ pub struct TranslateResponse {
     pub result: bool,
     pub message: Option<String>,
     pub matches: Vec<TranslationMatch>,
+}
+
+// ─── Search ───────────────────────────────────────────────────────────────────
+
+/// Query parameters for searching CodeSystem, ValueSet, or ConceptMap resources.
+///
+/// All fields are optional — omitting a field means "no filter on that field".
+/// Multiple fields are ANDed together.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct ResourceSearchQuery {
+    /// Filter by canonical URL (exact match).
+    pub url: Option<String>,
+    /// Filter by version string (exact match).
+    pub version: Option<String>,
+    /// Filter by computer-friendly name (exact match).
+    pub name: Option<String>,
+    /// Filter by human-friendly title (exact match).
+    pub title: Option<String>,
+    /// Filter by status: `draft`, `active`, `retired`, or `unknown`.
+    pub status: Option<String>,
+    /// Maximum number of results to return (default: 20).
+    #[serde(rename = "_count")]
+    pub count: Option<u32>,
+    /// Zero-based offset for pagination (default: 0).
+    #[serde(rename = "_offset")]
+    pub offset: Option<u32>,
 }
 
 // ─── $closure ─────────────────────────────────────────────────────────────────
@@ -288,6 +335,7 @@ mod tests {
             display_language: None,
             expression: None,
             properties: vec!["display".into()],
+            ..Default::default()
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: LookupRequest = serde_json::from_str(&json).unwrap();
@@ -302,6 +350,7 @@ mod tests {
             code: "ABC".into(),
             version: None,
             display: Some("Alpha Beta Charlie".into()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: ValidateCodeRequest = serde_json::from_str(&json).unwrap();
@@ -312,10 +361,9 @@ mod tests {
     fn expand_request_roundtrip() {
         let req = ExpandRequest {
             url: Some("http://example.org/vs".into()),
-            value_set: None,
-            filter: None,
             count: Some(100),
             offset: Some(0),
+            ..Default::default()
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: ExpandRequest = serde_json::from_str(&json).unwrap();

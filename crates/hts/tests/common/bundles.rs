@@ -20,6 +20,39 @@
 pub const ANATOMY_CS_URL: &str = "http://hts.test/anatomy";
 pub const LIMBS_VS_URL: &str = "http://hts.test/vs/limbs";
 
+// ── Implicit ValueSet bundle ───────────────────────────────────────────────────
+
+/// URL of the implicit ValueSet declared on `IMPLICIT_CS_URL` via `.valueSet`.
+pub const IMPLICIT_VS_URL: &str = "http://hts.test/vs/implicit-anatomy";
+
+/// A CodeSystem that declares an implicit ValueSet via its `valueSet` property.
+/// No explicit ValueSet resource exists for `IMPLICIT_VS_URL`.
+pub fn implicit_vs_bundle() -> &'static str {
+    r#"{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "CodeSystem",
+        "id": "anatomy-implicit",
+        "url": "http://hts.test/anatomy-implicit",
+        "valueSet": "http://hts.test/vs/implicit-anatomy",
+        "version": "1.0",
+        "name": "AnatomyImplicitCS",
+        "status": "active",
+        "content": "complete",
+        "concept": [
+          { "code": "bone", "display": "Bone" },
+          { "code": "muscle", "display": "Muscle" },
+          { "code": "nerve", "display": "Nerve" }
+        ]
+      }
+    }
+  ]
+}"#
+}
+
 /// R4 Bundle: anatomy CodeSystem + limbs ValueSet + R4-format ConceptMap.
 ///
 /// ConceptMap uses `sourceUri`/`targetUri` and `equivalence` in targets,

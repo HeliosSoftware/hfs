@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 
 use crate::error::HtsError;
-use crate::types::{ExpandRequest, ExpandResponse, ValidateCodeRequest, ValidateCodeResponse};
+use crate::types::{
+    ExpandRequest, ExpandResponse, ResourceSearchQuery, ValidateCodeRequest, ValidateCodeResponse,
+};
 
 /// Operations on FHIR ValueSet resources.
 ///
@@ -16,6 +18,16 @@ use crate::types::{ExpandRequest, ExpandResponse, ValidateCodeRequest, ValidateC
 /// over their stored value sets.
 #[async_trait]
 pub trait ValueSetOperations: Send + Sync {
+    /// Search for ValueSet resources matching the given query parameters.
+    ///
+    /// Returns a list of FHIR ValueSet JSON values. Returns an empty `Vec` when
+    /// no resources match.
+    async fn search(
+        &self,
+        ctx: &TenantContext,
+        query: ResourceSearchQuery,
+    ) -> Result<Vec<serde_json::Value>, HtsError>;
+
     /// Expand a value set, returning all contained codes.
     ///
     /// The backend checks for a cached expansion first; on cache miss it

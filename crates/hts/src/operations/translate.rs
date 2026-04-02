@@ -9,7 +9,9 @@
 
 use axum::{
     Json,
-    extract::{RawQuery, State},
+    extract::{Path, RawQuery, State},
+    http::{HeaderMap, header},
+    response::Response,
 };
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
@@ -19,14 +21,15 @@ use crate::state::AppState;
 use crate::traits::{ConceptMapOperations, TerminologyBackend};
 use crate::types::TranslateRequest;
 
+use super::format::{fhir_respond, negotiate_format};
 use super::params::{
     extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
 };
 
-async fn process_translate<B: TerminologyBackend>(
+pub(crate) async fn process_translate<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Value, HtsError> {
     let code = find_str_param(&params, "code")
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: code".into()))?;
 
@@ -43,6 +46,7 @@ async fn process_translate<B: TerminologyBackend>(
         target: find_str_param(&params, "target"),
         target_system: find_str_param(&params, "targetSystem"),
         reverse,
+        date: find_str_param(&params, "date"),
     };
 
     let ctx = TenantContext::system();
@@ -79,29 +83,101 @@ async fn process_translate<B: TerminologyBackend>(
         parameter.push(json!({"name": "match", "part": parts}));
     }
 
-    Ok(Json(json!({
+    Ok(json!({
         "resourceType": "Parameters",
         "parameter": parameter
-    })))
+    }))
 }
 
 /// POST /ConceptMap/$translate
 pub async fn translate_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let params = extract_parameter_array(&body)?;
-    process_translate(&state, params).await
+    Ok(fhir_respond(
+        process_translate(&state, params).await?,
+        format,
+    ))
 }
 
 /// GET /ConceptMap/$translate?code=...&system=...
 pub async fn get_translate_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    process_translate(&state, params).await
+    Ok(fhir_respond(
+        process_translate(&state, params).await?,
+        format,
+    ))
+}
+
+// ── Instance-level: /ConceptMap/{id}/$translate ───────────────────────────────
+
+/// Inject (or replace) the `url` parameter in a params list.
+fn inject_url(mut params: Vec<Value>, url: String) -> Vec<Value> {
+    params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("url"));
+    let mut with_url = vec![json!({"name": "url", "valueUri": url})];
+    with_url.append(&mut params);
+    with_url
+}
+
+/// POST /ConceptMap/{id}/$translate
+///
+/// Resolves the ConceptMap canonical URL from its FHIR `id`, then delegates to
+/// the same translate logic used by the system-level endpoint.
+pub async fn translate_by_id_post<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let url = state
+        .backend()
+        .resource_url_by_id("ConceptMap", &id)
+        .ok_or_else(|| HtsError::NotFound(format!("ConceptMap/{id}")))?;
+
+    let raw_params = body
+        .and_then(|Json(v)| extract_parameter_array(&v).ok())
+        .unwrap_or_default();
+    Ok(fhir_respond(
+        process_translate(&state, inject_url(raw_params, url)).await?,
+        format,
+    ))
+}
+
+/// GET /ConceptMap/{id}/$translate?code=...&system=...
+pub async fn get_translate_by_id<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let url = state
+        .backend()
+        .resource_url_by_id("ConceptMap", &id)
+        .ok_or_else(|| HtsError::NotFound(format!("ConceptMap/{id}")))?;
+
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    Ok(fhir_respond(
+        process_translate(&state, inject_url(params, url)).await?,
+        format,
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

@@ -35,6 +35,12 @@ pub struct HtsConfig {
     /// Allowed CORS origins (comma-separated)
     #[arg(long, env = "HTS_CORS_ORIGINS", default_value = "*")]
     pub cors_origins: String,
+
+    /// Maximum number of codes allowed in a single ValueSet expansion.
+    /// Requests that would exceed this limit receive HTTP 422 with issue
+    /// code `too-costly`.
+    #[arg(long, env = "HTS_MAX_EXPANSION_SIZE", default_value = "10000")]
+    pub max_expansion_size: u32,
 }
 
 impl HtsConfig {
@@ -54,6 +60,7 @@ impl Default for HtsConfig {
             storage_backend: "sqlite".into(),
             enable_cors: true,
             cors_origins: "*".into(),
+            max_expansion_size: 10_000,
         }
     }
 }

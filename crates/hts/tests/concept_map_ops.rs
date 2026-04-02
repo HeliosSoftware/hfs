@@ -186,3 +186,173 @@ async fn translate_unknown_concept_map_returns_result_false() {
 
     assert!(!result, "unknown ConceptMap should return result=false");
 }
+
+// ── GET /ConceptMap (search) ──────────────────────────────────────────────────
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_concept_maps_no_filter_returns_bundle() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app.get_fhir("/ConceptMap").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["resourceType"], "Bundle");
+    assert_eq!(body["type"], "searchset");
+    let entries = body["entry"].as_array().expect("entry array");
+    assert!(!entries.is_empty(), "should return at least one ConceptMap");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_concept_maps_by_url_returns_match() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let url = format!("/ConceptMap?url={}", bundles::CM_URL_R4);
+    let (status, body) = app.get_fhir(&url).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = body["entry"].as_array().expect("entry array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["resource"]["url"], bundles::CM_URL_R4);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_concept_maps_unknown_url_returns_empty() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app
+        .get_fhir("/ConceptMap?url=http://hts.test/no-such-cm")
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = body["entry"].as_array().expect("entry array");
+    assert!(entries.is_empty());
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_concept_maps_by_name() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app.get_fhir("/ConceptMap?name=AnatomyMapR4").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = body["entry"].as_array().expect("entry array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["resource"]["name"], "AnatomyMapR4");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_concept_maps_pagination() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app.get_fhir("/ConceptMap?_count=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = body["entry"].as_array().expect("entry array");
+    assert!(entries.len() <= 1);
+
+    let (status2, body2) = app.get_fhir("/ConceptMap?_offset=9999").await;
+    assert_eq!(status2, StatusCode::OK, "{body2}");
+    assert!(body2["entry"].as_array().expect("entry array").is_empty());
+}
+
+// ── Instance-level: /ConceptMap/{id}/$translate ───────────────────────────────
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn translate_by_id_post_returns_same_as_system_level() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    // System-level
+    let req_sys = TestApp::params(&[
+        ("url", "valueUri", bundles::CM_URL_R4),
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (_, system_body) = app.post_fhir("/ConceptMap/$translate", req_sys).await;
+
+    // Instance-level (the ConceptMap has id="anatomy-r4" in the r4_bundle)
+    let req_id = TestApp::params(&[
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, by_id_body) = app
+        .post_fhir("/ConceptMap/anatomy-r4/$translate", req_id)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{by_id_body}");
+
+    let sys_result = system_body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "result")
+        .and_then(|p| p["valueBoolean"].as_bool())
+        .expect("system result");
+
+    let id_result = by_id_body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "result")
+        .and_then(|p| p["valueBoolean"].as_bool())
+        .expect("by-id result");
+
+    assert_eq!(
+        sys_result, id_result,
+        "instance-level and system-level translate should agree"
+    );
+    assert!(id_result, "translation of 'arm' by id should succeed");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn translate_by_id_get_returns_match() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app
+        .get_fhir(&format!(
+            "/ConceptMap/anatomy-r4/$translate?code=arm&system={}",
+            bundles::ANATOMY_CS_URL
+        ))
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let result = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "result")
+        .and_then(|p| p["valueBoolean"].as_bool())
+        .expect("result param");
+
+    assert!(result, "GET by-id translate should find 'arm'");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn translate_by_id_unknown_id_returns_404() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let req = TestApp::params(&[
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, _) = app
+        .post_fhir("/ConceptMap/no-such-id/$translate", req)
+        .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

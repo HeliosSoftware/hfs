@@ -27,10 +27,28 @@ pub enum HtsError {
 
     #[error("Precondition failed: {0}")]
     PreconditionFailed(String),
+
+    /// The requested expansion would exceed the server's configured size limit.
+    #[error("Expansion too costly: {0}")]
+    TooCostly(String),
 }
 
 impl IntoResponse for HtsError {
     fn into_response(self) -> Response {
+        // `TooCostly` has its own tuple so we can't borrow `self` for the
+        // diagnostics string in the same `match`; handle it separately.
+        if let HtsError::TooCostly(ref msg) = self {
+            let body = json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "too-costly",
+                    "diagnostics": msg
+                }]
+            });
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
+        }
+
         let (status, code, diagnostics) = match &self {
             HtsError::NotFound(msg) => (StatusCode::NOT_FOUND, "not-found", msg.as_str()),
             HtsError::NotSupported(msg) => {
@@ -46,6 +64,7 @@ impl IntoResponse for HtsError {
             HtsError::PreconditionFailed(msg) => {
                 (StatusCode::PRECONDITION_FAILED, "conflict", msg.as_str())
             }
+            HtsError::TooCostly(_) => unreachable!("handled above"),
         };
 
         let body = json!({

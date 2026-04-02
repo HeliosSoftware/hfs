@@ -64,6 +64,8 @@ fn extract_any_string_value(param: &Value) -> Option<String> {
         "valueUuid",
         "valueMarkdown",
         "valueCanonical",
+        "valueDateTime",
+        "valueDate",
     ];
 
     for key in STRING_KEYS {
@@ -73,19 +75,56 @@ fn extract_any_string_value(param: &Value) -> Option<String> {
     }
 
     // For non-string primitives (boolean, integer, decimal) convert to string.
-    for key in &[
-        "valueBoolean",
-        "valueInteger",
-        "valueDecimal",
-        "valueDateTime",
-        "valueDate",
-    ] {
+    for key in &["valueBoolean", "valueInteger", "valueDecimal"] {
         if let Some(v) = param.get(key) {
             return Some(v.to_string());
         }
     }
 
     None
+}
+
+/// Extract a `valueCoding` parameter, returning `(system, code, display)`.
+///
+/// Looks for the first parameter named `name` that carries a `valueCoding`
+/// object and returns the `system`, `code`, and optional `display` from it.
+/// Returns `None` if the parameter is absent or incomplete.
+pub fn extract_coding(params: &[Value], name: &str) -> Option<(String, String, Option<String>)> {
+    let coding = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?
+        .get("valueCoding")?;
+    let system = coding.get("system").and_then(|v| v.as_str())?.to_string();
+    let code = coding.get("code").and_then(|v| v.as_str())?.to_string();
+    let display = coding
+        .get("display")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some((system, code, display))
+}
+
+/// Extract a `valueCodeableConcept` parameter, returning all `(system, code)` pairs.
+///
+/// Looks for the first parameter named `name` that carries a
+/// `valueCodeableConcept` object and collects every `coding` entry that
+/// contains both `system` and `code` fields.  Returns `None` if the parameter
+/// is absent; returns an empty `Vec` if the `coding` array is missing or all
+/// entries are incomplete.
+pub fn extract_codeable_concept(params: &[Value], name: &str) -> Option<Vec<(String, String)>> {
+    let cc = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?
+        .get("valueCodeableConcept")?;
+    let codings = cc.get("coding")?.as_array()?;
+    let pairs = codings
+        .iter()
+        .filter_map(|c| {
+            let system = c.get("system").and_then(|v| v.as_str())?.to_string();
+            let code = c.get("code").and_then(|v| v.as_str())?.to_string();
+            Some((system, code))
+        })
+        .collect();
+    Some(pairs)
 }
 
 // ── GET / query-string helpers ─────────────────────────────────────────────────
@@ -227,5 +266,87 @@ mod tests {
     fn property_value_part_unknown_type_falls_back_to_string() {
         let part = property_value_part("custom", "hello");
         assert_eq!(part["valueString"], "hello");
+    }
+
+    // ── extract_coding ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_coding_full() {
+        let params = vec![json!({
+            "name": "coding",
+            "valueCoding": {"system": "http://cs.org", "code": "A", "display": "Alpha"}
+        })];
+        let result = extract_coding(&params, "coding").unwrap();
+        assert_eq!(result.0, "http://cs.org");
+        assert_eq!(result.1, "A");
+        assert_eq!(result.2, Some("Alpha".into()));
+    }
+
+    #[test]
+    fn extract_coding_without_display() {
+        let params = vec![json!({
+            "name": "coding",
+            "valueCoding": {"system": "http://cs.org", "code": "B"}
+        })];
+        let result = extract_coding(&params, "coding").unwrap();
+        assert_eq!(result.1, "B");
+        assert!(result.2.is_none());
+    }
+
+    #[test]
+    fn extract_coding_missing_param_returns_none() {
+        let params: Vec<Value> = vec![];
+        assert!(extract_coding(&params, "coding").is_none());
+    }
+
+    #[test]
+    fn extract_coding_wrong_name_returns_none() {
+        let params = vec![json!({
+            "name": "other",
+            "valueCoding": {"system": "http://cs.org", "code": "A"}
+        })];
+        assert!(extract_coding(&params, "coding").is_none());
+    }
+
+    // ── extract_codeable_concept ───────────────────────────────────────────────
+
+    #[test]
+    fn extract_codeable_concept_multiple_codings() {
+        let params = vec![json!({
+            "name": "codeableConcept",
+            "valueCodeableConcept": {
+                "coding": [
+                    {"system": "http://cs1.org", "code": "A"},
+                    {"system": "http://cs2.org", "code": "B"}
+                ]
+            }
+        })];
+        let codings = extract_codeable_concept(&params, "codeableConcept").unwrap();
+        assert_eq!(codings.len(), 2);
+        assert_eq!(codings[0], ("http://cs1.org".into(), "A".into()));
+        assert_eq!(codings[1], ("http://cs2.org".into(), "B".into()));
+    }
+
+    #[test]
+    fn extract_codeable_concept_skips_incomplete_entries() {
+        let params = vec![json!({
+            "name": "codeableConcept",
+            "valueCodeableConcept": {
+                "coding": [
+                    {"system": "http://cs.org"},         // missing code
+                    {"code": "B"},                       // missing system
+                    {"system": "http://cs.org", "code": "C"}
+                ]
+            }
+        })];
+        let codings = extract_codeable_concept(&params, "codeableConcept").unwrap();
+        assert_eq!(codings.len(), 1);
+        assert_eq!(codings[0].1, "C");
+    }
+
+    #[test]
+    fn extract_codeable_concept_missing_param_returns_none() {
+        let params: Vec<Value> = vec![];
+        assert!(extract_codeable_concept(&params, "codeableConcept").is_none());
     }
 }

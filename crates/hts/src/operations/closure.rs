@@ -10,7 +10,12 @@
 //! # FHIR specification
 //! <https://hl7.org/fhir/conceptmap-operation-closure.html>
 
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{RawQuery, State},
+    http::{HeaderMap, header},
+    response::Response,
+};
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
@@ -19,13 +24,16 @@ use crate::state::AppState;
 use crate::traits::{ConceptMapOperations, TerminologyBackend};
 use crate::types::{ClosureRequest, CodingConcept};
 
+use super::format::{fhir_respond, negotiate_format};
 use super::params::extract_parameter_array;
 
 /// POST /ConceptMap/$closure
 pub async fn closure_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
     let params = extract_parameter_array(&body)?;
 
     // `name` is required.
@@ -86,10 +94,15 @@ pub async fn closure_handler<B: TerminologyBackend>(
         }));
     }
 
-    Ok(Json(json!({
-        "resourceType": "Parameters",
-        "parameter": parameter
-    })))
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    Ok(fhir_respond(
+        json!({
+            "resourceType": "Parameters",
+            "parameter": parameter
+        }),
+        format,
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

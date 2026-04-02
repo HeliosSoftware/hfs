@@ -8,7 +8,9 @@
 /// <https://hl7.org/fhir/codesystem-operation-lookup.html>
 use axum::{
     Json,
-    extract::{RawQuery, State},
+    extract::{Path, RawQuery, State},
+    http::{HeaderMap, header},
+    response::Response,
 };
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
@@ -18,6 +20,7 @@ use crate::state::AppState;
 use crate::traits::TerminologyBackend;
 use crate::types::LookupRequest;
 
+use super::format::{fhir_respond, negotiate_format};
 use super::params::{
     collect_str_params, extract_parameter_array, find_str_param, parse_query_string,
     property_value_part, query_params_to_fhir_params,
@@ -26,7 +29,7 @@ use super::params::{
 async fn process_lookup<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Value, HtsError> {
     let system = find_str_param(&params, "system")
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: system".into()))?;
 
@@ -40,6 +43,7 @@ async fn process_lookup<B: TerminologyBackend>(
         display_language: find_str_param(&params, "displayLanguage"),
         expression: find_str_param(&params, "expression"),
         properties: collect_str_params(&params, "property"),
+        date: find_str_param(&params, "date"),
     };
 
     let ctx = TenantContext::system();
@@ -86,29 +90,96 @@ async fn process_lookup<B: TerminologyBackend>(
         parameter.push(json!({"name": "designation", "part": parts}));
     }
 
-    Ok(Json(json!({
+    Ok(json!({
         "resourceType": "Parameters",
         "parameter": parameter
-    })))
+    }))
 }
 
 /// POST /CodeSystem/$lookup
 pub async fn lookup_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let params = extract_parameter_array(&body)?;
-    process_lookup(&state, params).await
+    Ok(fhir_respond(process_lookup(&state, params).await?, format))
 }
 
 /// GET /CodeSystem/$lookup?system=...&code=...
 pub async fn get_lookup_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    process_lookup(&state, params).await
+    Ok(fhir_respond(process_lookup(&state, params).await?, format))
+}
+
+/// Inject (or replace) the `system` parameter in a params list.
+///
+/// Removes any existing `system` entry from the caller's params so that the
+/// resource-id-resolved system URL always wins, then prepends it.
+fn inject_system(mut params: Vec<Value>, system: String) -> Vec<Value> {
+    params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("system"));
+    let mut with_system = vec![json!({"name": "system", "valueUri": system})];
+    with_system.append(&mut params);
+    with_system
+}
+
+/// POST /CodeSystem/{id}/$lookup
+///
+/// Resolves the CodeSystem canonical URL from its FHIR `id`, then delegates to
+/// the same lookup logic used by the system-level endpoint.
+pub async fn lookup_by_id_post<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let system = state
+        .backend()
+        .resource_url_by_id("CodeSystem", &id)
+        .ok_or_else(|| HtsError::NotFound(format!("CodeSystem/{id}")))?;
+
+    let raw_params = body
+        .and_then(|Json(v)| extract_parameter_array(&v).ok())
+        .unwrap_or_default();
+    Ok(fhir_respond(
+        process_lookup(&state, inject_system(raw_params, system)).await?,
+        format,
+    ))
+}
+
+/// GET /CodeSystem/{id}/$lookup?code=...
+pub async fn get_lookup_by_id<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let system = state
+        .backend()
+        .resource_url_by_id("CodeSystem", &id)
+        .ok_or_else(|| HtsError::NotFound(format!("CodeSystem/{id}")))?;
+
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    Ok(fhir_respond(
+        process_lookup(&state, inject_system(params, system)).await?,
+        format,
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

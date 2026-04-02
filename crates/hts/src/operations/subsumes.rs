@@ -13,6 +13,8 @@
 use axum::{
     Json,
     extract::{RawQuery, State},
+    http::{HeaderMap, header},
+    response::Response,
 };
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
@@ -22,22 +24,58 @@ use crate::state::AppState;
 use crate::traits::{CodeSystemOperations, TerminologyBackend};
 use crate::types::{SubsumesRequest, SubsumptionOutcome};
 
+use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
+    extract_coding, extract_parameter_array, find_str_param, parse_query_string,
+    query_params_to_fhir_params,
 };
 
 async fn process_subsumes<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
-) -> Result<Json<Value>, HtsError> {
-    let system = find_str_param(&params, "system")
-        .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: system".into()))?;
-
-    let code_a = find_str_param(&params, "codeA")
-        .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: codeA".into()))?;
-
-    let code_b = find_str_param(&params, "codeB")
-        .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: codeB".into()))?;
+) -> Result<Value, HtsError> {
+    // ── Resolve (system, codeA, codeB) from one of two input forms ───────────
+    //
+    // Form 1: bare `codeA` + `codeB` + shared `system` parameter.
+    // Form 2: `codingA` (valueCoding) + `codingB` (valueCoding) — system is
+    //         embedded in each Coding and they MUST be the same code system.
+    let (system, code_a, code_b) = match (
+        find_str_param(&params, "codeA"),
+        find_str_param(&params, "codeB"),
+    ) {
+        (Some(code_a), Some(code_b)) => {
+            // Bare code form — explicit `system` parameter is required.
+            let system = find_str_param(&params, "system").ok_or_else(|| {
+                HtsError::InvalidRequest("Missing required parameter: system".into())
+            })?;
+            (system, code_a, code_b)
+        }
+        _ => {
+            // Coding form — look for codingA and codingB valueCoding objects.
+            match (
+                extract_coding(&params, "codingA"),
+                extract_coding(&params, "codingB"),
+            ) {
+                (Some((sys_a, code_a, _)), Some((sys_b, code_b, _))) => {
+                    // FHIR spec: both codings MUST belong to the same code system.
+                    if sys_a != sys_b {
+                        return Err(HtsError::InvalidRequest(format!(
+                            "codingA.system ({sys_a}) and codingB.system ({sys_b}) \
+                             must be the same code system for $subsumes"
+                        )));
+                    }
+                    (sys_a, code_a, code_b)
+                }
+                _ => {
+                    return Err(HtsError::InvalidRequest(
+                        "Must provide either (system + codeA + codeB) \
+                         or (codingA + codingB) parameters"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    };
 
     let req = SubsumesRequest {
         system,
@@ -56,31 +94,44 @@ async fn process_subsumes<B: TerminologyBackend>(
         SubsumptionOutcome::NotSubsumed => "not-subsumed",
     };
 
-    Ok(Json(json!({
+    Ok(json!({
         "resourceType": "Parameters",
         "parameter": [
             {"name": "outcome", "valueCode": outcome_str}
         ]
-    })))
+    }))
 }
 
 /// POST /CodeSystem/$subsumes
 pub async fn subsumes_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let params = extract_parameter_array(&body)?;
-    process_subsumes(&state, params).await
+    Ok(fhir_respond(
+        process_subsumes(&state, params).await?,
+        format,
+    ))
 }
 
 /// GET /CodeSystem/$subsumes?system=...&codeA=...&codeB=...
 pub async fn get_subsumes_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    process_subsumes(&state, params).await
+    Ok(fhir_respond(
+        process_subsumes(&state, params).await?,
+        format,
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -274,6 +325,84 @@ mod tests {
     #[tokio::test]
     async fn wrong_resource_type_returns_400() {
         let body = json!({"resourceType": "CodeSystem", "parameter": []});
+        let resp = post_json(make_app(), "/CodeSystem/$subsumes", body).await;
+        assert_eq!(resp.status(), 400);
+    }
+
+    // ── codingA / codingB (valueCoding) input form ────────────────────────────
+
+    #[tokio::test]
+    async fn coding_form_subsumes_direct() {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {
+                    "name": "codingA",
+                    "valueCoding": {"system": "http://example.org/hier", "code": "A"}
+                },
+                {
+                    "name": "codingB",
+                    "valueCoding": {"system": "http://example.org/hier", "code": "B"}
+                }
+            ]
+        });
+        let resp = post_json(make_app(), "/CodeSystem/$subsumes", body).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(outcome(resp).await, "subsumes");
+    }
+
+    #[tokio::test]
+    async fn coding_form_equivalent() {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {
+                    "name": "codingA",
+                    "valueCoding": {"system": "http://example.org/hier", "code": "A"}
+                },
+                {
+                    "name": "codingB",
+                    "valueCoding": {"system": "http://example.org/hier", "code": "A"}
+                }
+            ]
+        });
+        let resp = post_json(make_app(), "/CodeSystem/$subsumes", body).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(outcome(resp).await, "equivalent");
+    }
+
+    #[tokio::test]
+    async fn cross_system_codings_returns_400() {
+        // codingA and codingB from different systems — must be rejected.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {
+                    "name": "codingA",
+                    "valueCoding": {"system": "http://example.org/hier", "code": "A"}
+                },
+                {
+                    "name": "codingB",
+                    "valueCoding": {"system": "http://other.org/cs", "code": "B"}
+                }
+            ]
+        });
+        let resp = post_json(make_app(), "/CodeSystem/$subsumes", body).await;
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn missing_coding_b_returns_400() {
+        // codingA provided but codingB missing — falls through to error.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {
+                    "name": "codingA",
+                    "valueCoding": {"system": "http://example.org/hier", "code": "A"}
+                }
+            ]
+        });
         let resp = post_json(make_app(), "/CodeSystem/$subsumes", body).await;
         assert_eq!(resp.status(), 400);
     }

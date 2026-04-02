@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use crate::error::HtsError;
 use crate::traits::ConceptMapOperations;
 use crate::types::{
-    ClosureRequest, ClosureResponse, TranslateRequest, TranslateResponse, TranslationMatch,
+    ClosureRequest, ClosureResponse, ResourceSearchQuery, TranslateRequest, TranslateResponse,
+    TranslationMatch,
 };
 
 use super::SqliteTerminologyBackend;
@@ -60,6 +61,87 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
     }
+
+    /// Search ConceptMap resources by query parameters.
+    async fn search(
+        &self,
+        _ctx: &TenantContext,
+        query: ResourceSearchQuery,
+    ) -> Result<Vec<serde_json::Value>, HtsError> {
+        let pool = self.pool().clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+            let limit = i64::from(query.count.unwrap_or(20));
+            let offset = i64::from(query.offset.unwrap_or(0));
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, url, version, name, title, status, resource_json
+                     FROM concept_maps
+                     WHERE (?1 IS NULL OR url = ?1)
+                       AND (?2 IS NULL OR version = ?2)
+                       AND (?3 IS NULL OR name = ?3)
+                       AND (?4 IS NULL OR title = ?4)
+                       AND (?5 IS NULL OR status = ?5)
+                     ORDER BY created_at
+                     LIMIT ?6 OFFSET ?7",
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![
+                        query.url,
+                        query.version,
+                        query.name,
+                        query.title,
+                        query.status,
+                        limit,
+                        offset
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                        ))
+                    },
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                let (id, url, version, name, title, status, resource_json) =
+                    row.map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                let resource = resource_json
+                    .and_then(|j| serde_json::from_str(&j).ok())
+                    .unwrap_or_else(|| {
+                        super::code_system::build_synthetic_resource(
+                            "ConceptMap",
+                            &id,
+                            &url,
+                            version.as_deref(),
+                            name.as_deref(),
+                            title.as_deref(),
+                            &status,
+                        )
+                    });
+                results.push(resource);
+            }
+            Ok(results)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
 }
 
 // ── $translate ─────────────────────────────────────────────────────────────────
@@ -74,6 +156,7 @@ fn translate_sync(
         req.system.as_deref(),
         req.url.as_deref(),
         req.reverse,
+        req.date.as_deref(),
     )?;
 
     let matches: Vec<TranslationMatch> = rows
@@ -128,6 +211,7 @@ fn query_translate_elements(
     system: Option<&str>,
     map_url: Option<&str>,
     reverse: bool,
+    date: Option<&str>,
 ) -> Result<Vec<TranslateRow>, HtsError> {
     // Column names depend on direction.
     let (search_code_col, search_sys_col, disp_sys_col, disp_code_col, res_sys_col, res_code_col) =
@@ -160,7 +244,8 @@ fn query_translate_elements(
          LEFT JOIN concepts c ON c.system_id = cs_disp.id AND c.code = {disp_code_col}
          WHERE {search_code_col} = ?1
            AND (?2 IS NULL OR {search_sys_col} = ?2)
-           AND (?3 IS NULL OR cm.url = ?3)"
+           AND (?3 IS NULL OR cm.url = ?3)
+           AND (?4 IS NULL OR json_extract(cm.resource_json, '$.date') <= ?4)"
     );
 
     let mut stmt = conn
@@ -168,7 +253,7 @@ fn query_translate_elements(
         .map_err(|e| HtsError::StorageError(format!("Prepare error: {e}")))?;
 
     let rows = stmt
-        .query_map(rusqlite::params![code, system, map_url], |row| {
+        .query_map(rusqlite::params![code, system, map_url, date], |row| {
             Ok(TranslateRow {
                 concept_system: row.get(0)?,
                 concept_code: row.get(1)?,
@@ -385,13 +470,9 @@ mod tests {
 
         let ctx = TenantContext::system();
         let req = TranslateRequest {
-            url: None,
             system: Some("http://example.org/src".into()),
             code: "A".into(),
-            source: None,
-            target: None,
-            target_system: None,
-            reverse: false,
+            ..Default::default()
         };
 
         let resp = backend.translate(&ctx, req).await.unwrap();
@@ -416,13 +497,9 @@ mod tests {
 
         let ctx = TenantContext::system();
         let req = TranslateRequest {
-            url: None,
             system: Some("http://example.org/src".into()),
             code: "B".into(),
-            source: None,
-            target: None,
-            target_system: None,
-            reverse: false,
+            ..Default::default()
         };
 
         let resp = backend.translate(&ctx, req).await.unwrap();
@@ -445,13 +522,9 @@ mod tests {
 
         let ctx = TenantContext::system();
         let req = TranslateRequest {
-            url: None,
             system: Some("http://example.org/src".into()),
             code: "D".into(), // D has no mapping
-            source: None,
-            target: None,
-            target_system: None,
-            reverse: false,
+            ..Default::default()
         };
 
         let resp = backend.translate(&ctx, req).await.unwrap();
@@ -471,10 +544,7 @@ mod tests {
             url: Some("http://example.org/cm".into()),
             system: Some("http://example.org/src".into()),
             code: "A".into(),
-            source: None,
-            target: None,
-            target_system: None,
-            reverse: false,
+            ..Default::default()
         };
         let resp = backend.translate(&ctx, req).await.unwrap();
         assert!(resp.result);
@@ -485,10 +555,7 @@ mod tests {
             url: Some("http://unknown.org/cm".into()),
             system: Some("http://example.org/src".into()),
             code: "A".into(),
-            source: None,
-            target: None,
-            target_system: None,
-            reverse: false,
+            ..Default::default()
         };
         let resp_bad = backend.translate(&ctx, req_bad).await.unwrap();
         assert!(!resp_bad.result);
@@ -502,13 +569,10 @@ mod tests {
         let ctx = TenantContext::system();
         // Reverse: given target code X (in target system), find source code A.
         let req = TranslateRequest {
-            url: None,
             system: Some("http://example.org/tgt".into()),
             code: "X".into(),
-            source: None,
-            target: None,
-            target_system: None,
             reverse: true,
+            ..Default::default()
         };
 
         let resp = backend.translate(&ctx, req).await.unwrap();
@@ -526,13 +590,8 @@ mod tests {
         let ctx = TenantContext::system();
         // No system filter — still finds mapping by code alone.
         let req = TranslateRequest {
-            url: None,
-            system: None,
             code: "A".into(),
-            source: None,
-            target: None,
-            target_system: None,
-            reverse: false,
+            ..Default::default()
         };
 
         let resp = backend.translate(&ctx, req).await.unwrap();
@@ -733,13 +792,9 @@ mod tests {
 
         // Now translate 100 → 200.
         let req = TranslateRequest {
-            url: None,
             system: Some("http://bundle-test.org/src".into()),
             code: "100".into(),
-            source: None,
-            target: None,
-            target_system: None,
-            reverse: false,
+            ..Default::default()
         };
 
         let resp = backend.translate(&ctx, req).await.unwrap();

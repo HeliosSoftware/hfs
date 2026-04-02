@@ -4,8 +4,9 @@ use helios_persistence::tenant::TenantContext;
 use crate::error::HtsError;
 use crate::traits::CodeSystemOperations;
 use crate::types::{
-    DesignationValue, LookupRequest, LookupResponse, PropertyValue, SubsumesRequest,
-    SubsumesResponse, SubsumptionOutcome, ValidateCodeRequest, ValidateCodeResponse,
+    DesignationValue, LookupRequest, LookupResponse, PropertyValue, ResourceSearchQuery,
+    SubsumesRequest, SubsumesResponse, SubsumptionOutcome, ValidateCodeRequest,
+    ValidateCodeResponse,
 };
 
 use super::SqliteTerminologyBackend;
@@ -37,8 +38,12 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-            let (system_id, cs_name, cs_version) =
-                resolve_code_system(&conn, &req.system, req.version.as_deref())?;
+            let (system_id, cs_name, cs_version) = resolve_code_system(
+                &conn,
+                &req.system,
+                req.version.as_deref(),
+                req.date.as_deref(),
+            )?;
 
             let (concept_id, display, _definition) = find_concept(&conn, &system_id, &req.code)?;
 
@@ -52,7 +57,29 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     .collect()
             };
 
-            let designations = fetch_designations(&conn, concept_id)?;
+            let all_designations = fetch_designations(&conn, concept_id)?;
+
+            // 10.2: When displayLanguage is set and a matching designation
+            // exists, prefer its value as the concept display.
+            let display = if let Some(lang) = req.display_language.as_deref() {
+                all_designations
+                    .iter()
+                    .find(|d| d.language.as_deref() == Some(lang))
+                    .map(|d| d.value.clone())
+                    .or(display)
+            } else {
+                display
+            };
+
+            // 10.1: Filter designations to the requested language (if set).
+            let designations = if let Some(lang) = req.display_language.as_deref() {
+                all_designations
+                    .into_iter()
+                    .filter(|d| d.language.as_deref() == Some(lang))
+                    .collect()
+            } else {
+                all_designations
+            };
 
             Ok(LookupResponse {
                 name: cs_name,
@@ -90,7 +117,12 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
             // Unknown code system is not an error — just a "false" result.
-            let system_id = match resolve_code_system(&conn, &system, req.version.as_deref()) {
+            let system_id = match resolve_code_system(
+                &conn,
+                &system,
+                req.version.as_deref(),
+                req.date.as_deref(),
+            ) {
                 Ok((id, _, _)) => id,
                 Err(HtsError::NotFound(_)) => {
                     return Ok(ValidateCodeResponse {
@@ -162,7 +194,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
             let (system_id, _, _) =
-                resolve_code_system(&conn, &req.system, req.version.as_deref())?;
+                resolve_code_system(&conn, &req.system, req.version.as_deref(), None)?;
 
             // Both codes must exist in this system.
             find_concept(&conn, &system_id, &req.code_a)?;
@@ -192,6 +224,91 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             Ok(SubsumesResponse {
                 outcome: SubsumptionOutcome::NotSubsumed,
             })
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    /// Search CodeSystem resources by query parameters.
+    ///
+    /// Filters are applied as exact matches against stored columns. Omitting a
+    /// field means "no filter". Returns up to `count` results starting at
+    /// `offset`, defaulting to 20 results from the beginning.
+    async fn search(
+        &self,
+        _ctx: &TenantContext,
+        query: ResourceSearchQuery,
+    ) -> Result<Vec<serde_json::Value>, HtsError> {
+        let pool = self.pool().clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+            let limit = i64::from(query.count.unwrap_or(20));
+            let offset = i64::from(query.offset.unwrap_or(0));
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, url, version, name, title, status, resource_json
+                     FROM code_systems
+                     WHERE (?1 IS NULL OR url = ?1)
+                       AND (?2 IS NULL OR version = ?2)
+                       AND (?3 IS NULL OR name = ?3)
+                       AND (?4 IS NULL OR title = ?4)
+                       AND (?5 IS NULL OR status = ?5)
+                     ORDER BY created_at
+                     LIMIT ?6 OFFSET ?7",
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![
+                        query.url,
+                        query.version,
+                        query.name,
+                        query.title,
+                        query.status,
+                        limit,
+                        offset
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,         // id
+                            row.get::<_, String>(1)?,         // url
+                            row.get::<_, Option<String>>(2)?, // version
+                            row.get::<_, Option<String>>(3)?, // name
+                            row.get::<_, Option<String>>(4)?, // title
+                            row.get::<_, String>(5)?,         // status
+                            row.get::<_, Option<String>>(6)?, // resource_json
+                        ))
+                    },
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                let (id, url, version, name, title, status, resource_json) =
+                    row.map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                let resource = resource_json
+                    .and_then(|j| serde_json::from_str(&j).ok())
+                    .unwrap_or_else(|| {
+                        build_synthetic_resource(
+                            "CodeSystem",
+                            &id,
+                            &url,
+                            version.as_deref(),
+                            name.as_deref(),
+                            title.as_deref(),
+                            &status,
+                        )
+                    });
+                results.push(resource);
+            }
+            Ok(results)
         })
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
@@ -236,19 +353,25 @@ fn check_ancestor(
     Ok(found.is_some())
 }
 
-/// Resolve a code system by URL (and optionally version).
+/// Resolve a code system by URL, optional version, and optional point-in-time date.
 ///
 /// Returns `(id, name_or_url, version)`.
+///
+/// When `date` is provided, only code systems whose `$.date` (from `resource_json`)
+/// is ≤ the requested date are matched, enabling point-in-time evaluation.
 fn resolve_code_system(
     conn: &rusqlite::Connection,
     url: &str,
     version: Option<&str>,
+    date: Option<&str>,
 ) -> Result<(String, String, Option<String>), HtsError> {
     let result = if let Some(ver) = version {
         conn.query_row(
             "SELECT id, COALESCE(name, url), version \
-             FROM code_systems WHERE url = ?1 AND version = ?2",
-            rusqlite::params![url, ver],
+             FROM code_systems \
+             WHERE url = ?1 AND version = ?2 \
+               AND (?3 IS NULL OR json_extract(resource_json, '$.date') <= ?3)",
+            rusqlite::params![url, ver, date],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -260,8 +383,10 @@ fn resolve_code_system(
     } else {
         conn.query_row(
             "SELECT id, COALESCE(name, url), version \
-             FROM code_systems WHERE url = ?1",
-            rusqlite::params![url],
+             FROM code_systems \
+             WHERE url = ?1 \
+               AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2)",
+            rusqlite::params![url, date],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -358,6 +483,36 @@ fn fetch_designations(
     .collect()
 }
 
+/// Build a minimal synthetic FHIR resource JSON when `resource_json` is absent.
+///
+/// Used as a fallback for resources that pre-date the `resource_json` column.
+pub(super) fn build_synthetic_resource(
+    resource_type: &str,
+    id: &str,
+    url: &str,
+    version: Option<&str>,
+    name: Option<&str>,
+    title: Option<&str>,
+    status: &str,
+) -> serde_json::Value {
+    let mut obj = serde_json::json!({
+        "resourceType": resource_type,
+        "id": id,
+        "url": url,
+        "status": status,
+    });
+    if let Some(v) = version {
+        obj["version"] = v.into();
+    }
+    if let Some(n) = name {
+        obj["name"] = n.into();
+    }
+    if let Some(t) = title {
+        obj["title"] = t.into();
+    }
+    obj
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -408,10 +563,8 @@ mod tests {
                 LookupRequest {
                     system: "http://example.org/cs".into(),
                     code: "ABC".into(),
-                    version: None,
-                    display_language: None,
-                    expression: None,
                     properties: vec![],
+                    ..Default::default()
                 },
             )
             .await
@@ -436,10 +589,8 @@ mod tests {
                 LookupRequest {
                     system: "http://example.org/cs".into(),
                     code: "ABC".into(),
-                    version: None,
-                    display_language: None,
-                    expression: None,
                     properties: vec!["parent".into()],
+                    ..Default::default()
                 },
             )
             .await
@@ -461,10 +612,7 @@ mod tests {
                 LookupRequest {
                     system: "http://example.org/cs".into(),
                     code: "NOPE".into(),
-                    version: None,
-                    display_language: None,
-                    expression: None,
-                    properties: vec![],
+                    ..Default::default()
                 },
             )
             .await
@@ -484,10 +632,7 @@ mod tests {
                 LookupRequest {
                     system: "http://other.org/cs".into(),
                     code: "ABC".into(),
-                    version: None,
-                    display_language: None,
-                    expression: None,
-                    properties: vec![],
+                    ..Default::default()
                 },
             )
             .await
@@ -506,10 +651,8 @@ mod tests {
                 LookupRequest {
                     system: "http://example.org/cs".into(),
                     code: "ABC".into(),
-                    version: None,
-                    display_language: None,
                     expression: Some("128045006:{363698007=56459004}".into()),
-                    properties: vec![],
+                    ..Default::default()
                 },
             )
             .await
@@ -529,11 +672,9 @@ mod tests {
             .validate_code(
                 &ctx(),
                 ValidateCodeRequest {
-                    url: None,
                     system: Some("http://example.org/cs".into()),
                     code: "ABC".into(),
-                    version: None,
-                    display: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -553,11 +694,9 @@ mod tests {
             .validate_code(
                 &ctx(),
                 ValidateCodeRequest {
-                    url: None,
                     system: Some("http://example.org/cs".into()),
                     code: "NOPE".into(),
-                    version: None,
-                    display: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -576,11 +715,9 @@ mod tests {
             .validate_code(
                 &ctx(),
                 ValidateCodeRequest {
-                    url: None,
                     system: Some("http://unknown.org/cs".into()),
                     code: "ABC".into(),
-                    version: None,
-                    display: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -598,11 +735,10 @@ mod tests {
             .validate_code(
                 &ctx(),
                 ValidateCodeRequest {
-                    url: None,
                     system: Some("http://example.org/cs".into()),
                     code: "ABC".into(),
-                    version: None,
                     display: Some("Alpha Beta Charlie".into()),
+                    ..Default::default()
                 },
             )
             .await
@@ -621,11 +757,10 @@ mod tests {
             .validate_code(
                 &ctx(),
                 ValidateCodeRequest {
-                    url: None,
                     system: Some("http://example.org/cs".into()),
                     code: "ABC".into(),
-                    version: None,
                     display: Some("Wrong Display".into()),
+                    ..Default::default()
                 },
             )
             .await
@@ -646,11 +781,8 @@ mod tests {
             .validate_code(
                 &ctx(),
                 ValidateCodeRequest {
-                    url: None,
-                    system: None,
                     code: "ABC".into(),
-                    version: None,
-                    display: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -825,5 +957,209 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, HtsError::NotFound(_)));
+    }
+
+    // ── date parameter (point-in-time filtering) ───────────────────────────────
+
+    /// Seed a code system whose `resource_json` contains a `date` field.
+    fn seed_with_date(b: &SqliteTerminologyBackend, cs_date: &str) {
+        let conn = b.pool().get().unwrap();
+        let resource_json = serde_json::json!({
+            "resourceType": "CodeSystem",
+            "id": "cs-dated",
+            "url": "http://example.org/cs-dated",
+            "name": "DatedCS",
+            "status": "active",
+            "date": cs_date
+        })
+        .to_string();
+        conn.execute_batch(&format!(
+            "INSERT INTO code_systems
+                 (id, url, version, name, status, content, resource_json, created_at, updated_at)
+             VALUES ('cs-dated', 'http://example.org/cs-dated', NULL, 'DatedCS',
+                     'active', 'complete', '{resource_json}', '2024-01-01', '2024-01-01');
+             INSERT INTO concepts (id, system_id, code, display)
+             VALUES (99, 'cs-dated', 'TEST', 'Test Concept');",
+        ))
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lookup_date_after_cs_date_succeeds() {
+        let b = backend();
+        seed_with_date(&b, "2024-06-01");
+
+        // Request date is after the CS date → code system is in scope.
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/cs-dated".into(),
+                    code: "TEST".into(),
+                    date: Some("2024-12-31".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.display, Some("Test Concept".into()));
+    }
+
+    #[tokio::test]
+    async fn lookup_date_before_cs_date_returns_not_found() {
+        let b = backend();
+        seed_with_date(&b, "2024-06-01");
+
+        // Request date is before the CS date → code system excluded.
+        let err = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/cs-dated".into(),
+                    code: "TEST".into(),
+                    date: Some("2024-01-01".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, HtsError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn lookup_without_date_ignores_cs_date_field() {
+        let b = backend();
+        seed_with_date(&b, "2024-06-01");
+
+        // No date param → date filter is NULL → all code systems match.
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/cs-dated".into(),
+                    code: "TEST".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.display, Some("Test Concept".into()));
+    }
+
+    // ── Phase 10: displayLanguage filtering ───────────────────────────────────
+
+    fn seed_multilang(b: &SqliteTerminologyBackend) {
+        let conn = b.pool().get().unwrap();
+        conn.execute_batch(
+            "INSERT INTO code_systems
+                 (id, url, version, name, status, content, created_at, updated_at)
+             VALUES ('cs-ml', 'http://example.org/cs-ml', '1.0', 'Multilang CS',
+                     'active', 'complete', '2024-01-01', '2024-01-01');
+
+             INSERT INTO concepts (id, system_id, code, display)
+             VALUES (100, 'cs-ml', 'TERM', 'Term (English default)');
+
+             INSERT INTO concept_designations (concept_id, language, use_system, use_code, value)
+             VALUES (100, 'en', NULL, NULL, 'Term in English'),
+                    (100, 'fr', NULL, NULL, 'Terme en français'),
+                    (100, 'de', NULL, NULL, 'Begriff auf Deutsch');",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lookup_display_language_filters_designations() {
+        let b = backend();
+        seed_multilang(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/cs-ml".into(),
+                    code: "TERM".into(),
+                    display_language: Some("fr".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Only the French designation should be returned.
+        assert_eq!(resp.designations.len(), 1);
+        assert_eq!(resp.designations[0].language.as_deref(), Some("fr"));
+        assert_eq!(resp.designations[0].value, "Terme en français");
+    }
+
+    #[tokio::test]
+    async fn lookup_display_language_overrides_default_display() {
+        let b = backend();
+        seed_multilang(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/cs-ml".into(),
+                    code: "TERM".into(),
+                    display_language: Some("fr".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Display should be the French designation value, not the default English display.
+        assert_eq!(resp.display, Some("Terme en français".into()));
+    }
+
+    #[tokio::test]
+    async fn lookup_display_language_no_match_returns_empty_designations() {
+        let b = backend();
+        seed_multilang(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/cs-ml".into(),
+                    code: "TERM".into(),
+                    display_language: Some("zh".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // No Chinese designations — filtered list is empty.
+        assert!(resp.designations.is_empty());
+        // Display falls back to concept default.
+        assert_eq!(resp.display, Some("Term (English default)".into()));
+    }
+
+    #[tokio::test]
+    async fn lookup_without_display_language_returns_all_designations() {
+        let b = backend();
+        seed_multilang(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/cs-ml".into(),
+                    code: "TERM".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // All three designations returned when no filter is applied.
+        assert_eq!(resp.designations.len(), 3);
+        // Default display is unchanged.
+        assert_eq!(resp.display, Some("Term (English default)".into()));
     }
 }

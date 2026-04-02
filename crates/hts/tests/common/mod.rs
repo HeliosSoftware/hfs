@@ -79,6 +79,59 @@ impl TestApp {
         (status, json)
     }
 
+    /// POST a FHIR JSON body to `path` requesting XML, returning `(status, body_string)`.
+    pub async fn post_fhir_xml(&self, path: &str, body: impl Into<String>) -> (StatusCode, String) {
+        let response = self
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/fhir+json")
+                    .header("accept", "application/fhir+xml")
+                    .body(Body::from(body.into()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// GET `path` requesting XML, returning `(status, body_string, content_type)`.
+    pub async fn get_fhir_xml(&self, path: &str) -> (StatusCode, String, String) {
+        let response = self
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header("accept", "application/fhir+xml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned(), ct)
+    }
+
     /// Import a FHIR Bundle JSON string, returning `(status, response_body)`.
     pub async fn import_bundle(&self, bundle: &str) -> (StatusCode, Value) {
         self.post_fhir("/import", bundle).await

@@ -21,8 +21,8 @@ mod inner {
 
     use axum::{
         Json,
-        extract::{Path, State},
-        http::{StatusCode, header},
+        extract::{Path, RawQuery, State},
+        http::{HeaderMap, HeaderValue, StatusCode, header},
         response::{IntoResponse, Response},
     };
     use helios_fhir::FhirVersion;
@@ -41,6 +41,8 @@ mod inner {
     };
     use crate::state::AppState;
     use crate::traits::TerminologyBackend;
+
+    use super::super::format::{ResponseFormat, fhir_respond, negotiate_format};
 
     // ── Tenant context ─────────────────────────────────────────────────────────
 
@@ -71,6 +73,7 @@ mod inner {
         resource_type: &'static str,
         state: AppState<B>,
         body: Value,
+        format: ResponseFormat,
     ) -> Result<Response, HtsError> {
         let store = Arc::clone(
             state
@@ -110,12 +113,16 @@ mod inner {
         let etag = stored.etag().to_string();
         let location = format!("/{}/{}", resource_type, stored.id());
 
-        Ok((
-            StatusCode::CREATED,
-            [(header::LOCATION, location), (header::ETAG, etag)],
-            Json(stored.content().clone()),
-        )
-            .into_response())
+        let mut response = fhir_respond(stored.content().clone(), format);
+        *response.status_mut() = StatusCode::CREATED;
+        let headers = response.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&location) {
+            headers.insert(header::LOCATION, v);
+        }
+        if let Ok(v) = HeaderValue::from_str(&etag) {
+            headers.insert(header::ETAG, v);
+        }
+        Ok(response)
     }
 
     /// GET /<ResourceType>/:id — read stored FHIR JSON.
@@ -126,6 +133,7 @@ mod inner {
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
+        format: ResponseFormat,
     ) -> Result<Response, HtsError> {
         let store = Arc::clone(
             state
@@ -138,12 +146,11 @@ mod inner {
         match store.read(&ctx, resource_type, &id).await {
             Ok(Some(resource)) if !resource.is_deleted() => {
                 let etag = resource.etag().to_string();
-                Ok((
-                    StatusCode::OK,
-                    [(header::ETAG, etag)],
-                    Json(resource.content().clone()),
-                )
-                    .into_response())
+                let mut response = fhir_respond(resource.content().clone(), format);
+                if let Ok(v) = HeaderValue::from_str(&etag) {
+                    response.headers_mut().insert(header::ETAG, v);
+                }
+                Ok(response)
             }
             Ok(Some(_)) | Ok(None) => Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
             // The persistence layer returns Gone for soft-deleted resources;
@@ -170,6 +177,7 @@ mod inner {
         id: String,
         if_match: Option<String>,
         body: Value,
+        format: ResponseFormat,
     ) -> Result<Response, HtsError> {
         let store = Arc::clone(
             state
@@ -243,12 +251,11 @@ mod inner {
         .map_err(|e| HtsError::Internal(e.to_string()))??;
 
         let etag = updated.etag().to_string();
-        Ok((
-            StatusCode::OK,
-            [(header::ETAG, etag)],
-            Json(updated.content().clone()),
-        )
-            .into_response())
+        let mut response = fhir_respond(updated.content().clone(), format);
+        if let Ok(v) = HeaderValue::from_str(&etag) {
+            response.headers_mut().insert(header::ETAG, v);
+        }
+        Ok(response)
     }
 
     /// DELETE /<ResourceType>/:id — soft-delete a resource.
@@ -302,33 +309,58 @@ mod inner {
         Ok(StatusCode::NO_CONTENT.into_response())
     }
 
+    // ── Format negotiation helper ──────────────────────────────────────────────
+
+    fn crud_format(headers: &HeaderMap, raw: Option<&str>) -> ResponseFormat {
+        let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+        negotiate_format(raw, accept)
+    }
+
     // ── CodeSystem CRUD ────────────────────────────────────────────────────────
 
     pub async fn create_code_system<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
+        RawQuery(raw): RawQuery,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Result<Response, HtsError> {
-        create_resource("CodeSystem", state, body).await
+        create_resource(
+            "CodeSystem",
+            state,
+            body,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
     }
 
     pub async fn read_code_system<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
         Path(id): Path<String>,
+        headers: HeaderMap,
+        RawQuery(raw): RawQuery,
     ) -> Result<Response, HtsError> {
-        read_resource("CodeSystem", state, id).await
+        read_resource(
+            "CodeSystem",
+            state,
+            id,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
     }
 
     pub async fn update_code_system<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
         Path(id): Path<String>,
-        headers: axum::http::HeaderMap,
+        RawQuery(raw): RawQuery,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Result<Response, HtsError> {
+        let format = crud_format(&headers, raw.as_deref());
         let if_match = headers
             .get(header::IF_MATCH)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        update_resource("CodeSystem", state, id, if_match, body).await
+        update_resource("CodeSystem", state, id, if_match, body, format).await
     }
 
     pub async fn delete_code_system<B: TerminologyBackend>(
@@ -342,29 +374,41 @@ mod inner {
 
     pub async fn create_value_set<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
+        RawQuery(raw): RawQuery,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Result<Response, HtsError> {
-        create_resource("ValueSet", state, body).await
+        create_resource(
+            "ValueSet",
+            state,
+            body,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
     }
 
     pub async fn read_value_set<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
         Path(id): Path<String>,
+        headers: HeaderMap,
+        RawQuery(raw): RawQuery,
     ) -> Result<Response, HtsError> {
-        read_resource("ValueSet", state, id).await
+        read_resource("ValueSet", state, id, crud_format(&headers, raw.as_deref())).await
     }
 
     pub async fn update_value_set<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
         Path(id): Path<String>,
-        headers: axum::http::HeaderMap,
+        RawQuery(raw): RawQuery,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Result<Response, HtsError> {
+        let format = crud_format(&headers, raw.as_deref());
         let if_match = headers
             .get(header::IF_MATCH)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        update_resource("ValueSet", state, id, if_match, body).await
+        update_resource("ValueSet", state, id, if_match, body, format).await
     }
 
     pub async fn delete_value_set<B: TerminologyBackend>(
@@ -378,29 +422,47 @@ mod inner {
 
     pub async fn create_concept_map<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
+        RawQuery(raw): RawQuery,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Result<Response, HtsError> {
-        create_resource("ConceptMap", state, body).await
+        create_resource(
+            "ConceptMap",
+            state,
+            body,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
     }
 
     pub async fn read_concept_map<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
         Path(id): Path<String>,
+        headers: HeaderMap,
+        RawQuery(raw): RawQuery,
     ) -> Result<Response, HtsError> {
-        read_resource("ConceptMap", state, id).await
+        read_resource(
+            "ConceptMap",
+            state,
+            id,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
     }
 
     pub async fn update_concept_map<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
         Path(id): Path<String>,
-        headers: axum::http::HeaderMap,
+        RawQuery(raw): RawQuery,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Result<Response, HtsError> {
+        let format = crud_format(&headers, raw.as_deref());
         let if_match = headers
             .get(header::IF_MATCH)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        update_resource("ConceptMap", state, id, if_match, body).await
+        update_resource("ConceptMap", state, id, if_match, body, format).await
     }
 
     pub async fn delete_concept_map<B: TerminologyBackend>(
@@ -1085,10 +1147,7 @@ mod tests {
                 LookupRequest {
                     system: "http://example.org/cs/cs-lookup".to_string(),
                     code: "A".into(),
-                    version: None,
-                    display_language: None,
-                    expression: None,
-                    properties: vec![],
+                    ..Default::default()
                 },
             )
             .await

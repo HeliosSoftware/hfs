@@ -1,4 +1,9 @@
-use axum::{Json, extract::State, response::IntoResponse};
+use axum::{
+    extract::{Query, RawQuery, State},
+    http::{HeaderMap, header},
+    response::Response,
+};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[cfg(feature = "R4")]
@@ -14,26 +19,55 @@ use crate::import::BundleImportBackend;
 use crate::state::AppState;
 use crate::traits::{TerminologyBackend, TerminologyMetadata};
 
+use super::format::{fhir_respond, negotiate_format};
+
 const HTS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HTS_NAME: &str = "Helios Terminology Service";
 
-/// GET /metadata — returns a FHIR TerminologyCapabilities resource.
+/// Query parameters accepted by `GET /metadata`.
+#[derive(Debug, Default, Deserialize)]
+pub struct MetadataQuery {
+    /// FHIR metadata mode:
+    /// - `"terminology"` → TerminologyCapabilities
+    /// - `"full"` or absent → CapabilityStatement
+    pub mode: Option<String>,
+}
+
+/// GET /metadata — returns a CapabilityStatement or TerminologyCapabilities.
 ///
-/// Lists all supported operations, known code systems, and backend metadata.
-/// Conforms to the FHIR R4 TerminologyCapabilities resource structure.
-pub async fn metadata_handler<B>(State(state): State<AppState<B>>) -> impl IntoResponse
+/// - No `mode` or `mode=full` → CapabilityStatement (full server capabilities)
+/// - `mode=terminology`      → TerminologyCapabilities (terminology-specific)
+pub async fn metadata_handler<B>(
+    State(state): State<AppState<B>>,
+    Query(query): Query<MetadataQuery>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response
 where
     B: TerminologyBackend + BundleImportBackend + Clone,
 {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let backend = state.backend();
-    let capabilities = build_terminology_capabilities(backend);
-    Json(capabilities)
+    let body = match query.mode.as_deref() {
+        Some("terminology") => build_terminology_capabilities(backend),
+        _ => build_capability_statement(backend),
+    };
+    fhir_respond(body, format)
 }
 
 /// Build the `TerminologyCapabilities` JSON value from backend metadata.
 ///
 /// Constructs a typed `TerminologyCapabilities` (FHIR R4) model and serializes it
 /// to JSON. Separated from the handler so it can be tested without a running server.
+///
+/// # Intentional 501 for `expression` parameter
+///
+/// The `$lookup` operation accepts an `expression` parameter for SNOMED
+/// post-coordination expressions.  This server intentionally returns
+/// `HTTP 501 Not Implemented` for any request that includes that parameter —
+/// post-coordination evaluation is out of scope for the SQLite MVP.
+/// Callers should not pass `expression`; use `code` instead.
 #[cfg(feature = "R4")]
 pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Value {
     let code_systems: Vec<TerminologyCapabilitiesCodeSystem> = backend
@@ -139,6 +173,111 @@ pub fn build_terminology_capabilities(_backend: &impl TerminologyMetadata) -> Va
     json!({ "resourceType": "TerminologyCapabilities", "status": "active", "kind": "terminology" })
 }
 
+/// Build a FHIR R4 CapabilityStatement for the HTS server.
+///
+/// Describes the full set of REST interactions (CRUD + search) and FHIR
+/// terminology operations supported for CodeSystem, ValueSet, and ConceptMap.
+/// Includes a `capabilitystatement-supported-system` extension for each
+/// code system URL currently registered in the backend.
+pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
+    // ── capabilitystatement-supported-system extensions ───────────────────────
+    let supported_system_extensions: Vec<Value> = backend
+        .supported_systems()
+        .into_iter()
+        .map(|url| {
+            json!({
+                "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-supported-system",
+                "valueUri": url
+            })
+        })
+        .collect();
+
+    // ── Shared search params for all three resource types ─────────────────────
+    let search_params = json!([
+        {"name": "url",     "type": "uri",    "documentation": "Canonical URL of the resource"},
+        {"name": "version", "type": "token",  "documentation": "Business version"},
+        {"name": "name",    "type": "string", "documentation": "Computer-friendly name"},
+        {"name": "title",   "type": "string", "documentation": "Human-friendly title"},
+        {"name": "status",  "type": "token",  "documentation": "Publication status"}
+    ]);
+
+    // ── Standard interactions supported by all three CRUD resources ───────────
+    let interactions = json!([
+        {"code": "read"},
+        {"code": "create"},
+        {"code": "update"},
+        {"code": "delete"},
+        {"code": "search-type"}
+    ]);
+
+    json!({
+        "resourceType": "CapabilityStatement",
+        "status": "active",
+        "kind": "instance",
+        "date": "2026-04-01",
+        "fhirVersion": "4.0.1",
+        "format": ["application/fhir+json", "application/fhir+xml"],
+        "extension": supported_system_extensions,
+        "software": {
+            "name": HTS_NAME,
+            "version": HTS_VERSION
+        },
+        "implementation": {
+            "description": "Helios Terminology Service SQLite backend"
+        },
+        "rest": [{
+            "mode": "server",
+            "resource": [
+                {
+                    "type": "CodeSystem",
+                    "interaction": interactions,
+                    "searchParam": search_params
+                },
+                {
+                    "type": "ValueSet",
+                    "interaction": interactions,
+                    "searchParam": search_params
+                },
+                {
+                    "type": "ConceptMap",
+                    "interaction": interactions,
+                    "searchParam": search_params
+                }
+            ],
+            "operation": [
+                {
+                    "name": "lookup",
+                    "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"
+                },
+                {
+                    "name": "validate-code",
+                    "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"
+                },
+                {
+                    "name": "subsumes",
+                    "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-subsumes"
+                },
+                {
+                    "name": "expand",
+                    "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"
+                },
+                {
+                    "name": "validate-code",
+                    "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-validate-code"
+                },
+                {
+                    "name": "translate",
+                    "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"
+                },
+                {
+                    "name": "closure",
+                    "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-closure"
+                }
+            ]
+        }]
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -234,68 +373,161 @@ mod tests {
         assert!(urls.contains(&"http://b.org"));
     }
 
-    // ── Integration test: HTTP GET /metadata returns 200 ──────────────────────
+    // ── Unit tests on build_capability_statement ──────────────────────────────
 
-    #[tokio::test]
-    async fn get_metadata_returns_200() {
-        use crate::state::AppState;
-
-        let b = SqliteTerminologyBackend::in_memory().unwrap();
-        let state = AppState::new(b);
-
-        let app = Router::new()
-            .route(
-                "/metadata",
-                get(metadata_handler::<SqliteTerminologyBackend>),
-            )
-            .with_state(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/metadata")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    #[test]
+    fn capability_statement_resource_type() {
+        let cs = build_capability_statement(&backend());
+        assert_eq!(cs["resourceType"], "CapabilityStatement");
     }
 
-    #[tokio::test]
-    async fn get_metadata_body_is_terminology_capabilities() {
-        use crate::state::AppState;
+    #[test]
+    fn capability_statement_status_and_kind() {
+        let cs = build_capability_statement(&backend());
+        assert_eq!(cs["status"], "active");
+        assert_eq!(cs["kind"], "instance");
+    }
 
+    #[test]
+    fn capability_statement_has_three_resource_types() {
+        let cs = build_capability_statement(&backend());
+        let resources = cs["rest"][0]["resource"].as_array().unwrap();
+        let types: Vec<&str> = resources
+            .iter()
+            .filter_map(|r| r["type"].as_str())
+            .collect();
+        assert!(types.contains(&"CodeSystem"));
+        assert!(types.contains(&"ValueSet"));
+        assert!(types.contains(&"ConceptMap"));
+    }
+
+    #[test]
+    fn capability_statement_each_resource_has_five_search_params() {
+        let cs = build_capability_statement(&backend());
+        for res in cs["rest"][0]["resource"].as_array().unwrap() {
+            let params = res["searchParam"].as_array().unwrap();
+            assert_eq!(
+                params.len(),
+                5,
+                "expected 5 search params for {}",
+                res["type"]
+            );
+            let names: Vec<&str> = params.iter().filter_map(|p| p["name"].as_str()).collect();
+            for expected in ["url", "version", "name", "title", "status"] {
+                assert!(
+                    names.contains(&expected),
+                    "missing search param '{expected}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn capability_statement_lists_all_operations() {
+        let cs = build_capability_statement(&backend());
+        let ops = cs["rest"][0]["operation"].as_array().unwrap();
+        let names: Vec<&str> = ops.iter().filter_map(|o| o["name"].as_str()).collect();
+        for expected in [
+            "lookup",
+            "validate-code",
+            "subsumes",
+            "expand",
+            "translate",
+            "closure",
+        ] {
+            assert!(names.contains(&expected), "missing operation '{expected}'");
+        }
+    }
+
+    #[test]
+    fn capability_statement_supported_system_extensions_empty_on_fresh_backend() {
+        let cs = build_capability_statement(&backend());
+        let exts = cs["extension"].as_array().unwrap();
+        assert!(
+            exts.is_empty(),
+            "fresh backend should have no supported-system extensions"
+        );
+    }
+
+    #[test]
+    fn capability_statement_supported_system_extension_populated() {
+        let b = backend();
+        let conn = b.pool().get().unwrap();
+        conn.execute(
+            "INSERT INTO code_systems (id, url, status, content, created_at, updated_at)
+             VALUES ('cs1', 'http://example.org/cs', 'active', 'complete', '2024-01-01', '2024-01-01')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let cs = build_capability_statement(&b);
+        let exts = cs["extension"].as_array().unwrap();
+        assert_eq!(exts.len(), 1);
+        assert_eq!(
+            exts[0]["url"],
+            "http://hl7.org/fhir/StructureDefinition/capabilitystatement-supported-system"
+        );
+        assert_eq!(exts[0]["valueUri"], "http://example.org/cs");
+    }
+
+    // ── Integration tests: HTTP GET /metadata mode dispatch ───────────────────
+
+    fn make_metadata_app() -> Router {
+        use crate::state::AppState;
         let b = SqliteTerminologyBackend::in_memory().unwrap();
         let state = AppState::new(b);
-
-        let app = Router::new()
+        Router::new()
             .route(
                 "/metadata",
                 get(metadata_handler::<SqliteTerminologyBackend>),
             )
-            .with_state(state);
+            .with_state(state)
+    }
 
+    async fn get_metadata(app: Router, uri: &str) -> Value {
         let response = app
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/metadata")
+                    .uri(uri)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
+    #[tokio::test]
+    async fn get_metadata_returns_200() {
+        let app = make_metadata_app();
+        let body = get_metadata(app, "/metadata").await;
+        assert_eq!(body["resourceType"], "CapabilityStatement");
+    }
+
+    #[tokio::test]
+    async fn get_metadata_no_mode_returns_capability_statement() {
+        let body = get_metadata(make_metadata_app(), "/metadata").await;
+        assert_eq!(body["resourceType"], "CapabilityStatement");
+        assert_eq!(body["kind"], "instance");
+    }
+
+    #[tokio::test]
+    async fn get_metadata_mode_full_returns_capability_statement() {
+        let body = get_metadata(make_metadata_app(), "/metadata?mode=full").await;
+        assert_eq!(body["resourceType"], "CapabilityStatement");
+        assert_eq!(body["kind"], "instance");
+    }
+
+    #[tokio::test]
+    async fn get_metadata_mode_terminology_returns_terminology_capabilities() {
+        let body = get_metadata(make_metadata_app(), "/metadata?mode=terminology").await;
         assert_eq!(body["resourceType"], "TerminologyCapabilities");
-        assert_eq!(body["status"], "active");
         assert_eq!(body["kind"], "terminology");
     }
 }

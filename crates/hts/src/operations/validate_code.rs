@@ -17,7 +17,9 @@
 //! - ValueSet:   <https://hl7.org/fhir/valueset-operation-validate-code.html>
 use axum::{
     Json,
-    extract::{RawQuery, State},
+    extract::{Path, RawQuery, State},
+    http::{HeaderMap, header},
+    response::Response,
 };
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
@@ -25,137 +27,303 @@ use serde_json::{Value, json};
 use crate::error::HtsError;
 use crate::state::AppState;
 use crate::traits::{CodeSystemOperations, TerminologyBackend, ValueSetOperations};
-use crate::types::ValidateCodeRequest;
+use crate::types::{ValidateCodeRequest, ValidateCodeResponse};
 
+use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
+    extract_codeable_concept, extract_coding, extract_parameter_array, find_str_param,
+    parse_query_string, query_params_to_fhir_params,
 };
 
-async fn process_validate_code<B: TerminologyBackend>(
-    state: &AppState<B>,
-    params: Vec<Value>,
-) -> Result<Json<Value>, HtsError> {
-    // FHIR R4/R5 spec: the parameter is `url` (CodeSystem canonical URL).
-    // `system` is not accepted — clients must use `url`.
-    let system = find_str_param(&params, "url").ok_or_else(|| {
-        HtsError::InvalidRequest(
-            "Missing required parameter: url (CodeSystem canonical URL). \
-             Use `url`, not `system`, for CodeSystem/$validate-code."
-                .into(),
-        )
-    })?;
-
-    let code = find_str_param(&params, "code")
-        .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: code".into()))?;
-
-    let req = ValidateCodeRequest {
-        url: None,
-        system: Some(system),
-        code,
-        version: find_str_param(&params, "version"),
-        display: find_str_param(&params, "display"),
-    };
-
-    let ctx = TenantContext::system();
-    let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
-
+/// Serialize a `ValidateCodeResponse` into a FHIR Parameters JSON value.
+fn build_validate_response(resp: ValidateCodeResponse) -> Value {
     let mut parameter: Vec<Value> = vec![json!({"name": "result", "valueBoolean": resp.result})];
-
     if let Some(msg) = resp.message {
         parameter.push(json!({"name": "message", "valueString": msg}));
     }
-
     if let Some(display) = resp.display {
         parameter.push(json!({"name": "display", "valueString": display}));
     }
-
-    Ok(Json(json!({
+    json!({
         "resourceType": "Parameters",
         "parameter": parameter
-    })))
+    })
+}
+
+pub(crate) async fn process_validate_code<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Value, HtsError> {
+    let ctx = TenantContext::system();
+
+    // ── Path 1: bare `code` parameter (requires `url` = CodeSystem canonical URL) ──
+    if let Some(code) = find_str_param(&params, "code") {
+        let system = find_str_param(&params, "url").ok_or_else(|| {
+            HtsError::InvalidRequest(
+                "Missing required parameter: url (CodeSystem canonical URL). \
+                 Use `url`, not `system`, for CodeSystem/$validate-code."
+                    .into(),
+            )
+        })?;
+        let req = ValidateCodeRequest {
+            url: None,
+            system: Some(system),
+            code,
+            version: find_str_param(&params, "version"),
+            display: find_str_param(&params, "display"),
+            date: find_str_param(&params, "date"),
+        };
+        let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
+        return Ok(build_validate_response(resp));
+    }
+
+    // ── Path 2: `coding` parameter (valueCoding — system+code bundled together) ──
+    if let Some((system, code, _display)) = extract_coding(&params, "coding") {
+        let req = ValidateCodeRequest {
+            url: None,
+            system: Some(system),
+            code,
+            version: find_str_param(&params, "version"),
+            display: find_str_param(&params, "display"),
+            date: find_str_param(&params, "date"),
+        };
+        let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
+        return Ok(build_validate_response(resp));
+    }
+
+    // ── Path 3: `codeableConcept` parameter (multiple codings — true if any matches) ──
+    if let Some(codings) = extract_codeable_concept(&params, "codeableConcept") {
+        if codings.is_empty() {
+            return Err(HtsError::InvalidRequest(
+                "codeableConcept parameter has no valid coding entries".into(),
+            ));
+        }
+        for (system, code) in codings {
+            let req = ValidateCodeRequest {
+                url: None,
+                system: Some(system),
+                code,
+                version: find_str_param(&params, "version"),
+                display: None,
+                date: find_str_param(&params, "date"),
+            };
+            let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
+            if resp.result {
+                return Ok(build_validate_response(resp));
+            }
+        }
+        // No coding matched
+        return Ok(build_validate_response(ValidateCodeResponse {
+            result: false,
+            message: Some("None of the provided codings were found in any CodeSystem".into()),
+            display: None,
+        }));
+    }
+
+    Err(HtsError::InvalidRequest(
+        "Must provide one of: code, coding (valueCoding), or \
+         codeableConcept (valueCodeableConcept)"
+            .into(),
+    ))
 }
 
 /// POST /CodeSystem/$validate-code
 pub async fn validate_code_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let params = extract_parameter_array(&body)?;
-    process_validate_code(&state, params).await
+    Ok(fhir_respond(
+        process_validate_code(&state, params).await?,
+        format,
+    ))
 }
 
 /// GET /CodeSystem/$validate-code?url=...&code=...
 pub async fn get_validate_code_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    process_validate_code(&state, params).await
+    Ok(fhir_respond(
+        process_validate_code(&state, params).await?,
+        format,
+    ))
 }
 
 // ── ValueSet/$validate-code ────────────────────────────────────────────────────
 
-async fn process_vs_validate_code<B: TerminologyBackend>(
+pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
-) -> Result<Json<Value>, HtsError> {
-    // ValueSet/$validate-code uses `url` for the ValueSet canonical URL.
+) -> Result<Value, HtsError> {
+    // ValueSet/$validate-code always requires `url` (the ValueSet canonical URL).
     let url = find_str_param(&params, "url").ok_or_else(|| {
         HtsError::InvalidRequest("Missing required parameter: url (ValueSet canonical URL)".into())
     })?;
 
-    let code = find_str_param(&params, "code")
-        .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: code".into()))?;
-
-    // `system` is optional: scopes code lookup to a specific code system in
-    // the expansion when the value set spans multiple systems.
-    let system = find_str_param(&params, "system");
-
-    let req = ValidateCodeRequest {
-        url: Some(url),
-        system,
-        code,
-        version: find_str_param(&params, "version"),
-        display: find_str_param(&params, "display"),
-    };
-
     let ctx = TenantContext::system();
-    let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
 
-    let mut parameter: Vec<Value> = vec![json!({"name": "result", "valueBoolean": resp.result})];
-
-    if let Some(msg) = resp.message {
-        parameter.push(json!({"name": "message", "valueString": msg}));
+    // ── Path 1: bare `code` parameter ────────────────────────────────────────────
+    if let Some(code) = find_str_param(&params, "code") {
+        let req = ValidateCodeRequest {
+            url: Some(url),
+            system: find_str_param(&params, "system"),
+            code,
+            version: find_str_param(&params, "version"),
+            display: find_str_param(&params, "display"),
+            date: find_str_param(&params, "date"),
+        };
+        let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
+        return Ok(build_validate_response(resp));
     }
 
-    if let Some(display) = resp.display {
-        parameter.push(json!({"name": "display", "valueString": display}));
+    // ── Path 2: `coding` parameter (valueCoding) ──────────────────────────────
+    if let Some((system, code, _display)) = extract_coding(&params, "coding") {
+        let req = ValidateCodeRequest {
+            url: Some(url),
+            system: Some(system),
+            code,
+            version: find_str_param(&params, "version"),
+            display: find_str_param(&params, "display"),
+            date: find_str_param(&params, "date"),
+        };
+        let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
+        return Ok(build_validate_response(resp));
     }
 
-    Ok(Json(json!({
-        "resourceType": "Parameters",
-        "parameter": parameter
-    })))
+    // ── Path 3: `codeableConcept` parameter (true if any coding is in the ValueSet) ──
+    if let Some(codings) = extract_codeable_concept(&params, "codeableConcept") {
+        if codings.is_empty() {
+            return Err(HtsError::InvalidRequest(
+                "codeableConcept parameter has no valid coding entries".into(),
+            ));
+        }
+        for (system, code) in codings {
+            let req = ValidateCodeRequest {
+                url: Some(url.clone()),
+                system: Some(system),
+                code,
+                version: find_str_param(&params, "version"),
+                display: None,
+                date: find_str_param(&params, "date"),
+            };
+            let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
+            if resp.result {
+                return Ok(build_validate_response(resp));
+            }
+        }
+        return Ok(build_validate_response(ValidateCodeResponse {
+            result: false,
+            message: Some("None of the provided codings were found in the ValueSet".into()),
+            display: None,
+        }));
+    }
+
+    Err(HtsError::InvalidRequest(
+        "Must provide one of: code, coding (valueCoding), or \
+         codeableConcept (valueCodeableConcept)"
+            .into(),
+    ))
 }
 
 /// POST /ValueSet/$validate-code
 pub async fn vs_validate_code_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let params = extract_parameter_array(&body)?;
-    process_vs_validate_code(&state, params).await
+    Ok(fhir_respond(
+        process_vs_validate_code(&state, params).await?,
+        format,
+    ))
 }
 
 /// GET /ValueSet/$validate-code?url=...&code=...
 pub async fn get_vs_validate_code_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, HtsError> {
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    process_vs_validate_code(&state, params).await
+    Ok(fhir_respond(
+        process_vs_validate_code(&state, params).await?,
+        format,
+    ))
+}
+
+// ── Instance-level: /ValueSet/{id}/$validate-code ─────────────────────────────
+
+/// Inject (or replace) the `url` parameter in a params list.
+fn inject_url(mut params: Vec<Value>, url: String) -> Vec<Value> {
+    params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("url"));
+    let mut with_url = vec![json!({"name": "url", "valueUri": url})];
+    with_url.append(&mut params);
+    with_url
+}
+
+/// POST /ValueSet/{id}/$validate-code
+///
+/// Resolves the ValueSet canonical URL from its FHIR `id`, then delegates to
+/// the same validate-code logic used by the system-level endpoint.
+pub async fn vs_validate_by_id_post<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let url = state
+        .backend()
+        .resource_url_by_id("ValueSet", &id)
+        .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
+
+    let raw_params = body
+        .and_then(|Json(v)| extract_parameter_array(&v).ok())
+        .unwrap_or_default();
+    Ok(fhir_respond(
+        process_vs_validate_code(&state, inject_url(raw_params, url)).await?,
+        format,
+    ))
+}
+
+/// GET /ValueSet/{id}/$validate-code?code=...
+pub async fn get_vs_validate_by_id<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let url = state
+        .backend()
+        .resource_url_by_id("ValueSet", &id)
+        .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
+
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    Ok(fhir_respond(
+        process_vs_validate_code(&state, inject_url(params, url)).await?,
+        format,
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -538,5 +706,174 @@ mod tests {
         let params = json["parameter"].as_array().unwrap();
         let display = params.iter().find(|p| p["name"] == "display").unwrap();
         assert_eq!(display["valueString"], "Alpha");
+    }
+
+    // ── valueCoding input ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cs_validate_coding_valid_returns_true() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {
+                    "name": "coding",
+                    "valueCoding": {
+                        "system": "http://example.org/cs",
+                        "code": "ABC",
+                        "display": "Alpha Beta Charlie"
+                    }
+                }
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], true);
+    }
+
+    #[tokio::test]
+    async fn cs_validate_coding_unknown_code_returns_false() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "coding",
+                "valueCoding": {"system": "http://example.org/cs", "code": "UNKNOWN"}
+            }]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], false);
+    }
+
+    #[tokio::test]
+    async fn vs_validate_coding_in_set_returns_true() {
+        let app = make_vs_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/vs"},
+                {
+                    "name": "coding",
+                    "valueCoding": {
+                        "system": "http://example.org/cs",
+                        "code": "A"
+                    }
+                }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], true);
+    }
+
+    // ── valueCodeableConcept input ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cs_validate_codeable_concept_one_match_returns_true() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "codeableConcept",
+                "valueCodeableConcept": {
+                    "coding": [
+                        {"system": "http://other.org/cs", "code": "NOPE"},
+                        {"system": "http://example.org/cs", "code": "ABC"}
+                    ]
+                }
+            }]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], true);
+    }
+
+    #[tokio::test]
+    async fn cs_validate_codeable_concept_no_match_returns_false() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "codeableConcept",
+                "valueCodeableConcept": {
+                    "coding": [
+                        {"system": "http://example.org/cs", "code": "X"},
+                        {"system": "http://example.org/cs", "code": "Y"}
+                    ]
+                }
+            }]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], false);
+    }
+
+    #[tokio::test]
+    async fn vs_validate_codeable_concept_one_match_returns_true() {
+        let app = make_vs_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/vs"},
+                {
+                    "name": "codeableConcept",
+                    "valueCodeableConcept": {
+                        "coding": [
+                            {"system": "http://example.org/cs", "code": "C"}, // not in VS
+                            {"system": "http://example.org/cs", "code": "A"}  // in VS
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], true);
+    }
+
+    #[tokio::test]
+    async fn no_input_param_returns_400() {
+        let app = make_app();
+        // No code, coding, or codeableConcept — should be rejected
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/cs"}
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 400);
     }
 }
