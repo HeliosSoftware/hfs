@@ -28,7 +28,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          clean: false
+          clean: true
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -87,7 +87,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          clean: false
+          clean: true
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -139,7 +139,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          clean: false
+          clean: true
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -206,7 +206,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          clean: false
+          clean: true
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -257,7 +257,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          clean: false
+          clean: true
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -333,7 +333,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          clean: false
+          clean: true
           fetch-depth: 0 # Need full history for change detection
 
       - name: Download FhirPath Validator
@@ -1178,4 +1178,3 @@ jobs:
             $SSH_CMD "sudo journalctl -u $SERVER_NAME --lines=20"
             exit 1
           fi
-
