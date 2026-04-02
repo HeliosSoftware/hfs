@@ -37,13 +37,15 @@ fn build_lifecycle_event(
     outcome: &str,
     details: &[(&str, String)],
 ) -> AuditEvent {
+    let operation = format!("lifecycle-{phase}");
     let mut builder = AuditEventBuilder::new(source_observer)
         .event_type(
             "http://terminology.hl7.org/CodeSystem/audit-event-type",
-            "lifecycle",
+            "object",
         )
         .action(AuditAction::Execute)
         .outcome(outcome)
+        .detail("audit-operation", operation)
         .detail("phase", phase);
 
     for (key, value) in details {
@@ -58,11 +60,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_startup_event_has_lifecycle_type() {
+    fn test_startup_event_has_object_type() {
         let event = build_lifecycle_event("Device/hfs", "startup", "0", &[]);
         assert_eq!(
             event.r#type.code.as_ref().and_then(|c| c.value.as_deref()),
-            Some("lifecycle")
+            Some("object")
         );
     }
 
@@ -70,7 +72,15 @@ mod tests {
     fn test_startup_event_has_phase_detail() {
         let event = build_lifecycle_event("Device/hfs", "startup", "0", &[]);
         let details = event.entity.as_ref().unwrap()[0].detail.as_ref().unwrap();
-        assert_eq!(details[0].r#type.value.as_deref(), Some("phase"));
+        assert_eq!(details[0].r#type.value.as_deref(), Some("audit-operation"));
+        assert_eq!(
+            details[0].value.as_ref().and_then(|v| match v {
+                helios_fhir::r4::AuditEventEntityDetailValue::String(s) => s.value.as_deref(),
+                _ => None,
+            }),
+            Some("lifecycle-startup")
+        );
+        assert_eq!(details[1].r#type.value.as_deref(), Some("phase"));
     }
 
     #[test]
@@ -82,18 +92,18 @@ mod tests {
         ];
         let event = build_lifecycle_event("Device/hfs", "startup", "0", &details);
         let entity_details = event.entity.as_ref().unwrap()[0].detail.as_ref().unwrap();
-        // phase + 3 config details
-        assert_eq!(entity_details.len(), 4);
+        // audit-operation + phase + 3 config details
+        assert_eq!(entity_details.len(), 5);
         assert_eq!(
-            entity_details[1].r#type.value.as_deref(),
+            entity_details[2].r#type.value.as_deref(),
             Some("storage-backend")
         );
         assert_eq!(
-            entity_details[2].r#type.value.as_deref(),
+            entity_details[3].r#type.value.as_deref(),
             Some("fhir-version")
         );
         assert_eq!(
-            entity_details[3].r#type.value.as_deref(),
+            entity_details[4].r#type.value.as_deref(),
             Some("auth-enabled")
         );
     }
@@ -102,7 +112,15 @@ mod tests {
     fn test_shutdown_event_has_phase() {
         let event = build_lifecycle_event("Device/hfs", "shutdown", "0", &[]);
         let details = event.entity.as_ref().unwrap()[0].detail.as_ref().unwrap();
-        assert_eq!(details[0].r#type.value.as_deref(), Some("phase"));
+        assert_eq!(details[0].r#type.value.as_deref(), Some("audit-operation"));
+        assert_eq!(
+            details[0].value.as_ref().and_then(|v| match v {
+                helios_fhir::r4::AuditEventEntityDetailValue::String(s) => s.value.as_deref(),
+                _ => None,
+            }),
+            Some("lifecycle-shutdown")
+        );
+        assert_eq!(details[1].r#type.value.as_deref(), Some("phase"));
     }
 
     #[tokio::test]
