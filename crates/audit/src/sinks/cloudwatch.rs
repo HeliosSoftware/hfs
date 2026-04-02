@@ -141,6 +141,7 @@ impl AuditSink for CloudWatchLogsSink {
 
 #[cfg(test)]
 mod tests {
+    use crate::AuditAction;
     use crate::builder::AuditEventBuilder;
 
     #[test]
@@ -152,7 +153,7 @@ mod tests {
     #[test]
     fn test_event_serializes_to_valid_json() {
         let event = AuditEventBuilder::new("Device/hfs")
-            .action("R")
+            .action(AuditAction::Read)
             .outcome("0")
             .resource("Patient", "123")
             .build();
