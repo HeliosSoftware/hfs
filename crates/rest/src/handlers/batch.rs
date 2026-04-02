@@ -6,12 +6,12 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
     extract::{Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
-use helios_audit::{AuditAction, AuditEventBuilder};
+use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
 use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
@@ -122,6 +122,7 @@ where
         tenant = %tenant.tenant_id(),
         "Processing batch request"
     );
+    let correlation = AuditCorrelation::new("batch");
 
     let entries = bundle
         .get("entry")
@@ -134,7 +135,15 @@ where
 
     for (index, entry) in entries.iter().enumerate() {
         let result = process_batch_entry(state, &tenant, entry, index, principal).await;
-        emit_batch_entry_audit(state, entry, &result, principal, None);
+        let correlation_details = EntryAuditCorrelation::from_bundle(&correlation, index);
+        emit_batch_entry_audit(
+            state,
+            entry,
+            &result,
+            principal,
+            None,
+            Some(&correlation_details),
+        );
         response_entries.push(bundle_entry_result_to_json(&result, base_url, prefer));
     }
 
@@ -174,6 +183,7 @@ where
         tenant = %tenant.tenant_id(),
         "Processing transaction request"
     );
+    let correlation = AuditCorrelation::new("transaction");
 
     let json_entries = bundle
         .get("entry")
@@ -247,8 +257,17 @@ where
                     .collect();
             ordered_results.sort_by_key(|(idx, _, _)| *idx);
 
-            for (_, entry, result) in &ordered_results {
-                emit_transaction_entry_audit(state, entry, result, principal, None);
+            for (orig_idx, entry, result) in &ordered_results {
+                let correlation_details =
+                    EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
+                emit_transaction_entry_audit(
+                    state,
+                    entry,
+                    result,
+                    principal,
+                    None,
+                    Some(&correlation_details),
+                );
             }
 
             let base_url = state.base_url();
@@ -274,13 +293,16 @@ where
             let rollback_reason = e.to_string();
             let rollback_result =
                 create_error_result(500, &format!("Transaction rolled back: {rollback_reason}"));
-            for (_, entry, _) in &indexed_entries {
+            for (orig_idx, entry, _) in &indexed_entries {
+                let correlation_details =
+                    EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
                 emit_transaction_entry_audit(
                     state,
                     entry,
                     &rollback_result,
                     principal,
                     Some(&rollback_reason),
+                    Some(&correlation_details),
                 );
             }
             error!(error = %e, "Transaction failed");
@@ -427,6 +449,23 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+struct EntryAuditCorrelation {
+    bundle_id: String,
+    bundle_type: String,
+    entry_index: usize,
+}
+
+impl EntryAuditCorrelation {
+    fn from_bundle(correlation: &AuditCorrelation, entry_index: usize) -> Self {
+        Self {
+            bundle_id: correlation.bundle_id.clone(),
+            bundle_type: correlation.bundle_type.clone(),
+            entry_index,
+        }
+    }
+}
+
 /// Emits an audit event for a processed batch entry.
 fn emit_batch_entry_audit<S>(
     state: &AppState<S>,
@@ -434,6 +473,7 @@ fn emit_batch_entry_audit<S>(
     result: &BundleEntryResult,
     principal: Option<&Principal>,
     rollback_reason: Option<&str>,
+    correlation: Option<&EntryAuditCorrelation>,
 ) where
     S: ResourceStorage + Send + Sync,
 {
@@ -452,6 +492,7 @@ fn emit_batch_entry_audit<S>(
         result,
         principal,
         rollback_reason,
+        correlation,
     );
 }
 
@@ -462,6 +503,7 @@ fn emit_transaction_entry_audit<S>(
     result: &BundleEntryResult,
     principal: Option<&Principal>,
     rollback_reason: Option<&str>,
+    correlation: Option<&EntryAuditCorrelation>,
 ) where
     S: ResourceStorage + Send + Sync,
 {
@@ -473,6 +515,7 @@ fn emit_transaction_entry_audit<S>(
         result,
         principal,
         rollback_reason,
+        correlation,
     );
 }
 
@@ -485,6 +528,7 @@ fn emit_entry_audit<S>(
     result: &BundleEntryResult,
     principal: Option<&Principal>,
     rollback_reason: Option<&str>,
+    correlation: Option<&EntryAuditCorrelation>,
 ) where
     S: ResourceStorage + Send + Sync,
 {
@@ -551,6 +595,12 @@ fn emit_entry_audit<S>(
         if !resource_type.is_empty() {
             builder = builder.resource(&resource_type, id);
         }
+    }
+    if let Some(correlation) = correlation {
+        builder = builder
+            .detail("bundle-id", &correlation.bundle_id)
+            .detail("bundle-type", &correlation.bundle_type)
+            .detail("entry-index", correlation.entry_index.to_string());
     }
 
     if let Some(patient_ref) = patient_ref {
@@ -887,10 +937,12 @@ fn transaction_error_to_response(err: TransactionError) -> RestResult<Response> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
+
     use async_trait::async_trait;
     use helios_audit::AuditSink;
+    use helios_fhir::r4::{AuditEvent, AuditEventEntityDetailValue};
     use helios_fhir::FhirVersion;
-    use helios_fhir::r4::AuditEvent;
     use helios_persistence::error::StorageResult;
     use helios_persistence::tenant::TenantContext;
     use helios_persistence::types::StoredResource;
@@ -978,6 +1030,25 @@ mod tests {
         }
     }
 
+    fn detail_map(event: &AuditEvent) -> HashMap<String, String> {
+        let mut details = HashMap::new();
+        for entity in event.entity.as_ref().into_iter().flatten() {
+            for detail in entity.detail.as_ref().into_iter().flatten() {
+                let Some(key) = detail.r#type.value.clone() else {
+                    continue;
+                };
+                let value = match &detail.value {
+                    Some(AuditEventEntityDetailValue::String(s)) => {
+                        s.value.clone().unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                details.insert(key, value);
+            }
+        }
+        details
+    }
+
     #[tokio::test]
     async fn test_emit_batch_entry_audit_records_per_entry() {
         let sink = Arc::new(CollectorSink {
@@ -1027,9 +1098,26 @@ mod tests {
             })),
             outcome: None,
         };
+        let correlation = AuditCorrelation::new("batch");
+        let correlation_0 = EntryAuditCorrelation::from_bundle(&correlation, 0);
+        let correlation_1 = EntryAuditCorrelation::from_bundle(&correlation, 1);
 
-        emit_batch_entry_audit(&state, &entry_1, &result_1, None, None);
-        emit_batch_entry_audit(&state, &entry_2, &result_2, None, None);
+        emit_batch_entry_audit(
+            &state,
+            &entry_1,
+            &result_1,
+            None,
+            None,
+            Some(&correlation_0),
+        );
+        emit_batch_entry_audit(
+            &state,
+            &entry_2,
+            &result_2,
+            None,
+            None,
+            Some(&correlation_1),
+        );
 
         for _ in 0..20 {
             if sink.events.lock().await.len() == 2 {
@@ -1040,5 +1128,26 @@ mod tests {
 
         let events = sink.events.lock().await;
         assert_eq!(events.len(), 2);
+
+        let event_details: Vec<HashMap<String, String>> = events.iter().map(detail_map).collect();
+
+        let bundle_ids: HashSet<String> = event_details
+            .iter()
+            .filter_map(|d| d.get("bundle-id").cloned())
+            .collect();
+        assert_eq!(bundle_ids.len(), 1);
+
+        assert!(event_details.iter().all(|d| d
+            .get("bundle-type")
+            .is_some_and(|bundle_type| bundle_type == "batch")));
+
+        let entry_indexes: HashSet<String> = event_details
+            .iter()
+            .filter_map(|d| d.get("entry-index").cloned())
+            .collect();
+        assert_eq!(
+            entry_indexes,
+            HashSet::from_iter(["0".to_string(), "1".to_string()])
+        );
     }
 }
