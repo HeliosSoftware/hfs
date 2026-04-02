@@ -2,7 +2,7 @@
 
 *by Steve Munini*
 
-This book is the official documentation for the Helios FHIR Server and its companion tools: the FHIRPath expression engine, the SQL-on-FHIR implementation, Python bindings, and the embedding API.
+An implementation of the HL7® FHIR® standard, built in Rust for high performance and optimized for clinical analytics workloads.
 
 The online version of this book is available at [https://heliossoftware.github.io/hfs/](https://heliossoftware.github.io/hfs/). The source is available on [GitHub](https://github.com/HeliosSoftware/hfs).
 
