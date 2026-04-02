@@ -43,6 +43,131 @@ jobs:
           path: target/debug/hfs
           retention-days: 1
 
+  cors-preflight:
+    name: CORS Preflight Test
+    needs: build
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hfs-binary
+          path: target/debug
+
+      - name: Make binary executable
+        run: chmod +x target/debug/hfs
+
+      - name: Start HFS server with CORS enabled
+        run: |
+          HFS_LOG="/tmp/hfs-cors-${{ github.run_id }}-${{ github.run_attempt }}.log"
+          HFS_PORT_CORS=18089
+
+          echo "HFS_LOG=$HFS_LOG" >> $GITHUB_ENV
+          echo "HFS_PORT_CORS=$HFS_PORT_CORS" >> $GITHUB_ENV
+
+          HFS_ENABLE_CORS=true \
+          HFS_CORS_ORIGINS="*" \
+          HFS_CORS_METHODS="GET,POST,PUT,PATCH,DELETE,OPTIONS" \
+          ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT_CORS" --host 127.0.0.1 > "$HFS_LOG" 2>&1 &
+
+          echo $! > /tmp/hfs-cors.pid
+          echo "HFS_PID_CORS=$(cat /tmp/hfs-cors.pid)" >> $GITHUB_ENV
+
+      - name: Wait for HFS to be ready
+        run: |
+          echo "Waiting for HFS to start (CORS test)..."
+          for i in {1..30}; do
+            if ! kill -0 "$HFS_PID_CORS" 2>/dev/null; then
+              echo "HFS process ($HFS_PID_CORS) exited"
+              cat "$HFS_LOG"
+              exit 1
+            fi
+            if curl -sf "http://localhost:$HFS_PORT_CORS/health" > /dev/null 2>&1; then
+              echo "HFS is ready"
+              exit 0
+            fi
+            echo "Attempt $i/30: HFS not ready yet..."
+            sleep 2
+          done
+
+          echo "HFS failed to start"
+          tail -50 "$HFS_LOG"
+          exit 1
+
+      - name: Validate CORS preflight behavior
+        run: |
+          HEADERS_FILE="/tmp/hfs-cors-preflight-${{ github.run_id }}-${{ github.run_attempt }}.headers"
+          STATUS="$(curl -sS -D "$HEADERS_FILE" -o /dev/null -w "%{http_code}" \
+            -X OPTIONS "http://localhost:$HFS_PORT_CORS/Patient" \
+            -H "Origin: https://app.example.com" \
+            -H "Access-Control-Request-Method: POST" \
+            -H "Access-Control-Request-Headers: Authorization,Content-Type")"
+
+          if [ "$STATUS" != "200" ] && [ "$STATUS" != "204" ]; then
+            echo "Expected preflight status 200/204, got $STATUS"
+            cat "$HEADERS_FILE"
+            exit 1
+          fi
+
+          ALLOW_ORIGIN="$(tr -d '\r' < "$HEADERS_FILE" | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}' | tail -1)"
+          if [ -z "$ALLOW_ORIGIN" ]; then
+            echo "Missing access-control-allow-origin header"
+            cat "$HEADERS_FILE"
+            exit 1
+          fi
+
+          ALLOW_METHODS="$(tr -d '\r' < "$HEADERS_FILE" | awk -F': ' 'tolower($1)=="access-control-allow-methods"{print $2}' | tail -1)"
+          if [ -z "$ALLOW_METHODS" ]; then
+            echo "Missing access-control-allow-methods header"
+            cat "$HEADERS_FILE"
+            exit 1
+          fi
+
+          if ! printf "%s" "$ALLOW_METHODS" | grep -qi "POST"; then
+            echo "Expected access-control-allow-methods to include POST, got: $ALLOW_METHODS"
+            cat "$HEADERS_FILE"
+            exit 1
+          fi
+
+          {
+            echo "## CORS Preflight Check"
+            echo ""
+            echo "- Status: $STATUS"
+            echo "- Access-Control-Allow-Origin: $ALLOW_ORIGIN"
+            echo "- Access-Control-Allow-Methods: $ALLOW_METHODS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop HFS
+        if: always()
+        run: |
+          if [ -f /tmp/hfs-cors.pid ]; then
+            HFS_PID_CORS="$(cat /tmp/hfs-cors.pid)"
+            kill -INT "$HFS_PID_CORS" 2>/dev/null || true
+            for _ in {1..50}; do
+              if kill -0 "$HFS_PID_CORS" 2>/dev/null; then
+                sleep 0.2
+              else
+                break
+              fi
+            done
+            kill -9 "$HFS_PID_CORS" 2>/dev/null || true
+            rm -f /tmp/hfs-cors.pid
+          fi
+
+      - name: Upload CORS artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cors-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/hfs-cors-${{ github.run_id }}-${{ github.run_attempt }}.log
+            /tmp/hfs-cors-preflight-${{ github.run_id }}-${{ github.run_attempt }}.headers
+          if-no-files-found: warn
+          retention-days: 30
+
   audit-test:
     name: Audit External Test (${{ matrix.backend }})
     needs: build
@@ -300,6 +425,7 @@ jobs:
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             HFS_AUDIT_BACKEND=file \
             HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_ENABLE_CORS=false \
             HFS_AUTH_ENABLED=true \
             HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
             HFS_AUTH_ISSUER="$AUTH_ISSUER" \
@@ -316,6 +442,7 @@ jobs:
             HFS_PG_PASSWORD=helios \
             HFS_AUDIT_BACKEND=file \
             HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_ENABLE_CORS=false \
             HFS_AUTH_ENABLED=true \
             HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
             HFS_AUTH_ISSUER="$AUTH_ISSUER" \
@@ -330,6 +457,7 @@ jobs:
             HFS_MONGODB_DATABASE="helios_audit_${{ github.run_id }}_${{ github.run_attempt }}" \
             HFS_AUDIT_BACKEND=file \
             HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_ENABLE_CORS=false \
             HFS_AUTH_ENABLED=true \
             HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
             HFS_AUTH_ISSUER="$AUTH_ISSUER" \
@@ -345,6 +473,7 @@ jobs:
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             HFS_AUDIT_BACKEND=file \
             HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_ENABLE_CORS=false \
             HFS_AUTH_ENABLED=true \
             HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
             HFS_AUTH_ISSUER="$AUTH_ISSUER" \
@@ -355,6 +484,7 @@ jobs:
           else
             HFS_AUDIT_BACKEND=file \
             HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_ENABLE_CORS=false \
             HFS_AUTH_ENABLED=true \
             HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
             HFS_AUTH_ISSUER="$AUTH_ISSUER" \
