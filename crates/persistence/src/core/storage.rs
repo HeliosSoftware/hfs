@@ -30,10 +30,11 @@ pub mod audit {
         let mut builder = AuditEventBuilder::new(source_observer)
             .event_type(
                 "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                "purge",
+                "object",
             )
             .action(AuditAction::Delete)
             .outcome("0")
+            .detail("audit-operation", "purge")
             .detail("count", count.to_string());
         if let Some(id) = resource_id {
             builder = builder.resource(resource_type, id);
@@ -58,10 +59,11 @@ pub mod audit {
             let event = AuditEventBuilder::new("Device/hfs")
                 .event_type(
                     "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                    "purge",
+                    "object",
                 )
                 .action(AuditAction::Delete)
                 .outcome("0")
+                .detail("audit-operation", "purge")
                 .resource("Patient", "123")
                 .detail("count", "1")
                 .build();
@@ -74,13 +76,21 @@ pub mod audit {
         #[test]
         fn test_purge_event_includes_count() {
             let event = AuditEventBuilder::new("Device/hfs")
+                .event_type(
+                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                    "object",
+                )
                 .action(AuditAction::Delete)
                 .outcome("0")
+                .detail("audit-operation", "purge")
                 .resource("Observation", "obs-1")
                 .detail("count", "15")
                 .build();
             let details = event.entity.as_ref().unwrap()[0].detail.as_ref().unwrap();
-            assert_eq!(details[0].r#type.value.as_deref(), Some("count"));
+            let count_detail = details
+                .iter()
+                .find(|d| d.r#type.value.as_deref() == Some("count"));
+            assert!(count_detail.is_some());
         }
 
         #[test]
@@ -426,6 +436,7 @@ pub enum ConditionalDeleteResult {
 
 /// Result of a conditional patch operation.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConditionalPatchResult {
     /// Resource was patched successfully.
     Patched(StoredResource),
