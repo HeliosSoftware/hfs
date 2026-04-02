@@ -4,23 +4,23 @@ Compared against [build.fhir.org/terminology-service.html](https://build.fhir.or
 
 ---
 
-## Operations (SHALL support all 6)
+## Operations ([spec §operations](https://build.fhir.org/terminology-service.html#operations)) — SHALL support all 6
 
 | Operation | Spec Requirement | HTS Status | Gaps |
 |-----------|-----------------|------------|------|
-| `CodeSystem/$lookup` | SHALL | **Implemented** | `expression` param (post-coordination) returns 501; GET not supported (POST only) |
-| `CodeSystem/$validate-code` | SHALL | **Implemented** | Uses `url` instead of spec's `system` param name; GET not supported |
-| `CodeSystem/$subsumes` | SHALL | **Implemented** | No cross-code-system error handling (spec: SHALL return error); GET not supported |
-| `ValueSet/$expand` | SHALL | **Implemented** | No `too-costly` error for huge expansions (SHOULD); no hierarchical tree mode; no `date` param; GET not supported |
-| `ValueSet/$validate-code` | SHALL | **Implemented** | No `CodeableConcept` input support; no instance-level (`/ValueSet/[id]/$validate-code`); GET not supported |
-| `ConceptMap/$translate` | SHALL | **Implemented** | No `source`/`target` value set filtering; no instance-level; GET not supported |
-| `$closure` | Optional | **Implemented** | Beyond spec requirements — good to have |
+| `CodeSystem/$lookup` | SHALL | **Implemented (GET+POST)** | `expression` param (post-coordination) returns 501 ([spec §lookup](https://build.fhir.org/terminology-service.html#lookup)) |
+| `CodeSystem/$validate-code` | SHALL | **Implemented (GET+POST)** | Uses `url` instead of spec's `system` param name ([spec §validation](https://build.fhir.org/terminology-service.html#validation)) |
+| `CodeSystem/$subsumes` | SHALL | **Implemented (GET+POST)** | Single `system` param by design — no cross-code-system error needed ([spec §subsumes](https://build.fhir.org/terminology-service.html#subsumes)) |
+| `ValueSet/$expand` | SHALL | **Implemented (GET+POST)** | No `too-costly` error for huge expansions (SHOULD); no hierarchical tree mode; no `date` param ([spec §expand](https://build.fhir.org/terminology-service.html#expand)) |
+| `ValueSet/$validate-code` | SHALL | **Implemented (GET+POST)** | No `CodeableConcept` input support; no instance-level ([spec §validation](https://build.fhir.org/terminology-service.html#validation)) |
+| `ConceptMap/$translate` | SHALL | **Implemented (GET+POST)** | No instance-level; `source`/`target` params extracted but backend filtering unverified ([spec §translate](https://build.fhir.org/terminology-service.html#translate)) |
+| `$closure` | Optional | **Implemented (POST only)** | Beyond spec requirements — good to have |
 
-**Summary:** All 6 mandatory operations are present. Main gap is **GET support** — spec implies both GET and POST for all operations, HTS only supports POST.
+**Summary:** All 6 mandatory operations are present with both GET and POST support. Remaining gaps are in advanced parameter handling and instance-level invocation.
 
 ---
 
-## RESTful Interactions (SHALL)
+## RESTful Interactions ([spec §restfulapi](https://build.fhir.org/terminology-service.html#restfulapi)) — SHALL
 
 | Requirement | HTS Status | Notes |
 |-------------|------------|-------|
@@ -36,18 +36,18 @@ Compared against [build.fhir.org/terminology-service.html](https://build.fhir.or
 
 ---
 
-## CapabilityStatement & TerminologyCapabilities
+## CapabilityStatement & TerminologyCapabilities ([spec §restfulapi](https://build.fhir.org/terminology-service.html#restfulapi))
 
 | Requirement | HTS Status | Notes |
 |-------------|------------|-------|
 | `GET /metadata` returns TerminologyCapabilities | **Implemented** | Lists code systems, operations, subsumption support |
-| `GET /metadata?mode=terminology` | **Not verified** | Spec distinguishes `mode=full` (CapabilityStatement) vs `mode=terminology` (TerminologyCapabilities) |
-| `GET /metadata` (no mode / mode=full) returns CapabilityStatement | **Likely missing** | HTS returns TerminologyCapabilities for `/metadata`; spec says a full CapabilityStatement should be the default |
-| `capabilitystatement-supported-system` extension | **Not implemented** | Required for advertising external code system support |
+| `GET /metadata?mode=terminology` | **Not implemented** | No `mode` query parameter support; always returns TerminologyCapabilities |
+| `GET /metadata` (no mode / mode=full) returns CapabilityStatement | **Missing** | Spec says default should be CapabilityStatement; HTS always returns TerminologyCapabilities |
+| `capabilitystatement-supported-system` extension | **Not implemented** | Required for advertising external code system support ([spec §externals](https://build.fhir.org/terminology-service.html#externals)) |
 
 ---
 
-## Format Support
+## Format Support ([spec §restfulapi](https://build.fhir.org/terminology-service.html#restfulapi))
 
 | Requirement | HTS Status | Notes |
 |-------------|------------|-------|
@@ -56,7 +56,7 @@ Compared against [build.fhir.org/terminology-service.html](https://build.fhir.or
 
 ---
 
-## Instance-Level Operations
+## Instance-Level Operations ([spec §operations](https://build.fhir.org/terminology-service.html#operations))
 
 | Operation | Spec | HTS |
 |-----------|------|-----|
@@ -67,16 +67,18 @@ Compared against [build.fhir.org/terminology-service.html](https://build.fhir.or
 
 ---
 
-## Batch Support
+## Batch Support ([spec §batch](https://build.fhir.org/terminology-service.html#batch), [§batch2](https://build.fhir.org/terminology-service.html#batch2))
 
 | Requirement | HTS Status |
 |-------------|------------|
 | Batch Bundle with multiple `$validate-code` | **Not implemented** |
 | Batch Bundle with multiple `$translate` | **Not implemented** |
 
+Note: `POST /import` exists for bulk-loading CodeSystem/ValueSet/ConceptMap resources, but this is not the same as FHIR batch operation execution.
+
 ---
 
-## Security
+## Security ([spec §security](https://build.fhir.org/terminology-service.html#security))
 
 | Requirement | Level | HTS Status |
 |-------------|-------|------------|
@@ -87,14 +89,13 @@ Compared against [build.fhir.org/terminology-service.html](https://build.fhir.or
 
 ## Other Gaps
 
-| Feature | Status |
-|---------|--------|
-| NamingSystem resource | Not implemented (not strictly required) |
-| Implicit value sets (CodeSystem.valueSet → all codes) | Not implemented |
-| `date` parameter for point-in-time evaluation | Not implemented |
-| `displayLanguage` filtering in responses | Param accepted in `$lookup` but designations not filtered |
-| Hierarchical expansion (tree mode) | Not implemented |
-| Cross-code-system subsumption error | Not implemented (SHALL) |
+| Feature | Status | Spec Reference |
+|---------|--------|----------------|
+| Implicit value sets (CodeSystem.valueSet → all codes) | Not implemented | [§externals](https://build.fhir.org/terminology-service.html#externals) |
+| `date` parameter for point-in-time evaluation | Not implemented on any operation | [§expand](https://build.fhir.org/terminology-service.html#expand), [§validation](https://build.fhir.org/terminology-service.html#validation) |
+| `displayLanguage` filtering in responses | Param accepted in `$lookup` but designations not actually filtered | [§lookup](https://build.fhir.org/terminology-service.html#lookup), [§standard-props](https://build.fhir.org/terminology-service.html#standard-props) |
+| Hierarchical expansion (tree mode) | Not implemented (metadata explicitly sets `hierarchical: false`) | [§expand](https://build.fhir.org/terminology-service.html#expand) |
+| `CodeableConcept` input for `$validate-code` | Not implemented (string codes only) | [§validation](https://build.fhir.org/terminology-service.html#validation) |
 
 ---
 
@@ -102,17 +103,17 @@ Compared against [build.fhir.org/terminology-service.html](https://build.fhir.or
 
 | Category | Score | Notes |
 |----------|-------|-------|
-| **Core Operations** | 6/6 present, ~70% param coverage | All exist but with gaps in parameters and GET support |
+| **Core Operations** | 6/6 present, ~75% param coverage | All exist with GET+POST; gaps in advanced params |
 | **RESTful Interactions** | READ done, SEARCH missing | 5 mandatory search params × 3 resource types = 0/15 |
-| **Capability Reporting** | Partial | TerminologyCapabilities exists, CapabilityStatement and mode switching missing |
+| **Capability Reporting** | Partial | TerminologyCapabilities exists; CapabilityStatement and mode switching missing |
 | **Format Support** | 1/2 | JSON only, XML missing (SHALL) |
 | **Instance-Level Ops** | 0/3 | None of the required instance-level operation endpoints |
 | **Batch** | 0/2 | No batch bundle support |
 
 ## Priority Recommendations
 
-1. **Search endpoints** (`/CodeSystem?url=...` etc.) — biggest SHALL-level gap
-2. **Instance-level operations** (`/ValueSet/[id]/$expand`, etc.) — required by spec
-3. **GET support for operations** — spec expects both GET and POST
-4. **XML format support** — SHALL requirement, though rarely used in practice
-5. **`mode` parameter on `/metadata`** — to properly distinguish CapabilityStatement vs TerminologyCapabilities
+1. **Search endpoints** (`/CodeSystem?url=...` etc.) — biggest SHALL-level gap ([§restfulapi](https://build.fhir.org/terminology-service.html#restfulapi))
+2. **Instance-level operations** (`/ValueSet/[id]/$expand`, etc.) — required by spec ([§operations](https://build.fhir.org/terminology-service.html#operations))
+3. **XML format support** — SHALL requirement, though rarely used in practice ([§restfulapi](https://build.fhir.org/terminology-service.html#restfulapi))
+4. **`mode` parameter on `/metadata`** — to properly distinguish CapabilityStatement vs TerminologyCapabilities ([§restfulapi](https://build.fhir.org/terminology-service.html#restfulapi))
+5. **`displayLanguage` filtering** — parameter is accepted but silently ignored; should filter or drop the param ([§lookup](https://build.fhir.org/terminology-service.html#lookup))
