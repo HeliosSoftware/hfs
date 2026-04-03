@@ -20,7 +20,7 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/medicalproductofhumanorigin",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "MedicalProductOfHumanOrigin",
   "title": "MedicalProductOfHumanOrigin",
   "status": "draft",
@@ -38,7 +38,7 @@
     }
   ],
   "description": "This profile is designed for biologically derived products that are derived from a human donor and intended for clinical application in a human recipient. Donor and recipient might, or might not, be the same individual. Products of this nature are referred to as medical products of human origin (MPHO) and have specific traceability requirements to ensure that the bi-directional link between donor and recipient is maintained. The profile specifies the essential identifiers for traceability as required elements.",
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "workflow",
@@ -85,7 +85,7 @@
     "extension": [
       {
         "url": "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-        "valueString": "6.0.0-ballot4"
+        "valueString": "6.0.0-ballot3"
       }
     ],
     "element": [
@@ -292,7 +292,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
           "additional": [
             {
               "purpose": "starter",
@@ -1373,7 +1373,7 @@
           ],
           "strength": "required",
           "description": "Identifies the purpose for this identifier, if known .",
-          "valueSet": "http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -1633,42 +1633,6 @@
         ]
       },
       {
-        "id": "BiologicallyDerivedProduct.therapyIdentifier",
-        "path": "BiologicallyDerivedProduct.therapyIdentifier",
-        "short": "Identifiers common to a given therapy",
-        "definition": "A shared identifier common to multiple independent BiologicallyDerivedProduct instances that are intended to be administered in the course of the same given therapy. The presence of the same identifier on each BiologicallyDerivedProduct ties those products together.",
-        "min": 0,
-        "max": "*",
-        "base": {
-          "path": "BiologicallyDerivedProduct.therapyIdentifier",
-          "min": 0,
-          "max": "*"
-        },
-        "type": [
-          {
-            "code": "Identifier"
-          }
-        ],
-        "constraint": [
-          {
-            "key": "ele-1",
-            "severity": "error",
-            "human": "All FHIR elements must have a @value or children",
-            "expression": "hasValue() or (children().count() \u003e id.count())",
-            "source": "http://hl7.org/fhir/StructureDefinition/Element"
-          }
-        ],
-        "mustSupport": false,
-        "isModifier": false,
-        "isSummary": false,
-        "mapping": [
-          {
-            "identity": "ISBT128Code",
-            "map": "Chain of Identity Identifier. Required for some ISBT 128 labeled products"
-          }
-        ]
-      },
-      {
         "id": "BiologicallyDerivedProduct.biologicalSourceEvent",
         "path": "BiologicallyDerivedProduct.biologicalSourceEvent",
         "short": "An identifier that supports traceability to the event during which material in this product from one or more biological entities was obtained or pooled",
@@ -1837,7 +1801,7 @@
           ],
           "strength": "required",
           "description": "Identifies the purpose for this identifier, if known .",
-          "valueSet": "http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot3"
         },
         "mapping": [
           {

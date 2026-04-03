@@ -1,0 +1,79 @@
+{
+  "resourceType": "ValueSet",
+  "id": "immunization-function",
+  "meta": {
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+  },
+  "text": {
+    "status": "extensions",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet immunization-function\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"immunization-function\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcimmunization-function\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://terminology.hl7.org/7.0.1/CodeSystem-v2-0443.html\"\u003e\u003ccode\u003ehttp://terminology.hl7.org/CodeSystem/v2-0443\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated, which means it is fixed to 3.0.0, the version found through the package references\"\u003e version \u0026#x1F4E6;3.0.0\u003c/span\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/7.0.1/CodeSystem-v2-0443.html#v2-0443-OP\"\u003eOP\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003eOrdering Provider\u003c/td\u003e\u003ctd\u003eOrdering Provider\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/7.0.1/CodeSystem-v2-0443.html#v2-0443-AP\"\u003eAP\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003eAdministering Provider\u003c/td\u003e\u003ctd\u003eAdministering Provider\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/valueset-extensible",
+      "valueBoolean": true
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "pher"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "normative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 5
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/immunization-function",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.3.995"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "ImmunizationFunctionCodes",
+  "title": "Immunization Function Codes",
+  "status": "active",
+  "experimental": false,
+  "publisher": "FHIR Project team",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/pher/index.cfm"
+        }
+      ]
+    }
+  ],
+  "description": "The value set to instantiate this attribute should be drawn from a terminologically robust code system that consists of or contains concepts to support describing the function a practitioner or organization may play in the immunization event. This value set is provided as a suggestive example.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "compose": {
+    "include": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v2-0443",
+        "concept": [
+          {
+            "code": "OP"
+          },
+          {
+            "code": "AP"
+          }
+        ]
+      }
+    ]
+  }
+}

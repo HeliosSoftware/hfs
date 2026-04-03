@@ -16,7 +16,7 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/fhirpath-patch",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "FHIRPathPatchProfile",
   "title": "FHIRPath Patch Profile",
   "status": "draft",
@@ -45,7 +45,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "w5",
@@ -72,7 +72,7 @@
     "extension": [
       {
         "url": "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-        "valueString": "6.0.0-ballot4"
+        "valueString": "6.0.0-ballot3"
       }
     ],
     "element": [
@@ -236,7 +236,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
           "additional": [
             {
               "purpose": "starter",

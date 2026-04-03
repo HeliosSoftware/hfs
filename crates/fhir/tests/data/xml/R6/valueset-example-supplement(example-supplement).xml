@@ -23,7 +23,7 @@
           <a href="codesystem-example.html">
             <code>http://hl7.org/fhir/CodeSystem/example</code>
           </a>
-          <span title="Version is not explicitly stated, which means it is fixed to the version provided in this specification"> version 📦6.0.0-ballot4</span> where legacy  = true
+          <span title="Version is not explicitly stated, which means it is fixed to the version provided in this specification"> version 📦6.0.0-ballot3</span> where legacy  = true
         </li>
       </ul>
     </div>
@@ -35,7 +35,7 @@
     <valueCode value="vocab"/>
   </extension>
   <url value="http://hl7.org/fhir/ValueSet/example-supplement"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="ACMECholCodesPlasmaSupplemented"/>
   <title value="ACME Codes for Cholesterol: Plasma only (Supplemented)"/>
   <status value="draft"/>

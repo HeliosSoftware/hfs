@@ -56,7 +56,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.4.1824"/>
   </identifier>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="ExampleMetadata"/>
   <title value="Metadata Example"/>
   <status value="draft"/>

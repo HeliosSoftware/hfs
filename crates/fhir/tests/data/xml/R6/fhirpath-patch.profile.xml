@@ -12,7 +12,7 @@
     <valueCode value="normative"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/fhirpath-patch"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="FHIRPathPatchProfile"/>
   <title value="FHIRPath Patch Profile"/>
   <status value="draft"/>
@@ -33,7 +33,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="w5"/>
     <uri value="http://hl7.org/fhir/fivews"/>
@@ -56,7 +56,7 @@
   <derivation value="constraint"/>
   <snapshot>
     <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-      <valueString value="6.0.0-ballot4"/>
+      <valueString value="6.0.0-ballot3"/>
     </extension>
     <element id="Parameters">
       <path value="Parameters"/>
@@ -191,7 +191,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>

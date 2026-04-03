@@ -3,7 +3,7 @@
   "id": "example-filter",
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n      \u003cp class\u003d\"res-header-id\"\u003e\n        \u003cb\u003eGenerated Narrative: ValueSet example-filter\u003c/b\u003e\n      \u003c/p\u003e\n      \u003ca name\u003d\"example-filter\"\u003e \u003c/a\u003e\n      \u003ca name\u003d\"hcexample-filter\"\u003e \u003c/a\u003e\n      \u003cul\u003e\n        \u003cli\u003eInclude codes from\n          \u003ca href\u003d\"codesystem-example.html\"\u003e\n            \u003ccode\u003ehttp://hl7.org/fhir/CodeSystem/example\u003c/code\u003e\n          \u003c/a\u003e\n          \u003cspan title\u003d\"Version is not explicitly stated, which means it is fixed to the version provided in this specification\"\u003e version \u0026#x1F4E6;6.0.0-ballot4\u003c/span\u003e where acme-plasma  \u003d true\n        \u003c/li\u003e\n      \u003c/ul\u003e\n    \u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n      \u003cp class\u003d\"res-header-id\"\u003e\n        \u003cb\u003eGenerated Narrative: ValueSet example-filter\u003c/b\u003e\n      \u003c/p\u003e\n      \u003ca name\u003d\"example-filter\"\u003e \u003c/a\u003e\n      \u003ca name\u003d\"hcexample-filter\"\u003e \u003c/a\u003e\n      \u003cul\u003e\n        \u003cli\u003eInclude codes from\n          \u003ca href\u003d\"codesystem-example.html\"\u003e\n            \u003ccode\u003ehttp://hl7.org/fhir/CodeSystem/example\u003c/code\u003e\n          \u003c/a\u003e\n          \u003cspan title\u003d\"Version is not explicitly stated, which means it is fixed to the version provided in this specification\"\u003e version \u0026#x1F4E6;6.0.0-ballot3\u003c/span\u003e where acme-plasma  \u003d true\n        \u003c/li\u003e\n      \u003c/ul\u003e\n    \u003c/div\u003e"
   },
   "extension": [
     {
@@ -18,7 +18,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.3.3148"
     }
   ],
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "ACMECholCodesPlasma",
   "title": "ACME Codes for Cholesterol: Plasma only",
   "status": "draft",

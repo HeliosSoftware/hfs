@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "Parameters",
   "meta": {
-    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Parameters",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "Parameters",
   "status": "active",
   "experimental": false,
-  "date": "2026-03-31T22:56:13+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -55,7 +55,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "w5",
@@ -244,7 +244,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
           "additional": [
             {
               "purpose": "starter",

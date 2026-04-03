@@ -2,11 +2,11 @@
   "resourceType": "ValueSet",
   "id": "security-labels",
   "meta": {
-    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet security-labels\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"security-labels\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcsecurity-labels\"\u003e \u003c/a\u003e\u003cp\u003eThis value set includes codes based on the following rules:\u003c/p\u003e\u003cul\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.1.0/ValueSet-v3-Confidentiality.html\"\u003eConfidentiality\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.1.0/ValueSet-v3-InformationSensitivityPolicy.html\"\u003eInformationSensitivityPolicy\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.1.0/ValueSet-v3-Compartment.html\"\u003eCompartment\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.1.0/ValueSet-v3-SecurityIntegrityObservationValue.html\"\u003eSecurityIntegrityObservationValue\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.1.0/ValueSet-v3-SecurityControlObservationValue.html\"\u003eSecurityControlObservationValue\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.1.0/ValueSet-v3-ActUSPrivacyLaw.html\"\u003eActUSPrivacyLaw\u003c/a\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet security-labels\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"security-labels\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcsecurity-labels\"\u003e \u003c/a\u003e\u003cp\u003eThis value set includes codes based on the following rules:\u003c/p\u003e\u003cul\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.0.1/ValueSet-v3-Confidentiality.html\"\u003eConfidentiality\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.0.1/ValueSet-v3-InformationSensitivityPolicy.html\"\u003eInformationSensitivityPolicy\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.0.1/ValueSet-v3-Compartment.html\"\u003eCompartment\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.0.1/ValueSet-v3-SecurityIntegrityObservationValue.html\"\u003eSecurityIntegrityObservationValue\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.0.1/ValueSet-v3-SecurityControlObservationValue.html\"\u003eSecurityControlObservationValue\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"http://terminology.hl7.org/7.0.1/ValueSet-v3-ActUSPrivacyLaw.html\"\u003eActUSPrivacyLaw\u003c/a\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -39,7 +39,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.2.31"
     }
   ],
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "AllSecurityLabels",
   "title": "All Security Labels",
   "status": "active",

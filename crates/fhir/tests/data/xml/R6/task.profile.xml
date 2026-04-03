@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Task"/>
   <meta>
-    <lastUpdated value="2026-03-31T22:56:13.851+00:00"/>
+    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -1013,11 +1013,11 @@
     <valueCode value="not-classified"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Task"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="Task"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-03-31T22:56:13+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -1039,7 +1039,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -1257,7 +1257,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1572,7 +1572,7 @@
         </extension>
         <strength value="required"/>
         <description value="The current status of the task."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/task-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/task-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -1698,7 +1698,7 @@
         </extension>
         <strength value="required"/>
         <description value="Distinguishes whether the task is a proposal, plan or full order."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/task-intent|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/task-intent|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -1748,7 +1748,7 @@
         </extension>
         <strength value="required"/>
         <description value="The priority of a task (may affect service level applied to the task)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -3879,7 +3879,7 @@
         </extension>
         <strength value="required"/>
         <description value="The current status of the task."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/task-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/task-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -3969,7 +3969,7 @@
         </extension>
         <strength value="required"/>
         <description value="Distinguishes whether the task is a proposal, plan or full order."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/task-intent|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/task-intent|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -4007,7 +4007,7 @@
         </extension>
         <strength value="required"/>
         <description value="The priority of a task (may affect service level applied to the task)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>

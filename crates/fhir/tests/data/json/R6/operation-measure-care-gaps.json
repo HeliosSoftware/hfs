@@ -20,13 +20,13 @@
     }
   ],
   "url": "http://hl7.org/fhir/OperationDefinition/Measure-care-gaps",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "CareGaps",
   "title": "Care Gaps",
   "status": "active",
   "kind": "operation",
   "experimental": false,
-  "date": "2026-03-31T22:56:13+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / Clinical Quality Information",
   "contact": [
     {

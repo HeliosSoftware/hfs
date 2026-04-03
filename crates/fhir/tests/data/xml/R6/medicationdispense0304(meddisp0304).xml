@@ -61,5 +61,56 @@
   </daysSupply>
   <whenPrepared value="2015-06-25T07:13:00+05:00"/>
   <whenHandedOver value="2015-06-26T07:13:00+05:00"/>
-  <dosageInstruction/>
+  <dosageInstruction>
+    <simple>
+      <text value="4.5 grams in D5W 250 ml. IV every 6 hours. Infuse over 30 min at 8L/min"/>
+      <timing>
+        <repeat>
+          <frequency value="1"/>
+          <period value="6"/>
+          <periodUnit value="h"/>
+        </repeat>
+      </timing>
+      <site>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="255560000"/>
+          <display value="Intravenous"/>
+        </coding>
+      </site>
+      <route>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="47625008"/>
+          <display value="An intravascular route that begins within a vein."/>
+        </coding>
+      </route>
+      <doseAndRate>
+        <type>
+          <coding>
+            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+            <code value="calculated"/>
+            <display value="Calculated"/>
+          </coding>
+        </type>
+        <doseQuantity>
+          <value value="4.5"/>
+          <system value="http://unitsofmeasure.org"/>
+          <code value="g"/>
+        </doseQuantity>
+        <rateRatio>
+          <numerator>
+            <value value="8"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="ml"/>
+          </numerator>
+          <denominator>
+            <value value="1"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="min"/>
+          </denominator>
+        </rateRatio>
+      </doseAndRate>
+    </simple>
+  </dosageInstruction>
 </MedicationDispense>

@@ -25,11 +25,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/decimal"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="decimal"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-03-31T22:56:13+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -51,7 +51,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <kind value="primitive-type"/>
   <abstract value="false"/>
   <type value="decimal"/>
@@ -153,7 +153,7 @@
           <valueUrl value="decimal"/>
         </extension>
         <extension url="http://hl7.org/fhir/StructureDefinition/regex">
-          <valueString value="-?(0|[1-9][0-9]{0,17})(\.[0-9]{1,17})?([eE][+-]?[0-9]{1,9})?"/>
+          <valueString value="-?(0|[1-9][0-9]{0,17})(\.[0-9]{1,17})?([eE][+-]?[0-9]{1,9}})?"/>
         </extension>
         <code value="http://hl7.org/fhirpath/System.Decimal"/>
       </type>
@@ -184,7 +184,7 @@
           <valueUrl value="decimal"/>
         </extension>
         <extension url="http://hl7.org/fhir/StructureDefinition/regex">
-          <valueString value="-?(0|[1-9][0-9]{0,17})(\.[0-9]{1,17})?([eE][+-]?[0-9]{1,9})?"/>
+          <valueString value="-?(0|[1-9][0-9]{0,17})(\.[0-9]{1,17})?([eE][+-]?[0-9]{1,9}})?"/>
         </extension>
         <code value="http://hl7.org/fhirpath/System.Decimal"/>
       </type>

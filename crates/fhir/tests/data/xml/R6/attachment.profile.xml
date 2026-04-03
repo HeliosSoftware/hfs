@@ -333,11 +333,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Attachment"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="Attachment"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-03-31T22:56:13+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -360,7 +360,7 @@
     </coding>
   </jurisdiction>
   <purpose value="Many models need to include data defined in other specifications that is complex and opaque to the healthcare model. This includes documents, media recordings, structured data, etc."/>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="v2"/>
     <uri value="http://hl7.org/v2"/>
@@ -520,7 +520,7 @@
         </extension>
         <strength value="required"/>
         <description value="BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -571,7 +571,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -972,7 +972,7 @@
         </extension>
         <strength value="required"/>
         <description value="BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -1010,7 +1010,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>

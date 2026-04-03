@@ -69,7 +69,63 @@
   <note>
     <text value="Patient told to take with food"/>
   </note>
-  <dosageInstruction/>
+  <dosageInstruction>
+    <simple>
+      <text value="one tablet one time daily in the morning for rib pain"/>
+      <additionalInstruction>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="418914006"/>
+          <display value="Warning. May cause drowsiness. If affected do not drive or operate machinery. Avoid alcoholic drink (qualifier value)"/>
+        </coding>
+      </additionalInstruction>
+      <timing>
+        <repeat>
+          <frequency value="1"/>
+          <period value="1"/>
+          <periodUnit value="d"/>
+          <when value="MORN"/>
+        </repeat>
+      </timing>
+      <route>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="26643006"/>
+          <display value="Oral Route"/>
+        </coding>
+      </route>
+      <method>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="421521009"/>
+          <display value="Swallow - dosing instruction imperative (qualifier value)"/>
+        </coding>
+      </method>
+      <doseAndRate>
+        <type>
+          <coding>
+            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+            <code value="ordered"/>
+            <display value="Ordered"/>
+          </coding>
+        </type>
+        <doseRange>
+          <low>
+            <value value="1"/>
+            <unit value="TAB"/>
+            <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
+            <code value="TAB"/>
+          </low>
+          <high>
+            <value value="2"/>
+            <unit value="TAB"/>
+            <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
+            <code value="TAB"/>
+          </high>
+        </doseRange>
+      </doseAndRate>
+    </simple>
+  </dosageInstruction>
   <dispenseRequest>
     <validityPeriod>
       <start value="2015-01-15"/>

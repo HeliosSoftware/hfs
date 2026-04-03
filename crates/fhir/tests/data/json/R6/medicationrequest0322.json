@@ -107,6 +107,58 @@
       }
     }
   ],
+  "dosageInstruction": {
+    "simple": {
+      "text": "KCl 20 mEq in 1 L 0.9%NS IV at 100 ml/hr",
+      "timing": {
+        "repeat": {
+          "frequency": 1,
+          "period": 1,
+          "periodUnit": "h"
+        }
+      },
+      "route": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "47625008",
+            "display": "Intravenous route"
+          }
+        ]
+      },
+      "doseAndRate": [
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
+                "code": "ordered",
+                "display": "Ordered"
+              }
+            ]
+          },
+          "doseQuantity": {
+            "value": 20,
+            "unit": "meq",
+            "system": "http://unitsofmeasure.org",
+            "code": "meq"
+          },
+          "rateRatio": {
+            "numerator": {
+              "value": 100,
+              "system": "http://unitsofmeasure.org",
+              "code": "mL"
+            },
+            "denominator": {
+              "value": 1,
+              "system": "http://unitsofmeasure.org",
+              "code": "h"
+            }
+          }
+        }
+      ]
+    }
+  },
   "meta": {
     "tag": [
       {

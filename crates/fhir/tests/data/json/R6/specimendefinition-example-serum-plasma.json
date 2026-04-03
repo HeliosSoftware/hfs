@@ -8,11 +8,9 @@
     }
   ],
   "url": "http://example.com/specdef/v1/12345",
-  "identifier": [
-    {
-      "value": "12345"
-    }
-  ],
+  "identifier": {
+    "value": "12345"
+  },
   "title": "Example Specimen Definition for Testing",
   "status": "active",
   "experimental": false,

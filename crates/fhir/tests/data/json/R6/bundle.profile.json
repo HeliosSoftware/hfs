@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "Bundle",
   "meta": {
-    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
     "status": "generated",
@@ -31,11 +31,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Bundle",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "Bundle",
   "status": "active",
   "experimental": false,
-  "date": "2026-03-31T22:56:13+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -59,7 +59,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "w5",
@@ -378,7 +378,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
           "additional": [
             {
               "purpose": "starter",
@@ -488,7 +488,7 @@
           ],
           "strength": "required",
           "description": "Indicates the purpose of a bundle - how it is intended to be used.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -764,7 +764,7 @@
         "isSummary": true,
         "binding": {
           "strength": "required",
-          "valueSet": "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot3"
         }
       },
       {
@@ -1261,7 +1261,7 @@
           ],
           "strength": "required",
           "description": "Why an entry is in the result set - whether it\u0027s included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot3"
         }
       },
       {
@@ -1495,7 +1495,7 @@
           ],
           "strength": "required",
           "description": "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot3"
         }
       },
       {
@@ -2239,7 +2239,7 @@
           ],
           "strength": "required",
           "description": "Indicates the purpose of a bundle - how it is intended to be used.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -2338,7 +2338,7 @@
         "isSummary": true,
         "binding": {
           "strength": "required",
-          "valueSet": "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot3"
         }
       },
       {
@@ -2506,7 +2506,7 @@
           ],
           "strength": "required",
           "description": "Why an entry is in the result set - whether it\u0027s included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot3"
         }
       },
       {
@@ -2577,7 +2577,7 @@
           ],
           "strength": "required",
           "description": "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot3"
         }
       },
       {

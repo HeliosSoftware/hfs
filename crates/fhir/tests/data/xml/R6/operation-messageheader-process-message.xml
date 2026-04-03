@@ -207,13 +207,13 @@
     <valueCode value="inm"/>
   </extension>
   <url value="http://hl7.org/fhir/OperationDefinition/MessageHeader-process-message"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="ProcessMessage"/>
   <title value="Process Message"/>
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2026-03-31T22:56:13+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / Infrastructure And Messaging"/>
   <contact>
     <telecom>

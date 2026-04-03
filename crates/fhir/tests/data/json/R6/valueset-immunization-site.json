@@ -2,11 +2,11 @@
   "resourceType": "ValueSet",
   "id": "immunization-site",
   "meta": {
-    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet immunization-site\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"immunization-site\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcimmunization-site\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://terminology.hl7.org/7.1.0/CodeSystem-v3-ActSite.html\"\u003e\u003ccode\u003ehttp://terminology.hl7.org/CodeSystem/v3-ActSite\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated, which means it is fixed to 4.0.0, the version found through the package references\"\u003e version \u0026#x1F4E6;4.0.0\u003c/span\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/7.1.0/CodeSystem-v3-ActSite.html#v3-ActSite-LA\"\u003eLA\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eLeft arm\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/7.1.0/CodeSystem-v3-ActSite.html#v3-ActSite-RA\"\u003eRA\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRight arm\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet immunization-site\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"immunization-site\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcimmunization-site\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://terminology.hl7.org/7.0.1/CodeSystem-v3-ActSite.html\"\u003e\u003ccode\u003ehttp://terminology.hl7.org/CodeSystem/v3-ActSite\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated, which means it is fixed to 3.0.0, the version found through the package references\"\u003e version \u0026#x1F4E6;3.0.0\u003c/span\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/7.0.1/CodeSystem-v3-ActSite.html#v3-ActSite-LA\"\u003eLA\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eLeft arm\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/7.0.1/CodeSystem-v3-ActSite.html#v3-ActSite-RA\"\u003eRA\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRight arm\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -39,7 +39,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.2.161"
     }
   ],
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "CodesForImmunizationSiteOfAdministration",
   "title": "Codes for Immunization Site of Administration",
   "status": "active",

@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "Task",
   "meta": {
-    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Task",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "Task",
   "status": "active",
   "experimental": false,
-  "date": "2026-03-31T22:56:13+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / Orders and Observations",
   "contact": [
     {
@@ -63,7 +63,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "workflow",
@@ -317,7 +317,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
           "additional": [
             {
               "purpose": "starter",
@@ -715,7 +715,7 @@
           ],
           "strength": "required",
           "description": "The current status of the task.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/task-status|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/task-status|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -871,7 +871,7 @@
           ],
           "strength": "required",
           "description": "Distinguishes whether the task is a proposal, plan or full order.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/task-intent|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/task-intent|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -932,7 +932,7 @@
           ],
           "strength": "required",
           "description": "The priority of a task (may affect service level applied to the task).",
-          "valueSet": "http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -3532,7 +3532,7 @@
           ],
           "strength": "required",
           "description": "The current status of the task.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/task-status|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/task-status|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -3646,7 +3646,7 @@
           ],
           "strength": "required",
           "description": "Distinguishes whether the task is a proposal, plan or full order.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/task-intent|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/task-intent|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -3693,7 +3693,7 @@
           ],
           "strength": "required",
           "description": "The priority of a task (may affect service level applied to the task).",
-          "valueSet": "http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot3"
         },
         "mapping": [
           {
