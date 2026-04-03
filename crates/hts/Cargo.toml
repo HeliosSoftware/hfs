@@ -41,7 +41,12 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = "1"
+csv = "1"
+flate2 = "1"
+roxmltree = "0.20"
 form_urlencoded = "1"
+tar = "0.4"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -60,3 +65,4 @@ deadpool-postgres = { version = "0.14", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }

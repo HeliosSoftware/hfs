@@ -560,6 +560,55 @@ Set `HFS_TERMINOLOGY_SERVER=http://localhost:8090` on the HFS process to enable:
 - FHIR search `:in` modifier (expands ValueSet, filters by code)
 - FHIRPath `memberOf()` / `subsumes()` delegation via `FHIRPATH_TERMINOLOGY_SERVER`
 
+### Bulk Import CLI (`hts import`)
+
+Load terminology packages directly from the filesystem without going through the HTTP API.
+
+```bash
+# HL7 FHIR NPM package (.tgz from https://terminology.hl7.org/en/downloads.html)
+cargo run --bin hts -- import ./hl7.terminology.r4-6.0.0.tgz
+
+# SNOMED CT RF2 ZIP  ⚠️  requires NRC license
+cargo run --bin hts -- import ./SnomedCT_InternationalRF2_*.zip --format snomed-rf2
+
+# LOINC CSV ZIP  ⚠️  requires free Regenstrief registration at loinc.org
+cargo run --bin hts -- import ./Loinc_*.zip --format loinc
+
+# ICD-10-CM tabular XML (free, no license needed — from cms.gov)
+cargo run --bin hts -- import ./icd10cm_tabular_2025.xml
+
+# RxNorm RRF folder  ⚠️  requires free NLM terms-of-service at nlm.nih.gov
+cargo run --bin hts -- import ./RxNorm_full_current/rrf/
+
+# Common flags
+cargo run --bin hts -- import ./package.tgz \
+  --database-url ./data/hts.db \   # SQLite file (default: ./data/hts.db)
+  --batch-size 1000 \              # resources per batch (default: 500)
+  --dry-run \                      # parse only — no DB writes
+  --verbose                        # debug output to stderr
+```
+
+#### Format auto-detection
+
+| Extension / pattern | Detected format |
+|---------------------|-----------------|
+| `.tgz` / `.tar.gz` | `hl7-npm` |
+| `*_tabular*.xml` | `icd10-cm` |
+| `.rrf` or directory | `rxnorm` |
+| `.zip` containing RF2 files | `snomed-rf2` |
+| `.zip` containing `LoincTable.csv` | `loinc` |
+| `.zip` containing `RXNCONSO.RRF` | `rxnorm` |
+
+`.zip` files that cannot be auto-detected require `--format`.
+
+#### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success — all resources imported |
+| `1` | Fatal error — import aborted |
+| `2` | Success with non-fatal errors — some records skipped |
+
 ---
 
 ## Docker
