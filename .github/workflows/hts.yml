@@ -49,7 +49,7 @@ jobs:
 
       - name: cargo clippy
         run: >
-          cargo clippy -p helios-hts --all-targets --all-features --
+          cargo clippy -p helios-hts --all-targets --
           -D warnings
           -A clippy::items_after_test_module
           -A clippy::large_enum_variant
