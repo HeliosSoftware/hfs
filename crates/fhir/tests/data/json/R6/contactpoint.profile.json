@@ -16,11 +16,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/ContactPoint",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "ContactPoint",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-03-31T22:56:13+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -53,7 +53,7 @@
     }
   ],
   "purpose": "Need to track phone, fax, mobile, sms numbers, email addresses, twitter tags, etc.",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "v2",
@@ -254,7 +254,7 @@
           ],
           "strength": "required",
           "description": "Telecommunications form for contact point.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/contact-point-system|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/contact-point-system|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -363,7 +363,7 @@
           ],
           "strength": "required",
           "description": "Use of contact point.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/contact-point-use|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/contact-point-use|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -527,7 +527,7 @@
           ],
           "strength": "required",
           "description": "Telecommunications form for contact point.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/contact-point-system|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/contact-point-system|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -607,7 +607,7 @@
           ],
           "strength": "required",
           "description": "Use of contact point.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/contact-point-use|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/contact-point-use|6.0.0-ballot4"
         },
         "mapping": [
           {

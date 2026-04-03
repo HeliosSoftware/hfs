@@ -27,31 +27,6 @@
           }
         ]
       }
-    },
-    {
-      "resourceType": "Specimen",
-      "id": "serum",
-      "identifier": [
-        {
-          "system": "http://acme.org/specimens",
-          "value": "20150107-0012"
-        }
-      ],
-      "type": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "119364003",
-            "display": "Serum sample"
-          }
-        ]
-      },
-      "subject": {
-        "reference": "Patient/example"
-      },
-      "collection": {
-        "collectedDateTime": "2015-08-16T06:40:17Z"
-      }
     }
   ],
   "identifier": [
@@ -116,12 +91,6 @@
         "reference": "#fasting",
         "display": "Fasting status"
       }
-    }
-  ],
-  "specimen": [
-    {
-      "reference": "#serum",
-      "display": "Serum specimen"
     }
   ],
   "note": [

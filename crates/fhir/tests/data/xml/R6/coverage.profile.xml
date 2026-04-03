@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Coverage"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-03-31T22:56:13.851+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -867,11 +867,11 @@
     <valueCode value="patient"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Coverage"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="Coverage"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-03-31T22:56:13+00:00"/>
   <publisher value="HL7 International / Financial Management"/>
   <contact>
     <telecom>
@@ -894,7 +894,7 @@
     </coding>
   </jurisdiction>
   <purpose value="Coverage provides a link between covered parties (patients) and the payors of their healthcare costs (both insurance and self-pay)."/>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -1109,7 +1109,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1327,7 +1327,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code specifying the state of the resource instance."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -1413,7 +1413,7 @@
           <valueString value="CoverageKind"/>
         </extension>
         <strength value="required"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/coverage-kind|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/coverage-kind|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="Coverage.paymentBy">
@@ -2939,7 +2939,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code specifying the state of the resource instance."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -3001,7 +3001,7 @@
           <valueString value="CoverageKind"/>
         </extension>
         <strength value="required"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/coverage-kind|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/coverage-kind|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="Coverage.paymentBy">

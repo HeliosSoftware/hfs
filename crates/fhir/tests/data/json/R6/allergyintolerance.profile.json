@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "AllergyIntolerance",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/AllergyIntolerance",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "AllergyIntolerance",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-03-31T22:56:13+00:00",
   "publisher": "HL7 International / Patient Care",
   "contact": [
     {
@@ -64,7 +64,7 @@
     }
   ],
   "purpose": "To record a clinical assessment of a propensity, or potential risk to an individual, of an adverse reaction upon future exposure to the specified substance, or class of substance.",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "w5",
@@ -301,7 +301,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -565,7 +565,7 @@
           ],
           "strength": "required",
           "description": "The clinical status of the allergy or intolerance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/allergyintolerance-clinical|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/allergyintolerance-clinical|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -618,7 +618,7 @@
           ],
           "strength": "required",
           "description": "Assertion about certainty associated with a propensity, or potential risk, of a reaction to the identified substance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/allergyintolerance-verification|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/allergyintolerance-verification|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -736,7 +736,7 @@
           ],
           "strength": "required",
           "description": "Category of an identified substance associated with allergies or intolerances.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/allergy-intolerance-category|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/allergy-intolerance-category|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -798,7 +798,7 @@
           ],
           "strength": "required",
           "description": "Estimate of the potential clinical harm, or seriousness, of a reaction to an identified substance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/allergy-intolerance-criticality|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/allergy-intolerance-criticality|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1629,7 +1629,7 @@
           ],
           "strength": "required",
           "description": "Clinical assessment of the severity of a reaction event as a whole, potentially considering multiple different manifestations.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/reaction-event-severity|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/reaction-event-severity|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1811,7 +1811,7 @@
           ],
           "strength": "required",
           "description": "The clinical status of the allergy or intolerance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/allergyintolerance-clinical|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/allergyintolerance-clinical|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1850,7 +1850,7 @@
           ],
           "strength": "required",
           "description": "Assertion about certainty associated with a propensity, or potential risk, of a reaction to the identified substance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/allergyintolerance-verification|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/allergyintolerance-verification|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1940,7 +1940,7 @@
           ],
           "strength": "required",
           "description": "Category of an identified substance associated with allergies or intolerances.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/allergy-intolerance-category|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/allergy-intolerance-category|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1988,7 +1988,7 @@
           ],
           "strength": "required",
           "description": "Estimate of the potential clinical harm, or seriousness, of a reaction to an identified substance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/allergy-intolerance-criticality|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/allergy-intolerance-criticality|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -2488,7 +2488,7 @@
           ],
           "strength": "required",
           "description": "Clinical assessment of the severity of a reaction event as a whole, potentially considering multiple different manifestations.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/reaction-event-severity|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/reaction-event-severity|6.0.0-ballot4"
         },
         "mapping": [
           {

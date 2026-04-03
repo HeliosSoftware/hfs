@@ -24,11 +24,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/CodeableConcept",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "CodeableConcept",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-03-31T22:56:13+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -61,7 +61,7 @@
     }
   ],
   "purpose": "This is a common pattern in healthcare - a concept that may be defined by one or more codes from formal definitions including LOINC and SNOMED CT, and/or defined by the provision of text that captures a human sense of the concept.",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "v2",

@@ -99,50 +99,6 @@
     "reference": "Practitioner/f007",
     "display": "Patrick Pump"
   },
-  "dosageInstruction": {
-    "simple": {
-      "text": "Dopamine 4mcg/kg/min",
-      "timing": {
-        "repeat": {
-          "duration": 33.33,
-          "durationUnit": "h"
-        }
-      },
-      "route": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "47625008",
-            "display": "Intravenous route"
-          }
-        ]
-      },
-      "doseAndRate": [
-        {
-          "type": {
-            "coding": [
-              {
-                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                "code": "ordered",
-                "display": "Ordered"
-              }
-            ]
-          },
-          "doseQuantity": {
-            "value": 400,
-            "unit": "mg",
-            "system": "http://unitsofmeasure.org",
-            "code": "mg"
-          },
-          "rateQuantity": {
-            "value": 7.5,
-            "unit": "ml/h",
-            "system": "http://unitsofmeasure.org"
-          }
-        }
-      ]
-    }
-  },
   "meta": {
     "tag": [
       {

@@ -57,7 +57,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-medication-statement-status"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="MedicationStatementStatusCodesCanonicalMap"/>
   <title value="Canonical Mapping for &quot;MedicationStatement Status Codes&quot;"/>
   <status value="draft"/>

@@ -21,8 +21,8 @@
       <br/>
       <p>
         <b>Group 1 </b>Mapping from 
-        <code>http://snomed.info/sct</code> to 
-        <code>http://hl7.org/fhir/sid/icd-10-cm</code>
+        <code>http://snomed.info/sct</code> (SNOMED CT International Edition) to 
+        <code>http://hl7.org/fhir/sid/icd-10-cm</code> (International Classification of Diseases, 10th Revision, Clinical Modification (ICD-10-CM))
       </p>
       <table class="grid">
         <tr>
@@ -70,7 +70,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:uuid:53cd62ee-033e-414c-9f58-3ca97b5ffc3b"/>
   </identifier>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="SNOMEDCTToICD10CMMappingsForFractureOfUlna"/>
   <title value="SNOMED CT to ICD-10-CM mappings for fracture of ulna"/>
   <status value="draft"/>

@@ -22,7 +22,7 @@
       "value": "urn:uuid:53cd62ee-033e-414c-9f58-3ca97b5ffc3b"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "SNOMEDCTToICD10CMMappingsForFractureOfUlna",
   "title": "SNOMED CT to ICD-10-CM mappings for fracture of ulna",
   "status": "draft",

@@ -1,4 +1,31 @@
+//! Terminology package importers and the [`BundleImportBackend`] trait.
+//!
+//! Each sub-module handles a specific terminology distribution format.
+//! All importers write into the same normalized HTS SQLite schema via the
+//! shared helpers in [`fhir_bundle`].
+//!
+//! ## Supported formats
+//!
+//! | Module | Format | Source |
+//! |--------|--------|--------|
+//! | [`fhir_bundle`] | FHIR Bundle JSON | Any FHIR server or file |
+//! | [`tgz`] | HL7 FHIR NPM package (`.tgz`) | <https://terminology.hl7.org> |
+//! | [`snomed_rf2`] | SNOMED CT RF2 (`.zip`) | NRC license required |
+//! | [`loinc_csv`] | LOINC CSV (`.zip`) | Free Regenstrief registration |
+//! | [`icd10_cm`] | ICD-10-CM tabular XML | Free (CMS / CDC) |
+//! | [`rxnorm_rrf`] | RxNorm RRF (folder or `.zip`) | Free NLM Terms of Service |
+//!
+//! All importers are invoked from the CLI (`hts import`) via `main.rs` using
+//! the format auto-detection in [`crate::config::detect_format`], or
+//! programmatically via [`BundleImportBackend::import_bundle`] for HTTP-based
+//! Bundle imports.
+
 pub mod fhir_bundle;
+pub mod icd10_cm;
+pub mod loinc_csv;
+pub mod rxnorm_rrf;
+pub mod snomed_rf2;
+pub mod tgz;
 
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
@@ -26,6 +53,36 @@ impl ImportStats {
     /// Returns `true` if any non-fatal errors were recorded during import.
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
+    }
+}
+
+/// Outcome of a completed CLI import run.
+///
+/// Wraps [`ImportStats`] with the format label and wall-clock duration so that
+/// `main.rs` can print a consistent summary line regardless of which importer
+/// produced the result.
+#[derive(Debug)]
+pub struct ImportResult {
+    /// Counts of imported resources and any non-fatal errors.
+    pub stats: ImportStats,
+    /// Human-readable format label (e.g. `"hl7-npm"`, `"loinc"`).
+    pub format: String,
+    /// Total wall-clock time for the import.
+    pub duration: std::time::Duration,
+}
+
+impl ImportResult {
+    /// Build an `ImportResult` from its components.
+    pub fn new(
+        stats: ImportStats,
+        format: impl Into<String>,
+        duration: std::time::Duration,
+    ) -> Self {
+        Self {
+            stats,
+            format: format.into(),
+            duration,
+        }
     }
 }
 

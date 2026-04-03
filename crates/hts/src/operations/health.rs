@@ -1,7 +1,19 @@
+//! `GET /health` — liveness probe endpoint.
+//!
+//! Returns a minimal JSON body `{"status": "ok", "service": "hts"}` with HTTP
+//! 200.  No authentication or backend access is required so the endpoint can be
+//! used as a Kubernetes liveness/readiness probe without side effects.
+
 use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde_json::json;
 
-/// GET /health — returns service health status.
+/// `GET /health` — returns service health status.
+///
+/// Always returns HTTP 200 with `{"status": "ok", "service": "hts"}` as long
+/// as the server process is running.  Does **not** check database connectivity;
+/// use [`GET /metadata`] for a deeper capability check.
+///
+/// [`GET /metadata`]: super::metadata::metadata_handler
 pub async fn health_handler() -> impl IntoResponse {
     (
         StatusCode::OK,

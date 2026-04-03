@@ -60,52 +60,5 @@
     <code value="d"/>
   </daysSupply>
   <whenPrepared value="2015-01-15T10:20:00Z"/>
-  <dosageInstruction>
-    <simple>
-      <text value="1 tablet every four hours as needed for pain"/>
-      <additionalInstruction>
-        <coding>
-          <system value="http://snomed.info/sct"/>
-          <code value="418914006"/>
-          <display value="Warning. May cause drowsiness. If affected do not drive or operate machinery. Avoid alcoholic drink (qualifier value)"/>
-        </coding>
-      </additionalInstruction>
-      <timing>
-        <repeat>
-          <frequency value="1"/>
-          <period value="4"/>
-          <periodUnit value="h"/>
-        </repeat>
-      </timing>
-      <asNeededFor>
-        <coding>
-          <system value="http://snomed.info/sct"/>
-          <code value="203082005"/>
-          <display value="Fibromyalgia (disorder)"/>
-        </coding>
-      </asNeededFor>
-      <route>
-        <coding>
-          <system value="http://snomed.info/sct"/>
-          <code value="26643006"/>
-          <display value="Oral Route"/>
-        </coding>
-      </route>
-      <doseAndRate>
-        <type>
-          <coding>
-            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
-            <code value="ordered"/>
-            <display value="Ordered"/>
-          </coding>
-        </type>
-        <doseQuantity>
-          <value value="1"/>
-          <unit value="TAB"/>
-          <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
-          <code value="TAB"/>
-        </doseQuantity>
-      </doseAndRate>
-    </simple>
-  </dosageInstruction>
+  <dosageInstruction/>
 </MedicationDispense>

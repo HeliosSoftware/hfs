@@ -28,11 +28,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Money",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "Money",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-03-31T22:56:13+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -64,7 +64,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "rim",
@@ -284,7 +284,7 @@
           ],
           "strength": "required",
           "description": "A code indicating the currency, taken from ISO 4217.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/currencies|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/currencies|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -364,7 +364,7 @@
           ],
           "strength": "required",
           "description": "A code indicating the currency, taken from ISO 4217.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/currencies|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/currencies|6.0.0-ballot4"
         },
         "mapping": [
           {

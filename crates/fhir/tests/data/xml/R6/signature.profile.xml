@@ -216,11 +216,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Signature"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="Signature"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-03-31T22:56:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -243,7 +243,7 @@
     </coding>
   </jurisdiction>
   <purpose value="There are a number of places where content must be signed in healthcare."/>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="rim"/>
     <uri value="http://hl7.org/v3"/>
@@ -506,7 +506,7 @@
         </extension>
         <strength value="required"/>
         <description value="BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="Signature.sigFormat">
@@ -544,7 +544,7 @@
         </extension>
         <strength value="required"/>
         <description value="BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="Signature.data">
@@ -680,7 +680,7 @@
         </extension>
         <strength value="required"/>
         <description value="BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="Signature.sigFormat">
@@ -704,7 +704,7 @@
         </extension>
         <strength value="required"/>
         <description value="BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="Signature.data">

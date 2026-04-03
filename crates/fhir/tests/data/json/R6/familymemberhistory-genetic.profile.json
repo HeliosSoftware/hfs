@@ -26,7 +26,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.5.1229"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "FamilyMemberHistoryForGeneticsAnalysis",
   "title": "Family member history for genetics analysis",
   "status": "draft",
@@ -44,7 +44,7 @@
     }
   ],
   "description": "Adds additional information to a family member history supporting both the capture of mother/father relationships as well as additional observations necessary to enable genetics-based risk analysis for patients",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "workflow",
@@ -76,7 +76,7 @@
     "extension": [
       {
         "url": "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-        "valueString": "6.0.0-ballot3"
+        "valueString": "6.0.0-ballot4"
       }
     ],
     "element": [
@@ -311,7 +311,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -712,7 +712,7 @@
           ],
           "strength": "required",
           "description": "A code that identifies the status of the family history record.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot4"
         },
         "mapping": [
           {

@@ -12,13 +12,13 @@
       <a name="hcbase"> </a>
       <h2 id="title"/>
       <ul>
-        <li>Implementation Guide Version: 6.0.0-ballot3 </li>
-        <li>FHIR Version: 6.0.0-ballot3 </li>
+        <li>Implementation Guide Version: 6.0.0-ballot4 </li>
+        <li>FHIR Version: 6.0.0-ballot4 </li>
         <li>Supported Formats: 
           <code>xml</code>, 
           <code>json</code>
         </li>
-        <li>Published on: 2025-11-27T16:48:47Z </li>
+        <li>Published on: 2026-03-31T22:56:13Z </li>
         <li>Published by: HL7 International / FHIR Infrastructure </li>
       </ul>
       <blockquote class="impl-note">
@@ -905,7 +905,7 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>identifier, request, parent, code, product-status, serial-number, patient, biological-source-event, product-category, collector</td>
+              <td>identifier, request, parent, therapy-identifier, code, product-status, serial-number, patient, biological-source-event, product-category, collector</td>
               <td>
                 <code>BiologicallyDerivedProduct.request</code>, 
                 <code>BiologicallyDerivedProduct.parent</code>, 
@@ -3430,19 +3430,17 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>date, combo-data-absent-reason, code, combo-code-value-quantity, component-data-absent-reason, subject, body-structure-code, value-concept, value-date, derived-from, focus, part-of, has-member, value-reference, combo-interpretation, reference, code-value-string, component-code-value-quantity, based-on, component-interpretation, code-value-date, patient, specimen, code-value-quantity, component-code, combo-code-value-concept, value-string, identifier, component-value-reference, performer, combo-code, method, value-quantity, component-value-quantity, data-absent-reason, combo-value-quantity, encounter, code-value-concept, interpretation, component-code-value-concept, component-value-concept, category, body-site, device, combo-value-concept, status</td>
+              <td>date, combo-data-absent-reason, code, combo-code-value-quantity, component-data-absent-reason, subject, body-structure-code, value-concept, value-date, derived-from, focus, part-of, has-member, combo-interpretation, reference, code-value-string, component-code-value-quantity, based-on, component-interpretation, code-value-date, patient, specimen, code-value-quantity, component-code, combo-code-value-concept, value-string, identifier, performer, combo-code, method, value-quantity, component-value-quantity, data-absent-reason, combo-value-quantity, encounter, code-value-concept, interpretation, component-code-value-concept, component-value-concept, category, body-site, device, combo-value-concept, status</td>
               <td>
                 <code>Observation.subject</code>, 
                 <code>Observation.derived-from</code>, 
                 <code>Observation.focus</code>, 
                 <code>Observation.part-of</code>, 
                 <code>Observation.has-member</code>, 
-                <code>Observation.value-reference</code>, 
                 <code>Observation.reference</code>, 
                 <code>Observation.based-on</code>, 
                 <code>Observation.patient</code>, 
                 <code>Observation.specimen</code>, 
-                <code>Observation.component-value-reference</code>, 
                 <code>Observation.performer</code>, 
                 <code>Observation.encounter</code>, 
                 <code>Observation.device</code>
@@ -9144,6 +9142,23 @@
                       <td>
                         <div>
                           <p>The parent biologically derived product</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="biologicallyderivedproduct-search.html#BiologicallyDerivedProduct-therapy-identifier">therapy-identifier</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Identifiers common to a given therapy</p>
 
                         </div>
                       </td>
@@ -34653,23 +34668,6 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="observation-search.html#Observation-value-reference">value-reference</a>
-                      </td>
-                      <td>
-                        <code>reference</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Reference contained in valueReference.</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
                         <a href="observation-search.html#Observation-combo-interpretation">combo-interpretation</a>
                       </td>
                       <td>
@@ -34899,23 +34897,6 @@
                       <td>
                         <div>
                           <p>The unique id for a particular observation</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="observation-search.html#Observation-component-value-reference">component-value-reference</a>
-                      </td>
-                      <td>
-                        <code>reference</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Reference contained in valueReference.</p>
 
                         </div>
                       </td>
@@ -49929,11 +49910,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/CapabilityStatement/base"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="Base FHIR Capability Statement (Full)"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-03-31T22:56:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -49946,7 +49927,7 @@
   <software>
     <name value="Insert your software name here..."/>
   </software>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <format value="xml"/>
   <format value="json"/>
   <rest>
@@ -51517,6 +51498,12 @@
         <definition value="http://hl7.org/fhir/SearchParameter/BiologicallyDerivedProduct-parent"/>
         <type value="reference"/>
         <documentation value="The parent biologically derived product"/>
+      </searchParam>
+      <searchParam>
+        <name value="therapy-identifier"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/BiologicallyDerivedProduct-therapy-identifier"/>
+        <type value="token"/>
+        <documentation value="Identifiers common to a given therapy"/>
       </searchParam>
       <searchParam>
         <name value="code"/>
@@ -61800,12 +61787,10 @@
       <searchInclude value="Observation.focus"/>
       <searchInclude value="Observation.part-of"/>
       <searchInclude value="Observation.has-member"/>
-      <searchInclude value="Observation.value-reference"/>
       <searchInclude value="Observation.reference"/>
       <searchInclude value="Observation.based-on"/>
       <searchInclude value="Observation.patient"/>
       <searchInclude value="Observation.specimen"/>
-      <searchInclude value="Observation.component-value-reference"/>
       <searchInclude value="Observation.performer"/>
       <searchInclude value="Observation.encounter"/>
       <searchInclude value="Observation.device"/>
@@ -61895,12 +61880,6 @@
         <documentation value="Related resource that belongs to the Observation group"/>
       </searchParam>
       <searchParam>
-        <name value="value-reference"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-value-reference"/>
-        <type value="reference"/>
-        <documentation value="Reference contained in valueReference."/>
-      </searchParam>
-      <searchParam>
         <name value="combo-interpretation"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-interpretation"/>
         <type value="token"/>
@@ -61983,12 +61962,6 @@
         <definition value="http://hl7.org/fhir/SearchParameter/clinical-identifier"/>
         <type value="token"/>
         <documentation value="The unique id for a particular observation"/>
-      </searchParam>
-      <searchParam>
-        <name value="component-value-reference"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-component-value-reference"/>
-        <type value="reference"/>
-        <documentation value="Reference contained in valueReference."/>
       </searchParam>
       <searchParam>
         <name value="performer"/>

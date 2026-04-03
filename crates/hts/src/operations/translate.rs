@@ -26,6 +26,25 @@ use super::params::{
     extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
 };
 
+/// Core translation logic shared by the POST and GET handlers.
+///
+/// Extracts `code` (required) and optional `system`, `url` (ConceptMap URL),
+/// `source`, `target`, `targetSystem`, `reverse`, and `date` from `params`,
+/// delegates to [`ConceptMapOperations::translate`], and assembles the FHIR
+/// `Parameters` response.
+///
+/// `reverse` is parsed from `"true"` / `"false"` strings so it works for both
+/// GET (query-string) and POST (JSON boolean) inputs.
+///
+/// ## Returns
+///
+/// A FHIR `Parameters` resource with a `result` boolean and zero or more
+/// `match` parts.  Each `match` part contains `equivalence`, `concept`
+/// (`valueCoding`), and optionally `source` (ConceptMap URL).
+///
+/// ## Errors
+///
+/// Returns [`HtsError::InvalidRequest`] when `code` is absent.
 pub(crate) async fn process_translate<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,

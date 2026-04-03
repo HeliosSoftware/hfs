@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "Procedure",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Procedure",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "Procedure",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-03-31T22:56:13+00:00",
   "publisher": "HL7 International / Patient Care",
   "contact": [
     {
@@ -63,7 +63,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "workflow",
@@ -310,7 +310,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -685,7 +685,7 @@
           ],
           "strength": "required",
           "description": "A code specifying the state of the procedure.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/event-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/event-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -2574,7 +2574,7 @@
           ],
           "strength": "required",
           "description": "A code specifying the state of the procedure.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/event-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/event-status|6.0.0-ballot4"
         },
         "mapping": [
           {

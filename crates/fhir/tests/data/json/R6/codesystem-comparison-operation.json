@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "comparison-operation",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
   },
   "text": {
     "status": "generated",
@@ -19,7 +19,7 @@
     }
   ],
   "url": "http://hl7.org/fhir/CodeSystem/comparison-operation",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "ComparisonOperationCS",
   "title": "Dose Limit Scope CodeSystem",
   "status": "active",

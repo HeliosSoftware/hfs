@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "devicealert-priority",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
   },
   "text": {
     "status": "generated",
@@ -23,13 +23,13 @@
     }
   ],
   "url": "http://hl7.org/fhir/devicealert-priority",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "DeviceAlertPriority",
   "title": "Device Alert Priority",
   "status": "active",
   "experimental": false,
   "date": "2023-12-10T10:01:24+11:00",
-  "publisher": "HL7 International / Health Care Devices",
+  "publisher": "HL7 International / Devices",
   "contact": [
     {
       "telecom": [

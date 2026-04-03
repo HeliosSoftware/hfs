@@ -57,7 +57,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-immunization-status"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="ImmunizationStatusCodesCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Immunization Status Codes&quot;"/>
   <status value="draft"/>

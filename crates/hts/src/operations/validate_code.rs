@@ -35,7 +35,10 @@ use super::params::{
     parse_query_string, query_params_to_fhir_params,
 };
 
-/// Serialize a `ValidateCodeResponse` into a FHIR Parameters JSON value.
+/// Serialize a [`ValidateCodeResponse`] into a FHIR Parameters JSON value.
+///
+/// Always includes `result` (boolean).  Includes `message` when set (e.g.,
+/// when a display mismatch is detected).  Includes `display` on success.
 fn build_validate_response(resp: ValidateCodeResponse) -> Value {
     let mut parameter: Vec<Value> = vec![json!({"name": "result", "valueBoolean": resp.result})];
     if let Some(msg) = resp.message {
@@ -50,6 +53,25 @@ fn build_validate_response(resp: ValidateCodeResponse) -> Value {
     })
 }
 
+/// Core validate-code logic for `CodeSystem/$validate-code`.
+///
+/// Accepts three input forms (checked in priority order):
+///
+/// 1. **`code`** parameter — requires `url` (CodeSystem canonical URL); `system`
+///    is intentionally not accepted here (FHIR spec distinction).
+/// 2. **`coding`** (`valueCoding`) — system and code bundled in a single object.
+/// 3. **`codeableConcept`** (`valueCodeableConcept`) — returns `true` if *any*
+///    coding in the concept is valid.
+///
+/// ## Returns
+///
+/// A FHIR `Parameters` resource with `result` (boolean), optional `display`
+/// (on success), and optional `message` (on display mismatch or failure).
+///
+/// ## Errors
+///
+/// Returns [`HtsError::InvalidRequest`] when none of the three input forms are
+/// present, or when `url` is absent for the bare-code form.
 pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
@@ -161,6 +183,18 @@ pub async fn get_validate_code_handler<B: TerminologyBackend>(
 
 // ── ValueSet/$validate-code ────────────────────────────────────────────────────
 
+/// Core validate-code logic for `ValueSet/$validate-code`.
+///
+/// Always requires the `url` parameter (ValueSet canonical URL).  The optional
+/// `system` parameter can further scope the check to a specific code system
+/// within the expanded value set.
+///
+/// Supports the same three input forms as [`process_validate_code`] (bare
+/// `code`, `coding`, and `codeableConcept`), with the same priority order.
+///
+/// Unlike `CodeSystem/$validate-code`, a missing or unknown ValueSet URL
+/// returns `result = false` (not an error), consistent with the FHIR spec's
+/// intent to treat absence of a value set as a negative match.
 pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,

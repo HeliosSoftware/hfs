@@ -1,3 +1,22 @@
+//! Axum application router for the Helios Terminology Service.
+//!
+//! [`create_app`] is the single entry point that wires every HTTP handler to
+//! its route and attaches middleware.  It is called from `main.rs` during
+//! server startup and from integration tests via [`crate::lib`].
+//!
+//! ## Middleware stack (outermost → innermost)
+//!
+//! 1. **CORS** — configurable allowed origins; enabled by default with `*`.
+//! 2. **Tracing** — emits `tracing` spans for every request/response pair.
+//! 3. **Timeout** — hard 30-second request deadline (non-configurable).
+//!
+//! ## Route registration order
+//!
+//! Instance-level operation routes (e.g., `/CodeSystem/{id}/$lookup`) **must**
+//! be registered before the bare `/{id}` CRUD routes.  Axum resolves routes in
+//! registration order; placing the operation routes first prevents the CRUD
+//! handler from capturing requests that end with an operation suffix.
+
 use crate::operations::batch::batch_handler;
 use axum::{
     Router,
@@ -36,6 +55,15 @@ use crate::state::AppState;
 use crate::traits::TerminologyBackend;
 
 /// Build the Axum application router with all middleware and routes.
+///
+/// Accepts the runtime [`HtsConfig`] (for CORS and other settings) and the
+/// shared [`AppState`] (backend + pools).  Returns a fully configured Axum
+/// [`Router`] ready to be bound to a TCP listener.
+///
+/// # Panics
+///
+/// Does not panic.  Invalid CORS origin strings are silently dropped because
+/// [`CorsLayer`] validates origins lazily at request time.
 pub fn create_app<B>(config: &HtsConfig, state: AppState<B>) -> Router
 where
     B: TerminologyBackend + BundleImportBackend + Clone,

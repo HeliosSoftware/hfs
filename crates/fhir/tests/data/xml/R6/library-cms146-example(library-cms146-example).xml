@@ -951,7 +951,7 @@
     <use value="official"/>
     <value value="CMS146"/>
   </identifier>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="CMS146"/>
   <title value="CMS146: Appropriate Testing for Children with Pharyngitis"/>
   <status value="draft"/>

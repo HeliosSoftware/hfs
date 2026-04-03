@@ -16,11 +16,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/DataRequirement",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "DataRequirement",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-03-31T22:56:13+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -52,7 +52,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "rim",
@@ -229,7 +229,7 @@
           ],
           "strength": "required",
           "description": "List of FHIR types (resources, data types).",
-          "valueSet": "http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot4"
         }
       },
       {
@@ -1040,7 +1040,7 @@
           ],
           "strength": "required",
           "description": "Possible comparators for the valueFilter element.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/value-filter-comparator|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/value-filter-comparator|6.0.0-ballot4"
         }
       },
       {
@@ -1298,7 +1298,7 @@
           ],
           "strength": "required",
           "description": "The possible sort directions, ascending or descending.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/sort-direction|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/sort-direction|6.0.0-ballot4"
         }
       }
     ]
@@ -1343,7 +1343,7 @@
           ],
           "strength": "required",
           "description": "List of FHIR types (resources, data types).",
-          "valueSet": "http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot4"
         }
       },
       {
@@ -1654,7 +1654,7 @@
           ],
           "strength": "required",
           "description": "Possible comparators for the valueFilter element.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/value-filter-comparator|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/value-filter-comparator|6.0.0-ballot4"
         }
       },
       {
@@ -1749,7 +1749,7 @@
           ],
           "strength": "required",
           "description": "The possible sort directions, ascending or descending.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/sort-direction|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/sort-direction|6.0.0-ballot4"
         }
       }
     ]

@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "interaction-effect",
   "meta": {
-    "lastUpdated": "2025-12-17T20:50:17.012+11:00"
+    "lastUpdated": "2026-04-01T09:56:13.851+11:00"
   },
   "text": {
     "status": "generated",
@@ -29,7 +29,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.3.3111"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "InteractionEffect",
   "title": "Interaction Effect",
   "status": "active",

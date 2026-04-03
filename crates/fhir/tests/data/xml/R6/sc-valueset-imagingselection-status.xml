@@ -64,7 +64,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-imagingselection-status"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="ImagingSelectionStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Imaging Selection Status&quot;"/>
   <status value="draft"/>

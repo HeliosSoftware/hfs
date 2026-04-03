@@ -28,14 +28,14 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/history-bundle",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "HistoryBundle",
   "title": "History bundle",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-03-31T22:56:13+00:00",
   "description": "This profile holds all the requirements and constraints related to a FHIR history bundle.",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "v2",
@@ -67,7 +67,7 @@
     "extension": [
       {
         "url": "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-        "valueString": "6.0.0-ballot3"
+        "valueString": "6.0.0-ballot4"
       }
     ],
     "element": [
@@ -356,7 +356,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -467,7 +467,7 @@
           ],
           "strength": "required",
           "description": "Indicates the purpose of a bundle - how it is intended to be used.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -743,7 +743,7 @@
         "isSummary": true,
         "binding": {
           "strength": "required",
-          "valueSet": "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
         }
       },
       {
@@ -1251,7 +1251,7 @@
           ],
           "strength": "required",
           "description": "Why an entry is in the result set - whether it\u0027s included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
         }
       },
       {
@@ -1485,7 +1485,7 @@
           ],
           "strength": "required",
           "description": "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
         }
       },
       {
@@ -2405,7 +2405,7 @@
           ],
           "strength": "required",
           "description": "Why an entry is in the result set - whether it\u0027s included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
         }
       },
       {
@@ -2640,7 +2640,7 @@
           ],
           "strength": "required",
           "description": "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
         }
       },
       {
@@ -3560,7 +3560,7 @@
           ],
           "strength": "required",
           "description": "Why an entry is in the result set - whether it\u0027s included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
         }
       },
       {
@@ -3795,7 +3795,7 @@
           ],
           "strength": "required",
           "description": "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
         }
       },
       {
@@ -4715,7 +4715,7 @@
           ],
           "strength": "required",
           "description": "Why an entry is in the result set - whether it\u0027s included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
         }
       },
       {
@@ -4950,7 +4950,7 @@
           ],
           "strength": "required",
           "description": "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
         }
       },
       {
@@ -5870,7 +5870,7 @@
           ],
           "strength": "required",
           "description": "Why an entry is in the result set - whether it\u0027s included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
         }
       },
       {
@@ -6105,7 +6105,7 @@
           ],
           "strength": "required",
           "description": "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
         }
       },
       {
@@ -7025,7 +7025,7 @@
           ],
           "strength": "required",
           "description": "Why an entry is in the result set - whether it\u0027s included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
         }
       },
       {
@@ -7259,7 +7259,7 @@
           ],
           "strength": "required",
           "description": "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
         }
       },
       {

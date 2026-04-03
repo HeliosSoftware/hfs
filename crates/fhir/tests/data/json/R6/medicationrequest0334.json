@@ -30,40 +30,6 @@
     "reference": "Practitioner/f007",
     "display": "Patrick Pump"
   },
-  "dosageInstruction": {
-    "simple": {
-      "text": "Apply to affected areas four times daily on Monday of each week",
-      "timing": {
-        "repeat": {
-          "frequency": 4,
-          "period": 1,
-          "periodUnit": "d",
-          "dayOfWeek": [
-            "mon"
-          ]
-        }
-      },
-      "doseAndRate": [
-        {
-          "type": {
-            "coding": [
-              {
-                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                "code": "ordered",
-                "display": "Ordered"
-              }
-            ]
-          },
-          "doseQuantity": {
-            "value": 1,
-            "unit": "ea",
-            "system": "http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm",
-            "code": "OINT"
-          }
-        }
-      ]
-    }
-  },
   "dispenseRequest": {
     "validityPeriod": {
       "start": "2015-01-15",

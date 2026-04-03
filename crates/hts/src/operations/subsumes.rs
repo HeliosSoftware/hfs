@@ -30,6 +30,29 @@ use super::params::{
     query_params_to_fhir_params,
 };
 
+/// Core subsumption logic shared by the POST and GET handlers.
+///
+/// Accepts two input forms (detected by inspecting `params`):
+///
+/// - **Bare code form** — `system` + `codeA` + `codeB` as separate parameters.
+/// - **Coding form** — `codingA` and `codingB` as `valueCoding` objects.
+///   Both codings must reference the same code system; an HTTP 400 is returned
+///   if they differ.
+///
+/// ## Returns
+///
+/// A FHIR `Parameters` resource with a single `outcome` parameter whose
+/// `valueCode` is one of `"equivalent"`, `"subsumes"`, `"subsumed-by"`, or
+/// `"not-subsumed"`.
+///
+/// ## Errors
+///
+/// | Condition | Error |
+/// |-----------|-------|
+/// | Missing `system` (bare form) | [`HtsError::InvalidRequest`] |
+/// | Cross-system codings | [`HtsError::InvalidRequest`] |
+/// | Neither form detected | [`HtsError::InvalidRequest`] |
+/// | Unknown code system | [`HtsError::NotFound`] |
 async fn process_subsumes<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,

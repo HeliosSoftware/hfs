@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "devicedefinition-warnings-example",
   "meta": {
-    "lastUpdated": "2026-03-29T05:41:31.558+11:00"
+    "lastUpdated": "2026-04-01T09:56:13.851+11:00"
   },
   "text": {
     "status": "generated",
