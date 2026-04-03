@@ -153,6 +153,7 @@ pub mod terminology;
 // Re-export commonly used types
 pub use config::{MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode};
 pub use error::{RestError, RestResult};
+pub use middleware::auth::AuthMiddlewareState;
 pub use state::AppState;
 pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
 
@@ -237,16 +238,62 @@ where
         + Sync
         + 'static,
 {
+    create_app_with_auth(storage, config, helios_auth::AuthConfig::default(), None)
+}
+
+/// Creates the Axum application with custom configuration and optional authentication.
+///
+/// When `auth_state` is `Some`, authentication and authorization middleware
+/// are added to the middleware stack.
+pub fn create_app_with_auth<S>(
+    storage: S,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + InstanceHistoryProvider
+        + BundleProvider
+        + Send
+        + Sync
+        + 'static,
+{
     info!(
         "Creating REST API server with backend: {}",
         storage.backend_name()
     );
+    if auth_state.is_some() {
+        info!("Authentication is ENABLED");
+    }
 
     // Create application state
-    let state = AppState::new(Arc::new(storage), config.clone());
+    let state = AppState::with_auth(
+        Arc::new(storage),
+        config.clone(),
+        auth_config,
+        auth_state.clone(),
+    );
 
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
+
+    // Apply auth middleware if enabled (outermost = runs first)
+    let router = if let Some(ref auth) = auth_state {
+        router
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::authz_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::auth_middleware,
+            ))
+    } else {
+        router
+    };
 
     // Build middleware stack
     let service_builder = ServiceBuilder::new()

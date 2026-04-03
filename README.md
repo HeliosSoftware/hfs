@@ -39,27 +39,28 @@ The server supports SQLite, PostgreSQL, Elasticsearch, and S3 in various configu
 
 Pre-built binaries are available on the [GitHub Releases](https://github.com/HeliosSoftware/hfs/releases) page. Download the appropriate archive for your platform and extract it.
 
-```bash
-# Start the FHIR server
-./hfs
-# Then access http://localhost:8080/metadata
+> **Windows users:** Add `.exe` to all binary names (e.g., `hfs.exe`, `fhirpath-cli.exe`, `sof-cli.exe`).
 
-# Run FHIRPath expressions
+The following are independent examples showing how to run each executable — pick whichever ones apply to your use case:
+
+```bash
+# FHIR server (access at http://localhost:8080/metadata)
+./hfs
+
+# Evaluate a FHIRPath expression
 echo '{"resourceType": "Patient", "id": "123"}' | ./fhirpath-cli 'Patient.id'
 
-# Transform FHIR to CSV using SQL-on-FHIR
+# Transform FHIR Bundle to CSV using SQL-on-FHIR
 ./sof-cli --view examples/patient-view.json --bundle examples/patients.json
 
-# Transform NDJSON file to CSV
+# Transform NDJSON file to CSV using SQL-on-FHIR
 ./sof-cli --view examples/patient-view.json --bundle examples/patients.ndjson
 
-# Start the SQL-on-FHIR server
+# SQL-on-FHIR HTTP server (POST to http://localhost:8080/ViewDefinition/$viewdefinition-run)
 ./sof-server
-# Then POST to http://localhost:8080/ViewDefinition/$viewdefinition-run
 
-# Start the FHIRPath server
+# FHIRPath HTTP server (POST expressions to http://localhost:3000/fhirpath)
 ./fhirpath-server
-# Then POST expressions to http://localhost:3000/fhirpath
 ```
 
 ## Using Docker Images
@@ -440,10 +441,15 @@ Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
 The Helios FHIR Server is licensed under the [MIT License](LICENSE).
 
-# Support
+# Community
 
-- **Issues**: [GitHub Issues](https://github.com/HeliosSoftware/hfs/issues)
-- **Website**: [heliossoftware.com](https://heliossoftware.com)
+We welcome contributors and feedback at every level — from opening issues to joining design discussions.
+
+- **📋 GitHub Discussions:** [github.com/HeliosSoftware/hfs/discussions](https://github.com/HeliosSoftware/hfs/discussions)
+- **🐛 Issues:** [github.com/HeliosSoftware/hfs/issues](https://github.com/HeliosSoftware/hfs/issues)
+- **🗓️ Weekly Developer Meeting:** Open to all. We review roadmap progress, discuss design decisions, and plan upcoming work. Details and updates are posted to [this GitHub Discussion](https://github.com/HeliosSoftware/hfs/discussions/40).
+- **💼 LinkedIn Group:** [linkedin.com/groups/8618077](https://www.linkedin.com/groups/8618077/) — Over 2,500 members
+- **🌐 Website:** [heliossoftware.com](https://heliossoftware.com)
 
 ---
 
