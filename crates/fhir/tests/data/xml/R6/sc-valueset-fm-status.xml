@@ -64,7 +64,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-fm-status"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="FinancialResourceStatusCodesCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Financial Resource Status Codes&quot;"/>
   <status value="draft"/>

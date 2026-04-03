@@ -8,6 +8,7 @@
 //! - [`conditional`] - Conditional request headers (If-Match, etc.)
 //! - [`prefer`] - Prefer header handling
 
+pub mod auth;
 pub mod conditional;
 pub mod content_type;
 pub mod prefer;

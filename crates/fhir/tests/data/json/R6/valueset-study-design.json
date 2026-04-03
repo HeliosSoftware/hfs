@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "study-design",
   "meta": {
-    "lastUpdated": "2026-03-31T22:56:13+00:00"
+    "lastUpdated": "2025-12-17T09:50:17+00:00"
   },
   "text": {
     "status": "extensions",
@@ -29,7 +29,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.3.3045"
     }
   ],
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "StudyDesign",
   "title": "Study Design",
   "status": "active",

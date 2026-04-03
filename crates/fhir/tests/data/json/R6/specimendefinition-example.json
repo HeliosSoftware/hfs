@@ -8,11 +8,9 @@
     }
   ],
   "url": "http://example-lab.com/specdef/123455",
-  "identifier": [
-    {
-      "value": "123455"
-    }
-  ],
+  "identifier": {
+    "value": "123455"
+  },
   "title": "Venous blood specimen",
   "status": "active",
   "experimental": true,

@@ -117,6 +117,60 @@
     "reference": "Practitioner/f007",
     "display": "Patrick Pump"
   },
+  "dosageInstruction": {
+    "simple": {
+      "text": "Apply twice daily to affected area on left arm",
+      "additionalInstruction": [
+        {
+          "text": "Apply sparingly"
+        }
+      ],
+      "timing": {
+        "repeat": {
+          "frequency": 2,
+          "period": 1,
+          "periodUnit": "d"
+        }
+      },
+      "site": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "72098002",
+            "display": "Entire left upper arm (body structure)"
+          }
+        ]
+      },
+      "route": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "359540000",
+            "display": "Topical (qualifier value)"
+          }
+        ]
+      },
+      "doseAndRate": [
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
+                "code": "ordered",
+                "display": "Ordered"
+              }
+            ]
+          },
+          "doseQuantity": {
+            "value": 1,
+            "unit": "ea",
+            "system": "http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm",
+            "code": "OINT"
+          }
+        }
+      ]
+    }
+  },
   "dispenseRequest": {
     "validityPeriod": {
       "start": "2015-01-15",

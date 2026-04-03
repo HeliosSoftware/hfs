@@ -6,9 +6,11 @@
 
 use std::sync::Arc;
 
+use helios_auth::AuthConfig;
 use helios_persistence::core::ResourceStorage;
 
 use crate::config::ServerConfig;
+use crate::middleware::auth::AuthMiddlewareState;
 
 /// Shared application state for the REST API.
 ///
@@ -36,6 +38,12 @@ pub struct AppState<S> {
 
     /// Server configuration.
     config: Arc<ServerConfig>,
+
+    /// Authentication configuration (always present, may be disabled).
+    auth_config: Arc<AuthConfig>,
+
+    /// Auth middleware state (present only when auth is enabled).
+    auth: Option<Arc<AuthMiddlewareState>>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -44,6 +52,8 @@ impl<S> Clone for AppState<S> {
         Self {
             storage: Arc::clone(&self.storage),
             config: Arc::clone(&self.config),
+            auth_config: Arc::clone(&self.auth_config),
+            auth: self.auth.clone(),
         }
     }
 }
@@ -59,6 +69,23 @@ impl<S: ResourceStorage> AppState<S> {
         Self {
             storage,
             config: Arc::new(config),
+            auth_config: Arc::new(AuthConfig::default()),
+            auth: None,
+        }
+    }
+
+    /// Creates a new AppState with auth configuration.
+    pub fn with_auth(
+        storage: Arc<S>,
+        config: ServerConfig,
+        auth_config: AuthConfig,
+        auth_state: Option<Arc<AuthMiddlewareState>>,
+    ) -> Self {
+        Self {
+            storage,
+            config: Arc::new(config),
+            auth_config: Arc::new(auth_config),
+            auth: auth_state,
         }
     }
 

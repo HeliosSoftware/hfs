@@ -78,11 +78,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Count"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="Count"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-03-31T22:56:13+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -105,7 +105,7 @@
     </coding>
   </jurisdiction>
   <purpose value="Need to able to capture all sorts of measured values, even if the measured value are not precisely quantified. Values include exact measures such as 3.51g, customary units such as 3 tablets, and currencies such as $100.32USD."/>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="v2"/>
     <uri value="http://hl7.org/v2"/>
@@ -313,7 +313,7 @@
         </extension>
         <strength value="required"/>
         <description value="How the Quantity should be understood and represented."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="v2"/>

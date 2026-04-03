@@ -16,7 +16,7 @@
       <Practitioner>
         <id value="a008e191-0dfa-3ab3-b035-49d7d2e69cb4"/>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Practitioner a008e191-0dfa-3ab3-b035-49d7d2e69cb4</b></p><a name="a008e191-0dfa-3ab3-b035-49d7d2e69cb4"> </a><a name="hca008e191-0dfa-3ab3-b035-49d7d2e69cb4"> </a><p><b>identifier</b>: <a href="http://terminology.hl7.org/7.1.0/NamingSystem-npi.html" title="National Provider Identifier">United States National Provider Identifier</a>/9999947796</p><p><b>active</b>: true</p><p><b>name</b>: Francisco472 Gusikowski974 </p><p><b>telecom</b>: <a href="mailto:Francisco472.Gusikowski974@example.com">Francisco472.Gusikowski974@example.com</a></p><p><b>gender</b>: Female</p><p><b>address</b>: 8 SHIPWAY PL # C-8 CHARLESTOWN MA 021294301 US </p></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Practitioner a008e191-0dfa-3ab3-b035-49d7d2e69cb4</b></p><a name="a008e191-0dfa-3ab3-b035-49d7d2e69cb4"> </a><a name="hca008e191-0dfa-3ab3-b035-49d7d2e69cb4"> </a><p><b>identifier</b>: <a href="http://terminology.hl7.org/7.0.0/NamingSystem-npi.html" title="National Provider Identifier">United States National Provider Identifier</a>/9999947796</p><p><b>active</b>: true</p><p><b>name</b>: Francisco472 Gusikowski974 </p><p><b>telecom</b>: <a href="mailto:Francisco472.Gusikowski974@example.com">Francisco472.Gusikowski974@example.com</a></p><p><b>gender</b>: Female</p><p><b>address</b>: 8 SHIPWAY PL # C-8 CHARLESTOWN MA 021294301 US </p></div>
         </text>
         <identifier>
           <system value="http://hl7.org/fhir/sid/us-npi"/>

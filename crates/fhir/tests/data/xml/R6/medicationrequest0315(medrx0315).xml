@@ -86,5 +86,68 @@
       </coding>
     </concept>
   </reason>
-  <dosageInstruction/>
+  <dosageInstruction>
+    <simple>
+      <text value="0.05 - 0.1mg/kg IV over 2-5 minutes every 15 minutes as needed"/>
+      <timing>
+        <repeat>
+          <frequency value="1"/>
+          <period value="15"/>
+          <periodUnit value="min"/>
+        </repeat>
+      </timing>
+      <asNeeded value="true"/>
+      <route>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="255560000"/>
+          <display value="Intravenous"/>
+        </coding>
+      </route>
+      <method>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="420620005"/>
+          <display value="Push - dosing instruction imperative (qualifier value)"/>
+        </coding>
+      </method>
+      <doseAndRate>
+        <type>
+          <coding>
+            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+            <code value="ordered"/>
+            <display value="Ordered"/>
+          </coding>
+        </type>
+        <doseRange>
+          <low>
+            <value value="0.05"/>
+            <unit value="mg/kg"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="mg/kg"/>
+          </low>
+          <high>
+            <value value="0.1"/>
+            <unit value="mg/kg"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="mg/kg"/>
+          </high>
+        </doseRange>
+        <rateRange>
+          <low>
+            <value value="2"/>
+            <unit value="min"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="min"/>
+          </low>
+          <high>
+            <value value="5"/>
+            <unit value="min"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="min"/>
+          </high>
+        </rateRange>
+      </doseAndRate>
+    </simple>
+  </dosageInstruction>
 </MedicationRequest>

@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "search-param-type",
   "meta": {
-    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
     "status": "generated",
@@ -33,12 +33,12 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.4.12"
     }
   ],
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "SearchParamType",
   "title": "SearchParamType",
   "status": "active",
   "experimental": false,
-  "date": "2026-03-31T22:56:13+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {

@@ -51,6 +51,42 @@
   },
   "whenPrepared": "2015-01-15T10:20:00Z",
   "whenHandedOver": "2015-01-15T16:20:00Z",
+  "dosageInstruction": {
+    "simple": {
+      "text": "Use two sprays twice daily",
+      "additionalInstruction": [
+        {
+          "text": "Shake Well"
+        }
+      ],
+      "timing": {
+        "repeat": {
+          "frequency": 2,
+          "period": 1,
+          "periodUnit": "d"
+        }
+      },
+      "doseAndRate": [
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
+                "code": "ordered",
+                "display": "Ordered"
+              }
+            ]
+          },
+          "doseQuantity": {
+            "value": 1,
+            "unit": "ea",
+            "system": "http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm",
+            "code": "ORINHL"
+          }
+        }
+      ]
+    }
+  },
   "meta": {
     "tag": [
       {

@@ -100,5 +100,50 @@
       </coding>
     </concept>
   </reason>
-  <dosageInstruction/>
+  <dosageInstruction>
+    <simple>
+      <text value="KCl 20 mEq in 1 L 0.9%NS IV at 100 ml/hr"/>
+      <timing>
+        <repeat>
+          <frequency value="1"/>
+          <period value="1"/>
+          <periodUnit value="h"/>
+        </repeat>
+      </timing>
+      <route>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="47625008"/>
+          <display value="Intravenous route"/>
+        </coding>
+      </route>
+      <doseAndRate>
+        <type>
+          <coding>
+            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+            <code value="ordered"/>
+            <display value="Ordered"/>
+          </coding>
+        </type>
+        <doseQuantity>
+          <value value="20"/>
+          <unit value="meq"/>
+          <system value="http://unitsofmeasure.org"/>
+          <code value="meq"/>
+        </doseQuantity>
+        <rateRatio>
+          <numerator>
+            <value value="100"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="mL"/>
+          </numerator>
+          <denominator>
+            <value value="1"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="h"/>
+          </denominator>
+        </rateRatio>
+      </doseAndRate>
+    </simple>
+  </dosageInstruction>
 </MedicationRequest>

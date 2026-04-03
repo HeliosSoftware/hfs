@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "Person",
   "meta": {
-    "lastUpdated": "2026-03-31T22:56:13.851+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Person",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "Person",
   "status": "active",
   "experimental": false,
-  "date": "2026-03-31T22:56:13+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / Patient Administration",
   "contact": [
     {
@@ -64,7 +64,7 @@
     }
   ],
   "purpose": "Need to track persons potentially across multiple roles.",
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "w5",
@@ -296,7 +296,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
           "additional": [
             {
               "purpose": "starter",
@@ -690,7 +690,7 @@
           ],
           "strength": "required",
           "description": "The gender of a person used for administrative purposes.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -1130,7 +1130,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
           "additional": [
             {
               "purpose": "starter",
@@ -1474,7 +1474,7 @@
           ],
           "strength": "required",
           "description": "The level of confidence that this link represents the same actual person, based on NIST Authentication Levels.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/identity-assuranceLevel|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/identity-assuranceLevel|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -1654,7 +1654,7 @@
           ],
           "strength": "required",
           "description": "The gender of a person used for administrative purposes.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -1875,7 +1875,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
           "additional": [
             {
               "purpose": "starter",
@@ -2028,7 +2028,7 @@
           ],
           "strength": "required",
           "description": "The level of confidence that this link represents the same actual person, based on NIST Authentication Levels.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/identity-assuranceLevel|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/identity-assuranceLevel|6.0.0-ballot3"
         },
         "mapping": [
           {

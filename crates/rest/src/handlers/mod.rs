@@ -25,6 +25,7 @@ pub mod history;
 pub mod patch;
 pub mod read;
 pub mod search;
+pub mod smart_discovery;
 pub mod update;
 pub mod versions;
 pub mod vread;
