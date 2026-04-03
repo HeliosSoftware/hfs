@@ -139,6 +139,11 @@ impl<S: ResourceStorage> AppState<S> {
         self.config.return_gone
     }
 
+    /// Returns a reference to the auth configuration.
+    pub fn auth_config(&self) -> &AuthConfig {
+        &self.auth_config
+    }
+
     /// Returns the configured terminology server URL, if any.
     ///
     /// When `Some`, the search handler will use this URL to expand ValueSets

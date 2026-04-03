@@ -208,6 +208,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let (auth_config, auth_state) = init_auth().await?;
+
     info!(
         port = config.port,
         host = %config.host,
