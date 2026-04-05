@@ -232,21 +232,15 @@ AWS_REGION=us-east-1 \
 | `HFS_S3_REGION` | *(AWS provider chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix prepended to all S3 object keys |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
-| `HFS_AUDIT_BACKEND` | `none` | Audit backend: `none` or `file` (`database` is currently not wired in `hfs`) |
+| `HFS_AUDIT_BACKEND` | `none` | [Audit backend](crates/persistence/README.md#building--running-storage-backends): `none`, `file`, or `cloudwatch` (`database` is currently not wired in `hfs`) |
 | `HFS_AUDIT_FILE_PATH` | *(none)* | Required when `HFS_AUDIT_BACKEND=file`; NDJSON file path for persisted `AuditEvent` logs |
 | `HFS_AUDIT_SOURCE_OBSERVER` | `Device/hfs` | Sets `AuditEvent.source.observer` |
 | `HFS_AUDIT_EXCLUDE_PATHS` | *(none)* | Comma-separated paths to exclude from audit middleware |
+| `HFS_AUDIT_CLOUDWATCH_LOG_GROUP` | *(none)* | Required when `HFS_AUDIT_BACKEND=cloudwatch`; CloudWatch Logs log group name |
+| `HFS_AUDIT_CLOUDWATCH_LOG_STREAM` | `hfs-audit` | CloudWatch Logs log stream name |
+| `HFS_AUDIT_CLOUDWATCH_REGION` | *(AWS chain)* | AWS region override for CloudWatch Logs |
 
 For detailed backend setup instructions (building from source, Docker commands, and search offloading architecture), see the [persistence crate documentation](crates/persistence/README.md#building--running-storage-backends).
-
-### Audit Logging (BALP)
-
-Set `HFS_AUDIT_BACKEND=file` and `HFS_AUDIT_FILE_PATH=/path/to/audit.ndjson` to enable append-only FHIR `AuditEvent` logging.
-
-- Search and history interactions are classified as BALP query events (for example: `GET /Patient`, `GET /_history`, `GET /Patient/123/_history`, `POST /Patient/_search`).
-- Create/update/patch audits are enriched with response context, including assigned resource IDs and patient references derived from the resulting resource body.
-- Batch/transaction requests (`POST /`) emit per-entry audit events from the batch handler (instead of one coarse request-level event), including rollback failure outcomes for failed transactions.
-- File sink writes are flushed after each event to reduce acknowledged-event loss on process crash.
 
 # Architecture Overview
 
@@ -335,6 +329,9 @@ Common types and traits for FHIRPath evaluation.
 
 ### 10. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
 Storage backend abstraction supporting multiple database technologies optimized for different FHIR workloads.
+
+### 11. [`helios-audit`](crates/audit) - BALP Audit Logging
+[IHE BALP](https://profiles.ihe.net/ITI/BALP/)-compliant `AuditEvent` logging for REST, auth, persistence, and lifecycle events. Supports file, database, and AWS CloudWatch Logs sinks. See the [helios-audit README](crates/audit/README.md) for full configuration details.
 
 ## Design Principles
 
