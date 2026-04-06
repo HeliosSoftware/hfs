@@ -45,7 +45,7 @@ jobs:
   # Release binary for integration tests (R4 + R4B + R5)
   # ─────────────────────────────────────────────────────────────────────────────
   build:
-    name: Build HTS binary (R4 + R4B + R5)
+    name: Build HTS binary (R4 + R5)
     runs-on: [self-hosted]
     needs: check
     steps:
@@ -68,8 +68,8 @@ jobs:
           printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]\n' \
             > ~/.cargo/config.toml
 
-      - name: cargo build --release (R4 + R4B + R5)
-        run: cargo build --release -p helios-hts --features "R4,R4B,R5"
+      - name: cargo build --release (R4 + R5)
+        run: cargo build --release -p helios-hts --features "R4,R5"
 
       - name: Upload HTS binary
         uses: actions/upload-artifact@v4
