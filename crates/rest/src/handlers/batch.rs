@@ -520,6 +520,7 @@ fn emit_transaction_entry_audit<S>(
 }
 
 /// Builds and records an audit event for a bundle entry result.
+#[allow(clippy::too_many_arguments)]
 fn emit_entry_audit<S>(
     state: &AppState<S>,
     method: &str,
@@ -591,10 +592,10 @@ fn emit_entry_audit<S>(
         builder = builder.outcome_desc(desc);
     }
 
-    if let Some(id) = resource_id.as_deref() {
-        if !resource_type.is_empty() {
-            builder = builder.resource(&resource_type, id);
-        }
+    if let Some(id) = resource_id.as_deref()
+        && !resource_type.is_empty()
+    {
+        builder = builder.resource(&resource_type, id);
     }
     if let Some(correlation) = correlation {
         builder = builder
