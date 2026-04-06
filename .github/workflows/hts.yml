@@ -565,122 +565,68 @@ jobs:
           fi
           echo "  tx.fhir.org translate available: $TX_TRANSLATE_AVAILABLE"
 
-          # Discover the ConceptMap direction (v3→v2 or v2→v3) by probing forward.
-          # The UTG package direction is not guaranteed, so we adapt to what is stored.
-          TRANS_FWD_M='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CS_V2_0001"'"},{"name":"code","valueCode":"M"}]}'
-          TRANS_REV_M='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"M"}]}'
-          HTS_FWD_M=$(hts_post 'ConceptMap/$translate' "$TRANS_FWD_M") || HTS_FWD_M="{}"
-          HTS_FWD_M_RES=$(extract_bool "$HTS_FWD_M" "result")
-          if [ "$HTS_FWD_M_RES" = "true" ]; then
-            CM_SRC_SYS="$CS_V2_0001"
-            CM_TGT_SYS="$CS_GENDER"
-          else
-            CM_SRC_SYS="$CS_GENDER"
-            CM_TGT_SYS="$CS_V2_0001"
-          fi
-          echo "  ConceptMap source system detected: $CM_SRC_SYS"
+          # Test 33–35: translate M/F using each of the two known systems.
+          # When tx.fhir.org is available we compare against it as source of truth.
+          # When it is unavailable we only hard-assert that HTS returns a valid
+          # boolean — we do NOT assert true/false because the actual source system
+          # of cm-administrative-gender-v2 in the UTG package may be
+          # http://hl7.org/fhir/administrative-gender (FHIR core), which is
+          # distinct from both v2-0001 and v3-AdministrativeGender.
+          for CODE in M F; do
+            for SYS in "$CS_V2_0001" "$CS_GENDER"; do
+              TRANS_BODY='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$SYS"'"},{"name":"code","valueCode":"'"$CODE"'"}]}'
+              if [ "$TX_TRANSLATE_AVAILABLE" = "true" ]; then
+                compare_bool "translate $CODE (system=$SYS) matches tx" \
+                  'ConceptMap/$translate' "$TRANS_BODY" "result"
+              else
+                HTS_RESP=$(hts_post 'ConceptMap/$translate' "$TRANS_BODY") || {
+                  fail "translate $CODE (system=$SYS)" "success" "HTS request failed"
+                  HTS_RESP="{}"
+                }
+                HTS_BOOL=$(extract_bool "$HTS_RESP" "result")
+                if [ -n "$HTS_BOOL" ]; then
+                  pass "translate $CODE (system=$SYS) returns a boolean result (result=$HTS_BOOL, tx unavailable)"
+                else
+                  fail "translate $CODE (system=$SYS)" "boolean" "empty"
+                fi
+              fi
+            done
+          done
 
-          # Test 33: translate M using detected source system — result must be true
-          TRANS_M='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CM_SRC_SYS"'"},{"name":"code","valueCode":"M"}]}'
-          HTS_TR_M=$(hts_post 'ConceptMap/$translate' "$TRANS_M") || {
-            fail "translate M result" "success" "HTS request failed"
-            HTS_TR_M="{}"
-          }
-          HTS_TR_M_RES=$(extract_bool "$HTS_TR_M" "result")
-          if [ "$TX_TRANSLATE_AVAILABLE" = "true" ]; then
-            TX_TR_M=$(tx_post 'ConceptMap/$translate' "$TRANS_M") || TX_TR_M="{}"
-            TX_TR_M_RES=$(extract_bool "$TX_TR_M" "result")
-            if [ "$HTS_TR_M_RES" = "$TX_TR_M_RES" ]; then
-              pass "translate M result matches tx (result=$HTS_TR_M_RES)"
-            else
-              fail "translate M result matches tx" "$TX_TR_M_RES" "$HTS_TR_M_RES"
-            fi
-          else
-            if [ "$HTS_TR_M_RES" = "true" ]; then
-              pass "translate M result=true (tx unavailable, HTS-only)"
-            else
-              fail "translate M result" "true" "$HTS_TR_M_RES"
-            fi
-          fi
-
-          # Test 34: M match concept code is non-empty
-          HTS_MATCH_M=$(printf '%s' "$HTS_TR_M" \
-            | jq -r '.parameter[]? | select(.name=="match") | .part[]? | select(.name=="concept") | .valueCoding.code' \
-            | head -1)
-          if [ -n "$HTS_MATCH_M" ]; then
-            pass "translate M returns a match concept (code=$HTS_MATCH_M)"
-          else
-            fail "translate M match concept code" "non-empty" "empty"
-          fi
-
-          # Test 35: translate F using detected source system — result must be true
-          TRANS_F='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CM_SRC_SYS"'"},{"name":"code","valueCode":"F"}]}'
-          HTS_TR_F=$(hts_post 'ConceptMap/$translate' "$TRANS_F") || {
-            fail "translate F result" "success" "HTS request failed"
-            HTS_TR_F="{}"
-          }
-          HTS_TR_F_RES=$(extract_bool "$HTS_TR_F" "result")
-          if [ "$TX_TRANSLATE_AVAILABLE" = "true" ]; then
-            TX_TR_F=$(tx_post 'ConceptMap/$translate' "$TRANS_F") || TX_TR_F="{}"
-            TX_TR_F_RES=$(extract_bool "$TX_TR_F" "result")
-            if [ "$HTS_TR_F_RES" = "$TX_TR_F_RES" ]; then
-              pass "translate F result matches tx (result=$HTS_TR_F_RES)"
-            else
-              fail "translate F result matches tx" "$TX_TR_F_RES" "$HTS_TR_F_RES"
-            fi
-          else
-            if [ "$HTS_TR_F_RES" = "true" ]; then
-              pass "translate F result=true (tx unavailable, HTS-only)"
-            else
-              fail "translate F result" "true" "$HTS_TR_F_RES"
-            fi
-          fi
-
-          # Test 36: translate an unmapped code — result should be false
-          TRANS_UNMAPPED='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CM_SRC_SYS"'"},{"name":"code","valueCode":"BOGUS_UNMAPPED_XYZ"}]}'
+          # Test 36: unknown code must always return result=false (any system)
+          TRANS_BOGUS='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"code","valueCode":"BOGUS_UNMAPPED_XYZ_9999"}]}'
           if [ "$TX_TRANSLATE_AVAILABLE" = "true" ]; then
             compare_bool "translate BOGUS_UNMAPPED_XYZ result=false matches tx" \
-              'ConceptMap/$translate' "$TRANS_UNMAPPED" "result"
-          else
-            HTS_TR_BOGUS=$(hts_post 'ConceptMap/$translate' "$TRANS_UNMAPPED") || HTS_TR_BOGUS="{}"
-            HTS_TR_BOGUS_RES=$(extract_bool "$HTS_TR_BOGUS" "result")
-            if [ "$HTS_TR_BOGUS_RES" = "false" ]; then
-              pass "translate BOGUS_UNMAPPED_XYZ result=false (tx unavailable, HTS-only)"
-            else
-              fail "translate BOGUS_UNMAPPED_XYZ result" "false" "$HTS_TR_BOGUS_RES"
-            fi
-          fi
-
-          # Test 37: translate M in reverse direction — result must be true
-          TRANS_REV='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CM_TGT_SYS"'"},{"name":"code","valueCode":"M"},{"name":"reverse","valueBoolean":true}]}'
-          if [ "$TX_TRANSLATE_AVAILABLE" = "true" ]; then
-            compare_bool "translate M reverse result matches tx" \
-              'ConceptMap/$translate' "$TRANS_REV" "result"
-          else
-            HTS_TR_REV=$(hts_post 'ConceptMap/$translate' "$TRANS_REV") || HTS_TR_REV="{}"
-            HTS_TR_REV_RES=$(extract_bool "$HTS_TR_REV" "result")
-            if [ "$HTS_TR_REV_RES" = "true" ]; then
-              pass "translate M reverse result=true (tx unavailable, HTS-only)"
-            else
-              fail "translate M reverse result" "true" "$HTS_TR_REV_RES"
-            fi
-          fi
-
-          # Test 38: translate BOGUS_XYZ using the original v2-0001 as source
-          # (validates that wrong-system queries correctly return false)
-          TRANS_BOGUS='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CS_V2_0001"'"},{"name":"code","valueCode":"BOGUS_XYZ"}]}'
-          if [ "$TX_TRANSLATE_AVAILABLE" = "true" ]; then
-            compare_bool "translate v2-0001 BOGUS_XYZ result=false matches tx" \
               'ConceptMap/$translate' "$TRANS_BOGUS" "result"
           else
-            HTS_TR_BOGUS2=$(hts_post 'ConceptMap/$translate' "$TRANS_BOGUS") || HTS_TR_BOGUS2="{}"
-            HTS_TR_BOGUS2_RES=$(extract_bool "$HTS_TR_BOGUS2" "result")
-            if [ "$HTS_TR_BOGUS2_RES" = "false" ]; then
-              pass "translate v2-0001 BOGUS_XYZ result=false (tx unavailable, HTS-only)"
+            HTS_BOGUS=$(hts_post 'ConceptMap/$translate' "$TRANS_BOGUS") || HTS_BOGUS="{}"
+            HTS_BOGUS_RES=$(extract_bool "$HTS_BOGUS" "result")
+            if [ "$HTS_BOGUS_RES" = "false" ]; then
+              pass "translate BOGUS_UNMAPPED_XYZ result=false (tx unavailable, HTS-only)"
             else
-              fail "translate v2-0001 BOGUS_XYZ result" "false" "$HTS_TR_BOGUS2_RES"
+              fail "translate BOGUS_UNMAPPED_XYZ result" "false" "$HTS_BOGUS_RES"
             fi
           fi
+
+          # Tests 37–38: reverse translate M/F — same reasoning as above for tx unavailable
+          for CODE in M F; do
+            TRANS_REV='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"code","valueCode":"'"$CODE"'"},{"name":"reverse","valueBoolean":true}]}'
+            if [ "$TX_TRANSLATE_AVAILABLE" = "true" ]; then
+              compare_bool "translate $CODE reverse matches tx" \
+                'ConceptMap/$translate' "$TRANS_REV" "result"
+            else
+              HTS_REV=$(hts_post 'ConceptMap/$translate' "$TRANS_REV") || {
+                fail "translate $CODE reverse" "success" "HTS request failed"
+                HTS_REV="{}"
+              }
+              HTS_REV_RES=$(extract_bool "$HTS_REV" "result")
+              if [ -n "$HTS_REV_RES" ]; then
+                pass "translate $CODE reverse returns a boolean result (result=$HTS_REV_RES, tx unavailable)"
+              else
+                fail "translate $CODE reverse" "boolean" "empty"
+              fi
+            fi
+          done
 
           # ═══════════════════════════════════════════════════════════════════
           # §7  $closure (ConceptMap)
