@@ -47,9 +47,10 @@ Work that is currently underway or planned for the near term.
 
 | Area | Item | Status |
 |------|------|--------|
-| **Compliance** | [Audit logging (AuditEvent resource support)](https://github.com/HeliosSoftware/hfs/discussions/50) | 🔵 Design |
+| **Compliance** | [Audit logging (AuditEvent resource support)](https://github.com/HeliosSoftware/hfs/discussions/50) | 🟡 In progress |
+| **Standards** | [Terminology](https://github.com/HeliosSoftware/hfs/discussions/54) | 🟡 In progress |
 | **Standards** | FHIR Validation engine | 🔵 Design |
-| **Documentation** | Project documentation website | 🔵 Design |
+| **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
 ### Discussion Documents
 
@@ -69,15 +70,8 @@ These items are well-understood and will be picked up once current work complete
 
 - **Bulk Data API** — Import and export (`$export` / `$import` operations)
 - **FHIR Subscriptions** — Topic-based notification support
-- **Terminology Server** — CodeSystem `$lookup`, ValueSet `$expand`, ConceptMap `$translate`
 - **SMART on FHIR** — Full launch framework (standalone launch, EHR launch) and fine-grained scoped access
 - **SQL on FHIR** — [SQL on FHIR operations](https://sql-on-fhir.org/ig/latest/operations.html) - using read-only database connections
-
-### Persistence Backends
-
-- Cassandra as a primary store
-- ClickHouse as a primary store
-- Cassandra with Elasticsearch as a query secondary
 
 ### Developer Experience
 
@@ -94,6 +88,9 @@ Longer-term ideas we are exploring. These are not yet committed and may evolve s
 
 ### Advanced Persistence
 
+- Cassandra as a primary store
+- Cassandra with Elasticsearch as a query secondary
+- ClickHouse as a primary store
 - Neo4j as a primary store
 - PostgreSQL with Neo4j as a graph query secondary
 
