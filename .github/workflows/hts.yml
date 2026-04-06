@@ -91,10 +91,10 @@ jobs:
       matrix:
         include:
           - label: R4
-            utg_url: https://build.fhir.org/ig/HL7/UTG/en/hl7.terminology.r4.tgz
+            utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r4.tgz
             tx_base: https://tx.fhir.org/r4
           #          - label: R5
-          #  utg_url: https://build.fhir.org/ig/HL7/UTG/en/hl7.terminology.r5.tgz
+          #  utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r5.tgz
           #  tx_base: https://tx.fhir.org/r5
 
     steps:
