@@ -148,6 +148,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             };
 
             // Optionally validate the caller's expected display.
+            // Per FHIR spec, a display mismatch causes result=false (with a message).
             let message = req.display.as_ref().and_then(|expected| {
                 let actual = display.as_deref().unwrap_or("");
                 if actual != expected.as_str() {
@@ -161,7 +162,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             });
 
             Ok(ValidateCodeResponse {
-                result: true,
+                result: message.is_none(),
                 message,
                 display,
             })
@@ -749,7 +750,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_code_display_mismatch_still_valid_but_has_message() {
+    async fn validate_code_display_mismatch_returns_false_with_message() {
         let b = backend();
         seed(&b);
 
@@ -766,7 +767,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(resp.result, "code itself is valid");
+        assert!(!resp.result, "display mismatch makes result=false per FHIR spec");
         assert!(
             resp.message.is_some(),
             "display mismatch should produce a message"

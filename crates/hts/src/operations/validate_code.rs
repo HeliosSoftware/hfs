@@ -533,7 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn display_mismatch_includes_message() {
+    async fn display_mismatch_returns_false_with_message() {
         let app = make_app();
         let body = json!({
             "resourceType": "Parameters",
@@ -550,8 +550,8 @@ mod tests {
         let params = json["parameter"].as_array().unwrap();
         let result_param = params.iter().find(|p| p["name"] == "result").unwrap();
         assert_eq!(
-            result_param["valueBoolean"], true,
-            "code is valid even with mismatch"
+            result_param["valueBoolean"], false,
+            "display mismatch makes result=false per FHIR spec"
         );
 
         let has_message = params.iter().any(|p| p["name"] == "message");

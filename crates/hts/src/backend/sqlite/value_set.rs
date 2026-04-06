@@ -248,8 +248,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             }
                         }
                     }
+                    // Per FHIR spec, a display mismatch causes result=false (with a message).
                     Ok(ValidateCodeResponse {
-                        result: true,
+                        result: message.is_none(),
                         message,
                         display: concept.display.clone(),
                     })
@@ -1120,10 +1121,10 @@ mod tests {
         assert!(!resp.result);
     }
 
-    // ── $validate-code: display mismatch returns true with message ─────────────
+    // ── $validate-code: display mismatch returns false with message ───────────────
 
     #[tokio::test]
-    async fn validate_code_display_mismatch_is_true_with_message() {
+    async fn validate_code_display_mismatch_returns_false_with_message() {
         let b = backend();
         b.import_bundle(&ctx(), bundle_with_explicit_codes().as_bytes())
             .await
@@ -1142,7 +1143,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(resp.result, "code is valid even with a display mismatch");
+        assert!(!resp.result, "display mismatch makes result=false per FHIR spec");
         assert!(
             resp.message.is_some(),
             "mismatch message should be included"
