@@ -1,6 +1,7 @@
 name: HTS Terminology Service CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, develop]
     paths:
@@ -11,14 +12,17 @@ on:
     paths:
       - "crates/hts/**"
       - ".github/workflows/hts.yml"
-  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
+  HTS_PORT: 8095
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Fast feedback: check, lint, and unit tests
+  # ─────────────────────────────────────────────────────────────────────────────
   check:
     name: Check helios-hts
     runs-on: [self-hosted]
@@ -49,7 +53,7 @@ jobs:
 
       - name: cargo clippy
         run: >
-          cargo clippy -p helios-hts --all-targets --
+          cargo clippy -p helios-hts --all-targets --all-features --
           -D warnings
           -A clippy::items_after_test_module
           -A clippy::large_enum_variant
@@ -63,7 +67,697 @@ jobs:
       - name: cargo test (R4 — default)
         run: cargo test -p helios-hts
 
-  # test-versions is disabled until helios-fhirpath supports R4B/R5/R6 match arms.
-  # Enabling --features R4B/R5/R6 on helios-hts propagates helios-fhir/R4B to fhirpath
-  # via Cargo feature unification, causing non-exhaustive match compile errors in fhirpath.
-  # Re-enable once fhirpath FhirVersion match arms cover all variants.
+  test-versions:
+    name: Unit tests — FHIR ${{ matrix.version }}
+    runs-on: [self-hosted]
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [R4B, R5, R6]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        if: runner.os != 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust linker (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
+
+      - name: cargo test (FHIR ${{ matrix.version }})
+        run: cargo test -p helios-hts --features ${{ matrix.version }}
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Release binary for integration tests (R4 + R4B + R5)
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build HTS binary (R4 + R4B + R5)
+    runs-on: [self-hosted]
+    needs: check
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        if: runner.os != 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust linker (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]\n' \
+            > ~/.cargo/config.toml
+
+      - name: cargo build --release (R4 + R4B + R5)
+        run: cargo build --release -p helios-hts --features "R4,R4B,R5"
+
+      - name: Upload HTS binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hts-binary
+          path: target/release/hts
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # End-to-end conformance tests against real UTG terminology data
+  # Compares every operation against tx.fhir.org as source of truth
+  # ─────────────────────────────────────────────────────────────────────────────
+  integration-test:
+    name: Integration tests — FHIR ${{ matrix.label }}
+    runs-on: [self-hosted]
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: R4
+            utg_url: https://build.fhir.org/ig/HL7/UTG/en/hl7.terminology.r4.tgz
+            tx_base: https://tx.fhir.org/r4
+          - label: R5
+            utg_url: https://build.fhir.org/ig/HL7/UTG/en/hl7.terminology.r5.tgz
+            tx_base: https://tx.fhir.org/r5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Download HTS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hts-binary
+          path: .
+
+      - name: Make binary executable
+        run: chmod +x ./hts
+
+      - name: Ensure jq is installed
+        if: runner.os == 'Linux'
+        run: command -v jq || sudo apt-get install -y jq
+
+      - name: Download UTG terminology package (${{ matrix.label }})
+        run: |
+          echo "Downloading ${{ matrix.utg_url }}"
+          curl -fsSL --max-time 300 "${{ matrix.utg_url }}" -o utg.tgz
+          ls -lh utg.tgz
+
+      - name: Create data directory
+        run: mkdir -p ./data
+
+      - name: Import UTG terminology (${{ matrix.label }})
+        run: |
+          ./hts import ./utg.tgz \
+            --database-url "./data/hts-${{ matrix.label }}.db" \
+            --batch-size 500 \
+            --verbose
+          IMPORT_CODE=$?
+          # exit 0 = clean; exit 2 = success with non-fatal warnings (acceptable)
+          if [ "$IMPORT_CODE" -eq 1 ]; then
+            echo "ERROR: import failed fatally (exit 1)"
+            exit 1
+          fi
+          echo "Import completed (exit code $IMPORT_CODE)"
+
+      - name: Kill any leftover process on port ${{ env.HTS_PORT }}
+        run: fuser -k "${{ env.HTS_PORT }}/tcp" 2>/dev/null || true
+
+      - name: Start HTS server (${{ matrix.label }})
+        run: |
+          HTS_SERVER_PORT="${{ env.HTS_PORT }}" \
+          HTS_DATABASE_URL="./data/hts-${{ matrix.label }}.db" \
+          HTS_LOG_LEVEL="warn" \
+            ./hts serve > "/tmp/hts-${{ matrix.label }}.log" 2>&1 &
+
+          echo "HTS_PID=$!" >> "$GITHUB_ENV"
+          echo "Started HTS server (PID=$!)"
+
+          # Poll /health — give server up to 60 s to become ready
+          for i in $(seq 1 30); do
+            if curl -sf "http://localhost:${{ env.HTS_PORT }}/health" > /dev/null 2>&1; then
+              echo "Server ready after $((i * 2)) seconds"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: server did not start within 60 s"
+              echo "--- server log ---"
+              cat "/tmp/hts-${{ matrix.label }}.log" || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Run terminology integration tests (${{ matrix.label }})
+        env:
+          HTS_BASE: http://localhost:${{ env.HTS_PORT }}
+          TX_BASE: ${{ matrix.tx_base }}
+          FHIR_LABEL: ${{ matrix.label }}
+        run: |
+          # Do NOT use set -e here — all tests must run before reporting failures.
+          set -uo pipefail
+
+          FAILURES=0
+          TESTS=0
+          SECTION=""
+
+          # ── Test harness ───────────────────────────────────────────────────
+
+          section() { SECTION="$1"; echo ""; echo "=== $SECTION ==="; }
+
+          pass() {
+            echo "  PASS [$SECTION] $*"
+            TESTS=$((TESTS + 1))
+          }
+
+          fail() {
+            local name="$1" expected="${2:-}" actual="${3:-}"
+            echo "  FAIL [$SECTION] $name | expected='$expected' got='$actual'"
+            TESTS=$((TESTS + 1))
+            FAILURES=$((FAILURES + 1))
+          }
+
+          hts_post() {
+            curl -sf --max-time 30 \
+              -X POST "$HTS_BASE/$1" \
+              -H "Content-Type: application/fhir+json" \
+              -d "$2"
+          }
+
+          tx_post() {
+            curl -sf --max-time 60 \
+              -X POST "$TX_BASE/$1" \
+              -H "Content-Type: application/fhir+json" \
+              -d "$2"
+          }
+
+          # Returns only the HTTP status code (used to assert 4xx error responses)
+          hts_status() {
+            curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+              -X POST "$HTS_BASE/$1" \
+              -H "Content-Type: application/fhir+json" \
+              -d "$2"
+          }
+
+          # Extract a string/code/uri named parameter from a FHIR Parameters JSON blob
+          extract_str() {
+            printf '%s' "$1" \
+              | jq -r --arg n "$2" \
+                  '.parameter[]? | select(.name == $n) | (.valueString // .valueCode // .valueUri // empty)' \
+              | head -1
+          }
+
+          # Extract a boolean parameter as the string "true" or "false"
+          extract_bool() {
+            printf '%s' "$1" \
+              | jq -r --arg n "$2" \
+                  '.parameter[]? | select(.name == $n) | .valueBoolean | tostring' \
+              | head -1
+          }
+
+          # Compare a boolean parameter between HTS and tx.fhir.org.
+          # Hard-fails if either server is unreachable or values differ.
+          compare_bool() {
+            local name="$1" endpoint="$2" body="$3" field="$4"
+            local hts_resp tx_resp hts_val tx_val
+
+            hts_resp=$(hts_post "$endpoint" "$body") || {
+              fail "$name" "success" "HTS request failed"
+              return
+            }
+            tx_resp=$(tx_post "$endpoint" "$body") || {
+              fail "$name" "success" "tx.fhir.org request failed"
+              return
+            }
+
+            hts_val=$(extract_bool "$hts_resp" "$field")
+            tx_val=$(extract_bool "$tx_resp" "$field")
+
+            if [ "$hts_val" = "$tx_val" ]; then
+              pass "$name (${field}=${hts_val})"
+            else
+              fail "$name" "$tx_val" "$hts_val"
+            fi
+          }
+
+          # Compare a string/code parameter between HTS and tx.fhir.org.
+          compare_str() {
+            local name="$1" endpoint="$2" body="$3" field="$4"
+            local hts_resp tx_resp hts_val tx_val
+
+            hts_resp=$(hts_post "$endpoint" "$body") || {
+              fail "$name" "success" "HTS request failed"
+              return
+            }
+            tx_resp=$(tx_post "$endpoint" "$body") || {
+              fail "$name" "success" "tx.fhir.org request failed"
+              return
+            }
+
+            hts_val=$(extract_str "$hts_resp" "$field")
+            tx_val=$(extract_str "$tx_resp" "$field")
+
+            if [ "$hts_val" = "$tx_val" ]; then
+              pass "$name (${field}='${hts_val}')"
+            else
+              fail "$name" "$tx_val" "$hts_val"
+            fi
+          }
+
+          # ── Shared terminology URIs ────────────────────────────────────────
+
+          CS_GENDER="http://terminology.hl7.org/CodeSystem/v3-AdministrativeGender"
+          CS_ACTSTATUS="http://terminology.hl7.org/CodeSystem/v3-ActStatus"
+          CS_V2_0001="http://terminology.hl7.org/CodeSystem/v2-0001"
+          VS_GENDER="http://terminology.hl7.org/ValueSet/v3-AdministrativeGender"
+          VS_ACTSTATUS="http://terminology.hl7.org/ValueSet/v3-ActStatus"
+          CM_GENDER_V2="http://terminology.hl7.org/ConceptMap/cm-administrative-gender-v2"
+
+          # ═══════════════════════════════════════════════════════════════════
+          # §1  $lookup (CodeSystem)
+          # ═══════════════════════════════════════════════════════════════════
+          section "\$lookup (CodeSystem)"
+
+          # Tests 1–3: display of M / F / UN must match tx.fhir.org
+          for CODE in M F UN; do
+            compare_str "lookup v3-AdministrativeGender $CODE display" \
+              'CodeSystem/$lookup' \
+              '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"'"$CODE"'"}]}' \
+              "display"
+          done
+
+          # Tests 4–6: display of active / completed / cancelled must match tx.fhir.org
+          for CODE in active completed cancelled; do
+            compare_str "lookup v3-ActStatus $CODE display" \
+              'CodeSystem/$lookup' \
+              '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_ACTSTATUS"'"},{"name":"code","valueCode":"'"$CODE"'"}]}' \
+              "display"
+          done
+
+          # Test 7: response includes a 'name' parameter (CodeSystem name)
+          RESP=$(hts_post 'CodeSystem/$lookup' \
+            '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"M"}]}') || {
+            fail "lookup v3-AdministrativeGender M returns name param" "non-empty" "HTS request failed"
+            RESP="{}"
+          }
+          NAME_VAL=$(extract_str "$RESP" "name")
+          if [ -n "$NAME_VAL" ]; then
+            pass "lookup v3-AdministrativeGender M returns name param (name=$NAME_VAL)"
+          else
+            fail "lookup v3-AdministrativeGender M returns name param" "non-empty string" "empty"
+          fi
+
+          # Test 8: non-existent code → HTTP 4xx
+          HTTP_CODE=$(hts_status 'CodeSystem/$lookup' \
+            '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"BOGUS_NONEXISTENT_XYZ"}]}')
+          if [[ "$HTTP_CODE" =~ ^4[0-9][0-9]$ ]]; then
+            pass "lookup unknown code returns 4xx (HTTP $HTTP_CODE)"
+          else
+            fail "lookup unknown code returns 4xx" "4xx" "$HTTP_CODE"
+          fi
+
+          # ═══════════════════════════════════════════════════════════════════
+          # §2  $validate-code (CodeSystem)
+          # ═══════════════════════════════════════════════════════════════════
+          section "\$validate-code (CodeSystem)"
+
+          # Tests 9–10: known valid codes → result=true, matches tx.fhir.org
+          for CODE in M F; do
+            compare_bool "validate-code CS v3-AdministrativeGender $CODE result" \
+              'CodeSystem/$validate-code' \
+              '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"'"$CODE"'"}]}' \
+              "result"
+          done
+
+          # Test 11: invalid code → result=false, matches tx.fhir.org
+          compare_bool "validate-code CS v3-AdministrativeGender INVALID_XYZ result=false" \
+            'CodeSystem/$validate-code' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"INVALID_XYZ"}]}' \
+            "result"
+
+          # Test 12: correct display → result=true (HTS assertion)
+          RESP=$(hts_post 'CodeSystem/$validate-code' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"M"},{"name":"display","valueString":"Male"}]}') || {
+            fail "validate-code CS M display=Male result=true" "true" "HTS request failed"
+            RESP="{}"
+          }
+          RESULT=$(extract_bool "$RESP" "result")
+          if [ "$RESULT" = "true" ]; then
+            pass "validate-code CS v3-AdministrativeGender M display=Male result=true"
+          else
+            fail "validate-code CS v3-AdministrativeGender M display=Male" "true" "$RESULT"
+          fi
+
+          # Test 13: wrong display → result=false, matches tx.fhir.org
+          compare_bool "validate-code CS v3-AdministrativeGender M display=Female result=false" \
+            'CodeSystem/$validate-code' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"M"},{"name":"display","valueString":"Female"}]}' \
+            "result"
+
+          # Test 14: v3-ActStatus active → result=true, matches tx.fhir.org
+          compare_bool "validate-code CS v3-ActStatus active result=true" \
+            'CodeSystem/$validate-code' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CS_ACTSTATUS"'"},{"name":"code","valueCode":"active"}]}' \
+            "result"
+
+          # ═══════════════════════════════════════════════════════════════════
+          # §3  $validate-code (ValueSet)
+          # ═══════════════════════════════════════════════════════════════════
+          section "\$validate-code (ValueSet)"
+
+          # Tests 15–16: M and F valid in v3-AdministrativeGender VS, matches tx
+          for CODE in M F; do
+            compare_bool "validate-code VS v3-AdministrativeGender $CODE result=true" \
+              'ValueSet/$validate-code' \
+              '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_GENDER"'"},{"name":"code","valueCode":"'"$CODE"'"},{"name":"system","valueUri":"'"$CS_GENDER"'"}]}' \
+              "result"
+          done
+
+          # Test 17: invalid code in VS → result=false, matches tx.fhir.org
+          compare_bool "validate-code VS v3-AdministrativeGender INVALID_XYZ result=false" \
+            'ValueSet/$validate-code' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_GENDER"'"},{"name":"code","valueCode":"INVALID_XYZ"},{"name":"system","valueUri":"'"$CS_GENDER"'"}]}' \
+            "result"
+
+          # Test 18: valueCoding parameter form → result=true
+          RESP=$(hts_post 'ValueSet/$validate-code' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_GENDER"'"},{"name":"valueCoding","valueCoding":{"system":"'"$CS_GENDER"'","code":"M"}}]}') || {
+            fail "validate-code VS v3-AdministrativeGender valueCoding M" "true" "HTS request failed"
+            RESP="{}"
+          }
+          RESULT=$(extract_bool "$RESP" "result")
+          if [ "$RESULT" = "true" ]; then
+            pass "validate-code VS v3-AdministrativeGender valueCoding M result=true"
+          else
+            fail "validate-code VS v3-AdministrativeGender valueCoding M" "true" "$RESULT"
+          fi
+
+          # Test 19: v3-ActStatus active in VS → result=true, matches tx.fhir.org
+          compare_bool "validate-code VS v3-ActStatus active result=true" \
+            'ValueSet/$validate-code' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_ACTSTATUS"'"},{"name":"code","valueCode":"active"},{"name":"system","valueUri":"'"$CS_ACTSTATUS"'"}]}' \
+            "result"
+
+          # ═══════════════════════════════════════════════════════════════════
+          # §4  $expand (ValueSet)
+          # ═══════════════════════════════════════════════════════════════════
+          section "\$expand (ValueSet)"
+
+          # Test 20: v3-AdministrativeGender expansion total matches tx.fhir.org
+          EXPAND_BODY='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_GENDER"'"}]}'
+          HTS_EXP=$(hts_post 'ValueSet/$expand' "$EXPAND_BODY") || {
+            fail "expand v3-AdministrativeGender" "success" "HTS request failed"
+            HTS_EXP="{}"
+          }
+          TX_EXP=$(tx_post 'ValueSet/$expand' "$EXPAND_BODY") || {
+            fail "expand v3-AdministrativeGender" "success" "tx.fhir.org request failed"
+            TX_EXP="{}"
+          }
+          HTS_EXP_TOTAL=$(printf '%s' "$HTS_EXP" | jq -r '.expansion.total // (.expansion.contains | length) // 0')
+          TX_EXP_TOTAL=$(printf '%s' "$TX_EXP"  | jq -r '.expansion.total // (.expansion.contains | length) // 0')
+          if [ "$HTS_EXP_TOTAL" = "$TX_EXP_TOTAL" ] && [ "$HTS_EXP_TOTAL" != "0" ]; then
+            pass "expand v3-AdministrativeGender total matches tx (total=$HTS_EXP_TOTAL)"
+          else
+            fail "expand v3-AdministrativeGender total matches tx" "$TX_EXP_TOTAL" "$HTS_EXP_TOTAL"
+          fi
+
+          # Tests 21–23: expansion must contain codes M, F, UN
+          HTS_EXP_CODES=$(printf '%s' "$HTS_EXP" | jq -r '[.expansion.contains[]?.code] | sort | join(",")' 2>/dev/null || echo "")
+          for CODE in M F UN; do
+            if printf '%s' "$HTS_EXP_CODES" | grep -q "$CODE"; then
+              pass "expand v3-AdministrativeGender contains code $CODE"
+            else
+              fail "expand v3-AdministrativeGender contains code $CODE" "present" "absent (codes=$HTS_EXP_CODES)"
+            fi
+          done
+
+          # Test 24: filter=Mal returns M but not F or UN
+          FILTER_RESP=$(hts_post 'ValueSet/$expand' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_GENDER"'"},{"name":"filter","valueString":"Mal"}]}') || {
+            fail "expand v3-AdministrativeGender filter=Mal" "success" "HTS request failed"
+            FILTER_RESP="{}"
+          }
+          FILTERED_CODES=$(printf '%s' "$FILTER_RESP" | jq -r '[.expansion.contains[]?.code] | join(",")' 2>/dev/null || echo "")
+          if printf '%s' "$FILTERED_CODES" | grep -q "M"; then
+            pass "expand v3-AdministrativeGender filter=Mal contains M (codes=$FILTERED_CODES)"
+          else
+            fail "expand v3-AdministrativeGender filter=Mal contains M" "M present" "codes=$FILTERED_CODES"
+          fi
+
+          # Test 25: count=1 → exactly 1 code in expansion
+          COUNT_RESP=$(hts_post 'ValueSet/$expand' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_GENDER"'"},{"name":"count","valueInteger":1}]}') || {
+            fail "expand v3-AdministrativeGender count=1" "success" "HTS request failed"
+            COUNT_RESP="{}"
+          }
+          CODE_COUNT=$(printf '%s' "$COUNT_RESP" | jq -r '.expansion.contains | length' 2>/dev/null || echo "0")
+          if [ "$CODE_COUNT" = "1" ]; then
+            pass "expand v3-AdministrativeGender count=1 returns exactly 1 code"
+          else
+            fail "expand v3-AdministrativeGender count=1" "1" "$CODE_COUNT"
+          fi
+
+          # Test 26: v3-ActStatus expansion total matches tx.fhir.org
+          ACTSTATUS_BODY='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_ACTSTATUS"'"}]}'
+          HTS_ACT=$(hts_post 'ValueSet/$expand' "$ACTSTATUS_BODY") || {
+            fail "expand v3-ActStatus" "success" "HTS request failed"
+            HTS_ACT="{}"
+          }
+          TX_ACT=$(tx_post 'ValueSet/$expand' "$ACTSTATUS_BODY") || {
+            fail "expand v3-ActStatus" "success" "tx.fhir.org request failed"
+            TX_ACT="{}"
+          }
+          HTS_ACT_TOTAL=$(printf '%s' "$HTS_ACT" | jq -r '.expansion.total // (.expansion.contains | length) // 0')
+          TX_ACT_TOTAL=$(printf '%s' "$TX_ACT"  | jq -r '.expansion.total // (.expansion.contains | length) // 0')
+          if [ "$HTS_ACT_TOTAL" = "$TX_ACT_TOTAL" ] && [ "$HTS_ACT_TOTAL" != "0" ]; then
+            pass "expand v3-ActStatus total matches tx (total=$HTS_ACT_TOTAL)"
+          else
+            fail "expand v3-ActStatus total matches tx" "$TX_ACT_TOTAL" "$HTS_ACT_TOTAL"
+          fi
+
+          # Test 27: v3-ActStatus filter=active → expansion contains 'active'
+          ACT_FILTER_RESP=$(hts_post 'ValueSet/$expand' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_ACTSTATUS"'"},{"name":"filter","valueString":"active"}]}') || {
+            fail "expand v3-ActStatus filter=active" "success" "HTS request failed"
+            ACT_FILTER_RESP="{}"
+          }
+          ACT_CODES=$(printf '%s' "$ACT_FILTER_RESP" | jq -r '[.expansion.contains[]?.code] | join(",")' 2>/dev/null || echo "")
+          if printf '%s' "$ACT_CODES" | grep -q "active"; then
+            pass "expand v3-ActStatus filter=active contains active (codes=$ACT_CODES)"
+          else
+            fail "expand v3-ActStatus filter=active contains active" "active present" "codes=$ACT_CODES"
+          fi
+
+          # ═══════════════════════════════════════════════════════════════════
+          # §5  $subsumes (CodeSystem)
+          # ═══════════════════════════════════════════════════════════════════
+          section "\$subsumes (CodeSystem)"
+
+          # Tests 28–29: same code vs same code → equivalent, matches tx.fhir.org
+          for CODE in M F; do
+            compare_str "subsumes v3-AdministrativeGender $CODE/$CODE outcome=equivalent" \
+              'CodeSystem/$subsumes' \
+              '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"codeA","valueCode":"'"$CODE"'"},{"name":"codeB","valueCode":"'"$CODE"'"}]}' \
+              "outcome"
+          done
+
+          # Test 30: M vs F in flat hierarchy → not-subsumed, matches tx.fhir.org
+          compare_str "subsumes v3-AdministrativeGender M/F outcome=not-subsumed" \
+            'CodeSystem/$subsumes' \
+            '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"codeA","valueCode":"M"},{"name":"codeB","valueCode":"F"}]}' \
+            "outcome"
+
+          # Test 31: codingA / codingB parameter form → equivalent
+          RESP=$(hts_post 'CodeSystem/$subsumes' \
+            '{"resourceType":"Parameters","parameter":[{"name":"codingA","valueCoding":{"system":"'"$CS_GENDER"'","code":"M"}},{"name":"codingB","valueCoding":{"system":"'"$CS_GENDER"'","code":"M"}}]}') || {
+            fail "subsumes v3-AdministrativeGender codingA/codingB M/M" "equivalent" "HTS request failed"
+            RESP="{}"
+          }
+          OUTCOME=$(extract_str "$RESP" "outcome")
+          if [ "$OUTCOME" = "equivalent" ]; then
+            pass "subsumes v3-AdministrativeGender codingA/codingB M/M outcome=equivalent"
+          else
+            fail "subsumes v3-AdministrativeGender codingA/codingB M/M" "equivalent" "$OUTCOME"
+          fi
+
+          # Test 32: unknown codeB → HTTP 4xx
+          SUB_HTTP=$(hts_status 'CodeSystem/$subsumes' \
+            '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"codeA","valueCode":"M"},{"name":"codeB","valueCode":"BOGUS_XYZ"}]}')
+          if [[ "$SUB_HTTP" =~ ^4[0-9][0-9]$ ]]; then
+            pass "subsumes unknown codeB returns 4xx (HTTP $SUB_HTTP)"
+          else
+            fail "subsumes unknown codeB returns 4xx" "4xx" "$SUB_HTTP"
+          fi
+
+          # ═══════════════════════════════════════════════════════════════════
+          # §6  $translate (ConceptMap)
+          # UTG ships cm-administrative-gender-v2: v2-0001 ↔ v3-AdministrativeGender
+          # ═══════════════════════════════════════════════════════════════════
+          section "\$translate (ConceptMap)"
+
+          # Test 33: translate v2-0001 M → v3-AdministrativeGender — result matches tx
+          TRANS_M='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CS_V2_0001"'"},{"name":"code","valueCode":"M"},{"name":"targetsystem","valueUri":"'"$CS_GENDER"'"}]}'
+          HTS_TR_M=$(hts_post 'ConceptMap/$translate' "$TRANS_M") || {
+            fail "translate v2-0001 M result" "success" "HTS request failed"
+            HTS_TR_M="{}"
+          }
+          TX_TR_M=$(tx_post 'ConceptMap/$translate' "$TRANS_M") || {
+            fail "translate v2-0001 M result" "success" "tx.fhir.org request failed"
+            TX_TR_M="{}"
+          }
+          HTS_TR_M_RES=$(extract_bool "$HTS_TR_M" "result")
+          TX_TR_M_RES=$(extract_bool "$TX_TR_M" "result")
+          if [ "$HTS_TR_M_RES" = "$TX_TR_M_RES" ]; then
+            pass "translate v2-0001 M result matches tx (result=$HTS_TR_M_RES)"
+          else
+            fail "translate v2-0001 M result matches tx" "$TX_TR_M_RES" "$HTS_TR_M_RES"
+          fi
+
+          # Test 34: translate v2-0001 M → v3 — matched concept code matches tx
+          HTS_MATCH_M=$(printf '%s' "$HTS_TR_M" \
+            | jq -r '.parameter[]? | select(.name=="match") | .part[]? | select(.name=="concept") | .valueCoding.code' \
+            | head -1)
+          TX_MATCH_M=$(printf '%s' "$TX_TR_M" \
+            | jq -r '.parameter[]? | select(.name=="match") | .part[]? | select(.name=="concept") | .valueCoding.code' \
+            | head -1)
+          if [ "$HTS_MATCH_M" = "$TX_MATCH_M" ]; then
+            pass "translate v2-0001 M target code matches tx (code=$HTS_MATCH_M)"
+          else
+            fail "translate v2-0001 M target code matches tx" "$TX_MATCH_M" "$HTS_MATCH_M"
+          fi
+
+          # Test 35: translate v2-0001 F → v3 — result matches tx
+          TRANS_F='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CS_V2_0001"'"},{"name":"code","valueCode":"F"},{"name":"targetsystem","valueUri":"'"$CS_GENDER"'"}]}'
+          HTS_TR_F=$(hts_post 'ConceptMap/$translate' "$TRANS_F") || {
+            fail "translate v2-0001 F result" "success" "HTS request failed"
+            HTS_TR_F="{}"
+          }
+          TX_TR_F=$(tx_post 'ConceptMap/$translate' "$TRANS_F") || {
+            fail "translate v2-0001 F result" "success" "tx.fhir.org request failed"
+            TX_TR_F="{}"
+          }
+          HTS_TR_F_RES=$(extract_bool "$HTS_TR_F" "result")
+          TX_TR_F_RES=$(extract_bool "$TX_TR_F" "result")
+          if [ "$HTS_TR_F_RES" = "$TX_TR_F_RES" ]; then
+            pass "translate v2-0001 F result matches tx (result=$HTS_TR_F_RES)"
+          else
+            fail "translate v2-0001 F result matches tx" "$TX_TR_F_RES" "$HTS_TR_F_RES"
+          fi
+
+          # Test 36: translate v2-0001 U (Unknown) → result matches tx (true or false)
+          compare_bool "translate v2-0001 U result matches tx" \
+            'ConceptMap/$translate' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CS_V2_0001"'"},{"name":"code","valueCode":"U"},{"name":"targetsystem","valueUri":"'"$CS_GENDER"'"}]}' \
+            "result"
+
+          # Test 37: translate unknown code → result=false, matches tx.fhir.org
+          compare_bool "translate v2-0001 BOGUS_XYZ result=false matches tx" \
+            'ConceptMap/$translate' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CS_V2_0001"'"},{"name":"code","valueCode":"BOGUS_XYZ"},{"name":"targetsystem","valueUri":"'"$CS_GENDER"'"}]}' \
+            "result"
+
+          # Test 38: reverse translate v3 M → v2-0001, result matches tx
+          compare_bool "translate reverse v3-AdministrativeGender M to v2-0001 result matches tx" \
+            'ConceptMap/$translate' \
+            '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"M"},{"name":"targetsystem","valueUri":"'"$CS_V2_0001"'"},{"name":"reverse","valueBoolean":true}]}' \
+            "result"
+
+          # ═══════════════════════════════════════════════════════════════════
+          # §7  $closure (ConceptMap)
+          # ═══════════════════════════════════════════════════════════════════
+          section "\$closure (ConceptMap)"
+
+          CLOSURE_NAME="hts-integ-closure-${FHIR_LABEL}"
+
+          # Test 39: initialize closure table → resourceType=Parameters
+          CLOSURE_INIT=$(hts_post 'ConceptMap/$closure' \
+            '{"resourceType":"Parameters","parameter":[{"name":"name","valueString":"'"$CLOSURE_NAME"'"}]}') || {
+            fail "closure init returns Parameters" "Parameters" "HTS request failed"
+            CLOSURE_INIT="{}"
+          }
+          CLOSURE_RT=$(printf '%s' "$CLOSURE_INIT" | jq -r '.resourceType' 2>/dev/null || echo "error")
+          if [ "$CLOSURE_RT" = "Parameters" ]; then
+            pass "closure init returns Parameters"
+          else
+            fail "closure init returns Parameters" "Parameters" "$CLOSURE_RT"
+          fi
+
+          # Test 40: add concept M to closure → resourceType=Parameters
+          CLOSURE_ADD=$(hts_post 'ConceptMap/$closure' \
+            '{"resourceType":"Parameters","parameter":[{"name":"name","valueString":"'"$CLOSURE_NAME"'"},{"name":"concept","valueCoding":{"system":"'"$CS_GENDER"'","code":"M"}}]}') || {
+            fail "closure add M returns Parameters" "Parameters" "HTS request failed"
+            CLOSURE_ADD="{}"
+          }
+          CLOSURE_ADD_RT=$(printf '%s' "$CLOSURE_ADD" | jq -r '.resourceType' 2>/dev/null || echo "error")
+          if [ "$CLOSURE_ADD_RT" = "Parameters" ]; then
+            pass "closure add M to closure returns Parameters"
+          else
+            fail "closure add M to closure returns Parameters" "Parameters" "$CLOSURE_ADD_RT"
+          fi
+
+          # ═══════════════════════════════════════════════════════════════════
+          # Summary
+          # ═══════════════════════════════════════════════════════════════════
+
+          echo ""
+          echo "════════════════════════════════════════════════════════"
+          PASSED=$((TESTS - FAILURES))
+          echo "HTS Integration Tests — FHIR ${FHIR_LABEL}"
+          echo "Results: ${PASSED}/${TESTS} passed, ${FAILURES} failed"
+          echo "════════════════════════════════════════════════════════"
+
+          {
+            echo "## HTS Integration Tests — FHIR ${FHIR_LABEL}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Total  | ${TESTS} |"
+            echo "| Passed | ${PASSED} |"
+            echo "| Failed | ${FAILURES} |"
+            if [ "${FAILURES}" -gt 0 ]; then
+              echo ""
+              echo "> :x: **${FAILURES} test(s) failed** — check the job log for details."
+            else
+              echo ""
+              echo "> :white_check_mark: All ${TESTS} tests passed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$FAILURES" -eq 0 ]
+
+      - name: Dump server log on failure
+        if: failure()
+        run: cat "/tmp/hts-${{ matrix.label }}.log" 2>/dev/null || echo "(no server log found)"
+
+      - name: Stop HTS server
+        if: always()
+        run: |
+          if [ -n "${HTS_PID:-}" ]; then
+            kill "$HTS_PID" 2>/dev/null || true
+            wait "$HTS_PID" 2>/dev/null || true
+          fi
+
+      - name: Clean up working files
+        if: always()
+        run: |
+          rm -f \
+            "./data/hts-${{ matrix.label }}.db" \
+            "./utg.tgz" \
+            "/tmp/hts-${{ matrix.label }}.log"
