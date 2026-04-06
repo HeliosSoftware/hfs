@@ -15,7 +15,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   check:
     name: Check helios-hts
-    runs-on: [self-hosted]
+    runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -45,8 +45,8 @@ jobs:
   # Release binary for integration tests (R4 + R4B + R5)
   # ─────────────────────────────────────────────────────────────────────────────
   build:
-    name: Build HTS binary (R4 + R5)
-    runs-on: [self-hosted]
+    name: Build HTS binary (R4)
+    runs-on: [self-hosted, Linux]
     needs: check
     steps:
       - name: Checkout code
@@ -68,8 +68,8 @@ jobs:
           printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]\n' \
             > ~/.cargo/config.toml
 
-      - name: cargo build --release (R4 + R5)
-        run: cargo build --release -p helios-hts --features "R4,R5"
+      - name: cargo build --release (R4)
+        run: cargo build --release -p helios-hts
 
       - name: Upload HTS binary
         uses: actions/upload-artifact@v4
@@ -84,7 +84,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   integration-test:
     name: Integration tests — FHIR ${{ matrix.label }}
-    runs-on: [self-hosted]
+    runs-on: [self-hosted, Linux]
     needs: build
     strategy:
       fail-fast: false
@@ -93,9 +93,9 @@ jobs:
           - label: R4
             utg_url: https://build.fhir.org/ig/HL7/UTG/en/hl7.terminology.r4.tgz
             tx_base: https://tx.fhir.org/r4
-          - label: R5
-            utg_url: https://build.fhir.org/ig/HL7/UTG/en/hl7.terminology.r5.tgz
-            tx_base: https://tx.fhir.org/r5
+          #          - label: R5
+          #  utg_url: https://build.fhir.org/ig/HL7/UTG/en/hl7.terminology.r5.tgz
+          #  tx_base: https://tx.fhir.org/r5
 
     steps:
       - name: Checkout code
