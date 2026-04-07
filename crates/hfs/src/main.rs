@@ -25,7 +25,7 @@ use helios_audit::{
     AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };
 use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
-use helios_persistence::{ResourceStorage, TenantContext};
+use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
 use helios_rest::{
     AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth, init_logging,
 };
@@ -36,46 +36,17 @@ use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 
 #[cfg(feature = "mongodb")]
 use helios_persistence::backends::mongodb::MongoBackend;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuditPrimaryBackendFamily {
-    Sqlite,
-    Postgres,
-    MongoDB,
-    S3,
-}
-
-fn audit_primary_backend_family(mode: StorageBackendMode) -> AuditPrimaryBackendFamily {
-    match mode {
-        StorageBackendMode::Sqlite | StorageBackendMode::SqliteElasticsearch => {
-            AuditPrimaryBackendFamily::Sqlite
-        }
-        StorageBackendMode::Postgres | StorageBackendMode::PostgresElasticsearch => {
-            AuditPrimaryBackendFamily::Postgres
-        }
-        StorageBackendMode::MongoDB | StorageBackendMode::MongoDBElasticsearch => {
-            AuditPrimaryBackendFamily::MongoDB
-        }
-        StorageBackendMode::S3 | StorageBackendMode::S3Elasticsearch => {
-            AuditPrimaryBackendFamily::S3
-        }
-    }
-}
-
-fn is_database_audit_dedicated(config: &AuditConfig, family: AuditPrimaryBackendFamily) -> bool {
-    match family {
-        AuditPrimaryBackendFamily::Sqlite | AuditPrimaryBackendFamily::Postgres => {
-            config.database_url.is_some()
-        }
-        AuditPrimaryBackendFamily::MongoDB => {
-            config.database_url.is_some() || config.mongodb_database.is_some()
-        }
-        AuditPrimaryBackendFamily::S3 => {
+fn is_database_audit_dedicated(config: &AuditConfig, backend_kind: BackendKind) -> bool {
+    match backend_kind {
+        BackendKind::Sqlite | BackendKind::Postgres => config.database_url.is_some(),
+        BackendKind::MongoDB => config.database_url.is_some() || config.mongodb_database.is_some(),
+        BackendKind::S3 => {
             config.s3_bucket.is_some()
                 || config.s3_prefix.is_some()
                 || config.s3_region.is_some()
                 || config.s3_validate_buckets.is_some()
         }
+        _ => false,
     }
 }
 
@@ -142,29 +113,31 @@ async fn create_database_audit_storage(
     backend_mode: StorageBackendMode,
     audit_config: &AuditConfig,
 ) -> anyhow::Result<Arc<dyn ResourceStorage>> {
-    let family = audit_primary_backend_family(backend_mode);
-    let dedicated = is_database_audit_dedicated(audit_config, family);
+    let backend_kind = backend_mode.primary_backend_kind();
+    let dedicated = is_database_audit_dedicated(audit_config, backend_kind);
 
     info!(
-        backend_family = ?family,
+        backend_kind = %backend_kind,
         storage_backend = %backend_mode,
         dedicated = dedicated,
         "Initializing database audit sink storage"
     );
 
-    match family {
-        AuditPrimaryBackendFamily::Sqlite => {
+    match backend_kind {
+        BackendKind::Sqlite => {
             create_audit_sqlite_storage(server_config, audit_config, dedicated).await
         }
-        AuditPrimaryBackendFamily::Postgres => {
+        BackendKind::Postgres => {
             create_audit_postgres_storage(server_config, audit_config, dedicated).await
         }
-        AuditPrimaryBackendFamily::MongoDB => {
+        BackendKind::MongoDB => {
             create_audit_mongodb_storage(server_config, audit_config, dedicated).await
         }
-        AuditPrimaryBackendFamily::S3 => {
-            create_audit_s3_storage(server_config, audit_config, dedicated).await
-        }
+        BackendKind::S3 => create_audit_s3_storage(server_config, audit_config, dedicated).await,
+        _ => anyhow::bail!(
+            "Database audit sink is unsupported for primary backend kind '{}'",
+            backend_kind
+        ),
     }
 }
 
@@ -1586,92 +1559,68 @@ mod tests {
     }
 
     #[test]
-    fn test_audit_primary_backend_family_mapping() {
+    fn test_storage_backend_mode_primary_backend_kind_mapping() {
         assert_eq!(
-            audit_primary_backend_family(StorageBackendMode::Sqlite),
-            AuditPrimaryBackendFamily::Sqlite
+            StorageBackendMode::Sqlite.primary_backend_kind(),
+            BackendKind::Sqlite
         );
         assert_eq!(
-            audit_primary_backend_family(StorageBackendMode::SqliteElasticsearch),
-            AuditPrimaryBackendFamily::Sqlite
+            StorageBackendMode::SqliteElasticsearch.primary_backend_kind(),
+            BackendKind::Sqlite
         );
         assert_eq!(
-            audit_primary_backend_family(StorageBackendMode::Postgres),
-            AuditPrimaryBackendFamily::Postgres
+            StorageBackendMode::Postgres.primary_backend_kind(),
+            BackendKind::Postgres
         );
         assert_eq!(
-            audit_primary_backend_family(StorageBackendMode::PostgresElasticsearch),
-            AuditPrimaryBackendFamily::Postgres
+            StorageBackendMode::PostgresElasticsearch.primary_backend_kind(),
+            BackendKind::Postgres
         );
         assert_eq!(
-            audit_primary_backend_family(StorageBackendMode::MongoDB),
-            AuditPrimaryBackendFamily::MongoDB
+            StorageBackendMode::MongoDB.primary_backend_kind(),
+            BackendKind::MongoDB
         );
         assert_eq!(
-            audit_primary_backend_family(StorageBackendMode::MongoDBElasticsearch),
-            AuditPrimaryBackendFamily::MongoDB
+            StorageBackendMode::MongoDBElasticsearch.primary_backend_kind(),
+            BackendKind::MongoDB
         );
         assert_eq!(
-            audit_primary_backend_family(StorageBackendMode::S3),
-            AuditPrimaryBackendFamily::S3
+            StorageBackendMode::S3.primary_backend_kind(),
+            BackendKind::S3
         );
         assert_eq!(
-            audit_primary_backend_family(StorageBackendMode::S3Elasticsearch),
-            AuditPrimaryBackendFamily::S3
+            StorageBackendMode::S3Elasticsearch.primary_backend_kind(),
+            BackendKind::S3
         );
     }
 
     #[test]
     fn test_is_database_audit_dedicated_detection() {
         let mut config = AuditConfig::default();
-        assert!(!is_database_audit_dedicated(
-            &config,
-            AuditPrimaryBackendFamily::Sqlite
-        ));
-        assert!(!is_database_audit_dedicated(
-            &config,
-            AuditPrimaryBackendFamily::Postgres
-        ));
-        assert!(!is_database_audit_dedicated(
-            &config,
-            AuditPrimaryBackendFamily::MongoDB
-        ));
-        assert!(!is_database_audit_dedicated(
-            &config,
-            AuditPrimaryBackendFamily::S3
-        ));
+        assert!(!is_database_audit_dedicated(&config, BackendKind::Sqlite));
+        assert!(!is_database_audit_dedicated(&config, BackendKind::Postgres));
+        assert!(!is_database_audit_dedicated(&config, BackendKind::MongoDB));
+        assert!(!is_database_audit_dedicated(&config, BackendKind::S3));
 
         config.database_url = Some("sqlite:///tmp/audit.db".to_string());
-        assert!(is_database_audit_dedicated(
-            &config,
-            AuditPrimaryBackendFamily::Sqlite
-        ));
-        assert!(is_database_audit_dedicated(
-            &config,
-            AuditPrimaryBackendFamily::Postgres
-        ));
-        assert!(is_database_audit_dedicated(
-            &config,
-            AuditPrimaryBackendFamily::MongoDB
-        ));
+        assert!(is_database_audit_dedicated(&config, BackendKind::Sqlite));
+        assert!(is_database_audit_dedicated(&config, BackendKind::Postgres));
+        assert!(is_database_audit_dedicated(&config, BackendKind::MongoDB));
 
         let mut mongo_only = AuditConfig::default();
         mongo_only.mongodb_database = Some("helios_audit".to_string());
         assert!(is_database_audit_dedicated(
             &mongo_only,
-            AuditPrimaryBackendFamily::MongoDB
+            BackendKind::MongoDB
         ));
         assert!(!is_database_audit_dedicated(
             &mongo_only,
-            AuditPrimaryBackendFamily::Postgres
+            BackendKind::Postgres
         ));
 
         let mut s3_only = AuditConfig::default();
         s3_only.s3_bucket = Some("audit-bucket".to_string());
-        assert!(is_database_audit_dedicated(
-            &s3_only,
-            AuditPrimaryBackendFamily::S3
-        ));
+        assert!(is_database_audit_dedicated(&s3_only, BackendKind::S3));
     }
 
     #[test]
