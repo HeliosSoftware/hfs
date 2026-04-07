@@ -215,14 +215,8 @@ mod tests {
 
         let config = AuditConfig::from_env();
         assert_eq!(config.backend, AuditBackend::CloudWatch);
-        assert_eq!(
-            config.cloudwatch_log_group.as_deref(),
-            Some("/hfs/audit")
-        );
-        assert_eq!(
-            config.cloudwatch_log_stream.as_deref(),
-            Some("ci-stream")
-        );
+        assert_eq!(config.cloudwatch_log_group.as_deref(), Some("/hfs/audit"));
+        assert_eq!(config.cloudwatch_log_stream.as_deref(), Some("ci-stream"));
         assert_eq!(config.cloudwatch_region.as_deref(), Some("us-east-1"));
 
         unsafe {
