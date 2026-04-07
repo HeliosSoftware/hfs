@@ -893,25 +893,40 @@ def main() -> int:
         if args.strict_correlation:
             correlation_ok = True
             failing_example: dict[str, Any] | None = None
+            required_keys = ("bundle-id", "bundle-type", "entry-index")
+            target_events: list[dict[str, Any]] = []
+            bundle_id_counts: dict[str, int] = {}
             for event in entry_events:
                 dmap = detail_map(event)
-                missing_keys = [k for k in ("bundle-id", "bundle-type", "entry-index") if k not in dmap]
+                bundle_types = [v for v in dmap.get("bundle-type", []) if v]
+
+                # Time-window partitioning can include unrelated CRUD events
+                # from neighboring interactions. Strict correlation should
+                # validate only events explicitly tagged for this bundle type.
+                if bundle_type not in bundle_types:
+                    continue
+
+                missing_keys = [k for k in required_keys if not any(v for v in dmap.get(k, []))]
                 if missing_keys:
                     correlation_ok = False
                     failing_example = event
                     break
-                bundle_types = [v for v in dmap.get("bundle-type", []) if v]
-                if bundle_types and bundle_type not in bundle_types:
-                    correlation_ok = False
-                    failing_example = event
-                    break
+
+                target_events.append(event)
+                for bundle_id in [v for v in dmap.get("bundle-id", []) if v]:
+                    bundle_id_counts[bundle_id] = bundle_id_counts.get(bundle_id, 0) + 1
+
+            if correlation_ok:
+                correlation_ok = any(count >= 2 for count in bundle_id_counts.values())
+                if not correlation_ok:
+                    failing_example = target_events[0] if target_events else (entry_events[0] if entry_events else None)
 
             checks.append(
                 check(
                     f"interaction_{call_name}_correlation",
                     correlation_ok and has_per_entry,
                     f"{bundle_type} per-entry events include bundle-id/bundle-type/entry-index",
-                    (entry_events[0] if correlation_ok and entry_events else failing_example),
+                    (target_events[0] if correlation_ok and target_events else failing_example),
                 )
             )
 
