@@ -41,6 +41,21 @@ pub struct AuditConfig {
     /// Optional dedicated database URL for audit events.
     /// When absent the main HFS storage backend is reused.
     pub database_url: Option<String>,
+    /// Optional dedicated MongoDB database name for audit events.
+    /// Used when the primary backend family is MongoDB.
+    pub mongodb_database: Option<String>,
+    /// Optional dedicated S3 bucket for audit events.
+    /// Used when the primary backend family is S3.
+    pub s3_bucket: Option<String>,
+    /// Optional dedicated S3 prefix for audit events.
+    /// Used when the primary backend family is S3.
+    pub s3_prefix: Option<String>,
+    /// Optional dedicated S3 region for audit events.
+    /// Used when the primary backend family is S3.
+    pub s3_region: Option<String>,
+    /// Optional dedicated S3 bucket validation toggle for audit events.
+    /// Used when the primary backend family is S3.
+    pub s3_validate_buckets: Option<bool>,
     /// Path/method pairs that should be excluded from audit logging.
     pub exclusions: Vec<ExclusionRule>,
     /// FHIR Reference used as `AuditEvent.source.observer`
@@ -85,6 +100,14 @@ impl AuditConfig {
             backend,
             file_path: env::var("HFS_AUDIT_FILE_PATH").ok(),
             database_url: env::var("HFS_AUDIT_DATABASE_URL").ok(),
+            mongodb_database: env::var("HFS_AUDIT_MONGODB_DATABASE").ok(),
+            s3_bucket: env::var("HFS_AUDIT_S3_BUCKET").ok(),
+            s3_prefix: env::var("HFS_AUDIT_S3_PREFIX").ok(),
+            s3_region: env::var("HFS_AUDIT_S3_REGION").ok(),
+            s3_validate_buckets: env::var("HFS_AUDIT_S3_VALIDATE_BUCKETS").ok().map(|v| {
+                let normalized = v.trim().to_ascii_lowercase();
+                !(normalized == "false" || normalized == "0")
+            }),
             exclusions,
             source_observer: env::var("HFS_AUDIT_SOURCE_OBSERVER")
                 .unwrap_or_else(|_| "Device/hfs".to_string()),
@@ -101,6 +124,11 @@ impl Default for AuditConfig {
             backend: AuditBackend::None,
             file_path: None,
             database_url: None,
+            mongodb_database: None,
+            s3_bucket: None,
+            s3_prefix: None,
+            s3_region: None,
+            s3_validate_buckets: None,
             exclusions: Vec::new(),
             source_observer: "Device/hfs".to_string(),
             cloudwatch_log_group: None,
@@ -120,6 +148,11 @@ mod tests {
         assert_eq!(config.backend, AuditBackend::None);
         assert!(config.file_path.is_none());
         assert!(config.database_url.is_none());
+        assert!(config.mongodb_database.is_none());
+        assert!(config.s3_bucket.is_none());
+        assert!(config.s3_prefix.is_none());
+        assert!(config.s3_region.is_none());
+        assert!(config.s3_validate_buckets.is_none());
         assert!(config.exclusions.is_empty());
         assert_eq!(config.source_observer, "Device/hfs");
     }
@@ -188,6 +221,41 @@ mod tests {
         assert_eq!(config.source_observer, "Device/my-server");
         unsafe {
             env::remove_var("HFS_AUDIT_SOURCE_OBSERVER");
+        }
+    }
+
+    #[test]
+    fn test_from_env_database_overrides() {
+        unsafe {
+            env::set_var(
+                "HFS_AUDIT_DATABASE_URL",
+                "postgresql://audit:pass@localhost:5432/audit",
+            );
+            env::set_var("HFS_AUDIT_MONGODB_DATABASE", "helios_audit");
+            env::set_var("HFS_AUDIT_S3_BUCKET", "audit-bucket");
+            env::set_var("HFS_AUDIT_S3_PREFIX", "audit/");
+            env::set_var("HFS_AUDIT_S3_REGION", "us-east-1");
+            env::set_var("HFS_AUDIT_S3_VALIDATE_BUCKETS", "false");
+        }
+
+        let config = AuditConfig::from_env();
+        assert_eq!(
+            config.database_url.as_deref(),
+            Some("postgresql://audit:pass@localhost:5432/audit")
+        );
+        assert_eq!(config.mongodb_database.as_deref(), Some("helios_audit"));
+        assert_eq!(config.s3_bucket.as_deref(), Some("audit-bucket"));
+        assert_eq!(config.s3_prefix.as_deref(), Some("audit/"));
+        assert_eq!(config.s3_region.as_deref(), Some("us-east-1"));
+        assert_eq!(config.s3_validate_buckets, Some(false));
+
+        unsafe {
+            env::remove_var("HFS_AUDIT_DATABASE_URL");
+            env::remove_var("HFS_AUDIT_MONGODB_DATABASE");
+            env::remove_var("HFS_AUDIT_S3_BUCKET");
+            env::remove_var("HFS_AUDIT_S3_PREFIX");
+            env::remove_var("HFS_AUDIT_S3_REGION");
+            env::remove_var("HFS_AUDIT_S3_VALIDATE_BUCKETS");
         }
     }
 }
