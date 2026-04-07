@@ -70,7 +70,6 @@ These items are well-understood and will be picked up once current work complete
 
 - **Bulk Data API** — Import and export (`$export` / `$import` operations)
 - **FHIR Subscriptions** — Topic-based notification support
-- **SMART on FHIR** — Full launch framework (standalone launch, EHR launch) and fine-grained scoped access
 - **SQL on FHIR** — [SQL on FHIR operations](https://sql-on-fhir.org/ig/latest/operations.html) - using read-only database connections
 
 ### Developer Experience
@@ -85,6 +84,10 @@ These items are well-understood and will be picked up once current work complete
 ## 🔭 Later — On the Horizon
 
 Longer-term ideas we are exploring. These are not yet committed and may evolve significantly based on community input.
+
+### FHIR Server Capabilities
+
+- **SMART on FHIR** — Full launch framework (standalone launch, EHR launch) and fine-grained scoped access
 
 ### Advanced Persistence
 
