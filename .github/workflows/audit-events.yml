@@ -555,14 +555,25 @@ jobs:
           cp "$HFS_LOG" audit-results/hfs.log || true
           docker logs "$KC_CONTAINER" > audit-results/keycloak.log 2>&1 || true
 
-          python3 ./crates/hfs/tests/audit/validate_report.py \
-            --audit-file "$AUDIT_FILE" \
-            --ranges-file audit-results/interaction_ranges.tsv \
-            --context-file audit-results/context.json \
-            --output-dir audit-results \
-            --tx-base-url "https://tx.fhir.org/r5" \
-            --tx-timeout-seconds 12 \
+          VALIDATOR="./crates/hfs/tests/audit/validate_report.py"
+          VALIDATOR_HELP="$(python3 "$VALIDATOR" --help 2>&1 || true)"
+
+          VALIDATE_ARGS=(
+            --audit-file "$AUDIT_FILE"
+            --ranges-file audit-results/interaction_ranges.tsv
+            --context-file audit-results/context.json
+            --output-dir audit-results
             --strict-correlation
+          )
+
+          if printf "%s\n" "$VALIDATOR_HELP" | grep -q -- "--tx-base-url"; then
+            VALIDATE_ARGS+=(--tx-base-url "https://tx.fhir.org/r5")
+          fi
+          if printf "%s\n" "$VALIDATOR_HELP" | grep -q -- "--tx-timeout-seconds"; then
+            VALIDATE_ARGS+=(--tx-timeout-seconds 12)
+          fi
+
+          python3 "$VALIDATOR" "${VALIDATE_ARGS[@]}"
 
       - name: Append report to workflow summary
         if: always()
@@ -945,8 +956,8 @@ jobs:
               if [ "${{ matrix.mode }}" = "dedicated" ]; then
                 DB_PATH="$AUDIT_SQLITE_DB"
               fi
-              CHECK_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM resources WHERE tenant_id='__system__' AND resource_type='AuditEvent';")
-              sqlite3 "$DB_PATH" "SELECT data FROM resources WHERE tenant_id='__system__' AND resource_type='AuditEvent' LIMIT 1;" > "$EXAMPLE_FILE"
+              CHECK_COUNT=$(python3 -c 'import sqlite3,sys; conn=sqlite3.connect(sys.argv[1]); row=conn.execute("SELECT COUNT(*) FROM resources WHERE tenant_id=? AND resource_type=?",("__system__","AuditEvent")).fetchone(); print(row[0] if row else 0); conn.close()' "$DB_PATH")
+              python3 -c 'import sqlite3,sys; conn=sqlite3.connect(sys.argv[1]); row=conn.execute("SELECT data FROM resources WHERE tenant_id=? AND resource_type=? LIMIT 1",("__system__","AuditEvent")).fetchone(); conn.close(); open(sys.argv[2], "w", encoding="utf-8").write(row[0] if row and row[0] is not None else "{}")' "$DB_PATH" "$EXAMPLE_FILE"
             elif [ "${{ matrix.backend }}" = "postgres" ]; then
               DB_NAME="helios"
               if [ "${{ matrix.mode }}" = "dedicated" ]; then
@@ -966,8 +977,9 @@ jobs:
               if [ "${{ matrix.mode }}" = "dedicated" ]; then
                 PREFIX="$AUDIT_S3_PREFIX"
               fi
-              CHECK_COUNT=$(aws s3 ls "s3://${HFS_S3_BUCKET}/${PREFIX}resources/AuditEvent/" --recursive | wc -l | tr -d ' ')
-              aws s3 ls "s3://${HFS_S3_BUCKET}/${PREFIX}resources/AuditEvent/" --recursive | head -1 > "$EXAMPLE_FILE" || true
+              AUDIT_EVENT_PREFIX="${PREFIX}__system__/resources/AuditEvent/"
+              CHECK_COUNT=$(aws s3 ls "s3://${HFS_S3_BUCKET}/${AUDIT_EVENT_PREFIX}" --recursive | wc -l | tr -d ' ')
+              aws s3 ls "s3://${HFS_S3_BUCKET}/${AUDIT_EVENT_PREFIX}" --recursive | head -1 > "$EXAMPLE_FILE" || true
             fi
 
             if [ "${CHECK_COUNT:-0}" -ge 1 ]; then
