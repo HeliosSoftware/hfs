@@ -560,6 +560,8 @@ jobs:
             --ranges-file audit-results/interaction_ranges.tsv \
             --context-file audit-results/context.json \
             --output-dir audit-results \
+            --tx-base-url "https://tx.fhir.org/r5" \
+            --tx-timeout-seconds 12 \
             --strict-correlation
 
       - name: Append report to workflow summary
@@ -603,3 +605,428 @@ jobs:
           docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Cleanup complete"
+
+  audit-database-smoke:
+    name: Audit DB Sink Smoke (${{ matrix.backend }} / ${{ matrix.mode }})
+    needs: build
+    runs-on: [self-hosted, Linux]
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        backend: [sqlite, postgres, mongodb, s3]
+        mode: [shared, dedicated]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hfs-binary
+          path: target/debug
+
+      - name: Make binary executable
+        run: chmod +x target/debug/hfs
+
+      - name: Determine runner IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+
+          echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> $GITHUB_ENV
+          echo "HFS_PORT_SMOKE=18088" >> $GITHUB_ENV
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      - name: Validate backend configuration
+        run: |
+          if [ "${{ matrix.backend }}" = "s3" ] && [ -z "$HFS_S3_BUCKET" ]; then
+            echo "::error::s3 backend requires HFS_S3_BUCKET to be configured"
+            exit 1
+          fi
+
+      - name: Start PostgreSQL
+        if: matrix.backend == 'postgres'
+        run: |
+          PG_CONTAINER="pg-audit-db-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PG_CONTAINER" -p 0:5432 \
+            -e POSTGRES_USER=helios \
+            -e POSTGRES_PASSWORD=helios \
+            -e POSTGRES_DB=helios \
+            postgres:16
+
+          echo "PG_CONTAINER=$PG_CONTAINER" >> $GITHUB_ENV
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..30}; do
+            if docker exec "$PG_CONTAINER" pg_isready -U helios > /dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PostgreSQL is ready on port $PG_PORT"
+                echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: PostgreSQL not ready yet..."
+            sleep 2
+          done
+
+          echo "PostgreSQL failed to start"
+          docker logs "$PG_CONTAINER"
+          exit 1
+
+      - name: Prepare PostgreSQL dedicated DB
+        if: matrix.backend == 'postgres' && matrix.mode == 'dedicated'
+        run: |
+          docker exec "$PG_CONTAINER" psql -U helios -d postgres -c "CREATE DATABASE helios_audit;" >/dev/null
+
+      - name: Start MongoDB replica set
+        if: matrix.backend == 'mongodb'
+        run: |
+          MONGO_CONTAINER="mongo-audit-db-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+
+          echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
+
+          READY=0
+          for i in {1..30}; do
+            if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' > /dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            echo "Attempt $i/30: MongoDB not ready yet..."
+            sleep 2
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "MongoDB failed to start"
+            docker logs "$MONGO_CONTAINER"
+            exit 1
+          fi
+
+          docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status(); } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] }); }' > /dev/null 2>&1
+
+          echo "Waiting for MongoDB replica set primary..."
+          for i in {1..60}; do
+            PRIMARY_STATE=$(docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status().myState } catch (e) { 0 }' | tr -d '\r\n ')
+            if [ "$PRIMARY_STATE" = "1" ]; then
+              MONGO_PORT=$(docker port "$MONGO_CONTAINER" 27017 | head -1 | sed 's/.*://')
+              echo "MongoDB replica set is ready on port $MONGO_PORT"
+              echo "MONGO_PORT=$MONGO_PORT" >> $GITHUB_ENV
+              exit 0
+            fi
+            echo "Attempt $i/60: MongoDB replica set not primary yet..."
+            sleep 2
+          done
+
+          echo "MongoDB replica set failed to become primary"
+          docker logs "$MONGO_CONTAINER"
+          exit 1
+
+      - name: Configure AWS credentials
+        if: matrix.backend == 's3'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install AWS CLI
+        if: matrix.backend == 's3'
+        run: |
+          if ! command -v aws &>/dev/null; then
+            if ! /tmp/aws-bin/aws --version &>/dev/null; then
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -qo /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
+              rm -rf /tmp/awscliv2.zip /tmp/aws
+            fi
+            echo "/tmp/aws-bin" >> $GITHUB_PATH
+          fi
+          aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
+      - name: Prepare S3 prefixes
+        if: matrix.backend == 's3'
+        run: |
+          BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}"
+          PRIMARY_PREFIX="ci-audit-db/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.mode }}/primary/"
+          AUDIT_PREFIX="ci-audit-db/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.mode }}/audit/"
+          echo "PRIMARY_S3_PREFIX=$PRIMARY_PREFIX" >> $GITHUB_ENV
+          echo "AUDIT_S3_PREFIX=$AUDIT_PREFIX" >> $GITHUB_ENV
+          aws s3 rm "s3://$BUCKET/$PRIMARY_PREFIX" --recursive || true
+          aws s3 rm "s3://$BUCKET/$AUDIT_PREFIX" --recursive || true
+
+      - name: Start HFS server (database audit sink)
+        run: |
+          HFS_LOG="/tmp/hfs-audit-db-${{ matrix.backend }}-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}.log"
+          echo "HFS_LOG=$HFS_LOG" >> $GITHUB_ENV
+
+          if [ "${{ matrix.backend }}" = "sqlite" ]; then
+            PRIMARY_SQLITE_DB="/tmp/hfs-audit-db-primary-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}.db"
+            AUDIT_SQLITE_DB="/tmp/hfs-audit-db-audit-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}.db"
+            rm -f "$PRIMARY_SQLITE_DB" "$AUDIT_SQLITE_DB"
+            echo "PRIMARY_SQLITE_DB=$PRIMARY_SQLITE_DB" >> $GITHUB_ENV
+            echo "AUDIT_SQLITE_DB=$AUDIT_SQLITE_DB" >> $GITHUB_ENV
+
+            if [ "${{ matrix.mode }}" = "dedicated" ]; then
+              HFS_STORAGE_BACKEND=sqlite \
+              HFS_AUDIT_BACKEND=database \
+              HFS_AUDIT_DATABASE_URL="$AUDIT_SQLITE_DB" \
+              HFS_ENABLE_CORS=false \
+              HFS_AUTH_ENABLED=false \
+              ./target/debug/hfs --database-url "$PRIMARY_SQLITE_DB" --log-level info --port "$HFS_PORT_SMOKE" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            else
+              HFS_STORAGE_BACKEND=sqlite \
+              HFS_AUDIT_BACKEND=database \
+              HFS_ENABLE_CORS=false \
+              HFS_AUTH_ENABLED=false \
+              ./target/debug/hfs --database-url "$PRIMARY_SQLITE_DB" --log-level info --port "$HFS_PORT_SMOKE" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            fi
+          elif [ "${{ matrix.backend }}" = "postgres" ]; then
+            if [ "${{ matrix.mode }}" = "dedicated" ]; then
+              HFS_STORAGE_BACKEND=postgres \
+              HFS_PG_HOST="$DOCKER_HOST_IP" \
+              HFS_PG_PORT="$PG_PORT" \
+              HFS_PG_DBNAME=helios \
+              HFS_PG_USER=helios \
+              HFS_PG_PASSWORD=helios \
+              HFS_AUDIT_BACKEND=database \
+              HFS_AUDIT_DATABASE_URL="postgresql://helios:helios@$DOCKER_HOST_IP:$PG_PORT/helios_audit" \
+              HFS_ENABLE_CORS=false \
+              HFS_AUTH_ENABLED=false \
+              ./target/debug/hfs --log-level info --port "$HFS_PORT_SMOKE" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            else
+              HFS_STORAGE_BACKEND=postgres \
+              HFS_PG_HOST="$DOCKER_HOST_IP" \
+              HFS_PG_PORT="$PG_PORT" \
+              HFS_PG_DBNAME=helios \
+              HFS_PG_USER=helios \
+              HFS_PG_PASSWORD=helios \
+              HFS_AUDIT_BACKEND=database \
+              HFS_ENABLE_CORS=false \
+              HFS_AUTH_ENABLED=false \
+              ./target/debug/hfs --log-level info --port "$HFS_PORT_SMOKE" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            fi
+          elif [ "${{ matrix.backend }}" = "mongodb" ]; then
+            PRIMARY_MONGO_DB="helios_audit_db_primary_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.mode }}"
+            AUDIT_MONGO_DB="helios_audit_db_audit_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.mode }}"
+            echo "PRIMARY_MONGO_DB=$PRIMARY_MONGO_DB" >> $GITHUB_ENV
+            echo "AUDIT_MONGO_DB=$AUDIT_MONGO_DB" >> $GITHUB_ENV
+
+            if [ "${{ matrix.mode }}" = "dedicated" ]; then
+              HFS_STORAGE_BACKEND=mongodb \
+              HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+              HFS_MONGODB_DATABASE="$PRIMARY_MONGO_DB" \
+              HFS_AUDIT_BACKEND=database \
+              HFS_AUDIT_MONGODB_DATABASE="$AUDIT_MONGO_DB" \
+              HFS_ENABLE_CORS=false \
+              HFS_AUTH_ENABLED=false \
+              ./target/debug/hfs --log-level info --port "$HFS_PORT_SMOKE" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            else
+              HFS_STORAGE_BACKEND=mongodb \
+              HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+              HFS_MONGODB_DATABASE="$PRIMARY_MONGO_DB" \
+              HFS_AUDIT_BACKEND=database \
+              HFS_ENABLE_CORS=false \
+              HFS_AUTH_ENABLED=false \
+              ./target/debug/hfs --log-level info --port "$HFS_PORT_SMOKE" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            fi
+          else
+            if [ "${{ matrix.mode }}" = "dedicated" ]; then
+              HFS_STORAGE_BACKEND=s3 \
+              HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
+              HFS_S3_PREFIX="$PRIMARY_S3_PREFIX" \
+              HFS_S3_VALIDATE_BUCKETS=false \
+              HFS_AUDIT_BACKEND=database \
+              HFS_AUDIT_S3_PREFIX="$AUDIT_S3_PREFIX" \
+              HFS_AUDIT_S3_VALIDATE_BUCKETS=false \
+              HFS_ENABLE_CORS=false \
+              HFS_AUTH_ENABLED=false \
+              ./target/debug/hfs --log-level info --port "$HFS_PORT_SMOKE" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            else
+              HFS_STORAGE_BACKEND=s3 \
+              HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
+              HFS_S3_PREFIX="$PRIMARY_S3_PREFIX" \
+              HFS_S3_VALIDATE_BUCKETS=false \
+              HFS_AUDIT_BACKEND=database \
+              HFS_ENABLE_CORS=false \
+              HFS_AUTH_ENABLED=false \
+              ./target/debug/hfs --log-level info --port "$HFS_PORT_SMOKE" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+            fi
+          fi
+
+          echo $! > /tmp/hfs-audit-db.pid
+          echo "HFS_PID=$(cat /tmp/hfs-audit-db.pid)" >> $GITHUB_ENV
+
+      - name: Wait for HFS to be ready
+        run: |
+          echo "Waiting for HFS to start..."
+          for i in {1..30}; do
+            if ! kill -0 "$HFS_PID" 2>/dev/null; then
+              echo "HFS process ($HFS_PID) exited"
+              cat "$HFS_LOG"
+              exit 1
+            fi
+            if curl -sf "http://localhost:$HFS_PORT_SMOKE/health" > /dev/null 2>&1; then
+              echo "HFS is ready"
+              exit 0
+            fi
+            echo "Attempt $i/30: HFS not ready yet..."
+            sleep 2
+          done
+
+          echo "HFS failed to start"
+          tail -100 "$HFS_LOG"
+          exit 1
+
+      - name: Run smoke interactions
+        run: |
+          mkdir -p audit-db-results
+          cat > /tmp/audit-db-smoke-patient.json <<JSON
+          {
+            "resourceType": "Patient",
+            "name": [{"family": "AuditDBSmoke", "given": ["Run"]}],
+            "active": true
+          }
+          JSON
+
+          CREATE_STATUS=$(curl -sS -o audit-db-results/create.body -w "%{http_code}" \
+            -X POST "http://localhost:$HFS_PORT_SMOKE/Patient" \
+            -H "Content-Type: application/fhir+json" \
+            --data-binary @/tmp/audit-db-smoke-patient.json)
+          if [ "$CREATE_STATUS" != "201" ]; then
+            echo "create_patient expected 201 got $CREATE_STATUS"
+            cat audit-db-results/create.body
+            exit 1
+          fi
+
+          PATIENT_ID=$(jq -r '.id // empty' audit-db-results/create.body)
+          if [ -z "$PATIENT_ID" ]; then
+            echo "create_patient response missing id"
+            cat audit-db-results/create.body
+            exit 1
+          fi
+
+          READ_STATUS=$(curl -sS -o audit-db-results/read.body -w "%{http_code}" \
+            "http://localhost:$HFS_PORT_SMOKE/Patient/$PATIENT_ID")
+          if [ "$READ_STATUS" != "200" ]; then
+            echo "read_patient expected 200 got $READ_STATUS"
+            cat audit-db-results/read.body
+            exit 1
+          fi
+
+          echo "PATIENT_ID=$PATIENT_ID" >> $GITHUB_ENV
+          sleep 1
+
+      - name: Validate database sink persistence
+        run: |
+          EXAMPLE_FILE="audit-db-results/example-event.json"
+          CHECK_COUNT=0
+
+          for _ in {1..20}; do
+            if [ "${{ matrix.mode }}" = "shared" ] && [ "${{ matrix.backend }}" != "s3" ]; then
+              curl -sS -H "X-Tenant-ID: __system__" \
+                "http://localhost:$HFS_PORT_SMOKE/AuditEvent?_count=20" > audit-db-results/auditevent-search.json
+              CHECK_COUNT=$(jq -r '.entry | length // 0' audit-db-results/auditevent-search.json)
+              jq '.entry[0].resource // {}' audit-db-results/auditevent-search.json > "$EXAMPLE_FILE"
+            elif [ "${{ matrix.backend }}" = "sqlite" ]; then
+              DB_PATH="$PRIMARY_SQLITE_DB"
+              if [ "${{ matrix.mode }}" = "dedicated" ]; then
+                DB_PATH="$AUDIT_SQLITE_DB"
+              fi
+              CHECK_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM resources WHERE tenant_id='__system__' AND resource_type='AuditEvent';")
+              sqlite3 "$DB_PATH" "SELECT data FROM resources WHERE tenant_id='__system__' AND resource_type='AuditEvent' LIMIT 1;" > "$EXAMPLE_FILE"
+            elif [ "${{ matrix.backend }}" = "postgres" ]; then
+              DB_NAME="helios"
+              if [ "${{ matrix.mode }}" = "dedicated" ]; then
+                DB_NAME="helios_audit"
+              fi
+              CHECK_COUNT=$(docker exec "$PG_CONTAINER" psql -U helios -d "$DB_NAME" -tAc "SELECT COUNT(*) FROM resources WHERE tenant_id='__system__' AND resource_type='AuditEvent';" | tr -d '[:space:]')
+              docker exec "$PG_CONTAINER" psql -U helios -d "$DB_NAME" -tAc "SELECT data FROM resources WHERE tenant_id='__system__' AND resource_type='AuditEvent' LIMIT 1;" > "$EXAMPLE_FILE"
+            elif [ "${{ matrix.backend }}" = "mongodb" ]; then
+              DB_NAME="$PRIMARY_MONGO_DB"
+              if [ "${{ matrix.mode }}" = "dedicated" ]; then
+                DB_NAME="$AUDIT_MONGO_DB"
+              fi
+              CHECK_COUNT=$(docker exec "$MONGO_CONTAINER" mongosh --quiet "$DB_NAME" --eval 'db.resources.countDocuments({tenant_id:"__system__",resource_type:"AuditEvent"})' | tr -d '[:space:]')
+              docker exec "$MONGO_CONTAINER" mongosh --quiet "$DB_NAME" --eval 'printjson(db.resources.findOne({tenant_id:"__system__",resource_type:"AuditEvent"},{_id:0,data:1}))' > "$EXAMPLE_FILE"
+            else
+              PREFIX="$PRIMARY_S3_PREFIX"
+              if [ "${{ matrix.mode }}" = "dedicated" ]; then
+                PREFIX="$AUDIT_S3_PREFIX"
+              fi
+              CHECK_COUNT=$(aws s3 ls "s3://${HFS_S3_BUCKET}/${PREFIX}resources/AuditEvent/" --recursive | wc -l | tr -d ' ')
+              aws s3 ls "s3://${HFS_S3_BUCKET}/${PREFIX}resources/AuditEvent/" --recursive | head -1 > "$EXAMPLE_FILE" || true
+            fi
+
+            if [ "${CHECK_COUNT:-0}" -ge 1 ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "${CHECK_COUNT:-0}" -lt 1 ]; then
+            echo "Expected persisted AuditEvent resources, found $CHECK_COUNT"
+            exit 1
+          fi
+
+          {
+            echo "## DB Audit Smoke"
+            echo ""
+            echo "- Backend: \`${{ matrix.backend }}\`"
+            echo "- Mode: \`${{ matrix.mode }}\`"
+            echo "- Persisted AuditEvent count check: \`${CHECK_COUNT}\`"
+            echo "- Patient ID used: \`${PATIENT_ID}\`"
+            echo ""
+            echo "### Example persisted record"
+            echo ""
+            echo '```json'
+            cat "$EXAMPLE_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop HFS gracefully
+        if: always()
+        run: |
+          if [ -f /tmp/hfs-audit-db.pid ]; then
+            HFS_PID=$(cat /tmp/hfs-audit-db.pid)
+            kill -INT "$HFS_PID" 2>/dev/null || true
+            for _ in {1..50}; do
+              if kill -0 "$HFS_PID" 2>/dev/null; then
+                sleep 0.2
+              else
+                break
+              fi
+            done
+            kill -9 "$HFS_PID" 2>/dev/null || true
+            rm -f /tmp/hfs-audit-db.pid
+          fi
+          sleep 1
+
+      - name: Upload database-smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-db-smoke-${{ matrix.backend }}-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            audit-db-results/
+            /tmp/hfs-audit-db-${{ matrix.backend }}-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Cleanup smoke resources
+        if: always()
+        run: |
+          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
