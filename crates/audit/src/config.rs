@@ -162,6 +162,7 @@ mod tests {
         assert_eq!(AuditBackend::None.to_string(), "none");
         assert_eq!(AuditBackend::File.to_string(), "file");
         assert_eq!(AuditBackend::Database.to_string(), "database");
+        assert_eq!(AuditBackend::CloudWatch.to_string(), "cloudwatch");
     }
 
     #[test]
@@ -200,6 +201,35 @@ mod tests {
         assert_eq!(config.backend, AuditBackend::Database);
         unsafe {
             env::remove_var("HFS_AUDIT_BACKEND");
+        }
+    }
+
+    #[test]
+    fn test_from_env_cloudwatch_backend_aliases() {
+        unsafe {
+            env::set_var("HFS_AUDIT_BACKEND", "cloudwatch-logs");
+            env::set_var("HFS_AUDIT_CLOUDWATCH_LOG_GROUP", "/hfs/audit");
+            env::set_var("HFS_AUDIT_CLOUDWATCH_LOG_STREAM", "ci-stream");
+            env::set_var("HFS_AUDIT_CLOUDWATCH_REGION", "us-east-1");
+        }
+
+        let config = AuditConfig::from_env();
+        assert_eq!(config.backend, AuditBackend::CloudWatch);
+        assert_eq!(
+            config.cloudwatch_log_group.as_deref(),
+            Some("/hfs/audit")
+        );
+        assert_eq!(
+            config.cloudwatch_log_stream.as_deref(),
+            Some("ci-stream")
+        );
+        assert_eq!(config.cloudwatch_region.as_deref(), Some("us-east-1"));
+
+        unsafe {
+            env::remove_var("HFS_AUDIT_BACKEND");
+            env::remove_var("HFS_AUDIT_CLOUDWATCH_LOG_GROUP");
+            env::remove_var("HFS_AUDIT_CLOUDWATCH_LOG_STREAM");
+            env::remove_var("HFS_AUDIT_CLOUDWATCH_REGION");
         }
     }
 
