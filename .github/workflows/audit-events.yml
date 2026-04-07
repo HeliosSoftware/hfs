@@ -545,8 +545,9 @@ jobs:
           STATUS=0
 
           for _ in {1..30}; do
+            EXPORT_TOKEN=$(KEYCLOAK_URL="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT" ./docker/keycloak/get-token.sh)
             STATUS=$(curl -sS -o "$BUNDLE_FILE" -w "%{http_code}" \
-              -H "Authorization: Bearer $FULL_TOKEN" \
+              -H "Authorization: Bearer $EXPORT_TOKEN" \
               -H "X-Tenant-ID: __system__" \
               -H "Accept: application/fhir+json" \
               "http://localhost:$HFS_PORT/AuditEvent?_count=200")
