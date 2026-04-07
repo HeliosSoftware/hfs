@@ -577,32 +577,41 @@ jobs:
           RESULTS_DIR="audit-results" \
           ./crates/hfs/tests/audit/run_external_audit.sh
 
-      - name: Export audit events from API (s3-elasticsearch)
+      - name: Export audit events from S3 (s3-elasticsearch)
         if: matrix.backend == 's3-elasticsearch'
         run: |
-          BUNDLE_FILE="audit-results/auditevent-search.json"
-          STATUS=0
+          AUDIT_EVENT_PREFIX="${AUDIT_S3_PREFIX}__system__/resources/AuditEvent/"
+          OUTPUT_FILE="audit-results/audit.ndjson"
+          KEYS_FILE="$(mktemp)"
 
           for _ in {1..30}; do
-            EXPORT_TOKEN=$(KEYCLOAK_URL="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT" ./docker/keycloak/get-token.sh)
-            STATUS=$(curl -sS -o "$BUNDLE_FILE" -w "%{http_code}" \
-              -H "Authorization: Bearer $EXPORT_TOKEN" \
-              -H "X-Tenant-ID: __system__" \
-              -H "Accept: application/fhir+json" \
-              "http://localhost:$HFS_PORT/AuditEvent?_count=200")
-            if [ "$STATUS" = "200" ]; then
-              COUNT=$(jq -r '.entry | length // 0' "$BUNDLE_FILE")
+            : > "$OUTPUT_FILE"
+            : > "$KEYS_FILE"
+
+            aws s3 ls "s3://${HFS_S3_BUCKET}/${AUDIT_EVENT_PREFIX}" --recursive \
+              | awk '{print $4}' \
+              | grep 'current\.json$' > "$KEYS_FILE" || true
+
+            if [ -s "$KEYS_FILE" ]; then
+              while IFS= read -r KEY; do
+                [ -z "$KEY" ] && continue
+                aws s3 cp "s3://${HFS_S3_BUCKET}/${KEY}" - \
+                  | jq -c '.content // empty' >> "$OUTPUT_FILE"
+              done < "$KEYS_FILE"
+
+              COUNT=$(grep -cve '^[[:space:]]*$' "$OUTPUT_FILE" || true)
               if [ "${COUNT:-0}" -gt 0 ]; then
-                jq -c '.entry[]?.resource' "$BUNDLE_FILE" > audit-results/audit.ndjson
-                echo "Exported $COUNT audit events from API"
+                echo "Exported $COUNT audit events from s3://${HFS_S3_BUCKET}/${AUDIT_EVENT_PREFIX}"
+                rm -f "$KEYS_FILE"
                 exit 0
               fi
             fi
             sleep 1
           done
 
-          echo "Failed to export audit events from API (status=$STATUS)"
-          cat "$BUNDLE_FILE" || true
+          echo "Failed to export audit events from S3 prefix s3://${HFS_S3_BUCKET}/${AUDIT_EVENT_PREFIX}"
+          aws s3 ls "s3://${HFS_S3_BUCKET}/${AUDIT_EVENT_PREFIX}" --recursive || true
+          rm -f "$KEYS_FILE"
           exit 1
 
       - name: Stop HFS gracefully
