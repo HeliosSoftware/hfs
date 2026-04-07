@@ -232,8 +232,14 @@ AWS_REGION=us-east-1 \
 | `HFS_S3_REGION` | *(AWS provider chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix prepended to all S3 object keys |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
-| `HFS_AUDIT_BACKEND` | `none` | [Audit backend](crates/persistence/README.md#building--running-storage-backends): `none`, `file`, or `cloudwatch` (`database` is currently not wired in `hfs`) |
+| `HFS_AUDIT_BACKEND` | `none` | [Audit backend](crates/audit/README.md#audit-sinks): `none`, `file`, `database`, or `cloudwatch` |
 | `HFS_AUDIT_FILE_PATH` | *(none)* | Required when `HFS_AUDIT_BACKEND=file`; NDJSON file path for persisted `AuditEvent` logs |
+| `HFS_AUDIT_DATABASE_URL` | *(none)* | Optional dedicated audit database URL/path (SQLite/PostgreSQL/MongoDB families) |
+| `HFS_AUDIT_MONGODB_DATABASE` | *(none)* | Optional dedicated MongoDB database name for audit events |
+| `HFS_AUDIT_S3_BUCKET` | *(none)* | Optional dedicated S3 bucket for audit events |
+| `HFS_AUDIT_S3_PREFIX` | *(none)* | Optional dedicated S3 prefix for audit events |
+| `HFS_AUDIT_S3_REGION` | *(none)* | Optional dedicated S3 region for audit events |
+| `HFS_AUDIT_S3_VALIDATE_BUCKETS` | *(none)* | Optional dedicated S3 bucket validation toggle for audit events |
 | `HFS_AUDIT_SOURCE_OBSERVER` | `Device/hfs` | Sets `AuditEvent.source.observer` |
 | `HFS_AUDIT_EXCLUDE_PATHS` | *(none)* | Comma-separated paths to exclude from audit middleware |
 | `HFS_AUDIT_CLOUDWATCH_LOG_GROUP` | *(none)* | Required when `HFS_AUDIT_BACKEND=cloudwatch`; CloudWatch Logs log group name |
