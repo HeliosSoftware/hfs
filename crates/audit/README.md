@@ -50,13 +50,38 @@ tail -f ./audit/audit.ndjson
 
 ### `DatabaseSink` — FHIR storage backend (`HFS_AUDIT_BACKEND=database`)
 
-Persists `AuditEvent` resources through the same storage backend used for clinical data (SQLite, PostgreSQL, S3). Events are stored as first-class FHIR resources and are queryable via the FHIR search API.
+Persists `AuditEvent` resources through HFS storage backends (SQLite, PostgreSQL, MongoDB, S3) as first-class FHIR resources.
+
+`database` mode supports both:
+
+- **Shared audit store (default):** no audit backend overrides are set, so audit events are written to the same primary backend/database as clinical data.
+- **Dedicated audit store:** one or more `HFS_AUDIT_*` backend override variables are set, so audit events are written to a separate backend target for independent management.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `HFS_AUDIT_DATABASE_URL` | No | Dedicated database URL; falls back to the main HFS database if unset |
+| `HFS_AUDIT_DATABASE_URL` | No | Dedicated database URL/path override (SQLite/PostgreSQL/MongoDB families) |
+| `HFS_AUDIT_MONGODB_DATABASE` | No | Dedicated MongoDB database name (MongoDB family) |
+| `HFS_AUDIT_S3_BUCKET` | No | Dedicated S3 bucket (S3 family) |
+| `HFS_AUDIT_S3_PREFIX` | No | Dedicated S3 key prefix (S3 family) |
+| `HFS_AUDIT_S3_REGION` | No | Dedicated S3 region override (S3 family) |
+| `HFS_AUDIT_S3_VALIDATE_BUCKETS` | No | Dedicated S3 bucket validation toggle (`true`/`false`, default inherited from primary) |
 
-> **Note:** The database sink is implemented but not yet wired into the HFS startup sequence. Use `file` or `cloudwatch` for now.
+`DatabaseSink` writes with `TenantContext::system()` (tenant ID `__system__`) to keep audit records isolated from tenant-scoped clinical writes.
+
+Examples:
+
+```bash
+# Shared mode (SQLite example): audit events stored in the same DB as primary data
+HFS_STORAGE_BACKEND=sqlite \
+HFS_AUDIT_BACKEND=database \
+cargo run --bin hfs -- --database-url ./fhir.db
+
+# Dedicated mode (PostgreSQL example): audit events stored in separate DB
+HFS_STORAGE_BACKEND=postgres \
+HFS_AUDIT_BACKEND=database \
+HFS_AUDIT_DATABASE_URL=postgresql://helios:helios@localhost:5432/helios_audit \
+cargo run --bin hfs
+```
 
 ### `CloudWatchLogsSink` — AWS CloudWatch Logs (`HFS_AUDIT_BACKEND=cloudwatch`)
 
@@ -375,7 +400,7 @@ The [FHIR AuditEvent specification](https://hl7.org/fhir/auditevent.html) identi
 
 ## Current Limitations
 
-- The `DatabaseSink` exists in this crate, but the current `hfs` startup wiring only enables `none` and `file`
+- Dedicated database audit stores are not automatically exposed through the primary REST API (they are intentionally separate storage targets)
 - Middleware records events after the handler runs and does not directly inspect response bodies (enrichment comes from response extensions)
 - Audit recording is intentionally infallible; write failures are logged, not surfaced to API clients
 - Persistence-layer audit functions are available but not yet wired into REST handlers (the functions are ready for callers to use at the appropriate lifecycle points)
