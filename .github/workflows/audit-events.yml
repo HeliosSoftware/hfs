@@ -11,6 +11,7 @@ env:
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}
+  HFS_AUDIT_CLOUDWATCH_LOG_GROUP: ${{ vars.HFS_AUDIT_CLOUDWATCH_LOG_GROUP }}
 
 jobs:
   build:
@@ -34,7 +35,7 @@ jobs:
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
 
       - name: Build HFS
-        run: cargo build -p helios-hfs --features R4,sqlite,elasticsearch,postgres,mongodb,s3
+        run: cargo build -p helios-hfs --features R4,sqlite,elasticsearch,postgres,mongodb,s3,cloudwatch
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v4
@@ -179,7 +180,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
+        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch, cloudwatch]
 
     steps:
       - name: Checkout code
@@ -195,6 +196,7 @@ jobs:
         run: |
           chmod +x target/debug/hfs
           chmod +x crates/hfs/tests/audit/run_external_audit.sh
+          chmod +x crates/hfs/tests/audit/partition_events_by_time.py
           chmod +x crates/hfs/tests/audit/validate_report.py
           chmod +x docker/keycloak/get-token.sh
 
@@ -216,6 +218,10 @@ jobs:
         run: |
           if [ "${{ matrix.backend }}" = "s3-elasticsearch" ] && [ -z "$HFS_S3_BUCKET" ]; then
             echo "::error::s3-elasticsearch backend requires HFS_S3_BUCKET to be configured"
+            exit 1
+          fi
+          if [ "${{ matrix.backend }}" = "cloudwatch" ] && [ -z "${HFS_AUDIT_CLOUDWATCH_LOG_GROUP:-}" ]; then
+            echo "::error::cloudwatch backend requires HFS_AUDIT_CLOUDWATCH_LOG_GROUP to be configured"
             exit 1
           fi
 
@@ -326,14 +332,14 @@ jobs:
           exit 1
 
       - name: Configure AWS credentials
-        if: matrix.backend == 's3-elasticsearch'
+        if: matrix.backend == 's3-elasticsearch' || matrix.backend == 'cloudwatch'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
 
       - name: Install AWS CLI
-        if: matrix.backend == 's3-elasticsearch'
+        if: matrix.backend == 's3-elasticsearch' || matrix.backend == 'cloudwatch'
         run: |
           if ! command -v aws &>/dev/null; then
             if ! /tmp/aws-bin/aws --version &>/dev/null; then
@@ -359,6 +365,20 @@ jobs:
           echo "Emptying s3://$BUCKET/$AUDIT_PREFIX"
           aws s3 rm "s3://$BUCKET/$AUDIT_PREFIX" --recursive
           echo "Prefixes emptied"
+
+      - name: Prepare CloudWatch log stream
+        if: matrix.backend == 'cloudwatch'
+        run: |
+          LOG_GROUP="${HFS_AUDIT_CLOUDWATCH_LOG_GROUP}"
+          LOG_STREAM="hfs-audit-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
+          START_MS="$(python3 -c 'import time; print(int(time.time() * 1000))')"
+
+          echo "CLOUDWATCH_LOG_GROUP=$LOG_GROUP" >> $GITHUB_ENV
+          echo "CLOUDWATCH_LOG_STREAM=$LOG_STREAM" >> $GITHUB_ENV
+          echo "AUDIT_RUN_START_MS=$START_MS" >> $GITHUB_ENV
+
+          aws logs create-log-group --log-group-name "$LOG_GROUP" >/dev/null 2>&1 || true
+          aws logs create-log-stream --log-group-name "$LOG_GROUP" --log-stream-name "$LOG_STREAM" >/dev/null 2>&1 || true
 
       - name: Start ephemeral Keycloak
         run: |
@@ -487,6 +507,20 @@ jobs:
             HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
             HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "cloudwatch" ]; then
+            HFS_STORAGE_BACKEND=sqlite \
+            HFS_AUDIT_BACKEND=cloudwatch \
+            HFS_AUDIT_CLOUDWATCH_LOG_GROUP="$CLOUDWATCH_LOG_GROUP" \
+            HFS_AUDIT_CLOUDWATCH_LOG_STREAM="$CLOUDWATCH_LOG_STREAM" \
+            HFS_AUDIT_CLOUDWATCH_REGION="${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}" \
+            HFS_ENABLE_CORS=false \
+            HFS_AUTH_ENABLED=true \
+            HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+            HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+            HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+            HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             HFS_AUDIT_BACKEND=file \
             HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
@@ -527,6 +561,10 @@ jobs:
       - name: Run external interaction suite
         run: |
           mkdir -p audit-results
+          AUDIT_WINDOW_MODE="file"
+          if [ "${{ matrix.backend }}" = "s3-elasticsearch" ] || [ "${{ matrix.backend }}" = "cloudwatch" ]; then
+            AUDIT_WINDOW_MODE="time"
+          fi
 
           BASE_URL="http://localhost:$HFS_PORT" \
           KEYCLOAK_URL="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT" \
@@ -534,6 +572,7 @@ jobs:
           GET_TOKEN_SCRIPT="./docker/keycloak/get-token.sh" \
           FULL_TOKEN="$FULL_TOKEN" \
           READONLY_TOKEN="$READONLY_TOKEN" \
+          AUDIT_WINDOW_MODE="$AUDIT_WINDOW_MODE" \
           AUDIT_FILE="$AUDIT_FILE" \
           RESULTS_DIR="audit-results" \
           ./crates/hfs/tests/audit/run_external_audit.sh
@@ -582,6 +621,73 @@ jobs:
             kill -9 "$HFS_PID" 2>/dev/null || true
           fi
           sleep 1
+
+      - name: Export audit events from CloudWatch (cloudwatch)
+        if: matrix.backend == 'cloudwatch'
+        run: |
+          TMP_EVENTS="$(mktemp)"
+          PREV_COUNT=-1
+          STABLE=0
+
+          for _ in {1..30}; do
+            : > "$TMP_EVENTS"
+            NEXT_TOKEN=""
+            while true; do
+              if [ -n "$NEXT_TOKEN" ]; then
+                RESPONSE="$(aws logs filter-log-events \
+                  --log-group-name "$CLOUDWATCH_LOG_GROUP" \
+                  --log-stream-names "$CLOUDWATCH_LOG_STREAM" \
+                  --start-time "$AUDIT_RUN_START_MS" \
+                  --next-token "$NEXT_TOKEN" \
+                  --output json)"
+              else
+                RESPONSE="$(aws logs filter-log-events \
+                  --log-group-name "$CLOUDWATCH_LOG_GROUP" \
+                  --log-stream-names "$CLOUDWATCH_LOG_STREAM" \
+                  --start-time "$AUDIT_RUN_START_MS" \
+                  --output json)"
+              fi
+
+              echo "$RESPONSE" | jq -r '.events[]?.message' >> "$TMP_EVENTS"
+              NEW_TOKEN="$(echo "$RESPONSE" | jq -r '.nextToken // empty')"
+              if [ -z "$NEW_TOKEN" ] || [ "$NEW_TOKEN" = "$NEXT_TOKEN" ]; then
+                break
+              fi
+              NEXT_TOKEN="$NEW_TOKEN"
+            done
+
+            cp "$TMP_EVENTS" audit-results/audit.ndjson
+            COUNT="$(grep -cve '^[[:space:]]*$' audit-results/audit.ndjson || true)"
+
+            if [ "$COUNT" -gt 0 ] && [ "$COUNT" -eq "$PREV_COUNT" ]; then
+              STABLE=$((STABLE + 1))
+            else
+              STABLE=0
+            fi
+            PREV_COUNT="$COUNT"
+
+            if [ "$COUNT" -gt 0 ] && [ "$STABLE" -ge 2 ]; then
+              echo "Exported $COUNT CloudWatch audit events"
+              break
+            fi
+            sleep 2
+          done
+
+          if [ ! -s audit-results/audit.ndjson ]; then
+            echo "Failed to export CloudWatch audit events"
+            aws logs describe-log-streams --log-group-name "$CLOUDWATCH_LOG_GROUP" --log-stream-name-prefix "$CLOUDWATCH_LOG_STREAM" || true
+            exit 1
+          fi
+
+      - name: Partition exported audit events by interaction windows
+        if: matrix.backend == 's3-elasticsearch' || matrix.backend == 'cloudwatch'
+        run: |
+          python3 ./crates/hfs/tests/audit/partition_events_by_time.py \
+            --audit-file audit-results/audit.ndjson \
+            --ranges-file audit-results/interaction_ranges.tsv \
+            --output-dir audit-results/events \
+            --start-margin-ms 1500 \
+            --end-margin-ms 3000
 
       - name: Validate audit coverage and generate report
         run: |
