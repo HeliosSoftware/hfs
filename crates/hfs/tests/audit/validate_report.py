@@ -2,6 +2,10 @@
 import argparse
 import json
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,6 +20,7 @@ SOURCE_TYPE_RESTFUL_INTERACTION_VS = "http://hl7.org/fhir/ValueSet/type-restful-
 SOURCE_SYSTEM_RESTFUL_INTERACTION_VS = "http://hl7.org/fhir/ValueSet/system-restful-interaction"
 SOURCE_INTERACTION_TRIGGER_VS = "http://hl7.org/fhir/ValueSet/interaction-trigger"
 SOURCE_TESTSCRIPT_OPERATION_CODES_VS = "http://hl7.org/fhir/ValueSet/testscript-operation-codes"
+DEFAULT_TX_BASE_URL = "https://tx.fhir.org/r5"
 
 VALID_AUDIT_EVENT_TYPE_CODES = {"rest", "hl7-v2", "hl7-v3", "document", "object"}
 VALID_RESTFUL_INTERACTION_CODES = {
@@ -89,7 +94,19 @@ TERMINOLOGY_SOURCES = [
         "applies_to": "TestScript operation code bindings",
         "note": "Cross-check context for operation-style interaction codes.",
     },
+    {
+        "name": "tx-r5-live-validation",
+        "url": DEFAULT_TX_BASE_URL,
+        "mode": "strict",
+        "applies_to": "Every extracted AuditEvent code usage (system+code)",
+        "note": "Live CodeSystem/$validate-code checks for all extracted code usages.",
+    },
 ]
+
+IMPLICIT_CODE_SYSTEMS: dict[tuple[str, ...], str] = {
+    ("action",): "http://hl7.org/fhir/audit-event-action",
+    ("outcome",): "http://terminology.hl7.org/CodeSystem/audit-event-outcome",
+}
 
 
 def load_ndjson(path: Path) -> list[dict[str, Any]]:
@@ -131,6 +148,21 @@ def scalar(value: Any) -> str:
             if text:
                 return text
     return ""
+
+
+def path_to_str(path: tuple[str, ...]) -> str:
+    if not path:
+        return "(root)"
+    out: list[str] = []
+    for part in path:
+        if part == "*":
+            if out:
+                out[-1] = f"{out[-1]}[*]"
+            else:
+                out.append("[*]")
+        else:
+            out.append(part)
+    return ".".join(out)
 
 
 def type_code(event: dict[str, Any]) -> str:
@@ -298,6 +330,174 @@ def validate_terminology(events: list[dict[str, Any]]) -> tuple[str, dict[str, A
     )
 
 
+def extract_code_occurrences(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    occurrences: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    def walk(node: Any, path: tuple[str, ...], event_line: int, event_id: str) -> None:
+        if isinstance(node, dict):
+            if "system" in node and "code" in node:
+                system = scalar(node.get("system"))
+                code = scalar(node.get("code"))
+                if code and system:
+                    occurrences.append(
+                        {
+                            "system": system,
+                            "code": code,
+                            "path": path_to_str(path),
+                            "line": event_line,
+                            "event_id": event_id,
+                            "source": "coding",
+                        }
+                    )
+                elif code and not system:
+                    skipped.append(
+                        {
+                            "code": code,
+                            "path": path_to_str(path),
+                            "line": event_line,
+                            "event_id": event_id,
+                            "reason": "code present without system",
+                        }
+                    )
+
+            for key, value in node.items():
+                walk(value, path + (key,), event_line, event_id)
+            return
+
+        if isinstance(node, list):
+            for item in node:
+                walk(item, path + ("*",), event_line, event_id)
+            return
+
+        system = IMPLICIT_CODE_SYSTEMS.get(path)
+        if system:
+            code = scalar(node)
+            if code:
+                occurrences.append(
+                    {
+                        "system": system,
+                        "code": code,
+                        "path": path_to_str(path),
+                        "line": event_line,
+                        "event_id": event_id,
+                        "source": "implicit",
+                    }
+                )
+
+    for event in events:
+        line = int(event.get("__line", 0))
+        event_id = scalar(event.get("id"))
+        walk(event, tuple(), line, event_id)
+
+    return occurrences, skipped
+
+
+def _tx_extract_result(payload: dict[str, Any]) -> tuple[bool | None, str]:
+    if payload.get("resourceType") != "Parameters":
+        return None, scalar(payload.get("issue")) or "Unexpected response from terminology server"
+
+    result: bool | None = None
+    message = ""
+    for param in payload.get("parameter") or []:
+        name = scalar(param.get("name"))
+        if name == "result":
+            raw = param.get("valueBoolean")
+            if isinstance(raw, bool):
+                result = raw
+            elif isinstance(raw, dict):
+                inner = raw.get("value")
+                if isinstance(inner, bool):
+                    result = inner
+                elif isinstance(inner, str):
+                    result = inner.lower() == "true"
+            elif isinstance(raw, str):
+                result = raw.lower() == "true"
+        elif name == "message":
+            message = scalar(param.get("valueString"))
+
+    return result, message
+
+
+def tx_validate_code(
+    tx_base_url: str,
+    system: str,
+    code: str,
+    timeout_seconds: float,
+    max_attempts: int = 2,
+) -> tuple[bool, str]:
+    base = tx_base_url.rstrip("/")
+    query = urllib.parse.urlencode({"url": system, "code": code})
+    url = f"{base}/CodeSystem/$validate-code?{query}"
+    request = urllib.request.Request(url, headers={"Accept": "application/fhir+json"})
+
+    last_error = ""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                payload = json.loads(body)
+                result, message = _tx_extract_result(payload)
+                if result is True:
+                    return True, message or "Validated by terminology server"
+                if result is False:
+                    return False, message or "Code not valid for system"
+                last_error = message or "Missing result parameter from terminology server"
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            last_error = f"HTTP {exc.code} from terminology server: {body[:400]}"
+        except Exception as exc:  # pragma: no cover - defensive guard for network/runtime errors
+            last_error = f"Terminology request error: {exc}"
+
+        if attempt < max_attempts:
+            time.sleep(0.2)
+
+    return False, last_error or "Unknown terminology validation failure"
+
+
+def validate_codes_with_tx(
+    events: list[dict[str, Any]],
+    tx_base_url: str,
+    timeout_seconds: float,
+    max_failures_report: int,
+) -> dict[str, Any]:
+    occurrences, skipped = extract_code_occurrences(events)
+    unique_pairs = sorted({(o["system"], o["code"]) for o in occurrences})
+
+    pair_results: dict[tuple[str, str], dict[str, Any]] = {}
+    invalid_pairs: list[dict[str, str]] = []
+    for system, code in unique_pairs:
+        ok, message = tx_validate_code(tx_base_url, system, code, timeout_seconds)
+        pair_results[(system, code)] = {"ok": ok, "message": message}
+        if not ok:
+            invalid_pairs.append({"system": system, "code": code, "message": message})
+
+    invalid_occurrences: list[dict[str, Any]] = []
+    for occ in occurrences:
+        pair = (occ["system"], occ["code"])
+        result = pair_results.get(pair, {"ok": False, "message": "Missing validation result"})
+        if not result["ok"]:
+            invalid_occurrences.append(
+                {
+                    **occ,
+                    "message": result["message"],
+                }
+            )
+
+    return {
+        "tx_base_url": tx_base_url,
+        "status": "pass" if not invalid_occurrences else "fail",
+        "total_occurrences": len(occurrences),
+        "unique_code_pairs": len(unique_pairs),
+        "invalid_pair_count": len(invalid_pairs),
+        "invalid_pairs": invalid_pairs[:max_failures_report],
+        "invalid_occurrences_count": len(invalid_occurrences),
+        "invalid_occurrences": invalid_occurrences[:max_failures_report],
+        "skipped_occurrences_count": len(skipped),
+        "skipped_occurrences": skipped[:max_failures_report],
+    }
+
+
 def collect_codes_by_system(events: list[dict[str, Any]]) -> dict[str, list[str]]:
     audit_type_codes: set[str] = set()
     restful_codes: set[str] = set()
@@ -330,7 +530,7 @@ def collect_codes_by_system(events: list[dict[str, Any]]) -> dict[str, list[str]
     }
 
 
-def build_terminology_context(events: list[dict[str, Any]]) -> dict[str, Any]:
+def build_terminology_context(events: list[dict[str, Any]], tx_validation: dict[str, Any] | None) -> dict[str, Any]:
     observed = collect_codes_by_system(events)
     restful_codes = observed["restful_interaction_codes"]
     has_operation = "operation" in restful_codes
@@ -391,12 +591,21 @@ def build_terminology_context(events: list[dict[str, Any]]) -> dict[str, Any]:
         },
     ]
 
-    return {
-        "sources": TERMINOLOGY_SOURCES,
+    sources = [dict(source) for source in TERMINOLOGY_SOURCES]
+    if tx_validation is not None:
+        for source in sources:
+            if source.get("name") == "tx-r5-live-validation":
+                source["url"] = tx_validation.get("tx_base_url", source["url"])
+
+    context = {
+        "sources": sources,
         "codes_observed": observed,
         "strict_results": strict_results,
         "context_results": context_results,
     }
+    if tx_validation is not None:
+        context["tx_validation"] = tx_validation
+    return context
 
 
 def read_ranges(path: Path) -> list[dict[str, Any]]:
@@ -407,7 +616,18 @@ def read_ranges(path: Path) -> list[dict[str, Any]]:
     for row in lines[1:]:
         if not row.strip():
             continue
-        name, method, req_path, expected, actual, start, end = row.split("\t")
+        parts = row.split("\t")
+        if len(parts) < 7:
+            raise RuntimeError(f"Invalid interaction range row (expected >= 7 columns): {row}")
+        name, method, req_path, expected, actual, start, end = parts[:7]
+        start_ts_ms = None
+        end_ts_ms = None
+        if len(parts) >= 9:
+            start_ts_ms_raw, end_ts_ms_raw = parts[7], parts[8]
+            if start_ts_ms_raw:
+                start_ts_ms = int(start_ts_ms_raw)
+            if end_ts_ms_raw:
+                end_ts_ms = int(end_ts_ms_raw)
         records.append(
             {
                 "name": name,
@@ -417,6 +637,8 @@ def read_ranges(path: Path) -> list[dict[str, Any]]:
                 "actual": actual,
                 "start_line": int(start),
                 "end_line": int(end),
+                "start_ts_ms": start_ts_ms,
+                "end_ts_ms": end_ts_ms,
             }
         )
     return records
@@ -453,6 +675,10 @@ def main() -> int:
     parser.add_argument("--context-file", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--strict-correlation", action="store_true")
+    parser.add_argument("--tx-base-url", default=DEFAULT_TX_BASE_URL)
+    parser.add_argument("--tx-timeout-seconds", type=float, default=10.0)
+    parser.add_argument("--tx-max-failures-report", type=int, default=25)
+    parser.add_argument("--skip-tx-validation", action="store_true")
     args = parser.parse_args()
 
     audit_file = Path(args.audit_file)
@@ -474,8 +700,21 @@ def main() -> int:
     # Lifecycle
     startup_example = find_example(events, lambda e: is_lifecycle_phase(e, "startup"))
     shutdown_example = find_example(events, lambda e: is_lifecycle_phase(e, "shutdown"))
+    expect_shutdown = context.get("audit_window_mode", "file") == "file"
+    shutdown_ok = shutdown_example is not None or not expect_shutdown
     checks.append(check("lifecycle_startup", startup_example is not None, "Startup lifecycle audit event", startup_example))
-    checks.append(check("lifecycle_shutdown", shutdown_example is not None, "Shutdown lifecycle audit event", shutdown_example))
+    checks.append(
+        check(
+            "lifecycle_shutdown",
+            shutdown_ok,
+            (
+                "Shutdown lifecycle audit event"
+                if expect_shutdown
+                else "Shutdown lifecycle audit event (optional in time-window export mode)"
+            ),
+            shutdown_example,
+        )
+    )
 
     # Auth global categories
     auth_missing_example = find_example(events, is_auth_missing_token)
@@ -498,7 +737,35 @@ def main() -> int:
             terminology_example,
         )
     )
-    terminology_context = build_terminology_context(events)
+    tx_validation: dict[str, Any] | None = None
+    if not args.skip_tx_validation:
+        tx_validation = validate_codes_with_tx(
+            events,
+            args.tx_base_url,
+            args.tx_timeout_seconds,
+            args.tx_max_failures_report,
+        )
+        tx_example = None
+        if tx_validation["invalid_occurrences"]:
+            failing_line = tx_validation["invalid_occurrences"][0].get("line")
+            tx_example = find_example(events, lambda e: int(e.get("__line", -1)) == int(failing_line))
+        checks.append(
+            check(
+                "terminology_tx_validate_code",
+                tx_validation["status"] == "pass",
+                (
+                    f"Validated {tx_validation['total_occurrences']} code occurrence(s) "
+                    f"({tx_validation['unique_code_pairs']} unique system+code pairs) via {args.tx_base_url}"
+                    if tx_validation["status"] == "pass"
+                    else (
+                        f"tx validation found {tx_validation['invalid_occurrences_count']} invalid occurrence(s) "
+                        f"across {tx_validation['invalid_pair_count']} unique pair(s) via {args.tx_base_url}"
+                    )
+                ),
+                tx_example,
+            )
+        )
+    terminology_context = build_terminology_context(events, tx_validation)
 
     # Per-interaction checks from captured windows
     interaction_specs: list[tuple[str, str, Callable[[list[dict[str, Any]]], dict[str, Any] | None]]] = [
@@ -650,13 +917,14 @@ def main() -> int:
 
     # Every recorded call should produce at least one audit event window
     for rec in ranges:
-        produced = rec["end_line"] > rec["start_line"]
+        call_window_events = call_events(output_dir, rec["name"])
+        produced = rec["end_line"] > rec["start_line"] or len(call_window_events) > 0
         checks.append(
             check(
                 f"window_{rec['name']}",
                 produced,
                 f"Captured audit window for {rec['method']} {rec['path']}",
-                call_events(output_dir, rec["name"])[0] if produced and call_events(output_dir, rec["name"]) else None,
+                call_window_events[0] if produced and call_window_events else None,
             )
         )
 
@@ -768,6 +1036,27 @@ def main() -> int:
         lines.append(f"- `[strict/{result['status']}]` `{result['key']}`: {result['message']}")
     for result in terminology_context["context_results"]:
         lines.append(f"- `[context/{result['status']}]` `{result['key']}`: {result['message']}")
+    if terminology_context.get("tx_validation") is not None:
+        tx_result = terminology_context["tx_validation"]
+        lines.append("")
+        lines.append("### tx.fhir.org/r5 Validation")
+        lines.append("")
+        lines.append(f"- Base URL: `{tx_result['tx_base_url']}`")
+        lines.append(f"- Total code occurrences validated: **{tx_result['total_occurrences']}**")
+        lines.append(f"- Unique system+code pairs validated: **{tx_result['unique_code_pairs']}**")
+        lines.append(f"- Invalid occurrences: **{tx_result['invalid_occurrences_count']}**")
+        lines.append(f"- Invalid unique pairs: **{tx_result['invalid_pair_count']}**")
+        if tx_result["skipped_occurrences_count"] > 0:
+            lines.append(
+                f"- Skipped occurrences (missing system / unsupported extraction context): **{tx_result['skipped_occurrences_count']}**"
+            )
+        if tx_result["invalid_pairs"]:
+            lines.append("")
+            lines.append("Invalid pairs (first entries):")
+            for item in tx_result["invalid_pairs"]:
+                lines.append(
+                    f"- `{item['system']} | {item['code']}`: {item['message']}"
+                )
 
     if failed:
         lines.append("")
