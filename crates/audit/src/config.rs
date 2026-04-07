@@ -141,6 +141,31 @@ impl Default for AuditConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    const AUDIT_ENV_KEYS: &[&str] = &[
+        "HFS_AUDIT_BACKEND",
+        "HFS_AUDIT_FILE_PATH",
+        "HFS_AUDIT_DATABASE_URL",
+        "HFS_AUDIT_MONGODB_DATABASE",
+        "HFS_AUDIT_S3_BUCKET",
+        "HFS_AUDIT_S3_PREFIX",
+        "HFS_AUDIT_S3_REGION",
+        "HFS_AUDIT_S3_VALIDATE_BUCKETS",
+        "HFS_AUDIT_EXCLUDE_PATHS",
+        "HFS_AUDIT_SOURCE_OBSERVER",
+        "HFS_AUDIT_CLOUDWATCH_LOG_GROUP",
+        "HFS_AUDIT_CLOUDWATCH_LOG_STREAM",
+        "HFS_AUDIT_CLOUDWATCH_REGION",
+    ];
+
+    fn clear_audit_env() {
+        for key in AUDIT_ENV_KEYS {
+            unsafe { env::remove_var(key) };
+        }
+    }
 
     #[test]
     fn test_default_config() {
@@ -167,6 +192,8 @@ mod tests {
 
     #[test]
     fn test_from_env_file_backend() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_audit_env();
         unsafe {
             env::set_var("HFS_AUDIT_BACKEND", "file");
             env::set_var("HFS_AUDIT_FILE_PATH", "/tmp/audit.log");
@@ -174,38 +201,37 @@ mod tests {
         let config = AuditConfig::from_env();
         assert_eq!(config.backend, AuditBackend::File);
         assert_eq!(config.file_path.as_deref(), Some("/tmp/audit.log"));
-        unsafe {
-            env::remove_var("HFS_AUDIT_BACKEND");
-            env::remove_var("HFS_AUDIT_FILE_PATH");
-        }
+        clear_audit_env();
     }
 
     #[test]
     fn test_from_env_database_backend() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_audit_env();
         unsafe {
             env::set_var("HFS_AUDIT_BACKEND", "database");
         }
         let config = AuditConfig::from_env();
         assert_eq!(config.backend, AuditBackend::Database);
-        unsafe {
-            env::remove_var("HFS_AUDIT_BACKEND");
-        }
+        clear_audit_env();
     }
 
     #[test]
     fn test_from_env_db_alias() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_audit_env();
         unsafe {
             env::set_var("HFS_AUDIT_BACKEND", "db");
         }
         let config = AuditConfig::from_env();
         assert_eq!(config.backend, AuditBackend::Database);
-        unsafe {
-            env::remove_var("HFS_AUDIT_BACKEND");
-        }
+        clear_audit_env();
     }
 
     #[test]
     fn test_from_env_cloudwatch_backend_aliases() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_audit_env();
         unsafe {
             env::set_var("HFS_AUDIT_BACKEND", "cloudwatch-logs");
             env::set_var("HFS_AUDIT_CLOUDWATCH_LOG_GROUP", "/hfs/audit");
@@ -219,37 +245,33 @@ mod tests {
         assert_eq!(config.cloudwatch_log_stream.as_deref(), Some("ci-stream"));
         assert_eq!(config.cloudwatch_region.as_deref(), Some("us-east-1"));
 
-        unsafe {
-            env::remove_var("HFS_AUDIT_BACKEND");
-            env::remove_var("HFS_AUDIT_CLOUDWATCH_LOG_GROUP");
-            env::remove_var("HFS_AUDIT_CLOUDWATCH_LOG_STREAM");
-            env::remove_var("HFS_AUDIT_CLOUDWATCH_REGION");
-        }
+        clear_audit_env();
     }
 
     #[test]
     fn test_from_env_unset_defaults_to_none() {
-        unsafe {
-            env::remove_var("HFS_AUDIT_BACKEND");
-        }
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_audit_env();
         let config = AuditConfig::from_env();
         assert_eq!(config.backend, AuditBackend::None);
     }
 
     #[test]
     fn test_from_env_custom_source_observer() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_audit_env();
         unsafe {
             env::set_var("HFS_AUDIT_SOURCE_OBSERVER", "Device/my-server");
         }
         let config = AuditConfig::from_env();
         assert_eq!(config.source_observer, "Device/my-server");
-        unsafe {
-            env::remove_var("HFS_AUDIT_SOURCE_OBSERVER");
-        }
+        clear_audit_env();
     }
 
     #[test]
     fn test_from_env_database_overrides() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_audit_env();
         unsafe {
             env::set_var(
                 "HFS_AUDIT_DATABASE_URL",
@@ -273,13 +295,6 @@ mod tests {
         assert_eq!(config.s3_region.as_deref(), Some("us-east-1"));
         assert_eq!(config.s3_validate_buckets, Some(false));
 
-        unsafe {
-            env::remove_var("HFS_AUDIT_DATABASE_URL");
-            env::remove_var("HFS_AUDIT_MONGODB_DATABASE");
-            env::remove_var("HFS_AUDIT_S3_BUCKET");
-            env::remove_var("HFS_AUDIT_S3_PREFIX");
-            env::remove_var("HFS_AUDIT_S3_REGION");
-            env::remove_var("HFS_AUDIT_S3_VALIDATE_BUCKETS");
-        }
+        clear_audit_env();
     }
 }
