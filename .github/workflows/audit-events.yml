@@ -350,10 +350,15 @@ jobs:
         if: matrix.backend == 's3-elasticsearch'
         run: |
           BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}"
-          PREFIX="ci-audit/${{ github.run_id }}/${{ github.run_attempt }}/"
-          echo "Emptying s3://$BUCKET/$PREFIX"
-          aws s3 rm "s3://$BUCKET/$PREFIX" --recursive
-          echo "Prefix emptied"
+          PRIMARY_PREFIX="ci-audit/${{ github.run_id }}/${{ github.run_attempt }}/primary/"
+          AUDIT_PREFIX="ci-audit/${{ github.run_id }}/${{ github.run_attempt }}/audit/"
+          echo "PRIMARY_S3_PREFIX=$PRIMARY_PREFIX" >> $GITHUB_ENV
+          echo "AUDIT_S3_PREFIX=$AUDIT_PREFIX" >> $GITHUB_ENV
+          echo "Emptying s3://$BUCKET/$PRIMARY_PREFIX"
+          aws s3 rm "s3://$BUCKET/$PRIMARY_PREFIX" --recursive
+          echo "Emptying s3://$BUCKET/$AUDIT_PREFIX"
+          aws s3 rm "s3://$BUCKET/$AUDIT_PREFIX" --recursive
+          echo "Prefixes emptied"
 
       - name: Start ephemeral Keycloak
         run: |
@@ -468,11 +473,12 @@ jobs:
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=s3-elasticsearch \
             HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
-            HFS_S3_PREFIX="ci-audit/${{ github.run_id }}/${{ github.run_attempt }}/" \
+            HFS_S3_PREFIX="$PRIMARY_S3_PREFIX" \
             HFS_S3_VALIDATE_BUCKETS=false \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
-            HFS_AUDIT_BACKEND=file \
-            HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_AUDIT_BACKEND=database \
+            HFS_AUDIT_S3_PREFIX="$AUDIT_S3_PREFIX" \
+            HFS_AUDIT_S3_VALIDATE_BUCKETS=false \
             HFS_ENABLE_CORS=false \
             HFS_AUTH_ENABLED=true \
             HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
@@ -532,6 +538,33 @@ jobs:
           RESULTS_DIR="audit-results" \
           ./crates/hfs/tests/audit/run_external_audit.sh
 
+      - name: Export audit events from API (s3-elasticsearch)
+        if: matrix.backend == 's3-elasticsearch'
+        run: |
+          BUNDLE_FILE="audit-results/auditevent-search.json"
+          STATUS=0
+
+          for _ in {1..30}; do
+            STATUS=$(curl -sS -o "$BUNDLE_FILE" -w "%{http_code}" \
+              -H "Authorization: Bearer $FULL_TOKEN" \
+              -H "X-Tenant-ID: __system__" \
+              -H "Accept: application/fhir+json" \
+              "http://localhost:$HFS_PORT/AuditEvent?_count=200")
+            if [ "$STATUS" = "200" ]; then
+              COUNT=$(jq -r '.entry | length // 0' "$BUNDLE_FILE")
+              if [ "${COUNT:-0}" -gt 0 ]; then
+                jq -c '.entry[]?.resource' "$BUNDLE_FILE" > audit-results/audit.ndjson
+                echo "Exported $COUNT audit events from API"
+                exit 0
+              fi
+            fi
+            sleep 1
+          done
+
+          echo "Failed to export audit events from API (status=$STATUS)"
+          cat "$BUNDLE_FILE" || true
+          exit 1
+
       - name: Stop HFS gracefully
         if: always()
         run: |
@@ -551,7 +584,14 @@ jobs:
 
       - name: Validate audit coverage and generate report
         run: |
-          cp "$AUDIT_FILE" audit-results/audit.ndjson || true
+          if [ ! -f audit-results/audit.ndjson ]; then
+            if [ -f "$AUDIT_FILE" ]; then
+              cp "$AUDIT_FILE" audit-results/audit.ndjson
+            else
+              echo "audit-results/audit.ndjson is missing and AUDIT_FILE was not produced"
+              exit 1
+            fi
+          fi
           cp "$HFS_LOG" audit-results/hfs.log || true
           docker logs "$KC_CONTAINER" > audit-results/keycloak.log 2>&1 || true
 
@@ -559,7 +599,7 @@ jobs:
           VALIDATOR_HELP="$(python3 "$VALIDATOR" --help 2>&1 || true)"
 
           VALIDATE_ARGS=(
-            --audit-file "$AUDIT_FILE"
+            --audit-file audit-results/audit.ndjson
             --ranges-file audit-results/interaction_ranges.tsv
             --context-file audit-results/context.json
             --output-dir audit-results
