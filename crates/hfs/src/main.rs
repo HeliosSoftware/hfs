@@ -25,6 +25,7 @@ use helios_audit::{
     AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };
 use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
+use helios_persistence::{ResourceStorage, TenantContext};
 use helios_rest::{
     AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth, init_logging,
 };
@@ -35,6 +36,381 @@ use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 
 #[cfg(feature = "mongodb")]
 use helios_persistence::backends::mongodb::MongoBackend;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditPrimaryBackendFamily {
+    Sqlite,
+    Postgres,
+    MongoDB,
+    S3,
+}
+
+fn audit_primary_backend_family(mode: StorageBackendMode) -> AuditPrimaryBackendFamily {
+    match mode {
+        StorageBackendMode::Sqlite | StorageBackendMode::SqliteElasticsearch => {
+            AuditPrimaryBackendFamily::Sqlite
+        }
+        StorageBackendMode::Postgres | StorageBackendMode::PostgresElasticsearch => {
+            AuditPrimaryBackendFamily::Postgres
+        }
+        StorageBackendMode::MongoDB | StorageBackendMode::MongoDBElasticsearch => {
+            AuditPrimaryBackendFamily::MongoDB
+        }
+        StorageBackendMode::S3 | StorageBackendMode::S3Elasticsearch => {
+            AuditPrimaryBackendFamily::S3
+        }
+    }
+}
+
+fn is_database_audit_dedicated(config: &AuditConfig, family: AuditPrimaryBackendFamily) -> bool {
+    match family {
+        AuditPrimaryBackendFamily::Sqlite | AuditPrimaryBackendFamily::Postgres => {
+            config.database_url.is_some()
+        }
+        AuditPrimaryBackendFamily::MongoDB => {
+            config.database_url.is_some() || config.mongodb_database.is_some()
+        }
+        AuditPrimaryBackendFamily::S3 => {
+            config.s3_bucket.is_some()
+                || config.s3_prefix.is_some()
+                || config.s3_region.is_some()
+                || config.s3_validate_buckets.is_some()
+        }
+    }
+}
+
+fn parse_env_bool(var: &str, default_value: bool) -> bool {
+    std::env::var(var)
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            !(normalized == "false" || normalized == "0")
+        })
+        .unwrap_or(default_value)
+}
+
+fn is_postgres_url(url: &str) -> bool {
+    url.starts_with("postgres://") || url.starts_with("postgresql://")
+}
+
+fn is_mongodb_url(url: &str) -> bool {
+    url.starts_with("mongodb://") || url.starts_with("mongodb+srv://")
+}
+
+fn validate_shared_sqlite_audit_path(path: &str, dedicated: bool) -> anyhow::Result<()> {
+    if !dedicated && path == ":memory:" {
+        anyhow::bail!(
+            "Database audit backend in shared SQLite mode cannot use :memory: because it cannot be shared \
+             across separate backend instances. Set HFS_AUDIT_DATABASE_URL to a file path for a dedicated \
+             audit store, or use HFS_AUDIT_BACKEND=file."
+        );
+    }
+    Ok(())
+}
+
+struct HfsAuditStorageAdapter {
+    storage: Arc<dyn ResourceStorage>,
+    tenant: TenantContext,
+}
+
+impl HfsAuditStorageAdapter {
+    fn new(storage: Arc<dyn ResourceStorage>) -> Self {
+        Self {
+            storage,
+            tenant: TenantContext::system(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl helios_audit::sinks::database::AuditStorage for HfsAuditStorageAdapter {
+    async fn create_resource(
+        &self,
+        resource_type: &str,
+        resource: serde_json::Value,
+        fhir_version: helios_fhir::FhirVersion,
+    ) -> Result<(), String> {
+        self.storage
+            .create(&self.tenant, resource_type, resource, fhir_version)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+async fn create_database_audit_storage(
+    server_config: &ServerConfig,
+    backend_mode: StorageBackendMode,
+    audit_config: &AuditConfig,
+) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+    let family = audit_primary_backend_family(backend_mode);
+    let dedicated = is_database_audit_dedicated(audit_config, family);
+
+    info!(
+        backend_family = ?family,
+        storage_backend = %backend_mode,
+        dedicated = dedicated,
+        "Initializing database audit sink storage"
+    );
+
+    match family {
+        AuditPrimaryBackendFamily::Sqlite => {
+            create_audit_sqlite_storage(server_config, audit_config, dedicated).await
+        }
+        AuditPrimaryBackendFamily::Postgres => {
+            create_audit_postgres_storage(server_config, audit_config, dedicated).await
+        }
+        AuditPrimaryBackendFamily::MongoDB => {
+            create_audit_mongodb_storage(server_config, audit_config, dedicated).await
+        }
+        AuditPrimaryBackendFamily::S3 => {
+            create_audit_s3_storage(server_config, audit_config, dedicated).await
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+async fn create_audit_sqlite_storage(
+    server_config: &ServerConfig,
+    audit_config: &AuditConfig,
+    dedicated: bool,
+) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+    let database_url = if dedicated {
+        audit_config.database_url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Dedicated SQLite audit mode requires HFS_AUDIT_DATABASE_URL to be set")
+        })?
+    } else {
+        server_config.database_url.as_deref().unwrap_or("fhir.db")
+    };
+
+    validate_shared_sqlite_audit_path(database_url, dedicated)?;
+
+    let mut sqlite_config = server_config.clone();
+    sqlite_config.database_url = Some(database_url.to_string());
+    let backend = create_sqlite_backend(&sqlite_config)?;
+
+    Ok(Arc::new(backend))
+}
+
+#[cfg(not(feature = "sqlite"))]
+async fn create_audit_sqlite_storage(
+    _server_config: &ServerConfig,
+    _audit_config: &AuditConfig,
+    _dedicated: bool,
+) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+    anyhow::bail!(
+        "Database audit backend with sqlite storage requires the 'sqlite' feature. \
+         Build with: cargo build -p helios-hfs --features sqlite"
+    )
+}
+
+#[cfg(feature = "postgres")]
+async fn create_audit_postgres_storage(
+    server_config: &ServerConfig,
+    audit_config: &AuditConfig,
+    dedicated: bool,
+) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+    use helios_persistence::backends::postgres::PostgresBackend;
+
+    let backend = if dedicated {
+        let url = audit_config.database_url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Dedicated PostgreSQL audit mode requires HFS_AUDIT_DATABASE_URL to be set"
+            )
+        })?;
+        if !is_postgres_url(url) {
+            anyhow::bail!(
+                "HFS_AUDIT_DATABASE_URL must be a PostgreSQL connection string when primary backend is postgres"
+            );
+        }
+        PostgresBackend::from_connection_string(url).await?
+    } else if let Some(ref url) = server_config.database_url {
+        if is_postgres_url(url) {
+            PostgresBackend::from_connection_string(url).await?
+        } else {
+            PostgresBackend::from_env().await?
+        }
+    } else {
+        PostgresBackend::from_env().await?
+    };
+
+    backend.init_schema().await?;
+    Ok(Arc::new(backend))
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn create_audit_postgres_storage(
+    _server_config: &ServerConfig,
+    _audit_config: &AuditConfig,
+    _dedicated: bool,
+) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+    anyhow::bail!(
+        "Database audit backend with postgres storage requires the 'postgres' feature. \
+         Build with: cargo build -p helios-hfs --features postgres"
+    )
+}
+
+#[cfg(feature = "mongodb")]
+async fn create_audit_mongodb_storage(
+    server_config: &ServerConfig,
+    audit_config: &AuditConfig,
+    dedicated: bool,
+) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+    use helios_persistence::backends::mongodb::MongoBackendConfig;
+
+    let backend = if dedicated {
+        let connection_string = match audit_config.database_url.as_deref() {
+            Some(url) => {
+                if !is_mongodb_url(url) {
+                    anyhow::bail!(
+                        "HFS_AUDIT_DATABASE_URL must be a MongoDB connection string when primary backend is mongodb"
+                    );
+                }
+                url.to_string()
+            }
+            None => {
+                if let Some(url) = server_config.database_url.as_deref() {
+                    if is_mongodb_url(url) {
+                        url.to_string()
+                    } else {
+                        std::env::var("HFS_MONGODB_URL")
+                            .or_else(|_| std::env::var("HFS_MONGODB_URI"))
+                            .or_else(|_| std::env::var("HFS_DATABASE_URL"))
+                            .unwrap_or_else(|_| "mongodb://localhost:27017".to_string())
+                    }
+                } else {
+                    std::env::var("HFS_MONGODB_URL")
+                        .or_else(|_| std::env::var("HFS_MONGODB_URI"))
+                        .or_else(|_| std::env::var("HFS_DATABASE_URL"))
+                        .unwrap_or_else(|_| "mongodb://localhost:27017".to_string())
+                }
+            }
+        };
+
+        let database_name = audit_config
+            .mongodb_database
+            .clone()
+            .or_else(|| std::env::var("HFS_MONGODB_DATABASE").ok())
+            .unwrap_or_else(|| "helios".to_string());
+
+        let max_connections = std::env::var("HFS_MONGODB_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(10);
+        let connect_timeout_ms = std::env::var("HFS_MONGODB_CONNECT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5000);
+
+        let config = MongoBackendConfig {
+            connection_string,
+            database_name,
+            max_connections,
+            connect_timeout_ms,
+            fhir_version: server_config.default_fhir_version,
+            data_dir: server_config.data_dir.clone(),
+            search_offloaded: false,
+        };
+        MongoBackend::new(config)?
+    } else if let Some(ref url) = server_config.database_url {
+        if is_mongodb_url(url) {
+            MongoBackend::from_connection_string(url)?
+        } else {
+            MongoBackend::from_env()?
+        }
+    } else {
+        MongoBackend::from_env()?
+    };
+
+    backend.init_schema().await?;
+    Ok(Arc::new(backend))
+}
+
+#[cfg(not(feature = "mongodb"))]
+async fn create_audit_mongodb_storage(
+    _server_config: &ServerConfig,
+    _audit_config: &AuditConfig,
+    _dedicated: bool,
+) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+    anyhow::bail!(
+        "Database audit backend with mongodb storage requires the 'mongodb' feature. \
+         Build with: cargo build -p helios-hfs --features mongodb"
+    )
+}
+
+#[cfg(feature = "s3")]
+async fn create_audit_s3_storage(
+    _server_config: &ServerConfig,
+    audit_config: &AuditConfig,
+    dedicated: bool,
+) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+    use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
+
+    if audit_config.database_url.is_some() {
+        anyhow::bail!(
+            "HFS_AUDIT_DATABASE_URL is not supported for S3-backed database audit sink. \
+             Use HFS_AUDIT_S3_BUCKET / HFS_AUDIT_S3_PREFIX / HFS_AUDIT_S3_REGION instead."
+        );
+    }
+
+    let bucket = audit_config
+        .s3_bucket
+        .clone()
+        .or_else(|| std::env::var("HFS_S3_BUCKET").ok())
+        .unwrap_or_else(|| "hfs".to_string());
+    let region = audit_config
+        .s3_region
+        .clone()
+        .or_else(|| std::env::var("HFS_S3_REGION").ok());
+    let prefix = audit_config
+        .s3_prefix
+        .clone()
+        .or_else(|| std::env::var("HFS_S3_PREFIX").ok());
+    let validate_buckets = audit_config
+        .s3_validate_buckets
+        .unwrap_or_else(|| parse_env_bool("HFS_S3_VALIDATE_BUCKETS", true));
+
+    info!(
+        bucket = %bucket,
+        region = ?region,
+        prefix = ?prefix,
+        validate_buckets = validate_buckets,
+        dedicated = dedicated,
+        "Initializing S3 storage for database audit sink"
+    );
+
+    let s3_config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::PrefixPerTenant {
+            bucket: bucket.clone(),
+        },
+        region,
+        prefix,
+        validate_buckets_on_startup: validate_buckets,
+        ..Default::default()
+    };
+
+    let backend = S3Backend::from_env_async(s3_config).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to initialize S3 storage for database audit sink (bucket={}, region={:?}): {}",
+            bucket,
+            std::env::var("AWS_REGION").ok(),
+            e
+        )
+    })?;
+
+    Ok(Arc::new(backend))
+}
+
+#[cfg(not(feature = "s3"))]
+async fn create_audit_s3_storage(
+    _server_config: &ServerConfig,
+    _audit_config: &AuditConfig,
+    _dedicated: bool,
+) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+    anyhow::bail!(
+        "Database audit backend with s3 storage requires the 's3' feature. \
+         Build with: cargo build -p helios-hfs --features s3"
+    )
+}
 
 /// Creates and initializes a SQLite backend from the server configuration.
 #[cfg(feature = "sqlite")]
@@ -214,7 +590,10 @@ async fn init_auth_with_audit(
 ///
 /// Returns the audit sink (for use as auth bridge) and optional middleware state.
 /// If audit is disabled, returns `(NullSink, None)`.
-async fn init_audit() -> anyhow::Result<(Arc<dyn AuditSink>, Option<Arc<AuditMiddlewareState>>)> {
+async fn init_audit(
+    server_config: &ServerConfig,
+    backend_mode: StorageBackendMode,
+) -> anyhow::Result<(Arc<dyn AuditSink>, Option<Arc<AuditMiddlewareState>>)> {
     let config = AuditConfig::from_env();
 
     let sink: Arc<dyn AuditSink> = match config.backend {
@@ -230,12 +609,13 @@ async fn init_audit() -> anyhow::Result<(Arc<dyn AuditSink>, Option<Arc<AuditMid
             Arc::new(helios_audit::FileSink::new(path).await?)
         }
         AuditBackend::Database => {
-            // Database sink requires a storage implementation to be provided
-            // by the caller. For now, fall back to file or null.
-            anyhow::bail!(
-                "Database audit backend is not yet wired into the HFS startup. \
-                 Use HFS_AUDIT_BACKEND=file or HFS_AUDIT_BACKEND=none for now."
-            );
+            let storage =
+                create_database_audit_storage(server_config, backend_mode, &config).await?;
+            let adapter = Arc::new(HfsAuditStorageAdapter::new(storage));
+            Arc::new(helios_audit::DatabaseSink::new(
+                adapter,
+                server_config.default_fhir_version,
+            ))
         }
         #[cfg(feature = "cloudwatch")]
         AuditBackend::CloudWatch => {
@@ -297,7 +677,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid storage backend configuration: {}", e))?;
 
     // Initialize audit subsystem
-    let (audit_sink, audit_state) = init_audit().await?;
+    let (audit_sink, audit_state) = init_audit(&config, backend_mode).await?;
 
     // Initialize authentication (with audit bridge if audit is enabled)
     let (auth_config, auth_state) = init_auth_with_audit(audit_sink).await?;
@@ -1123,6 +1503,7 @@ compile_error!("At least one database backend feature must be enabled");
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_audit::AuditConfig;
     use helios_rest::ServerConfig;
 
     // ── create_sqlite_backend() ───────────────────────────────────
@@ -1201,6 +1582,110 @@ mod tests {
         assert!(
             config.validate().is_ok(),
             "default ServerConfig should be valid"
+        );
+    }
+
+    #[test]
+    fn test_audit_primary_backend_family_mapping() {
+        assert_eq!(
+            audit_primary_backend_family(StorageBackendMode::Sqlite),
+            AuditPrimaryBackendFamily::Sqlite
+        );
+        assert_eq!(
+            audit_primary_backend_family(StorageBackendMode::SqliteElasticsearch),
+            AuditPrimaryBackendFamily::Sqlite
+        );
+        assert_eq!(
+            audit_primary_backend_family(StorageBackendMode::Postgres),
+            AuditPrimaryBackendFamily::Postgres
+        );
+        assert_eq!(
+            audit_primary_backend_family(StorageBackendMode::PostgresElasticsearch),
+            AuditPrimaryBackendFamily::Postgres
+        );
+        assert_eq!(
+            audit_primary_backend_family(StorageBackendMode::MongoDB),
+            AuditPrimaryBackendFamily::MongoDB
+        );
+        assert_eq!(
+            audit_primary_backend_family(StorageBackendMode::MongoDBElasticsearch),
+            AuditPrimaryBackendFamily::MongoDB
+        );
+        assert_eq!(
+            audit_primary_backend_family(StorageBackendMode::S3),
+            AuditPrimaryBackendFamily::S3
+        );
+        assert_eq!(
+            audit_primary_backend_family(StorageBackendMode::S3Elasticsearch),
+            AuditPrimaryBackendFamily::S3
+        );
+    }
+
+    #[test]
+    fn test_is_database_audit_dedicated_detection() {
+        let mut config = AuditConfig::default();
+        assert!(!is_database_audit_dedicated(
+            &config,
+            AuditPrimaryBackendFamily::Sqlite
+        ));
+        assert!(!is_database_audit_dedicated(
+            &config,
+            AuditPrimaryBackendFamily::Postgres
+        ));
+        assert!(!is_database_audit_dedicated(
+            &config,
+            AuditPrimaryBackendFamily::MongoDB
+        ));
+        assert!(!is_database_audit_dedicated(
+            &config,
+            AuditPrimaryBackendFamily::S3
+        ));
+
+        config.database_url = Some("sqlite:///tmp/audit.db".to_string());
+        assert!(is_database_audit_dedicated(
+            &config,
+            AuditPrimaryBackendFamily::Sqlite
+        ));
+        assert!(is_database_audit_dedicated(
+            &config,
+            AuditPrimaryBackendFamily::Postgres
+        ));
+        assert!(is_database_audit_dedicated(
+            &config,
+            AuditPrimaryBackendFamily::MongoDB
+        ));
+
+        let mut mongo_only = AuditConfig::default();
+        mongo_only.mongodb_database = Some("helios_audit".to_string());
+        assert!(is_database_audit_dedicated(
+            &mongo_only,
+            AuditPrimaryBackendFamily::MongoDB
+        ));
+        assert!(!is_database_audit_dedicated(
+            &mongo_only,
+            AuditPrimaryBackendFamily::Postgres
+        ));
+
+        let mut s3_only = AuditConfig::default();
+        s3_only.s3_bucket = Some("audit-bucket".to_string());
+        assert!(is_database_audit_dedicated(
+            &s3_only,
+            AuditPrimaryBackendFamily::S3
+        ));
+    }
+
+    #[test]
+    fn test_validate_shared_sqlite_audit_path_guard() {
+        let shared = validate_shared_sqlite_audit_path(":memory:", false);
+        assert!(shared.is_err(), "shared SQLite + :memory: must be rejected");
+
+        let dedicated = validate_shared_sqlite_audit_path(":memory:", true);
+        assert!(dedicated.is_ok(), "dedicated SQLite may use :memory:");
+
+        let shared_file = validate_shared_sqlite_audit_path("fhir.db", false);
+        assert!(
+            shared_file.is_ok(),
+            "shared SQLite file path must be accepted"
         );
     }
 }
