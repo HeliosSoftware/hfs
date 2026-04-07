@@ -66,6 +66,8 @@ parking_lot = "0.12"
 
 # Error handling
 anyhow = "1.0"
+async-trait = "0.1"
+serde_json = "1"
 
 # Vendor OpenSSL when cross-compiling for Linux ARM64 (the macOS runner
 # doesn't have target-platform OpenSSL dev libs).  Cargo feature unification
