@@ -403,4 +403,4 @@ The [FHIR AuditEvent specification](https://hl7.org/fhir/auditevent.html) identi
 - Dedicated database audit stores are not automatically exposed through the primary REST API (they are intentionally separate storage targets)
 - Middleware records events after the handler runs and does not directly inspect response bodies (enrichment comes from response extensions)
 - Audit recording is intentionally infallible; write failures are logged, not surfaced to API clients
-- Persistence-layer audit functions are available but not yet wired into REST handlers (the functions are ready for callers to use at the appropriate lifecycle points)
+- Persistence-layer audit functions (bulk export, purge, reindex) exist in `helios-persistence` but are not yet called — REST endpoints for these operations have not been implemented yet
