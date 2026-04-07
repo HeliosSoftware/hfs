@@ -2,7 +2,12 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:?BASE_URL is required}"
-AUDIT_FILE="${AUDIT_FILE:?AUDIT_FILE is required}"
+AUDIT_WINDOW_MODE="${AUDIT_WINDOW_MODE:-file}"
+if [ "$AUDIT_WINDOW_MODE" = "file" ]; then
+  AUDIT_FILE="${AUDIT_FILE:?AUDIT_FILE is required when AUDIT_WINDOW_MODE=file}"
+else
+  AUDIT_FILE="${AUDIT_FILE:-}"
+fi
 RESULTS_DIR="${RESULTS_DIR:-audit-results}"
 REFRESH_TOKENS_PER_CALL="${REFRESH_TOKENS_PER_CALL:-false}"
 GET_TOKEN_SCRIPT="${GET_TOKEN_SCRIPT:-./docker/keycloak/get-token.sh}"
@@ -28,7 +33,16 @@ mkdir -p "$RESULTS_DIR/http" "$RESULTS_DIR/events" "$RESULTS_DIR/payloads"
 RANGES_FILE="$RESULTS_DIR/interaction_ranges.tsv"
 CONTEXT_FILE="$RESULTS_DIR/context.json"
 
-echo -e "name\tmethod\tpath\texpected_status\tactual_status\tstart_line\tend_line" > "$RANGES_FILE"
+if [ "$AUDIT_WINDOW_MODE" != "file" ] && [ "$AUDIT_WINDOW_MODE" != "time" ]; then
+  echo "ERROR: AUDIT_WINDOW_MODE must be 'file' or 'time', got '$AUDIT_WINDOW_MODE'" >&2
+  exit 1
+fi
+
+echo -e "name\tmethod\tpath\texpected_status\tactual_status\tstart_line\tend_line\tstart_ts_ms\tend_ts_ms" > "$RANGES_FILE"
+
+now_ms() {
+  python3 -c 'import time; print(int(time.time() * 1000))'
+}
 
 line_count() {
   if [ -f "$AUDIT_FILE" ]; then
@@ -52,6 +66,13 @@ status_matches() {
 
 capture_event_window() {
   local start_line="$1"
+  if [ "$AUDIT_WINDOW_MODE" = "time" ]; then
+    # In time window mode, call-specific event windows are reconstructed later
+    # from exported sink data (e.g., CloudWatch/API snapshots).
+    echo "$start_line"
+    return
+  fi
+
   local current
   current="$(line_count)"
 
@@ -115,10 +136,11 @@ run_call() {
   local content_type="${6:-}"
   local data_file="${7:-}"
 
-  local start_line end_line status
+  local start_line end_line status start_ts_ms end_ts_ms
   local body_file="$RESULTS_DIR/http/${name}.body"
   local status_file="$RESULTS_DIR/http/${name}.status"
 
+  start_ts_ms="$(now_ms)"
   start_line="$(line_count)"
 
   local -a curl_args
@@ -146,15 +168,16 @@ run_call() {
   fi
 
   end_line="$(capture_event_window "$start_line")"
+  end_ts_ms="$(now_ms)"
 
-  if [ "$end_line" -gt "$start_line" ]; then
+  if [ "$AUDIT_WINDOW_MODE" = "file" ] && [ "$end_line" -gt "$start_line" ]; then
     sed -n "$((start_line + 1)),$((end_line))p" "$AUDIT_FILE" > "$RESULTS_DIR/events/${name}.ndjson"
   else
     : > "$RESULTS_DIR/events/${name}.ndjson"
   fi
 
-  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-    "$name" "$method" "$path" "$expected_status" "$status" "$start_line" "$end_line" >> "$RANGES_FILE"
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "$name" "$method" "$path" "$expected_status" "$status" "$start_line" "$end_line" "$start_ts_ms" "$end_ts_ms" >> "$RANGES_FILE"
 }
 
 # Give startup audit emission a chance to flush before first interaction windowing
@@ -289,6 +312,7 @@ cat > "$CONTEXT_FILE" <<JSON
 {
   "base_url": "${BASE_URL}",
   "audit_file": "${AUDIT_FILE}",
+  "audit_window_mode": "${AUDIT_WINDOW_MODE}",
   "patient_id": "${PATIENT_ID}",
   "observation_id": "${OBSERVATION_ID}",
   "run_tag": "${RUN_TAG}",
