@@ -36,14 +36,18 @@ s3 = ["helios-rest/s3"]
 # Auth backends
 redis = ["helios-rest/redis", "helios-auth/redis"]
 
+# Cloud audit backends
+cloudwatch = ["helios-audit/cloudwatch"]
+
 [build-dependencies]
 reqwest = { version = "0.12", features = ["blocking"] }
 
 [dependencies]
 helios-fhir = { path = "../fhir", version = "0.1.47" }
 helios-rest = { path = "../rest", version = "0.1.47", default-features = false }
-helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false }
+helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false, features = ["audit"] }
 helios-auth = { path = "../auth", version = "0.1.47" }
+helios-audit = { path = "../audit", version = "0.1.47" }
 
 # Web framework
 axum = "0.8"
@@ -62,6 +66,8 @@ parking_lot = "0.12"
 
 # Error handling
 anyhow = "1.0"
+async-trait = "0.1"
+serde_json = "1"
 
 # Vendor OpenSSL when cross-compiling for Linux ARM64 (the macOS runner
 # doesn't have target-platform OpenSSL dev libs).  Cargo feature unification
