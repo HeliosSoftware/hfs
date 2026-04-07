@@ -957,7 +957,7 @@ jobs:
                 DB_PATH="$AUDIT_SQLITE_DB"
               fi
               CHECK_COUNT=$(python3 -c 'import sqlite3,sys; conn=sqlite3.connect(sys.argv[1]); row=conn.execute("SELECT COUNT(*) FROM resources WHERE tenant_id=? AND resource_type=?",("__system__","AuditEvent")).fetchone(); print(row[0] if row else 0); conn.close()' "$DB_PATH")
-              python3 -c 'import sqlite3,sys; conn=sqlite3.connect(sys.argv[1]); row=conn.execute("SELECT data FROM resources WHERE tenant_id=? AND resource_type=? LIMIT 1",("__system__","AuditEvent")).fetchone(); conn.close(); open(sys.argv[2], "w", encoding="utf-8").write(row[0] if row and row[0] is not None else "{}")' "$DB_PATH" "$EXAMPLE_FILE"
+              python3 -c 'import base64,sqlite3,sys; conn=sqlite3.connect(sys.argv[1]); row=conn.execute("SELECT data FROM resources WHERE tenant_id=? AND resource_type=? LIMIT 1",("__system__","AuditEvent")).fetchone(); conn.close(); value=row[0] if row and row[0] is not None else "{}"; text=value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value); text="{\"binary_base64\":\"%s\"}" % base64.b64encode(value).decode("ascii") if isinstance(value, bytes) and not text.strip().startswith("{") else text; open(sys.argv[2], "w", encoding="utf-8").write(text)' "$DB_PATH" "$EXAMPLE_FILE"
             elif [ "${{ matrix.backend }}" = "postgres" ]; then
               DB_NAME="helios"
               if [ "${{ matrix.mode }}" = "dedicated" ]; then
