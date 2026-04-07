@@ -204,9 +204,13 @@ pub struct ImportArgs {
     #[arg(long, value_enum)]
     pub format: Option<ImportFormat>,
 
-    /// SQLite database file to load into
+    /// Database URL (SQLite file path or PostgreSQL connection string)
     #[arg(long, env = "HTS_DATABASE_URL", default_value = "./data/hts.db")]
     pub database_url: String,
+
+    /// Storage backend to import into (`sqlite` or `postgres`)
+    #[arg(long, env = "HTS_STORAGE_BACKEND", default_value = "sqlite")]
+    pub storage_backend: String,
 
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, env = "HTS_LOG_LEVEL", default_value = "info")]

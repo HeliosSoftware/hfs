@@ -26,34 +26,24 @@ use tar::Archive;
 use crate::error::HtsError;
 use crate::import::ImportStats;
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── Shared resource collection ────────────────────────────────────────────────
 
-/// Extract and bulk-import a FHIR NPM terminology package.
+/// Resources extracted from a `.tgz` archive, partitioned by type.
 ///
-/// Opens the `.tgz` at `path`, collects all `CodeSystem`, `ValueSet`, and
-/// `ConceptMap` resources, then imports them in dependency order using the
-/// existing `import_bundle_sync` pipeline.  Resources are processed in
-/// batches of `batch_size` to bound peak memory.
-///
-/// Progress is written to **stderr** in the format:
-/// `[hl7-npm] CodeSystem batch 1/3 — +47 concepts (total: 94)`
-///
-/// When `dry_run` is `true` the archive is fully parsed and counted but no
-/// data is written to the database.  Concept counts in dry-run mode reflect
-/// top-level `concept` array entries only (nested concepts are not traversed).
-///
-/// Returns cumulative [`ImportStats`] across all batches.
-#[cfg(feature = "sqlite")]
-pub fn import_tgz(
-    pool: &Pool<SqliteConnectionManager>,
-    path: &Path,
-    batch_size: usize,
-    dry_run: bool,
-) -> Result<ImportStats, HtsError> {
-    use super::fhir_bundle::import_bundle_sync;
+/// Backend-agnostic: consumed by both the SQLite and PostgreSQL import paths.
+pub(crate) struct CollectedResources {
+    pub code_systems: Vec<Value>,
+    pub value_sets: Vec<Value>,
+    pub concept_maps: Vec<Value>,
+    /// Non-fatal errors encountered while reading or parsing archive entries.
+    pub parse_errors: Vec<String>,
+}
 
-    const FORMAT: &str = "hl7-npm";
-
+/// Open a `.tgz` FHIR NPM package and collect all CodeSystem, ValueSet, and
+/// ConceptMap resources into separate lists.  Metadata files (`package.json`,
+/// `.index.json`) are silently skipped.  Unreadable or malformed entries are
+/// recorded in `parse_errors` and skipped.
+pub(crate) fn collect_tgz_resources(path: &Path) -> Result<CollectedResources, HtsError> {
     let file = std::fs::File::open(path)
         .map_err(|e| HtsError::InvalidRequest(format!("Cannot open {}: {e}", path.display())))?;
 
@@ -65,7 +55,6 @@ pub fn import_tgz(
     let mut concept_maps: Vec<Value> = Vec::new();
     let mut parse_errors: Vec<String> = Vec::new();
 
-    // ── Phase 1: extract and partition resources from the archive ─────────────
     let entries = archive
         .entries()
         .map_err(|e| HtsError::InvalidRequest(format!("Failed to read tar archive: {e}")))?;
@@ -89,7 +78,6 @@ pub fn import_tgz(
             .and_then(|n| n.to_str())
             .unwrap_or("");
 
-        // Only process .json files inside package/; skip metadata files.
         if !name.ends_with(".json") {
             continue;
         }
@@ -126,23 +114,60 @@ pub fn import_tgz(
         }
     }
 
+    Ok(CollectedResources {
+        code_systems,
+        value_sets,
+        concept_maps,
+        parse_errors,
+    })
+}
+
+// ── Public entry points ───────────────────────────────────────────────────────
+
+/// Extract and bulk-import a FHIR NPM terminology package (SQLite backend).
+///
+/// Opens the `.tgz` at `path`, collects all `CodeSystem`, `ValueSet`, and
+/// `ConceptMap` resources, then imports them in dependency order using the
+/// existing `import_bundle_sync` pipeline.  Resources are processed in
+/// batches of `batch_size` to bound peak memory.
+///
+/// Progress is written to **stderr** in the format:
+/// `[hl7-npm] CodeSystem batch 1/3 — +47 concepts (total: 94)`
+///
+/// When `dry_run` is `true` the archive is fully parsed and counted but no
+/// data is written to the database.  Concept counts in dry-run mode reflect
+/// top-level `concept` array entries only (nested concepts are not traversed).
+///
+/// Returns cumulative [`ImportStats`] across all batches.
+#[cfg(feature = "sqlite")]
+pub fn import_tgz(
+    pool: &Pool<SqliteConnectionManager>,
+    path: &Path,
+    batch_size: usize,
+    dry_run: bool,
+) -> Result<ImportStats, HtsError> {
+    use super::fhir_bundle::import_bundle_sync;
+
+    const FORMAT: &str = "hl7-npm";
+
+    let collected = collect_tgz_resources(path)?;
+
     tracing::info!(
-        code_systems = code_systems.len(),
-        value_sets = value_sets.len(),
-        concept_maps = concept_maps.len(),
-        parse_errors = parse_errors.len(),
+        code_systems = collected.code_systems.len(),
+        value_sets = collected.value_sets.len(),
+        concept_maps = collected.concept_maps.len(),
+        parse_errors = collected.parse_errors.len(),
         "Extracted resources from package; starting import"
     );
 
-    // ── Phase 2: import in batches, dependency order preserved ───────────────
     let mut total = ImportStats::default();
-    total.errors = parse_errors;
+    total.errors = collected.parse_errors;
 
     let batch_size = batch_size.max(1);
 
     import_type_batches(
         pool,
-        &code_systems,
+        &collected.code_systems,
         "CodeSystem",
         batch_size,
         dry_run,
@@ -152,7 +177,7 @@ pub fn import_tgz(
     )?;
     import_type_batches(
         pool,
-        &value_sets,
+        &collected.value_sets,
         "ValueSet",
         batch_size,
         dry_run,
@@ -162,7 +187,7 @@ pub fn import_tgz(
     )?;
     import_type_batches(
         pool,
-        &concept_maps,
+        &collected.concept_maps,
         "ConceptMap",
         batch_size,
         dry_run,
@@ -170,6 +195,93 @@ pub fn import_tgz(
         &mut total,
         import_bundle_sync,
     )?;
+
+    Ok(total)
+}
+
+/// Extract and bulk-import a FHIR NPM terminology package (PostgreSQL backend).
+///
+/// Async counterpart to [`import_tgz`].  Reads the archive with
+/// [`collect_tgz_resources`] (blocking, run via `spawn_blocking`), then
+/// imports each batch by calling [`BundleImportBackend::import_bundle`] on
+/// the provided backend.
+///
+/// When `dry_run` is `true` the archive is parsed and counted but no data is
+/// written to the database.
+#[cfg(feature = "postgres")]
+pub async fn import_tgz_pg(
+    backend: &crate::backend::postgres::PostgresTerminologyBackend,
+    path: &Path,
+    batch_size: usize,
+    dry_run: bool,
+) -> Result<ImportStats, HtsError> {
+    use helios_persistence::tenant::TenantContext;
+
+    const FORMAT: &str = "hl7-npm";
+
+    // Archive I/O is blocking — run off the async executor.
+    let path_owned = path.to_path_buf();
+    let collected = tokio::task::spawn_blocking(move || collect_tgz_resources(&path_owned))
+        .await
+        .map_err(|e| HtsError::StorageError(format!("Archive reader panicked: {e}")))??;
+
+    tracing::info!(
+        code_systems = collected.code_systems.len(),
+        value_sets = collected.value_sets.len(),
+        concept_maps = collected.concept_maps.len(),
+        parse_errors = collected.parse_errors.len(),
+        "Extracted resources from package; starting PostgreSQL import"
+    );
+
+    let mut total = ImportStats::default();
+    total.errors = collected.parse_errors;
+
+    let batch_size = batch_size.max(1);
+
+    let ctx = TenantContext::system();
+
+    for (resources, type_label) in [
+        (&collected.code_systems, "CodeSystem"),
+        (&collected.value_sets, "ValueSet"),
+        (&collected.concept_maps, "ConceptMap"),
+    ] {
+        if resources.is_empty() {
+            continue;
+        }
+        let num_batches = resources.len().div_ceil(batch_size);
+        for (i, chunk) in resources.chunks(batch_size).enumerate() {
+            let concepts_before = total.concepts;
+
+            if dry_run {
+                let batch = count_batch(chunk);
+                total.code_systems += batch.code_systems;
+                total.value_sets += batch.value_sets;
+                total.concept_maps += batch.concept_maps;
+                total.concepts += batch.concepts;
+            } else {
+                use crate::import::BundleImportBackend;
+                let bundle_bytes = make_bundle_bytes(chunk);
+                let stats = backend
+                    .import_bundle(&ctx, &bundle_bytes)
+                    .await
+                    .map_err(|e| {
+                        HtsError::StorageError(format!("{type_label} batch import failed: {e}"))
+                    })?;
+                total.code_systems += stats.code_systems;
+                total.value_sets += stats.value_sets;
+                total.concept_maps += stats.concept_maps;
+                total.concepts += stats.concepts;
+                total.errors.extend(stats.errors);
+            }
+
+            let new_concepts = total.concepts - concepts_before;
+            eprintln!(
+                "[{FORMAT}] {type_label} batch {}/{num_batches} — +{new_concepts} concepts (total: {})",
+                i + 1,
+                total.concepts,
+            );
+        }
+    }
 
     Ok(total)
 }

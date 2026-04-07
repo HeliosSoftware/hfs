@@ -767,7 +767,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!resp.result, "display mismatch makes result=false per FHIR spec");
+        assert!(
+            !resp.result,
+            "display mismatch makes result=false per FHIR spec"
+        );
         assert!(
             resp.message.is_some(),
             "display mismatch should produce a message"

@@ -1,8 +1,8 @@
 //! Terminology package importers and the [`BundleImportBackend`] trait.
 //!
 //! Each sub-module handles a specific terminology distribution format.
-//! All importers write into the same normalized HTS SQLite schema via the
-//! shared helpers in [`fhir_bundle`].
+//! The shared [`bundle_parser`] module handles all JSON-walking logic so that
+//! both the SQLite and PostgreSQL backends consume the same intermediate types.
 //!
 //! ## Supported formats
 //!
@@ -20,6 +20,7 @@
 //! programmatically via [`BundleImportBackend::import_bundle`] for HTTP-based
 //! Bundle imports.
 
+pub mod bundle_parser;
 pub mod fhir_bundle;
 pub mod icd10_cm;
 pub mod loinc_csv;
@@ -103,4 +104,21 @@ pub trait BundleImportBackend: Send + Sync {
         ctx: &TenantContext,
         data: &[u8],
     ) -> Result<ImportStats, HtsError>;
+
+    /// Remove all HTS normalized rows for the resource identified by `resource_url`.
+    ///
+    /// Called by the CRUD DELETE handler after the persistence soft-delete so
+    /// that `$lookup`, `$expand`, and `$search` no longer return stale data.
+    ///
+    /// The default implementation is a no-op.  Backends that manage their own
+    /// normalized tables (e.g. `PostgresTerminologyBackend`) override this.
+    /// The SQLite backend uses a separate `hts_pool`-based path in `crud.rs`
+    /// and relies on the default here.
+    async fn delete_normalized(
+        &self,
+        _resource_type: &str,
+        _resource_url: &str,
+    ) -> Result<(), HtsError> {
+        Ok(())
+    }
 }

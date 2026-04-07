@@ -2920,6 +2920,8 @@ dependencies = [
  "serde_json",
  "tar",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",

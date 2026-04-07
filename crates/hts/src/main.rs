@@ -8,6 +8,9 @@ use helios_hts::backend::SqliteTerminologyBackend;
 #[cfg(feature = "sqlite")]
 use helios_hts::state::AppState;
 
+#[cfg(feature = "postgres")]
+use helios_hts::backend::PostgresTerminologyBackend;
+
 fn init_logging(log_level: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
 
@@ -53,6 +56,16 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(feature = "sqlite")]
 async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
+    if config.storage_backend == "postgres" {
+        #[cfg(feature = "postgres")]
+        return run_server_postgres(config).await;
+        #[cfg(not(feature = "postgres"))]
+        anyhow::bail!(
+            "postgres storage backend requested but the 'postgres' feature is not enabled. \
+             Rebuild with `--features postgres`."
+        );
+    }
+
     use helios_persistence::backends::sqlite::SqliteBackend;
 
     let backend = SqliteTerminologyBackend::new(&config.database_url)?;
@@ -82,11 +95,52 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
 }
 
 #[cfg(not(feature = "sqlite"))]
-async fn run_server(_config: HtsConfig) -> anyhow::Result<()> {
+async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
+    if config.storage_backend == "postgres" {
+        #[cfg(feature = "postgres")]
+        return run_server_postgres(config).await;
+        #[cfg(not(feature = "postgres"))]
+        anyhow::bail!(
+            "No storage backend feature is enabled. \
+             Rebuild with `--features sqlite` or `--features postgres`."
+        );
+    }
     anyhow::bail!(
         "No storage backend feature is enabled. \
          Rebuild with `--features sqlite` (or another backend feature)."
     )
+}
+
+#[cfg(feature = "postgres")]
+async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
+    use helios_persistence::backends::postgres::PostgresBackend;
+    use std::sync::Arc;
+
+    let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
+
+    // Initialize the helios-persistence PostgreSQL resource store (raw FHIR JSON CRUD).
+    let resource_store = PostgresBackend::from_connection_string(&config.database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to open PostgreSQL resource store: {e}"))?;
+    resource_store.init_schema().await.map_err(|e| {
+        anyhow::anyhow!("Failed to initialize PostgreSQL resource store schema: {e}")
+    })?;
+
+    info!("PostgreSQL resource store (helios-persistence) initialized");
+
+    let state = helios_hts::state::AppState::new(backend.clone())
+        .with_resource_store_pg(resource_store)
+        .with_terminology_importer(Arc::new(backend))
+        .with_max_expansion_size(config.max_expansion_size);
+
+    let app = helios_hts::server::create_app(&config, state);
+
+    let addr = config.socket_addr();
+    info!(address = %addr, "HTS (PostgreSQL) listening");
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 // ── Import ────────────────────────────────────────────────────────────────────
@@ -95,8 +149,90 @@ async fn run_server(_config: HtsConfig) -> anyhow::Result<()> {
 /// - `0` — success, all resources imported
 /// - `1` — fatal error (propagated as `Err` by `?`)
 /// - `2` — success with non-fatal errors (some records skipped)
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
+    if args.storage_backend == "postgres" {
+        #[cfg(feature = "postgres")]
+        return run_import_postgres(args).await;
+        #[cfg(not(feature = "postgres"))]
+        anyhow::bail!(
+            "postgres storage backend requested but the 'postgres' feature is not enabled. \
+             Rebuild with `--features postgres`."
+        );
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    anyhow::bail!(
+        "sqlite storage backend requested but the 'sqlite' feature is not enabled. \
+         Rebuild with `--features sqlite`."
+    );
+
+    #[cfg(feature = "sqlite")]
+    run_import_sqlite(args).await
+}
+
+#[cfg(feature = "postgres")]
+async fn run_import_postgres(args: ImportArgs) -> anyhow::Result<i32> {
+    use helios_hts::config::ImportFormat;
+    use helios_hts::import::tgz::import_tgz_pg;
+
+    let format = match args.format {
+        Some(f) => f,
+        None => {
+            use helios_hts::config::detect_format;
+            detect_format(&args.path).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot auto-detect format from '{}'.\n\
+                     Use --format to specify one of: hl7-npm | snomed-rf2 | loinc | icd10-cm | rxnorm\n\
+                     Note: .zip files require --format because SNOMED and LOINC share the same extension.",
+                    args.path.display()
+                )
+            })?
+        }
+    };
+
+    if !matches!(format, ImportFormat::Hl7Npm) {
+        anyhow::bail!(
+            "'{format}' importer does not support the PostgreSQL backend. \
+             Use HTS_STORAGE_BACKEND=sqlite."
+        );
+    }
+
+    if !args.path.exists() {
+        anyhow::bail!("Path does not exist: '{}'", args.path.display());
+    }
+
+    if args.dry_run {
+        eprintln!(
+            "[hl7-npm] dry-run mode — parsing only, no changes will be written to the database"
+        );
+    }
+
+    info!(
+        path = %args.path.display(),
+        format = %format,
+        database_url = %args.database_url,
+        dry_run = args.dry_run,
+        "Starting PostgreSQL bulk import"
+    );
+
+    let backend = PostgresTerminologyBackend::new(&args.database_url).await?;
+
+    let started = std::time::Instant::now();
+    let stats = import_tgz_pg(&backend, &args.path, args.batch_size, args.dry_run).await?;
+    let result =
+        helios_hts::import::ImportResult::new(stats, format.to_string(), started.elapsed());
+
+    print_import_summary(&result, args.dry_run, &format.to_string());
+
+    if !result.stats.errors.is_empty() {
+        return Ok(2);
+    }
+    Ok(0)
+}
+
+#[cfg(feature = "sqlite")]
+async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
     use helios_hts::import::tgz::import_tgz;
 
     // ── Validate path ──────────────────────────────────────────────────────
@@ -216,8 +352,28 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
 
     let result = ImportResult::new(stats, format.to_string(), started.elapsed());
 
-    // ── Summary ────────────────────────────────────────────────────────────
-    let dry_label = if args.dry_run { " (dry-run)" } else { "" };
+    print_import_summary(&result, args.dry_run, &format.to_string());
+
+    if !result.stats.errors.is_empty() {
+        return Ok(2);
+    }
+
+    Ok(0)
+}
+
+#[cfg(not(any(feature = "sqlite", feature = "postgres")))]
+async fn run_import(_args: ImportArgs) -> anyhow::Result<i32> {
+    anyhow::bail!(
+        "No storage backend feature is enabled. \
+         Rebuild with `--features sqlite` or `--features postgres`."
+    )
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn print_import_summary(result: &helios_hts::import::ImportResult, dry_run: bool, format: &str) {
+    let dry_label = if dry_run { " (dry-run)" } else { "" };
     println!(
         "Import complete{dry_label} [{format}] in {:.1}s: \
          {} CodeSystems, {} ValueSets, {} ConceptMaps, {} concepts",
@@ -227,7 +383,6 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
         result.stats.concept_maps,
         result.stats.concepts,
     );
-
     if !result.stats.errors.is_empty() {
         eprintln!(
             "Non-fatal errors ({}); first few shown below:",
@@ -236,16 +391,51 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
         for e in result.stats.errors.iter().take(10) {
             eprintln!("  - {e}");
         }
-        return Ok(2);
     }
-
-    Ok(0)
 }
 
-#[cfg(not(feature = "sqlite"))]
-async fn run_import(_args: ImportArgs) -> anyhow::Result<i32> {
-    anyhow::bail!(
-        "No storage backend feature is enabled. \
-         Rebuild with `--features sqlite` (or another backend feature)."
-    )
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "postgres"))]
+mod tests {
+    use super::run_import_postgres;
+    use helios_hts::config::{ImportArgs, ImportFormat};
+    use std::path::PathBuf;
+
+    fn postgres_args(format: ImportFormat) -> ImportArgs {
+        ImportArgs {
+            path: PathBuf::from("/nonexistent/file.zip"),
+            format: Some(format),
+            database_url: "postgres://localhost/hts_test".into(),
+            storage_backend: "postgres".into(),
+            log_level: "info".into(),
+            batch_size: 500,
+            dry_run: false,
+            verbose: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_import_postgres_snomed_returns_error_message() {
+        let err = run_import_postgres(postgres_args(ImportFormat::SnomedRf2))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not support") && msg.contains("PostgreSQL"),
+            "expected unsupported-format error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_import_postgres_loinc_returns_error_message() {
+        let err = run_import_postgres(postgres_args(ImportFormat::Loinc))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not support") && msg.contains("PostgreSQL"),
+            "expected unsupported-format error, got: {msg}"
+        );
+    }
 }

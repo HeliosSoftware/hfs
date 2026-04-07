@@ -15,10 +15,8 @@
 //! PUT requests may include an `If-Match` header; when present, the handler
 //! returns **412 Precondition Failed** if the version no longer matches.
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod inner {
-    use std::sync::Arc;
-
     use axum::{
         Json,
         extract::{Path, RawQuery, State},
@@ -26,12 +24,16 @@ mod inner {
         response::{IntoResponse, Response},
     };
     use helios_fhir::FhirVersion;
-    use helios_persistence::ResourceStorage;
     use helios_persistence::tenant::TenantContext;
     use serde_json::Value;
 
     use crate::error::HtsError;
+    use crate::state::AppState;
+    use crate::traits::TerminologyBackend;
+
+    #[cfg(feature = "sqlite")]
     use crate::import::ImportStats;
+    #[cfg(feature = "sqlite")]
     use crate::import::fhir_bundle::{
         delete_code_system as hts_delete_cs, delete_concept_map as hts_delete_cm,
         delete_value_set as hts_delete_vs, get_code_system_url as hts_get_cs_url,
@@ -39,8 +41,6 @@ mod inner {
         import_value_set as hts_import_vs,
         invalidate_expansion_cache_for_system as hts_invalidate_expansion_cache,
     };
-    use crate::state::AppState;
-    use crate::traits::TerminologyBackend;
 
     use super::super::format::{ResponseFormat, fhir_respond, negotiate_format};
 
@@ -62,6 +62,38 @@ mod inner {
         )
     }
 
+    // ── HTS re-index helper (generic / async path) ────────────────────────────
+
+    /// Wrap `content` in a synthetic single-resource Bundle and call
+    /// `importer.import_bundle()` to (re-)index it into the HTS normalized tables.
+    ///
+    /// Used by the PostgreSQL CRUD path in place of the SQLite-specific `hts_pool`
+    /// spawn-blocking approach.
+    async fn hts_reindex_via_importer(
+        importer: &dyn crate::import::BundleImportBackend,
+        resource_type: &str,
+        content: Value,
+        ctx: &TenantContext,
+    ) -> Result<(), HtsError> {
+        if !matches!(resource_type, "CodeSystem" | "ValueSet" | "ConceptMap") {
+            return Err(HtsError::InvalidRequest(format!(
+                "Unsupported resource type for CRUD: {resource_type}"
+            )));
+        }
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [{"resource": content}]
+        });
+        let bytes =
+            serde_json::to_vec(&bundle).expect("in-memory bundle serialization cannot fail");
+        importer
+            .import_bundle(ctx, &bytes)
+            .await
+            .map_err(|e| HtsError::StorageError(format!("HTS re-index failed: {e}")))?;
+        Ok(())
+    }
+
     // ── Generic CRUD helpers ───────────────────────────────────────────────────
 
     /// POST /<ResourceType> — create a new resource.
@@ -75,13 +107,13 @@ mod inner {
         body: Value,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
-        let store = Arc::clone(
-            state
-                .resource_store
-                .as_ref()
-                .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?,
-        );
-        let hts_pool = state.require_hts_pool()?;
+        let store = state
+            .active_resource_store()
+            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
+
+        #[cfg(feature = "sqlite")]
+        let hts_pool = state.hts_pool.clone();
+        let terminology_importer = state.terminology_importer.clone();
         let ctx = ctx();
 
         // 1. Persist raw FHIR JSON (version_id = "1", ETag = W/"1").
@@ -93,22 +125,33 @@ mod inner {
         // 2. Index into HTS normalized tables using the canonical content
         //    (persistence layer injects the correct `id` into the JSON).
         let content = stored.content().clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = hts_pool
-                .get()
-                .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
-            let mut stats = ImportStats::default();
-            match resource_type {
-                "CodeSystem" => hts_import_cs(&conn, &content, &mut stats),
-                "ValueSet" => hts_import_vs(&conn, &content, &mut stats),
-                "ConceptMap" => hts_import_cm(&conn, &content, &mut stats),
-                _ => Err(HtsError::InvalidRequest(format!(
-                    "Unsupported resource type for CRUD: {resource_type}"
-                ))),
-            }
-        })
-        .await
-        .map_err(|e| HtsError::Internal(e.to_string()))??;
+
+        #[cfg(feature = "sqlite")]
+        if let Some(pool) = hts_pool {
+            tokio::task::spawn_blocking(move || {
+                let conn = pool
+                    .get()
+                    .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
+                let mut stats = ImportStats::default();
+                match resource_type {
+                    "CodeSystem" => hts_import_cs(&conn, &content, &mut stats),
+                    "ValueSet" => hts_import_vs(&conn, &content, &mut stats),
+                    "ConceptMap" => hts_import_cm(&conn, &content, &mut stats),
+                    _ => Err(HtsError::InvalidRequest(format!(
+                        "Unsupported resource type for CRUD: {resource_type}"
+                    ))),
+                }
+            })
+            .await
+            .map_err(|e| HtsError::Internal(e.to_string()))??;
+        } else if let Some(importer) = terminology_importer {
+            hts_reindex_via_importer(&*importer, resource_type, content, &ctx).await?;
+        }
+
+        #[cfg(not(feature = "sqlite"))]
+        if let Some(importer) = terminology_importer {
+            hts_reindex_via_importer(&*importer, resource_type, content, &ctx).await?;
+        }
 
         let etag = stored.etag().to_string();
         let location = format!("/{}/{}", resource_type, stored.id());
@@ -135,12 +178,9 @@ mod inner {
         id: String,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
-        let store = Arc::clone(
-            state
-                .resource_store
-                .as_ref()
-                .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?,
-        );
+        let store = state
+            .active_resource_store()
+            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
         let ctx = ctx();
 
         match store.read(&ctx, resource_type, &id).await {
@@ -179,13 +219,13 @@ mod inner {
         body: Value,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
-        let store = Arc::clone(
-            state
-                .resource_store
-                .as_ref()
-                .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?,
-        );
-        let hts_pool = state.require_hts_pool()?;
+        let store = state
+            .active_resource_store()
+            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
+
+        #[cfg(feature = "sqlite")]
+        let hts_pool = state.hts_pool.clone();
+        let terminology_importer = state.terminology_importer.clone();
         let ctx = ctx();
 
         // 1. Read current version.
@@ -214,41 +254,50 @@ mod inner {
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-        // 4. Re-index normalized HTS tables: delete old, import new.
+        // 4. Re-index normalized HTS tables.
         let content = updated.content().clone();
         let resource_id = updated.id().to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = hts_pool
-                .get()
-                .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
-            // Delete old normalized rows (ON DELETE CASCADE propagates to children).
-            // For CodeSystem: also invalidate cached value set expansions that
-            // drew from this system's URL — they are no longer valid after the
-            // system content changes.
-            match resource_type {
-                "CodeSystem" => {
-                    if let Some(url) = hts_get_cs_url(&conn, &resource_id)? {
-                        hts_invalidate_expansion_cache(&conn, &url)?;
+
+        #[cfg(feature = "sqlite")]
+        if let Some(pool) = hts_pool {
+            tokio::task::spawn_blocking(move || {
+                let conn = pool
+                    .get()
+                    .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
+                // Delete old normalized rows (ON DELETE CASCADE propagates).
+                // Invalidate expansion cache when a CodeSystem changes.
+                match resource_type {
+                    "CodeSystem" => {
+                        if let Some(url) = hts_get_cs_url(&conn, &resource_id)? {
+                            hts_invalidate_expansion_cache(&conn, &url)?;
+                        }
+                        hts_delete_cs(&conn, &resource_id)?;
                     }
-                    hts_delete_cs(&conn, &resource_id)?;
+                    "ValueSet" => hts_delete_vs(&conn, &resource_id)?,
+                    "ConceptMap" => hts_delete_cm(&conn, &resource_id)?,
+                    _ => {}
                 }
-                "ValueSet" => hts_delete_vs(&conn, &resource_id)?,
-                "ConceptMap" => hts_delete_cm(&conn, &resource_id)?,
-                _ => {}
-            }
-            // Re-import updated content.
-            let mut stats = ImportStats::default();
-            match resource_type {
-                "CodeSystem" => hts_import_cs(&conn, &content, &mut stats),
-                "ValueSet" => hts_import_vs(&conn, &content, &mut stats),
-                "ConceptMap" => hts_import_cm(&conn, &content, &mut stats),
-                _ => Err(HtsError::InvalidRequest(format!(
-                    "Unsupported resource type for CRUD: {resource_type}"
-                ))),
-            }
-        })
-        .await
-        .map_err(|e| HtsError::Internal(e.to_string()))??;
+                let mut stats = ImportStats::default();
+                match resource_type {
+                    "CodeSystem" => hts_import_cs(&conn, &content, &mut stats),
+                    "ValueSet" => hts_import_vs(&conn, &content, &mut stats),
+                    "ConceptMap" => hts_import_cm(&conn, &content, &mut stats),
+                    _ => Err(HtsError::InvalidRequest(format!(
+                        "Unsupported resource type for CRUD: {resource_type}"
+                    ))),
+                }
+            })
+            .await
+            .map_err(|e| HtsError::Internal(e.to_string()))??;
+        } else if let Some(importer) = terminology_importer {
+            // Postgres path: import_bundle upserts by URL so no explicit delete needed.
+            hts_reindex_via_importer(&*importer, resource_type, content, &ctx).await?;
+        }
+
+        #[cfg(not(feature = "sqlite"))]
+        if let Some(importer) = terminology_importer {
+            hts_reindex_via_importer(&*importer, resource_type, content, &ctx).await?;
+        }
 
         let etag = updated.etag().to_string();
         let mut response = fhir_respond(updated.content().clone(), format);
@@ -260,51 +309,77 @@ mod inner {
 
     /// DELETE /<ResourceType>/:id — soft-delete a resource.
     ///
-    /// 1. Soft-deletes the raw JSON in `helios-persistence`.
-    /// 2. Removes the resource's rows from HTS normalized tables.
-    /// 3. Returns **204 No Content**.
+    /// 1. Reads the current resource to extract its canonical URL (needed for
+    ///    HTS normalized-table cleanup).
+    /// 2. Soft-deletes the raw JSON in `helios-persistence`.
+    /// 3. Removes the resource's rows from HTS normalized tables:
+    ///    - SQLite path: via `hts_pool` spawn-blocking helpers.
+    ///    - PostgreSQL path: via `terminology_importer.delete_normalized()`.
+    /// 4. Returns **204 No Content**.
     async fn delete_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
     ) -> Result<Response, HtsError> {
-        let store = Arc::clone(
-            state
-                .resource_store
-                .as_ref()
-                .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?,
-        );
-        let hts_pool = state.require_hts_pool()?;
+        let store = state
+            .active_resource_store()
+            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
+
+        #[cfg(feature = "sqlite")]
+        let hts_pool = state.hts_pool.clone();
+        let terminology_importer = state.terminology_importer.clone();
         let ctx = ctx();
 
-        // 1. Soft-delete in persistence store.
+        // 1. Read the resource URL before deleting (needed by both HTS cleanup paths).
+        let resource_url: Option<String> = match store.read(&ctx, resource_type, &id).await {
+            Ok(Some(r)) if !r.is_deleted() => r
+                .content()
+                .get("url")
+                .and_then(|u| u.as_str())
+                .map(str::to_owned),
+            _ => None,
+        };
+
+        // 2. Soft-delete in persistence store.
         store
             .delete(&ctx, resource_type, &id)
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-        // 2. Delete from HTS normalized tables.
-        let resource_id = id.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = hts_pool
-                .get()
-                .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
-            match resource_type {
-                "CodeSystem" => {
-                    // Invalidate cached expansions derived from this system
-                    // before removing the system itself.
-                    if let Some(url) = hts_get_cs_url(&conn, &resource_id)? {
-                        hts_invalidate_expansion_cache(&conn, &url)?;
+        // 3. Delete from HTS normalized tables.
+        #[cfg(feature = "sqlite")]
+        if let Some(pool) = hts_pool {
+            let resource_id = id.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = pool
+                    .get()
+                    .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
+                match resource_type {
+                    "CodeSystem" => {
+                        if let Some(url) = hts_get_cs_url(&conn, &resource_id)? {
+                            hts_invalidate_expansion_cache(&conn, &url)?;
+                        }
+                        hts_delete_cs(&conn, &resource_id)
                     }
-                    hts_delete_cs(&conn, &resource_id)
+                    "ValueSet" => hts_delete_vs(&conn, &resource_id),
+                    "ConceptMap" => hts_delete_cm(&conn, &resource_id),
+                    _ => Ok(()),
                 }
-                "ValueSet" => hts_delete_vs(&conn, &resource_id),
-                "ConceptMap" => hts_delete_cm(&conn, &resource_id),
-                _ => Ok(()),
-            }
-        })
-        .await
-        .map_err(|e| HtsError::Internal(e.to_string()))??;
+            })
+            .await
+            .map_err(|e| HtsError::Internal(e.to_string()))??;
+        } else if let (Some(importer), Some(url)) =
+            (terminology_importer.as_deref(), resource_url.as_deref())
+        {
+            importer.delete_normalized(resource_type, url).await?;
+        }
+
+        #[cfg(not(feature = "sqlite"))]
+        if let (Some(importer), Some(url)) =
+            (terminology_importer.as_deref(), resource_url.as_deref())
+        {
+            importer.delete_normalized(resource_type, url).await?;
+        }
 
         Ok(StatusCode::NO_CONTENT.into_response())
     }
@@ -473,8 +548,8 @@ mod inner {
     }
 }
 
-// Re-export when the sqlite feature is active.
-#[cfg(feature = "sqlite")]
+// Re-export when any storage backend feature is active.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub use inner::*;
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

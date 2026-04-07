@@ -1,0 +1,1756 @@
+//! Integration tests for the PostgreSQL terminology backend.
+//!
+//! Requires Docker — uses `testcontainers` to spin up a real PostgreSQL
+//! instance. These tests are gated by `#[cfg(feature = "postgres")]` and
+//! are not run in the default test suite.
+//!
+//! Run with:
+//!   `cargo test -p helios-hts --features postgres --test postgres_integration_tests`
+
+#![cfg(feature = "postgres")]
+
+use helios_hts::backend::PostgresTerminologyBackend;
+use helios_hts::error::HtsError;
+use helios_hts::import::BundleImportBackend;
+use helios_hts::traits::{
+    CodeSystemOperations, ConceptMapOperations, TerminologyMetadata, ValueSetOperations,
+};
+use helios_hts::types::{
+    ClosureRequest, CodingConcept, ExpandRequest, LookupRequest, ResourceSearchQuery,
+    SubsumesRequest, SubsumptionOutcome, TranslateRequest, ValidateCodeRequest,
+};
+use helios_persistence::tenant::TenantContext;
+use std::sync::OnceLock;
+use testcontainers::ContainerAsync;
+use testcontainers_modules::postgres::Postgres;
+use tokio::sync::OnceCell;
+
+// ── Shared container (one per test binary run) ─────────────────────────────────
+//
+// The `ContainerAsync` must be kept alive for the lifetime of the process to
+// prevent the Docker container from being stopped.  We store it in a
+// process-level static.
+
+static CONTAINER: OnceLock<ContainerAsync<Postgres>> = OnceLock::new();
+static DB_URL: OnceCell<String> = OnceCell::const_new();
+
+/// Returns the PostgreSQL URL for the shared test container, starting it on the
+/// first call.
+async fn db_url() -> &'static str {
+    DB_URL
+        .get_or_init(|| async {
+            use testcontainers::runners::AsyncRunner;
+
+            let container = Postgres::default()
+                .start()
+                .await
+                .expect("Failed to start Postgres container");
+
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("Failed to get postgres port");
+
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+            // Keep the container alive for the process lifetime.
+            let _ = CONTAINER.set(container);
+            url
+        })
+        .await
+}
+
+/// Create a new `PostgresTerminologyBackend` connected to the shared container.
+async fn fresh_backend() -> PostgresTerminologyBackend {
+    PostgresTerminologyBackend::new(db_url().await)
+        .await
+        .expect("Backend should initialize")
+}
+
+fn ctx() -> TenantContext {
+    TenantContext::system()
+}
+
+/// Returns a unique base URL string for a given test to avoid cross-test
+/// interference when tests share the same PostgreSQL database.
+macro_rules! base_url {
+    ($prefix:literal) => {
+        format!("http://{}.{}/", $prefix, uuid::Uuid::new_v4().simple())
+    };
+}
+
+// ── Infrastructure tests ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn schema_applies_idempotently() {
+    let url = db_url().await;
+    PostgresTerminologyBackend::new(url)
+        .await
+        .expect("First schema application should succeed");
+    PostgresTerminologyBackend::new(url)
+        .await
+        .expect("Second schema application (idempotent) should also succeed");
+}
+
+#[tokio::test]
+async fn backend_name_is_postgres() {
+    let backend = fresh_backend().await;
+    assert_eq!(backend.backend_name(), "postgres");
+}
+
+#[tokio::test]
+async fn supported_systems_empty_initially() {
+    // Use a dedicated container to guarantee a truly empty DB.
+    use testcontainers::runners::AsyncRunner;
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("Failed to start Postgres container");
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+    let backend = PostgresTerminologyBackend::new(&url).await.unwrap();
+    assert!(
+        backend.supported_systems().is_empty(),
+        "fresh DB should have no systems"
+    );
+}
+
+// ── Seed helpers ───────────────────────────────────────────────────────────────
+
+/// Seed a CodeSystem into `backend` and return the URL that was used.
+async fn seed_code_system_with_url(backend: &PostgresTerminologyBackend, cs_url: &str) -> String {
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{
+            "resource": {
+                "resourceType": "CodeSystem",
+                "id": "cs-test",
+                "url": cs_url,
+                "name": "TestCS",
+                "version": "1.0",
+                "status": "active",
+                "content": "complete",
+                "concept": [{
+                    "code": "ABC",
+                    "display": "Alpha Beta Charlie",
+                    "definition": "The definition",
+                    "property": [
+                        { "code": "parent", "valueCode": "ROOT" },
+                        { "code": "inactive", "valueBoolean": false }
+                    ],
+                    "designation": [{
+                        "language": "fr",
+                        "value": "Alpha Bêta Charlie"
+                    }]
+                }]
+            }
+        }]
+    });
+    let bytes = serde_json::to_vec(&bundle).unwrap();
+    backend
+        .import_bundle(&ctx(), &bytes)
+        .await
+        .expect("Seed import should succeed");
+    cs_url.to_owned()
+}
+
+// ── 4.1 — Pre-existing tests (migrated to shared container) ───────────────────
+
+#[tokio::test]
+async fn import_bundle_end_to_end() {
+    let backend = fresh_backend().await;
+    let base = base_url!("e2e");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "CodeSystem",
+                    "id": "cs-e2e",
+                    "url": format!("{base}cs"),
+                    "name": "E2ECS",
+                    "version": "2.0",
+                    "status": "active",
+                    "content": "complete",
+                    "concept": [{
+                        "code": "X",
+                        "display": "X Display",
+                        "property": [{ "code": "type", "valueCode": "leaf" }],
+                        "designation": [{ "language": "de", "value": "X Anzeige" }]
+                    }]
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "ValueSet",
+                    "id": "vs-e2e",
+                    "url": format!("{base}vs"),
+                    "name": "E2EVS",
+                    "status": "active",
+                    "compose": {
+                        "include": [{ "system": format!("{base}cs") }]
+                    }
+                }
+            }
+        ]
+    });
+
+    let bytes = serde_json::to_vec(&bundle).unwrap();
+    let stats = backend.import_bundle(&ctx(), &bytes).await.unwrap();
+    assert_eq!(stats.code_systems, 1);
+    assert_eq!(stats.value_sets, 1);
+    assert_eq!(stats.concepts, 1);
+    assert!(stats.errors.is_empty(), "No errors: {:?}", stats.errors);
+
+    let req = LookupRequest {
+        system: format!("{base}cs"),
+        code: "X".into(),
+        ..Default::default()
+    };
+    let resp = CodeSystemOperations::lookup(&backend, &ctx(), req)
+        .await
+        .unwrap();
+    assert_eq!(resp.display.as_deref(), Some("X Display"));
+    assert_eq!(resp.version.as_deref(), Some("2.0"));
+
+    let expand_req = ExpandRequest {
+        url: Some(format!("{base}vs")),
+        ..Default::default()
+    };
+    let expand_resp = backend.expand(&ctx(), expand_req).await.unwrap();
+    assert_eq!(expand_resp.total, Some(1));
+    assert_eq!(expand_resp.contains[0].code, "X");
+}
+
+// ── 4.2 — CodeSystem tests ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn lookup_filters_properties() {
+    let backend = fresh_backend().await;
+    let base = base_url!("lkp-filt");
+    let cs_url = format!("{base}cs");
+    seed_code_system_with_url(&backend, &cs_url).await;
+
+    let resp = CodeSystemOperations::lookup(
+        &backend,
+        &ctx(),
+        LookupRequest {
+            system: cs_url,
+            code: "ABC".into(),
+            properties: vec!["parent".into()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.properties.len(), 1);
+    assert_eq!(resp.properties[0].code, "parent");
+}
+
+#[tokio::test]
+async fn lookup_display_language_preferred() {
+    let backend = fresh_backend().await;
+    let base = base_url!("lkp-lang");
+    let cs_url = format!("{base}cs");
+    seed_code_system_with_url(&backend, &cs_url).await;
+
+    let resp = CodeSystemOperations::lookup(
+        &backend,
+        &ctx(),
+        LookupRequest {
+            system: cs_url,
+            code: "ABC".into(),
+            display_language: Some("fr".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // French designation should be preferred for display.
+    assert_eq!(resp.display.as_deref(), Some("Alpha Bêta Charlie"));
+    // Only the French designation should be returned.
+    let fr_desigs: Vec<_> = resp
+        .designations
+        .iter()
+        .filter(|d| d.language.as_deref() == Some("fr"))
+        .collect();
+    assert!(
+        !fr_desigs.is_empty(),
+        "French designation should be returned"
+    );
+}
+
+#[tokio::test]
+async fn lookup_unknown_system_returns_not_found() {
+    let backend = fresh_backend().await;
+
+    let err = CodeSystemOperations::lookup(
+        &backend,
+        &ctx(),
+        LookupRequest {
+            system: "http://no.such.system/cs".into(),
+            code: "X".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, HtsError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn lookup_unknown_code_returns_not_found() {
+    let backend = fresh_backend().await;
+    let base = base_url!("lkp-404");
+    let cs_url = format!("{base}cs");
+    seed_code_system_with_url(&backend, &cs_url).await;
+
+    let err = CodeSystemOperations::lookup(
+        &backend,
+        &ctx(),
+        LookupRequest {
+            system: cs_url,
+            code: "NOPE".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, HtsError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn validate_code_display_mismatch_returns_false() {
+    let backend = fresh_backend().await;
+    let base = base_url!("vc-mismatch");
+    let cs_url = format!("{base}cs");
+    seed_code_system_with_url(&backend, &cs_url).await;
+
+    let resp = CodeSystemOperations::validate_code(
+        &backend,
+        &ctx(),
+        ValidateCodeRequest {
+            system: Some(cs_url),
+            code: "ABC".into(),
+            display: Some("Wrong Display".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!resp.result, "Display mismatch should return false");
+    assert!(resp.message.is_some(), "Message should be present");
+}
+
+#[tokio::test]
+async fn validate_code_unknown_system_returns_false() {
+    let backend = fresh_backend().await;
+
+    let resp = CodeSystemOperations::validate_code(
+        &backend,
+        &ctx(),
+        ValidateCodeRequest {
+            system: Some("http://no.such.system/cs".into()),
+            code: "X".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !resp.result,
+        "Unknown system should return false (not error)"
+    );
+}
+
+#[tokio::test]
+async fn subsumes_equivalent_same_code() {
+    let backend = fresh_backend().await;
+    let base = base_url!("sub-equiv");
+    let cs_url = format!("{base}cs");
+    seed_code_system_with_url(&backend, &cs_url).await;
+
+    let resp = CodeSystemOperations::subsumes(
+        &backend,
+        &ctx(),
+        SubsumesRequest {
+            system: cs_url,
+            code_a: "ABC".into(),
+            code_b: "ABC".into(),
+            version: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.outcome, SubsumptionOutcome::Equivalent);
+}
+
+#[tokio::test]
+async fn subsumes_subsumed_by_returns_correct_outcome() {
+    let backend = fresh_backend().await;
+    let base = base_url!("sub-by");
+
+    // A → B hierarchy
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "CodeSystem",
+            "id": "cs-hier",
+            "url": format!("{base}cs"),
+            "name": "HierCS",
+            "status": "active",
+            "content": "complete",
+            "concept": [{
+                "code": "A", "display": "A",
+                "concept": [{"code": "B", "display": "B"}]
+            }]
+        }}]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    // B is subsumed by A
+    let resp = CodeSystemOperations::subsumes(
+        &backend,
+        &ctx(),
+        SubsumesRequest {
+            system: format!("{base}cs"),
+            code_a: "B".into(),
+            code_b: "A".into(),
+            version: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.outcome, SubsumptionOutcome::SubsumedBy);
+}
+
+#[tokio::test]
+async fn subsumes_not_subsumed_returns_correct_outcome() {
+    let backend = fresh_backend().await;
+    let base = base_url!("sub-none");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "CodeSystem",
+            "id": "cs-flat",
+            "url": format!("{base}cs"),
+            "name": "FlatCS",
+            "status": "active",
+            "content": "complete",
+            "concept": [
+                {"code": "A", "display": "A"},
+                {"code": "B", "display": "B"}
+            ]
+        }}]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = CodeSystemOperations::subsumes(
+        &backend,
+        &ctx(),
+        SubsumesRequest {
+            system: format!("{base}cs"),
+            code_a: "A".into(),
+            code_b: "B".into(),
+            version: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.outcome, SubsumptionOutcome::NotSubsumed);
+}
+
+#[tokio::test]
+async fn search_by_url_returns_match() {
+    let backend = fresh_backend().await;
+    let base = base_url!("srch-url");
+    let cs_url = format!("{base}cs");
+    seed_code_system_with_url(&backend, &cs_url).await;
+
+    let results = CodeSystemOperations::search(
+        &backend,
+        &ctx(),
+        ResourceSearchQuery {
+            url: Some(cs_url.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "Should find exactly one CodeSystem by URL"
+    );
+    assert_eq!(results[0]["url"].as_str(), Some(cs_url.as_str()));
+}
+
+#[tokio::test]
+async fn search_by_name_returns_match() {
+    let backend = fresh_backend().await;
+    let base = base_url!("srch-name");
+    let cs_url = format!("{base}cs");
+    seed_code_system_with_url(&backend, &cs_url).await;
+
+    let results = CodeSystemOperations::search(
+        &backend,
+        &ctx(),
+        ResourceSearchQuery {
+            name: Some("TestCS".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!results.is_empty(), "Should find CodeSystem by name");
+    assert!(
+        results
+            .iter()
+            .any(|r| r["url"].as_str() == Some(cs_url.as_str())),
+        "Our seeded CS should be in the results"
+    );
+}
+
+#[tokio::test]
+async fn search_by_status_filters_correctly() {
+    let backend = fresh_backend().await;
+    let base = base_url!("srch-status");
+
+    // Import an active and a retired system.
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-active",
+                "url": format!("{base}active"), "name": "ActiveCS",
+                "status": "active", "content": "complete"
+            }},
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-retired",
+                "url": format!("{base}retired"), "name": "RetiredCS",
+                "status": "retired", "content": "complete"
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    // Filter for active only.
+    let results = CodeSystemOperations::search(
+        &backend,
+        &ctx(),
+        ResourceSearchQuery {
+            status: Some("active".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let urls: Vec<&str> = results.iter().filter_map(|r| r["url"].as_str()).collect();
+    assert!(
+        urls.contains(&format!("{base}active").as_str()),
+        "Active system should be in results"
+    );
+    assert!(
+        !urls.contains(&format!("{base}retired").as_str()),
+        "Retired system should be excluded"
+    );
+}
+
+#[tokio::test]
+async fn search_pagination_limit_and_offset() {
+    let backend = fresh_backend().await;
+    let base = base_url!("srch-page");
+
+    // Import 3 code systems with predictable names.
+    for i in 0..3u32 {
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": [{"resource": {
+                "resourceType": "CodeSystem",
+                "id": format!("cs-page-{i}"),
+                "url": format!("{base}cs-{i}"),
+                "name": format!("PageCS{i}"),
+                "status": "active",
+                "content": "complete"
+            }}]
+        });
+        backend
+            .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+            .await
+            .unwrap();
+    }
+
+    // Request page with count=2, offset=1 (filtered to our base URL pattern via name prefix).
+    // We use _count=2 and _offset=1 on the URL filter for the subset we imported.
+    let page = CodeSystemOperations::search(
+        &backend,
+        &ctx(),
+        ResourceSearchQuery {
+            url: Some(format!("{base}cs-1")),
+            count: Some(2),
+            offset: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page.len(), 1, "URL-filtered result should have exactly 1");
+}
+
+#[tokio::test]
+async fn search_unknown_url_returns_empty() {
+    let backend = fresh_backend().await;
+
+    let results = CodeSystemOperations::search(
+        &backend,
+        &ctx(),
+        ResourceSearchQuery {
+            url: Some("http://no.match.ever/cs-xxxx".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(results.is_empty(), "Unknown URL should return empty vec");
+}
+
+// ── 4.3 — ValueSet tests ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn expand_explicit_code_list() {
+    let backend = fresh_backend().await;
+    let base = base_url!("exp-explicit");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-exp",
+                "url": format!("{base}cs"), "name": "ExpCS",
+                "status": "active", "content": "complete",
+                "concept": [
+                    {"code": "A", "display": "Alpha"},
+                    {"code": "B", "display": "Beta"},
+                    {"code": "C", "display": "Gamma"}
+                ]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-exp",
+                "url": format!("{base}vs"), "name": "ExpVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs"),
+                    "concept": [{"code": "A"}, {"code": "C"}]}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(format!("{base}vs")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.total, Some(2));
+    let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+    assert!(codes.contains(&"A"));
+    assert!(codes.contains(&"C"));
+    assert!(!codes.contains(&"B"), "B should not be in explicit list");
+}
+
+#[tokio::test]
+async fn expand_exclude_rules_remove_codes() {
+    let backend = fresh_backend().await;
+    let base = base_url!("exp-excl");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-excl",
+                "url": format!("{base}cs"), "name": "ExclCS",
+                "status": "active", "content": "complete",
+                "concept": [
+                    {"code": "A", "display": "Alpha"},
+                    {"code": "B", "display": "Beta"}
+                ]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-excl",
+                "url": format!("{base}vs"), "name": "ExclVS",
+                "status": "active",
+                "compose": {
+                    "include": [{"system": format!("{base}cs")}],
+                    "exclude": [{"system": format!("{base}cs"),
+                        "concept": [{"code": "B"}]}]
+                }
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(format!("{base}vs")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+    assert!(codes.contains(&"A"), "A should be included");
+    assert!(!codes.contains(&"B"), "B should be excluded");
+}
+
+#[tokio::test]
+async fn expand_pagination_count_and_offset() {
+    let backend = fresh_backend().await;
+    let base = base_url!("exp-page");
+
+    let concepts: Vec<serde_json::Value> = (0..5)
+        .map(|i| serde_json::json!({"code": format!("C{i}"), "display": format!("Concept {i}")}))
+        .collect();
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-page",
+                "url": format!("{base}cs"), "name": "PageCS",
+                "status": "active", "content": "complete",
+                "concept": concepts
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-page",
+                "url": format!("{base}vs"), "name": "PageVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs")}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(format!("{base}vs")),
+                count: Some(2),
+                offset: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.total, Some(5), "Total should reflect all 5 concepts");
+    assert_eq!(resp.contains.len(), 2, "Page should contain 2 items");
+    assert_eq!(resp.offset, Some(1), "Offset should be returned");
+}
+
+#[tokio::test]
+async fn expand_filter_substring_match() {
+    let backend = fresh_backend().await;
+    let base = base_url!("exp-filt");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-filt",
+                "url": format!("{base}cs"), "name": "FiltCS",
+                "status": "active", "content": "complete",
+                "concept": [
+                    {"code": "APPLE", "display": "Apple"},
+                    {"code": "APRICOT", "display": "Apricot"},
+                    {"code": "BANANA", "display": "Banana"}
+                ]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-filt",
+                "url": format!("{base}vs"), "name": "FiltVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs")}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(format!("{base}vs")),
+                filter: Some("Ap".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+    assert!(codes.contains(&"APPLE"), "APPLE should match filter 'Ap'");
+    assert!(
+        codes.contains(&"APRICOT"),
+        "APRICOT should match filter 'Ap'"
+    );
+    assert!(
+        !codes.contains(&"BANANA"),
+        "BANANA should not match filter 'Ap'"
+    );
+}
+
+#[tokio::test]
+async fn expand_hierarchical_returns_nested_tree() {
+    let backend = fresh_backend().await;
+    let base = base_url!("exp-hier");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-hier",
+                "url": format!("{base}cs"), "name": "HierCS",
+                "status": "active", "content": "complete",
+                "concept": [{"code": "A", "display": "A",
+                    "concept": [{"code": "B", "display": "B",
+                        "concept": [{"code": "C", "display": "C"}]}]
+                }]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-hier",
+                "url": format!("{base}vs"), "name": "HierVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs")}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(format!("{base}vs")),
+                hierarchical: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Top-level should have A; A should have B as a child; B should have C.
+    assert_eq!(resp.contains.len(), 1, "Top level should have 1 root node");
+    let a = &resp.contains[0];
+    assert_eq!(a.code, "A");
+    assert!(!a.contains.is_empty(), "A should have children");
+    let b = &a.contains[0];
+    assert_eq!(b.code, "B");
+    assert!(!b.contains.is_empty(), "B should have children");
+    assert_eq!(b.contains[0].code, "C");
+}
+
+#[tokio::test]
+async fn expand_cache_hit_on_second_call() {
+    let backend = fresh_backend().await;
+    let base = base_url!("exp-cache");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-cache",
+                "url": format!("{base}cs"), "name": "CacheCS",
+                "status": "active", "content": "complete",
+                "concept": [{"code": "X", "display": "X"}]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-cache",
+                "url": format!("{base}vs"), "name": "CacheVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs")}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let req = ExpandRequest {
+        url: Some(format!("{base}vs")),
+        ..Default::default()
+    };
+    let first = backend.expand(&ctx(), req.clone()).await.unwrap();
+    let second = backend.expand(&ctx(), req).await.unwrap();
+
+    assert_eq!(
+        first.total, second.total,
+        "Both calls should return same total"
+    );
+    assert_eq!(
+        first.contains.len(),
+        second.contains.len(),
+        "Both calls should return same codes"
+    );
+}
+
+#[tokio::test]
+async fn expand_implicit_value_set() {
+    let backend = fresh_backend().await;
+    let base = base_url!("exp-impl");
+
+    // CodeSystem with a valueSet property pointing to its implicit VS.
+    let implicit_vs_url = format!("{base}vs");
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "CodeSystem", "id": "cs-impl",
+            "url": format!("{base}cs"),
+            "valueSet": implicit_vs_url,
+            "name": "ImplCS",
+            "status": "active", "content": "complete",
+            "concept": [
+                {"code": "A", "display": "Alpha"},
+                {"code": "B", "display": "Beta"}
+            ]
+        }}]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(implicit_vs_url),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.total, Some(2), "Implicit VS should expand all codes");
+}
+
+#[tokio::test]
+async fn expand_max_expansion_size_returns_too_costly() {
+    let backend = fresh_backend().await;
+    let base = base_url!("exp-costly");
+
+    let concepts: Vec<serde_json::Value> = (0..10)
+        .map(|i| serde_json::json!({"code": format!("C{i}"), "display": format!("Concept {i}")}))
+        .collect();
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-costly",
+                "url": format!("{base}cs"), "name": "CostlyCS",
+                "status": "active", "content": "complete",
+                "concept": concepts
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-costly",
+                "url": format!("{base}vs"), "name": "CostlyVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs")}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let err = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(format!("{base}vs")),
+                max_expansion_size: Some(3), // Limit to 3, but there are 10
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, HtsError::TooCostly(_)),
+        "Should return TooCostly when expansion exceeds limit, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn vs_validate_code_in_set_returns_true() {
+    let backend = fresh_backend().await;
+    let base = base_url!("vs-vc-true");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-vc",
+                "url": format!("{base}cs"), "name": "VCCS",
+                "status": "active", "content": "complete",
+                "concept": [{"code": "A", "display": "Alpha"}]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-vc",
+                "url": format!("{base}vs"), "name": "VCVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs")}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = ValueSetOperations::validate_code(
+        &backend,
+        &ctx(),
+        ValidateCodeRequest {
+            url: Some(format!("{base}vs")),
+            code: "A".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.result, "Code in set should return true");
+}
+
+#[tokio::test]
+async fn vs_validate_code_not_in_set_returns_false() {
+    let backend = fresh_backend().await;
+    let base = base_url!("vs-vc-false");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-nvc",
+                "url": format!("{base}cs"), "name": "NVCCS",
+                "status": "active", "content": "complete",
+                "concept": [{"code": "A", "display": "Alpha"}]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-nvc",
+                "url": format!("{base}vs"), "name": "NVCVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs")}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = ValueSetOperations::validate_code(
+        &backend,
+        &ctx(),
+        ValidateCodeRequest {
+            url: Some(format!("{base}vs")),
+            code: "Z".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!resp.result, "Code not in set should return false");
+}
+
+#[tokio::test]
+async fn vs_validate_code_display_mismatch_returns_false() {
+    let backend = fresh_backend().await;
+    let base = base_url!("vs-vc-disp");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-vcd",
+                "url": format!("{base}cs"), "name": "VCDCS",
+                "status": "active", "content": "complete",
+                "concept": [{"code": "A", "display": "Correct Display"}]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-vcd",
+                "url": format!("{base}vs"), "name": "VCDVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs")}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = ValueSetOperations::validate_code(
+        &backend,
+        &ctx(),
+        ValidateCodeRequest {
+            url: Some(format!("{base}vs")),
+            code: "A".into(),
+            display: Some("Wrong Display".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!resp.result, "Display mismatch should return false");
+    assert!(resp.message.is_some(), "Message should be present");
+}
+
+#[tokio::test]
+async fn vs_validate_code_system_filter() {
+    let backend = fresh_backend().await;
+    let base = base_url!("vs-vc-sys");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-sys1",
+                "url": format!("{base}cs1"), "name": "SysCS1",
+                "status": "active", "content": "complete",
+                "concept": [{"code": "A", "display": "A from CS1"}]
+            }},
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-sys2",
+                "url": format!("{base}cs2"), "name": "SysCS2",
+                "status": "active", "content": "complete",
+                "concept": [{"code": "A", "display": "A from CS2"}]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "vs-sys",
+                "url": format!("{base}vs"), "name": "SysVS",
+                "status": "active",
+                "compose": {"include": [
+                    {"system": format!("{base}cs1")},
+                    {"system": format!("{base}cs2")}
+                ]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    // Validate "A" from cs1 only (system filter)
+    let resp = ValueSetOperations::validate_code(
+        &backend,
+        &ctx(),
+        ValidateCodeRequest {
+            url: Some(format!("{base}vs")),
+            system: Some(format!("{base}cs1")),
+            code: "A".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.result, "Code A from cs1 should be valid in the VS");
+}
+
+#[tokio::test]
+async fn search_value_sets_by_url() {
+    let backend = fresh_backend().await;
+    let base = base_url!("vs-srch-url");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "ValueSet", "id": "vs-srch",
+            "url": format!("{base}vs"), "name": "SrchVS",
+            "status": "active"
+        }}]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let results = ValueSetOperations::search(
+        &backend,
+        &ctx(),
+        ResourceSearchQuery {
+            url: Some(format!("{base}vs")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(results.len(), 1, "Should find exactly one VS by URL");
+}
+
+#[tokio::test]
+async fn search_value_sets_pagination() {
+    let backend = fresh_backend().await;
+    let base = base_url!("vs-srch-page");
+
+    for i in 0..3u32 {
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": [{"resource": {
+                "resourceType": "ValueSet",
+                "id": format!("vs-pg-{i}"),
+                "url": format!("{base}vs-{i}"),
+                "name": format!("PgVS{i}"),
+                "status": "active"
+            }}]
+        });
+        backend
+            .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+            .await
+            .unwrap();
+    }
+
+    // Fetch exactly 1 value set from our set of 3 by using the specific URL.
+    let page1 = ValueSetOperations::search(
+        &backend,
+        &ctx(),
+        ResourceSearchQuery {
+            url: Some(format!("{base}vs-0")),
+            count: Some(2),
+            offset: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page1.len(), 1, "First page should have 1 VS for our URL");
+}
+
+// ── 4.4 — ConceptMap tests ─────────────────────────────────────────────────────
+
+async fn seed_concept_map(backend: &PostgresTerminologyBackend, base: &str) {
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-src",
+                "url": format!("{base}src"), "name": "SrcCS",
+                "status": "active", "content": "complete",
+                "concept": [{"code": "100", "display": "One Hundred"}]
+            }},
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "cs-tgt",
+                "url": format!("{base}tgt"), "name": "TgtCS",
+                "status": "active", "content": "complete",
+                "concept": [{"code": "200", "display": "Two Hundred"}]
+            }},
+            {"resource": {
+                "resourceType": "ConceptMap", "id": "cm-test",
+                "url": format!("{base}cm"), "name": "TestCM",
+                "status": "active",
+                "group": [{"source": format!("{base}src"), "target": format!("{base}tgt"),
+                    "element": [{"code": "100",
+                        "target": [{"code": "200", "equivalence": "equivalent"}]}]}]
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn translate_concept_map_basic() {
+    let backend = fresh_backend().await;
+    let base = base_url!("tr-basic");
+    seed_concept_map(&backend, &base).await;
+
+    let resp = ConceptMapOperations::translate(
+        &backend,
+        &ctx(),
+        TranslateRequest {
+            system: Some(format!("{base}src")),
+            code: "100".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.result);
+    assert_eq!(resp.matches.len(), 1);
+    assert_eq!(resp.matches[0].concept_code, "200");
+}
+
+#[tokio::test]
+async fn translate_multiple_targets() {
+    let backend = fresh_backend().await;
+    let base = base_url!("tr-multi");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "ConceptMap", "id": "cm-multi",
+                "url": format!("{base}cm"), "name": "MultiCM",
+                "status": "active",
+                "group": [{"source": format!("{base}src"), "target": format!("{base}tgt"),
+                    "element": [{"code": "A",
+                        "target": [
+                            {"code": "X", "equivalence": "equivalent"},
+                            {"code": "Y", "equivalence": "wider"}
+                        ]}]}]
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = ConceptMapOperations::translate(
+        &backend,
+        &ctx(),
+        TranslateRequest {
+            system: Some(format!("{base}src")),
+            code: "A".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.result);
+    assert_eq!(resp.matches.len(), 2, "Should return both targets");
+    let codes: Vec<&str> = resp
+        .matches
+        .iter()
+        .map(|m| m.concept_code.as_str())
+        .collect();
+    assert!(codes.contains(&"X"));
+    assert!(codes.contains(&"Y"));
+}
+
+#[tokio::test]
+async fn translate_no_match_returns_false() {
+    let backend = fresh_backend().await;
+    let base = base_url!("tr-nomatch");
+    seed_concept_map(&backend, &base).await;
+
+    let resp = ConceptMapOperations::translate(
+        &backend,
+        &ctx(),
+        TranslateRequest {
+            system: Some(format!("{base}src")),
+            code: "BOGUS".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!resp.result, "No match should return false");
+    assert!(resp.matches.is_empty());
+}
+
+#[tokio::test]
+async fn translate_system_filter() {
+    let backend = fresh_backend().await;
+    let base = base_url!("tr-sysfilt");
+
+    // Two maps: one from base/src1 and one from base/src2
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "ConceptMap", "id": "cm-s1",
+                "url": format!("{base}cm1"), "name": "CM1",
+                "status": "active",
+                "group": [{"source": format!("{base}src1"), "target": format!("{base}tgt"),
+                    "element": [{"code": "A",
+                        "target": [{"code": "X", "equivalence": "equivalent"}]}]}]
+            }},
+            {"resource": {
+                "resourceType": "ConceptMap", "id": "cm-s2",
+                "url": format!("{base}cm2"), "name": "CM2",
+                "status": "active",
+                "group": [{"source": format!("{base}src2"), "target": format!("{base}tgt"),
+                    "element": [{"code": "A",
+                        "target": [{"code": "Z", "equivalence": "equivalent"}]}]}]
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    // Filter to src1 only — should only find X, not Z
+    let resp = ConceptMapOperations::translate(
+        &backend,
+        &ctx(),
+        TranslateRequest {
+            system: Some(format!("{base}src1")),
+            code: "A".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.result);
+    assert!(
+        resp.matches.iter().any(|m| m.concept_code == "X"),
+        "src1 mapping should produce X"
+    );
+    assert!(
+        !resp.matches.iter().any(|m| m.concept_code == "Z"),
+        "src2 mapping should be excluded by system filter"
+    );
+}
+
+#[tokio::test]
+async fn translate_map_url_filter() {
+    let backend = fresh_backend().await;
+    let base = base_url!("tr-mapurl");
+
+    // Two maps with the same source code but different target codes
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "ConceptMap", "id": "cm-u1",
+                "url": format!("{base}cm1"), "name": "CMapU1",
+                "status": "active",
+                "group": [{"source": format!("{base}src"), "target": format!("{base}tgt"),
+                    "element": [{"code": "A",
+                        "target": [{"code": "P", "equivalence": "equivalent"}]}]}]
+            }},
+            {"resource": {
+                "resourceType": "ConceptMap", "id": "cm-u2",
+                "url": format!("{base}cm2"), "name": "CMapU2",
+                "status": "active",
+                "group": [{"source": format!("{base}src"), "target": format!("{base}tgt"),
+                    "element": [{"code": "A",
+                        "target": [{"code": "Q", "equivalence": "equivalent"}]}]}]
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    // Filter by map URL — should only use cm1 → P, not cm2 → Q
+    let resp = ConceptMapOperations::translate(
+        &backend,
+        &ctx(),
+        TranslateRequest {
+            url: Some(format!("{base}cm1")),
+            code: "A".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.result);
+    assert!(
+        resp.matches.iter().any(|m| m.concept_code == "P"),
+        "cm1 mapping should produce P"
+    );
+    assert!(
+        !resp.matches.iter().any(|m| m.concept_code == "Q"),
+        "cm2 mapping should be excluded by URL filter"
+    );
+}
+
+#[tokio::test]
+async fn translate_reverse_mode() {
+    let backend = fresh_backend().await;
+    let base = base_url!("tr-rev");
+    seed_concept_map(&backend, &base).await;
+
+    // Reverse: look up target "200" → should find source "100"
+    let resp = ConceptMapOperations::translate(
+        &backend,
+        &ctx(),
+        TranslateRequest {
+            system: Some(format!("{base}tgt")),
+            code: "200".into(),
+            reverse: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.result, "Reverse translation should succeed");
+    assert_eq!(resp.matches.len(), 1);
+    assert_eq!(resp.matches[0].concept_code, "100");
+}
+
+#[tokio::test]
+async fn translate_code_only_no_system() {
+    let backend = fresh_backend().await;
+    let base = base_url!("tr-nosys");
+    seed_concept_map(&backend, &base).await;
+
+    // No system filter — should still find the mapping
+    let resp = ConceptMapOperations::translate(
+        &backend,
+        &ctx(),
+        TranslateRequest {
+            code: "100".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        resp.result,
+        "Code-only lookup should find first matching mapping"
+    );
+    assert!(!resp.matches.is_empty());
+}
+
+#[tokio::test]
+async fn closure_empty_input_returns_empty_map() {
+    let backend = fresh_backend().await;
+
+    let resp = ConceptMapOperations::closure(
+        &backend,
+        &ctx(),
+        ClosureRequest {
+            name: "empty-closure".into(),
+            concept: vec![],
+            version: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let groups = resp
+        .concept_map
+        .as_ref()
+        .and_then(|cm| cm["group"].as_array())
+        .map(|g| g.len())
+        .unwrap_or(0);
+    assert_eq!(groups, 0, "Empty input should produce no groups");
+}
+
+#[tokio::test]
+async fn closure_unrelated_codes_produce_no_pairs() {
+    let backend = fresh_backend().await;
+    let base = base_url!("cl-unrelated");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "CodeSystem", "id": "cs-cl",
+            "url": format!("{base}cs"), "name": "CLCS",
+            "status": "active", "content": "complete",
+            "concept": [
+                {"code": "A", "display": "A"},
+                {"code": "B", "display": "B"}
+            ]
+        }}]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = ConceptMapOperations::closure(
+        &backend,
+        &ctx(),
+        ClosureRequest {
+            name: "unrelated-closure".into(),
+            concept: vec![
+                CodingConcept {
+                    system: format!("{base}cs"),
+                    code: "A".into(),
+                    display: None,
+                },
+                CodingConcept {
+                    system: format!("{base}cs"),
+                    code: "B".into(),
+                    display: None,
+                },
+            ],
+            version: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let groups = resp
+        .concept_map
+        .as_ref()
+        .and_then(|cm| cm["group"].as_array())
+        .map(|g| g.len())
+        .unwrap_or(0);
+    assert_eq!(
+        groups, 0,
+        "Unrelated codes should produce no hierarchy pairs"
+    );
+}
+
+#[tokio::test]
+async fn closure_unknown_system_skipped() {
+    let backend = fresh_backend().await;
+
+    let resp = ConceptMapOperations::closure(
+        &backend,
+        &ctx(),
+        ClosureRequest {
+            name: "unknown-sys-closure".into(),
+            concept: vec![CodingConcept {
+                system: "http://no.such.system/cs".into(),
+                code: "X".into(),
+                display: None,
+            }],
+            version: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Should not error; groups will be empty.
+    let groups = resp
+        .concept_map
+        .as_ref()
+        .and_then(|cm| cm["group"].as_array())
+        .map(|g| g.len())
+        .unwrap_or(0);
+    assert_eq!(
+        groups, 0,
+        "Unknown system should produce no pairs and no error"
+    );
+}
+
+#[tokio::test]
+async fn search_concept_maps_by_url() {
+    let backend = fresh_backend().await;
+    let base = base_url!("cm-srch-url");
+    seed_concept_map(&backend, &base).await;
+
+    let results = ConceptMapOperations::search(
+        &backend,
+        &ctx(),
+        ResourceSearchQuery {
+            url: Some(format!("{base}cm")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(results.len(), 1, "Should find exactly one CM by URL");
+    assert_eq!(
+        results[0]["url"].as_str(),
+        Some(format!("{base}cm").as_str())
+    );
+}
+
+#[tokio::test]
+async fn search_concept_maps_pagination() {
+    let backend = fresh_backend().await;
+    let base = base_url!("cm-srch-page");
+
+    for i in 0..3u32 {
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": [{"resource": {
+                "resourceType": "ConceptMap",
+                "id": format!("cm-p{i}"),
+                "url": format!("{base}cm-{i}"),
+                "name": format!("PageCM{i}"),
+                "status": "active"
+            }}]
+        });
+        backend
+            .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+            .await
+            .unwrap();
+    }
+
+    // Fetch by specific URL to verify individual results.
+    let result = ConceptMapOperations::search(
+        &backend,
+        &ctx(),
+        ResourceSearchQuery {
+            url: Some(format!("{base}cm-1")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.len(), 1, "Should find exactly the requested CM");
+}
