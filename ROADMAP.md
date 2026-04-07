@@ -33,6 +33,10 @@ These capabilities are available today in the current release.
 
 - [CDS Hooks](crates/cds-hooks/README.md) — HL7 CDS Hooks v3.0.0 protocol types, all 10 hook contexts, and async `CdsHooksService` trait
 
+**Compliance**
+
+- [Audit logging (AuditEvent resource support)](crates/audit/README.md) — REST, auth, and lifecycle audit events with IHE BALP profiles
+
 **Analytics & Tooling**
 
 - [SQL on FHIR](crates/sof/README.md) — CLI and HTTP server
@@ -47,7 +51,6 @@ Work that is currently underway or planned for the near term.
 
 | Area | Item | Status |
 |------|------|--------|
-| **Compliance** | [Audit logging (AuditEvent resource support)](https://github.com/HeliosSoftware/hfs/discussions/50) | 🟡 In progress |
 | **Standards** | [Terminology](https://github.com/HeliosSoftware/hfs/discussions/54) | 🟡 In progress |
 | **Standards** | FHIR Validation engine | 🔵 Design |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
@@ -58,7 +61,6 @@ We are actively developing community discussion documents on the following topic
 
 - **[Terminology](https://github.com/HeliosSoftware/hfs/discussions/54)** — Defining how code systems, value sets, and concept maps will be managed
 - **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
-- **[Audit](https://github.com/HeliosSoftware/hfs/discussions/50)** — Designing the audit trail architecture and AuditEvent generation
 
 ---
 
@@ -69,6 +71,7 @@ These items are well-understood and will be picked up once current work complete
 ### FHIR Server Capabilities
 
 - **Bulk Data API** — Import and export (`$export` / `$import` operations)
+- **Persistence-layer audit events** — Wire audit logging for bulk export, purge, and reindex operations (audit functions exist, pending REST endpoints)
 - **FHIR Subscriptions** — Topic-based notification support
 - **SQL on FHIR** — [SQL on FHIR operations](https://sql-on-fhir.org/ig/latest/operations.html) - using read-only database connections
 
