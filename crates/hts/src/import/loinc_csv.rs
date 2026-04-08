@@ -221,7 +221,9 @@ fn find_loinc_paths(path: &Path) -> Result<(String, String), HtsError> {
                 || filename.ends_with("loinctable.csv")
             {
                 loinc_path = Some(name);
-            } else if filename.contains("multiaxial") {
+            } else if filename.contains("multiaxial") || filename.contains("componenthierarchy") {
+                // LOINC ≤ 2.73: MultiAxialHierarchy.csv
+                // LOINC ≥ 2.74: ComponentHierarchyBySystem.csv
                 hierarchy_path = Some(name);
             }
         }
@@ -235,7 +237,7 @@ fn find_loinc_paths(path: &Path) -> Result<(String, String), HtsError> {
         })?,
         hierarchy_path.ok_or_else(|| {
             HtsError::InvalidRequest(
-                "No MultiAxialHierarchy CSV found. Expected a file whose name contains 'multiaxial'.".into(),
+                "No hierarchy CSV found. Expected 'MultiAxialHierarchy.csv' (LOINC ≤ 2.73) or 'ComponentHierarchyBySystem.csv' (LOINC ≥ 2.74).".into(),
             )
         })?,
     ))

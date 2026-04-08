@@ -13,6 +13,7 @@ crates/hts/plan-hts.md
 crates/hts/to-do-hts.md
 crates/hts/hts-gap-analysis/
 crates/hts/plans/
+crates/hts/terminology/
 
 # Build script download markers
 .download_marker
@@ -24,3 +25,6 @@ crates/hts/plans/
 
 # Test artifacts
 /test-artifacts
+
+# Terminology test files (real terminology data — not for version control)
+/data/terminology-test/

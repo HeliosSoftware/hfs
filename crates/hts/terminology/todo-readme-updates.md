@@ -1,0 +1,61 @@
+# TODO: README Terminology Licensing Updates
+
+Items to add/update in `crates/hts/README.md`. See `terminology-analysis.md` for the research behind each decision.
+
+---
+
+- ✅ **Add a "Terminology Licensing" section** to README.md, placed after the current "Included Terminologies" and "Terminologies Requiring a License" sections
+- ✅ **HL7 FHIR Core (THO):**
+  - ✅ Update license note: redistribution permitted **with attribution** (not "no attribution required"); add the required attribution string
+  - ✅ Add download link: https://terminology.hl7.org/en/downloads.html
+  - ✅ Note which FHIR versions each package covers (r4, r4b, r5, r6)
+  - ✅ Clarify CVX and UCUM are included in THO packages — no separate import needed
+- ✅ **SNOMED CT section:**
+  - ✅ Add link to SNOMED International licensing page: https://www.snomed.org/licensing
+  - ✅ Add US-specific path via NLM: https://www.nlm.nih.gov/healthit/snomedct/index.html
+  - ✅ Add MLDS download link: https://mlds.ihtsdotools.org/
+  - ✅ Add note about free use in ~42 member countries
+  - ✅ Add note about free use in least-developed countries
+  - ✅ Add note that vendors who redistribute SNOMED-enabled products must be Affiliates themselves
+  - ✅ Add link to full member country list: https://www.snomed.org/snomed-ct/get-snomed
+  - ✅ Add note recommending the **Snapshot** release (not the Full release) for most HTS deployments, and clarify the size difference (compressed vs. uncompressed)
+- ✅ **LOINC section:**
+  - ✅ Add link to LOINC license: https://loinc.org/kb/license/
+  - ✅ Add exact attribution string required by license
+  - ✅ Add download link: https://loinc.org/downloads/
+  - ✅ Clarify registration is required to download from Regenstrief, not a pre-condition for receiving a properly attributed redistributed copy
+  - ✅ Add note about what cannot be modified (Group 1 field names)
+  - ✅ Clarify the license explicitly permits redistribution with attribution; we do not bundle for operational currency reasons
+- ✅ **RxNorm section:**
+  - ✅ Add link to NLM Terms of Service: https://www.nlm.nih.gov/research/umls/rxnorm/docs/termsofservice.html
+  - ✅ Add UMLS UTS account link: https://uts.nlm.nih.gov
+  - ✅ Clarify that RXCUI codes (SRL 0) are public domain but the full dataset includes non-redistributable SRL 3/4 content from commercial sources
+  - ✅ Add required attribution text for products using RxNorm
+  - ✅ Add link to RxNorm files download: https://www.nlm.nih.gov/research/umls/rxnorm/docs/rxnormfiles.html
+- ✅ **Add CPT section (with "not supported / deferred" notice):**
+  - ✅ Explain CPT is AMA-owned with paid annual royalties
+  - ✅ Link to AMA licensing FAQ: https://www.ama-assn.org/practice-management/cpt/cpt-licensing-frequently-asked-questions-faqs
+  - ✅ State HTS does not currently support CPT import
+  - ✅ Note that HCPCS Level I = CPT
+- ✅ **Add CVX section:**
+  - ✅ State it is a US government / CDC work (public domain)
+  - ✅ Explain it's included automatically when importing HL7 THO packages
+  - ✅ Add CDC source link: https://www.cdc.gov/iis/code-sets/index.html
+- ✅ **Add HCPCS Level II section:**
+  - ✅ Distinguish Level I (CPT, AMA, paid) from Level II (CMS, public domain for A–V codes)
+  - ✅ State Level II A–V codes are free and public domain
+  - ✅ Add D-codes caveat: dental D-codes are derived from ADA CDT and may require ADA licensing; this is an ongoing legal ambiguity
+  - ✅ Add download link: https://www.cms.gov/medicare/coding-billing/healthcare-common-procedure-system/quarterly-update
+  - ✅ Note import support is not yet implemented
+- ✅ **Add ICD-9-CM section (deferred):**
+  - ✅ State it is retired (replaced by ICD-10-CM Oct 2015)
+  - ✅ State it is public domain
+  - ✅ State HTS does not currently support it
+  - ✅ Link to CMS archive: https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles
+- ✅ **Add ICD-11 section:**
+  - ✅ State it is published under CC BY-ND 3.0 IGO (redistribution with attribution permitted; no modifications)
+  - ✅ Note WHO adoption is still early (few production FHIR systems use it as of 2026)
+  - ✅ State HTS does not currently support import
+- ✅ **Add a "Not Supported" section** listing CPT, MedDRA, ICD-9-CM with brief reasons; ICD-11 is in the Additional Terminologies world list (conditionally redistributable, not "not supported")
+- ✅ **Add a "Quick Reference" licensing table** at the top of the Terminology section (like the Decision Matrix in §5 of `terminology-analysis.md`) so users can immediately see what they need to do
+- ✅ **Review and update existing README import examples** to ensure SNOMED CT example notes the license requirement inline and recommends the Snapshot release
