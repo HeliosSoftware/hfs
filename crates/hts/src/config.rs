@@ -107,6 +107,9 @@ pub enum ImportFormat {
     /// ICD-10-CM tabular XML from CMS
     #[value(name = "icd10-cm")]
     Icd10Cm,
+    /// ICD-9-CM pipe-delimited text from CMS (retired 2015, public domain)
+    #[value(name = "icd9-cm")]
+    Icd9Cm,
     /// RxNorm RRF files from NLM
     #[value(name = "rxnorm")]
     Rxnorm,
@@ -119,6 +122,7 @@ impl fmt::Display for ImportFormat {
             ImportFormat::SnomedRf2 => write!(f, "snomed-rf2"),
             ImportFormat::Loinc => write!(f, "loinc"),
             ImportFormat::Icd10Cm => write!(f, "icd10-cm"),
+            ImportFormat::Icd9Cm => write!(f, "icd9-cm"),
             ImportFormat::Rxnorm => write!(f, "rxnorm"),
         }
     }
@@ -186,6 +190,9 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
         }
         if entry_name.ends_with(".xml") && entry_name.contains("tabular") {
             return Some(ImportFormat::Icd10Cm);
+        }
+        if entry_name.contains("_desc_long_dx") || entry_name.contains("_desc_short_dx") {
+            return Some(ImportFormat::Icd9Cm);
         }
     }
     None
@@ -375,6 +382,35 @@ mod tests {
         assert_eq!(ImportFormat::SnomedRf2.to_string(), "snomed-rf2");
         assert_eq!(ImportFormat::Loinc.to_string(), "loinc");
         assert_eq!(ImportFormat::Icd10Cm.to_string(), "icd10-cm");
+        assert_eq!(ImportFormat::Icd9Cm.to_string(), "icd9-cm");
         assert_eq!(ImportFormat::Rxnorm.to_string(), "rxnorm");
+    }
+
+    #[test]
+    fn detect_zip_icd9_desc_long_dx() {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("CMS32_DESC_LONG_DX.txt", opts).unwrap();
+            zip.write_all(b"001|Cholera\n").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Icd9Cm));
+    }
+
+    #[test]
+    fn detect_zip_icd9_desc_short_dx() {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("CMS32_DESC_SHORT_DX.txt", opts).unwrap();
+            zip.write_all(b"001|Cholera\n").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Icd9Cm));
     }
 }

@@ -459,6 +459,7 @@ mod import_tests {
             ("snomed-rf2", ImportFormat::SnomedRf2),
             ("loinc", ImportFormat::Loinc),
             ("icd10-cm", ImportFormat::Icd10Cm),
+            ("icd9-cm", ImportFormat::Icd9Cm),
             ("rxnorm", ImportFormat::Rxnorm),
         ];
 
@@ -470,5 +471,64 @@ mod import_tests {
                 "failed for {flag_val}"
             );
         }
+    }
+
+    // ── ICD-9-CM end-to-end ───────────────────────────────────────────────────
+
+    /// Minimal pipe-delimited ICD-9-CM fixture with two categories, one
+    /// subcategory, and one sub-subcategory.
+    const ICD9_TXT: &str = "\
+001|Cholera\n\
+0010|Cholera due to vibrio cholerae\n\
+00100|Cholera due to vibrio cholerae\n\
+002|Typhoid and paratyphoid fevers\n\
+";
+
+    #[test]
+    fn import_icd9_end_to_end() {
+        use helios_hts::import::icd9_cm::import_icd9_cm;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(ICD9_TXT.as_bytes()).unwrap();
+
+        let stats = import_icd9_cm(&pool, tmp.path(), 500, false).unwrap();
+
+        // 4 concepts from the file
+        assert_eq!(stats.code_systems, 1);
+        assert_eq!(stats.concepts, 4);
+        assert!(stats.errors.is_empty());
+
+        // Verify a leaf code is queryable with the correct display code (dot inserted)
+        let conn = pool.get().unwrap();
+        let display: String = conn
+            .query_row(
+                "SELECT c.display FROM concepts c \
+                 JOIN code_systems cs ON cs.id = c.system_id \
+                 WHERE cs.url = 'http://hl7.org/fhir/sid/icd-9-cm' AND c.code = '001.00'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("001.00 not found");
+        assert_eq!(display, "Cholera due to vibrio cholerae");
+    }
+
+    #[test]
+    fn import_icd9_batch_size_zero_does_not_panic() {
+        use helios_hts::import::icd9_cm::import_icd9_cm;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(ICD9_TXT.as_bytes()).unwrap();
+
+        // batch_size=0 must not panic; the .max(1) guard clamps it to 1
+        let stats = import_icd9_cm(&pool, tmp.path(), 0, false).unwrap();
+        assert_eq!(stats.concepts, 4);
     }
 }

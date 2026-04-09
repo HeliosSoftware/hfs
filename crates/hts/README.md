@@ -516,6 +516,24 @@ hts import ./icd10cm_tabular_2026.xml
 
 ---
 
+### ICD-9-CM
+
+Produced by the [U.S. NCHS / CMS](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles). A US federal government work — public domain, no license or registration required. **Retired October 1, 2015** (replaced by ICD-10-CM); use for historical data and legacy EHR migration only.
+
+Download the pipe-delimited code files (`CMS32_DESC_LONG_DX.txt` or similar) from the [CMS ICD-9-CM archive](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles).
+
+```bash
+# From a raw pipe-delimited text file (--format required; .txt is ambiguous)
+hts import ./CMS32_DESC_LONG_DX.txt --format icd9-cm
+
+# From a ZIP containing the text file (auto-detected if file is named *_DESC_LONG_DX*.txt)
+hts import ./ICD9CM_2015.zip --format icd9-cm
+```
+
+Codes are stored with decimal points (`001.0`, `E800.0`). Hierarchy is inferred from code structure — 3-digit categories are top-level, subcategories hang beneath them. No chapter groupers are imported (CMS flat files do not include them).
+
+---
+
 ### SNOMED CT
 
 Owned by [SNOMED International](https://www.snomed.org) and licensed under the [SNOMED Affiliate License](https://www.snomed.org/licensing). Free in the US and ~50 member countries; paid elsewhere.
@@ -578,7 +596,7 @@ National Institutes of Health, Department of Health and Human Services.
 |-------------|--------|
 | **CPT** | Proprietary — requires a paid AMA license. Contact [ama-assn.org](https://www.ama-assn.org/practice-management/cpt/cpt-licensing-frequently-asked-questions-faqs) for licensing. Open an issue if you need the importer. |
 | **HCPCS Level II** | Public domain (US gov). Importer not yet implemented — open an issue. |
-| **ICD-9-CM** | Public domain (US gov, retired 2015). Importer not yet implemented — historical files at [cms.gov](https://www.cms.gov/medicare/coding-billing/icd-10-codes). |
+| **ICD-9-CM** | ✅ Supported — see [ICD-9-CM](#icd-9-cm) section above. |
 | **ICD-11** | Free ([CC BY-ND 3.0 IGO](https://creativecommons.org/licenses/by-nd/3.0/igo/)). Importer not yet implemented — WHO adoption is still early. |
 | **MedDRA** | Proprietary — requires a paid MSSO license. Contact [meddra.org](https://www.meddra.org). |
 | **NDC** | Public domain (FDA). Importer not yet implemented. |

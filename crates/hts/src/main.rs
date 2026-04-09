@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli
         .command
-        .unwrap_or_else(|| Command::Serve(HtsConfig::default()))
+        .unwrap_or_else(|| Command::Serve(HtsConfig::parse_from(["hts"])))
     {
         Command::Serve(config) => {
             init_logging(&config.log_level);
@@ -328,6 +328,19 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
             let dry_run = args.dry_run;
 
             tokio::task::spawn_blocking(move || import_icd10_cm(&pool, &path, batch_size, dry_run))
+                .await
+                .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
+        }
+
+        ImportFormat::Icd9Cm => {
+            use helios_hts::import::icd9_cm::import_icd9_cm;
+            let backend = SqliteTerminologyBackend::new(&args.database_url)?;
+            let pool = backend.pool().clone();
+            let path = args.path.clone();
+            let batch_size = args.batch_size;
+            let dry_run = args.dry_run;
+
+            tokio::task::spawn_blocking(move || import_icd9_cm(&pool, &path, batch_size, dry_run))
                 .await
                 .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
         }
