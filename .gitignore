@@ -1,4 +1,4 @@
-.DS_Store
+d.DS_Store
 /target
 /node_modules
 yarn.lock
@@ -14,6 +14,7 @@ crates/hts/to-do-hts.md
 crates/hts/hts-gap-analysis/
 crates/hts/plans/
 crates/hts/terminology/
+crates/hts/terminology-expert/
 
 # Build script download markers
 .download_marker
