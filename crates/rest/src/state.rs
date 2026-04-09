@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
 use helios_persistence::core::ResourceStorage;
 
@@ -44,6 +45,12 @@ pub struct AppState<S> {
 
     /// Auth middleware state (present only when auth is enabled).
     auth: Option<Arc<AuthMiddlewareState>>,
+
+    /// Optional audit sink for handler-level per-entry audit emission.
+    audit_sink: Option<Arc<dyn AuditSink>>,
+
+    /// Audit source observer reference used when emitting handler-level events.
+    audit_source_observer: String,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -54,6 +61,8 @@ impl<S> Clone for AppState<S> {
             config: Arc::clone(&self.config),
             auth_config: Arc::clone(&self.auth_config),
             auth: self.auth.clone(),
+            audit_sink: self.audit_sink.clone(),
+            audit_source_observer: self.audit_source_observer.clone(),
         }
     }
 }
@@ -71,6 +80,8 @@ impl<S: ResourceStorage> AppState<S> {
             config: Arc::new(config),
             auth_config: Arc::new(AuthConfig::default()),
             auth: None,
+            audit_sink: None,
+            audit_source_observer: "Device/hfs".to_string(),
         }
     }
 
@@ -81,11 +92,25 @@ impl<S: ResourceStorage> AppState<S> {
         auth_config: AuthConfig,
         auth_state: Option<Arc<AuthMiddlewareState>>,
     ) -> Self {
+        Self::with_auth_and_audit(storage, config, auth_config, auth_state, None, "Device/hfs")
+    }
+
+    /// Creates a new AppState with auth and audit configuration.
+    pub fn with_auth_and_audit(
+        storage: Arc<S>,
+        config: ServerConfig,
+        auth_config: AuthConfig,
+        auth_state: Option<Arc<AuthMiddlewareState>>,
+        audit_sink: Option<Arc<dyn AuditSink>>,
+        audit_source_observer: impl Into<String>,
+    ) -> Self {
         Self {
             storage,
             config: Arc::new(config),
             auth_config: Arc::new(auth_config),
             auth: auth_state,
+            audit_sink,
+            audit_source_observer: audit_source_observer.into(),
         }
     }
 
@@ -152,6 +177,16 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns whether authentication is enabled.
     pub fn auth_enabled(&self) -> bool {
         self.auth.is_some()
+    }
+
+    /// Returns the audit sink for handler-level audit emission, if configured.
+    pub fn audit_sink(&self) -> Option<&Arc<dyn AuditSink>> {
+        self.audit_sink.as_ref()
+    }
+
+    /// Returns the configured audit source observer reference.
+    pub fn audit_source_observer(&self) -> &str {
+        &self.audit_source_observer
     }
 }
 

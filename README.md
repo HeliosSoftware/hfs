@@ -232,6 +232,19 @@ AWS_REGION=us-east-1 \
 | `HFS_S3_REGION` | *(AWS provider chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix prepended to all S3 object keys |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
+| `HFS_AUDIT_BACKEND` | `none` | [Audit backend](crates/audit/README.md#audit-sinks): `none`, `file`, `database`, or `cloudwatch` |
+| `HFS_AUDIT_FILE_PATH` | *(none)* | Required when `HFS_AUDIT_BACKEND=file`; NDJSON file path for persisted `AuditEvent` logs |
+| `HFS_AUDIT_DATABASE_URL` | *(none)* | Optional dedicated audit database URL/path (SQLite/PostgreSQL/MongoDB families) |
+| `HFS_AUDIT_MONGODB_DATABASE` | *(none)* | Optional dedicated MongoDB database name for audit events |
+| `HFS_AUDIT_S3_BUCKET` | *(none)* | Optional dedicated S3 bucket for audit events |
+| `HFS_AUDIT_S3_PREFIX` | *(none)* | Optional dedicated S3 prefix for audit events |
+| `HFS_AUDIT_S3_REGION` | *(none)* | Optional dedicated S3 region for audit events |
+| `HFS_AUDIT_S3_VALIDATE_BUCKETS` | *(none)* | Optional dedicated S3 bucket validation toggle for audit events |
+| `HFS_AUDIT_SOURCE_OBSERVER` | `Device/hfs` | Sets `AuditEvent.source.observer` |
+| `HFS_AUDIT_EXCLUDE_PATHS` | *(none)* | Comma-separated paths to exclude from audit middleware |
+| `HFS_AUDIT_CLOUDWATCH_LOG_GROUP` | *(none)* | Required when `HFS_AUDIT_BACKEND=cloudwatch`; CloudWatch Logs log group name |
+| `HFS_AUDIT_CLOUDWATCH_LOG_STREAM` | `hfs-audit` | CloudWatch Logs log stream name |
+| `HFS_AUDIT_CLOUDWATCH_REGION` | *(AWS chain)* | AWS region override for CloudWatch Logs |
 
 For detailed backend setup instructions (building from source, Docker commands, and search offloading architecture), see the [persistence crate documentation](crates/persistence/README.md#building--running-storage-backends).
 
@@ -323,6 +336,9 @@ Common types and traits for FHIRPath evaluation.
 ### 10. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
 Storage backend abstraction supporting multiple database technologies optimized for different FHIR workloads.
 
+### 11. [`helios-audit`](crates/audit) - BALP Audit Logging
+[IHE BALP](https://profiles.ihe.net/ITI/BALP/)-compliant `AuditEvent` logging for REST, auth, persistence, and lifecycle events. Supports file, database, and AWS CloudWatch Logs sinks. See the [helios-audit README](crates/audit/README.md) for full configuration details.
+
 ## Design Principles
 
 - **Version Agnostic**: All components use enum wrappers to seamlessly handle multiple FHIR versions
@@ -357,6 +373,7 @@ Storage backend abstraction supporting multiple database technologies optimized 
 - Search with chained parameters
 - History and versioning
 - Batch/transaction support
+- Optional BALP-compliant `AuditEvent` logging for REST and auth interactions
 
 # Development
 
@@ -441,12 +458,16 @@ Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
 The Helios FHIR Server is licensed under the [MIT License](LICENSE).
 
-# Support
+# Community
 
-- **Issues**: [GitHub Issues](https://github.com/HeliosSoftware/hfs/issues)
-- **Website**: [heliossoftware.com](https://heliossoftware.com)
+We welcome contributors and feedback at every level — from opening issues to joining design discussions.
+
+- **📋 GitHub Discussions:** [github.com/HeliosSoftware/hfs/discussions](https://github.com/HeliosSoftware/hfs/discussions)
+- **🐛 Issues:** [github.com/HeliosSoftware/hfs/issues](https://github.com/HeliosSoftware/hfs/issues)
+- **🗓️ Weekly Developer Meeting:** Open to all. We review roadmap progress, discuss design decisions, and plan upcoming work. Details and updates are posted to [this GitHub Discussion](https://github.com/HeliosSoftware/hfs/discussions/40).
+- **💼 LinkedIn Group:** [linkedin.com/groups/8618077](https://www.linkedin.com/groups/8618077/) — Over 2,500 members
+- **🌐 Website:** [heliossoftware.com](https://heliossoftware.com)
 
 ---
 
 HL7® and FHIR® are registered trademarks of Health Level Seven International.
-
