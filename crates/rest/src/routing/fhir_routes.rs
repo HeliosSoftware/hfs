@@ -185,7 +185,7 @@ where
         + Sync
         + 'static,
 {
-    Router::new()
+    let router = Router::new()
         // System-level routes
         .route("/metadata", get(handlers::capabilities_handler::<S>))
         .route("/$versions", get(handlers::versions_handler::<S>))
@@ -249,12 +249,25 @@ where
         .route(
             "/{resource_type}/{id}/_history/{version_id}",
             delete(handlers::delete_version_handler::<S>),
-        )
-        // Compartment search: GET [base]/[compartment-type]/[id]/[target-type]?params
+        );
+
+    // Subscription operations (feature-gated, before compartment search)
+    #[cfg(feature = "subscriptions")]
+    let router = router
         .route(
-            "/{compartment_type}/{compartment_id}/{target_type}",
-            get(handlers::compartment_search_handler::<S>),
+            "/{resource_type}/{id}/$status",
+            get(handlers::subscriptions::subscription_status_handler::<S>),
         )
+        .route(
+            "/{resource_type}/{id}/$events",
+            get(handlers::subscriptions::subscription_events_handler::<S>),
+        );
+
+    // Compartment search: GET [base]/[compartment-type]/[id]/[target-type]?params
+    router.route(
+        "/{compartment_type}/{compartment_id}/{target_type}",
+        get(handlers::compartment_search_handler::<S>),
+    )
 }
 
 /// Creates a minimal set of routes for testing.
