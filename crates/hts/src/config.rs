@@ -113,6 +113,24 @@ pub enum ImportFormat {
     /// RxNorm RRF files from NLM
     #[value(name = "rxnorm")]
     Rxnorm,
+    /// UCUM ucum-essence.xml from unitsofmeasure.org (or bundled in HL7 THO)
+    #[value(name = "ucum")]
+    Ucum,
+    /// NCI Thesaurus flat-text (Thesaurus.txt) from NCI EVS
+    #[value(name = "nci-thesaurus")]
+    NciThesaurus,
+    /// MeSH XML (mesh.xml / desc*.xml) from NLM
+    #[value(name = "mesh")]
+    Mesh,
+    /// DICOM Part 16 code table CSV/TSV from NEMA
+    #[value(name = "dicom")]
+    Dicom,
+    /// HL7 v2 tables XML (redistributed with attribution; also bundled in THO)
+    #[value(name = "hl7-v2-tables")]
+    Hl7V2Tables,
+    /// NUCC Provider Taxonomy CSV from nucc.org
+    #[value(name = "nucc")]
+    Nucc,
 }
 
 impl fmt::Display for ImportFormat {
@@ -124,6 +142,12 @@ impl fmt::Display for ImportFormat {
             ImportFormat::Icd10Cm => write!(f, "icd10-cm"),
             ImportFormat::Icd9Cm => write!(f, "icd9-cm"),
             ImportFormat::Rxnorm => write!(f, "rxnorm"),
+            ImportFormat::Ucum => write!(f, "ucum"),
+            ImportFormat::NciThesaurus => write!(f, "nci-thesaurus"),
+            ImportFormat::Mesh => write!(f, "mesh"),
+            ImportFormat::Dicom => write!(f, "dicom"),
+            ImportFormat::Hl7V2Tables => write!(f, "hl7-v2-tables"),
+            ImportFormat::Nucc => write!(f, "nucc"),
         }
     }
 }
@@ -151,6 +175,22 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
     // (e.g. icd10cm_tabular_2025.xml). Generic .xml files require --format.
     if name.ends_with(".xml") && name.contains("tabular") {
         return Some(ImportFormat::Icd10Cm);
+    }
+    // UCUM essence XML (e.g. ucum-essence.xml, ucum_2.1.xml).
+    if name.ends_with(".xml") && (name.contains("ucum") || name.contains("essence")) {
+        return Some(ImportFormat::Ucum);
+    }
+    // MeSH XML (e.g. mesh2025.xml, desc2025.xml).
+    if name.ends_with(".xml") && (name.contains("mesh") || name.starts_with("desc")) {
+        return Some(ImportFormat::Mesh);
+    }
+    // NCI Thesaurus flat text.
+    if name.ends_with(".txt") && name.contains("thesaurus") {
+        return Some(ImportFormat::NciThesaurus);
+    }
+    // NUCC taxonomy CSV.
+    if name.ends_with(".csv") && (name.contains("nucc") || name.contains("taxonomy")) {
+        return Some(ImportFormat::Nucc);
     }
     if name.ends_with(".rrf") {
         return Some(ImportFormat::Rxnorm);
@@ -193,6 +233,32 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
         }
         if entry_name.contains("_desc_long_dx") || entry_name.contains("_desc_short_dx") {
             return Some(ImportFormat::Icd9Cm);
+        }
+        if entry_name.ends_with(".xml")
+            && (entry_name.contains("ucum") || entry_name.contains("essence"))
+        {
+            return Some(ImportFormat::Ucum);
+        }
+        if entry_name.ends_with(".txt") && entry_name.contains("thesaurus") {
+            return Some(ImportFormat::NciThesaurus);
+        }
+        if entry_name.ends_with(".xml") && {
+            let fname = entry_name.split('/').next_back().unwrap_or(&entry_name);
+            entry_name.contains("mesh") || fname.starts_with("desc")
+        } {
+            return Some(ImportFormat::Mesh);
+        }
+        if (entry_name.ends_with(".csv")
+            || entry_name.ends_with(".tsv")
+            || entry_name.ends_with(".txt"))
+            && (entry_name.contains("dicom") || entry_name.contains("dcm"))
+        {
+            return Some(ImportFormat::Dicom);
+        }
+        if entry_name.ends_with(".csv")
+            && (entry_name.contains("nucc") || entry_name.contains("taxonomy"))
+        {
+            return Some(ImportFormat::Nucc);
         }
     }
     None
@@ -384,6 +450,135 @@ mod tests {
         assert_eq!(ImportFormat::Icd10Cm.to_string(), "icd10-cm");
         assert_eq!(ImportFormat::Icd9Cm.to_string(), "icd9-cm");
         assert_eq!(ImportFormat::Rxnorm.to_string(), "rxnorm");
+        assert_eq!(ImportFormat::Ucum.to_string(), "ucum");
+        assert_eq!(ImportFormat::NciThesaurus.to_string(), "nci-thesaurus");
+        assert_eq!(ImportFormat::Mesh.to_string(), "mesh");
+        assert_eq!(ImportFormat::Dicom.to_string(), "dicom");
+        assert_eq!(ImportFormat::Hl7V2Tables.to_string(), "hl7-v2-tables");
+        assert_eq!(ImportFormat::Nucc.to_string(), "nucc");
+    }
+
+    // ── New format auto-detection (direct file) ───────────────────────────────
+
+    #[test]
+    fn detect_ucum_xml() {
+        assert_eq!(
+            detect_format(Path::new("ucum-essence.xml")),
+            Some(ImportFormat::Ucum)
+        );
+        assert_eq!(
+            detect_format(Path::new("ucum_2.2.xml")),
+            Some(ImportFormat::Ucum)
+        );
+    }
+
+    #[test]
+    fn detect_mesh_xml() {
+        assert_eq!(
+            detect_format(Path::new("desc2026.xml")),
+            Some(ImportFormat::Mesh)
+        );
+        assert_eq!(
+            detect_format(Path::new("mesh2025.xml")),
+            Some(ImportFormat::Mesh)
+        );
+    }
+
+    #[test]
+    fn detect_nci_thesaurus_txt() {
+        assert_eq!(
+            detect_format(Path::new("Thesaurus.txt")),
+            Some(ImportFormat::NciThesaurus)
+        );
+        assert_eq!(
+            detect_format(Path::new("nci_thesaurus_2024.txt")),
+            Some(ImportFormat::NciThesaurus)
+        );
+    }
+
+    #[test]
+    fn detect_nucc_csv() {
+        assert_eq!(
+            detect_format(Path::new("nucc_taxonomy_250.csv")),
+            Some(ImportFormat::Nucc)
+        );
+        assert_eq!(
+            detect_format(Path::new("provider_taxonomy.csv")),
+            Some(ImportFormat::Nucc)
+        );
+    }
+
+    // ── New format ZIP detection ──────────────────────────────────────────────
+
+    #[test]
+    fn detect_zip_ucum() {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("ucum-essence.xml", opts).unwrap();
+            zip.write_all(b"<root/>").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Ucum));
+    }
+
+    #[test]
+    fn detect_zip_nci_thesaurus() {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("Thesaurus.txt", opts).unwrap();
+            zip.write_all(b"dummy").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::NciThesaurus));
+    }
+
+    #[test]
+    fn detect_zip_mesh_via_desc_prefix() {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            // File is nested inside a subdirectory — tests the starts_with fix
+            zip.start_file("mesh2026/desc2026.xml", opts).unwrap();
+            zip.write_all(b"<MeshHeadingList/>").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Mesh));
+    }
+
+    #[test]
+    fn detect_zip_dicom() {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("dicom_codes.csv", opts).unwrap();
+            zip.write_all(b"dummy").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Dicom));
+    }
+
+    #[test]
+    fn detect_zip_nucc() {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("nucc_taxonomy_250.csv", opts).unwrap();
+            zip.write_all(b"dummy").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Nucc));
     }
 
     #[test]

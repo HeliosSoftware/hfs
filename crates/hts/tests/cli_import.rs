@@ -461,6 +461,12 @@ mod import_tests {
             ("icd10-cm", ImportFormat::Icd10Cm),
             ("icd9-cm", ImportFormat::Icd9Cm),
             ("rxnorm", ImportFormat::Rxnorm),
+            ("ucum", ImportFormat::Ucum),
+            ("nci-thesaurus", ImportFormat::NciThesaurus),
+            ("mesh", ImportFormat::Mesh),
+            ("dicom", ImportFormat::Dicom),
+            ("hl7-v2-tables", ImportFormat::Hl7V2Tables),
+            ("nucc", ImportFormat::Nucc),
         ];
 
         for (flag_val, expected) in cases {
@@ -471,6 +477,458 @@ mod import_tests {
                 "failed for {flag_val}"
             );
         }
+    }
+
+    // ── UCUM end-to-end ───────────────────────────────────────────────────────
+
+    const UCUM_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns="http://unitsofmeasure.org/ucum-essence" version="2.2">
+  <prefix Code="k" CODE="K"><name>kilo</name></prefix>
+  <base-unit Code="m" CODE="M" isMetric="yes"><name>meter</name></base-unit>
+  <unit Code="[lb_av]" CODE="[LB_AV]" isMetric="no"><name>pound</name></unit>
+</root>"#;
+
+    #[test]
+    fn import_ucum_end_to_end() {
+        use helios_hts::import::ucum::import_ucum;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
+        tmp.write_all(UCUM_XML.as_bytes()).unwrap();
+
+        let stats = import_ucum(&pool, tmp.path(), 500, false).unwrap();
+
+        assert_eq!(stats.code_systems, 1);
+        assert_eq!(stats.concepts, 3);
+        assert!(stats.errors.is_empty());
+
+        // Verify a specific code is queryable
+        let conn = pool.get().unwrap();
+        let display: String = conn
+            .query_row(
+                "SELECT c.display FROM concepts c \
+                 JOIN code_systems cs ON cs.id = c.system_id \
+                 WHERE cs.url = 'http://unitsofmeasure.org' AND c.code = 'm'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("meter not found");
+        assert_eq!(display, "meter");
+    }
+
+    #[test]
+    fn import_ucum_dry_run_writes_nothing() {
+        use helios_hts::import::ucum::import_ucum;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
+        tmp.write_all(UCUM_XML.as_bytes()).unwrap();
+
+        let stats = import_ucum(&pool, tmp.path(), 500, true).unwrap();
+        assert_eq!(stats.code_systems, 1);
+        assert_eq!(stats.concepts, 3);
+        assert_eq!(count_rows(&pool, "code_systems"), 0);
+        assert_eq!(count_rows(&pool, "concepts"), 0);
+    }
+
+    #[test]
+    fn import_ucum_idempotent() {
+        use helios_hts::import::ucum::import_ucum;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
+        tmp.write_all(UCUM_XML.as_bytes()).unwrap();
+
+        import_ucum(&pool, tmp.path(), 500, false).unwrap();
+        import_ucum(&pool, tmp.path(), 500, false).unwrap();
+
+        assert_eq!(count_rows(&pool, "code_systems"), 1);
+        // virtual root + 3 unit codes
+        assert_eq!(count_rows(&pool, "concepts"), 4);
+        assert_eq!(count_rows(&pool, "concept_hierarchy"), 3);
+    }
+
+    #[test]
+    fn import_ucum_batch_size_zero_does_not_panic() {
+        use helios_hts::import::ucum::import_ucum;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
+        tmp.write_all(UCUM_XML.as_bytes()).unwrap();
+
+        let stats = import_ucum(&pool, tmp.path(), 0, false).unwrap();
+        assert_eq!(stats.concepts, 3);
+    }
+
+    // ── NCI Thesaurus end-to-end ──────────────────────────────────────────────
+
+    /// Minimal NCI Thesaurus flat-file fixture (tab-delimited).
+    /// Columns: code, concept name, parents (pipe-sep), synonyms, definition, display_name, ...
+    const NCI_TXT: &str = "C12345\tRoot Concept\t\t\tA root concept.\tRoot Concept\n\
+C67890\tChild Concept\tC12345\t\tA child concept.\tChild Concept\n\
+C11111\tAnother Root\t\t\tAnother root.\tAnother Root\n";
+
+    #[test]
+    fn import_nci_thesaurus_end_to_end() {
+        use helios_hts::import::nci_thesaurus::import_nci_thesaurus;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(NCI_TXT.as_bytes()).unwrap();
+
+        let stats = import_nci_thesaurus(&pool, tmp.path(), 500, false).unwrap();
+
+        assert_eq!(stats.code_systems, 1);
+        assert_eq!(stats.concepts, 3);
+        assert!(stats.errors.is_empty());
+
+        let conn = pool.get().unwrap();
+        let display: String = conn
+            .query_row(
+                "SELECT c.display FROM concepts c \
+                 JOIN code_systems cs ON cs.id = c.system_id \
+                 WHERE cs.url = 'http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl' \
+                 AND c.code = 'C67890'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("C67890 not found");
+        assert_eq!(display, "Child Concept");
+    }
+
+    #[test]
+    fn import_nci_thesaurus_dry_run_writes_nothing() {
+        use helios_hts::import::nci_thesaurus::import_nci_thesaurus;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(NCI_TXT.as_bytes()).unwrap();
+
+        import_nci_thesaurus(&pool, tmp.path(), 500, true).unwrap();
+        assert_eq!(count_rows(&pool, "code_systems"), 0);
+        assert_eq!(count_rows(&pool, "concepts"), 0);
+    }
+
+    #[test]
+    fn import_nci_thesaurus_idempotent() {
+        use helios_hts::import::nci_thesaurus::import_nci_thesaurus;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(NCI_TXT.as_bytes()).unwrap();
+
+        import_nci_thesaurus(&pool, tmp.path(), 500, false).unwrap();
+        import_nci_thesaurus(&pool, tmp.path(), 500, false).unwrap();
+
+        assert_eq!(count_rows(&pool, "code_systems"), 1);
+        assert_eq!(count_rows(&pool, "concepts"), 3);
+    }
+
+    #[test]
+    fn import_nci_thesaurus_batch_size_zero_does_not_panic() {
+        use helios_hts::import::nci_thesaurus::import_nci_thesaurus;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(NCI_TXT.as_bytes()).unwrap();
+
+        let stats = import_nci_thesaurus(&pool, tmp.path(), 0, false).unwrap();
+        assert_eq!(stats.concepts, 3);
+    }
+
+    // ── DICOM end-to-end ──────────────────────────────────────────────────────
+
+    const DICOM_CSV: &str = "\
+CodeValue,CodingSchemeDesignator,CodeMeaning\n\
+121049,DCM,Image Position (Patient)\n\
+121050,DCM,Observer Context\n\
+121058,DCM,Procedure reported\n\
+";
+
+    #[test]
+    fn import_dicom_end_to_end() {
+        use helios_hts::import::dicom::import_dicom;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+        tmp.write_all(DICOM_CSV.as_bytes()).unwrap();
+
+        let stats = import_dicom(&pool, tmp.path(), 500, false).unwrap();
+
+        assert_eq!(stats.code_systems, 1);
+        assert_eq!(stats.concepts, 3);
+        assert!(stats.errors.is_empty());
+
+        let conn = pool.get().unwrap();
+        let display: String = conn
+            .query_row(
+                "SELECT c.display FROM concepts c \
+                 JOIN code_systems cs ON cs.id = c.system_id \
+                 WHERE cs.url = 'http://dicom.nema.org/resources/ontology/DCM' \
+                 AND c.code = '121050'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("121050 not found");
+        assert_eq!(display, "Observer Context");
+    }
+
+    #[test]
+    fn import_dicom_dry_run_writes_nothing() {
+        use helios_hts::import::dicom::import_dicom;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+        tmp.write_all(DICOM_CSV.as_bytes()).unwrap();
+
+        import_dicom(&pool, tmp.path(), 500, true).unwrap();
+        assert_eq!(count_rows(&pool, "code_systems"), 0);
+        assert_eq!(count_rows(&pool, "concepts"), 0);
+    }
+
+    #[test]
+    fn import_dicom_idempotent() {
+        use helios_hts::import::dicom::import_dicom;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+        tmp.write_all(DICOM_CSV.as_bytes()).unwrap();
+
+        import_dicom(&pool, tmp.path(), 500, false).unwrap();
+        import_dicom(&pool, tmp.path(), 500, false).unwrap();
+
+        assert_eq!(count_rows(&pool, "code_systems"), 1);
+        assert_eq!(count_rows(&pool, "concepts"), 4); // virtual root + 3
+    }
+
+    #[test]
+    fn import_dicom_batch_size_zero_does_not_panic() {
+        use helios_hts::import::dicom::import_dicom;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+        tmp.write_all(DICOM_CSV.as_bytes()).unwrap();
+
+        let stats = import_dicom(&pool, tmp.path(), 0, false).unwrap();
+        assert_eq!(stats.concepts, 3);
+    }
+
+    // ── HL7 v2 tables end-to-end ──────────────────────────────────────────────
+
+    const HL7V2_XML: &str = r#"<?xml version="1.0"?>
+<HL7Tables>
+  <HL7Table id="0001" name="Administrative Sex">
+    <tableEntry code="F" displayName="Female"/>
+    <tableEntry code="M" displayName="Male"/>
+    <tableEntry code="O" displayName="Other"/>
+  </HL7Table>
+</HL7Tables>"#;
+
+    #[test]
+    fn import_hl7_v2_tables_end_to_end() {
+        use helios_hts::import::hl7_v2_tables::import_hl7_v2_tables;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
+        tmp.write_all(HL7V2_XML.as_bytes()).unwrap();
+
+        let stats = import_hl7_v2_tables(&pool, tmp.path(), 500, false).unwrap();
+
+        assert_eq!(stats.code_systems, 1);
+        assert_eq!(stats.concepts, 3);
+        assert!(stats.errors.is_empty());
+
+        let conn = pool.get().unwrap();
+        let display: String = conn
+            .query_row(
+                "SELECT c.display FROM concepts c \
+                 JOIN code_systems cs ON cs.id = c.system_id \
+                 WHERE cs.url = 'http://terminology.hl7.org/CodeSystem/v2-0001' \
+                 AND c.code = 'F'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("code F not found");
+        assert_eq!(display, "Female");
+    }
+
+    #[test]
+    fn import_hl7_v2_tables_dry_run_writes_nothing() {
+        use helios_hts::import::hl7_v2_tables::import_hl7_v2_tables;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
+        tmp.write_all(HL7V2_XML.as_bytes()).unwrap();
+
+        import_hl7_v2_tables(&pool, tmp.path(), 500, true).unwrap();
+        assert_eq!(count_rows(&pool, "code_systems"), 0);
+        assert_eq!(count_rows(&pool, "concepts"), 0);
+    }
+
+    #[test]
+    fn import_hl7_v2_tables_idempotent() {
+        use helios_hts::import::hl7_v2_tables::import_hl7_v2_tables;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
+        tmp.write_all(HL7V2_XML.as_bytes()).unwrap();
+
+        import_hl7_v2_tables(&pool, tmp.path(), 500, false).unwrap();
+        import_hl7_v2_tables(&pool, tmp.path(), 500, false).unwrap();
+
+        assert_eq!(count_rows(&pool, "code_systems"), 1);
+        // virtual root (v2-0001) + 3 real codes = 4
+        assert_eq!(count_rows(&pool, "concepts"), 4);
+    }
+
+    #[test]
+    fn import_hl7_v2_tables_batch_size_zero_does_not_panic() {
+        use helios_hts::import::hl7_v2_tables::import_hl7_v2_tables;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
+        tmp.write_all(HL7V2_XML.as_bytes()).unwrap();
+
+        let stats = import_hl7_v2_tables(&pool, tmp.path(), 0, false).unwrap();
+        assert_eq!(stats.concepts, 3);
+    }
+
+    // ── NUCC end-to-end ───────────────────────────────────────────────────────
+
+    const NUCC_CSV: &str = "\
+Code,Grouping,Classification,Specialization,Definition,Notes,,,,,Display Name\n\
+101Y00000X,Behavioral Health & Social Service Providers,Counselor,,A provider who...,,,,,Counselor\n\
+101YA0400X,Behavioral Health & Social Service Providers,Counselor,Addiction (Substance Use Disorder),Addiction Counselor,,,,,Addiction Counselor\n\
+207R00000X,Allopathic & Osteopathic Physicians,Internal Medicine,,An internal medicine physician,,,,,Internist\n\
+";
+
+    #[test]
+    fn import_nucc_end_to_end() {
+        use helios_hts::import::nucc::import_nucc;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+        tmp.write_all(NUCC_CSV.as_bytes()).unwrap();
+
+        let stats = import_nucc(&pool, tmp.path(), 500, false).unwrap();
+
+        assert_eq!(stats.code_systems, 1);
+        assert_eq!(stats.concepts, 3);
+        assert!(stats.errors.is_empty());
+
+        let conn = pool.get().unwrap();
+        let display: String = conn
+            .query_row(
+                "SELECT c.display FROM concepts c \
+                 JOIN code_systems cs ON cs.id = c.system_id \
+                 WHERE cs.url = 'http://nucc.org/provider-taxonomy' \
+                 AND c.code = '207R00000X'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("207R00000X not found");
+        assert_eq!(display, "Internist");
+    }
+
+    #[test]
+    fn import_nucc_dry_run_writes_nothing() {
+        use helios_hts::import::nucc::import_nucc;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+        tmp.write_all(NUCC_CSV.as_bytes()).unwrap();
+
+        import_nucc(&pool, tmp.path(), 500, true).unwrap();
+        assert_eq!(count_rows(&pool, "code_systems"), 0);
+        assert_eq!(count_rows(&pool, "concepts"), 0);
+    }
+
+    #[test]
+    fn import_nucc_idempotent() {
+        use helios_hts::import::nucc::import_nucc;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+        tmp.write_all(NUCC_CSV.as_bytes()).unwrap();
+
+        import_nucc(&pool, tmp.path(), 500, false).unwrap();
+        import_nucc(&pool, tmp.path(), 500, false).unwrap();
+
+        assert_eq!(count_rows(&pool, "code_systems"), 1);
+        // 1 virtual root (NUCC) + 2 synthetic groupings + 2 synthetic classifications + 3 real codes = 8
+        assert_eq!(count_rows(&pool, "concepts"), 8);
+    }
+
+    #[test]
+    fn import_nucc_batch_size_zero_does_not_panic() {
+        use helios_hts::import::nucc::import_nucc;
+        use std::io::Write;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let pool = backend.pool().clone();
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+        tmp.write_all(NUCC_CSV.as_bytes()).unwrap();
+
+        let stats = import_nucc(&pool, tmp.path(), 0, false).unwrap();
+        assert_eq!(stats.concepts, 3);
     }
 
     // ── ICD-9-CM end-to-end ───────────────────────────────────────────────────

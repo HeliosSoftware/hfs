@@ -172,9 +172,8 @@ fn read_text(path: &Path) -> Result<String, HtsError> {
     if ext == "zip" {
         read_text_from_zip(path)
     } else {
-        std::fs::read_to_string(path).map_err(|e| {
-            HtsError::InvalidRequest(format!("Cannot read '{}': {e}", path.display()))
-        })
+        std::fs::read_to_string(path)
+            .map_err(|e| HtsError::InvalidRequest(format!("Cannot read '{}': {e}", path.display())))
     }
 }
 
@@ -188,9 +187,8 @@ fn read_text_from_zip(path: &Path) -> Result<String, HtsError> {
     let file = std::fs::File::open(path).map_err(|e| {
         HtsError::InvalidRequest(format!("Cannot open ZIP '{}': {e}", path.display()))
     })?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| {
-        HtsError::InvalidRequest(format!("Invalid ZIP '{}': {e}", path.display()))
-    })?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| HtsError::InvalidRequest(format!("Invalid ZIP '{}': {e}", path.display())))?;
 
     // Score each entry: 2 = long-desc match, 1 = short-desc match, 0 = other .txt
     let best_index = (0..archive.len())
@@ -223,14 +221,14 @@ fn read_text_from_zip(path: &Path) -> Result<String, HtsError> {
             ))
         })?;
 
-    let mut entry = archive.by_index(best_index).map_err(|e| {
-        HtsError::InvalidRequest(format!("Cannot read ZIP entry: {e}"))
-    })?;
+    let mut entry = archive
+        .by_index(best_index)
+        .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry: {e}")))?;
 
     let mut buf = String::new();
-    entry.read_to_string(&mut buf).map_err(|e| {
-        HtsError::InvalidRequest(format!("Cannot read text from ZIP: {e}"))
-    })?;
+    entry
+        .read_to_string(&mut buf)
+        .map_err(|e| HtsError::InvalidRequest(format!("Cannot read text from ZIP: {e}")))?;
 
     Ok(buf)
 }
@@ -337,7 +335,14 @@ fn upsert_code_system(conn: &rusqlite::Connection) -> Result<String, HtsError> {
         "INSERT OR IGNORE INTO code_systems \
          (id, url, version, name, title, status, content, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'complete', ?6, ?6)",
-        rusqlite::params![id, ICD9CM_URL, ICD9CM_VERSION, ICD9CM_NAME, ICD9CM_TITLE, now],
+        rusqlite::params![
+            id,
+            ICD9CM_URL,
+            ICD9CM_VERSION,
+            ICD9CM_NAME,
+            ICD9CM_TITLE,
+            now
+        ],
     )
     .map_err(|e| HtsError::Internal(format!("Upsert CodeSystem: {e}")))?;
 
@@ -392,9 +397,7 @@ fn insert_hierarchy_batch(
              VALUES (?1, ?2, ?3)",
             rusqlite::params![system_id, parent, c.code],
         )
-        .map_err(|e| {
-            HtsError::Internal(format!("Insert hierarchy {parent}->{}: {e}", c.code))
-        })?;
+        .map_err(|e| HtsError::Internal(format!("Insert hierarchy {parent}->{}: {e}", c.code)))?;
     }
 
     tx.commit()
@@ -558,11 +561,8 @@ V01|Contact with or exposure to communicable diseases\n\
             let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-                zip.start_file(
-                    "CMS32_DESC_LONG_DX.txt",
-                    zip::write::FileOptions::default(),
-                )
-                .unwrap();
+                zip.start_file("CMS32_DESC_LONG_DX.txt", zip::write::FileOptions::default())
+                    .unwrap();
                 zip.write_all(content.as_bytes()).unwrap();
                 zip.finish().unwrap();
             }
@@ -625,8 +625,12 @@ V01|Contact with or exposure to communicable diseases\n\
         #[test]
         fn missing_file_returns_error() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
-            let result =
-                import_icd9_cm(backend.pool(), Path::new("/nonexistent/icd9.txt"), 500, false);
+            let result = import_icd9_cm(
+                backend.pool(),
+                Path::new("/nonexistent/icd9.txt"),
+                500,
+                false,
+            );
             assert!(result.is_err());
         }
     }

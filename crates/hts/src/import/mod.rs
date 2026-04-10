@@ -22,13 +22,19 @@
 //! Bundle imports.
 
 pub mod bundle_parser;
+pub mod dicom;
 pub mod fhir_bundle;
+pub mod hl7_v2_tables;
 pub mod icd10_cm;
 pub mod icd9_cm;
 pub mod loinc_csv;
+pub mod mesh;
+pub mod nci_thesaurus;
+pub mod nucc;
 pub mod rxnorm_rrf;
 pub mod snomed_rf2;
 pub mod tgz;
+pub mod ucum;
 
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;

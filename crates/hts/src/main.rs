@@ -246,11 +246,21 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
         None => detect_format(&args.path).ok_or_else(|| {
             anyhow::anyhow!(
                 "Cannot auto-detect format from '{}'.\n\
-                 Use --format to specify one of: hl7-npm | snomed-rf2 | loinc | icd10-cm | rxnorm\n\
-                 Note: .zip files require --format because SNOMED and LOINC share the same extension.",
+                 Use --format to specify one of:\n\
+                 hl7-npm | snomed-rf2 | loinc | icd10-cm | icd9-cm | rxnorm |\n\
+                 ucum | nci-thesaurus | mesh | dicom | hl7-v2-tables | nucc\n\
+                 Note: .zip files may require --format if auto-detection is ambiguous.",
                 args.path.display()
             )
         })?,
+    };
+
+    // For dry-run, use an in-memory database so the pool opens even when the
+    // target DB file or its parent directory does not yet exist.
+    let database_url = if args.dry_run {
+        ":memory:".to_string()
+    } else {
+        args.database_url.clone()
     };
 
     if args.dry_run {
@@ -276,7 +286,7 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
 
     let stats = match format {
         ImportFormat::Hl7Npm => {
-            let backend = SqliteTerminologyBackend::new(&args.database_url)?;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
             let pool = backend.pool().clone();
             let path = args.path.clone();
             let batch_size = args.batch_size;
@@ -291,7 +301,7 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
             use helios_hts::import::snomed_rf2::import_snomed_rf2;
             // ⚠️  LICENSE REQUIRED — real SNOMED CT data requires a license
             // from SNOMED International / your national NRC before use.
-            let backend = SqliteTerminologyBackend::new(&args.database_url)?;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
             let pool = backend.pool().clone();
             let path = args.path.clone();
             let batch_size = args.batch_size;
@@ -308,7 +318,7 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
             use helios_hts::import::loinc_csv::import_loinc_csv;
             // ⚠️  LICENSE REQUIRED — real LOINC data requires a free license
             // from the Regenstrief Institute (registration at loinc.org, ~5 min).
-            let backend = SqliteTerminologyBackend::new(&args.database_url)?;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
             let pool = backend.pool().clone();
             let path = args.path.clone();
             let batch_size = args.batch_size;
@@ -321,7 +331,7 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
 
         ImportFormat::Icd10Cm => {
             use helios_hts::import::icd10_cm::import_icd10_cm;
-            let backend = SqliteTerminologyBackend::new(&args.database_url)?;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
             let pool = backend.pool().clone();
             let path = args.path.clone();
             let batch_size = args.batch_size;
@@ -334,7 +344,7 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
 
         ImportFormat::Icd9Cm => {
             use helios_hts::import::icd9_cm::import_icd9_cm;
-            let backend = SqliteTerminologyBackend::new(&args.database_url)?;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
             let pool = backend.pool().clone();
             let path = args.path.clone();
             let batch_size = args.batch_size;
@@ -349,7 +359,7 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
             use helios_hts::import::rxnorm_rrf::import_rxnorm_rrf;
             // ⚠️  LICENSE REQUIRED — real RxNorm data requires acceptance of
             // the NLM Terms of Service at https://www.nlm.nih.gov/databases/umls.html
-            let backend = SqliteTerminologyBackend::new(&args.database_url)?;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
             let pool = backend.pool().clone();
             let path = args.path.clone();
             let batch_size = args.batch_size;
@@ -360,6 +370,88 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
             })
             .await
             .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
+        }
+
+        ImportFormat::Ucum => {
+            use helios_hts::import::ucum::import_ucum;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
+            let pool = backend.pool().clone();
+            let path = args.path.clone();
+            let batch_size = args.batch_size;
+            let dry_run = args.dry_run;
+
+            tokio::task::spawn_blocking(move || import_ucum(&pool, &path, batch_size, dry_run))
+                .await
+                .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
+        }
+
+        ImportFormat::NciThesaurus => {
+            use helios_hts::import::nci_thesaurus::import_nci_thesaurus;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
+            let pool = backend.pool().clone();
+            let path = args.path.clone();
+            let batch_size = args.batch_size;
+            let dry_run = args.dry_run;
+
+            tokio::task::spawn_blocking(move || {
+                import_nci_thesaurus(&pool, &path, batch_size, dry_run)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
+        }
+
+        ImportFormat::Mesh => {
+            use helios_hts::import::mesh::import_mesh;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
+            let pool = backend.pool().clone();
+            let path = args.path.clone();
+            let batch_size = args.batch_size;
+            let dry_run = args.dry_run;
+
+            tokio::task::spawn_blocking(move || import_mesh(&pool, &path, batch_size, dry_run))
+                .await
+                .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
+        }
+
+        ImportFormat::Dicom => {
+            use helios_hts::import::dicom::import_dicom;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
+            let pool = backend.pool().clone();
+            let path = args.path.clone();
+            let batch_size = args.batch_size;
+            let dry_run = args.dry_run;
+
+            tokio::task::spawn_blocking(move || import_dicom(&pool, &path, batch_size, dry_run))
+                .await
+                .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
+        }
+
+        ImportFormat::Hl7V2Tables => {
+            use helios_hts::import::hl7_v2_tables::import_hl7_v2_tables;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
+            let pool = backend.pool().clone();
+            let path = args.path.clone();
+            let batch_size = args.batch_size;
+            let dry_run = args.dry_run;
+
+            tokio::task::spawn_blocking(move || {
+                import_hl7_v2_tables(&pool, &path, batch_size, dry_run)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
+        }
+
+        ImportFormat::Nucc => {
+            use helios_hts::import::nucc::import_nucc;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
+            let pool = backend.pool().clone();
+            let path = args.path.clone();
+            let batch_size = args.batch_size;
+            let dry_run = args.dry_run;
+
+            tokio::task::spawn_blocking(move || import_nucc(&pool, &path, batch_size, dry_run))
+                .await
+                .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
         }
     };
 

@@ -7,7 +7,7 @@ A FHIR Terminology Service built in Rust, implementing the [HL7 FHIR Terminology
 - All six standard FHIR terminology operations: `$lookup`, `$validate-code`, `$subsumes`, `$expand`, `$translate`, `$closure`
 - CRUD and search for CodeSystem, ValueSet, and ConceptMap resources
 - Batch endpoint supporting `$validate-code` and `$translate` in a single request
-- Bulk import CLI for major terminology distributions: SNOMED CT RF2, LOINC, ICD-10-CM, RxNorm, HL7 FHIR NPM packages
+- Bulk import CLI for major terminology distributions: SNOMED CT RF2, LOINC, ICD-10-CM, ICD-9-CM, RxNorm, UCUM, NCI Thesaurus, MeSH, DICOM, HL7 v2 tables, NUCC Provider Taxonomy, and HL7 FHIR NPM packages
 - Automatic format detection — no `--format` flag needed for most files
 - SQLite backend with auto-migration on startup (no manual schema setup)
 - `$expand` with lazy evaluation and materialized cache: expansions are computed once and cached across requests
@@ -293,6 +293,24 @@ hts import ./icd10cm_tabular_2025.xml
 # RxNorm RRF folder (requires free NLM terms-of-service)
 hts import ./RxNorm_full_current/rrf/
 
+# UCUM (free, from github.com/ucum-org/ucum/releases)
+hts import ./ucum-essence.xml
+
+# NCI Thesaurus (free, from evs.nci.nih.gov)
+hts import ./Thesaurus.txt --format nci-thesaurus
+
+# MeSH (free, from nlm.nih.gov)
+hts import ./mesh2025.xml
+
+# DICOM Part 16 code table (free, from dicomstandard.org — export as CSV)
+hts import ./dicom-codes.csv --format dicom
+
+# HL7 v2 tables XML (free with attribution)
+hts import ./hl7-v2-tables.xml --format hl7-v2-tables
+
+# NUCC Provider Taxonomy (free, from nucc.org)
+hts import ./nucc_taxonomy_240.csv
+
 # Dry run — parse without writing to database
 hts import ./package.tgz --dry-run --verbose
 ```
@@ -303,11 +321,19 @@ hts import ./package.tgz --dry-run --verbose
 |---------------------|-----------------|
 | `.tgz` / `.tar.gz` | `hl7-npm` |
 | `*tabular*.xml` | `icd10-cm` |
+| `*ucum*.xml` or `*essence*.xml` | `ucum` |
+| `*mesh*.xml` or `desc*.xml` | `mesh` |
+| `*thesaurus*.txt` | `nci-thesaurus` |
+| `*nucc*.csv` or `*taxonomy*.csv` | `nucc` |
 | `.rrf` or directory | `rxnorm` |
 | `.zip` containing RF2 files (`concept_full`, `description_full`) | `snomed-rf2` |
 | `.zip` containing `LoincTable.csv` | `loinc` |
 | `.zip` containing `RXNCONSO.RRF` | `rxnorm` |
 | `.zip` containing `*tabular*.xml` | `icd10-cm` |
+| `.zip` containing `*thesaurus*.txt` | `nci-thesaurus` |
+| `.zip` containing `*ucum*.xml` | `ucum` |
+| `.zip` containing `*dicom*.csv` or `*dcm*.csv` | `dicom` |
+| `.zip` containing `*nucc*.csv` | `nucc` |
 
 `.zip` files that match none of the above patterns require `--format`.
 
@@ -587,6 +613,23 @@ hts import ./RxNorm_full_current/rrf/       # or from extracted RRF directory
 This product uses publicly available data courtesy of the U.S. National Library of Medicine (NLM),
 National Institutes of Health, Department of Health and Human Services.
 ```
+
+---
+
+### Additional Terminologies
+
+The following terminologies are freely redistributable and supported by HTS standalone importers.
+
+| Terminology | FHIR URI | License | How to get it |
+|-------------|----------|---------|---------------|
+| **UCUM** | `http://unitsofmeasure.org` | Free, permissive | [github.com/ucum-org/ucum/releases](https://github.com/ucum-org/ucum/releases) — also bundled in the THO package |
+| **NCI Thesaurus (NCIt)** | `http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl` | Free, public domain | [evs.nci.nih.gov/ftp1/NCI_Thesaurus](https://evs.nci.nih.gov/ftp1/NCI_Thesaurus/) |
+| **MeSH** | `http://www.nlm.nih.gov/mesh` | Free, public domain | [nlm.nih.gov/databases/download/mesh.html](https://www.nlm.nih.gov/databases/download/mesh.html) |
+| **DICOM** | `http://dicom.nema.org/resources/ontology/DCM` | Free, publicly available | [dicomstandard.org/current](https://www.dicomstandard.org/current/) — export Part 16 code table as CSV |
+| **HL7 v2 tables** | `http://terminology.hl7.org/CodeSystem/v2-...` | HL7 FHIR License | [terminology.hl7.org](https://terminology.hl7.org) — also bundled in the THO package |
+| **NUCC** (Provider Taxonomy) | `http://nucc.org/provider-taxonomy` | Free | [nucc.org — CSV downloads](https://www.nucc.org/index.php/code-sets-mainmenu-41/provider-taxonomy-mainmenu-40/csv-mainmenu-57) |
+
+> **Note:** UCUM and HL7 v2 tables are already included in the HL7 THO NPM package. If you've already run `hts import <tgz>`, no separate import is needed for those two.
 
 ---
 
