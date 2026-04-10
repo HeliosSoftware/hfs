@@ -20,6 +20,7 @@ default-members = [
 	"crates/cds-hooks",
 	"crates/auth",
 	"crates/audit",
+	"crates/subscriptions",
 ]
 resolver = "2"
 
