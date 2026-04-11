@@ -26,6 +26,9 @@ s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types"]
 # Configuration advisor binary
 advisor = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber"]
 
+# Audit event integration
+audit = ["dep:helios-audit"]
+
 # FHIR version features (pass through to helios-fhir)
 R4 = ["helios-fhir/R4"]
 R4B = ["helios-fhir/R4B"]
@@ -80,6 +83,9 @@ elasticsearch = { version = "8.15.0-alpha.1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
+
+# Audit event integration
+helios-audit = { path = "../audit", version = "0.1.47", optional = true, default-features = false }
 
 # Configuration advisor HTTP server
 axum = { version = "0.8", optional = true }

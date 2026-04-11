@@ -47,6 +47,7 @@ use std::str::FromStr;
 
 use clap::Parser;
 use helios_fhir::FhirVersion;
+use helios_persistence::BackendKind;
 
 /// Storage backend mode.
 ///
@@ -75,6 +76,24 @@ pub enum StorageBackendMode {
     /// AWS S3 for CRUD/history + Elasticsearch for search.
     /// Requires AWS credentials and a running Elasticsearch instance.
     S3Elasticsearch,
+}
+
+impl StorageBackendMode {
+    /// Returns the primary storage backend kind for this mode.
+    pub fn primary_backend_kind(self) -> BackendKind {
+        match self {
+            StorageBackendMode::Sqlite | StorageBackendMode::SqliteElasticsearch => {
+                BackendKind::Sqlite
+            }
+            StorageBackendMode::Postgres | StorageBackendMode::PostgresElasticsearch => {
+                BackendKind::Postgres
+            }
+            StorageBackendMode::MongoDB | StorageBackendMode::MongoDBElasticsearch => {
+                BackendKind::MongoDB
+            }
+            StorageBackendMode::S3 | StorageBackendMode::S3Elasticsearch => BackendKind::S3,
+        }
+    }
 }
 
 impl fmt::Display for StorageBackendMode {
@@ -739,6 +758,42 @@ mod tests {
         assert_eq!(
             StorageBackendMode::S3Elasticsearch.to_string(),
             "s3-elasticsearch"
+        );
+    }
+
+    #[test]
+    fn test_storage_backend_mode_primary_backend_kind() {
+        assert_eq!(
+            StorageBackendMode::Sqlite.primary_backend_kind(),
+            BackendKind::Sqlite
+        );
+        assert_eq!(
+            StorageBackendMode::SqliteElasticsearch.primary_backend_kind(),
+            BackendKind::Sqlite
+        );
+        assert_eq!(
+            StorageBackendMode::Postgres.primary_backend_kind(),
+            BackendKind::Postgres
+        );
+        assert_eq!(
+            StorageBackendMode::PostgresElasticsearch.primary_backend_kind(),
+            BackendKind::Postgres
+        );
+        assert_eq!(
+            StorageBackendMode::MongoDB.primary_backend_kind(),
+            BackendKind::MongoDB
+        );
+        assert_eq!(
+            StorageBackendMode::MongoDBElasticsearch.primary_backend_kind(),
+            BackendKind::MongoDB
+        );
+        assert_eq!(
+            StorageBackendMode::S3.primary_backend_kind(),
+            BackendKind::S3
+        );
+        assert_eq!(
+            StorageBackendMode::S3Elasticsearch.primary_backend_kind(),
+            BackendKind::S3
         );
     }
 

@@ -1178,4 +1178,3 @@ jobs:
             $SSH_CMD "sudo journalctl -u $SERVER_NAME --lines=20"
             exit 1
           fi
-

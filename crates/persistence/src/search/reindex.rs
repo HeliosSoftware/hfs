@@ -20,6 +20,73 @@ use crate::types::StoredResource;
 use super::errors::ReindexError;
 use super::extractor::SearchParameterExtractor;
 
+/// Audit event helpers for reindex operations.
+#[cfg(feature = "audit")]
+pub mod audit {
+    use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
+
+    /// Record an audit event for a reindex lifecycle event.
+    ///
+    /// Call this at reindex start, completion, or cancellation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_reindex_event(
+        sink: &dyn AuditSink,
+        source_observer: &str,
+        agent: Option<&str>,
+        job_id: &str,
+        phase: &str,
+        resource_types: &[String],
+        resources_processed: u64,
+        outcome: &str,
+    ) {
+        let mut builder = AuditEventBuilder::new(source_observer)
+            .event_type(
+                "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                "object",
+            )
+            .action(AuditAction::Execute)
+            .outcome(outcome)
+            .detail("audit-operation", "reindex")
+            .detail("job-id", job_id)
+            .detail("phase", phase)
+            .detail("resources-processed", resources_processed.to_string());
+        if !resource_types.is_empty() {
+            builder = builder.detail("resource-types", resource_types.join(","));
+        }
+        if let Some(a) = agent {
+            builder = builder.agent(a, None, true);
+        }
+        sink.record(builder.build()).await;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use helios_audit::{AuditAction, AuditEventBuilder};
+
+        #[test]
+        fn test_reindex_event_includes_resources_processed() {
+            let event = AuditEventBuilder::new("Device/hfs")
+                .event_type(
+                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                    "object",
+                )
+                .action(AuditAction::Execute)
+                .outcome("0")
+                .detail("audit-operation", "reindex")
+                .detail("job-id", "reindex-1")
+                .detail("phase", "complete")
+                .detail("resources-processed", "500")
+                .build();
+            let details = event.entity.as_ref().unwrap()[0].detail.as_ref().unwrap();
+            assert_eq!(details.len(), 4);
+            assert_eq!(
+                details[3].r#type.value.as_deref(),
+                Some("resources-processed")
+            );
+        }
+    }
+}
+
 /// A page of resources for reindexing.
 #[derive(Debug)]
 pub struct ResourcePage {
@@ -412,15 +479,15 @@ impl<S: ReindexableStorage + 'static> ReindexOperation<S> {
         }
 
         // Clear existing indexes if requested
-        if request.clear_existing {
-            if let Err(e) = storage.clear_search_index(&tenant).await {
-                Self::mark_failed(
-                    &jobs,
-                    &job_id,
-                    format!("Failed to clear search index: {}", e),
-                );
-                return;
-            }
+        if request.clear_existing
+            && let Err(e) = storage.clear_search_index(&tenant).await
+        {
+            Self::mark_failed(
+                &jobs,
+                &job_id,
+                format!("Failed to clear search index: {}", e),
+            );
+            return;
         }
 
         // Process each resource type
@@ -629,15 +696,13 @@ impl<S: ReindexableStorage + 'static> ReindexOperation<S> {
         let mut channels = self.cancel_channels.write();
 
         jobs.retain(|job_id, progress| {
-            if progress.status.is_finished() {
-                if let Some(ref completed_at) = progress.completed_at {
-                    if let Ok(completed) = chrono::DateTime::parse_from_rfc3339(completed_at) {
-                        if completed.with_timezone(&chrono::Utc) < cutoff {
-                            channels.remove(job_id);
-                            return false;
-                        }
-                    }
-                }
+            if progress.status.is_finished()
+                && let Some(ref completed_at) = progress.completed_at
+                && let Ok(completed) = chrono::DateTime::parse_from_rfc3339(completed_at)
+                && completed.with_timezone(&chrono::Utc) < cutoff
+            {
+                channels.remove(job_id);
+                return false;
             }
             true
         });
