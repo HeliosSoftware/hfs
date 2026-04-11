@@ -338,7 +338,7 @@ async fn vs_validate_by_id_unknown_id_returns_404() {
 #[tokio::test]
 async fn expand_exceeds_limit_returns_422_too_costly() {
     use axum::{body::Body, http::Request};
-    use helios_hts::{backend::SqliteTerminologyBackend, config::HtsConfig, state::AppState};
+    use helios_hts::{backends::SqliteTerminologyBackend, config::HtsConfig, state::AppState};
     use tower::ServiceExt;
 
     // Build a minimal app with max_expansion_size = 1 (limbs VS has 3 codes).

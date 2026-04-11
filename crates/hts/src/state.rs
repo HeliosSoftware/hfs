@@ -53,7 +53,7 @@ pub struct AppState<B: TerminologyBackend> {
 
     /// Maximum number of codes allowed in a single `$expand` response.
     /// Requests that would exceed this limit receive `HtsError::TooCostly`.
-    /// Defaults to `10_000`; override with `HTS_MAX_EXPANSION_SIZE`.
+    /// Defaults to `3_500`; override with `HTS_MAX_EXPANSION_SIZE`.
     pub max_expansion_size: u32,
 }
 

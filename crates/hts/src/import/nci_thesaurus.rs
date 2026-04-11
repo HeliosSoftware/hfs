@@ -430,7 +430,7 @@ C000004\tGrandchild\tC000002|C000003\t\tA grandchild.\tGrandchild\tConcept\tEnti
     #[cfg(feature = "sqlite")]
     mod integration {
         use super::*;
-        use crate::backend::SqliteTerminologyBackend;
+        use crate::backends::SqliteTerminologyBackend;
         use std::io::Write;
 
         fn count(pool: &Pool<SqliteConnectionManager>, table: &str) -> i64 {

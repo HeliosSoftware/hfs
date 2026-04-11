@@ -286,7 +286,7 @@ mod tests {
     use axum::{Router, body::Body, http::Request, routing::get};
     use tower::ServiceExt;
 
-    use crate::backend::sqlite::SqliteTerminologyBackend;
+    use crate::backends::sqlite::SqliteTerminologyBackend;
 
     // Helper: build a fresh in-memory backend.
     fn backend() -> SqliteTerminologyBackend {

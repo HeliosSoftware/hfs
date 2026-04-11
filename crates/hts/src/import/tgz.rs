@@ -210,7 +210,7 @@ pub fn import_tgz(
 /// written to the database.
 #[cfg(feature = "postgres")]
 pub async fn import_tgz_pg(
-    backend: &crate::backend::postgres::PostgresTerminologyBackend,
+    backend: &crate::backends::postgres::PostgresTerminologyBackend,
     path: &Path,
     batch_size: usize,
     dry_run: bool,
@@ -381,7 +381,7 @@ fn make_bundle_bytes(resources: &[Value]) -> Vec<u8> {
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
-    use crate::backend::SqliteTerminologyBackend;
+    use crate::backends::SqliteTerminologyBackend;
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use serde_json::json;

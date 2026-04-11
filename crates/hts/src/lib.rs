@@ -23,7 +23,7 @@
 //!
 //! - [`state::AppState`] — shared application state injected into every handler.
 //! - [`traits::TerminologyBackend`] — supertrait implemented by all backends.
-//! - [`backend::SqliteTerminologyBackend`] — SQLite backend (default).
+//! - [`backends::SqliteTerminologyBackend`] — SQLite backend (default).
 //! - [`error::HtsError`] — unified error type with `IntoResponse`.
 //! - [`server::create_app`] — assembles the Axum router with all routes.
 //!
@@ -36,7 +36,7 @@
 //! [`AppState`]: state::AppState
 //! [`create_app`]: server::create_app
 
-pub mod backend;
+pub mod backends;
 pub mod config;
 pub mod error;
 pub mod import;

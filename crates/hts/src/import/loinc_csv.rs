@@ -460,7 +460,7 @@ fn insert_hierarchy_batch(
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
-    use crate::backend::SqliteTerminologyBackend;
+    use crate::backends::SqliteTerminologyBackend;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

@@ -23,7 +23,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run the FHIR Terminology HTTP server (default when no subcommand given)
-    Serve(HtsConfig),
+    Run(HtsConfig),
     /// Bulk-import a terminology package from the filesystem
     Import(ImportArgs),
 }
@@ -64,7 +64,7 @@ pub struct HtsConfig {
     /// Maximum number of codes allowed in a single ValueSet expansion.
     /// Requests that would exceed this limit receive HTTP 422 with issue
     /// code `too-costly`.
-    #[arg(long, env = "HTS_MAX_EXPANSION_SIZE", default_value = "10000")]
+    #[arg(long, env = "HTS_MAX_EXPANSION_SIZE", default_value = "3500")]
     pub max_expansion_size: u32,
 }
 

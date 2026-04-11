@@ -9,7 +9,7 @@
 
 #![cfg(feature = "postgres")]
 
-use helios_hts::backend::PostgresTerminologyBackend;
+use helios_hts::backends::PostgresTerminologyBackend;
 use helios_hts::error::HtsError;
 use helios_hts::import::BundleImportBackend;
 use helios_hts::traits::{

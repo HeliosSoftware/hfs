@@ -393,7 +393,7 @@ fn insert_hierarchy_batch(
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
-    use crate::backend::SqliteTerminologyBackend;
+    use crate::backends::SqliteTerminologyBackend;
 
     /// Minimal valid ICD-10-CM tabular XML with 2 chapters, 2 sections,
     /// and a mix of header and billable codes.
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn import_icd10_lookup_known_code() {
-        use crate::backend::SqliteTerminologyBackend;
+        use crate::backends::SqliteTerminologyBackend;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
         let pool = backend.pool().clone();

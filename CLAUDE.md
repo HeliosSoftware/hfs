@@ -373,6 +373,7 @@ FHIRPATH_SERVER_PORT=8080 FHIRPATH_SERVER_HOST=0.0.0.0 cargo run --bin fhirpath-
 | `SOF_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `SOF_ENABLE_CORS` | true | Enable CORS |
 | `SOF_CORS_ORIGINS` | * | Allowed origins |
+| `SOF_TERMINOLOGY_SERVER` | (none) | Terminology server URL for FHIRPath functions (memberOf, subsumes) |
 
 ### API Endpoints
 - `GET /metadata` - Returns CapabilityStatement

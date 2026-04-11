@@ -712,7 +712,7 @@ fn populate_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::sqlite::SqliteTerminologyBackend;
+    use crate::backends::sqlite::SqliteTerminologyBackend;
     use crate::import::BundleImportBackend;
     use crate::traits::ValueSetOperations;
     use helios_persistence::tenant::TenantContext;

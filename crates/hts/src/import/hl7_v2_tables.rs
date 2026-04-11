@@ -445,7 +445,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     mod integration {
         use super::*;
-        use crate::backend::SqliteTerminologyBackend;
+        use crate::backends::SqliteTerminologyBackend;
         use std::io::Write;
 
         fn count(pool: &Pool<SqliteConnectionManager>, table: &str) -> i64 {

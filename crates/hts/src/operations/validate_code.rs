@@ -368,7 +368,7 @@ mod tests {
     use axum::{Router, body::Body, http::Request, routing::post};
     use tower::ServiceExt;
 
-    use crate::backend::sqlite::SqliteTerminologyBackend;
+    use crate::backends::sqlite::SqliteTerminologyBackend;
     use crate::state::AppState;
 
     fn make_app() -> Router {

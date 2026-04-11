@@ -567,7 +567,7 @@ mod tests {
 
     use helios_persistence::backends::sqlite::SqliteBackend;
 
-    use crate::backend::sqlite::SqliteTerminologyBackend;
+    use crate::backends::sqlite::SqliteTerminologyBackend;
     use crate::state::AppState;
 
     use super::inner::*;

@@ -519,7 +519,7 @@ pub(super) fn build_synthetic_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::sqlite::SqliteTerminologyBackend;
+    use crate::backends::sqlite::SqliteTerminologyBackend;
     use crate::traits::CodeSystemOperations;
 
     fn backend() -> SqliteTerminologyBackend {

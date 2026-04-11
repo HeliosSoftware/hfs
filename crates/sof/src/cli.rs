@@ -24,6 +24,8 @@
 //!     --limit <LIMIT>            Limit the number of results (1-10000)
 //! -t, --threads <THREADS>        Number of threads to use for parallel processing
 //!     --fhir-version <VERSION>   FHIR version to use [default: R4]
+//!     --terminology-server <URL> Terminology server URL for FHIRPath functions
+//!                                [env: SOF_TERMINOLOGY_SERVER]
 //! -h, --help                     Print help
 //!
 //! * Additional FHIR versions (R4B, R5, R6) available when compiled with corresponding features
@@ -244,6 +246,10 @@ struct Args {
         help = "Continue processing when encountering invalid JSON lines in NDJSON files instead of returning an error"
     )]
     skip_invalid: bool,
+
+    /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
+    #[arg(long, env = "SOF_TERMINOLOGY_SERVER")]
+    terminology_server: Option<String>,
 }
 
 /// Normalize a source path to a URL.
@@ -322,6 +328,18 @@ fn normalize_source_path(source: &str) -> Result<String, Box<dyn std::error::Err
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // Propagate SOF_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
+    // FHIRPath evaluation (memberOf, subsumes, etc.) delegates terminology
+    // operations to the configured HTS instance.
+    if let Some(ref ts_url) = args.terminology_server {
+        if std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err() {
+            // SAFETY: called before any threads are spawned by the tokio runtime.
+            unsafe {
+                std::env::set_var("FHIRPATH_TERMINOLOGY_SERVER", ts_url);
+            }
+        }
+    }
 
     // Check that we have at least a view definition
     if args.view.is_none() {

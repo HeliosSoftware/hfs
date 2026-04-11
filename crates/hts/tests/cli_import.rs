@@ -9,7 +9,7 @@
 
 #[cfg(feature = "sqlite")]
 mod import_tests {
-    use helios_hts::backend::SqliteTerminologyBackend;
+    use helios_hts::backends::SqliteTerminologyBackend;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 

@@ -4,12 +4,12 @@ use helios_hts::import::ImportResult;
 use tracing::info;
 
 #[cfg(feature = "sqlite")]
-use helios_hts::backend::SqliteTerminologyBackend;
+use helios_hts::backends::SqliteTerminologyBackend;
 #[cfg(feature = "sqlite")]
 use helios_hts::state::AppState;
 
 #[cfg(feature = "postgres")]
-use helios_hts::backend::PostgresTerminologyBackend;
+use helios_hts::backends::PostgresTerminologyBackend;
 
 fn init_logging(log_level: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
@@ -24,9 +24,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli
         .command
-        .unwrap_or_else(|| Command::Serve(HtsConfig::parse_from(["hts"])))
+        .unwrap_or_else(|| Command::Run(HtsConfig::parse_from(["hts"])))
     {
-        Command::Serve(config) => {
+        Command::Run(config) => {
             init_logging(&config.log_level);
             info!(
                 port = config.port,

@@ -405,7 +405,7 @@ fn is_ancestor_of(
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::sqlite::SqliteTerminologyBackend;
+    use crate::backends::sqlite::SqliteTerminologyBackend;
     use crate::traits::ConceptMapOperations;
     use crate::types::{ClosureRequest, CodingConcept, TranslateRequest};
     use helios_persistence::tenant::TenantContext;

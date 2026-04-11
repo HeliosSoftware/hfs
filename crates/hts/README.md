@@ -1,6 +1,12 @@
-# Helios Terminology Service (HTS)
+# Helios Terminology Server (HTS)
 
-A FHIR Terminology Service built in Rust, implementing the [HL7 FHIR Terminology Service](http://hl7.org/fhir/terminology-service.html) specification. HTS runs as a standalone binary and can be wired into any HFS instance via a single environment variable.
+A FHIR Terminology Server built in Rust, implementing the [HL7 FHIR Terminology Service](http://hl7.org/fhir/terminology-service.html) specification. HTS runs as a standalone binary and can be wired into any of the other Helios Software binaries via a single environment variable:
+
+- [HFS](../hfs/README.md) — `HFS_TERMINOLOGY_SERVER` enables `:in`/`:not-in` search modifiers and FHIRPath `memberOf()`/`subsumes()` ([details](../hfs/README.md#configuration))
+- [FHIRPath CLI and Server](../fhirpath/README.md) — `FHIRPATH_TERMINOLOGY_SERVER` powers terminology-aware FHIRPath evaluation ([details](../fhirpath/README.md#terminology-service-integration))
+- [SOF CLI and Server](../sof/README.md) — `SOF_TERMINOLOGY_SERVER` enables FHIRPath terminology functions inside ViewDefinitions ([details](../sof/README.md#configuration))
+
+It can also be used standalone as a general-purpose FHIR terminology service, independent of any other Helios Software component.
 
 ## Features
 
@@ -9,7 +15,7 @@ A FHIR Terminology Service built in Rust, implementing the [HL7 FHIR Terminology
 - Batch endpoint supporting `$validate-code` and `$translate` in a single request
 - Bulk import CLI for major terminology distributions: SNOMED CT RF2, LOINC, ICD-10-CM, ICD-9-CM, RxNorm, UCUM, NCI Thesaurus, MeSH, DICOM, HL7 v2 tables, NUCC Provider Taxonomy, and HL7 FHIR NPM packages
 - Automatic format detection — no `--format` flag needed for most files
-- SQLite backend with auto-migration on startup (no manual schema setup)
+- SQLite and PostgreSQL backends with auto-migration on startup (no manual schema setup)
 - `$expand` with lazy evaluation and materialized cache: expansions are computed once and cached across requests
 - `$subsumes` via recursive CTE over a pre-materialized hierarchy table — no runtime graph traversal
 - `$closure` for transitive closure over concept hierarchy and ConceptMap mappings
@@ -18,9 +24,100 @@ A FHIR Terminology Service built in Rust, implementing the [HL7 FHIR Terminology
 - Content negotiation (JSON / XML)
 - CORS support
 
-## Installation
+## Quick Start
 
-### From Source
+### Using Release Binaries
+
+Pre-built binaries are available on the [GitHub Releases](https://github.com/HeliosSoftware/hfs/releases) page. Download the appropriate archive for your platform and extract it.
+
+> **Windows users:** Add `.exe` to the binary name (e.g., `hts.exe`).
+
+```bash
+# Import a terminology package
+./hts import ./hl7.terminology.r4-6.0.0.tgz
+
+# Start the server (R4, SQLite, port 8090)
+./hts run
+
+# Verify
+curl http://localhost:8090/health
+curl http://localhost:8090/metadata
+```
+
+### Using Docker Images
+
+Pre-built multi-arch Docker images (amd64/arm64) are available on GitHub Container Registry.
+
+```bash
+# Import a terminology package via Docker
+docker run \
+  -v hts-data:/data \
+  -v $(pwd)/terminology:/terminology \
+  ghcr.io/heliossoftware/hts:latest \
+  import /terminology/hl7.terminology.r4-6.0.0.tgz
+
+# With persistent SQLite storage
+docker run -p 8090:8090 \
+  -v hts-data:/data \
+  -e HTS_DATABASE_URL=/data/hts.db \
+  ghcr.io/heliossoftware/hts:latest
+```
+
+See [Environment Variables](#environment-variables) for all available configuration options.
+
+### Building From Source
+
+#### Prerequisites
+
+1. **Install [Rust](https://www.rust-lang.org/tools/install)**
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+
+2. **Install [LLD](https://lld.llvm.org/)**
+
+    Linux (Ubuntu/Debian):
+    ```bash
+    sudo apt install clang lld
+    ```
+
+    Windows:
+
+      Download a pre-build binary from [llvm-project's GitHub page](https://github.com/llvm/llvm-project/releases).
+
+    macOS:
+
+      LLD is not required for macOS.
+
+3. **Configure config.toml**
+
+    Create or modify `~/.cargo/config.toml`:
+    ```toml
+    [target.x86_64-unknown-linux-gnu]
+    linker = "clang"
+    rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]
+
+    [target.aarch64-apple-darwin]
+    linker = "clang"
+    rustflags = [
+      "-C", "link-arg=-Wl,-dead_strip",
+      "-C", "link-arg=-undefined",
+      "-C", "link-arg=dynamic_lookup"
+    ]
+
+    [target.x86_64-pc-windows-msvc]
+    linker = "lld-link.exe"
+    rustflags = ["-C", "link-arg=/STACK:8388608"]
+    ```
+
+4. **Memory-constrained builds** (optional):
+
+    If you run out of memory during compilation, limit parallel jobs:
+    ```bash
+    export CARGO_BUILD_JOBS=4
+    ```
+
+#### Build and Install
 
 ```bash
 # Clone the repository
@@ -32,49 +129,41 @@ cargo build --release -p helios-hts
 
 # Build with all FHIR versions
 cargo build --release -p helios-hts --features R4,R4B,R5,R6,sqlite
+
+# Import terminologies of interest
+./target/release/hts import ...
+
+# Run from build output
+./target/release/hts
 ```
 
 ## Usage
 
-### Running the Server
+### `hts run`
+
+Start the FHIR Terminology HTTP server. This is the default command when no subcommand is given.
 
 ```bash
 # Run with default settings (R4, SQLite, port 8090)
-./target/release/hts
+hts run
 
-# Explicit serve subcommand (equivalent to above)
-./target/release/hts serve
+# Equivalent — run is the default
+hts
 
 # Specify a different port
-./target/release/hts serve --port 9090
+hts run --port 9090
 
 # Custom database path
-./target/release/hts serve --database-url ./my-terminology.db
+hts run --database-url ./my-terminology.db
 
 # Enable debug logging
-./target/release/hts serve --log-level debug
+hts run --log-level debug
 ```
 
 On first start HTS creates the SQLite file (or `./data/hts.db` by default) and applies the schema automatically. No migrations or init scripts are required.
 
-### Command Line Options
-
 ```
-Usage: hts [COMMAND]
-
-Commands:
-  serve   Run the FHIR Terminology HTTP server (default when no subcommand given)
-  import  Bulk-import a terminology package from the filesystem
-
-Options:
-  -h, --help     Print help
-  -V, --version  Print version
-```
-
-#### `hts serve`
-
-```
-Usage: hts serve [OPTIONS]
+Usage: hts run [OPTIONS]
 
 Options:
       --port <PORT>                Server port [env: HTS_SERVER_PORT=] [default: 8090]
@@ -86,11 +175,54 @@ Options:
       --enable-cors                Enable CORS [env: HTS_ENABLE_CORS=] [default: true]
       --cors-origins <ORIGINS>     Allowed CORS origins [env: HTS_CORS_ORIGINS=] [default: *]
       --max-expansion-size <N>     Max codes in a ValueSet expansion [env: HTS_MAX_EXPANSION_SIZE=]
-                                   [default: 10000]
+                                   [default: 3500]
   -h, --help                       Print help
 ```
 
-#### `hts import`
+### `hts import`
+
+Bulk-import a terminology package from the filesystem into the HTS database.
+
+```bash
+# HL7 FHIR NPM package (.tgz from https://terminology.hl7.org/en/downloads.html)
+hts import ./hl7.terminology.r4-6.0.0.tgz
+
+# SNOMED CT RF2 ZIP (requires NRC license)
+hts import ./SnomedCT_InternationalRF2_*.zip --format snomed-rf2
+
+# LOINC CSV ZIP (requires free registration at loinc.org)
+hts import ./Loinc_*.zip --format loinc
+
+# ICD-10-CM tabular XML (free, from cms.gov)
+hts import ./icd10cm_tabular_2025.xml
+
+# ICD-9-CM pipe-delimited text (free, from cms.gov)
+hts import ./CMS32_DESC_LONG_DX.txt --format icd9-cm
+
+# RxNorm RRF folder (requires free NLM terms-of-service)
+hts import ./RxNorm_full_current/rrf/
+
+# UCUM (free, from github.com/ucum-org/ucum/releases)
+hts import ./ucum-essence.xml
+
+# NCI Thesaurus (free, from evs.nci.nih.gov)
+hts import ./Thesaurus.txt --format nci-thesaurus
+
+# MeSH (free, from nlm.nih.gov)
+hts import ./mesh2025.xml
+
+# DICOM Part 16 code table (free, from dicomstandard.org — export as CSV)
+hts import ./dicom-codes.csv --format dicom
+
+# HL7 v2 tables XML (free with attribution)
+hts import ./hl7-v2-tables.xml --format hl7-v2-tables
+
+# NUCC Provider Taxonomy (free, from nucc.org)
+hts import ./nucc_taxonomy_240.csv
+
+# Dry run — parse without writing to database
+hts import ./package.tgz --dry-run --verbose
+```
 
 ```
 Usage: hts import [OPTIONS] <PATH>
@@ -99,15 +231,48 @@ Arguments:
   <PATH>  Path to the terminology package file or directory
 
 Options:
-      --format <FORMAT>          Terminology format (auto-detected when omitted)
-                                 [possible values: hl7-npm, snomed-rf2, loinc, icd10-cm, rxnorm]
-      --database-url <URL>       SQLite database file [env: HTS_DATABASE_URL=] [default: ./data/hts.db]
-      --log-level <LOG_LEVEL>    Log level [env: HTS_LOG_LEVEL=] [default: info]
-      --batch-size <N>           Resources per import batch [default: 500]
-      --dry-run                  Parse only — no database writes
-      --verbose                  Emit per-batch progress to stderr
-  -h, --help                     Print help
+      --format <FORMAT>            Terminology format (auto-detected when omitted)
+                                   [possible values: hl7-npm, snomed-rf2, loinc, icd10-cm,
+                                    icd9-cm, rxnorm, ucum, nci-thesaurus, mesh, dicom,
+                                    hl7-v2-tables, nucc]
+      --database-url <URL>         Database URL [env: HTS_DATABASE_URL=] [default: ./data/hts.db]
+      --storage-backend <BACKEND>  Storage backend [env: HTS_STORAGE_BACKEND=] [default: sqlite]
+      --log-level <LOG_LEVEL>      Log level [env: HTS_LOG_LEVEL=] [default: info]
+      --batch-size <N>             Resources per import batch [default: 500]
+      --dry-run                    Parse only — no database writes
+      --verbose                    Emit per-batch progress to stderr
+  -h, --help                       Print help
 ```
+
+#### Format Auto-Detection
+
+| Extension / pattern | Detected format |
+|---------------------|-----------------|
+| `.tgz` / `.tar.gz` | `hl7-npm` |
+| `*tabular*.xml` | `icd10-cm` |
+| `*ucum*.xml` or `*essence*.xml` | `ucum` |
+| `*mesh*.xml` or `desc*.xml` | `mesh` |
+| `*thesaurus*.txt` | `nci-thesaurus` |
+| `*nucc*.csv` or `*taxonomy*.csv` | `nucc` |
+| `.rrf` or directory | `rxnorm` |
+| `.zip` containing RF2 files (`concept_full`, `description_full`) | `snomed-rf2` |
+| `.zip` containing `LoincTable.csv` | `loinc` |
+| `.zip` containing `RXNCONSO.RRF` | `rxnorm` |
+| `.zip` containing `*tabular*.xml` | `icd10-cm` |
+| `.zip` containing `*thesaurus*.txt` | `nci-thesaurus` |
+| `.zip` containing `*ucum*.xml` | `ucum` |
+| `.zip` containing `*dicom*.csv` or `*dcm*.csv` | `dicom` |
+| `.zip` containing `*nucc*.csv` | `nucc` |
+
+`.zip` files that match none of the above patterns require `--format`.
+
+#### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success — all resources imported |
+| `1` | Fatal error — import aborted |
+| `2` | Success with non-fatal errors — some records skipped |
 
 ## Configuration
 
@@ -119,16 +284,26 @@ Options:
 | `HTS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `HTS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
 | `HTS_DATABASE_URL` | ./data/hts.db | SQLite database file path |
-| `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite`; `postgres` planned) |
+| `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite` or `postgres`) |
 | `HTS_ENABLE_CORS` | true | Enable CORS |
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
-| `HTS_MAX_EXPANSION_SIZE` | 10000 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. |
+| `HTS_MAX_EXPANSION_SIZE` | 3500 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. |
 
-## Storage
+## Storage Backends
 
 ### SQLite (Default)
 
 HTS uses SQLite with a 9-table normalized schema. The schema is applied automatically at startup using `CREATE TABLE IF NOT EXISTS`, so no separate migration step is needed.
+
+```bash
+# Default: file-based
+hts run --database-url ./data/hts.db
+
+# In-memory (useful for testing; data is lost on shutdown)
+hts run --database-url :memory:
+```
+
+#### Schema
 
 ```
 code_systems          — canonical CodeSystem metadata
@@ -142,17 +317,13 @@ concept_maps          — ConceptMap metadata
 concept_map_mappings  — source→target code mappings with equivalence
 ```
 
-```bash
-# Default: file-based
-./target/release/hts serve --database-url ./data/hts.db
-
-# In-memory (useful for testing; data is lost on shutdown)
-./target/release/hts serve --database-url :memory:
-```
-
 The `value_set_expansions` table acts as a write-through cache: the first `$expand` call for a given ValueSet computes and stores the expansion; subsequent calls read from the cache directly. The cache is invalidated automatically when a CodeSystem or ValueSet is updated via PUT or DELETE.
 
-When HTS runs alongside an HFS instance sharing the same SQLite file, the two sets of tables coexist in the same file. The HFS `resources` / `resource_history` tables and the HTS normalized tables do not overlap.
+### PostgreSQL
+
+```bash
+hts run --storage-backend postgres --database-url "postgresql://user:pass@localhost/hts"
+```
 
 ## API Endpoints
 
@@ -275,76 +446,6 @@ curl -X POST http://localhost:8090/ \
 
 ## Examples
 
-### Import a Terminology Package
-
-```bash
-# HL7 FHIR NPM package (.tgz from https://terminology.hl7.org/en/downloads.html)
-hts import ./hl7.terminology.r4-6.0.0.tgz
-
-# SNOMED CT RF2 ZIP (requires NRC license)
-hts import ./SnomedCT_InternationalRF2_*.zip --format snomed-rf2
-
-# LOINC CSV ZIP (requires free registration at loinc.org)
-hts import ./Loinc_*.zip --format loinc
-
-# ICD-10-CM tabular XML (free, from cms.gov)
-hts import ./icd10cm_tabular_2025.xml
-
-# RxNorm RRF folder (requires free NLM terms-of-service)
-hts import ./RxNorm_full_current/rrf/
-
-# UCUM (free, from github.com/ucum-org/ucum/releases)
-hts import ./ucum-essence.xml
-
-# NCI Thesaurus (free, from evs.nci.nih.gov)
-hts import ./Thesaurus.txt --format nci-thesaurus
-
-# MeSH (free, from nlm.nih.gov)
-hts import ./mesh2025.xml
-
-# DICOM Part 16 code table (free, from dicomstandard.org — export as CSV)
-hts import ./dicom-codes.csv --format dicom
-
-# HL7 v2 tables XML (free with attribution)
-hts import ./hl7-v2-tables.xml --format hl7-v2-tables
-
-# NUCC Provider Taxonomy (free, from nucc.org)
-hts import ./nucc_taxonomy_240.csv
-
-# Dry run — parse without writing to database
-hts import ./package.tgz --dry-run --verbose
-```
-
-#### Format Auto-Detection
-
-| Extension / pattern | Detected format |
-|---------------------|-----------------|
-| `.tgz` / `.tar.gz` | `hl7-npm` |
-| `*tabular*.xml` | `icd10-cm` |
-| `*ucum*.xml` or `*essence*.xml` | `ucum` |
-| `*mesh*.xml` or `desc*.xml` | `mesh` |
-| `*thesaurus*.txt` | `nci-thesaurus` |
-| `*nucc*.csv` or `*taxonomy*.csv` | `nucc` |
-| `.rrf` or directory | `rxnorm` |
-| `.zip` containing RF2 files (`concept_full`, `description_full`) | `snomed-rf2` |
-| `.zip` containing `LoincTable.csv` | `loinc` |
-| `.zip` containing `RXNCONSO.RRF` | `rxnorm` |
-| `.zip` containing `*tabular*.xml` | `icd10-cm` |
-| `.zip` containing `*thesaurus*.txt` | `nci-thesaurus` |
-| `.zip` containing `*ucum*.xml` | `ucum` |
-| `.zip` containing `*dicom*.csv` or `*dcm*.csv` | `dicom` |
-| `.zip` containing `*nucc*.csv` | `nucc` |
-
-`.zip` files that match none of the above patterns require `--format`.
-
-#### Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| `0` | Success — all resources imported |
-| `1` | Fatal error — import aborted |
-| `2` | Success with non-fatal errors — some records skipped |
-
 ### Import a FHIR Bundle via HTTP
 
 ```bash
@@ -461,12 +562,6 @@ curl -X POST http://localhost:8090/CodeSystem \
 ```
 
 PUT automatically re-indexes the new concept set into the normalized tables. DELETE cascades to all concept, hierarchy, property, and designation rows via SQL `ON DELETE CASCADE`.
-
-### Get CapabilityStatement
-
-```bash
-curl http://localhost:8090/metadata
-```
 
 ## HFS Integration
 
@@ -639,28 +734,11 @@ The following terminologies are freely redistributable and supported by HTS stan
 |-------------|--------|
 | **CPT** | Proprietary — requires a paid AMA license. Contact [ama-assn.org](https://www.ama-assn.org/practice-management/cpt/cpt-licensing-frequently-asked-questions-faqs) for licensing. Open an issue if you need the importer. |
 | **HCPCS Level II** | Public domain (US gov). Importer not yet implemented — open an issue. |
-| **ICD-9-CM** | ✅ Supported — see [ICD-9-CM](#icd-9-cm) section above. |
 | **ICD-11** | Free ([CC BY-ND 3.0 IGO](https://creativecommons.org/licenses/by-nd/3.0/igo/)). Importer not yet implemented — WHO adoption is still early. |
 | **MedDRA** | Proprietary — requires a paid MSSO license. Contact [meddra.org](https://www.meddra.org). |
 | **NDC** | Public domain (FDA). Importer not yet implemented. |
 
 > UCUM, NCI Thesaurus, MeSH, DICOM, HL7 v2 tables, and NUCC provider taxonomy are all freely redistributable. Most arrive via the HL7 THO package — no separate import required. Open an issue for any that you need as a standalone importer.
-
-
-## Docker
-
-Using the generic workspace Dockerfile:
-
-```bash
-# Build HTS image
-docker build --build-arg BINARY_NAME=hts -t hts .
-
-# Run with a mounted data directory
-docker run -p 8090:8090 \
-  -v $(pwd)/data:/app/data \
-  -e HTS_SERVER_HOST=0.0.0.0 \
-  hts
-```
 
 ## FHIR Version Support
 

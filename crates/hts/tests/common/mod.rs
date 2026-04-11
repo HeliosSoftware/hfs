@@ -4,7 +4,7 @@
 pub mod bundles;
 
 #[cfg(feature = "sqlite")]
-use helios_hts::{backend::SqliteTerminologyBackend, config::HtsConfig, state::AppState};
+use helios_hts::{backends::SqliteTerminologyBackend, config::HtsConfig, state::AppState};
 
 #[cfg(feature = "postgres")]
 use helios_hts::{config::HtsConfig as PgHtsConfig, state::AppState as PgAppState};
@@ -238,7 +238,7 @@ pub struct TestAppPg {
 impl TestAppPg {
     /// Create a new `TestAppPg` wired to the shared PostgreSQL container.
     pub async fn new() -> Self {
-        use helios_hts::backend::PostgresTerminologyBackend;
+        use helios_hts::backends::PostgresTerminologyBackend;
         use helios_persistence::backends::postgres::PostgresBackend;
         use std::sync::Arc;
 

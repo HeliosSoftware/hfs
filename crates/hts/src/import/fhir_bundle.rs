@@ -387,7 +387,7 @@ fn utc_now() -> String {
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
-    use crate::backend::sqlite::SqliteTerminologyBackend;
+    use crate::backends::sqlite::SqliteTerminologyBackend;
     use crate::import::BundleImportBackend;
     use crate::traits::CodeSystemOperations;
     use crate::types::LookupRequest;

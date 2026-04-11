@@ -84,7 +84,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
-    use crate::backend::sqlite::SqliteTerminologyBackend;
+    use crate::backends::sqlite::SqliteTerminologyBackend;
     use crate::config::HtsConfig;
     use crate::server::create_app;
     use crate::state::AppState;
