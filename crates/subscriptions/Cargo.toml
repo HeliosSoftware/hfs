@@ -1,0 +1,53 @@
+[package]
+name = "helios-subscriptions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "FHIR topic-based Subscriptions engine for HFS"
+
+[features]
+default = ["R4"]
+R4 = ["helios-fhir/R4"]
+R4B = ["helios-fhir/R4B"]
+R5 = ["helios-fhir/R5"]
+R6 = ["helios-fhir/R6"]
+
+[dependencies]
+# FHIR models
+helios-fhir = { path = "../fhir" }
+
+# Persistence (for TenantContext, StoredResource, etc.)
+helios-persistence = { path = "../persistence", default-features = false }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+async-trait = "0.1"
+
+# Time
+chrono.workspace = true
+
+# Logging
+tracing = "0.1"
+
+# Error handling
+thiserror = "2"
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# HTTP client (rest-hook channel)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Concurrent data structures
+dashmap = "6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"
