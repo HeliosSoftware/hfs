@@ -6,7 +6,7 @@ R4 and R4B use the [Subscriptions R5 Backport IG](https://build.fhir.org/ig/HL7/
 
 ## Overview
 
-This crate implements topic-based subscriptions as an asynchronous pipeline that fires after every resource write. It decomposes into five concerns:
+This crate implements topic-based subscriptions as an asynchronous pipeline that fires after every resource create, update, or delete. These are the three interaction types defined by the FHIR [`SubscriptionTopic.resourceTrigger.supportedInteraction`](https://hl7.org/fhir/subscriptiontopic.html) value set. It decomposes into five concerns:
 
 1. **Topic Registry** — stores `SubscriptionTopic` definitions and evaluates resource triggers
 2. **Subscription Manager** — tracks active `Subscription` resources and their runtime state
@@ -14,7 +14,7 @@ This crate implements topic-based subscriptions as an asynchronous pipeline that
 4. **Notification Builder** — constructs version-specific notification bundles (R4 Parameters-based backport, R5/R6 native `SubscriptionStatus`)
 5. **Channel Dispatcher** — delivers notifications via pluggable channel implementations
 
-The [`SubscriptionEngine`] orchestrates all five concerns and is the main entry point, invoked via `tokio::spawn` after each resource write — mirroring the fire-and-forget pattern used by the audit middleware.
+The `SubscriptionEngine` orchestrates all five concerns and is the main entry point, invoked via `tokio::spawn` after each resource create, update, patch, or delete — mirroring the fire-and-forget pattern used by the audit middleware.
 
 ## Features
 
@@ -246,10 +246,103 @@ FHIR version support via Cargo feature flags:
 helios-subscriptions = { version = "0.1", features = ["R4"] }
 ```
 
+## Design Considerations
+
+### Performance: `tokio::spawn` per event
+
+The current design spawns one Tokio task per resource write. Each task runs the full evaluate → build → dispatch pipeline.
+
+**Where this works well:**
+
+- Task creation is cheap — a dozen allocations, no syscall. Thousands per second is not a problem for Tokio's scheduler.
+- In-memory evaluation is fast — topic matching and filter checks on `DashMap` are microseconds.
+- Low-volume servers handling tens of writes per second are well-served by this model.
+
+**Where it breaks down:**
+
+- **Unbounded concurrency on HTTP dispatch.** If an endpoint is slow or down, tasks accumulate — each holding memory for the request, the notification bundle, and sleeping during retry backoff. A burst of 1,000 writes to a subscription with a failing endpoint spawns 1,000 tasks, each retrying up to 10 times.
+- **No ordering guarantees.** Tokio tasks are scheduled cooperatively — event 2 can be dispatched before event 1. The engine assigns monotonic `eventNumber`s, but HTTP POSTs can arrive out of order at the receiver.
+- **Retry holds tasks alive.** A single dispatch with max retries and a 60s backoff cap can keep a task alive for ~2 minutes (1+2+4+8+16+32+60+60+60+60s), holding its full context in memory the entire time.
+- **No event coalescing.** If a resource is updated 5 times in rapid succession, 5 separate tasks run the full pipeline. No deduplication or batching.
+- **Fan-out is sequential.** If 50 subscriptions match an event, `dispatch_with_retry` runs sequentially for each within a single task. One slow endpoint blocks all subsequent dispatches in that task.
+
+### Alternative dispatch approaches (future phases)
+
+| Approach | Description | Trade-off |
+|----------|-------------|-----------|
+| **Semaphore on spawn** | Add a `tokio::sync::Semaphore` to cap concurrent outbound HTTP calls (e.g., 32). Minimal change. | Prevents unbounded fan-out but doesn't solve ordering or retry memory. |
+| **Bounded channel + worker pool** | Replace `tokio::spawn` with `tokio::sync::mpsc`. N worker tasks pull events from the channel. Backpressure is built in. | Standard production pattern. Solves backpressure and enables graceful shutdown. Recommended next step. |
+| **Per-subscription queues** | One queue per `(tenant, subscription_id)`. Events to the same subscription are strictly ordered; a slow endpoint only blocks its own queue. | "Actor per subscription" model. Good for ordering guarantees, heavier to implement. |
+| **Deferred retry queue** | Failed deliveries go to a separate retry queue with a scheduled wake-up, freeing the worker immediately. | Pairs well with the channel + worker pool approach. Eliminates long-lived sleeping tasks. |
+
+### Clustering
+
+The current architecture is **single-instance only**. The `InMemoryTopicRegistry` and `SubscriptionManager` are process-local `DashMap`s with no shared state between instances.
+
+In a clustered deployment behind a load balancer:
+
+```
+                    Load Balancer
+                   /             \
+              Instance A         Instance B
+              ┌──────────┐      ┌──────────┐
+              │ Topics: 1│      │ Topics: 0│
+              │ Subs:   3│      │ Subs:   0│
+              └──────────┘      └──────────┘
+
+POST /SubscriptionTopic → routed to A → only A has the topic
+POST /Subscription      → routed to A → only A tracks it
+POST /Encounter         → routed to B → B has no topics → no notification fires
+```
+
+Additional problems in a multi-instance deployment:
+
+- **Duplicate notifications.** If events are somehow visible to multiple instances, each fires independently — the subscriber receives the same notification N times.
+- **Split event counters.** `eventNumber` and `events_since_subscription_start` are per-instance counters. Instance A says event #5, Instance B says event #3 — the subscriber sees non-monotonic, duplicated sequence numbers.
+- **Split failure tracking.** Instance A records 2 consecutive failures, Instance B records 1. Neither reaches the `error_threshold` of 3, so the subscription never transitions to `error` even though the endpoint has failed 3 times total.
+- **Handshake races.** Two instances could both try to activate the same subscription simultaneously, sending duplicate handshake notifications.
+
+**Common production approaches:**
+
+| Approach | Description |
+|----------|-------------|
+| **Leader election** | One instance is elected (via distributed lock / lease) as the subscription processor. Others publish events to a shared queue (Postgres NOTIFY/LISTEN, Redis streams, Kafka). Simple, avoids duplication, but the leader is a bottleneck / SPOF. |
+| **Subscription partitioning** | Subscriptions are hash-partitioned across instances (`subscription_id % N`). Each instance only dispatches for its assigned subscriptions. Rebalances on scale-up/down. |
+| **Shared DB state / outbox pattern** | Topics, subscriptions, event counters, and failure counts live in the database. Events are written as outbox rows in the same transaction as the resource write. A single consumer dispatches from the outbox. |
+| **DB change streams** | The engine subscribes to the database's change feed (Postgres logical replication, MongoDB change streams) rather than hooking into REST handlers. Any write — including batch/transaction — triggers evaluation. |
+
+### Kafka-Based Event Bus (Future Phase)
+
+A Kafka-backed architecture addresses most of the single-instance and performance limitations simultaneously. In this model, REST handlers publish a lightweight `ResourceEvent` to a Kafka topic instead of spawning a local task, and a separate consumer group evaluates and dispatches notifications:
+
+```
+  HFS Instance A ──┐                          ┌── Subscription Worker 1
+  HFS Instance B ──┼── Kafka topic ──────────►├── Subscription Worker 2
+  HFS Instance C ──┘   (resource-events)       └── Subscription Worker 3
+                        partitioned by               (consumer group)
+                        resource type + id
+```
+
+**Why Kafka is a good fit for FHIR Subscriptions:**
+
+- **Decouples write path from notification path.** Handlers publish an event and return immediately — no HTTP dispatch, no retry loops, no spawned tasks. Write latency is unaffected regardless of how many subscriptions exist or how slow their endpoints are.
+- **Ordering guarantees.** Kafka partitions preserve strict ordering within a partition. Partitioning by `(resource_type, resource_id)` ensures that all events for a given resource are processed in order, so subscribers see monotonically increasing `eventNumber`s.
+- **Scalable consumer group.** Multiple subscription workers share the load via Kafka's consumer group protocol. Adding workers increases throughput without code changes. Kafka handles rebalancing automatically on scale-up/down.
+- **Durable retry without sleeping tasks.** Failed deliveries can be published to a retry topic (or dead-letter topic) with a delay, rather than holding a task alive with `tokio::time::sleep`. The worker is freed immediately to process the next event.
+- **Cluster-safe by design.** All HFS instances publish to the same topic. The consumer group ensures each event is processed exactly once — no duplicate notifications, no split counters, no handshake races.
+- **Batch/transaction gap closes naturally.** Any code path that writes a resource (including batch and transaction handlers) just needs to publish an event to Kafka. The subscription evaluation happens downstream, so there is no need to wire `emit_subscription_event` into every handler individually.
+- **Replay and debugging.** Kafka retains events for a configurable period. Operators can replay events to re-evaluate subscriptions after a bug fix, or inspect the event stream to diagnose why a notification was or wasn't sent.
+- **Backpressure is built in.** If workers fall behind, Kafka buffers events durably on disk. Consumer lag is observable via standard Kafka metrics, giving operators clear visibility into subscription processing health.
+
+**Trade-offs:** Kafka adds operational complexity (broker cluster, ZooKeeper/KRaft, topic configuration, monitoring). For single-node or small deployments the in-memory engine remains simpler and sufficient. Kafka is most justified when HFS is deployed as a clustered service handling high write volumes or when notification reliability is critical.
+
+**AWS alternative:** [Amazon MSK](https://aws.amazon.com/msk/) (Managed Streaming for Apache Kafka) provides a fully managed Kafka-compatible service, eliminating broker and ZooKeeper/KRaft operational overhead. For deployments that don't need Kafka's full feature set, [Amazon SQS](https://aws.amazon.com/sqs/) with FIFO queues offers a simpler alternative — FIFO queues provide exactly-once processing and strict ordering within a message group (analogous to a Kafka partition), which maps well to partitioning by `(resource_type, resource_id)`. SQS FIFO requires no cluster management and scales automatically, making it a pragmatic choice for AWS-native deployments where Kafka's replay and retention capabilities are not required.
+
 ## Current Limitations
 
 - FHIRPath filter criteria are not evaluated — Phase 1 uses direct JSON field matching only
 - Heartbeat delivery is not yet implemented — the `heartbeat_period` field is stored but no background task fires heartbeats
 - Batch and transaction bundle entries do not emit subscription events — only direct CRUD handlers (create, update, delete, patch) do
-- The engine is in-memory only; subscriptions and topics are not reloaded from storage on restart
+- [`eventTrigger`](https://hl7.org/fhir/subscriptiontopic.html) is not supported — only `resourceTrigger` (create, update, delete) is implemented
+- The engine is in-memory only and single-instance — subscriptions and topics are not shared across cluster nodes or reloaded from storage on restart (see [Clustering](#clustering) above)
 - Only the `rest-hook` channel is implemented; WebSocket, email, and FHIR messaging are planned for subsequent phases
