@@ -889,6 +889,7 @@ jobs:
           - hfs
           - fhirpath-server
           - sof-server
+          - hts
         arch:
           - amd64
           - arm64
@@ -904,6 +905,10 @@ jobs:
           - image: sof-server
             binary: sof-server
             port: 8080
+            include_data: false
+          - image: hts
+            binary: hts
+            port: 8090
             include_data: false
           - arch: amd64
             rust_target: x86_64-unknown-linux-gnu
@@ -975,6 +980,7 @@ jobs:
           - hfs
           - fhirpath-server
           - sof-server
+          - hts
     steps:
       - name: Determine version
         id: version
@@ -1032,6 +1038,7 @@ jobs:
           - fhirpath-server
           - sof-server
           - hfs
+          - hts
     steps:
       - name: Download release binary
         uses: actions/github-script@v7
@@ -1084,9 +1091,9 @@ jobs:
 
       - name: Deploy binary and create service
         env:
-          DEPLOY_HOST: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_HOST || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_HOST || secrets.HFS_DEPLOY_HOST }}
-          DEPLOY_USER: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_USER || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_USER || secrets.HFS_DEPLOY_USER }}
-          DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
+          DEPLOY_HOST: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_HOST || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_HOST || matrix.server == 'hts' && secrets.HTS_DEPLOY_HOST || secrets.HFS_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_USER || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_USER || matrix.server == 'hts' && secrets.HTS_DEPLOY_USER || secrets.HFS_DEPLOY_USER }}
+          DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || matrix.server == 'hts' && secrets.HTS_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
           SERVER_NAME: ${{ matrix.server }}
           HFS_PUBLIC_URL: ${{ secrets.HFS_BASE_URL }}
         run: |

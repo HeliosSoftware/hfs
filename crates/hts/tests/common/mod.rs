@@ -46,7 +46,12 @@ pub async fn pg_http_url() -> &'static str {
                 .await
                 .expect("Failed to get postgres port");
 
-            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let host = container
+                .get_host()
+                .await
+                .expect("Failed to get postgres host");
+
+            let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
             let _ = PG_HTTP_CONTAINER.set(container);
             url
         })
