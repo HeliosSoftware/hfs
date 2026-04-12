@@ -29,6 +29,8 @@ pub mod notification;
 pub mod topics;
 
 // Re-export key types for convenience.
+pub use channels::ws_manager::WebSocketManager;
+pub use channels::ws_token::WsBindingTokenManager;
 pub use config::SubscriptionConfig;
 pub use engine::SubscriptionEngine;
 pub use error::SubscriptionError;
