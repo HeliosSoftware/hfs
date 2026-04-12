@@ -33,6 +33,8 @@ pub mod subscriptions;
 pub mod update;
 pub mod versions;
 pub mod vread;
+#[cfg(feature = "subscriptions")]
+pub mod ws;
 
 /// Resolves a patient reference from a resource body for audit enrichment.
 pub(crate) fn extract_patient_from_resource(
