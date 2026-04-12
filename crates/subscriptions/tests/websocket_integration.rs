@@ -107,9 +107,7 @@ fn backport_parameter<'a>(bundle: &'a Value, name: &str) -> Option<&'a Value> {
 }
 
 fn backport_value_code<'a>(bundle: &'a Value, name: &str) -> Option<&'a str> {
-    backport_parameter(bundle, name)?
-        .get("valueCode")?
-        .as_str()
+    backport_parameter(bundle, name)?.get("valueCode")?.as_str()
 }
 
 fn backport_value_string<'a>(bundle: &'a Value, name: &str) -> Option<&'a str> {
@@ -200,11 +198,18 @@ async fn websocket_notification_delivered_to_connected_client() {
     let entries = notification["entry"]
         .as_array()
         .expect("bundle entry should be an array");
-    assert_eq!(entries.len(), 2, "id-only payload should include focus entry");
+    assert_eq!(
+        entries.len(),
+        2,
+        "id-only payload should include focus entry"
+    );
 
     let status_entry = backport_status_entry(&notification).expect("status entry should exist");
     assert_eq!(status_entry["request"]["method"], "GET");
-    assert_eq!(status_entry["request"]["url"], "Subscription/sub-ws-1/$status");
+    assert_eq!(
+        status_entry["request"]["url"],
+        "Subscription/sub-ws-1/$status"
+    );
     assert_eq!(status_entry["response"]["status"], "200");
 
     assert_eq!(
@@ -225,7 +230,10 @@ async fn websocket_notification_delivered_to_connected_client() {
         Some("1")
     );
     assert_eq!(backport_event_number(&notification), Some("1"));
-    assert_eq!(backport_focus_reference(&notification), Some("Encounter/enc-1"));
+    assert_eq!(
+        backport_focus_reference(&notification),
+        Some("Encounter/enc-1")
+    );
 
     let payload_entry = &entries[1];
     assert_eq!(payload_entry["request"]["method"], "GET");
@@ -295,12 +303,18 @@ async fn websocket_event_number_and_counter_are_monotonic() {
     engine
         .on_resource_event(encounter_create_event_with_id("enc-1"))
         .await;
-    let first = rx.recv().await.expect("first event notification should arrive");
+    let first = rx
+        .recv()
+        .await
+        .expect("first event notification should arrive");
 
     engine
         .on_resource_event(encounter_create_event_with_id("enc-2"))
         .await;
-    let second = rx.recv().await.expect("second event notification should arrive");
+    let second = rx
+        .recv()
+        .await
+        .expect("second event notification should arrive");
 
     assert_eq!(
         backport_value_string(&first, "events-since-subscription-start"),
