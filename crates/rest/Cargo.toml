@@ -50,7 +50,7 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # Web framework
-axum = { version = "0.8", features = ["json", "query", "matched-path"] }
+axum = { version = "0.8", features = ["json", "query", "matched-path", "ws"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id"] }
 http = "1.0"
