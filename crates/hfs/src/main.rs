@@ -50,6 +50,7 @@ fn is_database_audit_dedicated(config: &AuditConfig, backend_kind: BackendKind) 
     }
 }
 
+#[cfg(feature = "s3")]
 fn parse_env_bool(var: &str, default_value: bool) -> bool {
     std::env::var(var)
         .map(|v| {
@@ -59,10 +60,12 @@ fn parse_env_bool(var: &str, default_value: bool) -> bool {
         .unwrap_or(default_value)
 }
 
+#[cfg(feature = "postgres")]
 fn is_postgres_url(url: &str) -> bool {
     url.starts_with("postgres://") || url.starts_with("postgresql://")
 }
 
+#[cfg(feature = "mongodb")]
 fn is_mongodb_url(url: &str) -> bool {
     url.starts_with("mongodb://") || url.starts_with("mongodb+srv://")
 }
