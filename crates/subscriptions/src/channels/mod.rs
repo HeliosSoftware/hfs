@@ -4,6 +4,9 @@
 //! channel type (rest-hook, WebSocket, email, FHIR messaging).
 
 pub mod rest_hook;
+pub mod websocket;
+pub mod ws_manager;
+pub mod ws_token;
 
 use async_trait::async_trait;
 
