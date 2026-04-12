@@ -11,6 +11,9 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::channels::rest_hook::RestHookChannel;
+use crate::channels::websocket::WebSocketChannel;
+use crate::channels::ws_manager::WebSocketManager;
+use crate::channels::ws_token::WsBindingTokenManager;
 use crate::channels::{ChannelDispatcher, DispatchResult};
 use crate::config::SubscriptionConfig;
 use crate::evaluator::EventEvaluator;
@@ -30,6 +33,9 @@ pub struct SubscriptionEngine {
     manager: Arc<SubscriptionManager>,
     evaluator: EventEvaluator,
     rest_hook_channel: Arc<RestHookChannel>,
+    ws_manager: Arc<WebSocketManager>,
+    ws_channel: Arc<WebSocketChannel>,
+    ws_token_manager: Arc<WsBindingTokenManager>,
     config: SubscriptionConfig,
     base_url: String,
 }
@@ -44,12 +50,18 @@ impl SubscriptionEngine {
         ));
         let evaluator = EventEvaluator::new(Arc::clone(&topic_registry), Arc::clone(&manager));
         let rest_hook_channel = Arc::new(RestHookChannel::new());
+        let ws_manager = Arc::new(WebSocketManager::new());
+        let ws_channel = Arc::new(WebSocketChannel::new(Arc::clone(&ws_manager)));
+        let ws_token_manager = Arc::new(WsBindingTokenManager::new(config.ws_token_lifetime_secs));
 
         Self {
             topic_registry,
             manager,
             evaluator,
             rest_hook_channel,
+            ws_manager,
+            ws_channel,
+            ws_token_manager,
             config,
             base_url,
         }
@@ -63,6 +75,16 @@ impl SubscriptionEngine {
     /// Returns a reference to the subscription manager.
     pub fn manager(&self) -> &Arc<SubscriptionManager> {
         &self.manager
+    }
+
+    /// Returns a reference to the WebSocket manager.
+    pub fn ws_manager(&self) -> &Arc<WebSocketManager> {
+        &self.ws_manager
+    }
+
+    /// Returns a reference to the WebSocket binding token manager.
+    pub fn ws_token_manager(&self) -> &Arc<WsBindingTokenManager> {
+        &self.ws_token_manager
     }
 
     /// Called after a resource write has been committed.
@@ -146,6 +168,8 @@ impl SubscriptionEngine {
         match event.event_type {
             ResourceEventType::Delete => {
                 self.manager.deregister(&tenant_id, subscription_id);
+                self.ws_manager
+                    .remove_all_clients(&tenant_id, subscription_id);
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
@@ -234,6 +258,11 @@ impl SubscriptionEngine {
                     .handshake(subscription, &handshake_bundle)
                     .await
             }
+            ChannelType::Websocket => {
+                self.ws_channel
+                    .handshake(subscription, &handshake_bundle)
+                    .await
+            }
             _ => {
                 warn!(
                     subscription_id = sub_id,
@@ -280,6 +309,7 @@ impl SubscriptionEngine {
 
         let dispatcher: &dyn ChannelDispatcher = match subscription.channel.channel_type {
             ChannelType::RestHook => self.rest_hook_channel.as_ref(),
+            ChannelType::Websocket => self.ws_channel.as_ref(),
             _ => {
                 warn!(
                     subscription_id = sub_id,
