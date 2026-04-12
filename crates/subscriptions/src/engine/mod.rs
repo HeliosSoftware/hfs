@@ -123,13 +123,15 @@ impl SubscriptionEngine {
 
         // Build and dispatch notifications for each match.
         for eval_match in matches {
-            let subscription = &eval_match.subscription;
+            let mut subscription = eval_match.subscription;
 
             // Increment event counter.
             let event_number = self
                 .manager
                 .increment_event_count(&subscription.tenant_id, &subscription.id)
                 .unwrap_or(0);
+            // Ensure notification metadata reflects the event being emitted.
+            subscription.events_since_start = event_number;
 
             let event_data = NotificationEventData {
                 event_number,
@@ -139,7 +141,7 @@ impl SubscriptionEngine {
 
             // Build notification bundle.
             let bundle = match notification::build_event_notification(
-                subscription,
+                &subscription,
                 event_data,
                 event.resource.as_ref(),
                 &self.base_url,
@@ -156,7 +158,7 @@ impl SubscriptionEngine {
             };
 
             // Dispatch with retry.
-            self.dispatch_with_retry(subscription, &bundle).await;
+            self.dispatch_with_retry(&subscription, &bundle).await;
         }
     }
 
