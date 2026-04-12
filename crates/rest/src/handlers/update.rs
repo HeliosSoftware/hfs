@@ -184,6 +184,23 @@ where
         "Resource updated"
     );
 
+    // Emit subscription event
+    #[cfg(feature = "subscriptions")]
+    if let Some(engine) = state.subscription_engine() {
+        let event_type = if created {
+            helios_subscriptions::ResourceEventType::Create
+        } else {
+            helios_subscriptions::ResourceEventType::Update
+        };
+        super::subscription_event::emit_subscription_event(
+            engine,
+            tenant.context(),
+            &stored,
+            fhir_version,
+            event_type,
+        );
+    }
+
     build_update_response(
         status,
         &stored,

@@ -299,6 +299,23 @@ where
         app_audit_source_observer,
     );
 
+    // Inject subscription engine if enabled
+    #[cfg(feature = "subscriptions")]
+    let state = {
+        let subscriptions_enabled = std::env::var("HFS_SUBSCRIPTIONS_ENABLED")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
+            .unwrap_or(false);
+        if subscriptions_enabled {
+            let sub_config = helios_subscriptions::SubscriptionConfig::default();
+            let engine =
+                helios_subscriptions::SubscriptionEngine::new(sub_config, config.base_url.clone());
+            info!("Subscriptions engine ENABLED");
+            state.with_subscription_engine(Arc::new(engine))
+        } else {
+            state
+        }
+    };
+
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
 

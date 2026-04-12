@@ -132,6 +132,18 @@ where
         "Resource patched"
     );
 
+    // Emit subscription event
+    #[cfg(feature = "subscriptions")]
+    if let Some(engine) = state.subscription_engine() {
+        super::subscription_event::emit_subscription_event(
+            engine,
+            tenant.context(),
+            &stored,
+            stored.fhir_version(),
+            helios_subscriptions::ResourceEventType::Update,
+        );
+    }
+
     build_patch_response(&stored, headers, &prefer).map(|mut response| {
         response
             .extensions_mut()
