@@ -103,6 +103,82 @@ where
     Ok((StatusCode::OK, Json(bundle)).into_response())
 }
 
+/// Handler for the `$get-ws-binding-token` operation on Subscription resources.
+///
+/// Returns a `Parameters` resource containing a short-lived token, expiration,
+/// and the WebSocket URL for binding.
+///
+/// # HTTP Request
+///
+/// `GET [base]/Subscription/{id}/$get-ws-binding-token`
+pub async fn get_ws_binding_token_handler<S>(
+    State(state): State<AppState<S>>,
+    Path((_resource_type, id)): Path<(String, String)>,
+    tenant: TenantExtractor,
+) -> RestResult<Response>
+where
+    S: ResourceStorage + Send + Sync,
+{
+    let engine = state
+        .subscription_engine()
+        .ok_or(RestError::NotImplemented {
+            feature: "Subscriptions".to_string(),
+        })?;
+
+    // Verify subscription exists.
+    let sub = engine
+        .manager()
+        .get_subscription(tenant.tenant_id(), &id)
+        .ok_or(RestError::NotFound {
+            resource_type: "Subscription".to_string(),
+            id: id.clone(),
+        })?;
+
+    // Verify it's a websocket subscription.
+    if sub.channel.channel_type != helios_subscriptions::manager::ChannelType::Websocket {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "$get-ws-binding-token is only valid for websocket subscriptions, \
+                 but this subscription uses channel type '{}'",
+                sub.channel.channel_type.as_fhir_str()
+            ),
+        });
+    }
+
+    // Generate binding token.
+    let (token, expiration) = engine
+        .ws_token_manager()
+        .generate_token(tenant.tenant_id(), &id);
+
+    // Build WebSocket URL from the base URL.
+    let ws_base = state
+        .base_url()
+        .replace("http://", "ws://")
+        .replace("https://", "wss://");
+    let ws_url = format!("{}/ws/subscriptions/bind", ws_base);
+
+    // Return Parameters resource per FHIR spec.
+    let parameters = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "token",
+                "valueString": token
+            },
+            {
+                "name": "expiration",
+                "valueDateTime": expiration.to_rfc3339()
+            },
+            {
+                "name": "websocket-url",
+                "valueUrl": ws_url
+            }
+        ]
+    });
+
+    Ok((StatusCode::OK, Json(parameters)).into_response())
+}
+
 /// Builds a SubscriptionStatus resource for the $status response.
 fn build_subscription_status(
     sub: &helios_subscriptions::manager::ActiveSubscription,
