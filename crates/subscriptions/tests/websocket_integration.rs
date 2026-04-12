@@ -66,22 +66,90 @@ fn ws_subscription_create_event() -> ResourceEvent {
     }
 }
 
-fn encounter_create_event() -> ResourceEvent {
+fn encounter_create_event_with_id(resource_id: &str) -> ResourceEvent {
     ResourceEvent {
         tenant_id: TenantId::new(TENANT_ID),
         fhir_version: FhirVersion::default(),
         resource_type: "Encounter".to_string(),
-        resource_id: "enc-1".to_string(),
+        resource_id: resource_id.to_string(),
         version_id: "1".to_string(),
         event_type: ResourceEventType::Create,
         resource: Some(json!({
             "resourceType": "Encounter",
-            "id": "enc-1",
+            "id": resource_id,
             "status": "in-progress"
         })),
         previous_resource: None,
         timestamp: Utc::now(),
     }
+}
+
+fn encounter_create_event() -> ResourceEvent {
+    encounter_create_event_with_id("enc-1")
+}
+
+fn backport_status_entry(bundle: &Value) -> Option<&Value> {
+    let status_entry = bundle.get("entry")?.as_array()?.first()?;
+    let status_resource = status_entry.get("resource")?;
+    if status_resource.get("resourceType")?.as_str()? != "Parameters" {
+        return None;
+    }
+    Some(status_entry)
+}
+
+fn backport_parameter<'a>(bundle: &'a Value, name: &str) -> Option<&'a Value> {
+    let status_resource = backport_status_entry(bundle)?.get("resource")?;
+    status_resource
+        .get("parameter")?
+        .as_array()?
+        .iter()
+        .find(|parameter| parameter.get("name").and_then(Value::as_str) == Some(name))
+}
+
+fn backport_value_code<'a>(bundle: &'a Value, name: &str) -> Option<&'a str> {
+    backport_parameter(bundle, name)?
+        .get("valueCode")?
+        .as_str()
+}
+
+fn backport_value_string<'a>(bundle: &'a Value, name: &str) -> Option<&'a str> {
+    backport_parameter(bundle, name)?
+        .get("valueString")?
+        .as_str()
+}
+
+fn backport_value_reference<'a>(bundle: &'a Value, name: &str) -> Option<&'a str> {
+    backport_parameter(bundle, name)?
+        .get("valueReference")?
+        .get("reference")?
+        .as_str()
+}
+
+fn backport_value_canonical<'a>(bundle: &'a Value, name: &str) -> Option<&'a str> {
+    backport_parameter(bundle, name)?
+        .get("valueCanonical")?
+        .as_str()
+}
+
+fn backport_notification_event_part<'a>(bundle: &'a Value, name: &str) -> Option<&'a Value> {
+    backport_parameter(bundle, "notification-event")?
+        .get("part")?
+        .as_array()?
+        .iter()
+        .find(|part| part.get("name").and_then(Value::as_str) == Some(name))
+}
+
+fn backport_event_number<'a>(bundle: &'a Value) -> Option<&'a str> {
+    backport_notification_event_part(bundle, "event-number")?
+        .get("valueString")?
+        .as_str()
+}
+
+fn backport_focus_reference<'a>(bundle: &'a Value) -> Option<&'a str> {
+    backport_notification_event_part(bundle, "focus")?
+        .get("valueReference")?
+        .get("reference")?
+        .as_str()
 }
 
 fn make_engine() -> SubscriptionEngine {
@@ -124,9 +192,52 @@ async fn websocket_notification_delivered_to_connected_client() {
     // Fire an event that matches the topic.
     engine.on_resource_event(encounter_create_event()).await;
 
-    // The client should receive the notification bundle.
+    // The client should receive a backport-style event notification bundle.
     let notification = rx.recv().await.expect("should receive notification");
     assert_eq!(notification["resourceType"], "Bundle");
+    assert_eq!(notification["type"], "history");
+
+    let entries = notification["entry"]
+        .as_array()
+        .expect("bundle entry should be an array");
+    assert_eq!(entries.len(), 2, "id-only payload should include focus entry");
+
+    let status_entry = backport_status_entry(&notification).expect("status entry should exist");
+    assert_eq!(status_entry["request"]["method"], "GET");
+    assert_eq!(status_entry["request"]["url"], "Subscription/sub-ws-1/$status");
+    assert_eq!(status_entry["response"]["status"], "200");
+
+    assert_eq!(
+        backport_value_reference(&notification, "subscription"),
+        Some("Subscription/sub-ws-1")
+    );
+    assert_eq!(
+        backport_value_canonical(&notification, "topic"),
+        Some(TOPIC_URL)
+    );
+    assert_eq!(backport_value_code(&notification, "status"), Some("active"));
+    assert_eq!(
+        backport_value_code(&notification, "type"),
+        Some("event-notification")
+    );
+    assert_eq!(
+        backport_value_string(&notification, "events-since-subscription-start"),
+        Some("1")
+    );
+    assert_eq!(backport_event_number(&notification), Some("1"));
+    assert_eq!(backport_focus_reference(&notification), Some("Encounter/enc-1"));
+
+    let payload_entry = &entries[1];
+    assert_eq!(payload_entry["request"]["method"], "GET");
+    assert_eq!(payload_entry["request"]["url"], "Encounter/enc-1");
+    assert_eq!(
+        payload_entry["fullUrl"],
+        "http://localhost:8080/Encounter/enc-1"
+    );
+    assert!(
+        payload_entry.get("resource").is_none(),
+        "id-only payload should not include full resource"
+    );
 
     // Verify event count incremented.
     let sub = engine
@@ -153,6 +264,62 @@ async fn websocket_notification_broadcast_to_multiple_clients() {
     let n2 = rx2.recv().await.expect("client 2 should receive");
     assert_eq!(n1["resourceType"], "Bundle");
     assert_eq!(n2["resourceType"], "Bundle");
+    assert_eq!(n1["type"], "history");
+    assert_eq!(n2["type"], "history");
+    assert_eq!(backport_value_code(&n1, "type"), Some("event-notification"));
+    assert_eq!(backport_value_code(&n2, "type"), Some("event-notification"));
+    assert_eq!(
+        backport_value_string(&n1, "events-since-subscription-start"),
+        Some("1")
+    );
+    assert_eq!(
+        backport_value_string(&n2, "events-since-subscription-start"),
+        Some("1")
+    );
+    assert_eq!(backport_event_number(&n1), Some("1"));
+    assert_eq!(backport_event_number(&n2), Some("1"));
+    assert_eq!(backport_focus_reference(&n1), Some("Encounter/enc-1"));
+    assert_eq!(backport_focus_reference(&n2), Some("Encounter/enc-1"));
+}
+
+#[tokio::test]
+async fn websocket_event_number_and_counter_are_monotonic() {
+    let engine = make_engine();
+    engine.on_resource_event(topic_create_event()).await;
+    engine
+        .on_resource_event(ws_subscription_create_event())
+        .await;
+
+    let (_client_id, mut rx) = engine.ws_manager().register_client(TENANT_ID, "sub-ws-1");
+
+    engine
+        .on_resource_event(encounter_create_event_with_id("enc-1"))
+        .await;
+    let first = rx.recv().await.expect("first event notification should arrive");
+
+    engine
+        .on_resource_event(encounter_create_event_with_id("enc-2"))
+        .await;
+    let second = rx.recv().await.expect("second event notification should arrive");
+
+    assert_eq!(
+        backport_value_string(&first, "events-since-subscription-start"),
+        Some("1")
+    );
+    assert_eq!(
+        backport_value_string(&second, "events-since-subscription-start"),
+        Some("2")
+    );
+    assert_eq!(backport_event_number(&first), Some("1"));
+    assert_eq!(backport_event_number(&second), Some("2"));
+    assert_eq!(backport_focus_reference(&first), Some("Encounter/enc-1"));
+    assert_eq!(backport_focus_reference(&second), Some("Encounter/enc-2"));
+
+    let sub = engine
+        .manager()
+        .get_subscription(TENANT_ID, "sub-ws-1")
+        .expect("subscription should still be registered");
+    assert_eq!(sub.events_since_start, 2);
 }
 
 #[tokio::test]
