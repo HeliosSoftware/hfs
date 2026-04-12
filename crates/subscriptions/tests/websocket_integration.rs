@@ -137,13 +137,13 @@ fn backport_notification_event_part<'a>(bundle: &'a Value, name: &str) -> Option
         .find(|part| part.get("name").and_then(Value::as_str) == Some(name))
 }
 
-fn backport_event_number<'a>(bundle: &'a Value) -> Option<&'a str> {
+fn backport_event_number(bundle: &Value) -> Option<&str> {
     backport_notification_event_part(bundle, "event-number")?
         .get("valueString")?
         .as_str()
 }
 
-fn backport_focus_reference<'a>(bundle: &'a Value) -> Option<&'a str> {
+fn backport_focus_reference(bundle: &Value) -> Option<&str> {
     backport_notification_event_part(bundle, "focus")?
         .get("valueReference")?
         .get("reference")?
