@@ -54,6 +54,7 @@ Work that is currently underway or planned for the near term.
 | **Standards** | [Terminology](https://github.com/HeliosSoftware/hfs/discussions/54) | 🟡 In progress |
 | **Standards** | FHIR Validation engine | 🔵 Design |
 | **Standards** | [FHIR Subscriptions — Topic-based notification support](https://github.com/HeliosSoftware/hfs/discussions/59) | 🔵 Design |
+| **Analytics** | [SQL on FHIR](https://sql-on-fhir.org/ig/latest/) — HFS integration and operations update | 🔵 Design |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
 ### Discussion Documents
@@ -63,6 +64,7 @@ We are actively developing community discussion documents on the following topic
 - **[Terminology](https://github.com/HeliosSoftware/hfs/discussions/54)** — Defining how code systems, value sets, and concept maps will be managed
 - **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
 - **[Subscriptions](https://github.com/HeliosSoftware/hfs/discussions/59)** — Defining the approach for topic-based notification support
+- **SQL on FHIR** — Standalone `sof-cli` and `sof-server` already ship today; this effort integrates SQL on FHIR directly into HFS and brings all [SQL on FHIR operations](https://sql-on-fhir.org/ig/latest/operations.html) up to date with current spec progress
 
 ---
 
@@ -74,7 +76,6 @@ These items are well-understood and will be picked up once current work complete
 
 - **Bulk Data API** — Import and export (`$export` / `$import` operations)
 - **Persistence-layer audit events** — Wire audit logging for bulk export, purge, and reindex operations (audit functions exist, pending REST endpoints)
-- **SQL on FHIR** — [SQL on FHIR operations](https://sql-on-fhir.org/ig/latest/operations.html) - using read-only database connections
 
 ### Developer Experience
 
