@@ -10,7 +10,6 @@
 //! - `name TEXT` is included in `concept_maps` from the start
 //! - Trigram GIN index on `concepts.display` for fast substring search
 
-#[cfg(feature = "postgres")]
 /// Full PostgreSQL DDL for the HTS normalized schema.
 pub const SCHEMA: &str = "
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -124,7 +123,6 @@ CREATE INDEX IF NOT EXISTS idx_map_source
 /// Apply the HTS PostgreSQL schema to the given client connection.
 ///
 /// Safe to call on every startup — all statements are idempotent.
-#[cfg(feature = "postgres")]
 pub async fn apply(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
     client.batch_execute(SCHEMA).await
 }

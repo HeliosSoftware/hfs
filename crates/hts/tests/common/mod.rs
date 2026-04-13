@@ -58,6 +58,35 @@ pub async fn pg_http_url() -> &'static str {
         .await
 }
 
+/// Ensures the HTS + persistence schemas are applied exactly once per test
+/// binary, avoiding concurrent `CREATE EXTENSION` race conditions.
+#[cfg(feature = "postgres")]
+static PG_SCHEMA_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+#[cfg(feature = "postgres")]
+async fn ensure_pg_schemas(url: &str) {
+    PG_SCHEMA_INIT
+        .get_or_init(|| async {
+            use helios_hts::backends::PostgresTerminologyBackend;
+            use helios_persistence::backends::postgres::PostgresBackend;
+
+            // Apply HTS terminology schema.
+            PostgresTerminologyBackend::new(url)
+                .await
+                .expect("Failed to create PostgresTerminologyBackend (schema init)");
+
+            // Apply persistence resource-store schema.
+            let resource_store = PostgresBackend::from_connection_string(url)
+                .await
+                .expect("Failed to open PostgreSQL resource store (schema init)");
+            resource_store
+                .init_schema()
+                .await
+                .expect("Failed to initialize PostgreSQL resource store schema (schema init)");
+        })
+        .await;
+}
+
 /// A lightweight test application that wraps the full HTS Axum router backed
 /// by an isolated in-memory SQLite database.
 pub struct TestApp {
@@ -242,12 +271,18 @@ pub struct TestAppPg {
 #[cfg(feature = "postgres")]
 impl TestAppPg {
     /// Create a new `TestAppPg` wired to the shared PostgreSQL container.
+    ///
+    /// Schema initialization (HTS + persistence) is serialized via
+    /// [`ensure_pg_schemas`] so concurrent tests never race on DDL.
     pub async fn new() -> Self {
         use helios_hts::backends::PostgresTerminologyBackend;
         use helios_persistence::backends::postgres::PostgresBackend;
         use std::sync::Arc;
 
         let url = pg_http_url().await;
+
+        // Ensure schemas are applied exactly once (no concurrent DDL races).
+        ensure_pg_schemas(url).await;
 
         let backend = PostgresTerminologyBackend::new(url)
             .await
@@ -256,10 +291,6 @@ impl TestAppPg {
         let resource_store = PostgresBackend::from_connection_string(url)
             .await
             .expect("Failed to open PostgreSQL resource store");
-        resource_store
-            .init_schema()
-            .await
-            .expect("Failed to initialize PostgreSQL resource store schema");
 
         let state = PgAppState::new(backend.clone())
             .with_resource_store_pg(resource_store)

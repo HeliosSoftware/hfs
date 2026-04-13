@@ -3,8 +3,6 @@
 //! Gated by the `postgres` feature flag. Uses `deadpool-postgres` for async
 //! connection pooling and `tokio-postgres` for query execution.
 
-#![cfg(feature = "postgres")]
-
 pub mod schema;
 
 mod code_system;
@@ -12,7 +10,7 @@ mod concept_map;
 mod value_set;
 
 use async_trait::async_trait;
-use deadpool_postgres::{Config, Pool, Runtime};
+use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
 use tokio_postgres::NoTls;
 use tracing::info;
 
@@ -84,19 +82,22 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
 
     fn supported_systems(&self) -> Vec<String> {
         let pool = self.pool.clone();
-        // Block on async query from sync context.
-        tokio::runtime::Handle::current().block_on(async move {
-            let client = match pool.get().await {
-                Ok(c) => c,
-                Err(_) => return vec![],
-            };
-            match client
-                .query("SELECT url FROM code_systems ORDER BY url", &[])
-                .await
-            {
-                Ok(rows) => rows.into_iter().map(|r| r.get::<_, String>(0)).collect(),
-                Err(_) => vec![],
-            }
+        // Use block_in_place so we can safely block_on within a multi-threaded
+        // tokio runtime (avoids "cannot start a runtime from within a runtime").
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let client = match pool.get().await {
+                    Ok(c) => c,
+                    Err(_) => return vec![],
+                };
+                match client
+                    .query("SELECT url FROM code_systems ORDER BY url", &[])
+                    .await
+                {
+                    Ok(rows) => rows.into_iter().map(|r| r.get::<_, String>(0)).collect(),
+                    Err(_) => vec![],
+                }
+            })
         })
     }
 
@@ -108,16 +109,18 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
         let pool = self.pool.clone();
         let resource_type = resource_type.to_owned();
         let id = id.to_owned();
-        tokio::runtime::Handle::current().block_on(async move {
-            let client = pool.get().await.ok()?;
-            let sql = match resource_type.as_str() {
-                "CodeSystem" => "SELECT url FROM code_systems WHERE id = $1",
-                "ValueSet" => "SELECT url FROM value_sets WHERE id = $1",
-                "ConceptMap" => "SELECT url FROM concept_maps WHERE id = $1",
-                _ => return None,
-            };
-            let rows = client.query(sql, &[&id]).await.ok()?;
-            rows.into_iter().next().map(|r| r.get::<_, String>(0))
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let client = pool.get().await.ok()?;
+                let sql = match resource_type.as_str() {
+                    "CodeSystem" => "SELECT url FROM code_systems WHERE id = $1",
+                    "ValueSet" => "SELECT url FROM value_sets WHERE id = $1",
+                    "ConceptMap" => "SELECT url FROM concept_maps WHERE id = $1",
+                    _ => return None,
+                };
+                let rows = client.query(sql, &[&id]).await.ok()?;
+                rows.into_iter().next().map(|r| r.get::<_, String>(0))
+            })
         })
     }
 }
@@ -135,36 +138,45 @@ impl BundleImportBackend for PostgresTerminologyBackend {
     ) -> Result<ImportStats, HtsError> {
         let parsed = bundle_parser::parse_bundle(data)?;
 
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Begin transaction: {e}")))?;
+
         let mut stats = ImportStats::default();
         stats.errors.extend(parsed.parse_errors.iter().cloned());
 
         for cs in &parsed.code_systems {
-            if let Err(e) = write_code_system(&client, cs, &mut stats).await {
+            if let Err(e) = write_code_system(&tx, cs, &mut stats).await {
                 stats
                     .errors
                     .push(format!("CodeSystem '{}' import failed: {e}", cs.url));
             }
         }
         for vs in &parsed.value_sets {
-            if let Err(e) = write_value_set(&client, vs, &mut stats).await {
+            if let Err(e) = write_value_set(&tx, vs, &mut stats).await {
                 stats
                     .errors
                     .push(format!("ValueSet '{}' import failed: {e}", vs.url));
             }
         }
         for cm in &parsed.concept_maps {
-            if let Err(e) = write_concept_map(&client, cm, &mut stats).await {
+            if let Err(e) = write_concept_map(&tx, cm, &mut stats).await {
                 stats
                     .errors
                     .push(format!("ConceptMap '{}' import failed: {e}", cm.url));
             }
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
 
         Ok(stats)
     }
@@ -235,15 +247,18 @@ fn utc_now() -> String {
 }
 
 async fn write_code_system(
-    client: &tokio_postgres::Client,
+    client: &impl GenericClient,
     cs: &ParsedCodeSystem,
     stats: &mut ImportStats,
 ) -> Result<(), HtsError> {
     let resource_json = Some(cs.resource_json.clone());
     let now = utc_now();
 
-    client
-        .execute(
+    // Use RETURNING id to get the actual row id after an upsert — when
+    // ON CONFLICT (url) fires the existing row keeps its original `id`,
+    // which may differ from `cs.id`.
+    let cs_rows = client
+        .query(
             "INSERT INTO code_systems
              (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
@@ -254,7 +269,8 @@ async fn write_code_system(
                status       = EXCLUDED.status,
                content      = EXCLUDED.content,
                resource_json = EXCLUDED.resource_json,
-               updated_at   = EXCLUDED.updated_at",
+               updated_at   = EXCLUDED.updated_at
+             RETURNING id",
             &[
                 &cs.id,
                 &cs.url,
@@ -270,6 +286,14 @@ async fn write_code_system(
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    let system_id: String = cs_rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            HtsError::StorageError("INSERT code_systems RETURNING id got no row".into())
+        })?
+        .get(0);
+
     for concept in &cs.concepts {
         let rows = client
             .query(
@@ -279,7 +303,12 @@ async fn write_code_system(
                    display    = EXCLUDED.display,
                    definition = EXCLUDED.definition
                  RETURNING id",
-                &[&cs.id, &concept.code, &concept.display, &concept.definition],
+                &[
+                    &system_id,
+                    &concept.code,
+                    &concept.display,
+                    &concept.definition,
+                ],
             )
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -296,7 +325,7 @@ async fn write_code_system(
 
         // Hierarchy from nesting or "parent" property.
         if let Some(ref parent) = concept.parent_code {
-            insert_hierarchy(client, &cs.id, parent, &concept.code).await?;
+            insert_hierarchy(client, &system_id, parent, &concept.code).await?;
         }
 
         for prop in &concept.properties {
@@ -316,7 +345,7 @@ async fn write_code_system(
             // Extra hierarchy edge from a "parent" property.
             if prop.is_parent_edge {
                 if let Some(ref pv) = prop.parent_code_value {
-                    insert_hierarchy(client, &cs.id, pv, &concept.code).await?;
+                    insert_hierarchy(client, &system_id, pv, &concept.code).await?;
                 }
             }
         }
@@ -345,7 +374,7 @@ async fn write_code_system(
 }
 
 async fn insert_hierarchy(
-    client: &tokio_postgres::Client,
+    client: &impl GenericClient,
     system_id: &str,
     parent_code: &str,
     child_code: &str,
@@ -363,7 +392,7 @@ async fn insert_hierarchy(
 }
 
 async fn write_value_set(
-    client: &tokio_postgres::Client,
+    client: &impl GenericClient,
     vs: &ParsedValueSet,
     stats: &mut ImportStats,
 ) -> Result<(), HtsError> {
@@ -420,7 +449,7 @@ async fn write_value_set(
 }
 
 async fn write_concept_map(
-    client: &tokio_postgres::Client,
+    client: &impl GenericClient,
     cm: &ParsedConceptMap,
     stats: &mut ImportStats,
 ) -> Result<(), HtsError> {

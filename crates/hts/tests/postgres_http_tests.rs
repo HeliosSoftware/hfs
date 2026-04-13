@@ -19,7 +19,7 @@ use common::{TestAppPg, bundles};
 // CRUD round-trip tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn crud_code_system_create_read_update_delete() {
     let app = TestAppPg::new().await;
 
@@ -71,7 +71,7 @@ async fn crud_code_system_create_read_update_delete() {
     assert_eq!(status, StatusCode::NOT_FOUND, "GET after DELETE");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn crud_code_system_if_match_mismatch_returns_412() {
     let app = TestAppPg::new().await;
 
@@ -105,7 +105,7 @@ async fn crud_code_system_if_match_mismatch_returns_412() {
     assert_eq!(status, StatusCode::PRECONDITION_FAILED);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn crud_value_set_create_read_delete() {
     let app = TestAppPg::new().await;
 
@@ -131,7 +131,7 @@ async fn crud_value_set_create_read_delete() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn crud_concept_map_create_read_delete() {
     let app = TestAppPg::new().await;
 
@@ -157,7 +157,7 @@ async fn crud_concept_map_create_read_delete() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn crud_delete_also_removes_lookup_data() {
     // Verifies the Gap 1 fix: after DELETE /CodeSystem/{id}, $lookup returns 404.
     let app = TestAppPg::new().await;
@@ -205,7 +205,7 @@ async fn crud_delete_also_removes_lookup_data() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn crud_delete_also_removes_expand_data() {
     // Verifies the Gap 1 fix: after DELETE /ValueSet/{id}, $expand returns 404.
     let app = TestAppPg::new().await;
@@ -261,7 +261,7 @@ async fn crud_delete_also_removes_expand_data() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn crud_delete_also_removes_translate_data() {
     // Verifies the Gap 1 fix: after DELETE /ConceptMap/{id}, $translate returns false.
     let app = TestAppPg::new().await;
@@ -333,7 +333,7 @@ async fn crud_delete_also_removes_translate_data() {
 // By-id operation endpoints
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_by_id_post_returns_same_as_system_level() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -384,7 +384,7 @@ async fn lookup_by_id_post_returns_same_as_system_level() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_by_id_get_returns_display() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -415,7 +415,7 @@ async fn lookup_by_id_get_returns_display() {
     assert_eq!(display, "Arm");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_by_id_unknown_id_returns_404() {
     let app = TestAppPg::new().await;
 
@@ -425,7 +425,7 @@ async fn lookup_by_id_unknown_id_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_by_id_post_returns_expansion() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -446,25 +446,27 @@ async fn expand_by_id_post_returns_expansion() {
     assert_eq!(status_sys, StatusCode::OK, "{sys_body}");
     assert_eq!(status_id, StatusCode::OK, "{id_body}");
 
-    let sys_codes: Vec<&str> = sys_body["expansion"]["contains"]
+    let mut sys_codes: Vec<&str> = sys_body["expansion"]["contains"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|c| c["code"].as_str())
         .collect();
-    let id_codes: Vec<&str> = id_body["expansion"]["contains"]
+    sys_codes.sort();
+    let mut id_codes: Vec<&str> = id_body["expansion"]["contains"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|c| c["code"].as_str())
         .collect();
+    id_codes.sort();
     assert_eq!(
         sys_codes, id_codes,
         "by-id and system-level should expand identically"
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_by_id_get_returns_expansion() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -490,14 +492,14 @@ async fn expand_by_id_get_returns_expansion() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_by_id_unknown_id_returns_404() {
     let app = TestAppPg::new().await;
     let (status, _) = app.get_fhir("/ValueSet/nonexistent-vs-id/$expand").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_by_id_post_returns_match() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -530,7 +532,7 @@ async fn translate_by_id_post_returns_match() {
     assert!(result, "expected result=true");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_by_id_get_returns_match() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -562,7 +564,7 @@ async fn translate_by_id_get_returns_match() {
     assert!(result);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_by_id_unknown_id_returns_404() {
     let app = TestAppPg::new().await;
     let (status, _) = app
@@ -575,7 +577,7 @@ async fn translate_by_id_unknown_id_returns_404() {
 // Format negotiation
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_xml_response_contains_parameters_root() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -592,7 +594,7 @@ async fn lookup_xml_response_contains_parameters_root() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_xml_via_format_query_param() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -613,7 +615,7 @@ async fn lookup_xml_via_format_query_param() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_xml_response_contains_valueset_root() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -627,7 +629,7 @@ async fn expand_xml_response_contains_valueset_root() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn metadata_returns_capability_statement() {
     let app = TestAppPg::new().await;
     let (status, body) = app.get_fhir("/metadata").await;
@@ -639,7 +641,7 @@ async fn metadata_returns_capability_statement() {
 // Import endpoint (POST /import)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_r4_bundle_returns_correct_counts() {
     let app = TestAppPg::new().await;
     let (status, body) = app.import_bundle(bundles::r4_bundle()).await;
@@ -660,7 +662,7 @@ async fn import_r4_bundle_returns_correct_counts() {
     assert_eq!(body["concepts"].as_u64(), Some(5), "expected 5 concepts");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_r4b_bundle_returns_correct_counts() {
     let app = TestAppPg::new().await;
     let (status, body) = app.import_bundle(bundles::r4b_bundle()).await;
@@ -672,7 +674,7 @@ async fn import_r4b_bundle_returns_correct_counts() {
     assert_eq!(body["concepts"].as_u64(), Some(5));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_r5_bundle_returns_correct_counts() {
     let app = TestAppPg::new().await;
     let (status, body) = app.import_bundle(bundles::r5_bundle()).await;
@@ -684,7 +686,7 @@ async fn import_r5_bundle_returns_correct_counts() {
     assert_eq!(body["concepts"].as_u64(), Some(5));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_r6_bundle_returns_correct_counts() {
     let app = TestAppPg::new().await;
     let (status, body) = app.import_bundle(bundles::r6_bundle()).await;
@@ -696,7 +698,7 @@ async fn import_r6_bundle_returns_correct_counts() {
     assert_eq!(body["concepts"].as_u64(), Some(5));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn reimport_same_bundle_is_idempotent() {
     let app = TestAppPg::new().await;
 
@@ -710,7 +712,7 @@ async fn reimport_same_bundle_is_idempotent() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_non_bundle_returns_400() {
     let app = TestAppPg::new().await;
 
@@ -719,7 +721,7 @@ async fn import_non_bundle_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_bundle_with_malformed_cs_returns_207() {
     let app = TestAppPg::new().await;
 
@@ -769,7 +771,7 @@ async fn import_bundle_with_malformed_cs_returns_207() {
 // ValueSet validate-code input types
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_coding_in_set_returns_true() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -803,7 +805,7 @@ async fn vs_validate_coding_in_set_returns_true() {
     assert!(result, "arm is in the limbs ValueSet");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_codeable_concept_one_match_returns_true() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -838,7 +840,7 @@ async fn vs_validate_codeable_concept_one_match_returns_true() {
     assert!(result, "one coding in the CodeableConcept matches");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_codeable_concept_no_match_returns_false() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
@@ -877,16 +879,16 @@ async fn vs_validate_codeable_concept_no_match_returns_false() {
 // ValueSet expand flags
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_hierarchical_false_returns_flat_list() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
-    // Expand the full CodeSystem in flat (non-hierarchical) mode.
+    // Expand the limbs ValueSet in flat (non-hierarchical) mode.
     let req_flat = serde_json::json!({
         "resourceType": "Parameters",
         "parameter": [
-            {"name": "url", "valueUri": bundles::ANATOMY_CS_URL},
+            {"name": "url", "valueUri": bundles::LIMBS_VS_URL},
             {"name": "hierarchical", "valueBoolean": false}
         ]
     })
@@ -910,7 +912,7 @@ async fn expand_hierarchical_false_returns_flat_list() {
 // Multi-version ConceptMap translate
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r4b_arm_returns_snomed_code() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r4b_bundle()).await;
@@ -933,7 +935,7 @@ async fn translate_r4b_arm_returns_snomed_code() {
     assert!(result, "R4B arm should translate to SNOMED code");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r5_arm_returns_snomed_code() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r5_bundle()).await;
@@ -956,7 +958,7 @@ async fn translate_r5_arm_returns_snomed_code() {
     assert!(result, "R5 arm should translate to SNOMED code");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r6_arm_returns_snomed_code() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(bundles::r6_bundle()).await;

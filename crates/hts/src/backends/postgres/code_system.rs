@@ -241,7 +241,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             let status: String = row.get(5);
             let resource_json: Option<serde_json::Value> = row.get(6);
 
-            let resource = resource_json.unwrap_or_else(|| {
+            let mut resource = resource_json.unwrap_or_else(|| {
                 build_synthetic_resource(
                     "CodeSystem",
                     &id,
@@ -252,6 +252,11 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     &status,
                 )
             });
+            // Ensure the resource id matches the table's authoritative id column
+            // (may differ from resource_json after a URL-conflict upsert).
+            if let Some(obj) = resource.as_object_mut() {
+                obj.insert("id".to_string(), serde_json::Value::String(id));
+            }
             results.push(resource);
         }
         Ok(results)
