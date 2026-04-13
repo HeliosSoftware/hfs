@@ -46,12 +46,17 @@ async fn db_url() -> &'static str {
                 .await
                 .expect("Failed to start Postgres container");
 
+            let host = container
+                .get_host()
+                .await
+                .expect("Failed to get postgres host");
+
             let port = container
                 .get_host_port_ipv4(5432)
                 .await
                 .expect("Failed to get postgres port");
 
-            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
             // Keep the container alive for the process lifetime.
             let _ = CONTAINER.set(container);
@@ -106,8 +111,9 @@ async fn supported_systems_empty_initially() {
         .start()
         .await
         .expect("Failed to start Postgres container");
+    let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
     let backend = PostgresTerminologyBackend::new(&url).await.unwrap();
     assert!(
