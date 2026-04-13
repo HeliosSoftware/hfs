@@ -33,6 +33,7 @@ use tokio::sync::OnceCell;
 
 static CONTAINER: OnceLock<ContainerAsync<Postgres>> = OnceLock::new();
 static DB_URL: OnceCell<String> = OnceCell::const_new();
+static BACKEND: OnceCell<PostgresTerminologyBackend> = OnceCell::const_new();
 
 /// Returns the PostgreSQL URL for the shared test container, starting it on the
 /// first call.
@@ -65,23 +66,42 @@ async fn db_url() -> &'static str {
         .await
 }
 
-/// Create a new `PostgresTerminologyBackend` connected to the shared container.
+/// Return a shared `PostgresTerminologyBackend` connected to the shared
+/// container.  The schema is applied exactly once (on first call), avoiding
+/// concurrent `CREATE EXTENSION` races when many tests start in parallel.
 async fn fresh_backend() -> PostgresTerminologyBackend {
-    PostgresTerminologyBackend::new(db_url().await)
+    BACKEND
+        .get_or_init(|| async {
+            PostgresTerminologyBackend::new(db_url().await)
+                .await
+                .expect("Backend should initialize")
+        })
         .await
-        .expect("Backend should initialize")
+        .clone()
 }
 
 fn ctx() -> TenantContext {
     TenantContext::system()
 }
 
-/// Returns a unique base URL string for a given test to avoid cross-test
+/// Returns a `(base_url, uid)` pair for a given test to avoid cross-test
 /// interference when tests share the same PostgreSQL database.
+/// `base_url` is used for resource canonical URLs; `uid` is used for resource
+/// IDs so that no two tests ever try to write the same primary key.
+macro_rules! test_ctx {
+    ($prefix:literal) => {{
+        let uid = uuid::Uuid::new_v4().simple().to_string();
+        let base = format!("http://{}.{}/", $prefix, uid);
+        (base, uid)
+    }};
+}
+
+/// Legacy helper — returns only the base URL.
 macro_rules! base_url {
-    ($prefix:literal) => {
-        format!("http://{}.{}/", $prefix, uuid::Uuid::new_v4().simple())
-    };
+    ($prefix:literal) => {{
+        let (base, _uid) = test_ctx!($prefix);
+        base
+    }};
 }
 
 // ── Infrastructure tests ───────────────────────────────────────────────────────
@@ -103,7 +123,7 @@ async fn backend_name_is_postgres() {
     assert_eq!(backend.backend_name(), "postgres");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supported_systems_empty_initially() {
     // Use a dedicated container to guarantee a truly empty DB.
     use testcontainers::runners::AsyncRunner;
@@ -126,13 +146,14 @@ async fn supported_systems_empty_initially() {
 
 /// Seed a CodeSystem into `backend` and return the URL that was used.
 async fn seed_code_system_with_url(backend: &PostgresTerminologyBackend, cs_url: &str) -> String {
+    let uid = uuid::Uuid::new_v4().simple().to_string();
     let bundle = serde_json::json!({
         "resourceType": "Bundle",
         "type": "collection",
         "entry": [{
             "resource": {
                 "resourceType": "CodeSystem",
-                "id": "cs-test",
+                "id": format!("cs-{uid}"),
                 "url": cs_url,
                 "name": "TestCS",
                 "version": "1.0",
@@ -167,7 +188,7 @@ async fn seed_code_system_with_url(backend: &PostgresTerminologyBackend, cs_url:
 #[tokio::test]
 async fn import_bundle_end_to_end() {
     let backend = fresh_backend().await;
-    let base = base_url!("e2e");
+    let (base, uid) = test_ctx!("e2e");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle",
@@ -176,7 +197,7 @@ async fn import_bundle_end_to_end() {
             {
                 "resource": {
                     "resourceType": "CodeSystem",
-                    "id": "cs-e2e",
+                    "id": format!("cs-{uid}"),
                     "url": format!("{base}cs"),
                     "name": "E2ECS",
                     "version": "2.0",
@@ -193,7 +214,7 @@ async fn import_bundle_end_to_end() {
             {
                 "resource": {
                     "resourceType": "ValueSet",
-                    "id": "vs-e2e",
+                    "id": format!("vs-{uid}"),
                     "url": format!("{base}vs"),
                     "name": "E2EVS",
                     "status": "active",
@@ -405,7 +426,7 @@ async fn subsumes_equivalent_same_code() {
 #[tokio::test]
 async fn subsumes_subsumed_by_returns_correct_outcome() {
     let backend = fresh_backend().await;
-    let base = base_url!("sub-by");
+    let (base, uid) = test_ctx!("sub-by");
 
     // A → B hierarchy
     let bundle = serde_json::json!({
@@ -413,7 +434,7 @@ async fn subsumes_subsumed_by_returns_correct_outcome() {
         "type": "collection",
         "entry": [{"resource": {
             "resourceType": "CodeSystem",
-            "id": "cs-hier",
+            "id": format!("cs-{uid}"),
             "url": format!("{base}cs"),
             "name": "HierCS",
             "status": "active",
@@ -449,14 +470,14 @@ async fn subsumes_subsumed_by_returns_correct_outcome() {
 #[tokio::test]
 async fn subsumes_not_subsumed_returns_correct_outcome() {
     let backend = fresh_backend().await;
-    let base = base_url!("sub-none");
+    let (base, uid) = test_ctx!("sub-none");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle",
         "type": "collection",
         "entry": [{"resource": {
             "resourceType": "CodeSystem",
-            "id": "cs-flat",
+            "id": format!("cs-{uid}"),
             "url": format!("{base}cs"),
             "name": "FlatCS",
             "status": "active",
@@ -544,19 +565,19 @@ async fn search_by_name_returns_match() {
 #[tokio::test]
 async fn search_by_status_filters_correctly() {
     let backend = fresh_backend().await;
-    let base = base_url!("srch-status");
+    let (base, uid) = test_ctx!("srch-status");
 
     // Import an active and a retired system.
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-active",
+                "resourceType": "CodeSystem", "id": format!("cs-act-{uid}"),
                 "url": format!("{base}active"), "name": "ActiveCS",
                 "status": "active", "content": "complete"
             }},
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-retired",
+                "resourceType": "CodeSystem", "id": format!("cs-ret-{uid}"),
                 "url": format!("{base}retired"), "name": "RetiredCS",
                 "status": "retired", "content": "complete"
             }}
@@ -593,7 +614,7 @@ async fn search_by_status_filters_correctly() {
 #[tokio::test]
 async fn search_pagination_limit_and_offset() {
     let backend = fresh_backend().await;
-    let base = base_url!("srch-page");
+    let (base, uid) = test_ctx!("srch-page");
 
     // Import 3 code systems with predictable names.
     for i in 0..3u32 {
@@ -601,7 +622,7 @@ async fn search_pagination_limit_and_offset() {
             "resourceType": "Bundle", "type": "collection",
             "entry": [{"resource": {
                 "resourceType": "CodeSystem",
-                "id": format!("cs-page-{i}"),
+                "id": format!("cs-pg-{i}-{uid}"),
                 "url": format!("{base}cs-{i}"),
                 "name": format!("PageCS{i}"),
                 "status": "active",
@@ -655,13 +676,13 @@ async fn search_unknown_url_returns_empty() {
 #[tokio::test]
 async fn expand_explicit_code_list() {
     let backend = fresh_backend().await;
-    let base = base_url!("exp-explicit");
+    let (base, uid) = test_ctx!("exp-explicit");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-exp",
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
                 "url": format!("{base}cs"), "name": "ExpCS",
                 "status": "active", "content": "complete",
                 "concept": [
@@ -671,7 +692,7 @@ async fn expand_explicit_code_list() {
                 ]
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-exp",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "ExpVS",
                 "status": "active",
                 "compose": {"include": [{"system": format!("{base}cs"),
@@ -705,13 +726,13 @@ async fn expand_explicit_code_list() {
 #[tokio::test]
 async fn expand_exclude_rules_remove_codes() {
     let backend = fresh_backend().await;
-    let base = base_url!("exp-excl");
+    let (base, uid) = test_ctx!("exp-excl");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-excl",
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
                 "url": format!("{base}cs"), "name": "ExclCS",
                 "status": "active", "content": "complete",
                 "concept": [
@@ -720,7 +741,7 @@ async fn expand_exclude_rules_remove_codes() {
                 ]
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-excl",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "ExclVS",
                 "status": "active",
                 "compose": {
@@ -755,7 +776,7 @@ async fn expand_exclude_rules_remove_codes() {
 #[tokio::test]
 async fn expand_pagination_count_and_offset() {
     let backend = fresh_backend().await;
-    let base = base_url!("exp-page");
+    let (base, uid) = test_ctx!("exp-page");
 
     let concepts: Vec<serde_json::Value> = (0..5)
         .map(|i| serde_json::json!({"code": format!("C{i}"), "display": format!("Concept {i}")}))
@@ -765,13 +786,13 @@ async fn expand_pagination_count_and_offset() {
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-page",
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
                 "url": format!("{base}cs"), "name": "PageCS",
                 "status": "active", "content": "complete",
                 "concept": concepts
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-page",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "PageVS",
                 "status": "active",
                 "compose": {"include": [{"system": format!("{base}cs")}]}
@@ -804,13 +825,13 @@ async fn expand_pagination_count_and_offset() {
 #[tokio::test]
 async fn expand_filter_substring_match() {
     let backend = fresh_backend().await;
-    let base = base_url!("exp-filt");
+    let (base, uid) = test_ctx!("exp-filt");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-filt",
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
                 "url": format!("{base}cs"), "name": "FiltCS",
                 "status": "active", "content": "complete",
                 "concept": [
@@ -820,7 +841,7 @@ async fn expand_filter_substring_match() {
                 ]
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-filt",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "FiltVS",
                 "status": "active",
                 "compose": {"include": [{"system": format!("{base}cs")}]}
@@ -859,13 +880,13 @@ async fn expand_filter_substring_match() {
 #[tokio::test]
 async fn expand_hierarchical_returns_nested_tree() {
     let backend = fresh_backend().await;
-    let base = base_url!("exp-hier");
+    let (base, uid) = test_ctx!("exp-hier");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-hier",
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
                 "url": format!("{base}cs"), "name": "HierCS",
                 "status": "active", "content": "complete",
                 "concept": [{"code": "A", "display": "A",
@@ -874,7 +895,7 @@ async fn expand_hierarchical_returns_nested_tree() {
                 }]
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-hier",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "HierVS",
                 "status": "active",
                 "compose": {"include": [{"system": format!("{base}cs")}]}
@@ -912,19 +933,19 @@ async fn expand_hierarchical_returns_nested_tree() {
 #[tokio::test]
 async fn expand_cache_hit_on_second_call() {
     let backend = fresh_backend().await;
-    let base = base_url!("exp-cache");
+    let (base, uid) = test_ctx!("exp-cache");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-cache",
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
                 "url": format!("{base}cs"), "name": "CacheCS",
                 "status": "active", "content": "complete",
                 "concept": [{"code": "X", "display": "X"}]
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-cache",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "CacheVS",
                 "status": "active",
                 "compose": {"include": [{"system": format!("{base}cs")}]}
@@ -957,14 +978,14 @@ async fn expand_cache_hit_on_second_call() {
 #[tokio::test]
 async fn expand_implicit_value_set() {
     let backend = fresh_backend().await;
-    let base = base_url!("exp-impl");
+    let (base, uid) = test_ctx!("exp-impl");
 
     // CodeSystem with a valueSet property pointing to its implicit VS.
     let implicit_vs_url = format!("{base}vs");
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [{"resource": {
-            "resourceType": "CodeSystem", "id": "cs-impl",
+            "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
             "url": format!("{base}cs"),
             "valueSet": implicit_vs_url,
             "name": "ImplCS",
@@ -997,7 +1018,7 @@ async fn expand_implicit_value_set() {
 #[tokio::test]
 async fn expand_max_expansion_size_returns_too_costly() {
     let backend = fresh_backend().await;
-    let base = base_url!("exp-costly");
+    let (base, uid) = test_ctx!("exp-costly");
 
     let concepts: Vec<serde_json::Value> = (0..10)
         .map(|i| serde_json::json!({"code": format!("C{i}"), "display": format!("Concept {i}")}))
@@ -1007,13 +1028,13 @@ async fn expand_max_expansion_size_returns_too_costly() {
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-costly",
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
                 "url": format!("{base}cs"), "name": "CostlyCS",
                 "status": "active", "content": "complete",
                 "concept": concepts
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-costly",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "CostlyVS",
                 "status": "active",
                 "compose": {"include": [{"system": format!("{base}cs")}]}
@@ -1046,19 +1067,19 @@ async fn expand_max_expansion_size_returns_too_costly() {
 #[tokio::test]
 async fn vs_validate_code_in_set_returns_true() {
     let backend = fresh_backend().await;
-    let base = base_url!("vs-vc-true");
+    let (base, uid) = test_ctx!("vs-vc-true");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-vc",
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
                 "url": format!("{base}cs"), "name": "VCCS",
                 "status": "active", "content": "complete",
                 "concept": [{"code": "A", "display": "Alpha"}]
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-vc",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "VCVS",
                 "status": "active",
                 "compose": {"include": [{"system": format!("{base}cs")}]}
@@ -1088,19 +1109,19 @@ async fn vs_validate_code_in_set_returns_true() {
 #[tokio::test]
 async fn vs_validate_code_not_in_set_returns_false() {
     let backend = fresh_backend().await;
-    let base = base_url!("vs-vc-false");
+    let (base, uid) = test_ctx!("vs-vc-false");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-nvc",
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
                 "url": format!("{base}cs"), "name": "NVCCS",
                 "status": "active", "content": "complete",
                 "concept": [{"code": "A", "display": "Alpha"}]
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-nvc",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "NVCVS",
                 "status": "active",
                 "compose": {"include": [{"system": format!("{base}cs")}]}
@@ -1130,19 +1151,19 @@ async fn vs_validate_code_not_in_set_returns_false() {
 #[tokio::test]
 async fn vs_validate_code_display_mismatch_returns_false() {
     let backend = fresh_backend().await;
-    let base = base_url!("vs-vc-disp");
+    let (base, uid) = test_ctx!("vs-vc-disp");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-vcd",
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
                 "url": format!("{base}cs"), "name": "VCDCS",
                 "status": "active", "content": "complete",
                 "concept": [{"code": "A", "display": "Correct Display"}]
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-vcd",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "VCDVS",
                 "status": "active",
                 "compose": {"include": [{"system": format!("{base}cs")}]}
@@ -1174,25 +1195,25 @@ async fn vs_validate_code_display_mismatch_returns_false() {
 #[tokio::test]
 async fn vs_validate_code_system_filter() {
     let backend = fresh_backend().await;
-    let base = base_url!("vs-vc-sys");
+    let (base, uid) = test_ctx!("vs-vc-sys");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-sys1",
+                "resourceType": "CodeSystem", "id": format!("cs1-{uid}"),
                 "url": format!("{base}cs1"), "name": "SysCS1",
                 "status": "active", "content": "complete",
                 "concept": [{"code": "A", "display": "A from CS1"}]
             }},
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-sys2",
+                "resourceType": "CodeSystem", "id": format!("cs2-{uid}"),
                 "url": format!("{base}cs2"), "name": "SysCS2",
                 "status": "active", "content": "complete",
                 "concept": [{"code": "A", "display": "A from CS2"}]
             }},
             {"resource": {
-                "resourceType": "ValueSet", "id": "vs-sys",
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
                 "url": format!("{base}vs"), "name": "SysVS",
                 "status": "active",
                 "compose": {"include": [
@@ -1227,12 +1248,12 @@ async fn vs_validate_code_system_filter() {
 #[tokio::test]
 async fn search_value_sets_by_url() {
     let backend = fresh_backend().await;
-    let base = base_url!("vs-srch-url");
+    let (base, uid) = test_ctx!("vs-srch-url");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [{"resource": {
-            "resourceType": "ValueSet", "id": "vs-srch",
+            "resourceType": "ValueSet", "id": format!("vs-{uid}"),
             "url": format!("{base}vs"), "name": "SrchVS",
             "status": "active"
         }}]
@@ -1259,14 +1280,14 @@ async fn search_value_sets_by_url() {
 #[tokio::test]
 async fn search_value_sets_pagination() {
     let backend = fresh_backend().await;
-    let base = base_url!("vs-srch-page");
+    let (base, uid) = test_ctx!("vs-srch-page");
 
     for i in 0..3u32 {
         let bundle = serde_json::json!({
             "resourceType": "Bundle", "type": "collection",
             "entry": [{"resource": {
                 "resourceType": "ValueSet",
-                "id": format!("vs-pg-{i}"),
+                "id": format!("vs-pg-{i}-{uid}"),
                 "url": format!("{base}vs-{i}"),
                 "name": format!("PgVS{i}"),
                 "status": "active"
@@ -1298,23 +1319,24 @@ async fn search_value_sets_pagination() {
 // ── 4.4 — ConceptMap tests ─────────────────────────────────────────────────────
 
 async fn seed_concept_map(backend: &PostgresTerminologyBackend, base: &str) {
+    let uid = uuid::Uuid::new_v4().simple().to_string();
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-src",
+                "resourceType": "CodeSystem", "id": format!("cs-src-{uid}"),
                 "url": format!("{base}src"), "name": "SrcCS",
                 "status": "active", "content": "complete",
                 "concept": [{"code": "100", "display": "One Hundred"}]
             }},
             {"resource": {
-                "resourceType": "CodeSystem", "id": "cs-tgt",
+                "resourceType": "CodeSystem", "id": format!("cs-tgt-{uid}"),
                 "url": format!("{base}tgt"), "name": "TgtCS",
                 "status": "active", "content": "complete",
                 "concept": [{"code": "200", "display": "Two Hundred"}]
             }},
             {"resource": {
-                "resourceType": "ConceptMap", "id": "cm-test",
+                "resourceType": "ConceptMap", "id": format!("cm-{uid}"),
                 "url": format!("{base}cm"), "name": "TestCM",
                 "status": "active",
                 "group": [{"source": format!("{base}src"), "target": format!("{base}tgt"),
@@ -1355,13 +1377,13 @@ async fn translate_concept_map_basic() {
 #[tokio::test]
 async fn translate_multiple_targets() {
     let backend = fresh_backend().await;
-    let base = base_url!("tr-multi");
+    let (base, uid) = test_ctx!("tr-multi");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "ConceptMap", "id": "cm-multi",
+                "resourceType": "ConceptMap", "id": format!("cm-{uid}"),
                 "url": format!("{base}cm"), "name": "MultiCM",
                 "status": "active",
                 "group": [{"source": format!("{base}src"), "target": format!("{base}tgt"),
@@ -1426,14 +1448,14 @@ async fn translate_no_match_returns_false() {
 #[tokio::test]
 async fn translate_system_filter() {
     let backend = fresh_backend().await;
-    let base = base_url!("tr-sysfilt");
+    let (base, uid) = test_ctx!("tr-sysfilt");
 
     // Two maps: one from base/src1 and one from base/src2
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "ConceptMap", "id": "cm-s1",
+                "resourceType": "ConceptMap", "id": format!("cm1-{uid}"),
                 "url": format!("{base}cm1"), "name": "CM1",
                 "status": "active",
                 "group": [{"source": format!("{base}src1"), "target": format!("{base}tgt"),
@@ -1441,7 +1463,7 @@ async fn translate_system_filter() {
                         "target": [{"code": "X", "equivalence": "equivalent"}]}]}]
             }},
             {"resource": {
-                "resourceType": "ConceptMap", "id": "cm-s2",
+                "resourceType": "ConceptMap", "id": format!("cm2-{uid}"),
                 "url": format!("{base}cm2"), "name": "CM2",
                 "status": "active",
                 "group": [{"source": format!("{base}src2"), "target": format!("{base}tgt"),
@@ -1482,14 +1504,14 @@ async fn translate_system_filter() {
 #[tokio::test]
 async fn translate_map_url_filter() {
     let backend = fresh_backend().await;
-    let base = base_url!("tr-mapurl");
+    let (base, uid) = test_ctx!("tr-mapurl");
 
     // Two maps with the same source code but different target codes
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [
             {"resource": {
-                "resourceType": "ConceptMap", "id": "cm-u1",
+                "resourceType": "ConceptMap", "id": format!("cm1-{uid}"),
                 "url": format!("{base}cm1"), "name": "CMapU1",
                 "status": "active",
                 "group": [{"source": format!("{base}src"), "target": format!("{base}tgt"),
@@ -1497,7 +1519,7 @@ async fn translate_map_url_filter() {
                         "target": [{"code": "P", "equivalence": "equivalent"}]}]}]
             }},
             {"resource": {
-                "resourceType": "ConceptMap", "id": "cm-u2",
+                "resourceType": "ConceptMap", "id": format!("cm2-{uid}"),
                 "url": format!("{base}cm2"), "name": "CMapU2",
                 "status": "active",
                 "group": [{"source": format!("{base}src"), "target": format!("{base}tgt"),
@@ -1613,12 +1635,12 @@ async fn closure_empty_input_returns_empty_map() {
 #[tokio::test]
 async fn closure_unrelated_codes_produce_no_pairs() {
     let backend = fresh_backend().await;
-    let base = base_url!("cl-unrelated");
+    let (base, uid) = test_ctx!("cl-unrelated");
 
     let bundle = serde_json::json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [{"resource": {
-            "resourceType": "CodeSystem", "id": "cs-cl",
+            "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
             "url": format!("{base}cs"), "name": "CLCS",
             "status": "active", "content": "complete",
             "concept": [
@@ -1727,14 +1749,14 @@ async fn search_concept_maps_by_url() {
 #[tokio::test]
 async fn search_concept_maps_pagination() {
     let backend = fresh_backend().await;
-    let base = base_url!("cm-srch-page");
+    let (base, uid) = test_ctx!("cm-srch-page");
 
     for i in 0..3u32 {
         let bundle = serde_json::json!({
             "resourceType": "Bundle", "type": "collection",
             "entry": [{"resource": {
                 "resourceType": "ConceptMap",
-                "id": format!("cm-p{i}"),
+                "id": format!("cm-p{i}-{uid}"),
                 "url": format!("{base}cm-{i}"),
                 "name": format!("PageCM{i}"),
                 "status": "active"
