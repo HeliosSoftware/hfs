@@ -91,7 +91,7 @@ impl SubscriptionEngine {
     ///
     /// This method:
     /// 1. Handles subscription/topic lifecycle events (if the written resource
-    ///    is a Subscription or SubscriptionTopic).
+    ///    is a Subscription, SubscriptionTopic, or an R4 backport Basic topic).
     /// 2. Evaluates the event against all active subscriptions.
     /// 3. Builds and dispatches notifications.
     pub async fn on_resource_event(&self, event: ResourceEvent) {
@@ -104,6 +104,11 @@ impl SubscriptionEngine {
             "SubscriptionTopic" => {
                 self.handle_topic_event(&event).await;
                 return;
+            }
+            "Basic" => {
+                if self.handle_r4_basic_topic_event(&event).await {
+                    return;
+                }
             }
             _ => {}
         }
@@ -231,6 +236,58 @@ impl SubscriptionEngine {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Handle an R4 backport `Basic` topic event.
+    ///
+    /// Returns `true` when the `Basic` resource was recognized as a topic lifecycle
+    /// event (including malformed topic candidates), `false` otherwise.
+    async fn handle_r4_basic_topic_event(&self, event: &ResourceEvent) -> bool {
+        if event.fhir_version.as_str() != "R4" {
+            return false;
+        }
+
+        match event.event_type {
+            ResourceEventType::Delete => {
+                if let Some(resource) = &event.resource {
+                    if let Ok(Some(_)) =
+                        InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource)
+                    {
+                        info!(
+                            resource_id = %event.resource_id,
+                            "R4 Basic SubscriptionTopic deleted"
+                        );
+                        return true;
+                    }
+                }
+                false
+            }
+            ResourceEventType::Create | ResourceEventType::Update => {
+                if let Some(resource) = &event.resource {
+                    match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource) {
+                        Ok(Some(topic)) => {
+                            info!(
+                                topic_url = %topic.canonical_url,
+                                "Registered R4 Basic SubscriptionTopic"
+                            );
+                            self.topic_registry.add_topic(topic);
+                            true
+                        }
+                        Ok(None) => false,
+                        Err(e) => {
+                            warn!(
+                                resource_id = %event.resource_id,
+                                error = %e,
+                                "Failed to parse R4 Basic SubscriptionTopic"
+                            );
+                            true
+                        }
+                    }
+                } else {
+                    false
                 }
             }
         }
@@ -475,6 +532,40 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "R4")]
+    fn r4_basic_topic_event() -> ResourceEvent {
+        ResourceEvent {
+            tenant_id: TenantId::new("t1"),
+            fhir_version: FhirVersion::R4,
+            resource_type: "Basic".to_string(),
+            resource_id: "topic-basic-1".to_string(),
+            version_id: "1".to_string(),
+            event_type: ResourceEventType::Create,
+            resource: Some(json!({
+                "resourceType": "Basic",
+                "id": "topic-basic-1",
+                "code": {
+                    "coding": [{
+                        "system": "http://hl7.org/fhir/fhir-types",
+                        "code": "SubscriptionTopic"
+                    }]
+                },
+                "extension": [{
+                    "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url",
+                    "valueUri": "http://example.org/topic/encounter-start-basic"
+                }, {
+                    "url": "http://hl7.org/fhir/4.3/StructureDefinition/extension-SubscriptionTopic.resourceTrigger",
+                    "extension": [
+                        { "url": "resource", "valueUri": "http://hl7.org/fhir/StructureDefinition/Encounter" },
+                        { "url": "supportedInteraction", "valueCode": "create" }
+                    ]
+                }]
+            })),
+            previous_resource: None,
+            timestamp: Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn test_topic_event_registers_topic() {
         let engine = make_engine("http://localhost:8080");
@@ -486,6 +577,20 @@ mod tests {
         let topics = engine.topic_registry().list_topics();
         assert_eq!(topics.len(), 1);
         assert!(topics.contains(&"http://example.org/topic/encounter-start".to_string()));
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_r4_basic_topic_event_registers_topic() {
+        let engine = make_engine("http://localhost:8080");
+
+        assert!(engine.topic_registry().list_topics().is_empty());
+
+        engine.on_resource_event(r4_basic_topic_event()).await;
+
+        let topics = engine.topic_registry().list_topics();
+        assert_eq!(topics.len(), 1);
+        assert!(topics.contains(&"http://example.org/topic/encounter-start-basic".to_string()));
     }
 
     #[tokio::test]
