@@ -16,19 +16,48 @@ For terminologies where redistribution is permitted, the data is bundled directl
 
 ## Features
 
-- All six standard FHIR terminology operations: `$lookup`, `$validate-code`, `$subsumes`, `$expand`, `$translate`, `$closure`
-- CRUD and search for CodeSystem, ValueSet, and ConceptMap resources
-- Batch endpoint supporting `$validate-code` and `$translate` in a single request
-- Bulk import CLI for major terminology distributions: SNOMED CT RF2, LOINC, ICD-10-CM, ICD-9-CM, RxNorm, UCUM, NCI Thesaurus, MeSH, DICOM, HL7 v2 tables, NUCC Provider Taxonomy, and HL7 FHIR NPM packages
-- Automatic format detection — no `--format` flag needed for most files
-- SQLite and PostgreSQL backends with auto-migration on startup (no manual schema setup)
-- `$expand` with lazy evaluation and materialized cache: expansions are computed once and cached across requests
-- `$subsumes` via recursive CTE over a pre-materialized hierarchy table — no runtime graph traversal
-- `$closure` for transitive closure over concept hierarchy and ConceptMap mappings
-- Implicit ValueSet expansion: when a CodeSystem's `valueSet` URL is requested and no explicit ValueSet exists, all codes in that system are returned (FHIR R5 §4.8.7)
+### Terminology Operations
+
+All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-service.html) operations:
+
+| Operation | Spec | Description |
+|-----------|------|-------------|
+| `$lookup` | [CodeSystem/$lookup](https://hl7.org/fhir/codesystem-operation-lookup.html) | Look up display name and properties for a code |
+| `$validate-code` | [CodeSystem/$validate-code](https://hl7.org/fhir/codesystem-operation-validate-code.html) | Validate a code against a CodeSystem or ValueSet |
+| `$subsumes` | [CodeSystem/$subsumes](https://hl7.org/fhir/codesystem-operation-subsumes.html) | Test concept hierarchy (subsumes / subsumed-by / equivalent / not-subsumed) via recursive CTE — no runtime graph traversal |
+| `$expand` | [ValueSet/$expand](https://hl7.org/fhir/valueset-operation-expand.html) | Expand a ValueSet with lazy evaluation and materialized cache (computed once, cached across requests) |
+| `$translate` | [ConceptMap/$translate](https://hl7.org/fhir/conceptmap-operation-translate.html) | Translate a code using a ConceptMap |
+| `$closure` | [ConceptMap/$closure](https://hl7.org/fhir/conceptmap-operation-closure.html) | Compute transitive closure over a concept hierarchy and ConceptMap mappings |
+
+- [CRUD and search](https://hl7.org/fhir/http.html) for CodeSystem, ValueSet, and ConceptMap resources
+- [Batch](https://hl7.org/fhir/http.html#transaction) endpoint supporting `$validate-code` and `$translate` in a single request
+- Implicit ValueSet expansion: when a CodeSystem's `valueSet` URL is requested and no explicit ValueSet exists, all codes in that system are returned ([FHIR R5 §4.8.7](https://hl7.org/fhir/codesystem.html#implicit))
 - Dual `/metadata` response modes: `CapabilityStatement` (default) and `TerminologyCapabilities`
 - Content negotiation (JSON / XML)
 - CORS support
+
+### Supported Terminologies
+
+Terminologies marked **✅ Bundled** are included in the release distribution — no separate download or registration required. Terminologies marked **🔑 License required** must be obtained from the issuing authority before import.
+
+| Terminology | Authority | Distribution | License / How to obtain |
+|-------------|-----------|-------------|--------------------------|
+| [HL7 FHIR Core (THO)](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | Free — redistribution with attribution |
+| [ICD-10-CM](https://www.cdc.gov/nchs/icd/icd-10-cm/index.html) | [U.S. CDC / NCHS](https://www.cdc.gov) | ✅ Bundled | Public domain (US federal government work) |
+| [ICD-9-CM](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles) | [U.S. NCHS / CMS](https://www.cms.gov) | ✅ Bundled | Public domain — retired 2015, for legacy data only |
+| [UCUM](https://ucum.org) | [Regenstrief Institute](https://www.regenstrief.org) | ✅ Bundled | Free, permissive — also included in the THO package |
+| [NCI Thesaurus (NCIt)](https://evs.nci.nih.gov) | [U.S. National Cancer Institute](https://www.cancer.gov) | ✅ Bundled | Public domain |
+| [MeSH](https://www.nlm.nih.gov/mesh/) | [U.S. National Library of Medicine](https://www.nlm.nih.gov) | ✅ Bundled | Public domain |
+| [DICOM](https://www.dicomstandard.org) | [NEMA](https://www.nema.org) | ✅ Bundled | Free, publicly available |
+| [HL7 v2 tables](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | HL7 FHIR License (free with attribution) — also included in the THO package |
+| [NUCC Provider Taxonomy](https://www.nucc.org) | [NUCC](https://www.nucc.org) | ✅ Bundled | Free |
+| [SNOMED CT](https://www.snomed.org) | [SNOMED International](https://www.snomed.org) | 🔑 License required | Free in [~50 member countries](https://www.snomed.org/snomed-ct/get-snomed); paid elsewhere. [Register via MLDS](https://mlds.ihtsdotools.org/) or your [National Release Center](https://www.snomed.org/snomed-ct/get-snomed). US users: [nlm.nih.gov/healthit/snomedct](https://www.nlm.nih.gov/healthit/snomedct/index.html). |
+| [LOINC](https://loinc.org) | [Regenstrief Institute](https://www.regenstrief.org) | 🔑 License required | Free — [create a free account at loinc.org](https://loinc.org/download/) to download. |
+| [RxNorm](https://www.nlm.nih.gov/research/umls/rxnorm/overview.html) | [U.S. National Library of Medicine](https://www.nlm.nih.gov) | 🔑 License required | Free — [create a free UMLS account at uts.nlm.nih.gov](https://uts.nlm.nih.gov) and accept the [NLM Terms of Service](https://www.nlm.nih.gov/research/umls/rxnorm/docs/termsofservice.html). |
+
+- Bulk import CLI for all terminologies above — see [Supported Terminologies](#supported-terminologies-1) for per-terminology instructions
+- Automatic format detection — no `--format` flag needed for most files
+- SQLite and PostgreSQL backends with auto-migration on startup (no manual schema setup)
 
 ## Quick Start
 
