@@ -20,6 +20,223 @@
 pub const ANATOMY_CS_URL: &str = "http://hts.test/anatomy";
 pub const LIMBS_VS_URL: &str = "http://hts.test/vs/limbs";
 
+// ── ECL ValueSet fixtures ──────────────────────────────────────────────────────
+
+/// URL of the ValueSet whose compose filter uses an ECL `constraint` expression.
+pub const ECL_CONSTRAINT_VS_URL: &str = "http://hts.test/vs/ecl-descendants-of-limb";
+
+/// URL of the ValueSet whose compose filter uses `concept is-a` subsumption.
+pub const ECL_ISA_VS_URL: &str = "http://hts.test/vs/ecl-isa-limb";
+
+/// URL of the ValueSet using ECL `< limb` (strict descendants — limb excluded).
+pub const ECL_STRICT_DESC_VS_URL: &str = "http://hts.test/vs/ecl-strict-descendants-of-limb";
+
+/// URL of the ValueSet using ECL `>> arm` (ancestors of arm, including arm).
+pub const ECL_ANCESTORS_VS_URL: &str = "http://hts.test/vs/ecl-ancestors-of-arm";
+
+/// URL of the ValueSet using ECL `<< body MINUS << limb`.
+pub const ECL_MINUS_VS_URL: &str = "http://hts.test/vs/ecl-minus";
+
+/// URL of the ValueSet using ECL `<< limb OR head`.
+pub const ECL_OR_VS_URL: &str = "http://hts.test/vs/ecl-or";
+
+/// URL of the ValueSet using ECL `<< limb AND << body` (both filters on one include).
+pub const ECL_AND_FILTER_VS_URL: &str = "http://hts.test/vs/ecl-and-filter";
+
+/// A Bundle containing the anatomy CodeSystem and several ECL-filtered ValueSets.
+///
+/// Hierarchy:
+/// ```text
+/// body
+/// ├─ limb
+/// │   ├─ arm
+/// │   └─ leg
+/// └─ head
+/// ```
+pub fn ecl_bundle() -> &'static str {
+    r#"{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "CodeSystem",
+        "id": "anatomy-ecl",
+        "url": "http://hts.test/anatomy",
+        "version": "1.0",
+        "name": "AnatomyCS",
+        "status": "active",
+        "content": "complete",
+        "concept": [
+          {
+            "code": "body",
+            "display": "Body",
+            "concept": [
+              {
+                "code": "limb",
+                "display": "Limb",
+                "concept": [
+                  { "code": "arm", "display": "Arm" },
+                  { "code": "leg", "display": "Leg" }
+                ]
+              },
+              { "code": "head", "display": "Head" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "ecl-descendants-of-limb",
+        "url": "http://hts.test/vs/ecl-descendants-of-limb",
+        "version": "1.0",
+        "name": "EclDescendantsOfLimb",
+        "status": "active",
+        "compose": {
+          "include": [{
+            "system": "http://hts.test/anatomy",
+            "filter": [{
+              "property": "constraint",
+              "op": "=",
+              "value": "<< limb"
+            }]
+          }]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "ecl-isa-limb",
+        "url": "http://hts.test/vs/ecl-isa-limb",
+        "version": "1.0",
+        "name": "EclIsaLimb",
+        "status": "active",
+        "compose": {
+          "include": [{
+            "system": "http://hts.test/anatomy",
+            "filter": [{
+              "property": "concept",
+              "op": "is-a",
+              "value": "limb"
+            }]
+          }]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "ecl-strict-descendants-of-limb",
+        "url": "http://hts.test/vs/ecl-strict-descendants-of-limb",
+        "version": "1.0",
+        "name": "EclStrictDescendantsOfLimb",
+        "status": "active",
+        "compose": {
+          "include": [{
+            "system": "http://hts.test/anatomy",
+            "filter": [{
+              "property": "constraint",
+              "op": "=",
+              "value": "< limb"
+            }]
+          }]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "ecl-ancestors-of-arm",
+        "url": "http://hts.test/vs/ecl-ancestors-of-arm",
+        "version": "1.0",
+        "name": "EclAncestorsOfArm",
+        "status": "active",
+        "compose": {
+          "include": [{
+            "system": "http://hts.test/anatomy",
+            "filter": [{
+              "property": "constraint",
+              "op": "=",
+              "value": ">> arm"
+            }]
+          }]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "ecl-minus",
+        "url": "http://hts.test/vs/ecl-minus",
+        "version": "1.0",
+        "name": "EclMinus",
+        "status": "active",
+        "compose": {
+          "include": [{
+            "system": "http://hts.test/anatomy",
+            "filter": [{
+              "property": "constraint",
+              "op": "=",
+              "value": "<< body MINUS << limb"
+            }]
+          }]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "ecl-or",
+        "url": "http://hts.test/vs/ecl-or",
+        "version": "1.0",
+        "name": "EclOr",
+        "status": "active",
+        "compose": {
+          "include": [{
+            "system": "http://hts.test/anatomy",
+            "filter": [{
+              "property": "constraint",
+              "op": "=",
+              "value": "<< limb OR head"
+            }]
+          }]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "ecl-and-filter",
+        "url": "http://hts.test/vs/ecl-and-filter",
+        "version": "1.0",
+        "name": "EclAndFilter",
+        "status": "active",
+        "compose": {
+          "include": [{
+            "system": "http://hts.test/anatomy",
+            "filter": [
+              {
+                "property": "constraint",
+                "op": "=",
+                "value": "<< limb"
+              },
+              {
+                "property": "constraint",
+                "op": "=",
+                "value": "<< body"
+              }
+            ]
+          }]
+        }
+      }
+    }
+  ]
+}"#
+}
+
 // ── Implicit ValueSet bundle ───────────────────────────────────────────────────
 
 /// URL of the implicit ValueSet declared on `IMPLICIT_CS_URL` via `.valueSet`.

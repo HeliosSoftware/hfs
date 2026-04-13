@@ -41,6 +41,7 @@ use helios_persistence::tenant::TenantContext;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 
+use crate::ecl;
 use crate::error::HtsError;
 use crate::traits::ValueSetOperations;
 use crate::types::{
@@ -449,7 +450,11 @@ fn compute_expansion(
             }
         };
 
-        if let Some(explicit_codes) = inc["concept"].as_array() {
+        // Check for ECL / is-a filters before falling through to the explicit
+        // code list or "all concepts" paths.
+        if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc)? {
+            included.extend(filter_result);
+        } else if let Some(explicit_codes) = inc["concept"].as_array() {
             // Explicit code list: fetch display for each listed code.
             for entry in explicit_codes {
                 let code = match entry["code"].as_str() {
@@ -476,7 +481,8 @@ fn compute_expansion(
                 });
             }
         } else {
-            // No explicit codes: include ALL concepts from the referenced system.
+            // No explicit codes and no filters: include ALL concepts from the
+            // referenced system.
             let mut stmt = conn
                 .prepare("SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code")
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -519,6 +525,107 @@ fn compute_expansion(
     }
 
     Ok(included)
+}
+
+/// Evaluate any ECL or `is-a` filters declared on a compose include clause.
+///
+/// When a `compose.include[]` entry carries a `filter` array, this function
+/// evaluates every entry in that array and returns the resulting concept set.
+/// Multiple filters on the same include clause are **intersected** (AND
+/// semantics), matching the behaviour described in FHIR R5 §4.9.5.
+///
+/// # Return value
+///
+/// | Case | Return |
+/// |------|--------|
+/// | No `filter` key, or `filter` is an empty array | `Ok(None)` — caller should use the normal code-list / all-concepts path |
+/// | At least one recognised filter evaluated successfully | `Ok(Some(concepts))` |
+/// | All filter entries have an unrecognised `property`/`op` | `Ok(Some([]))` — an empty expansion (not all concepts) |
+/// | A recognised filter fails to parse or evaluate | `Err(_)` |
+///
+/// # Recognised filters
+///
+/// | `property`   | `op`   | Interpretation |
+/// |--------------|--------|----------------|
+/// | `constraint` | `=`    | Full ECL expression (e.g. `<< 404684003 \|Finding\|`) |
+/// | `concept`    | `is-a` | Subsumption shorthand — translated to `<< <value>` |
+///
+/// Unrecognised `(property, op)` pairs emit a `WARN` trace event and are
+/// treated as yielding an empty set so they do not silently expand the whole
+/// code system.
+fn apply_compose_filters(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    inc: &serde_json::Value,
+) -> Result<Option<Vec<ExpansionContains>>, HtsError> {
+    let filters = match inc["filter"].as_array() {
+        Some(f) if !f.is_empty() => f,
+        _ => return Ok(None),
+    };
+
+    // `result` starts as `None` (no filters processed yet).  After the first
+    // recognised filter it becomes `Some(set)`.  Subsequent recognised filters
+    // are intersected into that set.  Unrecognised filters shrink the set to
+    // empty (rather than being ignored) so they cannot expand it.
+    let mut result: Option<Vec<ExpansionContains>> = None;
+    let mut any_filter_seen = false;
+
+    for f in filters {
+        let property = f["property"].as_str().unwrap_or("");
+        let op = f["op"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+
+        let ecl_expr: String = match (property, op) {
+            ("constraint", "=") => value.to_owned(),
+            ("concept", "is-a") => format!("<< {value}"),
+            _ => {
+                tracing::warn!(
+                    property,
+                    op,
+                    "Unsupported compose filter — treating as empty set"
+                );
+                // Mark that we saw a filter so we don't fall through to
+                // all-concepts, then intersect with empty to zero out any
+                // previously accumulated set.
+                any_filter_seen = true;
+                result = Some(vec![]);
+                continue;
+            }
+        };
+
+        any_filter_seen = true;
+        let resolved = ecl::parse_and_evaluate(conn, system_id, &ecl_expr)?;
+        let concepts: Vec<ExpansionContains> = resolved
+            .into_iter()
+            .map(|c| ExpansionContains {
+                system: system_url.to_owned(),
+                code: c.code,
+                display: c.display,
+                inactive: None,
+                contains: vec![],
+            })
+            .collect();
+
+        match result.as_mut() {
+            // Intersect with the running result (AND semantics).
+            Some(prev) => {
+                let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
+                prev.retain(|c| keep.contains(&c.code));
+            }
+            None => result = Some(concepts),
+        }
+    }
+
+    // If we processed at least one filter entry (even if all were unrecognised)
+    // return Some(result) so the caller does not fall back to all-concepts.
+    // If result is still None at this point it means every filter was
+    // unrecognised → return an empty expansion.
+    if any_filter_seen && result.is_none() {
+        return Ok(Some(vec![]));
+    }
+
+    Ok(result)
 }
 
 /// Find the canonical URL of a CodeSystem whose `valueSet` property equals `vs_url`.

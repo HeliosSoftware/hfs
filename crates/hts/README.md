@@ -36,26 +36,31 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 - Content negotiation (JSON / XML)
 - CORS support
 
-### Supported Terminologies
+### Terminologies
 
-Terminologies marked **✅ Bundled** are included in the release distribution — no separate download or registration required. Terminologies marked **🔑 License required** must be obtained from the issuing authority before import.
-
-| Terminology | Authority | Distribution | License / How to obtain |
-|-------------|-----------|-------------|--------------------------|
+| Terminology | Authority | Import | License / How to obtain |
+|-------------|-----------|--------|--------------------------|
 | [HL7 FHIR Core (THO)](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | Free — redistribution with attribution |
 | [ICD-10-CM](https://www.cdc.gov/nchs/icd/icd-10-cm/index.html) | [U.S. CDC / NCHS](https://www.cdc.gov) | ✅ Bundled | Public domain (US federal government work) |
-| [ICD-9-CM](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles) | [U.S. NCHS / CMS](https://www.cms.gov) | ✅ Bundled | Public domain — retired 2015, for legacy data only |
-| [UCUM](https://ucum.org) | [Regenstrief Institute](https://www.regenstrief.org) | ✅ Bundled | Free, permissive — also included in the THO package |
+| [ICD-9-CM](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles) | [U.S. NCHS / CMS](https://www.cms.gov) | ✅ Bundled | Public domain — retired 2015, legacy data only |
+| [UCUM](https://ucum.org) | [Regenstrief Institute](https://www.regenstrief.org) | ✅ Bundled | Free, permissive — also in the THO package |
 | [NCI Thesaurus (NCIt)](https://evs.nci.nih.gov) | [U.S. National Cancer Institute](https://www.cancer.gov) | ✅ Bundled | Public domain |
 | [MeSH](https://www.nlm.nih.gov/mesh/) | [U.S. National Library of Medicine](https://www.nlm.nih.gov) | ✅ Bundled | Public domain |
 | [DICOM](https://www.dicomstandard.org) | [NEMA](https://www.nema.org) | ✅ Bundled | Free, publicly available |
-| [HL7 v2 tables](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | HL7 FHIR License (free with attribution) — also included in the THO package |
+| [HL7 v2 tables](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | HL7 FHIR License (free with attribution) — also in the THO package |
 | [NUCC Provider Taxonomy](https://www.nucc.org) | [NUCC](https://www.nucc.org) | ✅ Bundled | Free |
+| [NDC](https://www.fda.gov/drugs/drug-approvals-and-databases/national-drug-code-directory) | [U.S. FDA](https://www.fda.gov) | ✅ Bundled | Public domain (US federal government work) |
 | [SNOMED CT](https://www.snomed.org) | [SNOMED International](https://www.snomed.org) | 🔑 License required | Free in [~50 member countries](https://www.snomed.org/snomed-ct/get-snomed); paid elsewhere. [Register via MLDS](https://mlds.ihtsdotools.org/) or your [National Release Center](https://www.snomed.org/snomed-ct/get-snomed). US users: [nlm.nih.gov/healthit/snomedct](https://www.nlm.nih.gov/healthit/snomedct/index.html). |
 | [LOINC](https://loinc.org) | [Regenstrief Institute](https://www.regenstrief.org) | 🔑 License required | Free — [create a free account at loinc.org](https://loinc.org/download/) to download. |
 | [RxNorm](https://www.nlm.nih.gov/research/umls/rxnorm/overview.html) | [U.S. National Library of Medicine](https://www.nlm.nih.gov) | 🔑 License required | Free — [create a free UMLS account at uts.nlm.nih.gov](https://uts.nlm.nih.gov) and accept the [NLM Terms of Service](https://www.nlm.nih.gov/research/umls/rxnorm/docs/termsofservice.html). |
+| [HCPCS Level II](https://www.cms.gov/medicare/coding-billing/healthcare-common-procedure-system) | [U.S. CMS](https://www.cms.gov) | 🚫 Not supported | Public domain (US gov). |
+| [ICD-11](https://icd.who.int) | [WHO](https://www.who.int) | 🚫 Not supported | Free ([CC BY-ND 3.0 IGO](https://creativecommons.org/licenses/by-nd/3.0/igo/)). |
+| [CPT](https://www.ama-assn.org/practice-management/cpt) | [AMA](https://www.ama-assn.org) | 🚫 Not supported | Proprietary — paid AMA license required. [Contact AMA for licensing](https://www.ama-assn.org/practice-management/cpt/cpt-licensing-frequently-asked-questions-faqs). |
+| [MedDRA](https://www.meddra.org) | [MSSO](https://www.meddra.org) | 🚫 Not supported | Proprietary — paid MSSO license required. [Contact MedDRA](https://www.meddra.org). |
 
-- Bulk import CLI for all terminologies above — see [Supported Terminologies](#supported-terminologies-1) for per-terminology instructions
+**Legend:** ✅ Bundled — no separate download needed. 🔑 License required — freely available, but registration or terms acceptance required. 🚧 Not yet — importer not yet implemented; open an issue. 🚫 Not planned — proprietary data that requires a paid license.
+
+- Bulk import CLI for all supported terminologies — see [Supported Terminologies](#supported-terminologies-1) for per-terminology instructions
 - Automatic format detection — no `--format` flag needed for most files
 - SQLite and PostgreSQL backends with auto-migration on startup (no manual schema setup)
 
@@ -255,6 +260,9 @@ hts import ./hl7-v2-tables.xml --format hl7-v2-tables
 # NUCC Provider Taxonomy (free, from nucc.org)
 hts import ./nucc_taxonomy_240.csv
 
+# NDC Directory (free, public domain — from accessdata.fda.gov/cder/ndctext.zip)
+hts import ./ndctext.zip
+
 # Dry run — parse without writing to database
 hts import ./package.tgz --dry-run --verbose
 ```
@@ -268,7 +276,7 @@ Arguments:
 Options:
       --format <FORMAT>            Terminology format (auto-detected when omitted)
                                    [possible values: hl7-npm, snomed-rf2, loinc, icd10-cm,
-                                    icd9-cm, rxnorm, ucum, nci-thesaurus, mesh, dicom,
+                                    icd9-cm, rxnorm, ndc, ucum, nci-thesaurus, mesh, dicom,
                                     hl7-v2-tables, nucc]
       --database-url <URL>         Database URL [env: HTS_DATABASE_URL=] [default: ./data/hts.db]
       --storage-backend <BACKEND>  Storage backend [env: HTS_STORAGE_BACKEND=] [default: sqlite]
@@ -298,6 +306,9 @@ Options:
 | `.zip` containing `*ucum*.xml` | `ucum` |
 | `.zip` containing `*dicom*.csv` or `*dcm*.csv` | `dicom` |
 | `.zip` containing `*nucc*.csv` | `nucc` |
+| `product.txt` (exact name) | `ndc` |
+| file/path containing `ndctext` | `ndc` |
+| `.zip` containing `product.txt` | `ndc` |
 
 `.zip` files that match none of the above patterns require `--format`.
 
@@ -625,17 +636,6 @@ Without `HFS_TERMINOLOGY_SERVER`, these features fall back to empty results or `
 
 HTS is the engine — terminology data is not bundled. Each terminology has its own license, and you must obtain the data from its issuing authority before importing it.
 
-### Supported Terminologies
-
-| Terminology | FHIR URI | Cost | How to get it |
-|-------------|----------|------|---------------|
-| **HL7 FHIR Core (THO)** | `http://hl7.org/fhir/...` | Free | [terminology.hl7.org/en/downloads.html](https://terminology.hl7.org/en/downloads.html) |
-| **ICD-10-CM** | `http://hl7.org/fhir/sid/icd-10-cm` | Free | [cdc.gov — ICD-10-CM files](https://www.cdc.gov/nchs/icd/icd-10-cm/files.html) |
-| **CVX** (vaccine codes) | `http://hl7.org/fhir/sid/cvx` | Free | Included in the THO package — no separate import needed |
-| **SNOMED CT** | `http://snomed.info/sct` | Free in [~50 member countries](https://www.snomed.org/snomed-ct/get-snomed) | Register via [MLDS](https://mlds.ihtsdotools.org/) or your country's NRC |
-| **LOINC** | `http://loinc.org` | Free | Create a free account at [loinc.org](https://loinc.org) |
-| **RxNorm** | `http://www.nlm.nih.gov/research/umls/rxnorm` | Free | Create a free UMLS account at [uts.nlm.nih.gov](https://uts.nlm.nih.gov) |
-
 > **Note:** HTS has no licensing cost. The data you load is governed by each terminology's own license — make sure you've accepted the relevant terms before importing.
 
 ---
@@ -746,48 +746,4 @@ National Institutes of Health, Department of Health and Human Services.
 
 ---
 
-### Additional Terminologies
-
-The following terminologies are freely redistributable and supported by HTS standalone importers.
-
-| Terminology | FHIR URI | License | How to get it |
-|-------------|----------|---------|---------------|
-| **UCUM** | `http://unitsofmeasure.org` | Free, permissive | [github.com/ucum-org/ucum/releases](https://github.com/ucum-org/ucum/releases) — also bundled in the THO package |
-| **NCI Thesaurus (NCIt)** | `http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl` | Free, public domain | [evs.nci.nih.gov/ftp1/NCI_Thesaurus](https://evs.nci.nih.gov/ftp1/NCI_Thesaurus/) |
-| **MeSH** | `http://www.nlm.nih.gov/mesh` | Free, public domain | [nlm.nih.gov/databases/download/mesh.html](https://www.nlm.nih.gov/databases/download/mesh.html) |
-| **DICOM** | `http://dicom.nema.org/resources/ontology/DCM` | Free, publicly available | [dicomstandard.org/current](https://www.dicomstandard.org/current/) — export Part 16 code table as CSV |
-| **HL7 v2 tables** | `http://terminology.hl7.org/CodeSystem/v2-...` | HL7 FHIR License | [terminology.hl7.org](https://terminology.hl7.org) — also bundled in the THO package |
-| **NUCC** (Provider Taxonomy) | `http://nucc.org/provider-taxonomy` | Free | [nucc.org — CSV downloads](https://www.nucc.org/index.php/code-sets-mainmenu-41/provider-taxonomy-mainmenu-40/csv-mainmenu-57) |
-
 > **Note:** UCUM and HL7 v2 tables are already included in the HL7 THO NPM package. If you've already run `hts import <tgz>`, no separate import is needed for those two.
-
----
-
-### Not Yet Supported
-
-| Terminology | Reason |
-|-------------|--------|
-| **CPT** | Proprietary — requires a paid AMA license. Contact [ama-assn.org](https://www.ama-assn.org/practice-management/cpt/cpt-licensing-frequently-asked-questions-faqs) for licensing. Open an issue if you need the importer. |
-| **HCPCS Level II** | Public domain (US gov). Importer not yet implemented — open an issue. |
-| **ICD-11** | Free ([CC BY-ND 3.0 IGO](https://creativecommons.org/licenses/by-nd/3.0/igo/)). Importer not yet implemented — WHO adoption is still early. |
-| **MedDRA** | Proprietary — requires a paid MSSO license. Contact [meddra.org](https://www.meddra.org). |
-| **NDC** | Public domain (FDA). Importer not yet implemented. |
-
-> UCUM, NCI Thesaurus, MeSH, DICOM, HL7 v2 tables, and NUCC provider taxonomy are all freely redistributable. Most arrive via the HL7 THO package — no separate import required. Open an issue for any that you need as a standalone importer.
-
-## FHIR Version Support
-
-Build with specific FHIR versions using feature flags:
-
-```bash
-# R4 only (default)
-cargo build -p helios-hts
-
-# R5 only
-cargo build -p helios-hts --no-default-features --features R5,sqlite
-
-# All versions
-cargo build -p helios-hts --features R4,R4B,R5,R6,sqlite
-```
-
-The default feature set is `R4,sqlite`. The `TerminologyCapabilities` response is typed to the active FHIR version; on non-R4 builds without an explicit `#[cfg(feature)]` match, a minimal JSON fallback is returned.

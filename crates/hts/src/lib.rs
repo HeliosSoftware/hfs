@@ -38,6 +38,7 @@
 
 pub mod backends;
 pub mod config;
+pub mod ecl;
 pub mod error;
 pub mod import;
 pub mod operations;
