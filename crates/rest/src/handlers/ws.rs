@@ -4,38 +4,28 @@
 //! after obtaining a binding token via `$get-ws-binding-token`.
 //!
 //! The protocol is unidirectional (server → client): the server streams
-//! notification bundles as JSON text frames. Client messages are ignored
-//! (pings/pongs are handled automatically by axum).
+//! notification bundles as JSON text frames after the client sends a
+//! `bind-with-token <token>` message.
 
 use std::sync::Arc;
 
 use axum::{
-    extract::ws::{Message, WebSocket},
-    extract::{Query, State, WebSocketUpgrade},
+    extract::ws::{CloseFrame, Message, WebSocket},
+    extract::{State, WebSocketUpgrade},
     response::Response,
 };
 use helios_persistence::core::ResourceStorage;
-use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::error::{RestError, RestResult};
 use crate::state::AppState;
 
-/// Query parameters for the WebSocket bind endpoint.
-#[derive(Deserialize)]
-pub struct WsBindQuery {
-    /// The binding token obtained from `$get-ws-binding-token`.
-    token: String,
-}
-
 /// WebSocket binding handler.
 ///
-/// The client connects to `/ws/subscriptions/bind?token=<binding-token>`.
-/// The server validates the token, upgrades the connection, sends a handshake
-/// notification, and then streams notifications as they arrive.
+/// The client connects to `/ws/subscriptions/bind` and then sends
+/// `bind-with-token <binding-token>` as the first message.
 pub async fn ws_bind_handler<S>(
     State(state): State<AppState<S>>,
-    Query(query): Query<WsBindQuery>,
     ws: WebSocketUpgrade,
 ) -> RestResult<Response>
 where
@@ -47,72 +37,67 @@ where
             feature: "Subscriptions".to_string(),
         })?;
 
+    let engine = Arc::clone(engine);
+    let base_url = state.base_url().to_string();
+
+    // Upgrade the HTTP connection to WebSocket.
+    Ok(ws.on_upgrade(move |socket| handle_ws_connection(socket, engine, base_url)))
+}
+
+/// Handles the WebSocket connection lifecycle after upgrade.
+///
+/// Waits for a `bind-with-token` message, sends a handshake notification,
+/// then streams events from the subscription engine until disconnect.
+async fn handle_ws_connection(
+    mut socket: WebSocket,
+    engine: Arc<helios_subscriptions::SubscriptionEngine>,
+    base_url: String,
+) {
+    let token = match receive_bind_token(&mut socket).await {
+        Some(token) => token,
+        None => return,
+    };
+
     // Validate and consume the binding token (single-use).
-    let (tenant_id, subscription_id) = engine
-        .ws_token_manager()
-        .validate_and_consume(&query.token)
-        .ok_or(RestError::Unauthorized {
-            message: "Invalid or expired WebSocket binding token".to_string(),
-        })?;
+    let (tenant_id, subscription_id) = match engine.ws_token_manager().validate_and_consume(&token)
+    {
+        Some(binding) => binding,
+        None => {
+            warn!("Invalid or expired WebSocket binding token");
+            close_with_policy_violation(&mut socket, "invalid-or-expired-token").await;
+            return;
+        }
+    };
 
     // Verify subscription still exists.
-    let sub = engine
+    let sub = match engine
         .manager()
         .get_subscription(&tenant_id, &subscription_id)
-        .ok_or(RestError::NotFound {
-            resource_type: "Subscription".to_string(),
-            id: subscription_id.clone(),
-        })?;
+    {
+        Some(sub) => sub,
+        None => {
+            warn!(subscription_id = %subscription_id, "Subscription not found for binding token");
+            close_with_policy_violation(&mut socket, "subscription-not-found").await;
+            return;
+        }
+    };
 
     // Register this client with the WebSocket manager.
-    let (client_id, rx) = engine
+    let (client_id, mut rx) = engine
         .ws_manager()
         .register_client(&tenant_id, &subscription_id);
-
-    // Build handshake notification to send immediately after upgrade.
-    let handshake_bundle =
-        helios_subscriptions::notification::build_handshake(&sub, state.base_url());
-
     let ws_manager = Arc::clone(engine.ws_manager());
-    let tenant_id_owned = tenant_id.clone();
-    let sub_id_owned = subscription_id.clone();
-    let client_id_owned = client_id.clone();
 
     info!(
         tenant_id = %tenant_id,
         subscription_id = %subscription_id,
         client_id = %client_id,
-        "WebSocket client binding"
+        "WebSocket client bound with token"
     );
 
-    // Upgrade the HTTP connection to WebSocket.
-    Ok(ws.on_upgrade(move |socket| {
-        handle_ws_connection(
-            socket,
-            rx,
-            ws_manager,
-            tenant_id_owned,
-            sub_id_owned,
-            client_id_owned,
-            handshake_bundle,
-        )
-    }))
-}
+    // Build handshake notification after successful bind.
+    let handshake_bundle = helios_subscriptions::notification::build_handshake(&sub, &base_url);
 
-/// Handles the WebSocket connection lifecycle after upgrade.
-///
-/// Sends a handshake notification first, then streams events from the
-/// subscription engine until the client disconnects or the subscription
-/// is deregistered.
-async fn handle_ws_connection(
-    mut socket: WebSocket,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
-    ws_manager: Arc<helios_subscriptions::WebSocketManager>,
-    tenant_id: String,
-    subscription_id: String,
-    client_id: String,
-    handshake_bundle: Result<serde_json::Value, helios_subscriptions::SubscriptionError>,
-) {
     // Send handshake notification as the first message.
     if let Ok(bundle) = handshake_bundle {
         match serde_json::to_string(&bundle) {
@@ -183,8 +168,19 @@ async fn handle_ws_connection(
                         );
                         break;
                     }
+                    Some(Ok(Message::Text(text))) => {
+                        if parse_bind_with_token_message(text.as_ref()).is_some() {
+                            warn!(
+                                client_id = %client_id,
+                                "Received additional bind-with-token message after initial bind"
+                            );
+                            close_with_policy_violation(&mut socket, "single-bind-only").await;
+                            break;
+                        }
+                        // Ignore non-bind client messages.
+                    }
                     Some(Ok(_)) => {
-                        // Ignore other client messages.
+                        // Ignore other client messages (ping/pong/binary).
                     }
                     Some(Err(e)) => {
                         warn!(
@@ -206,4 +202,70 @@ async fn handle_ws_connection(
         subscription_id = %subscription_id,
         "WebSocket client disconnected"
     );
+}
+
+async fn receive_bind_token(socket: &mut WebSocket) -> Option<String> {
+    match socket.recv().await {
+        Some(Ok(Message::Text(text))) => {
+            if let Some(token) = parse_bind_with_token_message(text.as_ref()) {
+                Some(token.to_string())
+            } else {
+                warn!("Invalid websocket bind message");
+                close_with_policy_violation(socket, "expected-bind-with-token").await;
+                None
+            }
+        }
+        Some(Ok(Message::Close(_))) | None => {
+            debug!("WebSocket disconnected before bind");
+            None
+        }
+        Some(Ok(_)) => {
+            warn!("WebSocket bind expects first message to be text");
+            close_with_policy_violation(socket, "expected-text-bind-message").await;
+            None
+        }
+        Some(Err(e)) => {
+            warn!(error = %e, "WebSocket error before bind");
+            None
+        }
+    }
+}
+
+fn parse_bind_with_token_message(message: &str) -> Option<&str> {
+    let trimmed = message.trim();
+    let rest = trimmed.strip_prefix("bind-with-token")?;
+    let token = rest.trim_start_matches(':').trim();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+async fn close_with_policy_violation(socket: &mut WebSocket, reason: &str) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: 1008,
+            reason: reason.to_string().into(),
+        })))
+        .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bind_with_token_message;
+
+    #[test]
+    fn test_parse_bind_with_token_message() {
+        assert_eq!(
+            parse_bind_with_token_message("bind-with-token abc123"),
+            Some("abc123")
+        );
+        assert_eq!(
+            parse_bind_with_token_message("bind-with-token: abc123"),
+            Some("abc123")
+        );
+        assert_eq!(
+            parse_bind_with_token_message(" bind-with-token   abc123 "),
+            Some("abc123")
+        );
+        assert_eq!(parse_bind_with_token_message("bind-with-token"), None);
+        assert_eq!(parse_bind_with_token_message("hello"), None);
+    }
 }
