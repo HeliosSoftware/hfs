@@ -23,7 +23,7 @@ The `SubscriptionEngine` orchestrates all five concerns and is the main entry po
 - **Exponential backoff retry**: configurable initial delay, max delay, backoff factor, and max attempts before transitioning to `error` or `off`
 - **Tenant isolation**: all in-memory maps are keyed by `(tenant_id, subscription_id)` — subscriptions in different tenants never interact
 - **TLS enforcement**: `full-resource` payload subscriptions over non-HTTPS endpoints are rejected at dispatch time
-- **WebSocket channel**: server-managed connection registry with short-lived binding tokens; clients connect to `/ws/subscriptions/bind?token=<token>` after calling `$get-ws-binding-token`
+- **WebSocket channel**: server-managed connection registry with short-lived binding tokens; clients connect to `/ws/subscriptions/bind`, then send `bind-with-token <token>` after calling `$get-ws-binding-token`
 - **Pluggable channels**: `ChannelDispatcher` trait allows new channel types (email, FHIR messaging) to be added without touching the engine
 
 ## Channel Support
@@ -270,12 +270,14 @@ Tokens are single-use and expire after 30 seconds (configurable via `ws_token_li
 
 ```bash
 # Using websocat
-websocat "ws://localhost:8080/ws/subscriptions/bind?token=550e8400-e29b-41d4-a716-446655440000"
+websocat ws://localhost:8080/ws/subscriptions/bind
+# Then send:
+bind-with-token 550e8400-e29b-41d4-a716-446655440000
 ```
 
-On connect, the server sends a handshake notification bundle immediately. Subsequent event notifications are pushed as JSON text frames as matching resources are written to the server.
+After a successful bind message, the server sends a handshake notification bundle. Subsequent event notifications are pushed as JSON text frames as matching resources are written to the server.
 
-The WebSocket protocol is **unidirectional** (server → client). Client messages are ignored; close frames trigger graceful cleanup.
+The WebSocket protocol is **unidirectional** (server → client) after binding. Additional bind messages on the same connection are rejected; close frames trigger graceful cleanup.
 
 **Multiple clients:** Multiple clients can bind to the same subscription simultaneously. All connected clients receive every notification.
 
