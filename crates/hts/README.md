@@ -8,6 +8,12 @@ A FHIR Terminology Server built in Rust, implementing the [HL7 FHIR Terminology 
 
 It can also be used standalone as a general-purpose FHIR terminology service, independent of any other Helios Software component.
 
+### Terminology Data
+
+HTS is a terminology engine - it does not include terminology data by default. Each terminology must be imported from its issuing authority, and you are responsible for obtaining a license and the source data before importing.
+
+For terminologies where redistribution is permitted, the data is bundled directly in the release distribution, with the latest version available at the time of build.
+
 ## Features
 
 - All six standard FHIR terminology operations: `$lookup`, `$validate-code`, `$subsumes`, `$expand`, `$translate`, `$closure`
