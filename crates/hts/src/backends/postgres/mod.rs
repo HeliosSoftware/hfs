@@ -69,6 +69,7 @@ impl PostgresTerminologyBackend {
 fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
     let mut cfg = Config::new();
     cfg.url = Some(database_url.to_string());
+    cfg.pool = Some(deadpool_postgres::PoolConfig::new(16));
     cfg.create_pool(Some(Runtime::Tokio1), NoTls)
         .map_err(|e| HtsError::StorageError(format!("Failed to create PG pool: {e}")))
 }
