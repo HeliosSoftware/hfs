@@ -94,10 +94,19 @@ wait_for_health() {
 
 WEBHOOK_PID=""
 WS_PID=""
+WS_INPUT_FIFO=""
+WS_INPUT_OPEN=0
 cleanup() {
   if [ -n "${WS_PID:-}" ]; then
     kill "$WS_PID" 2>/dev/null || true
     wait "$WS_PID" 2>/dev/null || true
+  fi
+  if [ "${WS_INPUT_OPEN:-0}" -eq 1 ]; then
+    exec 3>&- || true
+    WS_INPUT_OPEN=0
+  fi
+  if [ -n "${WS_INPUT_FIFO:-}" ]; then
+    rm -f "$WS_INPUT_FIFO"
   fi
   if [ -n "${WEBHOOK_PID:-}" ]; then
     kill "$WEBHOOK_PID" 2>/dev/null || true
@@ -158,34 +167,62 @@ WS_ENCOUNTER_ID="enc-ws-smoke-1"
 
 cat > "$HTTP_DIR/topic.request.json" <<EOF
 {
-  "resourceType": "SubscriptionTopic",
+  "resourceType": "Basic",
   "id": "$TOPIC_ID",
-  "url": "$TOPIC_URL",
-  "status": "active",
-  "resourceTrigger": [{
-    "resource": "Encounter",
-    "supportedInteraction": ["create"]
+  "code": {
+    "coding": [{
+      "system": "http://hl7.org/fhir/fhir-types",
+      "code": "SubscriptionTopic"
+    }]
+  },
+  "extension": [{
+    "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url",
+    "valueUri": "$TOPIC_URL"
+  }, {
+    "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.title",
+    "valueString": "Subscriptions Smoke Encounter Topic"
+  }, {
+    "url": "http://hl7.org/fhir/4.3/StructureDefinition/extension-SubscriptionTopic.resourceTrigger",
+    "extension": [{
+      "url": "resource",
+      "valueUri": "http://hl7.org/fhir/StructureDefinition/Encounter"
+    }, {
+      "url": "supportedInteraction",
+      "valueCode": "create"
+    }]
   }]
 }
 EOF
 
 TOPIC_STATUS="$(curl -sS -o "$HTTP_DIR/topic.response.json" -w "%{http_code}" \
-  -X POST "$BASE_URL/SubscriptionTopic" \
+  -X POST "$BASE_URL/Basic" \
   -H "Content-Type: $FHIR_CT" \
   --data-binary @"$HTTP_DIR/topic.request.json")"
-expect_created "$TOPIC_STATUS" "create SubscriptionTopic" "$HTTP_DIR/topic.response.json"
-pass "created SubscriptionTopic"
+expect_created "$TOPIC_STATUS" "create R4 Basic SubscriptionTopic" "$HTTP_DIR/topic.response.json"
+pass "created R4 Basic SubscriptionTopic"
 
 cat > "$HTTP_DIR/rest-subscription.request.json" <<EOF
 {
   "resourceType": "Subscription",
   "id": "$REST_SUB_ID",
   "status": "requested",
+  "reason": "R4 backport rest-hook subscriptions smoke test",
+  "meta": {
+    "profile": [
+      "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-subscription"
+    ]
+  },
   "criteria": "$TOPIC_URL",
   "channel": {
     "type": "rest-hook",
     "endpoint": "http://127.0.0.1:$WEBHOOK_PORT/webhook",
-    "payload": "application/fhir+json"
+    "payload": "application/fhir+json",
+    "_payload": {
+      "extension": [{
+        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+        "valueCode": "id-only"
+      }]
+    }
   }
 }
 EOF
@@ -245,10 +282,22 @@ cat > "$HTTP_DIR/ws-subscription.request.json" <<EOF
   "resourceType": "Subscription",
   "id": "$WS_SUB_ID",
   "status": "requested",
+  "reason": "R4 backport websocket subscriptions smoke test",
+  "meta": {
+    "profile": [
+      "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-subscription"
+    ]
+  },
   "criteria": "$TOPIC_URL",
   "channel": {
     "type": "websocket",
-    "payload": "application/fhir+json"
+    "payload": "application/fhir+json",
+    "_payload": {
+      "extension": [{
+        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+        "valueCode": "id-only"
+      }]
+    }
   }
 }
 EOF
@@ -274,10 +323,16 @@ pass "websocket binding token response includes token, expiration, and websocket
 
 WS_FRAMES="$WS_DIR/frames.ndjson"
 : > "$WS_FRAMES"
+WS_INPUT_FIFO="$WS_DIR/ws-input.fifo"
+rm -f "$WS_INPUT_FIFO"
+mkfifo "$WS_INPUT_FIFO"
+exec 3<>"$WS_INPUT_FIFO"
+WS_INPUT_OPEN=1
 
 log "Connecting websocket client"
-timeout 45s "$WEBSOCAT_BIN" "${WS_URL}?token=${TOKEN}" > "$WS_FRAMES" 2> "$WS_DIR/websocat.stderr" &
+timeout 45s "$WEBSOCAT_BIN" "$WS_URL" < "$WS_INPUT_FIFO" > "$WS_FRAMES" 2> "$WS_DIR/websocat.stderr" &
 WS_PID="$!"
+printf 'bind-with-token %s\n' "$TOKEN" >&3
 
 wait_for_value_count "$WS_FRAMES" \
   '.entry[0].resource.parameter[]? | select(.name=="type" and .valueCode=="handshake") | .valueCode' \
@@ -327,6 +382,11 @@ if [ -n "${WS_PID:-}" ]; then
   wait "$WS_PID" 2>/dev/null || true
   WS_PID=""
 fi
+if [ "${WS_INPUT_OPEN:-0}" -eq 1 ]; then
+  exec 3>&- || true
+  WS_INPUT_OPEN=0
+fi
+rm -f "$WS_INPUT_FIFO"
 
 REST_TOTAL="$(wc -l < "$REST_CAPTURE_FILE" 2>/dev/null | tr -d ' ')"
 WS_TOTAL="$(wc -l < "$WS_FRAMES" 2>/dev/null | tr -d ' ')"
