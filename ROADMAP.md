@@ -53,7 +53,7 @@ Work that is currently underway or planned for the near term.
 |------|------|--------|
 | **Standards** | [Terminology](https://github.com/HeliosSoftware/hfs/discussions/54) | 🟡 In progress |
 | **Standards** | FHIR Validation engine | 🔵 Design |
-| **Standards** | FHIR Subscriptions — Topic-based notification support | 🔵 Design |
+| **Standards** | [FHIR Subscriptions — Topic-based notification support](https://github.com/HeliosSoftware/hfs/discussions/59) | 🔵 Design |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
 ### Discussion Documents
@@ -62,7 +62,7 @@ We are actively developing community discussion documents on the following topic
 
 - **[Terminology](https://github.com/HeliosSoftware/hfs/discussions/54)** — Defining how code systems, value sets, and concept maps will be managed
 - **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
-- **Subscriptions** — Defining the approach for topic-based notification support
+- **[Subscriptions](https://github.com/HeliosSoftware/hfs/discussions/59)** — Defining the approach for topic-based notification support
 
 ---
 
@@ -168,7 +168,6 @@ Devitt's book defines nine key questions organizations must answer before choosi
 
 | Gap | Book Reference | Current Status |
 |-----|---------------|----------------|
-| **No FHIR Subscriptions** | Ch. 3 "Deal Breakers" — Subscriptions are a key feature relied upon by many consumers, especially in hospital settings. | 🗺️ Next |
 | **No profile validation on write** | Ch. 1 Fig 1.1 shows "FHIR validation + Profile validation" as a core server responsibility on create. Ch. 6 warns that without it, data quality degrades in FHIR-native systems. | 🔵 Design |
 
 #### Significant
