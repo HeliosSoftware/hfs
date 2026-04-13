@@ -45,6 +45,8 @@ SubscriptionEngine.on_resource_event()
      │
      ├─ resource_type == "Subscription"   → SubscriptionManager.register() / deregister()
      ├─ resource_type == "SubscriptionTopic" → InMemoryTopicRegistry.add_topic()
+     ├─ resource_type == "Basic" && fhir_version == "R4"
+     │    → parse as R4 backport topic candidate; add/remove topic when valid
      │
      └─ otherwise:
            │
@@ -138,7 +140,7 @@ Filters use the R4 backport string format `ResourceType?parameter=value` (parsed
 | `identifier` | `identifier[].value` |
 | *(other)* | Direct JSON field lookup by name |
 
-Comparators supported: `eq` (default), `in`. FHIRPath evaluation is not used in Phase 1 — filters operate on the raw resource JSON.
+Comparators supported: `eq` (default), `in`. FHIRPath evaluation is not used in Phase 2 — filters currently operate on the raw resource JSON.
 
 ## Configuration
 
@@ -186,6 +188,8 @@ The spawned task calls `engine.on_resource_event(event).await`, which runs the f
 
 POST a `SubscriptionTopic` resource (R5/R6) or a `Basic` resource with the backport profile (R4) to your HFS instance. The engine picks it up automatically on the next write:
 
+**R5/R6 (native `SubscriptionTopic`)**
+
 ```bash
 curl -X POST http://localhost:8080/SubscriptionTopic \
   -H "Content-Type: application/fhir+json" \
@@ -200,6 +204,35 @@ curl -X POST http://localhost:8080/SubscriptionTopic \
     "canFilterBy": [{
       "resource": "Encounter",
       "filterParameter": "patient"
+    }]
+  }'
+```
+
+**R4 (backport `Basic` topic representation)**
+
+```bash
+curl -X POST http://localhost:8080/Basic \
+  -H "Content-Type: application/fhir+json" \
+  -d '{
+    "resourceType": "Basic",
+    "code": {
+      "coding": [{
+        "system": "http://hl7.org/fhir/fhir-types",
+        "code": "SubscriptionTopic"
+      }]
+    },
+    "extension": [{
+      "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url",
+      "valueUri": "http://example.org/topic/encounter-start"
+    }, {
+      "url": "http://hl7.org/fhir/4.3/StructureDefinition/extension-SubscriptionTopic.resourceTrigger",
+      "extension": [{
+        "url": "resource",
+        "valueUri": "http://hl7.org/fhir/StructureDefinition/Encounter"
+      }, {
+        "url": "supportedInteraction",
+        "valueCode": "create"
+      }]
     }]
   }'
 ```
@@ -401,7 +434,7 @@ A Kafka-backed architecture addresses most of the single-instance and performanc
 
 ## Current Limitations
 
-- FHIRPath filter criteria are not evaluated — Phase 1 uses direct JSON field matching only
+- FHIRPath filter criteria are not evaluated — Phase 2 uses direct JSON field matching only
 - Heartbeat delivery is not yet implemented — the `heartbeat_period` field is stored but no background task fires heartbeats
 - Batch and transaction bundle entries do not emit subscription events — only direct CRUD handlers (create, update, delete, patch) do
 - [`eventTrigger`](https://hl7.org/fhir/subscriptiontopic.html) is not supported — only `resourceTrigger` (create, update, delete) is implemented
