@@ -431,10 +431,15 @@ fn extract_channel_config(
                 .unwrap_or_default();
 
             // Payload content from backport extension.
-            let payload_content = find_extension_value_code(
-                resource,
-                "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
-            )
+            // Prefer channel._payload extension (spec-compliant) and fall back
+            // to root extension for backward compatibility.
+            let payload_content = find_channel_payload_content_code(resource)
+                .or_else(|| {
+                    find_extension_value_code(
+                        resource,
+                        "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+                    )
+                })
             .and_then(|s| PayloadContent::from_fhir_str(&s))
             .unwrap_or(PayloadContent::IdOnly);
 
@@ -592,6 +597,24 @@ fn find_extension_value_code(resource: &serde_json::Value, url: &str) -> Option<
         .as_array()?
         .iter()
         .find(|ext| ext.get("url").and_then(|v| v.as_str()) == Some(url))
+        .and_then(|ext| ext.get("valueCode"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+fn find_channel_payload_content_code(resource: &serde_json::Value) -> Option<String> {
+    resource
+        .get("channel")?
+        .get("_payload")?
+        .get("extension")?
+        .as_array()?
+        .iter()
+        .find(|ext| {
+            ext.get("url").and_then(|v| v.as_str())
+                == Some(
+                    "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+                )
+        })
         .and_then(|ext| ext.get("valueCode"))
         .and_then(|v| v.as_str())
         .map(String::from)
@@ -769,6 +792,37 @@ pub(crate) mod tests {
         assert_eq!(sub.channel.heartbeat_period, Some(60));
         assert_eq!(sub.channel.headers.len(), 1);
         assert!(sub.channel.headers[0].contains("Authorization"));
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn test_register_r4_subscription_payload_content_in_channel_payload_extension() {
+        let registry = create_test_registry();
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+
+        let resource = json!({
+            "resourceType": "Subscription",
+            "id": "sub-r4-2",
+            "status": "requested",
+            "criteria": "http://example.org/topic/encounter-start",
+            "channel": {
+                "type": "rest-hook",
+                "endpoint": "https://example.com/webhook",
+                "payload": "application/fhir+json",
+                "_payload": {
+                    "extension": [{
+                        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+                        "valueCode": "empty"
+                    }]
+                }
+            }
+        });
+
+        let sub = manager
+            .register("tenant-1", "sub-r4-2", &resource, FhirVersion::R4)
+            .unwrap();
+
+        assert_eq!(sub.channel.payload_content, PayloadContent::Empty);
     }
 
     /// Build a version-appropriate subscription JSON with custom topic/channel.
