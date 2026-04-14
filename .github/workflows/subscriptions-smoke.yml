@@ -14,8 +14,12 @@ env:
 
 jobs:
   build:
-    name: Build HFS (subscriptions)
+    name: Build HFS (subscriptions, ${{ matrix.fhir_version }})
     runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        fhir_version: [R4, R4B, R5]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -34,17 +38,18 @@ jobs:
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
 
       - name: Build HFS binary with subscriptions
-        run: cargo build -p helios-hfs --features R4,subscriptions,sqlite,elasticsearch,postgres,mongodb,s3
+        run: |
+          cargo build -p helios-hfs --no-default-features --features "${{ matrix.fhir_version }},subscriptions,sqlite,elasticsearch,postgres,mongodb,s3"
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v4
         with:
-          name: hfs-subscriptions-binary
+          name: hfs-subscriptions-binary-${{ matrix.fhir_version }}
           path: target/debug/hfs
           retention-days: 1
 
   subscriptions-smoke:
-    name: Subscriptions Smoke (${{ matrix.backend }})
+    name: Subscriptions Smoke (${{ matrix.fhir_version }} / ${{ matrix.backend }})
     needs: build
     runs-on: [self-hosted, Linux]
     permissions:
@@ -54,9 +59,10 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
+        fhir_version: [R4, R4B, R5]
         backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
     env:
-      RESULTS_DIR: subscriptions-smoke-results/${{ matrix.backend }}
+      RESULTS_DIR: subscriptions-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -64,7 +70,7 @@ jobs:
       - name: Download HFS binary
         uses: actions/download-artifact@v4
         with:
-          name: hfs-subscriptions-binary
+          name: hfs-subscriptions-binary-${{ matrix.fhir_version }}
           path: target/debug
 
       - name: Make executables available
@@ -328,6 +334,7 @@ jobs:
       - name: Run subscriptions smoke checks
         run: |
           BASE_URL="http://localhost:$HFS_PORT" \
+          FHIR_VERSION="${{ matrix.fhir_version }}" \
           RESULTS_DIR="$RESULTS_DIR" \
           WEBSOCAT_BIN="$WEBSOCAT_BIN" \
           ./crates/hfs/tests/subscriptions/run_external_subscriptions_smoke.sh
