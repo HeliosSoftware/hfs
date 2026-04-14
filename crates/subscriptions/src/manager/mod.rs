@@ -562,11 +562,16 @@ fn extract_filter_criteria(resource: &serde_json::Value, fhir_version: FhirVersi
                     let param = f.get("filterParameter")?.as_str()?;
                     let value = f.get("value")?.as_str()?;
                     let resource_type = f.get("resourceType").and_then(|v| v.as_str());
+                    let comparator = f.get("comparator").and_then(|v| v.as_str());
+                    let value_with_comparator = comparator
+                        .filter(|c| !c.is_empty())
+                        .map(|c| format!("{c}:{value}"))
+                        .unwrap_or_else(|| value.to_string());
 
                     let filter_str = if let Some(rt) = resource_type {
-                        format!("{rt}?{param}={value}")
+                        format!("{rt}?{param}={value_with_comparator}")
                     } else {
-                        format!("{param}={value}")
+                        format!("{param}={value_with_comparator}")
                     };
 
                     Some(filter_str)
@@ -579,6 +584,7 @@ fn extract_filter_criteria(resource: &serde_json::Value, fhir_version: FhirVersi
 // --- Extension helpers for R4 backport ---
 
 /// Find a single extension with the given URL and return its `valueUrl`.
+#[cfg(feature = "R4")]
 fn find_extension_value_url(resource: &serde_json::Value, url: &str) -> Option<String> {
     resource
         .get("extension")?
@@ -591,6 +597,7 @@ fn find_extension_value_url(resource: &serde_json::Value, url: &str) -> Option<S
 }
 
 /// Find a single extension with the given URL and return its `valueCode`.
+#[cfg(feature = "R4")]
 fn find_extension_value_code(resource: &serde_json::Value, url: &str) -> Option<String> {
     resource
         .get("extension")?
@@ -602,6 +609,7 @@ fn find_extension_value_code(resource: &serde_json::Value, url: &str) -> Option<
         .map(String::from)
 }
 
+#[cfg(feature = "R4")]
 fn find_channel_payload_content_code(resource: &serde_json::Value) -> Option<String> {
     resource
         .get("channel")?
@@ -621,6 +629,7 @@ fn find_channel_payload_content_code(resource: &serde_json::Value) -> Option<Str
 }
 
 /// Find a single extension with the given URL and return its `valueUnsignedInt`.
+#[cfg(feature = "R4")]
 fn find_extension_value_unsigned_int(resource: &serde_json::Value, url: &str) -> Option<u32> {
     resource
         .get("extension")?
@@ -633,6 +642,7 @@ fn find_extension_value_unsigned_int(resource: &serde_json::Value, url: &str) ->
 }
 
 /// Find all extensions with the given URL and return their `valueString` values.
+#[cfg(feature = "R4")]
 fn find_all_extension_values_string(resource: &serde_json::Value, url: &str) -> Vec<String> {
     resource
         .get("extension")
@@ -773,6 +783,52 @@ pub(crate) mod tests {
         assert_eq!(sub.channel.payload_content, PayloadContent::IdOnly);
         assert_eq!(sub.status, SubscriptionStatusCode::Requested);
         assert_eq!(sub.events_since_start, 0);
+    }
+
+    #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
+    #[test]
+    fn test_register_native_subscription_topic_and_channeltype_parsing() {
+        let registry = create_test_registry();
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+
+        let resource = json!({
+            "resourceType": "Subscription",
+            "id": "sub-native-1",
+            "status": "requested",
+            "topic": "http://example.org/topic/encounter-start",
+            "channelType": {
+                "system": "http://terminology.hl7.org/CodeSystem/subscription-channel-type",
+                "code": "rest-hook"
+            },
+            "endpoint": "https://example.com/webhook",
+            "contentType": "application/fhir+json",
+            "content": "id-only",
+            "parameter": [{
+                "name": "Authorization",
+                "value": "Bearer native-token"
+            }]
+        });
+
+        let sub = manager
+            .register(
+                "tenant-1",
+                "sub-native-1",
+                &resource,
+                FhirVersion::default(),
+            )
+            .unwrap();
+
+        assert_eq!(sub.topic_url, "http://example.org/topic/encounter-start");
+        assert_eq!(sub.channel.channel_type, ChannelType::RestHook);
+        assert_eq!(
+            sub.channel.endpoint.as_deref(),
+            Some("https://example.com/webhook")
+        );
+        assert_eq!(sub.channel.payload_content, PayloadContent::IdOnly);
+        assert_eq!(
+            sub.channel.headers,
+            vec!["Authorization: Bearer native-token".to_string()]
+        );
     }
 
     #[cfg(feature = "R4")]
@@ -1084,7 +1140,7 @@ pub(crate) mod tests {
                 }
             ]
         });
-        #[cfg(not(feature = "R4"))]
+        #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
         let resource = json!({
             "resourceType": "Subscription",
             "status": "requested",
@@ -1107,6 +1163,36 @@ pub(crate) mod tests {
         assert_eq!(sub.filters[0].filter_parameter, "patient");
         assert_eq!(sub.filters[0].value, "Patient/123");
         assert_eq!(sub.channel.payload_content, PayloadContent::FullResource);
+    }
+
+    #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
+    #[test]
+    fn test_register_with_native_filter_by_comparator() {
+        let registry = create_test_registry();
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+
+        let resource = json!({
+            "resourceType": "Subscription",
+            "status": "requested",
+            "topic": "http://example.org/topic/encounter-start",
+            "channelType": { "code": "rest-hook" },
+            "endpoint": "https://example.com/webhook",
+            "filterBy": [{
+                "resourceType": "Encounter",
+                "filterParameter": "patient",
+                "comparator": "eq",
+                "value": "Patient/123"
+            }]
+        });
+
+        let sub = manager
+            .register("t1", "sub-1", &resource, FhirVersion::default())
+            .unwrap();
+
+        assert_eq!(sub.filters.len(), 1);
+        assert_eq!(sub.filters[0].filter_parameter, "patient");
+        assert_eq!(sub.filters[0].comparator, "eq");
+        assert_eq!(sub.filters[0].value, "Patient/123");
     }
 
     #[test]
@@ -1134,7 +1220,7 @@ pub(crate) mod tests {
                 }
             ]
         });
-        #[cfg(not(feature = "R4"))]
+        #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
         let resource = json!({
             "resourceType": "Subscription",
             "status": "requested",
