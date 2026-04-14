@@ -20,6 +20,11 @@ use tower::ServiceExt;
 // ── PostgreSQL shared container for HTTP tests ─────────────────────────────────
 
 #[cfg(feature = "postgres")]
+const HTTP_PG_LABEL_KEY: &str = "io.helios.hts.test-pool";
+#[cfg(feature = "postgres")]
+const HTTP_PG_LABEL_VALUE: &str = "hts-http-pg";
+
+#[cfg(feature = "postgres")]
 static PG_HTTP_CONTAINER: std::sync::OnceLock<
     testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
 > = std::sync::OnceLock::new();
@@ -27,16 +32,43 @@ static PG_HTTP_CONTAINER: std::sync::OnceLock<
 #[cfg(feature = "postgres")]
 static PG_HTTP_URL: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
+/// Force-remove any PostgreSQL testcontainer started by this test binary when
+/// the process exits. `static` values are never dropped, so `ContainerAsync`'s
+/// async cleanup never runs; this atexit hook does it synchronously via the
+/// `docker` CLI instead.
+#[cfg(feature = "postgres")]
+#[ctor::dtor]
+fn cleanup_http_pg_container() {
+    let filter = format!("label={HTTP_PG_LABEL_KEY}={HTTP_PG_LABEL_VALUE}");
+    let Ok(listing) = std::process::Command::new("docker")
+        .args(["ps", "-aq", "--filter", &filter])
+        .output()
+    else {
+        return;
+    };
+    let ids = String::from_utf8_lossy(&listing.stdout);
+    for id in ids.split_whitespace() {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
+    }
+}
+
 /// Returns the PostgreSQL URL for the shared HTTP-test container, starting it
 /// on the first call. Shared across all `TestAppPg` instances in a test binary.
 #[cfg(feature = "postgres")]
 pub async fn pg_http_url() -> &'static str {
     PG_HTTP_URL
         .get_or_init(|| async {
-            use testcontainers::runners::AsyncRunner;
+            use testcontainers::{ImageExt, runners::AsyncRunner};
             use testcontainers_modules::postgres::Postgres;
 
+            // Tag with a label so the `#[ctor::dtor]` below can find and
+            // force-remove the container at process exit. Without this, the
+            // static would hold the `ContainerAsync` until process exit, but
+            // `Drop` is never called on statics → container leaks.
             let container = Postgres::default()
+                .with_label(HTTP_PG_LABEL_KEY, HTTP_PG_LABEL_VALUE)
                 .start()
                 .await
                 .expect("Failed to start Postgres container for HTTP tests");

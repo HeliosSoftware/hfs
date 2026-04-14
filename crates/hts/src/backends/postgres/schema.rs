@@ -122,7 +122,24 @@ CREATE INDEX IF NOT EXISTS idx_map_source
 
 /// Apply the HTS PostgreSQL schema to the given client connection.
 ///
-/// Safe to call on every startup — all statements are idempotent.
+/// Safe to call on every startup — all statements are idempotent. Concurrent
+/// callers are serialized via a session-scoped advisory lock so that racing
+/// `CREATE EXTENSION IF NOT EXISTS pg_trgm` calls cannot collide on
+/// `pg_extension_name_index` (Postgres's `IF NOT EXISTS` guard is not
+/// transactional with concurrent writers).
 pub async fn apply(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
-    client.batch_execute(SCHEMA).await
+    // Arbitrary constant — must match across all callers that apply this
+    // schema. Use an application-scoped value that won't collide with
+    // user-chosen advisory locks.
+    const HTS_SCHEMA_LOCK: i64 = 0x4854_535f_5343_484du64 as i64; // "HTS_SCHM"
+
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&HTS_SCHEMA_LOCK])
+        .await?;
+    let result = client.batch_execute(SCHEMA).await;
+    // Always release the lock, even if schema apply failed.
+    let _ = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&HTS_SCHEMA_LOCK])
+        .await;
+    result
 }

@@ -29,7 +29,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             )
         })?;
 
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
@@ -50,7 +50,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             )));
                         }
                     }
-                    populate_cache(&client, &vs_id, &codes).await?;
+                    populate_cache(&mut client, &vs_id, &codes).await?;
                     codes
                 } else {
                     cached
@@ -128,7 +128,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             )
         })?;
 
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
@@ -150,7 +150,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         let cached = fetch_cache(&client, &vs_id).await?;
         let all_codes = if cached.is_empty() {
             let codes = compute_expansion(&client, compose_json.as_deref()).await?;
-            populate_cache(&client, &vs_id, &codes).await?;
+            populate_cache(&mut client, &vs_id, &codes).await?;
             codes
         } else {
             cached
@@ -538,30 +538,45 @@ fn build_subtree(
 }
 
 /// Write computed expansion entries into the `value_set_expansions` cache.
+///
+/// Uses a transaction so the DELETE+INSERTs are atomic: without it, another
+/// connection running `write_value_set` (which also DELETEs expansion rows
+/// for the same `value_set_id` inside its own import transaction) can
+/// interleave its buffered DELETE with our per-statement autocommits and
+/// leave the cache with only the entries we inserted *after* that DELETE.
+/// The symptom is a validate-code call reading a partially populated cache
+/// (e.g. only the last-inserted code survives).
 async fn populate_cache(
-    client: &tokio_postgres::Client,
+    client: &mut tokio_postgres::Client,
     vs_id: &str,
     codes: &[ExpansionContains],
 ) -> Result<(), HtsError> {
-    client
-        .execute(
-            "DELETE FROM value_set_expansions WHERE value_set_id = $1",
-            &[&vs_id],
-        )
+    let tx = client
+        .transaction()
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    tx.execute(
+        "DELETE FROM value_set_expansions WHERE value_set_id = $1",
+        &[&vs_id],
+    )
+    .await
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
     for item in codes {
-        client
-            .execute(
-                "INSERT INTO value_set_expansions (value_set_id, system_url, code, display)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT DO NOTHING",
-                &[&vs_id, &item.system, &item.code, &item.display],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO value_set_expansions (value_set_id, system_url, code, display)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT DO NOTHING",
+            &[&vs_id, &item.system, &item.code, &item.display],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     Ok(())
 }

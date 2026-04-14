@@ -255,23 +255,19 @@ async fn write_code_system(
     let resource_json = Some(cs.resource_json.clone());
     let now = utc_now();
 
-    // Use RETURNING id to get the actual row id after an upsert — when
-    // ON CONFLICT (url) fires the existing row keeps its original `id`,
-    // which may differ from `cs.id`.
-    let cs_rows = client
-        .query(
+    // Two-step upsert so we handle conflicts on *either* unique constraint
+    // (the `url` index and the PK on `id`). `ON CONFLICT (url) DO UPDATE`
+    // alone does not catch a PK collision that would happen when two
+    // concurrent importers use the same `cs.id` — the INSERT can fail on the
+    // PK arbiter index before the URL arbiter is consulted. `ON CONFLICT DO
+    // NOTHING` (no target) swallows any unique-constraint conflict, after
+    // which a plain UPDATE by URL refreshes the row and returns its id.
+    client
+        .execute(
             "INSERT INTO code_systems
              (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
-             ON CONFLICT (url) DO UPDATE SET
-               version      = EXCLUDED.version,
-               name         = EXCLUDED.name,
-               title        = EXCLUDED.title,
-               status       = EXCLUDED.status,
-               content      = EXCLUDED.content,
-               resource_json = EXCLUDED.resource_json,
-               updated_at   = EXCLUDED.updated_at
-             RETURNING id",
+             ON CONFLICT DO NOTHING",
             &[
                 &cs.id,
                 &cs.url,
@@ -287,11 +283,37 @@ async fn write_code_system(
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    let cs_rows = client
+        .query(
+            "UPDATE code_systems SET
+               version       = $1,
+               name          = $2,
+               title         = $3,
+               status        = $4,
+               content       = $5,
+               resource_json = $6,
+               updated_at    = $7
+             WHERE url = $8
+             RETURNING id",
+            &[
+                &cs.version,
+                &cs.name,
+                &cs.title,
+                &cs.status,
+                &cs.content,
+                &resource_json,
+                &now,
+                &cs.url,
+            ],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
     let system_id: String = cs_rows
         .into_iter()
         .next()
         .ok_or_else(|| {
-            HtsError::StorageError("INSERT code_systems RETURNING id got no row".into())
+            HtsError::StorageError("UPDATE code_systems RETURNING id got no row".into())
         })?
         .get(0);
 
@@ -417,19 +439,14 @@ async fn write_value_set(
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
     }
 
+    // Two-step upsert — see `write_code_system` for why `ON CONFLICT (url)`
+    // alone is not safe under concurrent imports that share `vs.id`.
     client
         .execute(
             "INSERT INTO value_sets
              (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
-             ON CONFLICT (url) DO UPDATE SET
-               version      = EXCLUDED.version,
-               name         = EXCLUDED.name,
-               title        = EXCLUDED.title,
-               status       = EXCLUDED.status,
-               compose_json = EXCLUDED.compose_json,
-               resource_json = EXCLUDED.resource_json,
-               updated_at   = EXCLUDED.updated_at",
+             ON CONFLICT DO NOTHING",
             &[
                 &vs.id,
                 &vs.url,
@@ -440,6 +457,31 @@ async fn write_value_set(
                 &vs.compose_json,
                 &resource_json,
                 &now,
+            ],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    client
+        .execute(
+            "UPDATE value_sets SET
+               version       = $1,
+               name          = $2,
+               title         = $3,
+               status        = $4,
+               compose_json  = $5,
+               resource_json = $6,
+               updated_at    = $7
+             WHERE url = $8",
+            &[
+                &vs.version,
+                &vs.name,
+                &vs.title,
+                &vs.status,
+                &vs.compose_json,
+                &resource_json,
+                &now,
+                &vs.url,
             ],
         )
         .await
@@ -457,20 +499,14 @@ async fn write_concept_map(
     let resource_json = Some(cm.resource_json.clone());
     let now = utc_now();
 
-    let rows = client
-        .query(
+    // Two-step upsert — see `write_code_system` for why `ON CONFLICT (url)`
+    // alone is not safe under concurrent imports that share `cm.id`.
+    client
+        .execute(
             "INSERT INTO concept_maps
              (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             ON CONFLICT (url) DO UPDATE SET
-               version    = EXCLUDED.version,
-               name       = EXCLUDED.name,
-               title      = EXCLUDED.title,
-               source_uri = EXCLUDED.source_uri,
-               target_uri = EXCLUDED.target_uri,
-               status     = EXCLUDED.status,
-               resource_json = EXCLUDED.resource_json
-             RETURNING id",
+             ON CONFLICT DO NOTHING",
             &[
                 &cm.id,
                 &cm.url,
@@ -487,11 +523,37 @@ async fn write_concept_map(
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    let rows = client
+        .query(
+            "UPDATE concept_maps SET
+               version       = $1,
+               name          = $2,
+               title         = $3,
+               source_uri    = $4,
+               target_uri    = $5,
+               status        = $6,
+               resource_json = $7
+             WHERE url = $8
+             RETURNING id",
+            &[
+                &cm.version,
+                &cm.name,
+                &cm.title,
+                &cm.source_uri,
+                &cm.target_uri,
+                &cm.status,
+                &resource_json,
+                &cm.url,
+            ],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
     let map_id: String = rows
         .into_iter()
         .next()
         .ok_or_else(|| {
-            HtsError::StorageError("INSERT concept_maps RETURNING id got no row".into())
+            HtsError::StorageError("UPDATE concept_maps RETURNING id got no row".into())
         })?
         .get(0);
 

@@ -29,20 +29,44 @@ use tokio::sync::OnceCell;
 //
 // The `ContainerAsync` must be kept alive for the lifetime of the process to
 // prevent the Docker container from being stopped.  We store it in a
-// process-level static.
+// process-level static and force-remove the container via an atexit hook
+// (`#[ctor::dtor]`) since `static` values are never dropped.
+
+const INTEGRATION_PG_LABEL_KEY: &str = "io.helios.hts.test-pool";
+const INTEGRATION_PG_LABEL_VALUE: &str = "hts-integration-pg";
 
 static CONTAINER: OnceLock<ContainerAsync<Postgres>> = OnceLock::new();
 static DB_URL: OnceCell<String> = OnceCell::const_new();
-static BACKEND: OnceCell<PostgresTerminologyBackend> = OnceCell::const_new();
+
+/// Force-remove the shared PostgreSQL testcontainer at process exit.
+/// `static CONTAINER` is never dropped, so its async cleanup never runs;
+/// this synchronous `docker rm -f` by label is the backstop.
+#[ctor::dtor]
+fn cleanup_integration_pg_container() {
+    let filter = format!("label={INTEGRATION_PG_LABEL_KEY}={INTEGRATION_PG_LABEL_VALUE}");
+    let Ok(listing) = std::process::Command::new("docker")
+        .args(["ps", "-aq", "--filter", &filter])
+        .output()
+    else {
+        return;
+    };
+    let ids = String::from_utf8_lossy(&listing.stdout);
+    for id in ids.split_whitespace() {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
+    }
+}
 
 /// Returns the PostgreSQL URL for the shared test container, starting it on the
 /// first call.
 async fn db_url() -> &'static str {
     DB_URL
         .get_or_init(|| async {
-            use testcontainers::runners::AsyncRunner;
+            use testcontainers::{ImageExt, runners::AsyncRunner};
 
             let container = Postgres::default()
+                .with_label(INTEGRATION_PG_LABEL_KEY, INTEGRATION_PG_LABEL_VALUE)
                 .start()
                 .await
                 .expect("Failed to start Postgres container");
@@ -66,18 +90,17 @@ async fn db_url() -> &'static str {
         .await
 }
 
-/// Return a shared `PostgresTerminologyBackend` connected to the shared
-/// container.  The schema is applied exactly once (on first call), avoiding
-/// concurrent `CREATE EXTENSION` races when many tests start in parallel.
+/// Return a fresh `PostgresTerminologyBackend` connected to the shared
+/// container. A new pool is built *per test* on purpose: a `#[tokio::test]`
+/// tears down its runtime when the test ends, which aborts the connection
+/// driver tasks spawned by `deadpool-postgres`. Sharing a single pool across
+/// tests would then hand out dead connections to later tests, producing
+/// transient "connection closed" errors. Concurrent schema application is
+/// made safe inside `schema::apply` via a PG advisory lock.
 async fn fresh_backend() -> PostgresTerminologyBackend {
-    BACKEND
-        .get_or_init(|| async {
-            PostgresTerminologyBackend::new(db_url().await)
-                .await
-                .expect("Backend should initialize")
-        })
+    PostgresTerminologyBackend::new(db_url().await)
         .await
-        .clone()
+        .expect("Backend should initialize")
 }
 
 fn ctx() -> TenantContext {
@@ -588,12 +611,15 @@ async fn search_by_status_filters_correctly() {
         .await
         .unwrap();
 
-    // Filter for active only.
+    // Filter for active only. Use a large page size so that this test's
+    // own fresh imports are not pushed off the first page by other
+    // concurrent tests writing to the shared DB.
     let results = CodeSystemOperations::search(
         &backend,
         &ctx(),
         ResourceSearchQuery {
             status: Some("active".into()),
+            count: Some(1000),
             ..Default::default()
         },
     )
