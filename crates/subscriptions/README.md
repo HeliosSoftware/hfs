@@ -2,7 +2,7 @@
 
 FHIR topic-based Subscriptions engine for the Helios FHIR Server, implementing the [FHIR Subscriptions Framework](https://build.fhir.org/subscriptions.html) across R4, R4B, R5, and R6.
 
-R4 and R4B use the [Subscriptions R5 Backport IG](https://build.fhir.org/ig/HL7/fhir-subscription-backport-ig/); R5 and R6 use the native Subscriptions Framework.
+R4 uses the [Subscriptions R5 Backport IG](https://build.fhir.org/ig/HL7/fhir-subscription-backport-ig/). R4B, R5, and R6 use native subscription resources.
 
 ## Overview
 
@@ -11,14 +11,14 @@ This crate implements topic-based subscriptions as an asynchronous pipeline that
 1. **Topic Registry** — stores `SubscriptionTopic` definitions and evaluates resource triggers
 2. **Subscription Manager** — tracks active `Subscription` resources and their runtime state
 3. **Event Evaluator** — matches write events against active subscriptions using topic triggers and filter criteria
-4. **Notification Builder** — constructs version-specific notification bundles (R4 Parameters-based backport, R5/R6 native `SubscriptionStatus`)
+4. **Notification Builder** — constructs version-specific notification bundles (R4 Parameters-based backport, R4B/R5/R6 native `SubscriptionStatus`)
 5. **Channel Dispatcher** — delivers notifications via pluggable channel implementations
 
 The `SubscriptionEngine` orchestrates all five concerns and is the main entry point, invoked via `tokio::spawn` after each resource create, update, patch, or delete — mirroring the fire-and-forget pattern used by the audit middleware.
 
 ## Features
 
-- **Version-aware parsing**: R4 reads the backport extension set (`backport-topic-canonical`, `backport-payload-content`, `backport-channel-type`, `backport-filter-criteria`); R5/R6 read native `topic`, `channelType`, `filterBy` fields
+- **Version-aware parsing**: R4 reads the backport extension set (`backport-topic-canonical`, `backport-payload-content`, `backport-channel-type`, `backport-filter-criteria`); R4B/R5/R6 read native `topic`, `channelType`, `filterBy` fields
 - **Status state machine**: `Requested → Active → Error → Off` with validated transitions; subscriptions activate only after a successful handshake
 - **Exponential backoff retry**: configurable initial delay, max delay, backoff factor, and max attempts before transitioning to `error` or `off`
 - **Tenant isolation**: all in-memory maps are keyed by `(tenant_id, subscription_id)` — subscriptions in different tenants never interact
@@ -100,24 +100,26 @@ SubscriptionEngine.on_resource_event()
 }
 ```
 
-### R5/R6 (Native)
+### R4B/R5/R6 (Native)
+
+`Bundle.type` is `history` for R4B and `subscription-notification` for R5/R6.
 
 ```json
 {
   "resourceType": "Bundle",
-  "type": "subscription-notification",
+  "type": "<history|subscription-notification>",
   "entry": [
     {
       "resource": {
         "resourceType": "SubscriptionStatus",
         "status": "active",
         "type": "event-notification",
-        "eventsSinceSubscriptionStart": "3",
+        "eventsSinceSubscriptionStart": 3,
         "subscription": { "reference": "Subscription/sub-1" },
         "topic": "http://example.org/topic/encounter-start",
         "notificationEvent": [
           {
-            "eventNumber": "3",
+            "eventNumber": 3,
             "timestamp": "2026-04-09T12:00:00Z",
             "focus": { "reference": "Encounter/enc-99" }
           }
@@ -186,7 +188,7 @@ The spawned task calls `engine.on_resource_event(event).await`, which runs the f
 
 ### Registering a Topic
 
-POST a `SubscriptionTopic` resource (R5/R6) or a `Basic` resource with the backport profile (R4) to your HFS instance. The engine picks it up automatically on the next write:
+POST a `SubscriptionTopic` resource (R4B/R5/R6) or a `Basic` resource with the backport profile (R4) to your HFS instance. The engine picks it up automatically on the next write:
 
 **R5/R6 (native `SubscriptionTopic`)**
 
