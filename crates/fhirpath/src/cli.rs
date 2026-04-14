@@ -82,6 +82,33 @@ use crate::parse_debug::{expression_to_debug_tree, generate_parse_debug};
 use crate::{EvaluationResult, evaluate_expression};
 use helios_fhir::{FhirResource, FhirVersion};
 
+#[allow(unreachable_code)]
+fn default_cli_fhir_version() -> FhirVersion {
+    #[cfg(feature = "R4")]
+    {
+        return FhirVersion::R4;
+    }
+    #[cfg(all(not(feature = "R4"), feature = "R4B"))]
+    {
+        return FhirVersion::R4B;
+    }
+    #[cfg(all(not(feature = "R4"), not(feature = "R4B"), feature = "R5"))]
+    {
+        return FhirVersion::R5;
+    }
+    #[cfg(all(
+        not(feature = "R4"),
+        not(feature = "R4B"),
+        not(feature = "R5"),
+        feature = "R6"
+    ))]
+    {
+        return FhirVersion::R6;
+    }
+
+    panic!("No FHIR version feature enabled");
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "fhirpath-cli")]
 #[command(about = "FHIRPath CLI tool for evaluating expressions against FHIR resources")]
@@ -126,7 +153,7 @@ pub struct Args {
     pub trace: bool,
 
     /// FHIR version to use for parsing resources
-    #[arg(long, value_enum, default_value_t = FhirVersion::R4)]
+    #[arg(long, value_enum, default_value_t = default_cli_fhir_version())]
     pub fhir_version: FhirVersion,
 
     /// Validate expression before execution
