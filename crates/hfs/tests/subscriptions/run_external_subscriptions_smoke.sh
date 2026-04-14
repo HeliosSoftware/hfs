@@ -4,32 +4,42 @@ set -euo pipefail
 BASE_URL="${BASE_URL:-http://localhost:8080}"
 RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results}"
 WEBSOCAT_BIN="${WEBSOCAT_BIN:-websocat}"
-TOPIC_URL="${TOPIC_URL:-http://example.org/topic/encounter-start-smoke}"
+TOPIC_URL_BASE="${TOPIC_URL:-http://example.org/topic/encounter-start-smoke}"
+SMOKE_RUN_SUFFIX="${SMOKE_RUN_SUFFIX:-local-$(date +%s)-$$}"
 FHIR_VERSION="${FHIR_VERSION:-R4}"
 
 HTTP_DIR="$RESULTS_DIR/http"
 REST_DIR="$RESULTS_DIR/rest-hook"
 WS_DIR="$RESULTS_DIR/ws"
 SUMMARY_FILE="$RESULTS_DIR/summary.md"
-FHIR_CT="application/fhir+json"
 
 case "$FHIR_VERSION" in
   R4)
     USE_BACKPORT=1
     EXPECTED_BUNDLE_TYPE="history"
+    FHIR_MIME_VERSION="4.0"
     ;;
   R4B)
     USE_BACKPORT=0
     EXPECTED_BUNDLE_TYPE="history"
+    FHIR_MIME_VERSION="4.3"
     ;;
-  R5|R6)
+  R5)
     USE_BACKPORT=0
     EXPECTED_BUNDLE_TYPE="subscription-notification"
+    FHIR_MIME_VERSION="5.0"
+    ;;
+  R6)
+    USE_BACKPORT=0
+    EXPECTED_BUNDLE_TYPE="subscription-notification"
+    FHIR_MIME_VERSION="6.0"
     ;;
   *)
     fail "unsupported FHIR_VERSION: $FHIR_VERSION (expected R4, R4B, R5, or R6)"
     ;;
 esac
+FHIR_CT="application/fhir+json; fhirVersion=$FHIR_MIME_VERSION"
+FHIR_ACCEPT="$FHIR_CT"
 
 NOTIFICATION_TYPE_JQ='if .entry[0].resource.resourceType=="Parameters" then ([.entry[0].resource.parameter[]? | select(.name=="type") | .valueCode][0] // "") else (.entry[0].resource.type // "") end'
 
@@ -42,7 +52,18 @@ log() {
 fail() {
   local msg="$1"
   echo "[subscriptions-smoke] ERROR: $msg" >&2
+  mkdir -p "$(dirname "$SUMMARY_FILE")"
   echo "- FAIL: $msg" >> "$SUMMARY_FILE"
+  if [ -n "${HFS_LOG:-}" ] && [ -f "$HFS_LOG" ]; then
+    echo "---- hfs log (tail) ----" >&2
+    tail -n 120 "$HFS_LOG" >&2 || true
+    echo "------------------------" >&2
+  fi
+  if [ -n "${WEBHOOK_LOG:-}" ] && [ -f "$WEBHOOK_LOG" ]; then
+    echo "---- webhook capture log (tail) ----" >&2
+    tail -n 80 "$WEBHOOK_LOG" >&2 || true
+    echo "------------------------------------" >&2
+  fi
   exit 1
 }
 
@@ -98,6 +119,11 @@ wait_for_value_count() {
     sleep 1
   done
 
+  if [ -f "$file" ]; then
+    echo "---- $label source ($file) tail ----" >&2
+    tail -n 40 "$file" >&2 || true
+    echo "-----------------------------------" >&2
+  fi
   fail "timed out waiting for $label in $file"
 }
 
@@ -136,12 +162,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+SUFFIX_SAFE="$(printf '%s' "$SMOKE_RUN_SUFFIX" | tr -cs '[:alnum:]-' '-' | sed -e 's/^-*//' -e 's/-*$//')"
+if [ -z "$SUFFIX_SAFE" ]; then
+  SUFFIX_SAFE="smoke"
+fi
+ID_SUFFIX="$(printf '%s' "$SUFFIX_SAFE" | cut -c1-24)"
+TOPIC_URL="${TOPIC_URL_BASE}-${SUFFIX_SAFE}"
+
 cat > "$SUMMARY_FILE" <<EOF
 ## Subscriptions Smoke Test
 
 - Base URL: \`$BASE_URL\`
 - Topic URL: \`$TOPIC_URL\`
 - FHIR Version: \`$FHIR_VERSION\`
+- Run Suffix: \`$SUFFIX_SAFE\`
 
 EOF
 
@@ -181,11 +215,11 @@ if [ "$webhook_started" -ne 1 ]; then
 fi
 pass "webhook capture started on port $WEBHOOK_PORT"
 
-TOPIC_ID="topic-smoke-1"
-REST_SUB_ID="sub-rest-smoke-1"
-WS_SUB_ID="sub-ws-smoke-1"
-REST_ENCOUNTER_ID="enc-rest-smoke-1"
-WS_ENCOUNTER_ID="enc-ws-smoke-1"
+TOPIC_ID="topic-smoke-$ID_SUFFIX"
+REST_SUB_ID="sub-rest-$ID_SUFFIX"
+WS_SUB_ID="sub-ws-$ID_SUFFIX"
+REST_ENCOUNTER_ID="enc-rest-$ID_SUFFIX"
+WS_ENCOUNTER_ID="enc-ws-$ID_SUFFIX"
 
 if [ "$USE_BACKPORT" -eq 1 ]; then
   TOPIC_CREATE_ENDPOINT="Basic"
@@ -236,6 +270,7 @@ fi
 TOPIC_STATUS="$(curl -sS -o "$HTTP_DIR/topic.response.json" -w "%{http_code}" \
   -X POST "$BASE_URL/$TOPIC_CREATE_ENDPOINT" \
   -H "Content-Type: $FHIR_CT" \
+  -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/topic.request.json")"
 expect_created "$TOPIC_STATUS" "create SubscriptionTopic" "$HTTP_DIR/topic.response.json"
 pass "created topic for FHIR $FHIR_VERSION"
@@ -292,6 +327,7 @@ fi
 REST_SUB_STATUS="$(curl -sS -o "$HTTP_DIR/rest-subscription.response.json" -w "%{http_code}" \
   -X POST "$BASE_URL/Subscription" \
   -H "Content-Type: $FHIR_CT" \
+  -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/rest-subscription.request.json")"
 expect_created "$REST_SUB_STATUS" "create rest-hook Subscription" "$HTTP_DIR/rest-subscription.response.json"
 
@@ -311,6 +347,7 @@ EOF
 REST_ENCOUNTER_STATUS="$(curl -sS -o "$HTTP_DIR/rest-encounter.response.json" -w "%{http_code}" \
   -X POST "$BASE_URL/Encounter" \
   -H "Content-Type: $FHIR_CT" \
+  -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/rest-encounter.request.json")"
 expect_created "$REST_ENCOUNTER_STATUS" "create Encounter for rest-hook smoke" "$HTTP_DIR/rest-encounter.response.json"
 
@@ -387,10 +424,12 @@ fi
 WS_SUB_STATUS="$(curl -sS -o "$HTTP_DIR/ws-subscription.response.json" -w "%{http_code}" \
   -X POST "$BASE_URL/Subscription" \
   -H "Content-Type: $FHIR_CT" \
+  -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/ws-subscription.request.json")"
 expect_created "$WS_SUB_STATUS" "create websocket Subscription" "$HTTP_DIR/ws-subscription.response.json"
 
 WS_TOKEN_STATUS="$(curl -sS -o "$WS_DIR/token.response.json" -w "%{http_code}" \
+  -H "Accept: $FHIR_ACCEPT" \
   "$BASE_URL/Subscription/$WS_SUB_ID/\$get-ws-binding-token")"
 expect_ok "$WS_TOKEN_STATUS" "get websocket binding token" "$WS_DIR/token.response.json"
 
@@ -431,6 +470,7 @@ EOF
 WS_ENCOUNTER_STATUS="$(curl -sS -o "$HTTP_DIR/ws-encounter.response.json" -w "%{http_code}" \
   -X POST "$BASE_URL/Encounter" \
   -H "Content-Type: $FHIR_CT" \
+  -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/ws-encounter.request.json")"
 expect_created "$WS_ENCOUNTER_STATUS" "create Encounter for websocket smoke" "$HTTP_DIR/ws-encounter.response.json"
 
