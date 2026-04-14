@@ -73,13 +73,12 @@ pub fn not_function(
     // Convert invocation_base to its 3-valued logic boolean form.
     // This handles singletons (Boolean, Integer, String, etc.) and empty/singleton collections.
     // Pass R4 compatibility flag based on FHIR version
-    use helios_fhir::FhirVersion;
+    #[allow(unreachable_patterns)]
     let r4_compat = match context.fhir_version {
         #[cfg(feature = "R4")]
-        FhirVersion::R4 => true,
+        helios_fhir::FhirVersion::R4 => true,
         #[cfg(feature = "R4B")]
-        FhirVersion::R4B => true,
-        #[cfg(any(feature = "R5", feature = "R6"))]
+        helios_fhir::FhirVersion::R4B => true,
         _ => false,
     };
     let base_as_logic_bool = invocation_base.to_boolean_for_logic_with_r4_compat(r4_compat)?;
