@@ -19,7 +19,7 @@ use crate::state::AppState;
 
 /// Handler for the `$status` operation on Subscription resources.
 ///
-/// Returns a `SubscriptionStatus` (R5/R6) or `Parameters` (R4/R4B backport)
+/// Returns a `SubscriptionStatus` (R4B/R5/R6) or `Parameters` (R4 backport)
 /// resource reflecting the subscription's current runtime state.
 ///
 /// # HTTP Request
@@ -83,15 +83,21 @@ where
         })?;
 
     // Return a Bundle with a SubscriptionStatus indicating query-status
+    let bundle_type = if matches!(sub.fhir_version.as_str(), "R5" | "R6") {
+        "subscription-notification"
+    } else {
+        "history"
+    };
+
     let bundle = json!({
         "resourceType": "Bundle",
-        "type": "history",
+        "type": bundle_type,
         "entry": [{
             "resource": {
                 "resourceType": "SubscriptionStatus",
                 "status": sub.status.as_fhir_str(),
                 "type": "query-status",
-                "eventsSinceSubscriptionStart": sub.events_since_start.to_string(),
+                "eventsSinceSubscriptionStart": sub.events_since_start,
                 "subscription": {
                     "reference": format!("Subscription/{}", id)
                 },
@@ -186,7 +192,7 @@ fn build_subscription_status(
     base_url: &str,
 ) -> serde_json::Value {
     if uses_backport_ig(sub.fhir_version) {
-        // R4/R4B backport: return Parameters resource
+        // R4 backport: return Parameters resource
         json!({
             "resourceType": "Parameters",
             "parameter": [
@@ -220,7 +226,7 @@ fn build_subscription_status(
             "resourceType": "SubscriptionStatus",
             "status": sub.status.as_fhir_str(),
             "type": "query-status",
-            "eventsSinceSubscriptionStart": sub.events_since_start.to_string(),
+            "eventsSinceSubscriptionStart": sub.events_since_start,
             "subscription": {
                 "reference": format!("Subscription/{}", id)
             },
@@ -230,7 +236,7 @@ fn build_subscription_status(
 }
 
 /// Returns true for FHIR versions that use the Subscriptions R5 Backport IG
-/// (R4 and R4B), false for versions with native subscription support (R5, R6).
+/// (R4), false for versions with native subscription support (R4B, R5, R6).
 fn uses_backport_ig(version: helios_fhir::FhirVersion) -> bool {
-    matches!(version.as_str(), "R4" | "R4B")
+    version.as_str() == "R4"
 }
