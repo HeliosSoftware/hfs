@@ -617,7 +617,12 @@ impl SearchParameterLoader {
 
 impl Default for SearchParameterLoader {
     fn default() -> Self {
-        Self::new(FhirVersion::R4)
+        Self::new(
+            FhirVersion::enabled_versions()
+                .first()
+                .copied()
+                .expect("at least one FHIR version feature must be enabled"),
+        )
     }
 }
 
