@@ -5,12 +5,12 @@
 //!
 //! - **R4**: Bundle(type=history) with SubscriptionStatus as Parameters (backport IG)
 //! - **R4B**: Bundle(type=history) with native SubscriptionStatus
-//! - **R5**: Bundle(type=subscription-notification) with native SubscriptionStatus
-//! - **R6**: Follows R5 model with refinements
+//! - **R5/R6**: Bundle(type=subscription-notification) with native SubscriptionStatus
 
 mod builder;
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "R4")]
 use helios_fhir::FhirVersion;
 
 use crate::error::SubscriptionError;
@@ -127,6 +127,7 @@ mod tests {
     use super::*;
     use crate::manager::{ChannelConfig, ChannelType, PayloadContent, SubscriptionStatusCode};
     use chrono::Utc;
+    use helios_fhir::FhirVersion;
     use serde_json::json;
 
     fn test_subscription(payload: PayloadContent) -> ActiveSubscription {
@@ -261,9 +262,47 @@ mod tests {
         let sub = test_subscription(PayloadContent::IdOnly);
         let bundle = build_handshake(&sub, "http://localhost:8080").unwrap();
 
-        // For the default version (R4 with backport), type is "history".
-        // For R5+, type would be "subscription-notification".
         #[cfg(feature = "R4")]
         assert_eq!(bundle["type"], "history");
+
+        #[cfg(feature = "R4B")]
+        assert_eq!(bundle["type"], "history");
+
+        #[cfg(any(feature = "R5", feature = "R6"))]
+        assert_eq!(bundle["type"], "subscription-notification");
+    }
+
+    #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
+    #[test]
+    fn test_native_status_uses_integer_counters() {
+        let mut sub = test_subscription(PayloadContent::IdOnly);
+        #[cfg(feature = "R4B")]
+        {
+            sub.fhir_version = FhirVersion::R4B;
+        }
+        #[cfg(feature = "R5")]
+        {
+            sub.fhir_version = FhirVersion::R5;
+        }
+        #[cfg(feature = "R6")]
+        {
+            sub.fhir_version = FhirVersion::R6;
+        }
+
+        let event = NotificationEventData {
+            event_number: 6,
+            timestamp: Utc::now(),
+            focus_reference: "Encounter/123".to_string(),
+        };
+
+        let bundle = build_event_notification(&sub, event, None, "http://localhost:8080").unwrap();
+        let status = &bundle["entry"][0]["resource"];
+
+        assert_eq!(status["resourceType"], "SubscriptionStatus");
+        assert_eq!(status["eventsSinceSubscriptionStart"].as_u64(), Some(5));
+        assert_eq!(
+            status["notificationEvent"][0]["eventNumber"].as_u64(),
+            Some(6)
+        );
     }
 }
