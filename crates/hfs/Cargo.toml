@@ -46,7 +46,7 @@ cloudwatch = ["helios-audit/cloudwatch"]
 reqwest = { version = "0.12", features = ["blocking"] }
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.1.47" }
+helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
 helios-rest = { path = "../rest", version = "0.1.47", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false, features = ["audit"] }
 helios-auth = { path = "../auth", version = "0.1.47" }
