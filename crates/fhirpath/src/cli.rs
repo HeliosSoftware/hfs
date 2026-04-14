@@ -303,6 +303,7 @@ fn write_output(path: &Option<PathBuf>, content: &str) -> FhirPathResult<()> {
 
 /// Parse FHIR resource based on version
 fn parse_fhir_resource(json: Value, version: FhirVersion) -> FhirPathResult<FhirResource> {
+    #[allow(unreachable_patterns)]
     match version {
         #[cfg(feature = "R4")]
         FhirVersion::R4 => {
@@ -324,9 +325,8 @@ fn parse_fhir_resource(json: Value, version: FhirVersion) -> FhirPathResult<Fhir
             let resource: helios_fhir::r6::Resource = serde_json::from_value(json)?;
             Ok(FhirResource::R6(Box::new(resource)))
         }
-        #[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6")))]
         _ => Err(FhirPathError::InvalidInput(format!(
-            "FHIR version {:?} is not enabled. Compile with the appropriate feature flag.",
+            "FHIR version {:?} is not enabled in this helios-fhirpath build. Compile with the matching version feature.",
             version
         ))),
     }
