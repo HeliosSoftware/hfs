@@ -8,6 +8,7 @@ pub mod retry;
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
 use crate::channels::rest_hook::RestHookChannel;
@@ -30,6 +31,7 @@ use crate::topics::InMemoryTopicRegistry;
 /// (fire-and-forget via `tokio::spawn`), mirroring the audit middleware pattern.
 pub struct SubscriptionEngine {
     topic_registry: Arc<InMemoryTopicRegistry>,
+    topic_resource_index: DashMap<(String, String, String), String>,
     manager: Arc<SubscriptionManager>,
     evaluator: EventEvaluator,
     rest_hook_channel: Arc<RestHookChannel>,
@@ -56,6 +58,7 @@ impl SubscriptionEngine {
 
         Self {
             topic_registry,
+            topic_resource_index: DashMap::new(),
             manager,
             evaluator,
             rest_hook_channel,
@@ -208,22 +211,81 @@ impl SubscriptionEngine {
 
     /// Handle a SubscriptionTopic resource event.
     async fn handle_topic_event(&self, event: &ResourceEvent) {
+        let topic_key = (
+            event.tenant_id.to_string(),
+            event.resource_type.clone(),
+            event.resource_id.clone(),
+        );
+
         match event.event_type {
             ResourceEventType::Delete => {
-                // Remove topic by canonical URL (we'd need to look it up).
-                // For now, we can't easily remove without knowing the canonical URL.
-                // This will be handled via a full registry refresh.
-                info!(
-                    resource_id = %event.resource_id,
-                    "SubscriptionTopic deleted"
-                );
+                let mut candidate_urls = Vec::new();
+
+                if let Some((_, indexed_url)) = self.topic_resource_index.remove(&topic_key) {
+                    candidate_urls.push(indexed_url);
+                }
+
+                if let Some(resource) = &event.resource {
+                    match InMemoryTopicRegistry::parse_topic_resource(resource) {
+                        Ok(topic) => candidate_urls.push(topic.canonical_url),
+                        Err(e) => {
+                            warn!(
+                                resource_id = %event.resource_id,
+                                error = %e,
+                                "Failed to parse SubscriptionTopic delete payload"
+                            );
+                        }
+                    }
+                }
+
+                if let Some(previous_resource) = &event.previous_resource {
+                    match InMemoryTopicRegistry::parse_topic_resource(previous_resource) {
+                        Ok(topic) => candidate_urls.push(topic.canonical_url),
+                        Err(e) => {
+                            warn!(
+                                resource_id = %event.resource_id,
+                                error = %e,
+                                "Failed to parse previous SubscriptionTopic state"
+                            );
+                        }
+                    }
+                }
+
+                candidate_urls.sort();
+                candidate_urls.dedup();
+
+                if candidate_urls.is_empty() {
+                    warn!(
+                        resource_id = %event.resource_id,
+                        "SubscriptionTopic deleted but canonical URL could not be resolved"
+                    );
+                    return;
+                }
+
+                for canonical_url in candidate_urls {
+                    let removed = self.topic_registry.remove_topic(&canonical_url);
+                    info!(
+                        resource_id = %event.resource_id,
+                        topic_url = %canonical_url,
+                        removed,
+                        "SubscriptionTopic deleted"
+                    );
+                }
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
                     match InMemoryTopicRegistry::parse_topic_resource(resource) {
                         Ok(topic) => {
+                            let canonical_url = topic.canonical_url.clone();
+                            if let Some(previous_url) = self
+                                .topic_resource_index
+                                .insert(topic_key, canonical_url.clone())
+                                .filter(|previous_url| previous_url != &canonical_url)
+                            {
+                                let _ = self.topic_registry.remove_topic(&previous_url);
+                            }
                             info!(
-                                topic_url = %topic.canonical_url,
+                                topic_url = %canonical_url,
                                 "Registered SubscriptionTopic"
                             );
                             self.topic_registry.add_topic(topic);
@@ -250,27 +312,89 @@ impl SubscriptionEngine {
             return false;
         }
 
+        let topic_key = (
+            event.tenant_id.to_string(),
+            event.resource_type.clone(),
+            event.resource_id.clone(),
+        );
+
         match event.event_type {
             ResourceEventType::Delete => {
+                let mut candidate_urls = Vec::new();
+                let mut recognized_topic = false;
+
+                if let Some((_, indexed_url)) = self.topic_resource_index.remove(&topic_key) {
+                    candidate_urls.push(indexed_url);
+                    recognized_topic = true;
+                }
+
                 if let Some(resource) = &event.resource {
-                    if let Ok(Some(_)) =
-                        InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource)
-                    {
-                        info!(
-                            resource_id = %event.resource_id,
-                            "R4 Basic SubscriptionTopic deleted"
-                        );
-                        return true;
+                    match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource) {
+                        Ok(Some(topic)) => {
+                            candidate_urls.push(topic.canonical_url);
+                            recognized_topic = true;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(
+                                resource_id = %event.resource_id,
+                                error = %e,
+                                "Failed to parse R4 Basic SubscriptionTopic delete payload"
+                            );
+                            recognized_topic = true;
+                        }
                     }
                 }
-                false
+
+                if let Some(previous_resource) = &event.previous_resource {
+                    match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(
+                        previous_resource,
+                    ) {
+                        Ok(Some(topic)) => {
+                            candidate_urls.push(topic.canonical_url);
+                            recognized_topic = true;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(
+                                resource_id = %event.resource_id,
+                                error = %e,
+                                "Failed to parse previous R4 Basic SubscriptionTopic state"
+                            );
+                            recognized_topic = true;
+                        }
+                    }
+                }
+
+                candidate_urls.sort();
+                candidate_urls.dedup();
+
+                for canonical_url in candidate_urls {
+                    let removed = self.topic_registry.remove_topic(&canonical_url);
+                    info!(
+                        resource_id = %event.resource_id,
+                        topic_url = %canonical_url,
+                        removed,
+                        "R4 Basic SubscriptionTopic deleted"
+                    );
+                }
+
+                recognized_topic
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
                     match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource) {
                         Ok(Some(topic)) => {
+                            let canonical_url = topic.canonical_url.clone();
+                            if let Some(previous_url) = self
+                                .topic_resource_index
+                                .insert(topic_key, canonical_url.clone())
+                                .filter(|previous_url| previous_url != &canonical_url)
+                            {
+                                let _ = self.topic_registry.remove_topic(&previous_url);
+                            }
                             info!(
-                                topic_url = %topic.canonical_url,
+                                topic_url = %canonical_url,
                                 "Registered R4 Basic SubscriptionTopic"
                             );
                             self.topic_registry.add_topic(topic);
@@ -577,6 +701,29 @@ mod tests {
         let topics = engine.topic_registry().list_topics();
         assert_eq!(topics.len(), 1);
         assert!(topics.contains(&"http://example.org/topic/encounter-start".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_topic_delete_event_removes_topic_without_payload() {
+        let engine = make_engine("http://localhost:8080");
+        engine.on_resource_event(topic_event()).await;
+
+        let delete_event = ResourceEvent {
+            tenant_id: TenantId::new("t1"),
+            fhir_version: FhirVersion::default(),
+            resource_type: "SubscriptionTopic".to_string(),
+            resource_id: "topic-1".to_string(),
+            version_id: "2".to_string(),
+            event_type: ResourceEventType::Delete,
+            resource: None,
+            previous_resource: None,
+            timestamp: Utc::now(),
+        };
+
+        engine.on_resource_event(delete_event).await;
+
+        let topics = engine.topic_registry().list_topics();
+        assert!(topics.is_empty());
     }
 
     #[cfg(feature = "R4")]
