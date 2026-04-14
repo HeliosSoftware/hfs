@@ -259,17 +259,29 @@ mod tests {
 
     #[test]
     fn test_native_notification_bundle_type() {
-        let sub = test_subscription(PayloadContent::IdOnly);
-        let bundle = build_handshake(&sub, "http://localhost:8080").unwrap();
-
-        #[cfg(feature = "R4")]
-        assert_eq!(bundle["type"], "history");
-
         #[cfg(feature = "R4B")]
-        assert_eq!(bundle["type"], "history");
+        {
+            let mut sub = test_subscription(PayloadContent::IdOnly);
+            sub.fhir_version = FhirVersion::R4B;
+            let bundle = build_handshake(&sub, "http://localhost:8080").unwrap();
+            assert_eq!(bundle["type"], "history");
+        }
 
-        #[cfg(any(feature = "R5", feature = "R6"))]
-        assert_eq!(bundle["type"], "subscription-notification");
+        #[cfg(feature = "R5")]
+        {
+            let mut sub = test_subscription(PayloadContent::IdOnly);
+            sub.fhir_version = FhirVersion::R5;
+            let bundle = build_handshake(&sub, "http://localhost:8080").unwrap();
+            assert_eq!(bundle["type"], "subscription-notification");
+        }
+
+        #[cfg(feature = "R6")]
+        {
+            let mut sub = test_subscription(PayloadContent::IdOnly);
+            sub.fhir_version = FhirVersion::R6;
+            let bundle = build_handshake(&sub, "http://localhost:8080").unwrap();
+            assert_eq!(bundle["type"], "subscription-notification");
+        }
     }
 
     #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
