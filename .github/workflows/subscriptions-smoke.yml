@@ -272,12 +272,14 @@ jobs:
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_SUBSCRIPTIONS_ENABLED=true \
             HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres" ]; then
             HFS_SUBSCRIPTIONS_ENABLED=true \
             HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
             HFS_STORAGE_BACKEND=postgres \
             HFS_PG_HOST="$DOCKER_HOST_IP" \
             HFS_PG_PORT="$PG_PORT" \
@@ -288,6 +290,7 @@ jobs:
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
             HFS_SUBSCRIPTIONS_ENABLED=true \
             HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_subscriptions_smoke_${{ github.run_id }}_${{ github.run_attempt }}" \
@@ -295,15 +298,17 @@ jobs:
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_SUBSCRIPTIONS_ENABLED=true \
             HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
             HFS_STORAGE_BACKEND=s3-elasticsearch \
             HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
-            HFS_S3_PREFIX="ci/subscriptions-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.backend }}/" \
+            HFS_S3_PREFIX="ci/subscriptions-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.fhir_version }}/${{ matrix.backend }}/" \
             HFS_S3_VALIDATE_BUCKETS=false \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             HFS_SUBSCRIPTIONS_ENABLED=true \
             HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
             ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           fi
 
@@ -337,6 +342,7 @@ jobs:
           FHIR_VERSION="${{ matrix.fhir_version }}" \
           RESULTS_DIR="$RESULTS_DIR" \
           WEBSOCAT_BIN="$WEBSOCAT_BIN" \
+          SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}" \
           ./crates/hfs/tests/subscriptions/run_external_subscriptions_smoke.sh
 
       - name: Stop HFS gracefully
@@ -359,7 +365,7 @@ jobs:
       - name: Collect backend container logs
         if: always()
         run: |
-          RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results/${{ matrix.backend }}}"
+          RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}}"
           mkdir -p "$RESULTS_DIR/backend-logs"
           if [ -n "${ES_CONTAINER:-}" ]; then
             docker logs "$ES_CONTAINER" > "$RESULTS_DIR/backend-logs/elasticsearch.log" 2>&1 || true
@@ -374,7 +380,7 @@ jobs:
       - name: Append smoke report to summary
         if: always()
         run: |
-          RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results/${{ matrix.backend }}}"
+          RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}}"
           if [ -f "$RESULTS_DIR/summary.md" ]; then
             cat "$RESULTS_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
           else
@@ -387,8 +393,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: subscriptions-smoke-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: subscriptions-smoke-results/${{ matrix.backend }}/
+          name: subscriptions-smoke-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: subscriptions-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}/
           retention-days: 30
 
       - name: Cleanup containers
