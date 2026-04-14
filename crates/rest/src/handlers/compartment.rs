@@ -54,6 +54,8 @@ fn get_compartment_params_for_version(
         FhirVersion::R5 => helios_fhir::r5::get_compartment_params(compartment_type, resource_type),
         #[cfg(feature = "R6")]
         FhirVersion::R6 => helios_fhir::r6::get_compartment_params(compartment_type, resource_type),
+        #[allow(unreachable_patterns)]
+        _ => &[],
     }
 }
 
