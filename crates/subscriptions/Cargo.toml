@@ -10,14 +10,14 @@ description = "FHIR topic-based Subscriptions engine for HFS"
 
 [features]
 default = ["R4"]
-R4 = ["helios-fhir/R4"]
-R4B = ["helios-fhir/R4B"]
-R5 = ["helios-fhir/R5"]
-R6 = ["helios-fhir/R6"]
+R4 = ["helios-fhir/R4", "helios-persistence/R4"]
+R4B = ["helios-fhir/R4B", "helios-persistence/R4B"]
+R5 = ["helios-fhir/R5", "helios-persistence/R5"]
+R6 = ["helios-fhir/R6", "helios-persistence/R6"]
 
 [dependencies]
 # FHIR models
-helios-fhir = { path = "../fhir" }
+helios-fhir = { path = "../fhir", default-features = false }
 
 # Persistence (for TenantContext, StoredResource, etc.)
 helios-persistence = { path = "../persistence", default-features = false }
