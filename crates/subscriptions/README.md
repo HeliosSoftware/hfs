@@ -19,6 +19,7 @@ The `SubscriptionEngine` orchestrates all five concerns and is the main entry po
 ## Features
 
 - **Version-aware parsing**: R4 reads the backport extension set (`backport-topic-canonical`, `backport-payload-content`, `backport-channel-type`, `backport-filter-criteria`); R4B/R5/R6 read native `topic`, `channelType`, `filterBy` fields
+- **Topic lifecycle parity**: topic create/update/delete now updates the in-memory registry for both native `SubscriptionTopic` and R4 backport `Basic` topic resources
 - **Status state machine**: `Requested → Active → Error → Off` with validated transitions; subscriptions activate only after a successful handshake
 - **Exponential backoff retry**: configurable initial delay, max delay, backoff factor, and max attempts before transitioning to `error` or `off`
 - **Tenant isolation**: all in-memory maps are keyed by `(tenant_id, subscription_id)` — subscriptions in different tenants never interact
@@ -44,7 +45,7 @@ ResourceEvent
 SubscriptionEngine.on_resource_event()
      │
      ├─ resource_type == "Subscription"   → SubscriptionManager.register() / deregister()
-     ├─ resource_type == "SubscriptionTopic" → InMemoryTopicRegistry.add_topic()
+     ├─ resource_type == "SubscriptionTopic" → add/update/remove topic in InMemoryTopicRegistry
      ├─ resource_type == "Basic" && fhir_version == "R4"
      │    → parse as R4 backport topic candidate; add/remove topic when valid
      │
@@ -132,7 +133,7 @@ SubscriptionEngine.on_resource_event()
 
 ## Filter Matching
 
-Filters use the R4 backport string format `ResourceType?parameter=value` (parsed by `parse_filter_string`) or the native R5 `filterBy` array. The evaluator supports:
+Filters use the R4 backport string format `ResourceType?parameter=value` (parsed by `parse_filter_string`) or the native R4B/R5/R6 `filterBy` array. The evaluator supports:
 
 | Filter parameter | Resolved from |
 |-----------------|---------------|
@@ -142,7 +143,7 @@ Filters use the R4 backport string format `ResourceType?parameter=value` (parsed
 | `identifier` | `identifier[].value` |
 | *(other)* | Direct JSON field lookup by name |
 
-Comparators supported: `eq` (default), `in`. FHIRPath evaluation is not used in Phase 2 — filters currently operate on the raw resource JSON.
+Comparators supported: `eq` (default), `in`. Native `filterBy.comparator` values are mapped into the internal filter form. FHIRPath evaluation is not used in Phase 2 — filters currently operate on the raw resource JSON.
 
 ## Configuration
 
@@ -171,6 +172,17 @@ cargo build --bin hfs --features subscriptions
 HFS_SUBSCRIPTIONS_ENABLED=true cargo run --bin hfs --features subscriptions
 ```
 
+For version-specific validation, use explicit feature selection:
+
+```bash
+cargo check -p helios-subscriptions --no-default-features --features R4
+cargo check -p helios-subscriptions --no-default-features --features R4B
+cargo check -p helios-subscriptions --no-default-features --features R5
+cargo check -p helios-subscriptions --no-default-features --features R6
+```
+
+External smoke script supports version selection through `FHIR_VERSION` (`R4`, `R4B`, `R5`, `R6`).
+
 When enabled, the engine auto-initializes with default configuration and begins processing events after the first resource write.
 
 ## Integration
@@ -190,7 +202,7 @@ The spawned task calls `engine.on_resource_event(event).await`, which runs the f
 
 POST a `SubscriptionTopic` resource (R4B/R5/R6) or a `Basic` resource with the backport profile (R4) to your HFS instance. The engine picks it up automatically on the next write:
 
-**R5/R6 (native `SubscriptionTopic`)**
+**R4B/R5/R6 (native `SubscriptionTopic`)**
 
 ```bash
 curl -X POST http://localhost:8080/SubscriptionTopic \
@@ -324,7 +336,7 @@ The WebSocket protocol is **unidirectional** (server → client) after binding. 
 GET /Subscription/{id}/$status
 ```
 
-Returns a `Parameters` resource (R4) or `SubscriptionStatus` resource (R5/R6) with the current runtime status and event count.
+Returns a `Parameters` resource (R4) or `SubscriptionStatus` resource (R4B/R5/R6) with the current runtime status and event count.
 
 ## Features
 
@@ -333,7 +345,7 @@ FHIR version support via Cargo feature flags:
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `R4` | Yes | FHIR R4 with Subscriptions R5 Backport IG |
-| `R4B` | No | FHIR R4B with Subscriptions R5 Backport IG |
+| `R4B` | No | FHIR R4B with native Subscriptions resources |
 | `R5` | No | FHIR R5 with native Subscriptions Framework |
 | `R6` | No | FHIR R6 with native Subscriptions Framework |
 
