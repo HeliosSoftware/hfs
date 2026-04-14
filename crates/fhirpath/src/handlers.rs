@@ -547,6 +547,7 @@ fn detect_fhir_version(resource: &Value) -> FhirVersion {
 
 /// Parse FHIR resource based on version
 fn parse_fhir_resource(json: Value, version: FhirVersion) -> FhirPathResult<FhirResource> {
+    #[allow(unreachable_patterns)]
     match version {
         #[cfg(feature = "R4")]
         FhirVersion::R4 => {
@@ -572,9 +573,8 @@ fn parse_fhir_resource(json: Value, version: FhirVersion) -> FhirPathResult<Fhir
                 .map_err(|e| FhirPathError::InvalidInput(format!("Invalid R6 resource: {}", e)))?;
             Ok(FhirResource::R6(Box::new(resource)))
         }
-        #[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6")))]
         _ => Err(FhirPathError::InvalidInput(format!(
-            "FHIR version {:?} is not enabled",
+            "FHIR version {:?} is not enabled in this helios-fhirpath build",
             version
         ))),
     }
