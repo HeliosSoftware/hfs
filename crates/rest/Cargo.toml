@@ -38,7 +38,7 @@ subscriptions = ["dep:helios-subscriptions"]
 
 [dependencies]
 # Core dependencies
-helios-fhir = { path = "../fhir", version = "0.1.47" }
+helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false }
 helios-serde = { path = "../serde", version = "0.1.47", default-features = false, optional = true }
 helios-auth = { path = "../auth", version = "0.1.47" }
