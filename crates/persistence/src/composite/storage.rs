@@ -641,8 +641,16 @@ impl CompositeStorage {
                 let fhir_version = resource_json
                     .get("meta")
                     .and_then(|m| m.get("profile"))
-                    .map(|_| FhirVersion::default())
-                    .unwrap_or_default();
+                    .and_then(|v| v.as_array())
+                    .and_then(|profiles| profiles.first())
+                    .and_then(|v| v.as_str())
+                    .and_then(FhirVersion::from_storage)
+                    .unwrap_or_else(|| {
+                        FhirVersion::enabled_versions()
+                            .first()
+                            .copied()
+                            .expect("at least one FHIR version feature must be enabled")
+                    });
 
                 if let Err(e) = self
                     .sync_to_secondaries(SyncEvent::Create {
