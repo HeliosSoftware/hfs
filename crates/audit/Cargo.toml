@@ -46,7 +46,10 @@ uuid = { version = "1", features = ["v4"] }
 axum = "0.8"
 
 # AWS CloudWatch Logs (optional)
-aws-sdk-cloudwatchlogs = { version = "1", optional = true }
+# Disable default features to avoid the legacy `rustls` feature that pulls
+# in vulnerable rustls 0.21 / rustls-webpki 0.101. `default-https-client`
+# uses the modern rustls-aws-lc path instead.
+aws-sdk-cloudwatchlogs = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 
 [dev-dependencies]
