@@ -131,6 +131,9 @@ pub enum ImportFormat {
     /// NUCC Provider Taxonomy CSV from nucc.org
     #[value(name = "nucc")]
     Nucc,
+    /// FDA National Drug Code Directory (`product.txt` or `ndctext.zip`) — public domain
+    #[value(name = "ndc")]
+    Ndc,
 }
 
 impl fmt::Display for ImportFormat {
@@ -148,6 +151,7 @@ impl fmt::Display for ImportFormat {
             ImportFormat::Dicom => write!(f, "dicom"),
             ImportFormat::Hl7V2Tables => write!(f, "hl7-v2-tables"),
             ImportFormat::Nucc => write!(f, "nucc"),
+            ImportFormat::Ndc => write!(f, "ndc"),
         }
     }
 }
@@ -191,6 +195,10 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
     // NUCC taxonomy CSV.
     if name.ends_with(".csv") && (name.contains("nucc") || name.contains("taxonomy")) {
         return Some(ImportFormat::Nucc);
+    }
+    // NDC flat text file distributed directly (e.g. product.txt or ndctext.txt).
+    if name == "product.txt" || name.contains("ndctext") {
+        return Some(ImportFormat::Ndc);
     }
     if name.ends_with(".rrf") {
         return Some(ImportFormat::Rxnorm);
@@ -259,6 +267,10 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
             && (entry_name.contains("nucc") || entry_name.contains("taxonomy"))
         {
             return Some(ImportFormat::Nucc);
+        }
+        // NDC: ZIP containing product.txt (e.g. ndctext.zip from FDA).
+        if entry_name == "product.txt" || entry_name.ends_with("/product.txt") {
+            return Some(ImportFormat::Ndc);
         }
     }
     None

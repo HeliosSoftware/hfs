@@ -15,6 +15,7 @@
 //! | [`icd10_cm`] | ICD-10-CM tabular XML | Free (CMS / CDC) |
 //! | [`icd9_cm`]  | ICD-9-CM pipe-delimited text  | Free (public domain, retired 2015) |
 //! | [`rxnorm_rrf`] | RxNorm RRF (folder or `.zip`) | Free NLM Terms of Service |
+//! | [`ndc`] | FDA NDC Directory (`product.txt` or `.zip`) | Free (public domain) |
 //!
 //! All importers are invoked from the CLI (`hts import`) via `main.rs` using
 //! the format auto-detection in [`crate::config::detect_format`], or
@@ -30,6 +31,7 @@ pub mod icd9_cm;
 pub mod loinc_csv;
 pub mod mesh;
 pub mod nci_thesaurus;
+pub mod ndc;
 pub mod nucc;
 pub mod rxnorm_rrf;
 pub mod snomed_rf2;

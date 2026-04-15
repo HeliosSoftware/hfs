@@ -248,7 +248,7 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
                 "Cannot auto-detect format from '{}'.\n\
                  Use --format to specify one of:\n\
                  hl7-npm | snomed-rf2 | loinc | icd10-cm | icd9-cm | rxnorm |\n\
-                 ucum | nci-thesaurus | mesh | dicom | hl7-v2-tables | nucc\n\
+                 ucum | nci-thesaurus | mesh | dicom | hl7-v2-tables | nucc | ndc\n\
                  Note: .zip files may require --format if auto-detection is ambiguous.",
                 args.path.display()
             )
@@ -450,6 +450,19 @@ async fn run_import_sqlite(args: ImportArgs) -> anyhow::Result<i32> {
             let dry_run = args.dry_run;
 
             tokio::task::spawn_blocking(move || import_nucc(&pool, &path, batch_size, dry_run))
+                .await
+                .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
+        }
+
+        ImportFormat::Ndc => {
+            use helios_hts::import::ndc::import_ndc;
+            let backend = SqliteTerminologyBackend::new(&database_url)?;
+            let pool = backend.pool().clone();
+            let path = args.path.clone();
+            let batch_size = args.batch_size;
+            let dry_run = args.dry_run;
+
+            tokio::task::spawn_blocking(move || import_ndc(&pool, &path, batch_size, dry_run))
                 .await
                 .map_err(|e| anyhow::anyhow!("Import task panicked: {e}"))??
         }
