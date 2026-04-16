@@ -1,0 +1,20 @@
+//! Export job infrastructure for `$viewdefinition-export`.
+//!
+//! This module defines:
+//! - [`ExportJobController`] — trait for managing async export jobs
+//! - [`InMemoryController`] — default in-process implementation
+//! - [`ExportSink`] — trait for writing output files
+//! - [`FilesystemSink`] — writes output to a local directory
+//! - [`InMemorySink`] — in-process sink for testing
+
+pub mod controller;
+pub mod in_memory;
+pub mod planner;
+pub mod sink;
+
+pub use controller::{CompletedFile, ExportError, ExportJobController, ExportTask, JobStatus};
+pub use in_memory::InMemoryController;
+pub use planner::DEFAULT_SHARD_ROWS;
+#[cfg(feature = "s3")]
+pub use sink::S3Sink;
+pub use sink::{ExportSink, FilesystemSink, InMemorySink};

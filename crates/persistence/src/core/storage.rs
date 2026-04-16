@@ -4,10 +4,13 @@
 //! CRUD operations for FHIR resources. All storage operations require a [`TenantContext`]
 //! to ensure proper tenant isolation.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
+use crate::core::sof_runner::SofRunner;
 use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
@@ -264,6 +267,17 @@ pub trait ResourceStorage: Send + Sync {
         tenant: &TenantContext,
         resource_type: Option<&str>,
     ) -> StorageResult<u64>;
+
+    /// Returns the SQL-on-FHIR runner for this backend, if it supports in-DB execution.
+    ///
+    /// Backends that can compile ViewDefinitions to SQL and run them natively (SQLite,
+    /// PostgreSQL) return `Some(runner)`. All other backends return `None`, causing the
+    /// handler layer to fall back to the in-process runner.
+    ///
+    /// The default implementation returns `None`.
+    fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
 }
 
 /// Extension trait for storage backends that support permanent deletion.

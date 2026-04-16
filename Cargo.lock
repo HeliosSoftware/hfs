@@ -1952,6 +1952,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2720,6 +2734,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+
+[[package]]
+name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
@@ -2886,13 +2906,16 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "dashmap",
  "helios-auth",
  "helios-fhir",
  "helios-persistence",
  "helios-rest",
+ "helios-sof",
  "openssl",
  "parking_lot",
  "reqwest",
+ "sqlparser",
  "tokio",
  "tracing",
 ]
@@ -2901,6 +2924,7 @@ dependencies = [
 name = "helios-persistence"
 version = "0.1.47"
 dependencies = [
+ "async-stream",
  "async-trait",
  "aws-config",
  "aws-credential-types",
@@ -2937,6 +2961,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
+ "tokio-stream",
  "tokio-test",
  "tower-http 0.6.8",
  "tracing",
@@ -2950,14 +2975,19 @@ version = "0.1.47"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
  "axum",
  "axum-test",
  "chrono",
  "clap",
+ "dashmap",
+ "futures",
  "helios-auth",
  "helios-fhir",
  "helios-persistence",
  "helios-serde",
+ "helios-sof",
  "http 1.4.0",
  "json-patch",
  "jsonpath-rust",
@@ -2965,6 +2995,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sqlparser",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -5232,6 +5263,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "recursive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0786a43debb760f491b1bc0269fe5e84155353c67482b9e60d0cfb596054b43e"
+dependencies = [
+ "recursive-proc-macro-impl",
+ "stacker",
+]
+
+[[package]]
+name = "recursive-proc-macro-impl"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76009fbe0614077fc1a2ce255e3a1881a2e3a3527097d5dc6d8212c585e7e38b"
+dependencies = [
+ "quote",
+ "syn 2.0.116",
+]
+
+[[package]]
 name = "redis"
 version = "0.27.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6102,6 +6153,16 @@ checksum = "67cf02bbac7a337dc36e4f5a693db6c21e7863f45070f7064577eb4367a3212b"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.54.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c66e3b7374ad4a6af849b08b3e7a6eda0edbd82f0fd59b57e22671bf16979899"
+dependencies = [
+ "log",
+ "recursive",
 ]
 
 [[package]]

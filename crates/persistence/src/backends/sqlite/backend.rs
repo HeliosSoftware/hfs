@@ -369,6 +369,11 @@ impl SqliteBackend {
         Ok(count)
     }
 
+    /// Returns a clone of the connection pool (cheap — pool is `Arc`-backed internally).
+    pub(crate) fn pool(&self) -> Pool<SqliteConnectionManager> {
+        self.pool.clone()
+    }
+
     /// Get a connection from the pool.
     pub(crate) fn get_connection(
         &self,

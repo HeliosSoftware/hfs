@@ -140,12 +140,15 @@
 
 pub mod config;
 pub mod error;
+#[cfg(feature = "sof")]
+pub mod export;
 pub mod extractors;
 pub mod fhir_types;
 pub mod handlers;
 pub mod middleware;
 pub mod responses;
 pub mod routing;
+pub mod sof;
 pub mod state;
 pub mod tenant;
 
@@ -159,6 +162,8 @@ pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
 use std::sync::Arc;
 
 use axum::Router;
+#[cfg(feature = "sof")]
+use helios_persistence::core::sof_runner::SofRunner;
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
 };
@@ -268,13 +273,156 @@ where
         info!("Authentication is ENABLED");
     }
 
+    // Wrap storage in Arc so we can share it with the SofRunner
+    let storage_arc = Arc::new(storage);
+
     // Create application state
-    let state = AppState::with_auth(
-        Arc::new(storage),
+    let mut state = AppState::with_auth(
+        Arc::clone(&storage_arc),
         config.clone(),
         auth_config,
         auth_state.clone(),
     );
+
+    // Wire SQL-on-FHIR runner and export controller
+    #[cfg(feature = "sof")]
+    if config.sof_enabled {
+        let runner: Arc<dyn SofRunner> = {
+            // Prefer the storage's own in-DB runner (will be Some for SQLite/PG after Phase 3).
+            // Force in-process when HFS_SOF_DEFAULT_RUNNER=inprocess.
+            let force_inprocess = config.sof_default_runner.to_lowercase() == "inprocess";
+            if !force_inprocess {
+                storage_arc.sof_runner()
+            } else {
+                None
+            }
+        }
+        .unwrap_or_else(|| {
+            use crate::sof::in_process::InProcessRunner;
+            info!(
+                runner = "inprocess",
+                fhir_version = ?config.default_fhir_version,
+                "Using in-process SofRunner (no in-DB runner available)"
+            );
+            Arc::new(InProcessRunner::new(
+                Arc::clone(&storage_arc),
+                config.default_fhir_version,
+            ))
+        });
+
+        // Keep a clone for the export controller before moving runner into state.
+        let runner_for_export = Arc::clone(&runner);
+        state = state.with_sof_runner(runner);
+
+        // Wire the export job controller.
+        use crate::export::{ExportJobController, FilesystemSink, InMemoryController};
+        let controller: Arc<dyn ExportJobController> = {
+            let max_concurrency = Some(config.export_max_concurrency);
+            let shard_rows = Some(config.export_shard_rows);
+
+            #[cfg(feature = "s3")]
+            if config.export_sink.to_lowercase() == "s3" {
+                use crate::export::S3Sink;
+                let bucket = config
+                    .export_s3_bucket
+                    .clone()
+                    .unwrap_or_else(|| "hfs-exports".to_string());
+                let region = config.export_s3_region.clone();
+                let ttl = config.export_presign_ttl_secs;
+
+                info!(bucket = %bucket, "Export controller: InMemory + S3Sink");
+
+                match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(S3Sink::from_config(
+                        bucket.clone(),
+                        region,
+                        String::new(),
+                        ttl,
+                    ))
+                }) {
+                    Ok(sink) => Arc::new(InMemoryController::with_shard_rows(
+                        runner_for_export,
+                        sink,
+                        max_concurrency,
+                        shard_rows,
+                    )),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            dir = %config.export_dir,
+                            "S3 export sink init failed — falling back to FilesystemSink"
+                        );
+                        let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                        Arc::new(InMemoryController::with_shard_rows(
+                            runner_for_export,
+                            sink,
+                            max_concurrency,
+                            shard_rows,
+                        ))
+                    }
+                }
+            } else {
+                info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
+                let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                Arc::new(InMemoryController::with_shard_rows(
+                    runner_for_export,
+                    sink,
+                    max_concurrency,
+                    shard_rows,
+                ))
+            }
+
+            #[cfg(not(feature = "s3"))]
+            {
+                info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
+                let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                Arc::new(InMemoryController::with_shard_rows(
+                    runner_for_export,
+                    sink,
+                    max_concurrency,
+                    shard_rows,
+                ))
+            }
+        };
+        state = state.with_export_controller(controller);
+
+        // Wire raw SQL query runner when explicitly enabled + URL provided.
+        if config.sof_sql_query_enabled {
+            if let Some(ref url) = config.sof_readonly_url {
+                use helios_persistence::core::raw_sql::RawSqlRunner;
+                let is_pg = url.starts_with("postgres://") || url.starts_with("postgresql://");
+
+                // PostgreSQL raw runner (only when postgres feature is compiled in).
+                #[cfg(feature = "postgres")]
+                if is_pg {
+                    use helios_persistence::raw_sql::PgRawRunner;
+                    info!(url = %url, "Raw SQL runner: PgRawRunner");
+                    state = state.with_raw_sql_runner(
+                        Arc::new(PgRawRunner::new(url.clone())) as Arc<dyn RawSqlRunner>
+                    );
+                }
+
+                // SQLite raw runner (only when sqlite feature is compiled in).
+                #[cfg(feature = "sqlite")]
+                if !is_pg {
+                    use helios_persistence::raw_sql::SqliteRawRunner;
+                    info!(url = %url, "Raw SQL runner: SqliteRawRunner");
+                    state =
+                        state
+                            .with_raw_sql_runner(Arc::new(SqliteRawRunner::new(url.clone()))
+                                as Arc<dyn RawSqlRunner>);
+                }
+
+                if state.raw_sql_runner().is_none() {
+                    tracing::warn!(
+                        url = %url,
+                        "HFS_SOF_READONLY_URL set but no matching backend feature \
+                         is compiled in; $sql-query-run will return 501"
+                    );
+                }
+            }
+        }
+    }
 
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);

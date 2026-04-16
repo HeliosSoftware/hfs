@@ -347,6 +347,82 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
     pub elasticsearch_password: Option<String>,
 
+    /// Enable SQL-on-FHIR operations ($viewdefinition-run, $viewdefinition-export).
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
+    pub sof_enabled: bool,
+
+    /// Default runner for $viewdefinition-run: "auto" (prefer in-DB, fall back to in-process),
+    /// "inprocess" (always use in-process FHIRPath evaluation).
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_SOF_DEFAULT_RUNNER", default_value = "auto")]
+    pub sof_default_runner: String,
+
+    /// Export sink type: "fs" (default, local filesystem) or "s3" (AWS S3).
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_EXPORT_SINK", default_value = "fs")]
+    pub export_sink: String,
+
+    /// Root directory for filesystem export sink.
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_EXPORT_DIR", default_value = "./exports")]
+    pub export_dir: String,
+
+    /// S3 bucket name for S3 export sink.
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_EXPORT_S3_BUCKET")]
+    pub export_s3_bucket: Option<String>,
+
+    /// S3 region for S3 export sink (defaults to AWS credential-chain region).
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_EXPORT_S3_REGION")]
+    pub export_s3_region: Option<String>,
+
+    /// Pre-signed URL TTL (seconds) for S3 export sink.
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_EXPORT_PRESIGN_TTL_SECS", default_value = "3600")]
+    pub export_presign_ttl_secs: u64,
+
+    /// Maximum concurrent export jobs.
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_EXPORT_MAX_CONCURRENCY", default_value = "4")]
+    pub export_max_concurrency: usize,
+
+    /// Target rows per output shard for `$viewdefinition-export`.
+    /// Large result sets are split into multiple files of this size.
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_EXPORT_SHARD_ROWS", default_value = "500000")]
+    pub export_shard_rows: usize,
+
+    /// Export job controller backend: "memory" (default, in-process).
+    /// Future values: "kafka", "sqs".
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_EXPORT_CONTROLLER", default_value = "memory")]
+    pub export_controller: String,
+
+    /// Enable the `$sql-query-run` operation.
+    /// Only takes effect when the backend advertises `BackendCapability::RawSqlQuery`.
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_SOF_SQL_QUERY_ENABLED", default_value = "false")]
+    pub sof_sql_query_enabled: bool,
+
+    /// Read-only database URL for `$sql-query-run`.
+    /// For Postgres: `postgres://readonly_user:pass@host/db`.
+    /// For SQLite: file path (e.g. `./fhir.db`).
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_SOF_READONLY_URL")]
+    pub sof_readonly_url: Option<String>,
+
+    /// Hard timeout (seconds) for `$sql-query-run` queries.
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_SOF_SQL_QUERY_TIMEOUT_SECS", default_value = "30")]
+    pub sof_sql_query_timeout_secs: u64,
+
+    /// Maximum rows returned by `$sql-query-run`.
+    #[cfg(feature = "sof")]
+    #[arg(long, env = "HFS_SOF_SQL_QUERY_MAX_ROWS", default_value = "100000")]
+    pub sof_sql_query_max_rows: usize,
+
     /// Multitenancy configuration (loaded from environment variables).
     #[arg(skip)]
     pub multitenancy: MultitenancyConfig,
@@ -387,6 +463,34 @@ impl Default for ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            #[cfg(feature = "sof")]
+            sof_enabled: true,
+            #[cfg(feature = "sof")]
+            sof_default_runner: "auto".to_string(),
+            #[cfg(feature = "sof")]
+            export_sink: "fs".to_string(),
+            #[cfg(feature = "sof")]
+            export_dir: "./exports".to_string(),
+            #[cfg(feature = "sof")]
+            export_s3_bucket: None,
+            #[cfg(feature = "sof")]
+            export_s3_region: None,
+            #[cfg(feature = "sof")]
+            export_presign_ttl_secs: 3600,
+            #[cfg(feature = "sof")]
+            export_max_concurrency: 4,
+            #[cfg(feature = "sof")]
+            export_shard_rows: 500_000,
+            #[cfg(feature = "sof")]
+            export_controller: "memory".to_string(),
+            #[cfg(feature = "sof")]
+            sof_sql_query_enabled: false,
+            #[cfg(feature = "sof")]
+            sof_readonly_url: None,
+            #[cfg(feature = "sof")]
+            sof_sql_query_timeout_secs: 30,
+            #[cfg(feature = "sof")]
+            sof_sql_query_max_rows: 100_000,
             multitenancy: MultitenancyConfig::default(),
         }
     }
@@ -477,6 +581,34 @@ impl ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            #[cfg(feature = "sof")]
+            sof_enabled: true,
+            #[cfg(feature = "sof")]
+            sof_default_runner: "auto".to_string(),
+            #[cfg(feature = "sof")]
+            export_sink: "fs".to_string(),
+            #[cfg(feature = "sof")]
+            export_dir: "./exports".to_string(),
+            #[cfg(feature = "sof")]
+            export_s3_bucket: None,
+            #[cfg(feature = "sof")]
+            export_s3_region: None,
+            #[cfg(feature = "sof")]
+            export_presign_ttl_secs: 3600,
+            #[cfg(feature = "sof")]
+            export_max_concurrency: 4,
+            #[cfg(feature = "sof")]
+            export_shard_rows: 500_000,
+            #[cfg(feature = "sof")]
+            export_controller: "memory".to_string(),
+            #[cfg(feature = "sof")]
+            sof_sql_query_enabled: false,
+            #[cfg(feature = "sof")]
+            sof_readonly_url: None,
+            #[cfg(feature = "sof")]
+            sof_sql_query_timeout_secs: 30,
+            #[cfg(feature = "sof")]
+            sof_sql_query_max_rows: 100_000,
             multitenancy: MultitenancyConfig::default(),
         }
     }

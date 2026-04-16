@@ -48,6 +48,11 @@ impl ResourceStorage for PostgresBackend {
         "postgres"
     }
 
+    fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
+        use crate::sof::postgres::PgInDbRunner;
+        Some(std::sync::Arc::new(PgInDbRunner::new(self.pool())))
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,

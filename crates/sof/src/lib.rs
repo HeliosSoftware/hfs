@@ -1949,7 +1949,7 @@ fn extract_view_definition_constants<VD: ViewDefinitionTrait>(
 }
 
 // Generic version-agnostic ViewDefinition processing
-fn process_view_definition_generic<VD, B>(
+pub(crate) fn process_view_definition_generic<VD, B>(
     view_definition: VD,
     bundle: B,
 ) -> Result<ProcessedResult, SofError>

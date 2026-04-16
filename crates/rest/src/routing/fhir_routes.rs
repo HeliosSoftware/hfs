@@ -255,6 +255,74 @@ where
             "/{compartment_type}/{compartment_id}/{target_type}",
             get(handlers::compartment_search_handler::<S>),
         )
+        // SQL-on-FHIR operations
+        .merge(create_sof_routes::<S>())
+}
+
+/// Creates SQL-on-FHIR operation routes (gated on the `sof` feature).
+#[cfg(feature = "sof")]
+fn create_sof_routes<S>() -> Router<AppState<S>>
+where
+    S: SearchProvider
+        + ConditionalStorage
+        + InstanceHistoryProvider
+        + BundleProvider
+        + ResourceStorage
+        + Send
+        + Sync
+        + 'static,
+{
+    Router::new()
+        // SQL-on-FHIR capabilities: GET /$sql-on-fhir-capabilities
+        .route(
+            "/$sql-on-fhir-capabilities",
+            get(handlers::sof::sof_capabilities_handler::<S>),
+        )
+        // Anonymous run: POST /ViewDefinition/$viewdefinition-run
+        .route(
+            "/ViewDefinition/$viewdefinition-run",
+            post(handlers::sof::run_view_definition_handler::<S>),
+        )
+        // Instance run: POST /ViewDefinition/{id}/$viewdefinition-run
+        .route(
+            "/ViewDefinition/{id}/$viewdefinition-run",
+            post(handlers::sof::run_stored_view_definition_handler::<S>),
+        )
+        // Export: POST /ViewDefinition/$viewdefinition-export
+        .route(
+            "/ViewDefinition/$viewdefinition-export",
+            post(handlers::sof::export_view_definition_handler::<S>),
+        )
+        // Export instance: POST /ViewDefinition/{id}/$viewdefinition-export
+        .route(
+            "/ViewDefinition/{id}/$viewdefinition-export",
+            post(handlers::sof::export_stored_view_definition_handler::<S>),
+        )
+        // Export status: GET /_operations/export/{job-id}
+        .route(
+            "/_operations/export/{job_id}",
+            get(handlers::sof::get_export_status_handler::<S>)
+                .delete(handlers::sof::cancel_export_handler::<S>),
+        )
+        // Export download: GET /_operations/export/{job-id}/{filename}
+        .route(
+            "/_operations/export/{job_id}/{filename}",
+            get(handlers::sof::download_export_file_handler::<S>),
+        )
+        // Raw SQL query: POST /$sql-query-run
+        .route(
+            "/$sql-query-run",
+            post(handlers::sof::sql_query_run_handler::<S>),
+        )
+}
+
+/// No-op when `sof` feature is disabled.
+#[cfg(not(feature = "sof"))]
+fn create_sof_routes<S>() -> Router<AppState<S>>
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    Router::new()
 }
 
 /// Creates a minimal set of routes for testing.

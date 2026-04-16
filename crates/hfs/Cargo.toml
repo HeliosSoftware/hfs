@@ -15,7 +15,7 @@ name = "hfs"
 path = "src/main.rs"
 
 [features]
-default = ["R4", "sqlite"]
+default = ["R4", "sqlite", "sof"]
 
 # FHIR version features
 R4 = ["helios-fhir/R4", "helios-rest/R4"]
@@ -33,6 +33,9 @@ mongodb = ["helios-rest/mongodb"]
 elasticsearch = ["helios-rest/elasticsearch"]
 s3 = ["helios-rest/s3"]
 
+# SQL-on-FHIR (on by default)
+sof = ["helios-rest/sof"]
+
 # Auth backends
 redis = ["helios-rest/redis", "helios-auth/redis"]
 
@@ -43,7 +46,14 @@ reqwest = { version = "0.12", features = ["blocking"] }
 helios-fhir = { path = "../fhir", version = "0.1.47" }
 helios-rest = { path = "../rest", version = "0.1.47", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false }
+helios-sof = { path = "../sof", version = "0.1.47", default-features = false }
 helios-auth = { path = "../auth", version = "0.1.47" }
+
+# Export job controller
+dashmap = "6"
+
+# SQL query DDL rejection
+sqlparser = "0.54"
 
 # Web framework
 axum = "0.8"
