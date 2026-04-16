@@ -4261,8 +4261,12 @@ fn call_function(
             Ok(match (invocation_base, &args[0]) {
                 // Wrap in Ok
                 (EvaluationResult::String(s, _), EvaluationResult::String(substring, _)) => {
-                    match s.find(substring) {
-                        Some(index) => EvaluationResult::integer(index as i64),
+                    match s.find(substring.as_str()) {
+                        // Convert byte offset to character (Unicode scalar value) index
+                        // per FHIRPath string spec (FHIR-53554).
+                        Some(byte_idx) => {
+                            EvaluationResult::integer(s[..byte_idx].chars().count() as i64)
+                        }
                         None => EvaluationResult::integer(-1),
                     }
                 }
@@ -4304,8 +4308,11 @@ fn call_function(
                         // Per spec: returns 0 if substring is empty
                         EvaluationResult::integer(0)
                     } else {
-                        match s.rfind(substring) {
-                            Some(index) => EvaluationResult::integer(index as i64),
+                        match s.rfind(substring.as_str()) {
+                            // Convert byte offset to character index (FHIR-53554).
+                            Some(byte_idx) => {
+                                EvaluationResult::integer(s[..byte_idx].chars().count() as i64)
+                            }
                             None => EvaluationResult::integer(-1),
                         }
                     }
@@ -7010,6 +7017,12 @@ fn evaluate_indexer(
             }
             items.get(idx).cloned().unwrap_or(EvaluationResult::Empty)
         }
+        // String indexer: returns the idx-th character (Unicode scalar value)
+        // as a single-character string, per FHIRPath string spec (FHIR-53554).
+        EvaluationResult::String(s, _) => match s.chars().nth(idx) {
+            Some(c) => EvaluationResult::string(c.to_string()),
+            None => EvaluationResult::Empty,
+        },
         // Indexer on single item or empty returns empty
         _ => EvaluationResult::Empty,
     })
