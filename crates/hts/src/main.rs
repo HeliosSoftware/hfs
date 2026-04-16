@@ -1,3 +1,10 @@
+//! Entry point for the `hts` binary.
+//!
+//! Dispatches on the top-level [`Cli`] subcommand: [`Command::Run`] boots the
+//! HTTP server via [`helios_hts::server::create_app`] and [`Command::Import`]
+//! ingests a terminology package from the filesystem.  When no subcommand is
+//! given the server runs with default settings.
+
 use clap::Parser;
 use helios_hts::config::{Cli, Command, HtsConfig, ImportArgs, ImportFormat, detect_format};
 use helios_hts::import::ImportResult;

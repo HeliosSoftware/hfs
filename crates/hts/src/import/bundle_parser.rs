@@ -25,7 +25,7 @@ use crate::error::HtsError;
 ///
 /// `parse_errors` accumulates non-fatal parse failures (e.g. a CodeSystem
 /// missing its `url`).  Write layers should propagate these into
-/// [`ImportStats::errors`] so callers can return HTTP 207 Multi-Status.
+/// [`super::ImportStats::errors`] so callers can return HTTP 207 Multi-Status.
 #[derive(Debug, Default)]
 pub struct ParsedBundle {
     pub code_systems: Vec<ParsedCodeSystem>,

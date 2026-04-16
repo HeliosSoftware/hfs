@@ -6,11 +6,11 @@
 //!
 //! # Supported entry operations (MVP)
 //!
-//! | `entry.request.url`            | Dispatched to                        |
-//! |-------------------------------|--------------------------------------|
-//! | `CodeSystem/$validate-code`   | [`process_validate_code`]            |
-//! | `ValueSet/$validate-code`     | [`process_vs_validate_code`]         |
-//! | `ConceptMap/$translate`       | [`process_translate`]                |
+//! | `entry.request.url`            | Dispatched to             |
+//! |-------------------------------|---------------------------|
+//! | `CodeSystem/$validate-code`   | `process_validate_code`    |
+//! | `ValueSet/$validate-code`     | `process_vs_validate_code` |
+//! | `ConceptMap/$translate`       | `process_translate`        |
 //!
 //! Unsupported operations return a `400` entry-level OperationOutcome without
 //! failing the overall batch.

@@ -1,3 +1,17 @@
+//! Trait definitions for the Helios Terminology Service.
+//!
+//! Each sub-module defines one slice of the backend contract:
+//!
+//! - [`CodeSystemOperations`] — `$lookup`, `$validate-code`, `$subsumes`
+//! - [`ValueSetOperations`] — `$expand`, `$validate-code` (value-set form)
+//! - [`ConceptMapOperations`] — `$translate`, `$closure`
+//! - [`TerminologyMetadata`] — introspection helpers used by `/metadata`
+//!
+//! The [`TerminologyBackend`] supertrait aggregates all four with the
+//! `Send + Sync + 'static` bounds required for sharing in [`AppState`].
+//!
+//! [`AppState`]: crate::state::AppState
+
 mod code_system;
 mod concept_map;
 mod metadata;

@@ -1,3 +1,14 @@
+//! SQLite implementation of [`CodeSystemOperations`].
+//!
+//! Implements `$lookup`, `$validate-code`, and `$subsumes` against the
+//! `code_systems`, `concepts`, `concept_properties`, `concept_designations`,
+//! and `concept_hierarchy` tables.
+//!
+//! Subsumption is O(1): the `concept_hierarchy` table is pre-materialised at
+//! import time, so ancestor/descendant checks become direct closure lookups
+//! instead of recursive traversals.  SNOMED post-coordination expressions are
+//! deliberately unsupported and return [`HtsError::NotSupported`].
+
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 

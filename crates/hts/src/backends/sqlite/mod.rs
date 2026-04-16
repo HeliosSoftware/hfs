@@ -1,3 +1,16 @@
+//! SQLite implementation of [`TerminologyBackend`].
+//!
+//! The backend owns an r2d2 connection pool and applies the schema from
+//! [`schema::SCHEMA`] on construction.  Trait methods are split across private
+//! sub-modules (`code_system`, `value_set`, `concept_map`) plus the
+//! [`TerminologyMetadata`] impl in this file, so each source file stays
+//! focused on one FHIR resource type.
+//!
+//! Synchronous `rusqlite` calls are dispatched through
+//! [`tokio::task::spawn_blocking`] to avoid stalling the async runtime.
+//!
+//! [`TerminologyBackend`]: crate::traits::TerminologyBackend
+
 pub mod schema;
 
 mod code_system;
@@ -74,9 +87,9 @@ impl SqliteTerminologyBackend {
     }
 
     /// Open an **in-memory** SQLite database (useful for tests).
-    #[allow(dead_code)]
     ///
     /// Each call creates a fresh, isolated database.
+    #[allow(dead_code)]
     pub fn in_memory() -> Result<Self, HtsError> {
         // Use a shared-cache URI so all pool connections share the same in-memory DB.
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -170,7 +183,7 @@ impl BundleImportBackend for SqliteTerminologyBackend {
     /// Parse a FHIR Bundle from raw JSON bytes and insert all contained
     /// terminology resources into SQLite.
     ///
-    /// Delegates to [`crate::import::fhir_bundle::import_bundle_sync`] on a
+    /// Delegates to `crate::import::fhir_bundle::import_bundle_sync` on a
     /// blocking thread to avoid holding the async executor while performing
     /// synchronous SQLite I/O.
     async fn import_bundle(

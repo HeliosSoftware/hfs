@@ -230,7 +230,7 @@ pub(super) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
 /// # Errors
 ///
 /// Returns `Err(message)` on any of:
-/// - An unrecognised character in the input (propagated from [`tokenize`]).
+/// - An unrecognised character in the input (propagated from the tokenizer).
 /// - A parse grammar error (unexpected token or unexpected end of input).
 /// - Trailing tokens after a complete expression (e.g. `<< 1 << 2`).
 pub fn parse(input: &str) -> Result<EclExpr, String> {

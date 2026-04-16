@@ -1,15 +1,17 @@
-/// Handler for `POST /CodeSystem/$subsumes`.
-///
-/// Accepts a FHIR Parameters resource containing `system`, `codeA`, `codeB`,
-/// and an optional `version`. Returns a FHIR Parameters resource with a single
-/// `outcome` parameter whose value is one of:
-/// - `"equivalent"`   — the two codes are identical
-/// - `"subsumes"`     — codeA is an ancestor of codeB
-/// - `"subsumed-by"`  — codeA is a descendant of codeB
-/// - `"not-subsumed"` — no hierarchical relationship exists
-///
-/// # FHIR specification
-/// <https://hl7.org/fhir/codesystem-operation-subsumes.html>
+//! `$subsumes` operation on `CodeSystem`.
+//!
+//! Accepts a FHIR Parameters resource (POST) or query string (GET) containing
+//! either `system` + `codeA` + `codeB` + optional `version`, or two
+//! `valueCoding` parameters (`codingA`, `codingB`).  Returns a Parameters
+//! resource whose single `outcome` value is one of:
+//!
+//! - `"equivalent"` — the two codes are identical
+//! - `"subsumes"` — codeA is an ancestor of codeB
+//! - `"subsumed-by"` — codeA is a descendant of codeB
+//! - `"not-subsumed"` — no hierarchical relationship exists
+//!
+//! Spec: <https://hl7.org/fhir/codesystem-operation-subsumes.html>
+
 use axum::{
     Json,
     extract::{RawQuery, State},

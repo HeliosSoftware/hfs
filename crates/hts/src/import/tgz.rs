@@ -7,9 +7,8 @@
 //!
 //! This module extracts those resources, groups them by type to preserve the
 //! required import order (CodeSystems → ValueSets → ConceptMaps), and feeds
-//! them in batches through the existing [`import_bundle_sync`] pipeline.
-//!
-//! [`import_bundle_sync`]: super::fhir_bundle::import_bundle_sync
+//! them in batches through the existing `import_bundle_sync` pipeline in
+//! [`super::fhir_bundle`].
 
 #[cfg(feature = "sqlite")]
 use r2d2::Pool;
@@ -201,10 +200,11 @@ pub fn import_tgz(
 
 /// Extract and bulk-import a FHIR NPM terminology package (PostgreSQL backend).
 ///
-/// Async counterpart to [`import_tgz`].  Reads the archive with
-/// [`collect_tgz_resources`] (blocking, run via `spawn_blocking`), then
-/// imports each batch by calling [`BundleImportBackend::import_bundle`] on
-/// the provided backend.
+/// Async counterpart to [`import_tgz`].  Reads the archive with the internal
+/// `collect_tgz_resources` helper (blocking, run via `spawn_blocking`), then
+/// imports each batch by calling
+/// [`crate::import::BundleImportBackend::import_bundle`] on the provided
+/// backend.
 ///
 /// When `dry_run` is `true` the archive is parsed and counted but no data is
 /// written to the database.

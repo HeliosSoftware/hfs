@@ -2,7 +2,7 @@
 //!
 //! [`create_app`] is the single entry point that wires every HTTP handler to
 //! its route and attaches middleware.  It is called from `main.rs` during
-//! server startup and from integration tests via [`crate::lib`].
+//! server startup and from integration tests that use the crate as a library.
 //!
 //! ## Middleware stack (outermost → innermost)
 //!

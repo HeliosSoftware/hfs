@@ -1,3 +1,18 @@
+//! SQLite DDL and migrations for the HTS terminology schema.
+//!
+//! # Layout
+//!
+//! - [`SCHEMA`] — the initial DDL, applied idempotently on every startup via
+//!   [`apply`].  Uses `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`
+//!   throughout so repeated application is a no-op.
+//! - [`migrate_search_columns`] — additive migration that adds columns and
+//!   indexes required by the search handlers to pre-existing databases.
+//!
+//! Tables model the core FHIR terminology resources — `code_systems`,
+//! `concepts`, `concept_hierarchy`, `value_sets`, `value_set_expansions`,
+//! `concept_maps`, and their child tables (properties, designations, group
+//! elements) — plus `concept_closure` used by `$closure`.
+
 /// SQL DDL for the HTS SQLite schema.
 ///
 /// All statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`

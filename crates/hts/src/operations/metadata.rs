@@ -1,3 +1,18 @@
+//! `/metadata` endpoint — serves the server's `CapabilityStatement` or
+//! `TerminologyCapabilities` resource.
+//!
+//! The `mode` query parameter selects the resource type:
+//!
+//! - absent or `full` — returns a full FHIR `CapabilityStatement` covering
+//!   CRUD plus every terminology operation wired into the router.
+//! - `terminology` — returns a `TerminologyCapabilities` resource that
+//!   advertises supported code systems, expansion/translation parameters,
+//!   and closure support, populated from the [`TerminologyMetadata`] impl
+//!   on the active backend.
+//!
+//! Content negotiation honours both `_format` and the `Accept` header,
+//! supporting `application/fhir+json` and `application/fhir+xml`.
+
 use axum::{
     extract::{Query, RawQuery, State},
     http::{HeaderMap, header},

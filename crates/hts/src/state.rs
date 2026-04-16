@@ -1,3 +1,13 @@
+//! Shared application state injected into Axum handlers.
+//!
+//! The [`AppState`] struct is generic over the concrete [`TerminologyBackend`]
+//! implementation so that the SQLite and PostgreSQL paths can reuse the same
+//! handler bodies.  It also carries the raw FHIR resource store used by CRUD
+//! handlers and the asynchronous re-index hook (`terminology_importer`)
+//! triggered after create/update operations.
+//!
+//! [`TerminologyBackend`]: crate::traits::TerminologyBackend
+
 use std::sync::Arc;
 
 use helios_persistence::ResourceStorage;
@@ -22,10 +32,13 @@ use crate::traits::TerminologyBackend;
 /// ## CRUD storage fields
 ///
 /// - **SQLite path**: `resource_store` (SQLite persistence) + `hts_pool` (SQLite
-///   re-index pool) are set via [`with_resource_store`] / [`with_hts_pool`].
+///   re-index pool) are set via [`Self::with_resource_store`] /
+///   [`Self::with_hts_pool`].
 /// - **PostgreSQL path**: `resource_store_pg` (persistence) + `terminology_importer`
 ///   (async re-index via `BundleImportBackend`) are set via the
-///   [`with_resource_store_pg`] / [`with_terminology_importer`] methods.
+///   `with_resource_store_pg` / [`Self::with_terminology_importer`]
+///   methods.  (`with_resource_store_pg` is only available with the `postgres`
+///   feature enabled.)
 ///
 /// CRUD handlers check the SQLite fields first (backward compat) and fall back
 /// to the generic fields for the PostgreSQL backend.

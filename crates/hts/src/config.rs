@@ -1,3 +1,13 @@
+//! Command-line and environment configuration for the HTS binary.
+//!
+//! Defines the top-level [`Cli`] structure with its two subcommands
+//! ([`Command::Run`] for the HTTP server and [`Command::Import`] for bulk
+//! ingestion), plus the [`HtsConfig`] and [`ImportArgs`] structs that clap
+//! populates from flags and `HTS_*` environment variables.
+//!
+//! Running `hts` with no subcommand is equivalent to `hts serve` for
+//! backwards-compatible behaviour.
+
 use std::fmt;
 use std::path::Path;
 
