@@ -2,17 +2,19 @@
 
 A FHIR Terminology Server built in Rust, implementing the [HL7 FHIR Terminology Service](http://hl7.org/fhir/terminology-service.html) specification. HTS runs as a standalone binary and can be wired into any of the other Helios Software binaries via a single environment variable:
 
-- [HFS](../hfs/README.md) — `HFS_TERMINOLOGY_SERVER` enables `:in`/`:not-in` search modifiers and FHIRPath `memberOf()`/`subsumes()` ([details](../hfs/README.md#configuration))
-- [FHIRPath CLI and Server](../fhirpath/README.md) — `FHIRPATH_TERMINOLOGY_SERVER` powers terminology-aware FHIRPath evaluation ([details](../fhirpath/README.md#terminology-service-integration))
-- [SOF CLI and Server](../sof/README.md) — `SOF_TERMINOLOGY_SERVER` enables FHIRPath terminology functions inside ViewDefinitions ([details](../sof/README.md#configuration))
+- [HFS](../hfs/README.md) - `HFS_TERMINOLOGY_SERVER` enables `:in`/`:not-in` search modifiers and FHIRPath `memberOf()`/`subsumes()` ([details](../hfs/README.md#configuration))
+- [FHIRPath CLI and Server](../fhirpath/README.md) - `FHIRPATH_TERMINOLOGY_SERVER` powers terminology-aware FHIRPath evaluation ([details](../fhirpath/README.md#terminology-service-integration))
+- [SOF CLI and Server](../sof/README.md) - `SOF_TERMINOLOGY_SERVER` enables FHIRPath terminology functions inside ViewDefinitions ([details](../sof/README.md#configuration))
 
 It can also be used standalone as a general-purpose FHIR terminology service, independent of any other Helios Software component.
+
+HTS supports both SQLite and PostgreSQL as database backends - see [Storage Backends](#storage-backends) for details.
 
 ### Terminology Data
 
 HTS is a terminology engine - it does not include terminology data by default. Each terminology must be imported from its issuing authority, and you are responsible for obtaining a license and the source data before importing.
 
-For terminologies where redistribution is permitted, the data is bundled directly in the release distribution, with the latest version available at the time of build.
+For terminologies where redistribution is permitted, we bundle the data directly in the release distribution, with the latest version available at the time of build for your convenience.
 
 ## Features
 
@@ -24,7 +26,7 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 |-----------|------|-------------|
 | `$lookup` | [CodeSystem/$lookup](https://hl7.org/fhir/codesystem-operation-lookup.html) | Look up display name and properties for a code |
 | `$validate-code` | [CodeSystem/$validate-code](https://hl7.org/fhir/codesystem-operation-validate-code.html) | Validate a code against a CodeSystem or ValueSet |
-| `$subsumes` | [CodeSystem/$subsumes](https://hl7.org/fhir/codesystem-operation-subsumes.html) | Test concept hierarchy (subsumes / subsumed-by / equivalent / not-subsumed) via recursive CTE — no runtime graph traversal |
+| `$subsumes` | [CodeSystem/$subsumes](https://hl7.org/fhir/codesystem-operation-subsumes.html) | Test concept hierarchy (subsumes / subsumed-by / equivalent / not-subsumed) via recursive CTE - no runtime graph traversal |
 | `$expand` | [ValueSet/$expand](https://hl7.org/fhir/valueset-operation-expand.html) | Expand a ValueSet with lazy evaluation and materialized cache (computed once, cached across requests) |
 | `$translate` | [ConceptMap/$translate](https://hl7.org/fhir/conceptmap-operation-translate.html) | Translate a code using a ConceptMap |
 | `$closure` | [ConceptMap/$closure](https://hl7.org/fhir/conceptmap-operation-closure.html) | Compute transitive closure over a concept hierarchy and ConceptMap mappings |
@@ -40,28 +42,28 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 
 | Terminology | Authority | Import | License / How to obtain |
 |-------------|-----------|--------|--------------------------|
-| [HL7 FHIR Core (THO)](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | Free — redistribution with attribution |
+| [HL7 FHIR Core (THO)](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | Free - redistribution with attribution |
 | [ICD-10-CM](https://www.cdc.gov/nchs/icd/icd-10-cm/index.html) | [U.S. CDC / NCHS](https://www.cdc.gov) | ✅ Bundled | Public domain (US federal government work) |
-| [ICD-9-CM](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles) | [U.S. NCHS / CMS](https://www.cms.gov) | ✅ Bundled | Public domain — retired 2015, legacy data only |
-| [UCUM](https://ucum.org) | [Regenstrief Institute](https://www.regenstrief.org) | ✅ Bundled | Free, permissive — also in the THO package |
+| [ICD-9-CM](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles) | [U.S. NCHS / CMS](https://www.cms.gov) | ✅ Bundled | Public domain - retired 2015, legacy data only |
+| [UCUM](https://ucum.org) | [Regenstrief Institute](https://www.regenstrief.org) | ✅ Bundled | Free, permissive - also in the THO package |
 | [NCI Thesaurus (NCIt)](https://evs.nci.nih.gov) | [U.S. National Cancer Institute](https://www.cancer.gov) | ✅ Bundled | Public domain |
 | [MeSH](https://www.nlm.nih.gov/mesh/) | [U.S. National Library of Medicine](https://www.nlm.nih.gov) | ✅ Bundled | Public domain |
 | [DICOM](https://www.dicomstandard.org) | [NEMA](https://www.nema.org) | ✅ Bundled | Free, publicly available |
-| [HL7 v2 tables](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | HL7 FHIR License (free with attribution) — also in the THO package |
+| [HL7 v2 tables](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | HL7 FHIR License (free with attribution) - also in the THO package |
 | [NUCC Provider Taxonomy](https://www.nucc.org) | [NUCC](https://www.nucc.org) | ✅ Bundled | Free |
 | [NDC](https://www.fda.gov/drugs/drug-approvals-and-databases/national-drug-code-directory) | [U.S. FDA](https://www.fda.gov) | ✅ Bundled | Public domain (US federal government work) |
 | [SNOMED CT](https://www.snomed.org) | [SNOMED International](https://www.snomed.org) | 🔑 License required | Free in [~50 member countries](https://www.snomed.org/snomed-ct/get-snomed); paid elsewhere. [Register via MLDS](https://mlds.ihtsdotools.org/) or your [National Release Center](https://www.snomed.org/snomed-ct/get-snomed). US users: [nlm.nih.gov/healthit/snomedct](https://www.nlm.nih.gov/healthit/snomedct/index.html). |
-| [LOINC](https://loinc.org) | [Regenstrief Institute](https://www.regenstrief.org) | 🔑 License required | Free — [create a free account at loinc.org](https://loinc.org/download/) to download. |
-| [RxNorm](https://www.nlm.nih.gov/research/umls/rxnorm/overview.html) | [U.S. National Library of Medicine](https://www.nlm.nih.gov) | 🔑 License required | Free — [create a free UMLS account at uts.nlm.nih.gov](https://uts.nlm.nih.gov) and accept the [NLM Terms of Service](https://www.nlm.nih.gov/research/umls/rxnorm/docs/termsofservice.html). |
+| [LOINC](https://loinc.org) | [Regenstrief Institute](https://www.regenstrief.org) | 🔑 License required | Free - [create a free account at loinc.org](https://loinc.org/download/) to download. |
+| [RxNorm](https://www.nlm.nih.gov/research/umls/rxnorm/overview.html) | [U.S. National Library of Medicine](https://www.nlm.nih.gov) | 🔑 License required | Free - [create a free UMLS account at uts.nlm.nih.gov](https://uts.nlm.nih.gov) and accept the [NLM Terms of Service](https://www.nlm.nih.gov/research/umls/rxnorm/docs/termsofservice.html). |
 | [HCPCS Level II](https://www.cms.gov/medicare/coding-billing/healthcare-common-procedure-system) | [U.S. CMS](https://www.cms.gov) | 🚫 Not supported | Public domain (US gov). |
 | [ICD-11](https://icd.who.int) | [WHO](https://www.who.int) | 🚫 Not supported | Free ([CC BY-ND 3.0 IGO](https://creativecommons.org/licenses/by-nd/3.0/igo/)). |
-| [CPT](https://www.ama-assn.org/practice-management/cpt) | [AMA](https://www.ama-assn.org) | 🚫 Not supported | Proprietary — paid AMA license required. [Contact AMA for licensing](https://www.ama-assn.org/practice-management/cpt/cpt-licensing-frequently-asked-questions-faqs). |
-| [MedDRA](https://www.meddra.org) | [MSSO](https://www.meddra.org) | 🚫 Not supported | Proprietary — paid MSSO license required. [Contact MedDRA](https://www.meddra.org). |
+| [CPT](https://www.ama-assn.org/practice-management/cpt) | [AMA](https://www.ama-assn.org) | 🚫 Not supported | Proprietary - paid AMA license required. [Contact AMA for licensing](https://www.ama-assn.org/practice-management/cpt/cpt-licensing-frequently-asked-questions-faqs). |
+| [MedDRA](https://www.meddra.org) | [MSSO](https://www.meddra.org) | 🚫 Not supported | Proprietary - paid MSSO license required. [Contact MedDRA](https://www.meddra.org). |
 
-**Legend:** ✅ Bundled — no separate download needed. 🔑 License required — freely available, but registration or terms acceptance required. 🚧 Not yet — importer not yet implemented; open an issue. 🚫 Not planned — proprietary data that requires a paid license.
+**Legend:** ✅ Bundled - no separate download needed. 🔑 License required - freely available, but registration or terms acceptance required. 🚧 Not yet - importer not yet implemented; open an issue. 🚫 Not planned - proprietary data that requires a paid license.
 
-- Bulk import CLI for all supported terminologies — see [Supported Terminologies](#supported-terminologies-1) for per-terminology instructions
-- Automatic format detection — no `--format` flag needed for most files
+- Bulk import CLI for all supported terminologies - see [Supported Terminologies](#supported-terminologies-1) for per-terminology instructions
+- Automatic format detection - no `--format` flag needed for most files
 - SQLite and PostgreSQL backends with auto-migration on startup (no manual schema setup)
 
 ## Quick Start
@@ -152,7 +154,7 @@ See [Environment Variables](#environment-variables) for all available configurat
 
 4. **Memory-constrained builds** (optional):
 
-    If you run out of memory during compilation, limit parallel jobs:
+    **Tip**: If you run out of memory during compilation on Linux, especially on high CPU core count machines, limit parallel jobs to 4 (or less):
     ```bash
     export CARGO_BUILD_JOBS=4
     ```
@@ -187,7 +189,7 @@ Start the FHIR Terminology HTTP server. This is the default command when no subc
 # Run with default settings (R4, SQLite, port 8090)
 hts run
 
-# Equivalent — run is the default
+# Equivalent - run is the default
 hts
 
 # Specify a different port
@@ -251,7 +253,7 @@ hts import ./Thesaurus.txt --format nci-thesaurus
 # MeSH (free, from nlm.nih.gov)
 hts import ./mesh2025.xml
 
-# DICOM Part 16 code table (free, from dicomstandard.org — export as CSV)
+# DICOM Part 16 code table (free, from dicomstandard.org - export as CSV)
 hts import ./dicom-codes.csv --format dicom
 
 # HL7 v2 tables XML (free with attribution)
@@ -260,10 +262,10 @@ hts import ./hl7-v2-tables.xml --format hl7-v2-tables
 # NUCC Provider Taxonomy (free, from nucc.org)
 hts import ./nucc_taxonomy_240.csv
 
-# NDC Directory (free, public domain — from accessdata.fda.gov/cder/ndctext.zip)
+# NDC Directory (free, public domain - from accessdata.fda.gov/cder/ndctext.zip)
 hts import ./ndctext.zip
 
-# Dry run — parse without writing to database
+# Dry run - parse without writing to database
 hts import ./package.tgz --dry-run --verbose
 ```
 
@@ -282,7 +284,7 @@ Options:
       --storage-backend <BACKEND>  Storage backend [env: HTS_STORAGE_BACKEND=] [default: sqlite]
       --log-level <LOG_LEVEL>      Log level [env: HTS_LOG_LEVEL=] [default: info]
       --batch-size <N>             Resources per import batch [default: 500]
-      --dry-run                    Parse only — no database writes
+      --dry-run                    Parse only - no database writes
       --verbose                    Emit per-batch progress to stderr
   -h, --help                       Print help
 ```
@@ -316,9 +318,9 @@ Options:
 
 | Code | Meaning |
 |------|---------|
-| `0` | Success — all resources imported |
-| `1` | Fatal error — import aborted |
-| `2` | Success with non-fatal errors — some records skipped |
+| `0` | Success - all resources imported |
+| `1` | Fatal error - import aborted |
+| `2` | Success with non-fatal errors - some records skipped |
 
 ## Configuration
 
@@ -352,15 +354,15 @@ hts run --database-url :memory:
 #### Schema
 
 ```
-code_systems          — canonical CodeSystem metadata
-concepts              — individual codes with display and definition
-concept_hierarchy     — pre-materialized parent→child links (used by $subsumes)
-concept_properties    — arbitrary FHIR properties per concept
-concept_designations  — alternate names and translations per concept
-value_sets            — canonical ValueSet metadata and compose rules
-value_set_expansions  — materialized expansion cache (populated on first $expand)
-concept_maps          — ConceptMap metadata
-concept_map_mappings  — source→target code mappings with equivalence
+code_systems          - canonical CodeSystem metadata
+concepts              - individual codes with display and definition
+concept_hierarchy     - pre-materialized parent→child links (used by $subsumes)
+concept_properties    - arbitrary FHIR properties per concept
+concept_designations  - alternate names and translations per concept
+value_sets            - canonical ValueSet metadata and compose rules
+value_set_expansions  - materialized expansion cache (populated on first $expand)
+concept_maps          - ConceptMap metadata
+concept_map_mappings  - source→target code mappings with equivalence
 ```
 
 The `value_set_expansions` table acts as a write-through cache: the first `$expand` call for a given ValueSet computes and stores the expansion; subsequent calls read from the cache directly. The cache is invalidated automatically when a CodeSystem or ValueSet is updated via PUT or DELETE.
@@ -625,8 +627,8 @@ HFS propagates the URL to its embedded FHIRPath engine as `FHIRPATH_TERMINOLOGY_
 
 | Feature | Delegation |
 |---------|-----------|
-| FHIR search `:in` modifier | `POST /ValueSet/$expand` — expands the ValueSet, then filters results |
-| FHIR search `:not-in` modifier | `POST /ValueSet/$expand` — expands the ValueSet, then excludes matches |
+| FHIR search `:in` modifier | `POST /ValueSet/$expand` - expands the ValueSet, then filters results |
+| FHIR search `:not-in` modifier | `POST /ValueSet/$expand` - expands the ValueSet, then excludes matches |
 | FHIRPath `memberOf()` | `POST /ValueSet/$validate-code` |
 | FHIRPath `subsumes()` | `POST /CodeSystem/$subsumes` |
 
@@ -634,9 +636,9 @@ Without `HFS_TERMINOLOGY_SERVER`, these features fall back to empty results or `
 
 ## Terminology Support
 
-HTS is the engine — terminology data is not bundled. Each terminology has its own license, and you must obtain the data from its issuing authority before importing it.
+HTS is the engine - terminology data is not bundled. Each terminology has its own license, and you must obtain the data from its issuing authority before importing it.
 
-> **Note:** HTS has no licensing cost. The data you load is governed by each terminology's own license — make sure you've accepted the relevant terms before importing.
+> **Note:** HTS has no licensing cost. The data you load is governed by each terminology's own license - make sure you've accepted the relevant terms before importing.
 
 ---
 
@@ -660,7 +662,7 @@ Copyright © Health Level Seven International. Licensed under the HL7 FHIR Licen
 
 ### ICD-10-CM
 
-Produced by the [U.S. CDC / NCHS](https://www.cdc.gov/nchs/icd/icd-10-cm/index.html). A US federal government work — public domain, no license or registration required. Updated annually (effective October 1).
+Produced by the [U.S. CDC / NCHS](https://www.cdc.gov/nchs/icd/icd-10-cm/index.html). A US federal government work - public domain, no license or registration required. Updated annually (effective October 1).
 
 Download `icd10cm_tabular_YYYY.xml` from the [CDC ICD-10-CM files page](https://www.cdc.gov/nchs/icd/icd-10-cm/files.html) or the [CMS ICD-10 page](https://www.cms.gov/medicare/coding-billing/icd-10-codes).
 
@@ -674,7 +676,7 @@ hts import ./icd10cm_tabular_2026.xml
 
 ### ICD-9-CM
 
-Produced by the [U.S. NCHS / CMS](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles). A US federal government work — public domain, no license or registration required. **Retired October 1, 2015** (replaced by ICD-10-CM); use for historical data and legacy EHR migration only.
+Produced by the [U.S. NCHS / CMS](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles). A US federal government work - public domain, no license or registration required. **Retired October 1, 2015** (replaced by ICD-10-CM); use for historical data and legacy EHR migration only.
 
 Download the pipe-delimited code files (`CMS32_DESC_LONG_DX.txt` or similar) from the [CMS ICD-9-CM archive](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles).
 
@@ -686,7 +688,7 @@ hts import ./CMS32_DESC_LONG_DX.txt --format icd9-cm
 hts import ./ICD9CM_2015.zip --format icd9-cm
 ```
 
-Codes are stored with decimal points (`001.0`, `E800.0`). Hierarchy is inferred from code structure — 3-digit categories are top-level, subcategories hang beneath them. No chapter groupers are imported (CMS flat files do not include them).
+Codes are stored with decimal points (`001.0`, `E800.0`). Hierarchy is inferred from code structure - 3-digit categories are top-level, subcategories hang beneath them. No chapter groupers are imported (CMS flat files do not include them).
 
 ---
 
@@ -698,7 +700,7 @@ Owned by [SNOMED International](https://www.snomed.org) and licensed under the [
 - **United States:** Register at [nlm.nih.gov/healthit/snomedct](https://www.nlm.nih.gov/healthit/snomedct/index.html)
 - **Other member countries:** Register via [MLDS](https://mlds.ihtsdotools.org/) or your [National Release Center](https://www.snomed.org/snomed-ct/get-snomed)
 
-Download the **Snapshot** ZIP (not Full or Delta) — it contains the current state of all concepts without historical versions.
+Download the **Snapshot** ZIP (not Full or Delta) - it contains the current state of all concepts without historical versions.
 
 ```bash
 hts import ./SnomedCT_InternationalRF2_PRODUCTION_20250901T120000Z.zip --format snomed-rf2
@@ -730,8 +732,8 @@ Terms of Use: https://loinc.org/license/
 Produced by the [U.S. National Library of Medicine (NLM)](https://www.nlm.nih.gov/research/umls/rxnorm/overview.html). Provides normalized names and identifiers for US drugs. A free UMLS account is required to download the full monthly release.
 
 **Two options:**
-- **Current Prescribable Content** — no account needed; smaller subset of actively prescribable drugs. Download from [nlm.nih.gov/research/umls/rxnorm/docs/rxnormfiles.html](https://www.nlm.nih.gov/research/umls/rxnorm/docs/rxnormfiles.html).
-- **Full monthly release** — complete dataset including historical and branded content. Requires a free UMLS account at [uts.nlm.nih.gov](https://uts.nlm.nih.gov) and acceptance of the [NLM Terms of Service](https://www.nlm.nih.gov/research/umls/rxnorm/docs/termsofservice.html).
+- **Current Prescribable Content** - no account needed; smaller subset of actively prescribable drugs. Download from [nlm.nih.gov/research/umls/rxnorm/docs/rxnormfiles.html](https://www.nlm.nih.gov/research/umls/rxnorm/docs/rxnormfiles.html).
+- **Full monthly release** - complete dataset including historical and branded content. Requires a free UMLS account at [uts.nlm.nih.gov](https://uts.nlm.nih.gov) and acceptance of the [NLM Terms of Service](https://www.nlm.nih.gov/research/umls/rxnorm/docs/termsofservice.html).
 
 ```bash
 hts import ./RxNorm_full_current.zip        # from ZIP
