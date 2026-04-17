@@ -36,6 +36,9 @@ s3 = ["helios-rest/s3"]
 # Auth backends
 redis = ["helios-rest/redis", "helios-auth/redis"]
 
+# Subscriptions
+subscriptions = ["helios-rest/subscriptions", "dep:helios-subscriptions"]
+
 # Cloud audit backends
 cloudwatch = ["helios-audit/cloudwatch"]
 
@@ -48,6 +51,7 @@ helios-rest = { path = "../rest", version = "0.1.47", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false, features = ["audit"] }
 helios-auth = { path = "../auth", version = "0.1.47" }
 helios-audit = { path = "../audit", version = "0.1.47" }
+helios-subscriptions = { path = "../subscriptions", version = "0.1.47", optional = true }
 
 # Web framework
 axum = "0.8"

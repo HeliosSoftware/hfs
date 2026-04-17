@@ -201,6 +201,18 @@ where
         "Resource created"
     );
 
+    // Emit subscription event
+    #[cfg(feature = "subscriptions")]
+    if let Some(engine) = state.subscription_engine() {
+        super::subscription_event::emit_subscription_event(
+            engine,
+            tenant.context(),
+            &stored,
+            fhir_version,
+            helios_subscriptions::ResourceEventType::Create,
+        );
+    }
+
     build_create_response(
         StatusCode::CREATED,
         &stored,

@@ -51,6 +51,10 @@ pub struct AppState<S> {
 
     /// Audit source observer reference used when emitting handler-level events.
     audit_source_observer: String,
+
+    /// Optional subscription engine for FHIR topic-based subscriptions.
+    #[cfg(feature = "subscriptions")]
+    subscription_engine: Option<Arc<helios_subscriptions::SubscriptionEngine>>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -63,6 +67,8 @@ impl<S> Clone for AppState<S> {
             auth: self.auth.clone(),
             audit_sink: self.audit_sink.clone(),
             audit_source_observer: self.audit_source_observer.clone(),
+            #[cfg(feature = "subscriptions")]
+            subscription_engine: self.subscription_engine.clone(),
         }
     }
 }
@@ -82,6 +88,8 @@ impl<S: ResourceStorage> AppState<S> {
             auth: None,
             audit_sink: None,
             audit_source_observer: "Device/hfs".to_string(),
+            #[cfg(feature = "subscriptions")]
+            subscription_engine: None,
         }
     }
 
@@ -111,7 +119,19 @@ impl<S: ResourceStorage> AppState<S> {
             auth: auth_state,
             audit_sink,
             audit_source_observer: audit_source_observer.into(),
+            #[cfg(feature = "subscriptions")]
+            subscription_engine: None,
         }
+    }
+
+    /// Sets the subscription engine on this AppState.
+    #[cfg(feature = "subscriptions")]
+    pub fn with_subscription_engine(
+        mut self,
+        engine: Arc<helios_subscriptions::SubscriptionEngine>,
+    ) -> Self {
+        self.subscription_engine = Some(engine);
+        self
     }
 
     /// Returns a reference to the storage backend.
@@ -187,6 +207,12 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns the configured audit source observer reference.
     pub fn audit_source_observer(&self) -> &str {
         &self.audit_source_observer
+    }
+
+    /// Returns the subscription engine, if configured.
+    #[cfg(feature = "subscriptions")]
+    pub fn subscription_engine(&self) -> Option<&Arc<helios_subscriptions::SubscriptionEngine>> {
+        self.subscription_engine.as_ref()
     }
 }
 

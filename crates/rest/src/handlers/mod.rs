@@ -26,6 +26,10 @@ pub mod patch;
 pub mod read;
 pub mod search;
 pub mod smart_discovery;
+#[cfg(feature = "subscriptions")]
+pub mod subscription_event;
+#[cfg(feature = "subscriptions")]
+pub mod subscriptions;
 pub mod update;
 pub mod versions;
 pub mod vread;
