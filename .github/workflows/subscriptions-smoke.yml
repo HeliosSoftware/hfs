@@ -14,12 +14,8 @@ env:
 
 jobs:
   build:
-    name: Build HFS (subscriptions, ${{ matrix.fhir_version }})
+    name: Build HFS (subscriptions, all FHIR versions)
     runs-on: [self-hosted, Linux]
-    strategy:
-      fail-fast: false
-      matrix:
-        fhir_version: [R4, R4B, R5]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -39,12 +35,12 @@ jobs:
 
       - name: Build HFS binary with subscriptions
         run: |
-          cargo build -p helios-hfs --no-default-features --features "${{ matrix.fhir_version }},subscriptions,sqlite,elasticsearch,postgres,mongodb,s3"
+          cargo build -p helios-hfs --no-default-features --features "R4,R4B,R5,R6,subscriptions,sqlite,elasticsearch,postgres,mongodb,s3"
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v4
         with:
-          name: hfs-subscriptions-binary-${{ matrix.fhir_version }}
+          name: hfs-subscriptions-binary
           path: target/debug/hfs
           retention-days: 1
 
@@ -70,7 +66,7 @@ jobs:
       - name: Download HFS binary
         uses: actions/download-artifact@v4
         with:
-          name: hfs-subscriptions-binary-${{ matrix.fhir_version }}
+          name: hfs-subscriptions-binary
           path: target/debug
 
       - name: Make executables available

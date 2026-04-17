@@ -46,8 +46,10 @@ jobs:
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
 
       - name: Run subscriptions rest-hook integration test
+        env:
+          HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
         run: |
-          cargo test -p helios-subscriptions --no-default-features --features "${{ matrix.fhir_version }}" --test rest_hook_integration
+          cargo test -p helios-subscriptions --features "R4,R4B,R5,R6" --test rest_hook_integration
 
   websocket-integration:
     name: WebSocket Channel Integration (${{ matrix.fhir_version }})
@@ -76,5 +78,7 @@ jobs:
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
 
       - name: Run subscriptions websocket integration test
+        env:
+          HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
         run: |
-          cargo test -p helios-subscriptions --no-default-features --features "${{ matrix.fhir_version }}" --test websocket_integration
+          cargo test -p helios-subscriptions --features "R4,R4B,R5,R6" --test websocket_integration

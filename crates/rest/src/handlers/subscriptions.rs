@@ -83,11 +83,7 @@ where
         })?;
 
     // Return a Bundle with a SubscriptionStatus indicating query-status
-    let bundle_type = if matches!(sub.fhir_version.as_str(), "R5" | "R6") {
-        "subscription-notification"
-    } else {
-        "history"
-    };
+    let bundle_type = sub.fhir_version.notification_bundle_type();
 
     let bundle = json!({
         "resourceType": "Bundle",

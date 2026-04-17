@@ -12,42 +12,27 @@ use serde_json::{Value, json};
 const TENANT_ID: &str = "tenant-ws";
 const TOPIC_URL: &str = "http://example.org/topic/encounter-start";
 
-#[allow(unreachable_code)]
 fn current_fhir_version() -> FhirVersion {
-    #[cfg(feature = "R4")]
-    {
-        return FhirVersion::R4;
+    // Honor HFS_TEST_FHIR_VERSION so the same all-features test binary can
+    // exercise per-version notification shapes in CI matrices. Variants are
+    // cfg-gated, so each arm only compiles when the matching feature is on.
+    match std::env::var("HFS_TEST_FHIR_VERSION").ok().as_deref() {
+        #[cfg(feature = "R4B")]
+        Some("R4B") => FhirVersion::R4B,
+        #[cfg(feature = "R5")]
+        Some("R5") => FhirVersion::R5,
+        #[cfg(feature = "R6")]
+        Some("R6") => FhirVersion::R6,
+        _ => FhirVersion::default(),
     }
-    #[cfg(all(not(feature = "R4"), feature = "R4B"))]
-    {
-        return FhirVersion::R4B;
-    }
-    #[cfg(all(not(feature = "R4"), not(feature = "R4B"), feature = "R5"))]
-    {
-        return FhirVersion::R5;
-    }
-    #[cfg(all(
-        not(feature = "R4"),
-        not(feature = "R4B"),
-        not(feature = "R5"),
-        feature = "R6"
-    ))]
-    {
-        return FhirVersion::R6;
-    }
-
-    panic!("No FHIR version feature enabled");
 }
 
 fn uses_backport_ig() -> bool {
-    current_fhir_version().as_str() == "R4"
+    current_fhir_version() == FhirVersion::R4
 }
 
 fn expected_bundle_type() -> &'static str {
-    match current_fhir_version().as_str() {
-        "R5" | "R6" => "subscription-notification",
-        _ => "history",
-    }
+    current_fhir_version().notification_bundle_type()
 }
 
 fn topic_resource() -> Value {
