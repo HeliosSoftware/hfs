@@ -168,7 +168,6 @@ pub fn extract_parameters(params: FhirPathParameters) -> Result<ExtractedParamet
     let mut extracted = ExtractedParameters::default();
 
     // Process parameters based on version
-    #[allow(unreachable_patterns)]
     match params {
         #[cfg(feature = "R4")]
         FhirPathParameters::R4(parameters) => {
@@ -185,12 +184,6 @@ pub fn extract_parameters(params: FhirPathParameters) -> Result<ExtractedParamet
         #[cfg(feature = "R6")]
         FhirPathParameters::R6(parameters) => {
             extract_parameters_from_r6(parameters, &mut extracted)?;
-        }
-        _ => {
-            return Err(
-                "Parameters payload version is not enabled in this helios-fhirpath build"
-                    .to_string(),
-            );
         }
     }
 
