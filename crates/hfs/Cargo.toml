@@ -18,10 +18,10 @@ path = "src/main.rs"
 default = ["R4", "sqlite"]
 
 # FHIR version features
-R4 = ["helios-fhir/R4", "helios-rest/R4", "helios-subscriptions?/R4"]
-R4B = ["helios-fhir/R4B", "helios-rest/R4B", "helios-subscriptions?/R4B"]
-R5 = ["helios-fhir/R5", "helios-rest/R5", "helios-subscriptions?/R5"]
-R6 = ["helios-fhir/R6", "helios-rest/R6", "helios-subscriptions?/R6"]
+R4 = ["helios-fhir/R4", "helios-rest/R4"]
+R4B = ["helios-fhir/R4B", "helios-rest/R4B"]
+R5 = ["helios-fhir/R5", "helios-rest/R5"]
+R6 = ["helios-fhir/R6", "helios-rest/R6"]
 
 # Build options
 skip-r6-download = []
@@ -46,12 +46,12 @@ cloudwatch = ["helios-audit/cloudwatch"]
 reqwest = { version = "0.12", features = ["blocking"] }
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.1.47" }
 helios-rest = { path = "../rest", version = "0.1.47", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false, features = ["audit"] }
 helios-auth = { path = "../auth", version = "0.1.47" }
 helios-audit = { path = "../audit", version = "0.1.47" }
-helios-subscriptions = { path = "../subscriptions", version = "0.1.47", optional = true, default-features = false }
+helios-subscriptions = { path = "../subscriptions", version = "0.1.47", optional = true }
 
 # Web framework
 axum = "0.8"
