@@ -1,5 +1,12 @@
 name: HFS Subscriptions External Smoke
 
+# Matrix shape (see .claude/plans/create-a-plan-to-wild-hopcroft.md):
+#   15 build configs   — every non-empty subset of {R4, R4B, R5, R6}.
+#   120 smoke jobs     — for each build config, every enabled runtime version
+#                        except R6 (R6 is ballot), crossed with 5 backends.
+# R6 is compiled and tested by subscriptions-channels.yml (integration + unit
+# tests) but not exercised at runtime by the external smoke script.
+
 on:
   workflow_dispatch:
 
@@ -13,9 +20,56 @@ env:
   HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}
 
 jobs:
-  build:
-    name: Build HFS (subscriptions, all FHIR versions)
+  matrix-setup:
+    name: Generate matrix
     runs-on: [self-hosted, Linux]
+    outputs:
+      build-matrix: ${{ steps.gen.outputs.build-matrix }}
+      smoke-matrix: ${{ steps.gen.outputs.smoke-matrix }}
+    steps:
+      - id: gen
+        run: |
+          SUBSETS='[
+            {"build_key":"single-R4",   "features":"R4",           "enabled":["R4"]},
+            {"build_key":"single-R4B",  "features":"R4B",          "enabled":["R4B"]},
+            {"build_key":"single-R5",   "features":"R5",           "enabled":["R5"]},
+            {"build_key":"single-R6",   "features":"R6",           "enabled":["R6"]},
+            {"build_key":"R4-R4B",      "features":"R4,R4B",       "enabled":["R4","R4B"]},
+            {"build_key":"R4-R5",       "features":"R4,R5",        "enabled":["R4","R5"]},
+            {"build_key":"R4-R6",       "features":"R4,R6",        "enabled":["R4","R6"]},
+            {"build_key":"R4B-R5",      "features":"R4B,R5",       "enabled":["R4B","R5"]},
+            {"build_key":"R4B-R6",      "features":"R4B,R6",       "enabled":["R4B","R6"]},
+            {"build_key":"R5-R6",       "features":"R5,R6",        "enabled":["R5","R6"]},
+            {"build_key":"R4-R4B-R5",   "features":"R4,R4B,R5",    "enabled":["R4","R4B","R5"]},
+            {"build_key":"R4-R4B-R6",   "features":"R4,R4B,R6",    "enabled":["R4","R4B","R6"]},
+            {"build_key":"R4-R5-R6",    "features":"R4,R5,R6",     "enabled":["R4","R5","R6"]},
+            {"build_key":"R4B-R5-R6",   "features":"R4B,R5,R6",    "enabled":["R4B","R5","R6"]},
+            {"build_key":"all",         "features":"R4,R4B,R5,R6", "enabled":["R4","R4B","R5","R6"]}
+          ]'
+          BACKENDS='["sqlite","sqlite-elasticsearch","postgres","mongodb","s3-elasticsearch"]'
+
+          BUILD=$(jq -c '[.[] | {build_key, features}]' <<<"$SUBSETS")
+          # Runtime smoke excludes R6 (ballot spec).
+          SMOKE=$(jq -c --argjson b "$BACKENDS" \
+            '[.[] as $s | ($s.enabled - ["R6"])[] as $v | $b[] as $bk
+              | {build_key: $s.build_key, features: $s.features, fhir_version: $v, backend: $bk}]' \
+            <<<"$SUBSETS")
+
+          echo "build-matrix=$BUILD"   >> "$GITHUB_OUTPUT"
+          echo "smoke-matrix=$SMOKE"   >> "$GITHUB_OUTPUT"
+
+          echo "Build matrix: $(jq 'length' <<<"$BUILD") jobs"
+          echo "Smoke matrix: $(jq 'length' <<<"$SMOKE") jobs"
+
+  build:
+    name: Build HFS (${{ matrix.build_key }})
+    needs: matrix-setup
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include: ${{ fromJSON(needs.matrix-setup.outputs.build-matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -35,18 +89,19 @@ jobs:
 
       - name: Build HFS binary with subscriptions
         run: |
-          cargo build -p helios-hfs --no-default-features --features "R4,R4B,R5,R6,subscriptions,sqlite,elasticsearch,postgres,mongodb,s3"
+          cargo build -p helios-hfs --no-default-features \
+            --features "${{ matrix.features }},subscriptions,sqlite,elasticsearch,postgres,mongodb,s3"
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v4
         with:
-          name: hfs-subscriptions-binary
+          name: hfs-subscriptions-binary-${{ matrix.build_key }}
           path: target/debug/hfs
           retention-days: 1
 
   subscriptions-smoke:
-    name: Subscriptions Smoke (${{ matrix.fhir_version }} / ${{ matrix.backend }})
-    needs: build
+    name: Smoke (${{ matrix.build_key }} / ${{ matrix.fhir_version }} / ${{ matrix.backend }})
+    needs: [matrix-setup, build]
     runs-on: [self-hosted, Linux]
     permissions:
       id-token: write
@@ -55,10 +110,9 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        fhir_version: [R4, R4B, R5]
-        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
+        include: ${{ fromJSON(needs.matrix-setup.outputs.smoke-matrix) }}
     env:
-      RESULTS_DIR: subscriptions-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}
+      RESULTS_DIR: subscriptions-smoke-results/${{ matrix.build_key }}/${{ matrix.fhir_version }}/${{ matrix.backend }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -66,7 +120,7 @@ jobs:
       - name: Download HFS binary
         uses: actions/download-artifact@v4
         with:
-          name: hfs-subscriptions-binary
+          name: hfs-subscriptions-binary-${{ matrix.build_key }}
           path: target/debug
 
       - name: Make executables available
@@ -97,7 +151,7 @@ jobs:
       - name: Start Elasticsearch
         if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
         run: |
-          ES_CONTAINER="es-subscriptions-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          ES_CONTAINER="es-subscriptions-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_key }}-${{ matrix.fhir_version }}"
           docker rm -f "$ES_CONTAINER" 2>/dev/null || true
           docker run -d --name "$ES_CONTAINER" -p 0:9200 \
             -e "discovery.type=single-node" \
@@ -128,7 +182,7 @@ jobs:
       - name: Start PostgreSQL
         if: matrix.backend == 'postgres'
         run: |
-          PG_CONTAINER="pg-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
+          PG_CONTAINER="pg-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_key }}-${{ matrix.fhir_version }}"
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
@@ -159,7 +213,7 @@ jobs:
       - name: Start MongoDB replica set
         if: matrix.backend == 'mongodb'
         run: |
-          MONGO_CONTAINER="mongo-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
+          MONGO_CONTAINER="mongo-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_key }}-${{ matrix.fhir_version }}"
           docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
 
@@ -289,7 +343,7 @@ jobs:
             HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
-            HFS_MONGODB_DATABASE="helios_subscriptions_smoke_${{ github.run_id }}_${{ github.run_attempt }}" \
+            HFS_MONGODB_DATABASE="helios_subscriptions_smoke_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.build_key }}_${{ matrix.fhir_version }}" \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_SUBSCRIPTIONS_ENABLED=true \
@@ -297,7 +351,7 @@ jobs:
             HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
             HFS_STORAGE_BACKEND=s3-elasticsearch \
             HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
-            HFS_S3_PREFIX="ci/subscriptions-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.fhir_version }}/${{ matrix.backend }}/" \
+            HFS_S3_PREFIX="ci/subscriptions-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.build_key }}/${{ matrix.fhir_version }}/${{ matrix.backend }}/" \
             HFS_S3_VALIDATE_BUCKETS=false \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
@@ -338,7 +392,7 @@ jobs:
           FHIR_VERSION="${{ matrix.fhir_version }}" \
           RESULTS_DIR="$RESULTS_DIR" \
           WEBSOCAT_BIN="$WEBSOCAT_BIN" \
-          SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}" \
+          SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_key }}-${{ matrix.fhir_version }}-${{ matrix.backend }}" \
           ./crates/hfs/tests/subscriptions/run_external_subscriptions_smoke.sh
 
       - name: Stop HFS gracefully
@@ -361,7 +415,7 @@ jobs:
       - name: Collect backend container logs
         if: always()
         run: |
-          RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}}"
+          RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results/${{ matrix.build_key }}/${{ matrix.fhir_version }}/${{ matrix.backend }}}"
           mkdir -p "$RESULTS_DIR/backend-logs"
           if [ -n "${ES_CONTAINER:-}" ]; then
             docker logs "$ES_CONTAINER" > "$RESULTS_DIR/backend-logs/elasticsearch.log" 2>&1 || true
@@ -376,11 +430,11 @@ jobs:
       - name: Append smoke report to summary
         if: always()
         run: |
-          RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}}"
+          RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results/${{ matrix.build_key }}/${{ matrix.fhir_version }}/${{ matrix.backend }}}"
           if [ -f "$RESULTS_DIR/summary.md" ]; then
             cat "$RESULTS_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "## Subscriptions Smoke (${{ matrix.backend }})" >> "$GITHUB_STEP_SUMMARY"
+            echo "## Subscriptions Smoke (${{ matrix.build_key }} / ${{ matrix.fhir_version }} / ${{ matrix.backend }})" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "No summary produced." >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -389,8 +443,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: subscriptions-smoke-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: subscriptions-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}/
+          name: subscriptions-smoke-${{ matrix.build_key }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: subscriptions-smoke-results/${{ matrix.build_key }}/${{ matrix.fhir_version }}/${{ matrix.backend }}/
           retention-days: 30
 
       - name: Cleanup containers
