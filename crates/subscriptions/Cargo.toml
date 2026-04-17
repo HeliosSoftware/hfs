@@ -17,7 +17,7 @@ R6 = ["helios-fhir/R6", "helios-persistence/R6"]
 
 [dependencies]
 # FHIR models
-helios-fhir = { path = "../fhir", default-features = false }
+helios-fhir = { path = "../fhir" }
 
 # Persistence (for TenantContext, StoredResource, etc.)
 helios-persistence = { path = "../persistence", default-features = false }

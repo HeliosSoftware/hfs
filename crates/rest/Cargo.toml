@@ -38,12 +38,12 @@ subscriptions = ["dep:helios-subscriptions"]
 
 [dependencies]
 # Core dependencies
-helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.1.47" }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false }
 helios-serde = { path = "../serde", version = "0.1.47", default-features = false, optional = true }
 helios-auth = { path = "../auth", version = "0.1.47" }
 helios-audit = { path = "../audit", version = "0.1.47" }
-helios-subscriptions = { path = "../subscriptions", version = "0.1.47", optional = true, default-features = false }
+helios-subscriptions = { path = "../subscriptions", version = "0.1.47", optional = true }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
