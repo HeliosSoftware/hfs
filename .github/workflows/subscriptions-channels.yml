@@ -1,5 +1,11 @@
 name: Subscriptions Channel Integration
 
+# Matrix shape (see .claude/plans/create-a-plan-to-wild-hopcroft.md):
+#   15 unit-test jobs      — one per non-empty subset of {R4, R4B, R5, R6}.
+#                            Catches Class 1 (broken single-version builds).
+#   32 rest-hook jobs      — one per enabled runtime version per subset.
+#   32 websocket jobs      — same shape. Drives HFS_TEST_FHIR_VERSION.
+
 on:
   workflow_dispatch:
   push:
@@ -19,13 +25,88 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  rest-hook-integration:
-    name: Rest-Hook Channel Integration (${{ matrix.fhir_version }})
+  matrix-setup:
+    name: Generate matrix
+    runs-on: [self-hosted, Linux]
+    outputs:
+      build-matrix: ${{ steps.gen.outputs.build-matrix }}
+      integration-matrix: ${{ steps.gen.outputs.integration-matrix }}
+    steps:
+      - id: gen
+        run: |
+          SUBSETS='[
+            {"build_key":"single-R4",   "features":"R4",           "enabled":["R4"]},
+            {"build_key":"single-R4B",  "features":"R4B",          "enabled":["R4B"]},
+            {"build_key":"single-R5",   "features":"R5",           "enabled":["R5"]},
+            {"build_key":"single-R6",   "features":"R6",           "enabled":["R6"]},
+            {"build_key":"R4-R4B",      "features":"R4,R4B",       "enabled":["R4","R4B"]},
+            {"build_key":"R4-R5",       "features":"R4,R5",        "enabled":["R4","R5"]},
+            {"build_key":"R4-R6",       "features":"R4,R6",        "enabled":["R4","R6"]},
+            {"build_key":"R4B-R5",      "features":"R4B,R5",       "enabled":["R4B","R5"]},
+            {"build_key":"R4B-R6",      "features":"R4B,R6",       "enabled":["R4B","R6"]},
+            {"build_key":"R5-R6",       "features":"R5,R6",        "enabled":["R5","R6"]},
+            {"build_key":"R4-R4B-R5",   "features":"R4,R4B,R5",    "enabled":["R4","R4B","R5"]},
+            {"build_key":"R4-R4B-R6",   "features":"R4,R4B,R6",    "enabled":["R4","R4B","R6"]},
+            {"build_key":"R4-R5-R6",    "features":"R4,R5,R6",     "enabled":["R4","R5","R6"]},
+            {"build_key":"R4B-R5-R6",   "features":"R4B,R5,R6",    "enabled":["R4B","R5","R6"]},
+            {"build_key":"all",         "features":"R4,R4B,R5,R6", "enabled":["R4","R4B","R5","R6"]}
+          ]'
+
+          BUILD=$(jq -c '[.[] | {build_key, features}]' <<<"$SUBSETS")
+          INTEGRATION=$(jq -c \
+            '[.[] as $s | $s.enabled[] as $v
+              | {build_key: $s.build_key, features: $s.features, fhir_version: $v}]' \
+            <<<"$SUBSETS")
+
+          echo "build-matrix=$BUILD"             >> "$GITHUB_OUTPUT"
+          echo "integration-matrix=$INTEGRATION" >> "$GITHUB_OUTPUT"
+
+          echo "Build / unit-test matrix: $(jq 'length' <<<"$BUILD") jobs"
+          echo "Integration matrix: $(jq 'length' <<<"$INTEGRATION") jobs"
+
+  unit-tests:
+    name: Unit tests (${{ matrix.build_key }})
+    needs: matrix-setup
     runs-on: [self-hosted, Linux]
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
-        fhir_version: [R4, R4B, R5, R6]
+        include: ${{ fromJSON(needs.matrix-setup.outputs.build-matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust linker (Linux)
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Run unit tests
+        run: |
+          cargo test --no-default-features \
+            --features "${{ matrix.features }}" \
+            -p helios-subscriptions -p helios-rest -p helios-persistence -p helios-fhirpath
+
+  rest-hook-integration:
+    name: Rest-Hook (${{ matrix.build_key }} / ${{ matrix.fhir_version }})
+    needs: matrix-setup
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.matrix-setup.outputs.integration-matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -49,15 +130,18 @@ jobs:
         env:
           HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
         run: |
-          cargo test -p helios-subscriptions --features "R4,R4B,R5,R6" --test rest_hook_integration
+          cargo test -p helios-subscriptions --no-default-features \
+            --features "${{ matrix.features }}" --test rest_hook_integration
 
   websocket-integration:
-    name: WebSocket Channel Integration (${{ matrix.fhir_version }})
+    name: WebSocket (${{ matrix.build_key }} / ${{ matrix.fhir_version }})
+    needs: matrix-setup
     runs-on: [self-hosted, Linux]
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
-        fhir_version: [R4, R4B, R5, R6]
+        include: ${{ fromJSON(needs.matrix-setup.outputs.integration-matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -81,4 +165,5 @@ jobs:
         env:
           HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
         run: |
-          cargo test -p helios-subscriptions --features "R4,R4B,R5,R6" --test websocket_integration
+          cargo test -p helios-subscriptions --no-default-features \
+            --features "${{ matrix.features }}" --test websocket_integration
