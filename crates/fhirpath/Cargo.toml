@@ -18,7 +18,7 @@ R5 = ["helios-fhir/R5"]
 R6 = ["helios-fhir/R6"]
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.1.47" }
 helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.47" }
 chumsky = "0.10"
 roxmltree = "0.20"
@@ -81,3 +81,4 @@ harness = false
 [package.metadata.docs.rs]
 features = ["R4"]
 rustdoc-args = ["--cfg", "docsrs"]
+
