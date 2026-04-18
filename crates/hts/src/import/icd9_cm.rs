@@ -6,85 +6,33 @@
 //!
 //! # No license required
 //!
-//! ICD-9-CM is a US government work in the public domain.  The final release
-//! was FY2015 (the last year before the ICD-10-CM transition on Oct 1, 2015).
-//! Download from the CMS archive:
-//! <https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles>
-//!
-//! # File format
-//!
-//! The CMS distribution is a ZIP containing pipe-delimited text files:
-//!
-//! ```text
-//! 0010|Cholera due to vibrio cholerae
-//! 00100|Cholera due to vibrio cholerae
-//! 00101|Cholera due to vibrio cholerae el tor
-//! ```
-//!
-//! Codes are stored **without** the decimal point.  This importer inserts it
-//! for display:
-//!
-//! | Raw code | Display code |
-//! |----------|-------------|
-//! | `001`    | `001`        |
-//! | `0010`   | `001.0`      |
-//! | `00100`  | `001.00`     |
-//! | `E800`   | `E800`       |
-//! | `E8000`  | `E800.0`     |
-//! | `V01`    | `V01`        |
-//! | `V010`   | `V01.0`      |
-//!
-//! # Hierarchy
-//!
-//! # Hierarchy
-//!
-//! Hierarchy is inferred from the display code:
-//! - No dot → top-level category; parent is the virtual root `ICD-9-CM`.
-//! - One char after dot (e.g., `001.0`) → parent is the part before the dot (`001`).
-//! - Two chars after dot (e.g., `001.00`) → parent is the code without the last char (`001.0`).
-//!
-//! # Known limitations
-//!
-//! - **Diagnosis codes only.**  CMS also distributes procedure/surgery codes in
-//!   `*_DESC_LONG_SG*.txt`.  This importer accepts any pipe-delimited `.txt`
-//!   file, so procedure codes will import but share the same CodeSystem URL.
-//!   If separate CodeSystems are needed, import the files separately into
-//!   different databases.
-//! - **No chapter/section groupers.**  ICD-9-CM has named chapters (e.g.,
-//!   "Infectious And Parasitic Diseases: 001–139") but CMS flat files do not
-//!   include them.  Top-level 3-digit codes are placed directly under the
-//!   virtual root `ICD-9-CM` rather than under a chapter concept.
-//! - **V-codes with 4-char bases are not handled specially.**  `V700` is treated
-//!   as a sub-code of `V70` (3-char base), which matches ICD-9-CM conventions.
-
-#[cfg(feature = "sqlite")]
-use r2d2::Pool;
-#[cfg(feature = "sqlite")]
-use r2d2_sqlite::SqliteConnectionManager;
+//! ICD-9-CM is a US government work in the public domain.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
+use helios_persistence::tenant::TenantContext;
+
 use crate::error::HtsError;
+use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const ICD9CM_URL: &str = "http://hl7.org/fhir/sid/icd-9-cm";
+const ICD9CM_ID: &str = "icd9cm";
 const ICD9CM_NAME: &str = "ICD-9-CM";
 const ICD9CM_TITLE: &str =
     "ICD-9-CM (International Classification of Diseases, 9th Revision, Clinical Modification)";
 const ICD9CM_VERSION: &str = "2015";
-/// Virtual root code — all top-level categories hang off this.
 const ROOT_CODE: &str = "ICD-9-CM";
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 struct Icd9Concept {
-    /// FHIR-facing code with decimal point inserted (e.g. `"001.0"`).
     code: String,
-    /// Human-readable description from the source file.
     display: String,
     /// Parent code (also with decimal) or `None` when the parent is the
     /// virtual root `ICD-9-CM`.
@@ -93,22 +41,25 @@ struct Icd9Concept {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Import a CMS ICD-9-CM distribution into the HTS database.
-///
-/// `path` may point to:
-/// - The raw pipe-delimited `.txt` file, or
-/// - A `.zip` archive containing a `*_DESC_LONG_DX*.txt` (or any single `.txt`) file.
-#[cfg(feature = "sqlite")]
-pub fn import_icd9_cm(
-    pool: &Pool<SqliteConnectionManager>,
+/// Import a CMS ICD-9-CM distribution through the given backend.
+pub async fn import_icd9_cm(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
     path: &Path,
     batch_size: usize,
     dry_run: bool,
 ) -> Result<ImportStats, HtsError> {
     let batch_size = batch_size.max(1);
-    let text = read_text(path)?;
 
-    let (concepts, errors) = parse_pipe_delimited(&text);
+    let path_owned = path.to_path_buf();
+    let (concepts, errors) = tokio::task::spawn_blocking(
+        move || -> Result<(Vec<Icd9Concept>, Vec<String>), HtsError> {
+            let text = read_text(&path_owned)?;
+            Ok(parse_pipe_delimited(&text))
+        },
+    )
+    .await
+    .map_err(|e| HtsError::Internal(format!("ICD-9-CM parser panicked: {e}")))??;
 
     let mut stats = ImportStats {
         errors,
@@ -125,33 +76,50 @@ pub fn import_icd9_cm(
         return Ok(stats);
     }
 
-    let conn = pool
-        .get()
-        .map_err(|e| HtsError::Internal(format!("DB pool error: {e}")))?;
+    let meta = CodeSystemMeta {
+        id: ICD9CM_ID,
+        url: ICD9CM_URL,
+        version: Some(ICD9CM_VERSION),
+        name: Some(ICD9CM_NAME),
+        title: Some(ICD9CM_TITLE),
+        status: "active",
+        content: "complete",
+    };
 
-    let system_id = upsert_code_system(&conn)?;
-    stats.code_systems = 1;
-
-    // Insert the virtual root concept first so hierarchy edges can reference it.
-    conn.execute(
-        "INSERT OR IGNORE INTO concepts (system_id, code, display, definition) \
-         VALUES (?1, ?2, ?3, 'header')",
-        rusqlite::params![system_id, ROOT_CODE, ICD9CM_TITLE],
-    )
-    .map_err(|e| HtsError::Internal(format!("Insert virtual root: {e}")))?;
+    // Seed: CodeSystem metadata + virtual root concept.
+    let root = BuilderConcept {
+        code: ROOT_CODE,
+        display: Some(ICD9CM_TITLE),
+        definition: Some("header"),
+        ..Default::default()
+    };
+    let seed = build_code_system_bundle(&meta, std::slice::from_ref(&root));
+    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    stats.code_systems = seed_stats.code_systems;
+    stats.errors.extend(seed_stats.errors);
 
     let total = concepts.len();
-    let total_batches = total.div_ceil(batch_size);
+    let total_batches = total.div_ceil(batch_size).max(1);
 
     for (batch_idx, batch) in concepts.chunks(batch_size).enumerate() {
-        insert_concept_batch(&conn, &system_id, batch)?;
-        insert_hierarchy_batch(&conn, &system_id, batch)?;
+        let builder: Vec<BuilderConcept<'_>> = batch
+            .iter()
+            .map(|c| BuilderConcept {
+                code: &c.code,
+                display: Some(&c.display),
+                parent_code: Some(c.parent.as_deref().unwrap_or(ROOT_CODE)),
+                ..Default::default()
+            })
+            .collect();
+        let bytes = build_code_system_bundle(&meta, &builder);
+        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        stats.errors.extend(chunk.errors);
 
-        let inserted = ((batch_idx + 1) * batch_size).min(total);
         eprintln!(
-            "[icd9-cm] batch {}/{total_batches} — +{} concepts (total: {inserted})",
+            "[icd9-cm] batch {}/{total_batches} — +{} concepts (total: {})",
             batch_idx + 1,
-            batch.len()
+            batch.len(),
+            ((batch_idx + 1) * batch_size).min(total)
         );
     }
 
@@ -161,7 +129,6 @@ pub fn import_icd9_cm(
 
 // ── File reader ───────────────────────────────────────────────────────────────
 
-/// Read the pipe-delimited text from either a raw `.txt` file or a `.zip`.
 fn read_text(path: &Path) -> Result<String, HtsError> {
     let ext = path
         .extension()
@@ -177,12 +144,6 @@ fn read_text(path: &Path) -> Result<String, HtsError> {
     }
 }
 
-/// Extract the first suitable text file from a ZIP archive.
-///
-/// Preference order:
-/// 1. A file whose name contains `_desc_long_dx` (CMS long-description file).
-/// 2. A file whose name contains `_desc_short_dx` (CMS short-description file).
-/// 3. The first `.txt` file that is not a readme or license.
 fn read_text_from_zip(path: &Path) -> Result<String, HtsError> {
     let file = std::fs::File::open(path).map_err(|e| {
         HtsError::InvalidRequest(format!("Cannot open ZIP '{}': {e}", path.display()))
@@ -190,7 +151,6 @@ fn read_text_from_zip(path: &Path) -> Result<String, HtsError> {
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| HtsError::InvalidRequest(format!("Invalid ZIP '{}': {e}", path.display())))?;
 
-    // Score each entry: 2 = long-desc match, 1 = short-desc match, 0 = other .txt
     let best_index = (0..archive.len())
         .filter_map(|i| {
             let entry = archive.by_index(i).ok()?;
@@ -198,7 +158,6 @@ fn read_text_from_zip(path: &Path) -> Result<String, HtsError> {
             if !name.ends_with(".txt") {
                 return None;
             }
-            // Skip obvious non-data files
             if name.contains("readme") || name.contains("license") || name.contains("read_me") {
                 return None;
             }
@@ -235,12 +194,6 @@ fn read_text_from_zip(path: &Path) -> Result<String, HtsError> {
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
-/// Parse a pipe-delimited ICD-9-CM text file into [`Icd9Concept`]s.
-///
-/// Expected line format: `code|description`
-///
-/// Lines that do not contain `|` or have an empty code are skipped and
-/// recorded as non-fatal errors.
 fn parse_pipe_delimited(text: &str) -> (Vec<Icd9Concept>, Vec<String>) {
     let mut concepts = Vec::new();
     let mut errors = Vec::new();
@@ -284,13 +237,6 @@ fn parse_pipe_delimited(text: &str) -> (Vec<Icd9Concept>, Vec<String>) {
     (concepts, errors)
 }
 
-// ── Code helpers ──────────────────────────────────────────────────────────────
-
-/// Insert the decimal point into a raw ICD-9-CM code.
-///
-/// The base length (before the decimal) is:
-/// - 4 for E-codes (`E` prefix) — e.g., `E800` is a base code, `E8000` → `E800.0`
-/// - 3 for all other codes (numeric and V-codes)
 fn insert_dot(raw: &str) -> String {
     let base = if raw.starts_with('E') || raw.starts_with('e') {
         4
@@ -304,105 +250,18 @@ fn insert_dot(raw: &str) -> String {
     }
 }
 
-/// Infer the parent code from a display code (with decimal).
-///
-/// Returns `None` for top-level categories (no dot), which means the parent
-/// is the virtual root and the hierarchy batch will use `ROOT_CODE`.
 fn parent_of(code: &str) -> Option<String> {
     match code.find('.') {
-        None => None, // top-level → parent is virtual root
+        None => None,
         Some(dot) => {
             let after_dot = &code[dot + 1..];
             if after_dot.len() <= 1 {
-                // e.g. "001.0" → parent is "001"
                 Some(code[..dot].to_string())
             } else {
-                // e.g. "001.00" → parent is "001.0"
                 Some(code[..code.len() - 1].to_string())
             }
         }
     }
-}
-
-// ── DB helpers ────────────────────────────────────────────────────────────────
-
-#[cfg(feature = "sqlite")]
-fn upsert_code_system(conn: &rusqlite::Connection) -> Result<String, HtsError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    conn.execute(
-        "INSERT OR IGNORE INTO code_systems \
-         (id, url, version, name, title, status, content, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'complete', ?6, ?6)",
-        rusqlite::params![
-            id,
-            ICD9CM_URL,
-            ICD9CM_VERSION,
-            ICD9CM_NAME,
-            ICD9CM_TITLE,
-            now
-        ],
-    )
-    .map_err(|e| HtsError::Internal(format!("Upsert CodeSystem: {e}")))?;
-
-    let system_id: String = conn
-        .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
-            rusqlite::params![ICD9CM_URL],
-            |row| row.get(0),
-        )
-        .map_err(|e| HtsError::Internal(format!("Fetch CodeSystem id: {e}")))?;
-
-    Ok(system_id)
-}
-
-#[cfg(feature = "sqlite")]
-fn insert_concept_batch(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    batch: &[Icd9Concept],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin transaction: {e}")))?;
-
-    for c in batch {
-        tx.execute(
-            "INSERT OR REPLACE INTO concepts (system_id, code, display) VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, c.code, c.display],
-        )
-        .map_err(|e| HtsError::Internal(format!("Insert concept '{}': {e}", c.code)))?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit: {e}")))?;
-    Ok(())
-}
-
-#[cfg(feature = "sqlite")]
-fn insert_hierarchy_batch(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    batch: &[Icd9Concept],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin hierarchy transaction: {e}")))?;
-
-    for c in batch {
-        let parent = c.parent.as_deref().unwrap_or(ROOT_CODE);
-        tx.execute(
-            "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code) \
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, parent, c.code],
-        )
-        .map_err(|e| HtsError::Internal(format!("Insert hierarchy {parent}->{}: {e}", c.code)))?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit hierarchy: {e}")))?;
-    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -410,8 +269,6 @@ fn insert_hierarchy_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── insert_dot ────────────────────────────────────────────────────────────
 
     #[test]
     fn dot_not_inserted_for_3_char_numeric() {
@@ -448,8 +305,6 @@ mod tests {
         assert_eq!(insert_dot("V010"), "V01.0");
     }
 
-    // ── parent_of ─────────────────────────────────────────────────────────────
-
     #[test]
     fn parent_of_top_level_is_none() {
         assert_eq!(parent_of("001"), None);
@@ -469,8 +324,6 @@ mod tests {
         assert_eq!(parent_of("001.00"), Some("001.0".to_string()));
         assert_eq!(parent_of("E800.01"), Some("E800.0".to_string()));
     }
-
-    // ── parse_pipe_delimited ──────────────────────────────────────────────────
 
     const SAMPLE: &str = "\
 001|Cholera\n\
@@ -493,9 +346,9 @@ V01|Contact with or exposure to communicable diseases\n\
     fn parse_inserts_dot_in_codes() {
         let (concepts, _) = parse_pipe_delimited(SAMPLE);
         let codes: Vec<&str> = concepts.iter().map(|c| c.code.as_str()).collect();
-        assert!(codes.contains(&"001.0"), "expected 001.0 in {codes:?}");
-        assert!(codes.contains(&"001.00"), "expected 001.00 in {codes:?}");
-        assert!(codes.contains(&"E800.0"), "expected E800.0 in {codes:?}");
+        assert!(codes.contains(&"001.0"));
+        assert!(codes.contains(&"001.00"));
+        assert!(codes.contains(&"E800.0"));
     }
 
     #[test]
@@ -503,10 +356,10 @@ V01|Contact with or exposure to communicable diseases\n\
         let (concepts, _) = parse_pipe_delimited(SAMPLE);
         let find = |code: &str| concepts.iter().find(|c| c.code == code).unwrap();
 
-        assert_eq!(find("001").parent, None); // virtual root
+        assert_eq!(find("001").parent, None);
         assert_eq!(find("001.0").parent, Some("001".to_string()));
         assert_eq!(find("001.00").parent, Some("001.0".to_string()));
-        assert_eq!(find("E800").parent, None); // virtual root
+        assert_eq!(find("E800").parent, None);
         assert_eq!(find("E800.0").parent, Some("E800".to_string()));
     }
 
@@ -536,16 +389,16 @@ V01|Contact with or exposure to communicable diseases\n\
         assert_eq!(concepts.len(), 2);
     }
 
-    // ── Integration (SQLite) ──────────────────────────────────────────────────
-
     #[cfg(feature = "sqlite")]
     mod integration {
         use super::*;
         use crate::backends::SqliteTerminologyBackend;
         use std::io::Write;
 
-        fn count(pool: &Pool<SqliteConnectionManager>, table: &str) -> i64 {
-            pool.get()
+        fn count(backend: &SqliteTerminologyBackend, table: &str) -> i64 {
+            backend
+                .pool()
+                .get()
                 .unwrap()
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap()
@@ -569,68 +422,86 @@ V01|Contact with or exposure to communicable diseases\n\
             tmp
         }
 
-        #[test]
-        fn dry_run_does_not_write() {
+        #[tokio::test]
+        async fn dry_run_does_not_write() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_txt_file(SAMPLE);
-            let stats = import_icd9_cm(backend.pool(), f.path(), 500, true).unwrap();
+            let stats = import_icd9_cm(&backend, &ctx, f.path(), 500, true)
+                .await
+                .unwrap();
             assert_eq!(stats.code_systems, 1);
             assert_eq!(stats.concepts, 7);
-            assert_eq!(count(backend.pool(), "code_systems"), 0);
-            assert_eq!(count(backend.pool(), "concepts"), 0);
+            assert_eq!(count(&backend, "code_systems"), 0);
+            assert_eq!(count(&backend, "concepts"), 0);
         }
 
-        #[test]
-        fn live_import_writes_concepts_and_hierarchy() {
+        #[tokio::test]
+        async fn live_import_writes_concepts_and_hierarchy() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_txt_file(SAMPLE);
-            let stats = import_icd9_cm(backend.pool(), f.path(), 500, false).unwrap();
+            let stats = import_icd9_cm(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
             assert_eq!(stats.code_systems, 1);
             assert_eq!(stats.concepts, 7);
-            // virtual root + 7 concepts
-            assert_eq!(count(backend.pool(), "concepts"), 8);
-            // 7 hierarchy edges (all concepts have a parent — virtual root or real)
-            assert_eq!(count(backend.pool(), "concept_hierarchy"), 7);
+            assert_eq!(count(&backend, "concepts"), 8);
+            assert_eq!(count(&backend, "concept_hierarchy"), 7);
         }
 
-        #[test]
-        fn idempotent_reimport() {
+        #[tokio::test]
+        async fn idempotent_reimport() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_txt_file(SAMPLE);
-            import_icd9_cm(backend.pool(), f.path(), 500, false).unwrap();
-            import_icd9_cm(backend.pool(), f.path(), 500, false).unwrap();
-            assert_eq!(count(backend.pool(), "code_systems"), 1);
-            assert_eq!(count(backend.pool(), "concepts"), 8);
-            assert_eq!(count(backend.pool(), "concept_hierarchy"), 7);
+            import_icd9_cm(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
+            import_icd9_cm(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
+            assert_eq!(count(&backend, "code_systems"), 1);
+            assert_eq!(count(&backend, "concepts"), 8);
+            assert_eq!(count(&backend, "concept_hierarchy"), 7);
         }
 
-        #[test]
-        fn import_from_zip() {
+        #[tokio::test]
+        async fn import_from_zip() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_zip_file(SAMPLE);
-            let stats = import_icd9_cm(backend.pool(), f.path(), 500, false).unwrap();
+            let stats = import_icd9_cm(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
             assert_eq!(stats.concepts, 7);
-            assert_eq!(count(backend.pool(), "concepts"), 8);
+            assert_eq!(count(&backend, "concepts"), 8);
         }
 
-        #[test]
-        fn batching_preserves_all_concepts() {
+        #[tokio::test]
+        async fn batching_preserves_all_concepts() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_txt_file(SAMPLE);
-            let stats = import_icd9_cm(backend.pool(), f.path(), 2, false).unwrap();
+            let stats = import_icd9_cm(&backend, &ctx, f.path(), 2, false)
+                .await
+                .unwrap();
             assert_eq!(stats.concepts, 7);
-            assert_eq!(count(backend.pool(), "concepts"), 8);
+            assert_eq!(count(&backend, "concepts"), 8);
         }
 
-        #[test]
-        fn missing_file_returns_error() {
+        #[tokio::test]
+        async fn missing_file_returns_error() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let result = import_icd9_cm(
-                backend.pool(),
+                &backend,
+                &ctx,
                 Path::new("/nonexistent/icd9.txt"),
                 500,
                 false,
-            );
+            )
+            .await;
             assert!(result.is_err());
         }
     }

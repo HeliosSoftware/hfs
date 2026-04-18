@@ -10,58 +10,16 @@
 //! and are freely redistributable with attribution. They are also bundled inside
 //! the HL7 THO NPM package — if you have already run `hts import <tgz>`, no
 //! separate import is needed.
-//!
-//! For standalone use, download the v2 table definitions from:
-//! <https://terminology.hl7.org>
-//!
-//! **Required attribution when redistributing:**
-//! ```text
-//! This product includes content from HL7 Terminology (THO).
-//! Copyright © Health Level Seven International.
-//! Licensed under the HL7 FHIR License.
-//! ```
-//!
-//! # File format
-//!
-//! The importer accepts an HL7 v2 tables XML file in either of two common
-//! formats:
-//!
-//! **Format A — single root with `<HL7Table>` children:**
-//! ```xml
-//! <HL7Tables>
-//!   <HL7Table id="0001" name="Administrative Sex">
-//!     <tableEntry code="F" displayName="Female"/>
-//!     <tableEntry code="M" displayName="Male"/>
-//!   </HL7Table>
-//! </HL7Tables>
-//! ```
-//!
-//! **Format B — single `<HL7Table>` root (one file per table):**
-//! ```xml
-//! <HL7Table id="0001" name="Administrative Sex">
-//!   <tableEntry code="F" displayName="Female"/>
-//!   <tableEntry code="M" displayName="Male"/>
-//! </HL7Table>
-//! ```
-//!
-//! ZIP archives containing multiple XML files are also supported; each `.xml`
-//! file inside is parsed as an independent table.
-//!
-//! # Hierarchy
-//!
-//! HL7 v2 tables are flat enumerations. All codes are placed as children of a
-//! virtual root concept named after the table ID (e.g. `v2-0001`).
-
-#[cfg(feature = "sqlite")]
-use r2d2::Pool;
-#[cfg(feature = "sqlite")]
-use r2d2_sqlite::SqliteConnectionManager;
 
 use std::io::Read;
 use std::path::Path;
 
+use helios_persistence::tenant::TenantContext;
+
 use crate::error::HtsError;
+use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -75,7 +33,6 @@ struct V2Table {
     id: String,
     /// Table name, e.g. "Administrative Sex".
     name: String,
-    /// All code entries.
     entries: Vec<V2Entry>,
 }
 
@@ -87,31 +44,34 @@ struct V2Entry {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Import HL7 v2 table definitions into the HTS database.
-///
-/// `path` may point to:
-/// - A single XML file (one table or a multi-table document), or
-/// - A `.zip` archive containing one or more XML files.
-///
-/// Each distinct HL7 v2 table becomes a separate `CodeSystem` in HTS.
-#[cfg(feature = "sqlite")]
-pub fn import_hl7_v2_tables(
-    pool: &Pool<SqliteConnectionManager>,
+/// Import HL7 v2 table definitions through the given backend. Each table
+/// becomes a separate FHIR CodeSystem.
+pub async fn import_hl7_v2_tables(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
     path: &Path,
     batch_size: usize,
     dry_run: bool,
 ) -> Result<ImportStats, HtsError> {
     let batch_size = batch_size.max(1);
-    let xmls = read_xmls(path)?;
 
-    let mut all_tables: Vec<V2Table> = Vec::new();
-    let mut all_errors: Vec<String> = Vec::new();
+    let path_owned = path.to_path_buf();
+    let (all_tables, all_errors) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<V2Table>, Vec<String>), HtsError> {
+            let xmls = read_xmls(&path_owned)?;
 
-    for (source_name, xml) in &xmls {
-        let (tables, errors) = parse_v2_xml(xml, source_name);
-        all_tables.extend(tables);
-        all_errors.extend(errors);
-    }
+            let mut all_tables: Vec<V2Table> = Vec::new();
+            let mut all_errors: Vec<String> = Vec::new();
+
+            for (source_name, xml) in &xmls {
+                let (tables, errors) = parse_v2_xml(xml, source_name);
+                all_tables.extend(tables);
+                all_errors.extend(errors);
+            }
+            Ok((all_tables, all_errors))
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("HL7 v2 tables parser panicked: {e}")))??;
 
     let total_concepts: u32 = all_tables.iter().map(|t| t.entries.len() as u32).sum();
 
@@ -131,31 +91,53 @@ pub fn import_hl7_v2_tables(
         return Ok(stats);
     }
 
-    let conn = pool
-        .get()
-        .map_err(|e| HtsError::Internal(format!("DB pool error: {e}")))?;
-
     for table in &all_tables {
-        let system_id = upsert_code_system(&conn, table)?;
-
-        // Virtual root concept for hierarchy edges.
+        let url = format!("{V2_URL_PREFIX}{}", table.id);
+        let name = format!("v2-{}", table.id);
         let root_code = format!("v2-{}", table.id);
-        conn.execute(
-            "INSERT OR IGNORE INTO concepts (system_id, code, display, definition) \
-             VALUES (?1, ?2, ?3, 'header')",
-            rusqlite::params![system_id, root_code, table.name],
-        )
-        .map_err(|e| HtsError::Internal(format!("Insert root concept: {e}")))?;
+        let cs_id = format!("v2-{}", table.id);
+
+        let meta = CodeSystemMeta {
+            id: &cs_id,
+            url: &url,
+            version: Some("current"),
+            name: Some(&name),
+            title: Some(&table.name),
+            status: "active",
+            content: "complete",
+        };
+
+        // Seed bundle: virtual root.
+        let root = BuilderConcept {
+            code: &root_code,
+            display: Some(&table.name),
+            definition: Some("header"),
+            ..Default::default()
+        };
+        let seed_bytes = build_code_system_bundle(&meta, std::slice::from_ref(&root));
+        let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+        stats.code_systems += seed_stats.code_systems;
+        stats.errors.extend(seed_stats.errors);
 
         let total = table.entries.len();
-        let total_batches = total.div_ceil(batch_size);
+        let total_batches = total.div_ceil(batch_size).max(1);
 
         for (batch_idx, batch) in table.entries.chunks(batch_size).enumerate() {
-            insert_entry_batch(&conn, &system_id, &root_code, batch)?;
+            let builder: Vec<BuilderConcept<'_>> = batch
+                .iter()
+                .map(|e| BuilderConcept {
+                    code: &e.code,
+                    display: Some(&e.display),
+                    parent_code: Some(&root_code),
+                    ..Default::default()
+                })
+                .collect();
+            let bytes = build_code_system_bundle(&meta, &builder);
+            let chunk = backend.import_bundle(ctx, &bytes).await?;
+            stats.errors.extend(chunk.errors);
 
-            let inserted = ((batch_idx + 1) * batch_size).min(total);
             eprintln!(
-                "[hl7-v2-tables] table {} ({}) batch {}/{total_batches} — +{} codes (total: {inserted})",
+                "[hl7-v2-tables] table {} ({}) batch {}/{total_batches} — +{} codes",
                 table.id,
                 table.name,
                 batch_idx + 1,
@@ -163,7 +145,6 @@ pub fn import_hl7_v2_tables(
             );
         }
 
-        stats.code_systems += 1;
         stats.concepts += total as u32;
     }
 
@@ -172,7 +153,6 @@ pub fn import_hl7_v2_tables(
 
 // ── File reader ───────────────────────────────────────────────────────────────
 
-/// Returns a list of `(source_name, xml_content)` pairs.
 fn read_xmls(path: &Path) -> Result<Vec<(String, String)>, HtsError> {
     let ext = path
         .extension()
@@ -237,11 +217,6 @@ fn read_xmls_from_zip(path: &Path) -> Result<Vec<(String, String)>, HtsError> {
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
-/// Parse one HL7 v2 XML file into a list of tables and non-fatal errors.
-///
-/// Returns `(tables, non_fatal_errors)`.
-/// Handles both Format A (`<HL7Tables>` root with multiple `<HL7Table>` children)
-/// and Format B (a single `<HL7Table>` as the root element).
 fn parse_v2_xml(xml: &str, source_name: &str) -> (Vec<V2Table>, Vec<String>) {
     let doc = match roxmltree::Document::parse(xml) {
         Ok(d) => d,
@@ -260,7 +235,6 @@ fn parse_v2_xml(xml: &str, source_name: &str) -> (Vec<V2Table>, Vec<String>) {
 
     match root_tag {
         "HL7Tables" => {
-            // Format A: multiple tables under a single root.
             for child in root
                 .children()
                 .filter(|n| n.is_element() && n.tag_name().name() == "HL7Table")
@@ -271,7 +245,6 @@ fn parse_v2_xml(xml: &str, source_name: &str) -> (Vec<V2Table>, Vec<String>) {
             }
         }
         "HL7Table" => {
-            // Format B: single table as the root element.
             if let Some(t) = parse_table_element(&root, &mut errors) {
                 tables.push(t);
             }
@@ -286,9 +259,6 @@ fn parse_v2_xml(xml: &str, source_name: &str) -> (Vec<V2Table>, Vec<String>) {
     (tables, errors)
 }
 
-/// Extract a [`V2Table`] from an `<HL7Table>` element.
-///
-/// Returns `None` if the required `id` attribute is absent.
 fn parse_table_element(node: &roxmltree::Node, errors: &mut Vec<String>) -> Option<V2Table> {
     let id = node.attribute("id")?.trim().to_string();
     let name = node.attribute("name").unwrap_or(&id).trim().to_string();
@@ -316,72 +286,6 @@ fn parse_table_element(node: &roxmltree::Node, errors: &mut Vec<String>) -> Opti
     }
 
     Some(V2Table { id, name, entries })
-}
-
-// ── DB helpers ────────────────────────────────────────────────────────────────
-
-/// Insert a CodeSystem row for the given HL7 v2 table if absent, then return
-/// its `id`.  Each table maps to a distinct CodeSystem URL (e.g.
-/// `http://terminology.hl7.org/CodeSystem/v2-0001`).
-#[cfg(feature = "sqlite")]
-fn upsert_code_system(conn: &rusqlite::Connection, table: &V2Table) -> Result<String, HtsError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let url = format!("{V2_URL_PREFIX}{}", table.id);
-
-    conn.execute(
-        "INSERT OR IGNORE INTO code_systems \
-         (id, url, version, name, title, status, content, created_at, updated_at) \
-         VALUES (?1, ?2, 'current', ?3, ?4, 'active', 'complete', ?5, ?5)",
-        rusqlite::params![id, url, format!("v2-{}", table.id), table.name, now],
-    )
-    .map_err(|e| HtsError::Internal(format!("Upsert CodeSystem v2-{}: {e}", table.id)))?;
-
-    let system_id: String = conn
-        .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
-            rusqlite::params![url],
-            |row| row.get(0),
-        )
-        .map_err(|e| HtsError::Internal(format!("Fetch CodeSystem id: {e}")))?;
-
-    Ok(system_id)
-}
-
-/// Upsert one batch of table entries and their flat hierarchy edges inside a
-/// single transaction.  Each entry also gets a `ROOT_CODE → code` edge so
-/// the virtual table root connects to all codes.
-#[cfg(feature = "sqlite")]
-fn insert_entry_batch(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    root_code: &str,
-    batch: &[V2Entry],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin transaction: {e}")))?;
-
-    for e in batch {
-        tx.execute(
-            "INSERT OR REPLACE INTO concepts (system_id, code, display) VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, e.code, e.display],
-        )
-        .map_err(|e_| HtsError::Internal(format!("Insert concept '{}': {e_}", e.code)))?;
-
-        tx.execute(
-            "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code) \
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, root_code, e.code],
-        )
-        .map_err(|e_| {
-            HtsError::Internal(format!("Insert hierarchy {root_code}->{}: {e_}", e.code))
-        })?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit: {e}")))?;
-    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -448,8 +352,10 @@ mod tests {
         use crate::backends::SqliteTerminologyBackend;
         use std::io::Write;
 
-        fn count(pool: &Pool<SqliteConnectionManager>, table: &str) -> i64 {
-            pool.get()
+        fn count(backend: &SqliteTerminologyBackend, table: &str) -> i64 {
+            backend
+                .pool()
+                .get()
                 .unwrap()
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap()
@@ -461,39 +367,50 @@ mod tests {
             f
         }
 
-        #[test]
-        fn dry_run_does_not_write() {
+        #[tokio::test]
+        async fn dry_run_does_not_write() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_xml_file(SAMPLE_MULTI);
-            let stats = import_hl7_v2_tables(backend.pool(), f.path(), 500, true).unwrap();
+            let stats = import_hl7_v2_tables(&backend, &ctx, f.path(), 500, true)
+                .await
+                .unwrap();
             assert_eq!(stats.code_systems, 2);
             assert_eq!(stats.concepts, 5);
-            assert_eq!(count(backend.pool(), "code_systems"), 0);
+            assert_eq!(count(&backend, "code_systems"), 0);
         }
 
-        #[test]
-        fn live_import_writes_two_code_systems() {
+        #[tokio::test]
+        async fn live_import_writes_two_code_systems() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_xml_file(SAMPLE_MULTI);
-            let stats = import_hl7_v2_tables(backend.pool(), f.path(), 500, false).unwrap();
+            let stats = import_hl7_v2_tables(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
             assert_eq!(stats.code_systems, 2);
             assert_eq!(stats.concepts, 5);
-            assert_eq!(count(backend.pool(), "code_systems"), 2);
+            assert_eq!(count(&backend, "code_systems"), 2);
             // 2 virtual root concepts + 5 codes = 7
-            assert_eq!(count(backend.pool(), "concepts"), 7);
+            assert_eq!(count(&backend, "concepts"), 7);
             // 5 flat hierarchy edges
-            assert_eq!(count(backend.pool(), "concept_hierarchy"), 5);
+            assert_eq!(count(&backend, "concept_hierarchy"), 5);
         }
 
-        #[test]
-        fn idempotent_reimport() {
+        #[tokio::test]
+        async fn idempotent_reimport() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_xml_file(SAMPLE_MULTI);
-            import_hl7_v2_tables(backend.pool(), f.path(), 500, false).unwrap();
-            import_hl7_v2_tables(backend.pool(), f.path(), 500, false).unwrap();
-            assert_eq!(count(backend.pool(), "code_systems"), 2);
-            assert_eq!(count(backend.pool(), "concepts"), 7);
-            assert_eq!(count(backend.pool(), "concept_hierarchy"), 5);
+            import_hl7_v2_tables(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
+            import_hl7_v2_tables(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
+            assert_eq!(count(&backend, "code_systems"), 2);
+            assert_eq!(count(&backend, "concepts"), 7);
+            assert_eq!(count(&backend, "concept_hierarchy"), 5);
         }
     }
 }

@@ -27,20 +27,20 @@
 //! UCUM codes form a flat list. All codes are placed as children of a virtual
 //! root `UCUM` concept in the `concept_hierarchy` table.
 
-#[cfg(feature = "sqlite")]
-use r2d2::Pool;
-#[cfg(feature = "sqlite")]
-use r2d2_sqlite::SqliteConnectionManager;
-
 use std::io::Read;
 use std::path::Path;
 
+use helios_persistence::tenant::TenantContext;
+
 use crate::error::HtsError;
+use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const UCUM_URL: &str = "http://unitsofmeasure.org";
+const UCUM_ID: &str = "ucum";
 const UCUM_NAME: &str = "UCUM";
 const UCUM_TITLE: &str = "Unified Code for Units of Measure (UCUM)";
 const ROOT_CODE: &str = "UCUM";
@@ -55,23 +55,43 @@ struct UcumConcept {
     display: String,
 }
 
+/// Result of parsing a UCUM XML file.
+#[derive(Debug)]
+struct UcumParseResult {
+    concepts: Vec<UcumConcept>,
+    version: Option<String>,
+    errors: Vec<String>,
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Import a UCUM `ucum-essence.xml` distribution into the HTS database.
+/// Import a UCUM `ucum-essence.xml` distribution through the given backend.
 ///
 /// `path` may point to:
 /// - The raw `ucum-essence.xml` file, or
 /// - A `.zip` archive containing a file with "ucum" or "essence" in the name.
-#[cfg(feature = "sqlite")]
-pub fn import_ucum(
-    pool: &Pool<SqliteConnectionManager>,
+pub async fn import_ucum(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
     path: &Path,
     batch_size: usize,
     dry_run: bool,
 ) -> Result<ImportStats, HtsError> {
     let batch_size = batch_size.max(1);
-    let xml = read_xml(path)?;
-    let (concepts, version, errors) = parse_ucum_xml(&xml)?;
+
+    let path_owned = path.to_path_buf();
+    let parsed = tokio::task::spawn_blocking(move || -> Result<UcumParseResult, HtsError> {
+        let xml = read_xml(&path_owned)?;
+        parse_ucum_xml(&xml)
+    })
+    .await
+    .map_err(|e| HtsError::Internal(format!("UCUM parser panicked: {e}")))??;
+
+    let UcumParseResult {
+        concepts,
+        version,
+        errors,
+    } = parsed;
 
     let mut stats = ImportStats {
         errors,
@@ -89,37 +109,68 @@ pub fn import_ucum(
         return Ok(stats);
     }
 
-    let conn = pool
-        .get()
-        .map_err(|e| HtsError::Internal(format!("DB pool error: {e}")))?;
-
-    let system_id = upsert_code_system(&conn, version.as_deref())?;
-    stats.code_systems = 1;
-
-    // Virtual root so hierarchy edges have a valid parent.
-    conn.execute(
-        "INSERT OR IGNORE INTO concepts (system_id, code, display, definition) \
-         VALUES (?1, ?2, ?3, 'header')",
-        rusqlite::params![system_id, ROOT_CODE, UCUM_TITLE],
-    )
-    .map_err(|e| HtsError::Internal(format!("Insert virtual root: {e}")))?;
-
+    // First bundle carries the virtual root concept so every real code can
+    // reference it as `parent`.
+    let version_str = version.as_deref().unwrap_or("current");
     let total = concepts.len();
-    let total_batches = total.div_ceil(batch_size);
+    let total_batches = total.div_ceil(batch_size).max(1);
+
+    // Seed bundle: CodeSystem metadata + the virtual root.
+    let root = BuilderConcept {
+        code: ROOT_CODE,
+        display: Some(UCUM_TITLE),
+        definition: Some("header"),
+        ..Default::default()
+    };
+    let seed_bytes = build_code_system_bundle(
+        &CodeSystemMeta {
+            id: UCUM_ID,
+            url: UCUM_URL,
+            version: Some(version_str),
+            name: Some(UCUM_NAME),
+            title: Some(UCUM_TITLE),
+            status: "active",
+            content: "complete",
+        },
+        std::slice::from_ref(&root),
+    );
+    let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+    stats.code_systems = seed_stats.code_systems;
+    stats.errors.extend(seed_stats.errors);
 
     for (batch_idx, batch) in concepts.chunks(batch_size).enumerate() {
-        insert_concept_batch(&conn, &system_id, batch)?;
+        let builder_concepts: Vec<BuilderConcept<'_>> = batch
+            .iter()
+            .map(|c| BuilderConcept {
+                code: &c.code,
+                display: Some(&c.display),
+                parent_code: Some(ROOT_CODE),
+                ..Default::default()
+            })
+            .collect();
 
-        let inserted = ((batch_idx + 1) * batch_size).min(total);
+        let bytes = build_code_system_bundle(
+            &CodeSystemMeta {
+                id: UCUM_ID,
+                url: UCUM_URL,
+                version: Some(version_str),
+                name: Some(UCUM_NAME),
+                title: Some(UCUM_TITLE),
+                status: "active",
+                content: "complete",
+            },
+            &builder_concepts,
+        );
+
+        let chunk_stats = backend.import_bundle(ctx, &bytes).await?;
+        stats.errors.extend(chunk_stats.errors);
+
         eprintln!(
-            "[ucum] batch {}/{total_batches} — +{} codes (total: {inserted})",
+            "[ucum] batch {}/{total_batches} — +{} codes",
             batch_idx + 1,
-            batch.len()
+            batch.len(),
         );
     }
-
-    // All codes hang off the virtual root (UCUM is a flat enumeration).
-    insert_flat_hierarchy(&conn, &system_id, &concepts)?;
 
     stats.concepts = total as u32;
     Ok(stats)
@@ -180,11 +231,7 @@ fn read_xml_from_zip(path: &Path) -> Result<String, HtsError> {
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 /// Parse UCUM essence XML into a flat list of concepts.
-///
-/// Returns `(concepts, version, non_fatal_errors)`.
-/// `version` is taken from the `version` attribute on the root element.
-#[allow(clippy::type_complexity)]
-fn parse_ucum_xml(xml: &str) -> Result<(Vec<UcumConcept>, Option<String>, Vec<String>), HtsError> {
+fn parse_ucum_xml(xml: &str) -> Result<UcumParseResult, HtsError> {
     let doc = roxmltree::Document::parse(xml)
         .map_err(|e| HtsError::InvalidRequest(format!("Invalid UCUM XML: {e}")))?;
 
@@ -218,87 +265,11 @@ fn parse_ucum_xml(xml: &str) -> Result<(Vec<UcumConcept>, Option<String>, Vec<St
         concepts.push(UcumConcept { code, display });
     }
 
-    Ok((concepts, version, errors))
-}
-
-// ── DB helpers ────────────────────────────────────────────────────────────────
-
-/// Insert the UCUM CodeSystem row if absent, then return its `id`.
-#[cfg(feature = "sqlite")]
-fn upsert_code_system(
-    conn: &rusqlite::Connection,
-    version: Option<&str>,
-) -> Result<String, HtsError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let ver = version.unwrap_or("current");
-
-    conn.execute(
-        "INSERT OR IGNORE INTO code_systems \
-         (id, url, version, name, title, status, content, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'complete', ?6, ?6)",
-        rusqlite::params![id, UCUM_URL, ver, UCUM_NAME, UCUM_TITLE, now],
-    )
-    .map_err(|e| HtsError::Internal(format!("Upsert CodeSystem: {e}")))?;
-
-    let system_id: String = conn
-        .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
-            rusqlite::params![UCUM_URL],
-            |row| row.get(0),
-        )
-        .map_err(|e| HtsError::Internal(format!("Fetch CodeSystem id: {e}")))?;
-
-    Ok(system_id)
-}
-
-/// Upsert one batch of UCUM concepts inside a single transaction.
-#[cfg(feature = "sqlite")]
-fn insert_concept_batch(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    batch: &[UcumConcept],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin transaction: {e}")))?;
-
-    for c in batch {
-        tx.execute(
-            "INSERT OR REPLACE INTO concepts (system_id, code, display) VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, c.code, c.display],
-        )
-        .map_err(|e| HtsError::Internal(format!("Insert concept '{}': {e}", c.code)))?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit: {e}")))?;
-    Ok(())
-}
-
-/// Insert one `ROOT_CODE → code` edge per concept (flat enumeration).
-#[cfg(feature = "sqlite")]
-fn insert_flat_hierarchy(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    concepts: &[UcumConcept],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin hierarchy transaction: {e}")))?;
-
-    for c in concepts {
-        tx.execute(
-            "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code) \
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, ROOT_CODE, c.code],
-        )
-        .map_err(|e| HtsError::Internal(format!("Insert hierarchy UCUM->{}: {e}", c.code)))?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit hierarchy: {e}")))?;
-    Ok(())
+    Ok(UcumParseResult {
+        concepts,
+        version,
+        errors,
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -329,17 +300,17 @@ mod tests {
 
     #[test]
     fn parse_returns_all_codes() {
-        let (concepts, version, errors) = parse_ucum_xml(SAMPLE_XML).unwrap();
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-        assert_eq!(concepts.len(), 3);
-        assert_eq!(version.as_deref(), Some("2.1"));
+        let r = parse_ucum_xml(SAMPLE_XML).unwrap();
+        assert!(r.errors.is_empty(), "unexpected errors: {:?}", r.errors);
+        assert_eq!(r.concepts.len(), 3);
+        assert_eq!(r.version.as_deref(), Some("2.1"));
     }
 
     #[test]
     fn parse_extracts_display_names() {
-        let (concepts, _, _) = parse_ucum_xml(SAMPLE_XML).unwrap();
+        let r = parse_ucum_xml(SAMPLE_XML).unwrap();
         let find = |code: &str| {
-            concepts
+            r.concepts
                 .iter()
                 .find(|c| c.code == code)
                 .map(|c| c.display.as_str())
@@ -356,10 +327,10 @@ mod tests {
   <unit><name>no-code</name></unit>
   <unit Code="m"><name>meter</name></unit>
 </root>"#;
-        let (concepts, _, errors) = parse_ucum_xml(xml).unwrap();
-        assert_eq!(concepts.len(), 1);
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("missing Code attribute"));
+        let r = parse_ucum_xml(xml).unwrap();
+        assert_eq!(r.concepts.len(), 1);
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].contains("missing Code attribute"));
     }
 
     #[cfg(feature = "sqlite")]
@@ -368,8 +339,10 @@ mod tests {
         use crate::backends::SqliteTerminologyBackend;
         use std::io::Write;
 
-        fn count(pool: &Pool<SqliteConnectionManager>, table: &str) -> i64 {
-            pool.get()
+        fn count(backend: &SqliteTerminologyBackend, table: &str) -> i64 {
+            backend
+                .pool()
+                .get()
                 .unwrap()
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap()
@@ -381,48 +354,62 @@ mod tests {
             f
         }
 
-        #[test]
-        fn dry_run_does_not_write() {
+        #[tokio::test]
+        async fn dry_run_does_not_write() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_xml_file(SAMPLE_XML);
-            let stats = import_ucum(backend.pool(), f.path(), 500, true).unwrap();
+            let stats = import_ucum(&backend, &ctx, f.path(), 500, true)
+                .await
+                .unwrap();
             assert_eq!(stats.code_systems, 1);
             assert_eq!(stats.concepts, 3);
-            assert_eq!(count(backend.pool(), "code_systems"), 0);
-            assert_eq!(count(backend.pool(), "concepts"), 0);
+            assert_eq!(count(&backend, "code_systems"), 0);
+            assert_eq!(count(&backend, "concepts"), 0);
         }
 
-        #[test]
-        fn live_import_writes_concepts_and_hierarchy() {
+        #[tokio::test]
+        async fn live_import_writes_concepts_and_hierarchy() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_xml_file(SAMPLE_XML);
-            let stats = import_ucum(backend.pool(), f.path(), 500, false).unwrap();
+            let stats = import_ucum(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
             assert_eq!(stats.code_systems, 1);
             assert_eq!(stats.concepts, 3);
             // virtual root + 3 unit codes
-            assert_eq!(count(backend.pool(), "concepts"), 4);
+            assert_eq!(count(&backend, "concepts"), 4);
             // 3 flat hierarchy edges (UCUM → each code)
-            assert_eq!(count(backend.pool(), "concept_hierarchy"), 3);
+            assert_eq!(count(&backend, "concept_hierarchy"), 3);
         }
 
-        #[test]
-        fn idempotent_reimport() {
+        #[tokio::test]
+        async fn idempotent_reimport() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_xml_file(SAMPLE_XML);
-            import_ucum(backend.pool(), f.path(), 500, false).unwrap();
-            import_ucum(backend.pool(), f.path(), 500, false).unwrap();
-            assert_eq!(count(backend.pool(), "code_systems"), 1);
-            assert_eq!(count(backend.pool(), "concepts"), 4);
-            assert_eq!(count(backend.pool(), "concept_hierarchy"), 3);
+            import_ucum(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
+            import_ucum(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
+            assert_eq!(count(&backend, "code_systems"), 1);
+            assert_eq!(count(&backend, "concepts"), 4);
+            assert_eq!(count(&backend, "concept_hierarchy"), 3);
         }
 
-        #[test]
-        fn batching_preserves_all_concepts() {
+        #[tokio::test]
+        async fn batching_preserves_all_concepts() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_xml_file(SAMPLE_XML);
-            let stats = import_ucum(backend.pool(), f.path(), 1, false).unwrap();
+            let stats = import_ucum(&backend, &ctx, f.path(), 1, false)
+                .await
+                .unwrap();
             assert_eq!(stats.concepts, 3);
-            assert_eq!(count(backend.pool(), "concepts"), 4);
+            assert_eq!(count(&backend, "concepts"), 4);
         }
     }
 }

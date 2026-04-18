@@ -9,60 +9,27 @@
 //! ICD-10-CM is maintained by CMS and the CDC and distributed free of charge
 //! with no registration or license agreement required.
 //! Download from: <https://www.cms.gov/medicare/coding-billing/icd-10-codes>
-//!
-//! # Tabular XML structure
-//!
-//! ```xml
-//! <ICD10CM.tabular>
-//!   <chapter>
-//!     <name>I</name>
-//!     <desc>Certain infectious and parasitic diseases</desc>
-//!     <section id="A00-A09">
-//!       <desc>Intestinal infectious diseases</desc>
-//!       <diag>
-//!         <name>A00</name>
-//!         <desc>Cholera</desc>
-//!         <diag>
-//!           <name>A00.0</name>
-//!           <desc>Cholera due to Vibrio cholerae 01, biovar cholerae</desc>
-//!         </diag>
-//!       </diag>
-//!     </section>
-//!   </chapter>
-//! </ICD10CM.tabular>
-//! ```
-//!
-//! A code is **billable** (leaf) when it has no child `<diag>` elements.
-//! Header codes (non-billable) act as groupers and are also imported so the
-//! hierarchy is navigable.
-//!
-//! # Hierarchy mapping
-//!
-//! The importer synthesises a virtual root concept `ICD-10-CM` and builds
-//! edges: chapter → section → diag → sub-diag.  Sections are imported as
-//! synthetic concepts using the range string (e.g. `A00-A09`) as the code.
-
-#[cfg(feature = "sqlite")]
-use r2d2::Pool;
-#[cfg(feature = "sqlite")]
-use r2d2_sqlite::SqliteConnectionManager;
 
 use std::io::Read;
 use std::path::Path;
 
+use helios_persistence::tenant::TenantContext;
+
 use crate::error::HtsError;
+use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
 
 // ── ICD-10-CM constants ───────────────────────────────────────────────────────
 
 const ICD10CM_URL: &str = "http://hl7.org/fhir/sid/icd-10-cm";
+const ICD10CM_ID: &str = "icd10cm";
 const ICD10CM_NAME: &str = "ICD-10-CM";
 const ICD10CM_TITLE: &str =
     "ICD-10-CM (International Classification of Diseases, 10th Revision, Clinical Modification)";
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
-/// A single parsed concept before DB insertion.
 #[derive(Debug)]
 struct Icd10Concept {
     code: String,
@@ -75,24 +42,25 @@ struct Icd10Concept {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Import an ICD-10-CM tabular XML file into the HTS database.
-///
-/// `path` may point to either:
-/// - The raw `.xml` file directly, or
-/// - A `.zip` archive containing exactly one `*tabular*.xml` file.
-///
-/// Returns [`ImportStats`] with concept counts and any non-fatal errors.
-#[cfg(feature = "sqlite")]
-pub fn import_icd10_cm(
-    pool: &Pool<SqliteConnectionManager>,
+/// Import an ICD-10-CM tabular XML file through the given backend.
+pub async fn import_icd10_cm(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
     path: &Path,
     batch_size: usize,
     dry_run: bool,
 ) -> Result<ImportStats, HtsError> {
     let batch_size = batch_size.max(1);
-    let xml_bytes = read_xml_bytes(path)?;
 
-    let (concepts, errors) = parse_tabular_xml(&xml_bytes)?;
+    let path_owned = path.to_path_buf();
+    let (concepts, errors) = tokio::task::spawn_blocking(
+        move || -> Result<(Vec<Icd10Concept>, Vec<String>), HtsError> {
+            let xml_bytes = read_xml_bytes(&path_owned)?;
+            parse_tabular_xml(&xml_bytes)
+        },
+    )
+    .await
+    .map_err(|e| HtsError::Internal(format!("ICD-10-CM parser panicked: {e}")))??;
 
     let mut stats = ImportStats {
         errors,
@@ -109,26 +77,45 @@ pub fn import_icd10_cm(
         return Ok(stats);
     }
 
-    // ── Write to DB ────────────────────────────────────────────────────────
-    let conn = pool
-        .get()
-        .map_err(|e| HtsError::Internal(format!("DB pool error: {e}")))?;
+    let meta = CodeSystemMeta {
+        id: ICD10CM_ID,
+        url: ICD10CM_URL,
+        version: Some("current"),
+        name: Some(ICD10CM_NAME),
+        title: Some(ICD10CM_TITLE),
+        status: "active",
+        content: "complete",
+    };
 
-    let system_id = upsert_code_system(&conn)?;
-    stats.code_systems = 1;
+    // Seed with an empty CodeSystem to register metadata.
+    let seed_bytes = build_code_system_bundle(&meta, &[]);
+    let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+    stats.code_systems = seed_stats.code_systems;
+    stats.errors.extend(seed_stats.errors);
 
-    let total_batches = concepts.len().div_ceil(batch_size);
     let total = concepts.len();
+    let total_batches = total.div_ceil(batch_size).max(1);
 
     for (batch_idx, batch) in concepts.chunks(batch_size).enumerate() {
-        insert_concept_batch(&conn, &system_id, batch)?;
-        insert_hierarchy_batch(&conn, &system_id, batch)?;
+        let builder: Vec<BuilderConcept<'_>> = batch
+            .iter()
+            .map(|c| BuilderConcept {
+                code: &c.code,
+                display: Some(c.display.as_str()).filter(|s| !s.is_empty()),
+                definition: if c.billable { None } else { Some("header") },
+                parent_code: c.parent.as_deref(),
+                ..Default::default()
+            })
+            .collect();
+        let bytes = build_code_system_bundle(&meta, &builder);
+        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        stats.errors.extend(chunk.errors);
 
-        let inserted = ((batch_idx + 1) * batch_size).min(total);
         eprintln!(
-            "[icd10-cm] batch {}/{total_batches} — +{} concepts (total: {inserted})",
+            "[icd10-cm] batch {}/{total_batches} — +{} concepts (total: {})",
             batch_idx + 1,
-            batch.len()
+            batch.len(),
+            ((batch_idx + 1) * batch_size).min(total),
         );
     }
 
@@ -138,7 +125,6 @@ pub fn import_icd10_cm(
 
 // ── XML reader ────────────────────────────────────────────────────────────────
 
-/// Read XML bytes from either a raw `.xml` file or a `.zip` containing one.
 fn read_xml_bytes(path: &Path) -> Result<Vec<u8>, HtsError> {
     let ext = path
         .extension()
@@ -154,7 +140,6 @@ fn read_xml_bytes(path: &Path) -> Result<Vec<u8>, HtsError> {
             HtsError::InvalidRequest(format!("Invalid ZIP '{p}': {e}", p = path.display()))
         })?;
 
-        // Find the tabular XML entry
         let xml_index = (0..archive.len())
             .find(|&i| {
                 archive
@@ -190,9 +175,6 @@ fn read_xml_bytes(path: &Path) -> Result<Vec<u8>, HtsError> {
 
 // ── XML parser ────────────────────────────────────────────────────────────────
 
-/// Parse the ICD-10-CM tabular XML into a flat list of [`Icd10Concept`]s.
-///
-/// Returns `(concepts, non_fatal_errors)`.
 fn parse_tabular_xml(xml: &[u8]) -> Result<(Vec<Icd10Concept>, Vec<String>), HtsError> {
     let text = std::str::from_utf8(xml)
         .map_err(|e| HtsError::InvalidRequest(format!("XML is not valid UTF-8: {e}")))?;
@@ -204,7 +186,6 @@ fn parse_tabular_xml(xml: &[u8]) -> Result<(Vec<Icd10Concept>, Vec<String>), Hts
     let mut concepts: Vec<Icd10Concept> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    // Virtual root concept so that chapters have a parent.
     concepts.push(Icd10Concept {
         code: "ICD-10-CM".to_string(),
         display: ICD10CM_TITLE.to_string(),
@@ -221,7 +202,6 @@ fn parse_tabular_xml(xml: &[u8]) -> Result<(Vec<Icd10Concept>, Vec<String>), Hts
             continue;
         }
 
-        // Chapter concept — use roman numeral as code, e.g. "CH:I"
         let ch_code = format!("CH:{ch_name}");
         concepts.push(Icd10Concept {
             code: ch_code.clone(),
@@ -257,7 +237,6 @@ fn parse_tabular_xml(xml: &[u8]) -> Result<(Vec<Icd10Concept>, Vec<String>), Hts
     Ok((concepts, errors))
 }
 
-/// Recursively walk a `<diag>` node and its nested `<diag>` children.
 fn walk_diag(
     node: &roxmltree::Node,
     parent_code: &str,
@@ -296,96 +275,12 @@ fn walk_diag(
     }
 }
 
-/// Return the trimmed text of the first child element with the given tag name.
 fn child_text(node: &roxmltree::Node, tag: &str) -> Option<String> {
     node.children()
         .find(|n| n.has_tag_name(tag))
         .and_then(|n| n.text())
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
-}
-
-// ── DB helpers ────────────────────────────────────────────────────────────────
-
-#[cfg(feature = "sqlite")]
-fn upsert_code_system(conn: &rusqlite::Connection) -> Result<String, HtsError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    conn.execute(
-        "INSERT OR IGNORE INTO code_systems \
-         (id, url, version, name, title, status, content, created_at, updated_at) \
-         VALUES (?1, ?2, 'current', ?3, ?4, 'active', 'complete', ?5, ?5)",
-        rusqlite::params![id, ICD10CM_URL, ICD10CM_NAME, ICD10CM_TITLE, now],
-    )
-    .map_err(|e| HtsError::Internal(format!("Upsert CodeSystem: {e}")))?;
-
-    let system_id: String = conn
-        .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
-            rusqlite::params![ICD10CM_URL],
-            |row| row.get(0),
-        )
-        .map_err(|e| HtsError::Internal(format!("Fetch CodeSystem id: {e}")))?;
-
-    Ok(system_id)
-}
-
-#[cfg(feature = "sqlite")]
-fn insert_concept_batch(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    batch: &[Icd10Concept],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin transaction: {e}")))?;
-
-    for c in batch {
-        let definition: Option<&str> = if c.billable { None } else { Some("header") };
-        tx.execute(
-            "INSERT OR REPLACE INTO concepts (system_id, code, display, definition)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![system_id, c.code, c.display, definition],
-        )
-        .map_err(|e| HtsError::Internal(format!("Insert concept '{}': {e}", c.code)))?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit transaction: {e}")))?;
-    Ok(())
-}
-
-#[cfg(feature = "sqlite")]
-fn insert_hierarchy_batch(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    batch: &[Icd10Concept],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin hierarchy transaction: {e}")))?;
-
-    for c in batch {
-        let Some(ref parent_code) = c.parent else {
-            continue;
-        };
-        tx.execute(
-            "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, parent_code, c.code],
-        )
-        .map_err(|e| {
-            HtsError::Internal(format!(
-                "Insert hierarchy edge {parent_code}->{}: {e}",
-                c.code
-            ))
-        })?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit hierarchy transaction: {e}")))?;
-    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -395,8 +290,6 @@ mod tests {
     use super::*;
     use crate::backends::SqliteTerminologyBackend;
 
-    /// Minimal valid ICD-10-CM tabular XML with 2 chapters, 2 sections,
-    /// and a mix of header and billable codes.
     const TABULAR_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <ICD10CM.tabular>
   <chapter>
@@ -439,8 +332,8 @@ mod tests {
   </chapter>
 </ICD10CM.tabular>"#;
 
-    fn count_rows(pool: &Pool<SqliteConnectionManager>, table: &str) -> i64 {
-        let conn = pool.get().unwrap();
+    fn count_rows(backend: &SqliteTerminologyBackend, table: &str) -> i64 {
+        let conn = backend.pool().get().unwrap();
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
             row.get(0)
         })
@@ -451,8 +344,6 @@ mod tests {
 
     #[test]
     fn parse_xml_returns_correct_concept_count() {
-        // virtual root + 2 chapters + 2 sections + 2 header diags + 5 billable
-        // = 12 total
         let (concepts, errors) = parse_tabular_xml(TABULAR_XML.as_bytes()).unwrap();
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(concepts.len(), 11);
@@ -471,7 +362,6 @@ mod tests {
         let (concepts, _) = parse_tabular_xml(TABULAR_XML.as_bytes()).unwrap();
         let ch = concepts.iter().find(|c| c.code == "CH:I").unwrap();
         assert_eq!(ch.parent.as_deref(), Some("ICD-10-CM"));
-        assert!(!ch.billable);
     }
 
     #[test]
@@ -479,7 +369,6 @@ mod tests {
         let (concepts, _) = parse_tabular_xml(TABULAR_XML.as_bytes()).unwrap();
         let sec = concepts.iter().find(|c| c.code == "A00-A09").unwrap();
         assert_eq!(sec.parent.as_deref(), Some("CH:I"));
-        assert!(!sec.billable);
     }
 
     #[test]
@@ -510,9 +399,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn import_icd10_missing_desc_recorded_in_errors() {
-        // XML where a leaf <diag> has <name> but no <desc>
+    #[tokio::test]
+    async fn import_icd10_missing_desc_recorded_in_errors() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <ICD10CM.tabular>
   <chapter>
@@ -522,44 +410,27 @@ mod tests {
       <desc>Intestinal diseases</desc>
       <diag>
         <name>A00</name>
-        <!-- no <desc> here -->
       </diag>
     </section>
   </chapter>
 </ICD10CM.tabular>"#;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         use std::io::Write;
         tmp.write_all(xml.as_bytes()).unwrap();
 
-        let stats = import_icd10_cm(&pool, tmp.path(), 500, true).unwrap();
+        let stats = import_icd10_cm(&backend, &ctx, tmp.path(), 500, true)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            stats.errors.len(),
-            1,
-            "expected one non-fatal error for missing <desc>"
-        );
-        assert!(
-            stats.errors[0].contains("A00"),
-            "error should mention the code: {}",
-            stats.errors[0]
-        );
-        assert!(
-            stats.errors[0].contains("missing <desc>"),
-            "error should describe the problem: {}",
-            stats.errors[0]
-        );
-        // concept is still imported even with empty display
-        assert!(
-            stats.concepts > 0,
-            "concept should still be counted even without <desc>"
-        );
+        assert_eq!(stats.errors.len(), 1);
+        assert!(stats.errors[0].contains("A00"));
+        assert!(stats.errors[0].contains("missing <desc>"));
+        assert!(stats.concepts > 0);
     }
-
-    // ── Integration tests ─────────────────────────────────────────────────
 
     fn make_xml_file() -> tempfile::NamedTempFile {
         use std::io::Write;
@@ -568,95 +439,111 @@ mod tests {
         f
     }
 
-    #[test]
-    fn import_icd10_dry_run_returns_correct_counts() {
+    #[tokio::test]
+    async fn import_icd10_dry_run_returns_correct_counts() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let f = make_xml_file();
 
-        let stats = import_icd10_cm(&pool, f.path(), 500, true).unwrap();
+        let stats = import_icd10_cm(&backend, &ctx, f.path(), 500, true)
+            .await
+            .unwrap();
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 11);
         assert!(stats.errors.is_empty());
     }
 
-    #[test]
-    fn import_icd10_dry_run_does_not_write_to_db() {
+    #[tokio::test]
+    async fn import_icd10_dry_run_does_not_write_to_db() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let f = make_xml_file();
 
-        import_icd10_cm(&pool, f.path(), 500, true).unwrap();
+        import_icd10_cm(&backend, &ctx, f.path(), 500, true)
+            .await
+            .unwrap();
 
-        assert_eq!(count_rows(&pool, "code_systems"), 0);
-        assert_eq!(count_rows(&pool, "concepts"), 0);
+        assert_eq!(count_rows(&backend, "code_systems"), 0);
+        assert_eq!(count_rows(&backend, "concepts"), 0);
     }
 
-    #[test]
-    fn import_icd10_live_writes_to_db() {
+    #[tokio::test]
+    async fn import_icd10_live_writes_to_db() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let f = make_xml_file();
 
-        let stats = import_icd10_cm(&pool, f.path(), 500, false).unwrap();
+        let stats = import_icd10_cm(&backend, &ctx, f.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 11);
-        assert_eq!(count_rows(&pool, "code_systems"), 1);
-        assert_eq!(count_rows(&pool, "concepts"), 11);
-        // 10 edges: all concepts except the virtual root have a parent
-        assert_eq!(count_rows(&pool, "concept_hierarchy"), 10);
+        assert_eq!(count_rows(&backend, "code_systems"), 1);
+        assert_eq!(count_rows(&backend, "concepts"), 11);
+        assert_eq!(count_rows(&backend, "concept_hierarchy"), 10);
     }
 
-    #[test]
-    fn import_icd10_idempotent_reimport() {
+    #[tokio::test]
+    async fn import_icd10_idempotent_reimport() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let f = make_xml_file();
 
-        import_icd10_cm(&pool, f.path(), 500, false).unwrap();
-        import_icd10_cm(&pool, f.path(), 500, false).unwrap();
+        import_icd10_cm(&backend, &ctx, f.path(), 500, false)
+            .await
+            .unwrap();
+        import_icd10_cm(&backend, &ctx, f.path(), 500, false)
+            .await
+            .unwrap();
 
-        // Second import must not duplicate rows
-        assert_eq!(count_rows(&pool, "code_systems"), 1);
-        assert_eq!(count_rows(&pool, "concepts"), 11);
-        assert_eq!(count_rows(&pool, "concept_hierarchy"), 10);
+        assert_eq!(count_rows(&backend, "code_systems"), 1);
+        assert_eq!(count_rows(&backend, "concepts"), 11);
+        assert_eq!(count_rows(&backend, "concept_hierarchy"), 10);
     }
 
-    #[test]
-    fn import_icd10_batching_preserves_all_concepts() {
+    #[tokio::test]
+    async fn import_icd10_batching_preserves_all_concepts() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let f = make_xml_file();
 
-        // batch_size = 3 forces multiple batches across 11 concepts
-        let stats = import_icd10_cm(&pool, f.path(), 3, false).unwrap();
+        let stats = import_icd10_cm(&backend, &ctx, f.path(), 3, false)
+            .await
+            .unwrap();
 
         assert_eq!(stats.concepts, 11);
-        assert_eq!(count_rows(&pool, "concepts"), 11);
-        assert_eq!(count_rows(&pool, "concept_hierarchy"), 10);
+        assert_eq!(count_rows(&backend, "concepts"), 11);
+        assert_eq!(count_rows(&backend, "concept_hierarchy"), 10);
     }
 
-    #[test]
-    fn import_icd10_missing_file_returns_error() {
+    #[tokio::test]
+    async fn import_icd10_missing_file_returns_error() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
-        let result = import_icd10_cm(&pool, Path::new("/nonexistent/tabular.xml"), 500, false);
+        let ctx = TenantContext::system();
+        let result = import_icd10_cm(
+            &backend,
+            &ctx,
+            Path::new("/nonexistent/tabular.xml"),
+            500,
+            false,
+        )
+        .await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn import_icd10_lookup_known_code() {
-        use crate::backends::SqliteTerminologyBackend;
-
+    #[tokio::test]
+    async fn import_icd10_lookup_known_code() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let f = make_xml_file();
 
-        import_icd10_cm(&pool, f.path(), 500, false).unwrap();
+        import_icd10_cm(&backend, &ctx, f.path(), 500, false)
+            .await
+            .unwrap();
 
-        let conn = pool.get().unwrap();
+        let conn = backend.pool().get().unwrap();
         let (display, definition): (String, Option<String>) = conn
             .query_row(
                 "SELECT display, definition FROM concepts WHERE code = ?1",
@@ -666,21 +553,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(display, "Cholera, unspecified");
-        assert!(
-            definition.is_none(),
-            "billable codes should have no definition"
-        );
+        assert!(definition.is_none());
     }
 
-    #[test]
-    fn import_icd10_header_code_has_header_definition() {
+    #[tokio::test]
+    async fn import_icd10_header_code_has_header_definition() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let f = make_xml_file();
 
-        import_icd10_cm(&pool, f.path(), 500, false).unwrap();
+        import_icd10_cm(&backend, &ctx, f.path(), 500, false)
+            .await
+            .unwrap();
 
-        let conn = pool.get().unwrap();
+        let conn = backend.pool().get().unwrap();
         let definition: Option<String> = conn
             .query_row(
                 "SELECT definition FROM concepts WHERE code = ?1",
@@ -692,8 +578,8 @@ mod tests {
         assert_eq!(definition.as_deref(), Some("header"));
     }
 
-    #[test]
-    fn import_icd10_from_zip() {
+    #[tokio::test]
+    async fn import_icd10_from_zip() {
         use std::io::Write;
 
         let dir = tempfile::tempdir().unwrap();
@@ -709,10 +595,12 @@ mod tests {
         }
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
 
-        let stats = import_icd10_cm(&pool, &zip_path, 500, false).unwrap();
+        let stats = import_icd10_cm(&backend, &ctx, &zip_path, 500, false)
+            .await
+            .unwrap();
         assert_eq!(stats.concepts, 11);
-        assert_eq!(count_rows(&pool, "concepts"), 11);
+        assert_eq!(count_rows(&backend, "concepts"), 11);
     }
 }

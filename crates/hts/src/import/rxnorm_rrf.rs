@@ -7,90 +7,57 @@
 //! # ⚠️  LICENSE REQUIRED
 //!
 //! Real RxNorm data requires acceptance of the NLM Terms of Service.
-//! The agreement is free and takes ~5 minutes at
-//! <https://www.nlm.nih.gov/databases/umls.html>.
-//! This parser was written and tested using **synthetic fixture data only**.
-//!
-//! # Input formats
-//!
-//! `path` may be:
-//! - A **folder** containing `RXNCONSO.RRF` and `RXNREL.RRF` directly.
-//! - A **ZIP file** containing those files anywhere inside the archive.
-//!
-//! # RRF format
-//!
-//! RRF files are pipe-delimited with **no header row** and an optional
-//! trailing pipe on each line.
-//!
-//! ## `RXNCONSO.RRF` columns (indices used)
-//!
-//! | Index | Field | Notes |
-//! |-------|-------|-------|
-//! | 0 | RXCUI | Concept identifier |
-//! | 1 | LAT | Language — filter to `ENG` |
-//! | 6 | ISPREF | `Y` = preferred term |
-//! | 11 | SAB | Source — filter to `RXNORM` |
-//! | 12 | TTY | Term type (IN, BN, SCD, …) |
-//! | 14 | STR | Display string |
-//! | 16 | SUPPRESS | `O` = obsolete — skip |
-//!
-//! ## `RXNREL.RRF` columns (indices used)
-//!
-//! | Index | Field | Notes |
-//! |-------|-------|-------|
-//! | 0 | RXCUI1 | Child concept |
-//! | 4 | RXCUI2 | Parent concept |
-//! | 7 | RELA | Relationship type — import `isa` |
-//! | 10 | SAB | Source — filter to `RXNORM` |
-//! | 14 | SUPPRESS | `O` = obsolete — skip |
-
-#[cfg(feature = "sqlite")]
-use r2d2::Pool;
-#[cfg(feature = "sqlite")]
-use r2d2_sqlite::SqliteConnectionManager;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use helios_persistence::tenant::TenantContext;
+
 use crate::error::HtsError;
+use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
+use crate::import::bundle_builder::{
+    BuilderConcept, BuilderProperty, CodeSystemMeta, build_code_system_bundle,
+};
 
 // ── RxNorm constants ──────────────────────────────────────────────────────────
 
 const RXNORM_URL: &str = "http://www.nlm.nih.gov/research/umls/rxnorm";
+const RXNORM_ID: &str = "rxnorm";
 const RXNORM_NAME: &str = "RxNorm";
 const RXNORM_TITLE: &str = "RxNorm — NLM Drug Terminology";
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Import an RxNorm RRF distribution into the HTS database.
-///
-/// `path` may point to a **folder** containing `RXNCONSO.RRF` + `RXNREL.RRF`,
-/// or a **ZIP file** containing those files inside the archive.
-///
-/// Returns [`ImportStats`] with concept counts and any non-fatal errors.
-///
-/// # ⚠️  LICENSE REQUIRED
-/// Real RxNorm data requires acceptance of the NLM Terms of Service
-/// (<https://www.nlm.nih.gov/databases/umls.html>).
-#[cfg(feature = "sqlite")]
-pub fn import_rxnorm_rrf(
-    pool: &Pool<SqliteConnectionManager>,
+/// Import an RxNorm RRF distribution through the given backend.
+pub async fn import_rxnorm_rrf(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
     path: &Path,
     batch_size: usize,
     dry_run: bool,
 ) -> Result<ImportStats, HtsError> {
     let batch_size = batch_size.max(1);
-    let (conso_bytes, rel_bytes) = read_rrf_files(path)?;
 
-    let mut parse_errors: Vec<String> = Vec::new();
-    let concepts = parse_concepts(BufReader::new(conso_bytes.as_slice()), &mut parse_errors)?;
-    let edges = parse_relationships(
-        BufReader::new(rel_bytes.as_slice()),
-        &concepts,
-        &mut parse_errors,
-    )?;
+    type RxnormParsed = (HashMap<String, String>, Vec<(String, String)>, Vec<String>);
+
+    let path_owned = path.to_path_buf();
+    let (concepts, edges, parse_errors) =
+        tokio::task::spawn_blocking(move || -> Result<RxnormParsed, HtsError> {
+            let (conso_bytes, rel_bytes) = read_rrf_files(&path_owned)?;
+            let mut parse_errors: Vec<String> = Vec::new();
+            let concepts =
+                parse_concepts(BufReader::new(conso_bytes.as_slice()), &mut parse_errors)?;
+            let edges = parse_relationships(
+                BufReader::new(rel_bytes.as_slice()),
+                &concepts,
+                &mut parse_errors,
+            )?;
+            Ok((concepts, edges, parse_errors))
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("RxNorm parser panicked: {e}")))??;
 
     let mut stats = ImportStats {
         errors: parse_errors,
@@ -108,47 +75,88 @@ pub fn import_rxnorm_rrf(
         return Ok(stats);
     }
 
-    // ── Write to DB ────────────────────────────────────────────────────────
-    let conn = pool
-        .get()
-        .map_err(|e| HtsError::Internal(format!("DB pool error: {e}")))?;
+    // Build child → parents map (a concept can have multiple parents).
+    let mut parents_of: HashMap<String, Vec<String>> = HashMap::new();
+    for (child, parent) in &edges {
+        parents_of
+            .entry(child.clone())
+            .or_default()
+            .push(parent.clone());
+    }
 
-    let system_id = upsert_code_system(&conn)?;
-    stats.code_systems = 1;
+    let meta = CodeSystemMeta {
+        id: RXNORM_ID,
+        url: RXNORM_URL,
+        version: Some("current"),
+        name: Some(RXNORM_NAME),
+        title: Some(RXNORM_TITLE),
+        status: "active",
+        content: "complete",
+    };
+
+    // Seed empty CodeSystem.
+    let seed = build_code_system_bundle(&meta, &[]);
+    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    stats.code_systems = seed_stats.code_systems;
+    stats.errors.extend(seed_stats.errors);
 
     let concept_list: Vec<(String, String)> = concepts.into_iter().collect();
     let total = concept_list.len();
-    let total_batches = total.div_ceil(batch_size);
+    let total_batches = total.div_ceil(batch_size).max(1);
 
     for (batch_idx, batch) in concept_list.chunks(batch_size).enumerate() {
-        insert_concept_batch(&conn, &system_id, batch)?;
+        let extras_per: Vec<Vec<BuilderProperty<'_>>> = batch
+            .iter()
+            .map(|(code, _)| {
+                parents_of
+                    .get(code)
+                    .map(|parents| {
+                        parents
+                            .iter()
+                            .skip(1)
+                            .map(|p| BuilderProperty {
+                                code: "parent",
+                                value_key: "valueCode",
+                                value: p.as_str(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
 
-        let inserted = ((batch_idx + 1) * batch_size).min(total);
+        let builder: Vec<BuilderConcept<'_>> = batch
+            .iter()
+            .enumerate()
+            .map(|(i, (code, display))| BuilderConcept {
+                code: code.as_str(),
+                display: Some(display.as_str()),
+                parent_code: parents_of
+                    .get(code)
+                    .and_then(|p| p.first().map(|s| s.as_str())),
+                extra_properties: extras_per[i].as_slice(),
+                ..Default::default()
+            })
+            .collect();
+
+        let bytes = build_code_system_bundle(&meta, &builder);
+        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        stats.errors.extend(chunk.errors);
+
         eprintln!(
-            "[rxnorm] concept batch {}/{total_batches} — +{} concepts (total: {inserted})",
+            "[rxnorm] concept batch {}/{total_batches} — +{} concepts (total: {})",
             batch_idx + 1,
-            batch.len()
+            batch.len(),
+            ((batch_idx + 1) * batch_size).min(total)
         );
     }
+
     stats.concepts = total as u32;
-
-    let edge_total = edges.len();
-    let edge_batches = edge_total.div_ceil(batch_size);
-    for (batch_idx, batch) in edges.chunks(batch_size).enumerate() {
-        insert_hierarchy_batch(&conn, &system_id, batch)?;
-        eprintln!(
-            "[rxnorm] hierarchy batch {}/{edge_batches} — +{} edges",
-            batch_idx + 1,
-            batch.len()
-        );
-    }
-
     Ok(stats)
 }
 
 // ── File reader ───────────────────────────────────────────────────────────────
 
-/// Return raw bytes for `(RXNCONSO.RRF, RXNREL.RRF)` from a folder or ZIP.
 fn read_rrf_files(path: &Path) -> Result<(Vec<u8>, Vec<u8>), HtsError> {
     if path.is_dir() {
         let conso = std::fs::read(path.join("RXNCONSO.RRF")).map_err(|e| {
@@ -166,7 +174,6 @@ fn read_rrf_files(path: &Path) -> Result<(Vec<u8>, Vec<u8>), HtsError> {
         return Ok((conso, rel));
     }
 
-    // Try as ZIP
     let file = std::fs::File::open(path)
         .map_err(|e| HtsError::InvalidRequest(format!("Cannot open '{}': {e}", path.display())))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -211,11 +218,6 @@ fn read_zip_entry(
 
 // ── RRF parsers ───────────────────────────────────────────────────────────────
 
-/// Parse `RXNCONSO.RRF` and return a map of `RXCUI → preferred display name`.
-///
-/// Filters to `SAB=RXNORM`, `LAT=ENG`, non-suppressed rows.
-/// Preferred terms (`ISPREF=Y`) take priority over non-preferred ones.
-/// Malformed lines (fewer than 15 fields) are skipped and recorded in `errors`.
 fn parse_concepts(
     reader: impl BufRead,
     errors: &mut Vec<String>,
@@ -245,15 +247,12 @@ fn parse_concepts(
         let sab = fields[11];
         let str_val = fields[14];
 
-        // Filter: English, RXNORM source only
         if lat != "ENG" || sab != "RXNORM" {
             continue;
         }
-        // Skip suppressed (SUPPRESS column at index 16 when present)
         if fields.len() > 16 && fields[16] == "O" {
             continue;
         }
-        // Skip empty display
         if str_val.is_empty() {
             continue;
         }
@@ -261,7 +260,6 @@ fn parse_concepts(
         let is_pref = ispref == "Y";
         let already_preferred = *preferred.get(rxcui).unwrap_or(&false);
 
-        // Accept if: preferred term, OR no entry yet
         if is_pref || !concepts.contains_key(rxcui) {
             if !already_preferred || is_pref {
                 concepts.insert(rxcui.to_string(), str_val.to_string());
@@ -273,11 +271,6 @@ fn parse_concepts(
     Ok(concepts)
 }
 
-/// Parse `RXNREL.RRF` and return `(child_rxcui, parent_rxcui)` `isa` edges.
-///
-/// Filters to `SAB=RXNORM`, `RELA=isa`, non-suppressed rows.
-/// Only edges where both concepts are in `active_concepts` are kept.
-/// Malformed lines (fewer than 11 fields) are skipped and recorded in `errors`.
 fn parse_relationships(
     reader: impl BufRead,
     active_concepts: &HashMap<String, String>,
@@ -301,19 +294,17 @@ fn parse_relationships(
             continue;
         }
 
-        let rxcui1 = fields[0]; // child
-        let rxcui2 = fields[4]; // parent
+        let rxcui1 = fields[0];
+        let rxcui2 = fields[4];
         let rela = fields[7];
         let sab = fields[10];
 
         if sab != "RXNORM" || rela != "isa" {
             continue;
         }
-        // Skip suppressed
         if fields.len() > 14 && fields[14] == "O" {
             continue;
         }
-        // Both ends must be in active concepts
         if !active_concepts.contains_key(rxcui1) || !active_concepts.contains_key(rxcui2) {
             continue;
         }
@@ -321,84 +312,9 @@ fn parse_relationships(
         edges.push((rxcui1.to_string(), rxcui2.to_string()));
     }
 
-    // Deduplicate
     edges.sort_unstable();
     edges.dedup();
     Ok(edges)
-}
-
-// ── DB helpers ────────────────────────────────────────────────────────────────
-
-#[cfg(feature = "sqlite")]
-fn upsert_code_system(conn: &rusqlite::Connection) -> Result<String, HtsError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    conn.execute(
-        "INSERT OR IGNORE INTO code_systems \
-         (id, url, version, name, title, status, content, created_at, updated_at) \
-         VALUES (?1, ?2, 'current', ?3, ?4, 'active', 'complete', ?5, ?5)",
-        rusqlite::params![id, RXNORM_URL, RXNORM_NAME, RXNORM_TITLE, now],
-    )
-    .map_err(|e| HtsError::Internal(format!("Upsert CodeSystem: {e}")))?;
-
-    let system_id: String = conn
-        .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
-            rusqlite::params![RXNORM_URL],
-            |row| row.get(0),
-        )
-        .map_err(|e| HtsError::Internal(format!("Fetch CodeSystem id: {e}")))?;
-
-    Ok(system_id)
-}
-
-#[cfg(feature = "sqlite")]
-fn insert_concept_batch(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    batch: &[(String, String)],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin transaction: {e}")))?;
-
-    for (code, display) in batch {
-        tx.execute(
-            "INSERT OR REPLACE INTO concepts (system_id, code, display)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, code, display],
-        )
-        .map_err(|e| HtsError::Internal(format!("Insert concept '{code}': {e}")))?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit transaction: {e}")))?;
-    Ok(())
-}
-
-#[cfg(feature = "sqlite")]
-fn insert_hierarchy_batch(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    batch: &[(String, String)],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin hierarchy transaction: {e}")))?;
-
-    for (child_code, parent_code) in batch {
-        tx.execute(
-            "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, parent_code, child_code],
-        )
-        .map_err(|e| HtsError::Internal(format!("Insert edge {parent_code}->{child_code}: {e}")))?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit hierarchy transaction: {e}")))?;
-    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -408,20 +324,6 @@ mod tests {
     use super::*;
     use crate::backends::SqliteTerminologyBackend;
 
-    // ── Synthetic RRF fixtures ────────────────────────────────────────────
-    //
-    // RXNCONSO.RRF — no header, pipe-delimited, 18 fields
-    // Cols: RXCUI|LAT|TS|LUI|STT|SUI|ISPREF|RXAUI|SAUI|SCUI|SDUI|SAB|TTY|CODE|STR|SRL|SUPPRESS|CVF
-    //
-    // Concepts:
-    //   1049502 = acetaminophen (ingredient, preferred)
-    //   1049520 = ibuprofen     (ingredient, preferred)
-    //   198444  = Tylenol       (brand name, preferred)
-    //   1049527 = acetaminophen 325 MG Oral Tablet (SCD, preferred)
-    //   9999999 = suppressed concept (should be skipped)
-    // RXNCONSO.RRF columns (0-indexed):
-    // 0=RXCUI 1=LAT 2=TS 3=LUI 4=STT 5=SUI 6=ISPREF 7=RXAUI 8=SAUI 9=SCUI
-    // 10=SDUI 11=SAB 12=TTY 13=CODE 14=STR 15=SRL 16=SUPPRESS 17=CVF
     const CONSO_RRF: &str = "\
 1049502|ENG|P|L0000001|PF|S0000001|Y|1049502|||1049502|RXNORM|IN|1049502|acetaminophen|0|N|\n\
 1049520|ENG|P|L0000002|PF|S0000002|Y|1049520|||1049520|RXNORM|IN|1049520|ibuprofen|0|N|\n\
@@ -429,20 +331,13 @@ mod tests {
 1049527|ENG|P|L0000004|PF|S0000004|Y|1049527|||1049527|RXNORM|SCD|1049527|acetaminophen 325 MG Oral Tablet|0|N|\n\
 9999999|ENG|P|L0000005|PF|S0000005|Y|9999999|||9999999|RXNORM|IN|9999999|suppressed_drug|0|O|\n";
 
-    // RXNREL.RRF — no header, pipe-delimited, 16 fields
-    // Cols: RXCUI1|RXAUI1|STYPE1|REL|RXCUI2|RXAUI2|STYPE2|RELA|RUI|SRUI|SAB|SL|DIR|RG|SUPPRESS|CVF
-    //
-    // Edges (isa):
-    //   198444  isa 1049502  (Tylenol is-a acetaminophen)
-    //   1049527 isa 1049502  (acet 325mg tablet is-a acetaminophen)
-    //   9999999 isa 1049502  (suppressed edge — skipped)
     const REL_RRF: &str = "\
 198444||RXCUI|RN|1049502||RXCUI|isa|RUI001||RXNORM|||N|N|N|\n\
 1049527||RXCUI|RN|1049502||RXCUI|isa|RUI002||RXNORM|||N|N|N|\n\
 9999999||RXCUI|RN|1049502||RXCUI|isa|RUI003||RXNORM|||N|N|O|\n";
 
-    fn count_rows(pool: &Pool<SqliteConnectionManager>, table: &str) -> i64 {
-        let conn = pool.get().unwrap();
+    fn count_rows(backend: &SqliteTerminologyBackend, table: &str) -> i64 {
+        let conn = backend.pool().get().unwrap();
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
             row.get(0)
         })
@@ -469,7 +364,6 @@ mod tests {
     fn parse_concepts_returns_four_active_concepts() {
         let mut errors = Vec::new();
         let concepts = parse_concepts(BufReader::new(CONSO_RRF.as_bytes()), &mut errors).unwrap();
-        // suppressed concept (9999999) is excluded
         assert_eq!(concepts.len(), 4);
         assert_eq!(concepts["1049502"], "acetaminophen");
         assert_eq!(concepts["198444"], "Tylenol");
@@ -495,7 +389,6 @@ mod tests {
 
     #[test]
     fn parse_concepts_prefers_ispref_y() {
-        // Two rows for same RXCUI; ISPREF=Y should win
         let data = "\
 1049502|ENG|P|L1|PF|S1|N|1049502|||1049502|RXNORM|IN|1049502|acetaminophen alt|0|N|\n\
 1049502|ENG|P|L1|PF|S2|Y|1049502|||1049502|RXNORM|IN|1049502|acetaminophen|0|N|\n";
@@ -510,7 +403,6 @@ mod tests {
         let concepts = parse_concepts(BufReader::new(CONSO_RRF.as_bytes()), &mut errors).unwrap();
         let edges = parse_relationships(BufReader::new(REL_RRF.as_bytes()), &concepts, &mut errors)
             .unwrap();
-        // 9999999 edge skipped (concept not in active set and suppress=O)
         assert_eq!(edges.len(), 2);
         assert!(edges.contains(&("198444".to_string(), "1049502".to_string())));
         assert!(edges.contains(&("1049527".to_string(), "1049502".to_string())));
@@ -532,109 +424,118 @@ mod tests {
     }
 
     #[test]
-    fn import_rxnorm_malformed_conso_line_recorded_in_errors() {
-        // CONSO with one valid line (18 fields) and one short line (3 fields)
+    fn parse_conso_malformed_line_recorded_in_errors() {
         let data = "\
 1049502|ENG|P|L0000001|PF|S0000001|Y|1049502|||1049502|RXNORM|IN|1049502|acetaminophen|0|N|\n\
 BAD|LINE|ONLY_THREE_FIELDS\n";
         let mut errors = Vec::new();
         let concepts = parse_concepts(BufReader::new(data.as_bytes()), &mut errors).unwrap();
-        assert_eq!(concepts.len(), 1, "only the valid line should be parsed");
-        assert_eq!(errors.len(), 1, "one error for the malformed line");
-        assert!(
-            errors[0].contains("line 2"),
-            "error should mention line number: {}",
-            errors[0]
-        );
+        assert_eq!(concepts.len(), 1);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("line 2"));
     }
 
     // ── Integration tests ─────────────────────────────────────────────────
 
-    #[test]
-    fn import_rxnorm_dry_run_returns_correct_counts() {
+    #[tokio::test]
+    async fn import_rxnorm_dry_run_returns_correct_counts() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let dir = make_folder();
 
-        let stats = import_rxnorm_rrf(&pool, dir.path(), 500, true).unwrap();
+        let stats = import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, true)
+            .await
+            .unwrap();
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 4);
         assert!(stats.errors.is_empty());
     }
 
-    #[test]
-    fn import_rxnorm_dry_run_does_not_write_to_db() {
+    #[tokio::test]
+    async fn import_rxnorm_dry_run_does_not_write_to_db() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let dir = make_folder();
 
-        import_rxnorm_rrf(&pool, dir.path(), 500, true).unwrap();
+        import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, true)
+            .await
+            .unwrap();
 
-        assert_eq!(count_rows(&pool, "code_systems"), 0);
-        assert_eq!(count_rows(&pool, "concepts"), 0);
+        assert_eq!(count_rows(&backend, "code_systems"), 0);
+        assert_eq!(count_rows(&backend, "concepts"), 0);
     }
 
-    #[test]
-    fn import_rxnorm_live_writes_to_db() {
+    #[tokio::test]
+    async fn import_rxnorm_live_writes_to_db() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let dir = make_folder();
 
-        let stats = import_rxnorm_rrf(&pool, dir.path(), 500, false).unwrap();
+        let stats = import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 4);
-        assert_eq!(count_rows(&pool, "code_systems"), 1);
-        assert_eq!(count_rows(&pool, "concepts"), 4);
-        assert_eq!(count_rows(&pool, "concept_hierarchy"), 2);
+        assert_eq!(count_rows(&backend, "code_systems"), 1);
+        assert_eq!(count_rows(&backend, "concepts"), 4);
+        assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
     }
 
-    #[test]
-    fn import_rxnorm_idempotent_reimport() {
+    #[tokio::test]
+    async fn import_rxnorm_idempotent_reimport() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let dir = make_folder();
 
-        import_rxnorm_rrf(&pool, dir.path(), 500, false).unwrap();
-        import_rxnorm_rrf(&pool, dir.path(), 500, false).unwrap();
+        import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, false)
+            .await
+            .unwrap();
+        import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, false)
+            .await
+            .unwrap();
 
-        assert_eq!(count_rows(&pool, "code_systems"), 1);
-        assert_eq!(count_rows(&pool, "concepts"), 4);
-        assert_eq!(count_rows(&pool, "concept_hierarchy"), 2);
+        assert_eq!(count_rows(&backend, "code_systems"), 1);
+        assert_eq!(count_rows(&backend, "concepts"), 4);
+        assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
     }
 
-    #[test]
-    fn import_rxnorm_batching_preserves_all_concepts() {
+    #[tokio::test]
+    async fn import_rxnorm_batching_preserves_all_concepts() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let dir = make_folder();
 
-        // batch_size=2 forces multiple batches across 4 concepts
-        let stats = import_rxnorm_rrf(&pool, dir.path(), 2, false).unwrap();
+        let stats = import_rxnorm_rrf(&backend, &ctx, dir.path(), 2, false)
+            .await
+            .unwrap();
 
         assert_eq!(stats.concepts, 4);
-        assert_eq!(count_rows(&pool, "concepts"), 4);
-        assert_eq!(count_rows(&pool, "concept_hierarchy"), 2);
+        assert_eq!(count_rows(&backend, "concepts"), 4);
+        assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
     }
 
-    #[test]
-    fn import_rxnorm_missing_folder_returns_error() {
+    #[tokio::test]
+    async fn import_rxnorm_missing_folder_returns_error() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
-        let result = import_rxnorm_rrf(&pool, Path::new("/nonexistent/rxnorm"), 500, false);
+        let ctx = TenantContext::system();
+        let result =
+            import_rxnorm_rrf(&backend, &ctx, Path::new("/nonexistent/rxnorm"), 500, false).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn import_rxnorm_lookup_drug_code() {
+    #[tokio::test]
+    async fn import_rxnorm_lookup_drug_code() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
         let dir = make_folder();
 
-        import_rxnorm_rrf(&pool, dir.path(), 500, false).unwrap();
+        import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, false)
+            .await
+            .unwrap();
 
-        let conn = pool.get().unwrap();
+        let conn = backend.pool().get().unwrap();
         let display: String = conn
             .query_row(
                 "SELECT display FROM concepts WHERE code = ?1",
@@ -646,8 +547,8 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         assert_eq!(display, "acetaminophen 325 MG Oral Tablet");
     }
 
-    #[test]
-    fn import_rxnorm_from_zip() {
+    #[tokio::test]
+    async fn import_rxnorm_from_zip() {
         use std::io::Write;
 
         let dir = tempfile::tempdir().unwrap();
@@ -665,11 +566,13 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         }
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
 
-        let stats = import_rxnorm_rrf(&pool, &zip_path, 500, false).unwrap();
+        let stats = import_rxnorm_rrf(&backend, &ctx, &zip_path, 500, false)
+            .await
+            .unwrap();
         assert_eq!(stats.concepts, 4);
-        assert_eq!(count_rows(&pool, "concepts"), 4);
-        assert_eq!(count_rows(&pool, "concept_hierarchy"), 2);
+        assert_eq!(count_rows(&backend, "concepts"), 4);
+        assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
     }
 }

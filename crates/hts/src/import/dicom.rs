@@ -10,42 +10,25 @@
 //! DICOM PS3.16 (Content Mapping Resource). Download from:
 //! <https://www.dicomstandard.org/current/>
 //!
-//! # File format
-//!
-//! The importer accepts a CSV or tab-delimited file with the DICOM code table.
-//! The expected columns are:
-//!
-//! ```text
-//! CodeValue,CodingSchemeDesignator,CodeMeaning
-//! 001,DCM,Quantitative Immunofluorescence
-//! 002,DCM,Qualitative Immunofluorescence
-//! ```
-//!
-//! - A header row is optional; it is skipped when the first column does not look
-//!   like a DICOM code (i.e. contains letters other than `DCM` or similar).
-//! - Both comma (`,`) and tab (`\t`) delimiters are supported; the importer
-//!   auto-detects from the first line.
-//! - Lines with fewer than two non-empty columns are skipped.
-//!
 //! # Hierarchy
 //!
 //! DICOM codes form a flat list. All codes are placed as children of a virtual
 //! root `DCM` concept in the `concept_hierarchy` table.
 
-#[cfg(feature = "sqlite")]
-use r2d2::Pool;
-#[cfg(feature = "sqlite")]
-use r2d2_sqlite::SqliteConnectionManager;
-
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
+use helios_persistence::tenant::TenantContext;
+
 use crate::error::HtsError;
+use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const DICOM_URL: &str = "http://dicom.nema.org/resources/ontology/DCM";
+const DICOM_ID: &str = "dicom";
 const DICOM_NAME: &str = "DCM";
 const DICOM_TITLE: &str = "DICOM Controlled Terminology";
 const ROOT_CODE: &str = "DCM";
@@ -54,29 +37,31 @@ const ROOT_CODE: &str = "DCM";
 
 #[derive(Debug)]
 struct DicomConcept {
-    /// DICOM code value, e.g. `121049`.
     code: String,
-    /// Human-readable code meaning.
     display: String,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Import a DICOM Part 16 code table (CSV or TSV) into the HTS database.
-///
-/// `path` may point to:
-/// - A raw `.csv` or `.txt` / `.tsv` file, or
-/// - A `.zip` archive containing such a file with "dicom" or "dcm" in the name.
-#[cfg(feature = "sqlite")]
-pub fn import_dicom(
-    pool: &Pool<SqliteConnectionManager>,
+/// Import a DICOM Part 16 code table (CSV or TSV) through the given backend.
+pub async fn import_dicom(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
     path: &Path,
     batch_size: usize,
     dry_run: bool,
 ) -> Result<ImportStats, HtsError> {
     let batch_size = batch_size.max(1);
-    let text = read_text(path)?;
-    let (concepts, errors) = parse_dicom_table(&text);
+
+    let path_owned = path.to_path_buf();
+    let (concepts, errors) = tokio::task::spawn_blocking(
+        move || -> Result<(Vec<DicomConcept>, Vec<String>), HtsError> {
+            let text = read_text(&path_owned)?;
+            Ok(parse_dicom_table(&text))
+        },
+    )
+    .await
+    .map_err(|e| HtsError::Internal(format!("DICOM parser panicked: {e}")))??;
 
     let mut stats = ImportStats {
         errors,
@@ -93,37 +78,51 @@ pub fn import_dicom(
         return Ok(stats);
     }
 
-    let conn = pool
-        .get()
-        .map_err(|e| HtsError::Internal(format!("DB pool error: {e}")))?;
+    let meta = CodeSystemMeta {
+        id: DICOM_ID,
+        url: DICOM_URL,
+        version: Some("current"),
+        name: Some(DICOM_NAME),
+        title: Some(DICOM_TITLE),
+        status: "active",
+        content: "complete",
+    };
 
-    let system_id = upsert_code_system(&conn)?;
-    stats.code_systems = 1;
-
-    // Virtual root so hierarchy edges have a valid parent.
-    conn.execute(
-        "INSERT OR IGNORE INTO concepts (system_id, code, display, definition) \
-         VALUES (?1, ?2, ?3, 'header')",
-        rusqlite::params![system_id, ROOT_CODE, DICOM_TITLE],
-    )
-    .map_err(|e| HtsError::Internal(format!("Insert virtual root: {e}")))?;
+    // Seed: virtual root only.
+    let root = BuilderConcept {
+        code: ROOT_CODE,
+        display: Some(DICOM_TITLE),
+        definition: Some("header"),
+        ..Default::default()
+    };
+    let seed = build_code_system_bundle(&meta, std::slice::from_ref(&root));
+    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    stats.code_systems = seed_stats.code_systems;
+    stats.errors.extend(seed_stats.errors);
 
     let total = concepts.len();
-    let total_batches = total.div_ceil(batch_size);
+    let total_batches = total.div_ceil(batch_size).max(1);
 
     for (batch_idx, batch) in concepts.chunks(batch_size).enumerate() {
-        insert_concept_batch(&conn, &system_id, batch)?;
+        let builder: Vec<BuilderConcept<'_>> = batch
+            .iter()
+            .map(|c| BuilderConcept {
+                code: &c.code,
+                display: Some(&c.display),
+                parent_code: Some(ROOT_CODE),
+                ..Default::default()
+            })
+            .collect();
+        let bytes = build_code_system_bundle(&meta, &builder);
+        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        stats.errors.extend(chunk.errors);
 
-        let inserted = ((batch_idx + 1) * batch_size).min(total);
         eprintln!(
-            "[dicom] batch {}/{total_batches} — +{} codes (total: {inserted})",
+            "[dicom] batch {}/{total_batches} — +{} codes",
             batch_idx + 1,
             batch.len()
         );
     }
-
-    // All codes hang off the virtual root.
-    insert_flat_hierarchy(&conn, &system_id, &concepts)?;
 
     stats.concepts = total as u32;
     Ok(stats)
@@ -185,7 +184,6 @@ fn read_text_from_zip(path: &Path) -> Result<String, HtsError> {
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
-/// Auto-detect delimiter: tab if the first non-empty line contains a tab, else comma.
 fn detect_delimiter(text: &str) -> char {
     for line in text.lines() {
         let trimmed = line.trim();
@@ -196,23 +194,18 @@ fn detect_delimiter(text: &str) -> char {
     ','
 }
 
-/// Parse the DICOM code table into a flat list of concepts.
-///
-/// Returns `(concepts, non_fatal_errors)`.
 fn parse_dicom_table(text: &str) -> (Vec<DicomConcept>, Vec<String>) {
     let delimiter = detect_delimiter(text);
     let mut concepts = Vec::new();
     let mut errors = Vec::new();
     let mut lines = BufReader::new(text.as_bytes()).lines().enumerate();
 
-    // Skip the header row if the first column is not numeric-looking.
     if let Some((_, Ok(first))) = lines.next() {
         let trimmed = first.trim();
         let first_col = trimmed.split(delimiter).next().unwrap_or("").trim();
         if looks_like_code(first_col) {
             process_line(0, trimmed, delimiter, &mut concepts, &mut errors);
         }
-        // else: header — skip
     }
 
     for (line_num, line) in lines {
@@ -230,18 +223,10 @@ fn parse_dicom_table(text: &str) -> (Vec<DicomConcept>, Vec<String>) {
     (concepts, errors)
 }
 
-/// Returns `true` if the string looks like a DICOM code value.
-///
-/// DICOM code values (Part 16) are 1–16 characters containing digits, uppercase
-/// letters, and punctuation — never lowercase letters. Header field names like
-/// "CodeValue" or "CodeMeaning" always contain lowercase, so this check reliably
-/// distinguishes data rows from header rows.
 fn looks_like_code(s: &str) -> bool {
     !s.is_empty() && s.len() <= 16 && !s.chars().any(|c| c.is_ascii_lowercase())
 }
 
-/// Parse a single delimited data line and push the result into `concepts`,
-/// or push a message into `errors` if the line is malformed or incomplete.
 fn process_line(
     line_num: usize,
     line: &str,
@@ -251,12 +236,9 @@ fn process_line(
 ) {
     let cols: Vec<&str> = line.splitn(3, delimiter).collect();
 
-    // Support both 2-column (code, meaning) and 3-column (code, scheme, meaning) formats.
     let (code_col, meaning_col) = if cols.len() >= 3 {
-        // 3-column: CodeValue, CodingSchemeDesignator, CodeMeaning
         (cols[0].trim(), cols[2].trim())
     } else if cols.len() == 2 {
-        // 2-column: CodeValue, CodeMeaning
         (cols[0].trim(), cols[1].trim())
     } else {
         errors.push(format!("line {line_num}: too few columns — skipped"));
@@ -278,82 +260,6 @@ fn process_line(
         code: code_col.to_string(),
         display: meaning_col.to_string(),
     });
-}
-
-// ── DB helpers ────────────────────────────────────────────────────────────────
-
-/// Insert the DICOM CodeSystem row if absent, then return its `id`.
-#[cfg(feature = "sqlite")]
-fn upsert_code_system(conn: &rusqlite::Connection) -> Result<String, HtsError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    conn.execute(
-        "INSERT OR IGNORE INTO code_systems \
-         (id, url, version, name, title, status, content, created_at, updated_at) \
-         VALUES (?1, ?2, 'current', ?3, ?4, 'active', 'complete', ?5, ?5)",
-        rusqlite::params![id, DICOM_URL, DICOM_NAME, DICOM_TITLE, now],
-    )
-    .map_err(|e| HtsError::Internal(format!("Upsert CodeSystem: {e}")))?;
-
-    let system_id: String = conn
-        .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
-            rusqlite::params![DICOM_URL],
-            |row| row.get(0),
-        )
-        .map_err(|e| HtsError::Internal(format!("Fetch CodeSystem id: {e}")))?;
-
-    Ok(system_id)
-}
-
-/// Upsert one batch of DICOM concepts inside a single transaction.
-#[cfg(feature = "sqlite")]
-fn insert_concept_batch(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    batch: &[DicomConcept],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin transaction: {e}")))?;
-
-    for c in batch {
-        tx.execute(
-            "INSERT OR REPLACE INTO concepts (system_id, code, display) VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, c.code, c.display],
-        )
-        .map_err(|e| HtsError::Internal(format!("Insert concept '{}': {e}", c.code)))?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit: {e}")))?;
-    Ok(())
-}
-
-/// Insert one `ROOT_CODE → code` edge per concept (flat enumeration).
-#[cfg(feature = "sqlite")]
-fn insert_flat_hierarchy(
-    conn: &rusqlite::Connection,
-    system_id: &str,
-    concepts: &[DicomConcept],
-) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| HtsError::Internal(format!("Begin hierarchy transaction: {e}")))?;
-
-    for c in concepts {
-        tx.execute(
-            "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code) \
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![system_id, ROOT_CODE, c.code],
-        )
-        .map_err(|e| HtsError::Internal(format!("Insert hierarchy DCM->{}: {e}", c.code)))?;
-    }
-
-    tx.commit()
-        .map_err(|e| HtsError::Internal(format!("Commit hierarchy: {e}")))?;
-    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -426,8 +332,10 @@ CodeValue\tCodingSchemeDesignator\tCodeMeaning\n\
         use crate::backends::SqliteTerminologyBackend;
         use std::io::Write;
 
-        fn count(pool: &Pool<SqliteConnectionManager>, table: &str) -> i64 {
-            pool.get()
+        fn count(backend: &SqliteTerminologyBackend, table: &str) -> i64 {
+            backend
+                .pool()
+                .get()
                 .unwrap()
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap()
@@ -439,38 +347,49 @@ CodeValue\tCodingSchemeDesignator\tCodeMeaning\n\
             f
         }
 
-        #[test]
-        fn dry_run_does_not_write() {
+        #[tokio::test]
+        async fn dry_run_does_not_write() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_csv_file(SAMPLE_CSV);
-            let stats = import_dicom(backend.pool(), f.path(), 500, true).unwrap();
+            let stats = import_dicom(&backend, &ctx, f.path(), 500, true)
+                .await
+                .unwrap();
             assert_eq!(stats.code_systems, 1);
             assert_eq!(stats.concepts, 3);
-            assert_eq!(count(backend.pool(), "code_systems"), 0);
+            assert_eq!(count(&backend, "code_systems"), 0);
         }
 
-        #[test]
-        fn live_import_writes_concepts_and_hierarchy() {
+        #[tokio::test]
+        async fn live_import_writes_concepts_and_hierarchy() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_csv_file(SAMPLE_CSV);
-            let stats = import_dicom(backend.pool(), f.path(), 500, false).unwrap();
+            let stats = import_dicom(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
             assert_eq!(stats.code_systems, 1);
             assert_eq!(stats.concepts, 3);
             // virtual root + 3 codes
-            assert_eq!(count(backend.pool(), "concepts"), 4);
+            assert_eq!(count(&backend, "concepts"), 4);
             // 3 flat hierarchy edges
-            assert_eq!(count(backend.pool(), "concept_hierarchy"), 3);
+            assert_eq!(count(&backend, "concept_hierarchy"), 3);
         }
 
-        #[test]
-        fn idempotent_reimport() {
+        #[tokio::test]
+        async fn idempotent_reimport() {
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
             let f = make_csv_file(SAMPLE_CSV);
-            import_dicom(backend.pool(), f.path(), 500, false).unwrap();
-            import_dicom(backend.pool(), f.path(), 500, false).unwrap();
-            assert_eq!(count(backend.pool(), "code_systems"), 1);
-            assert_eq!(count(backend.pool(), "concepts"), 4);
-            assert_eq!(count(backend.pool(), "concept_hierarchy"), 3);
+            import_dicom(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
+            import_dicom(&backend, &ctx, f.path(), 500, false)
+                .await
+                .unwrap();
+            assert_eq!(count(&backend, "code_systems"), 1);
+            assert_eq!(count(&backend, "concepts"), 4);
+            assert_eq!(count(&backend, "concept_hierarchy"), 3);
         }
     }
 }

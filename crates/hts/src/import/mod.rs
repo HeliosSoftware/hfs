@@ -22,6 +22,7 @@
 //! programmatically via [`BundleImportBackend::import_bundle`] for HTTP-based
 //! Bundle imports.
 
+pub mod bundle_builder;
 pub mod bundle_parser;
 pub mod dicom;
 pub mod fhir_bundle;

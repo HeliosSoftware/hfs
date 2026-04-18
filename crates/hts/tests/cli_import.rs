@@ -10,6 +10,7 @@
 #[cfg(feature = "sqlite")]
 mod import_tests {
     use helios_hts::backends::SqliteTerminologyBackend;
+    use helios_persistence::tenant::TenantContext;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -81,19 +82,22 @@ mod import_tests {
         gz.finish().unwrap()
     }
 
-    #[test]
-    fn import_tgz_imports_code_system_and_value_set() {
+    #[tokio::test]
+    async fn import_tgz_imports_code_system_and_value_set() {
         use helios_hts::import::tgz::import_tgz;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
 
         let tgz_bytes = build_minimal_npm_tgz();
         let mut tmp = tempfile::NamedTempFile::with_suffix(".tgz").unwrap();
         tmp.write_all(&tgz_bytes).unwrap();
 
-        let stats = import_tgz(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_tgz(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(stats.code_systems, 1, "expected 1 CodeSystem");
         assert_eq!(stats.value_sets, 1, "expected 1 ValueSet");
@@ -105,37 +109,43 @@ mod import_tests {
         );
     }
 
-    #[test]
-    fn import_tgz_dry_run_writes_nothing() {
+    #[tokio::test]
+    async fn import_tgz_dry_run_writes_nothing() {
         use helios_hts::import::tgz::import_tgz;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let tgz_bytes = build_minimal_npm_tgz();
         let mut tmp = tempfile::NamedTempFile::with_suffix(".tgz").unwrap();
         tmp.write_all(&tgz_bytes).unwrap();
 
-        import_tgz(&pool, tmp.path(), 500, true).unwrap();
+        import_tgz(&backend, &ctx, tmp.path(), 500, true)
+            .await
+            .unwrap();
 
         assert_eq!(count_rows(&pool, "code_systems"), 0);
         assert_eq!(count_rows(&pool, "concepts"), 0);
     }
 
-    #[test]
-    fn import_tgz_lookup_after_import() {
+    #[tokio::test]
+    async fn import_tgz_lookup_after_import() {
         use helios_hts::import::tgz::import_tgz;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let tgz_bytes = build_minimal_npm_tgz();
         let mut tmp = tempfile::NamedTempFile::with_suffix(".tgz").unwrap();
         tmp.write_all(&tgz_bytes).unwrap();
 
-        import_tgz(&pool, tmp.path(), 500, false).unwrap();
+        import_tgz(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         // Verify concept A is in the DB with the correct display
         let conn = pool.get().unwrap();
@@ -152,27 +162,32 @@ mod import_tests {
         assert_eq!(display, "Alpha");
     }
 
-    #[test]
-    fn import_tgz_is_idempotent() {
+    #[tokio::test]
+    async fn import_tgz_is_idempotent() {
         use helios_hts::import::tgz::import_tgz;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let tgz_bytes = build_minimal_npm_tgz();
         let mut tmp = tempfile::NamedTempFile::with_suffix(".tgz").unwrap();
         tmp.write_all(&tgz_bytes).unwrap();
 
-        import_tgz(&pool, tmp.path(), 500, false).unwrap();
-        import_tgz(&pool, tmp.path(), 500, false).unwrap();
+        import_tgz(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
+        import_tgz(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(count_rows(&pool, "code_systems"), 1);
         assert_eq!(count_rows(&pool, "concepts"), 2);
     }
 
-    #[test]
-    fn import_tgz_skips_non_resource_files() {
+    #[tokio::test]
+    async fn import_tgz_skips_non_resource_files() {
         use flate2::Compression;
         use flate2::write::GzEncoder;
         use helios_hts::import::tgz::import_tgz;
@@ -195,9 +210,12 @@ mod import_tests {
         tmp.write_all(&tgz_bytes).unwrap();
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
 
-        let stats = import_tgz(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_tgz(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
         assert_eq!(stats.code_systems, 0);
         assert_eq!(stats.concepts, 0);
     }
@@ -221,18 +239,21 @@ mod import_tests {
   </chapter>
 </ICD10CM.tabular>"#;
 
-    #[test]
-    fn import_icd10_end_to_end() {
+    #[tokio::test]
+    async fn import_icd10_end_to_end() {
         use helios_hts::import::icd10_cm::import_icd10_cm;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         tmp.write_all(ICD10_XML.as_bytes()).unwrap();
 
-        let stats = import_icd10_cm(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_icd10_cm(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         // virtual root + 1 chapter + 1 section + 1 header + 2 billable = 6
         assert_eq!(stats.code_systems, 1);
@@ -255,8 +276,8 @@ mod import_tests {
 
     // ── Error message quality ─────────────────────────────────────────────────
 
-    #[test]
-    fn import_tgz_bad_json_records_filename_in_error() {
+    #[tokio::test]
+    async fn import_tgz_bad_json_records_filename_in_error() {
         use flate2::Compression;
         use flate2::write::GzEncoder;
         use helios_hts::import::tgz::import_tgz;
@@ -281,9 +302,12 @@ mod import_tests {
         tmp.write_all(&tgz_bytes).unwrap();
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
 
-        let stats = import_tgz(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_tgz(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         // Import should succeed (non-fatal) and record an error with the filename
         assert_eq!(stats.errors.len(), 1, "expected exactly 1 non-fatal error");
@@ -299,8 +323,8 @@ mod import_tests {
     /// valid resource is still imported.  The exit-code mapping (`Ok(2)`)
     /// is exercised via `run_import` internally; this test confirms the
     /// condition that triggers it.
-    #[test]
-    fn import_tgz_non_fatal_errors_reflected_in_stats() {
+    #[tokio::test]
+    async fn import_tgz_non_fatal_errors_reflected_in_stats() {
         use flate2::Compression;
         use flate2::write::GzEncoder;
         use helios_hts::import::tgz::import_tgz;
@@ -338,9 +362,12 @@ mod import_tests {
         tmp.write_all(&tgz_bytes).unwrap();
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
 
-        let stats = import_tgz(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_tgz(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         // Valid resource imported despite the bad neighbour
         assert_eq!(
@@ -397,28 +424,32 @@ mod import_tests {
 
     // ── batch_size=0 guard ────────────────────────────────────────────────────
 
-    #[test]
-    fn import_icd10_batch_size_zero_does_not_panic() {
+    #[tokio::test]
+    async fn import_icd10_batch_size_zero_does_not_panic() {
         use helios_hts::import::icd10_cm::import_icd10_cm;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         tmp.write_all(ICD10_XML.as_bytes()).unwrap();
 
         // batch_size=0 must not panic; the .max(1) guard clamps it to 1
-        let stats = import_icd10_cm(&pool, tmp.path(), 0, false).unwrap();
+        let stats = import_icd10_cm(&backend, &ctx, tmp.path(), 0, false)
+            .await
+            .unwrap();
         assert_eq!(stats.concepts, 6);
     }
 
-    #[test]
-    fn import_rxnorm_batch_size_zero_does_not_panic() {
+    #[tokio::test]
+    async fn import_rxnorm_batch_size_zero_does_not_panic() {
         use helios_hts::import::rxnorm_rrf::import_rxnorm_rrf;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
         let dir = tempfile::tempdir().unwrap();
         std::fs::File::create(dir.path().join("RXNCONSO.RRF"))
             .unwrap()
@@ -431,7 +462,9 @@ mod import_tests {
             .write_all(b"")
             .unwrap();
 
-        let stats = import_rxnorm_rrf(&pool, dir.path(), 0, false).unwrap();
+        let stats = import_rxnorm_rrf(&backend, &ctx, dir.path(), 0, false)
+            .await
+            .unwrap();
         assert_eq!(stats.concepts, 1);
     }
 
@@ -488,18 +521,21 @@ mod import_tests {
   <unit Code="[lb_av]" CODE="[LB_AV]" isMetric="no"><name>pound</name></unit>
 </root>"#;
 
-    #[test]
-    fn import_ucum_end_to_end() {
+    #[tokio::test]
+    async fn import_ucum_end_to_end() {
         use helios_hts::import::ucum::import_ucum;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         tmp.write_all(UCUM_XML.as_bytes()).unwrap();
 
-        let stats = import_ucum(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_ucum(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 3);
@@ -519,37 +555,45 @@ mod import_tests {
         assert_eq!(display, "meter");
     }
 
-    #[test]
-    fn import_ucum_dry_run_writes_nothing() {
+    #[tokio::test]
+    async fn import_ucum_dry_run_writes_nothing() {
         use helios_hts::import::ucum::import_ucum;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         tmp.write_all(UCUM_XML.as_bytes()).unwrap();
 
-        let stats = import_ucum(&pool, tmp.path(), 500, true).unwrap();
+        let stats = import_ucum(&backend, &ctx, tmp.path(), 500, true)
+            .await
+            .unwrap();
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 3);
         assert_eq!(count_rows(&pool, "code_systems"), 0);
         assert_eq!(count_rows(&pool, "concepts"), 0);
     }
 
-    #[test]
-    fn import_ucum_idempotent() {
+    #[tokio::test]
+    async fn import_ucum_idempotent() {
         use helios_hts::import::ucum::import_ucum;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         tmp.write_all(UCUM_XML.as_bytes()).unwrap();
 
-        import_ucum(&pool, tmp.path(), 500, false).unwrap();
-        import_ucum(&pool, tmp.path(), 500, false).unwrap();
+        import_ucum(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
+        import_ucum(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(count_rows(&pool, "code_systems"), 1);
         // virtual root + 3 unit codes
@@ -557,18 +601,21 @@ mod import_tests {
         assert_eq!(count_rows(&pool, "concept_hierarchy"), 3);
     }
 
-    #[test]
-    fn import_ucum_batch_size_zero_does_not_panic() {
+    #[tokio::test]
+    async fn import_ucum_batch_size_zero_does_not_panic() {
         use helios_hts::import::ucum::import_ucum;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         tmp.write_all(UCUM_XML.as_bytes()).unwrap();
 
-        let stats = import_ucum(&pool, tmp.path(), 0, false).unwrap();
+        let stats = import_ucum(&backend, &ctx, tmp.path(), 0, false)
+            .await
+            .unwrap();
         assert_eq!(stats.concepts, 3);
     }
 
@@ -580,18 +627,21 @@ mod import_tests {
 C67890\tChild Concept\tC12345\t\tA child concept.\tChild Concept\n\
 C11111\tAnother Root\t\t\tAnother root.\tAnother Root\n";
 
-    #[test]
-    fn import_nci_thesaurus_end_to_end() {
+    #[tokio::test]
+    async fn import_nci_thesaurus_end_to_end() {
         use helios_hts::import::nci_thesaurus::import_nci_thesaurus;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         tmp.write_all(NCI_TXT.as_bytes()).unwrap();
 
-        let stats = import_nci_thesaurus(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_nci_thesaurus(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 3);
@@ -611,52 +661,63 @@ C11111\tAnother Root\t\t\tAnother root.\tAnother Root\n";
         assert_eq!(display, "Child Concept");
     }
 
-    #[test]
-    fn import_nci_thesaurus_dry_run_writes_nothing() {
+    #[tokio::test]
+    async fn import_nci_thesaurus_dry_run_writes_nothing() {
         use helios_hts::import::nci_thesaurus::import_nci_thesaurus;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         tmp.write_all(NCI_TXT.as_bytes()).unwrap();
 
-        import_nci_thesaurus(&pool, tmp.path(), 500, true).unwrap();
+        import_nci_thesaurus(&backend, &ctx, tmp.path(), 500, true)
+            .await
+            .unwrap();
         assert_eq!(count_rows(&pool, "code_systems"), 0);
         assert_eq!(count_rows(&pool, "concepts"), 0);
     }
 
-    #[test]
-    fn import_nci_thesaurus_idempotent() {
+    #[tokio::test]
+    async fn import_nci_thesaurus_idempotent() {
         use helios_hts::import::nci_thesaurus::import_nci_thesaurus;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         tmp.write_all(NCI_TXT.as_bytes()).unwrap();
 
-        import_nci_thesaurus(&pool, tmp.path(), 500, false).unwrap();
-        import_nci_thesaurus(&pool, tmp.path(), 500, false).unwrap();
+        import_nci_thesaurus(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
+        import_nci_thesaurus(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(count_rows(&pool, "code_systems"), 1);
         assert_eq!(count_rows(&pool, "concepts"), 3);
     }
 
-    #[test]
-    fn import_nci_thesaurus_batch_size_zero_does_not_panic() {
+    #[tokio::test]
+    async fn import_nci_thesaurus_batch_size_zero_does_not_panic() {
         use helios_hts::import::nci_thesaurus::import_nci_thesaurus;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         tmp.write_all(NCI_TXT.as_bytes()).unwrap();
 
-        let stats = import_nci_thesaurus(&pool, tmp.path(), 0, false).unwrap();
+        let stats = import_nci_thesaurus(&backend, &ctx, tmp.path(), 0, false)
+            .await
+            .unwrap();
         assert_eq!(stats.concepts, 3);
     }
 
@@ -669,18 +730,21 @@ CodeValue,CodingSchemeDesignator,CodeMeaning\n\
 121058,DCM,Procedure reported\n\
 ";
 
-    #[test]
-    fn import_dicom_end_to_end() {
+    #[tokio::test]
+    async fn import_dicom_end_to_end() {
         use helios_hts::import::dicom::import_dicom;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
         tmp.write_all(DICOM_CSV.as_bytes()).unwrap();
 
-        let stats = import_dicom(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_dicom(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 3);
@@ -700,52 +764,63 @@ CodeValue,CodingSchemeDesignator,CodeMeaning\n\
         assert_eq!(display, "Observer Context");
     }
 
-    #[test]
-    fn import_dicom_dry_run_writes_nothing() {
+    #[tokio::test]
+    async fn import_dicom_dry_run_writes_nothing() {
         use helios_hts::import::dicom::import_dicom;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
         tmp.write_all(DICOM_CSV.as_bytes()).unwrap();
 
-        import_dicom(&pool, tmp.path(), 500, true).unwrap();
+        import_dicom(&backend, &ctx, tmp.path(), 500, true)
+            .await
+            .unwrap();
         assert_eq!(count_rows(&pool, "code_systems"), 0);
         assert_eq!(count_rows(&pool, "concepts"), 0);
     }
 
-    #[test]
-    fn import_dicom_idempotent() {
+    #[tokio::test]
+    async fn import_dicom_idempotent() {
         use helios_hts::import::dicom::import_dicom;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
         tmp.write_all(DICOM_CSV.as_bytes()).unwrap();
 
-        import_dicom(&pool, tmp.path(), 500, false).unwrap();
-        import_dicom(&pool, tmp.path(), 500, false).unwrap();
+        import_dicom(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
+        import_dicom(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(count_rows(&pool, "code_systems"), 1);
         assert_eq!(count_rows(&pool, "concepts"), 4); // virtual root + 3
     }
 
-    #[test]
-    fn import_dicom_batch_size_zero_does_not_panic() {
+    #[tokio::test]
+    async fn import_dicom_batch_size_zero_does_not_panic() {
         use helios_hts::import::dicom::import_dicom;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
         tmp.write_all(DICOM_CSV.as_bytes()).unwrap();
 
-        let stats = import_dicom(&pool, tmp.path(), 0, false).unwrap();
+        let stats = import_dicom(&backend, &ctx, tmp.path(), 0, false)
+            .await
+            .unwrap();
         assert_eq!(stats.concepts, 3);
     }
 
@@ -760,18 +835,21 @@ CodeValue,CodingSchemeDesignator,CodeMeaning\n\
   </HL7Table>
 </HL7Tables>"#;
 
-    #[test]
-    fn import_hl7_v2_tables_end_to_end() {
+    #[tokio::test]
+    async fn import_hl7_v2_tables_end_to_end() {
         use helios_hts::import::hl7_v2_tables::import_hl7_v2_tables;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         tmp.write_all(HL7V2_XML.as_bytes()).unwrap();
 
-        let stats = import_hl7_v2_tables(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_hl7_v2_tables(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 3);
@@ -791,53 +869,64 @@ CodeValue,CodingSchemeDesignator,CodeMeaning\n\
         assert_eq!(display, "Female");
     }
 
-    #[test]
-    fn import_hl7_v2_tables_dry_run_writes_nothing() {
+    #[tokio::test]
+    async fn import_hl7_v2_tables_dry_run_writes_nothing() {
         use helios_hts::import::hl7_v2_tables::import_hl7_v2_tables;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         tmp.write_all(HL7V2_XML.as_bytes()).unwrap();
 
-        import_hl7_v2_tables(&pool, tmp.path(), 500, true).unwrap();
+        import_hl7_v2_tables(&backend, &ctx, tmp.path(), 500, true)
+            .await
+            .unwrap();
         assert_eq!(count_rows(&pool, "code_systems"), 0);
         assert_eq!(count_rows(&pool, "concepts"), 0);
     }
 
-    #[test]
-    fn import_hl7_v2_tables_idempotent() {
+    #[tokio::test]
+    async fn import_hl7_v2_tables_idempotent() {
         use helios_hts::import::hl7_v2_tables::import_hl7_v2_tables;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         tmp.write_all(HL7V2_XML.as_bytes()).unwrap();
 
-        import_hl7_v2_tables(&pool, tmp.path(), 500, false).unwrap();
-        import_hl7_v2_tables(&pool, tmp.path(), 500, false).unwrap();
+        import_hl7_v2_tables(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
+        import_hl7_v2_tables(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(count_rows(&pool, "code_systems"), 1);
         // virtual root (v2-0001) + 3 real codes = 4
         assert_eq!(count_rows(&pool, "concepts"), 4);
     }
 
-    #[test]
-    fn import_hl7_v2_tables_batch_size_zero_does_not_panic() {
+    #[tokio::test]
+    async fn import_hl7_v2_tables_batch_size_zero_does_not_panic() {
         use helios_hts::import::hl7_v2_tables::import_hl7_v2_tables;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
         tmp.write_all(HL7V2_XML.as_bytes()).unwrap();
 
-        let stats = import_hl7_v2_tables(&pool, tmp.path(), 0, false).unwrap();
+        let stats = import_hl7_v2_tables(&backend, &ctx, tmp.path(), 0, false)
+            .await
+            .unwrap();
         assert_eq!(stats.concepts, 3);
     }
 
@@ -850,18 +939,21 @@ Code,Grouping,Classification,Specialization,Definition,Notes,,,,,Display Name\n\
 207R00000X,Allopathic & Osteopathic Physicians,Internal Medicine,,An internal medicine physician,,,,,Internist\n\
 ";
 
-    #[test]
-    fn import_nucc_end_to_end() {
+    #[tokio::test]
+    async fn import_nucc_end_to_end() {
         use helios_hts::import::nucc::import_nucc;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
         tmp.write_all(NUCC_CSV.as_bytes()).unwrap();
 
-        let stats = import_nucc(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_nucc(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 3);
@@ -881,53 +973,64 @@ Code,Grouping,Classification,Specialization,Definition,Notes,,,,,Display Name\n\
         assert_eq!(display, "Internist");
     }
 
-    #[test]
-    fn import_nucc_dry_run_writes_nothing() {
+    #[tokio::test]
+    async fn import_nucc_dry_run_writes_nothing() {
         use helios_hts::import::nucc::import_nucc;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
         tmp.write_all(NUCC_CSV.as_bytes()).unwrap();
 
-        import_nucc(&pool, tmp.path(), 500, true).unwrap();
+        import_nucc(&backend, &ctx, tmp.path(), 500, true)
+            .await
+            .unwrap();
         assert_eq!(count_rows(&pool, "code_systems"), 0);
         assert_eq!(count_rows(&pool, "concepts"), 0);
     }
 
-    #[test]
-    fn import_nucc_idempotent() {
+    #[tokio::test]
+    async fn import_nucc_idempotent() {
         use helios_hts::import::nucc::import_nucc;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
         tmp.write_all(NUCC_CSV.as_bytes()).unwrap();
 
-        import_nucc(&pool, tmp.path(), 500, false).unwrap();
-        import_nucc(&pool, tmp.path(), 500, false).unwrap();
+        import_nucc(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
+        import_nucc(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         assert_eq!(count_rows(&pool, "code_systems"), 1);
         // 1 virtual root (NUCC) + 2 synthetic groupings + 2 synthetic classifications + 3 real codes = 8
         assert_eq!(count_rows(&pool, "concepts"), 8);
     }
 
-    #[test]
-    fn import_nucc_batch_size_zero_does_not_panic() {
+    #[tokio::test]
+    async fn import_nucc_batch_size_zero_does_not_panic() {
         use helios_hts::import::nucc::import_nucc;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
         tmp.write_all(NUCC_CSV.as_bytes()).unwrap();
 
-        let stats = import_nucc(&pool, tmp.path(), 0, false).unwrap();
+        let stats = import_nucc(&backend, &ctx, tmp.path(), 0, false)
+            .await
+            .unwrap();
         assert_eq!(stats.concepts, 3);
     }
 
@@ -942,18 +1045,21 @@ Code,Grouping,Classification,Specialization,Definition,Notes,,,,,Display Name\n\
 002|Typhoid and paratyphoid fevers\n\
 ";
 
-    #[test]
-    fn import_icd9_end_to_end() {
+    #[tokio::test]
+    async fn import_icd9_end_to_end() {
         use helios_hts::import::icd9_cm::import_icd9_cm;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
         let pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         tmp.write_all(ICD9_TXT.as_bytes()).unwrap();
 
-        let stats = import_icd9_cm(&pool, tmp.path(), 500, false).unwrap();
+        let stats = import_icd9_cm(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
 
         // 4 concepts from the file
         assert_eq!(stats.code_systems, 1);
@@ -974,19 +1080,22 @@ Code,Grouping,Classification,Specialization,Definition,Notes,,,,,Display Name\n\
         assert_eq!(display, "Cholera due to vibrio cholerae");
     }
 
-    #[test]
-    fn import_icd9_batch_size_zero_does_not_panic() {
+    #[tokio::test]
+    async fn import_icd9_batch_size_zero_does_not_panic() {
         use helios_hts::import::icd9_cm::import_icd9_cm;
         use std::io::Write;
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let pool = backend.pool().clone();
+        let ctx = TenantContext::system();
+        let _pool = backend.pool().clone();
 
         let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         tmp.write_all(ICD9_TXT.as_bytes()).unwrap();
 
         // batch_size=0 must not panic; the .max(1) guard clamps it to 1
-        let stats = import_icd9_cm(&pool, tmp.path(), 0, false).unwrap();
+        let stats = import_icd9_cm(&backend, &ctx, tmp.path(), 0, false)
+            .await
+            .unwrap();
         assert_eq!(stats.concepts, 4);
     }
 }

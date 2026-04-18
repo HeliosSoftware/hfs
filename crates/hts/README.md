@@ -187,7 +187,7 @@ Bulk-import a terminology package from the filesystem into the HTS database. Typ
 
 If the target SQLite database does not yet exist, `hts import` creates the file (default: `./data/hts.db`) and applies the schema automatically - no prior `hts run` is required. The same is true for PostgreSQL: pass `--storage-backend postgres` (or set `HTS_STORAGE_BACKEND=postgres`) along with a `postgresql://` connection string and the schema is created on first import.
 
-> **PostgreSQL note:** only the `hl7-npm` importer currently supports the PostgreSQL backend. All other formats (SNOMED, LOINC, ICD-10-CM, ICD-9-CM, RxNorm, UCUM, NCI Thesaurus, MeSH, DICOM, HL7 v2 tables, NUCC, NDC) require the SQLite backend.
+All 13 import formats (`hl7-npm`, `snomed-rf2`, `loinc`, `icd10-cm`, `icd9-cm`, `rxnorm`, `ucum`, `nci-thesaurus`, `mesh`, `dicom`, `hl7-v2-tables`, `nucc`, `ndc`) work against both the SQLite and PostgreSQL backends.
 
 ```bash
 # HL7 FHIR NPM package (.tgz from https://terminology.hl7.org/en/downloads.html)

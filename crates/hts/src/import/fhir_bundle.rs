@@ -104,8 +104,12 @@ fn write_code_system(
     let resource_json = serde_json::to_string(&cs.resource_json).ok();
     let now = utc_now();
 
+    // Non-destructive upsert: if a row with the same `url` already exists (e.g.
+    // from a prior chunk of a large CodeSystem), keep it and its concepts
+    // intact. Re-inserts with a different `id` are ignored rather than firing
+    // the `ON DELETE CASCADE` on the `concepts.system_id` FK.
     conn.execute(
-        "INSERT OR REPLACE INTO code_systems
+        "INSERT OR IGNORE INTO code_systems
          (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         rusqlite::params![
@@ -122,11 +126,44 @@ fn write_code_system(
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    conn.execute(
+        "UPDATE code_systems SET
+           version       = ?1,
+           name          = ?2,
+           title         = ?3,
+           status        = ?4,
+           content       = ?5,
+           resource_json = ?6,
+           updated_at    = ?7
+         WHERE url = ?8",
+        rusqlite::params![
+            cs.version,
+            cs.name,
+            cs.title,
+            cs.status,
+            cs.content,
+            resource_json,
+            now,
+            cs.url,
+        ],
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    // Concepts reference the authoritative `id` resolved by URL, which may
+    // differ from `cs.id` if a prior chunk created the row.
+    let system_id: String = conn
+        .query_row(
+            "SELECT id FROM code_systems WHERE url = ?1",
+            rusqlite::params![cs.url],
+            |row| row.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(format!("Failed to resolve CodeSystem id: {e}")))?;
+
     for concept in &cs.concepts {
         conn.execute(
             "INSERT OR REPLACE INTO concepts (system_id, code, display, definition)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![cs.id, concept.code, concept.display, concept.definition],
+            rusqlite::params![system_id, concept.code, concept.display, concept.definition],
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -134,7 +171,7 @@ fn write_code_system(
 
         // Hierarchy from nesting or "parent" property.
         if let Some(ref parent) = concept.parent_code {
-            insert_hierarchy(conn, &cs.id, parent, &concept.code)?;
+            insert_hierarchy(conn, &system_id, parent, &concept.code)?;
         }
 
         // Properties.
@@ -152,7 +189,7 @@ fn write_code_system(
             // Extra hierarchy edge from a "parent" property.
             if prop.is_parent_edge {
                 if let Some(ref pv) = prop.parent_code_value {
-                    insert_hierarchy(conn, &cs.id, pv, &concept.code)?;
+                    insert_hierarchy(conn, &system_id, pv, &concept.code)?;
                 }
             }
         }

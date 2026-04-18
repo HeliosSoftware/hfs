@@ -517,8 +517,8 @@ HTS_DATABASE_URL=./my-terminology.db HTS_SERVER_PORT=9090 cargo run --bin hts
 | `HTS_SERVER_PORT` | 8090 | Server port |
 | `HTS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `HTS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
-| `HTS_DATABASE_URL` | ./data/hts.db | SQLite database file path |
-| `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite`; `postgres` planned) |
+| `HTS_DATABASE_URL` | ./data/hts.db | Database location — SQLite file path, or `postgresql://user:pass@host/db` for Postgres |
+| `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite` default; `postgres` when built with `--features postgres`) |
 | `HTS_ENABLE_CORS` | true | Enable CORS |
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
 
