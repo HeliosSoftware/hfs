@@ -55,12 +55,12 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 | [SNOMED CT](https://www.snomed.org) | [SNOMED International](https://www.snomed.org) | 🔑 License required | Free in [~50 member countries](https://www.snomed.org/snomed-ct/get-snomed); paid elsewhere. [Register via MLDS](https://mlds.ihtsdotools.org/) or your [National Release Center](https://www.snomed.org/snomed-ct/get-snomed). US users: [nlm.nih.gov/healthit/snomedct](https://www.nlm.nih.gov/healthit/snomedct/index.html). |
 | [LOINC](https://loinc.org) | [Regenstrief Institute](https://www.regenstrief.org) | 🔑 License required | Free - [create a free account at loinc.org](https://loinc.org/download/) to download. |
 | [RxNorm](https://www.nlm.nih.gov/research/umls/rxnorm/overview.html) | [U.S. National Library of Medicine](https://www.nlm.nih.gov) | 🔑 License required | Free - [create a free UMLS account at uts.nlm.nih.gov](https://uts.nlm.nih.gov) and accept the [NLM Terms of Service](https://www.nlm.nih.gov/research/umls/rxnorm/docs/termsofservice.html). |
-| [HCPCS Level II](https://www.cms.gov/medicare/coding-billing/healthcare-common-procedure-system) | [U.S. CMS](https://www.cms.gov) | 🚫 Not supported | Public domain (US gov). |
-| [ICD-11](https://icd.who.int) | [WHO](https://www.who.int) | 🚫 Not supported | Free ([CC BY-ND 3.0 IGO](https://creativecommons.org/licenses/by-nd/3.0/igo/)). |
-| [CPT](https://www.ama-assn.org/practice-management/cpt) | [AMA](https://www.ama-assn.org) | 🚫 Not supported | Proprietary - paid AMA license required. [Contact AMA for licensing](https://www.ama-assn.org/practice-management/cpt/cpt-licensing-frequently-asked-questions-faqs). |
-| [MedDRA](https://www.meddra.org) | [MSSO](https://www.meddra.org) | 🚫 Not supported | Proprietary - paid MSSO license required. [Contact MedDRA](https://www.meddra.org). |
+| [HCPCS Level II](https://www.cms.gov/medicare/coding-billing/healthcare-common-procedure-system) | [U.S. CMS](https://www.cms.gov) | 🚧 Not yet | Public domain (US gov). |
+| [ICD-11](https://icd.who.int) | [WHO](https://www.who.int) | 🚧 Not yet | Free ([CC BY-ND 3.0 IGO](https://creativecommons.org/licenses/by-nd/3.0/igo/)). |
+| [CPT](https://www.ama-assn.org/practice-management/cpt) | [AMA](https://www.ama-assn.org) | 🚧 Not yet | Proprietary - paid AMA license required. [Contact AMA for licensing](https://www.ama-assn.org/practice-management/cpt/cpt-licensing-frequently-asked-questions-faqs). |
+| [MedDRA](https://www.meddra.org) | [MSSO](https://www.meddra.org) | 🚧 Not yet | Proprietary - paid MSSO license required. [Contact MedDRA](https://www.meddra.org). |
 
-**Legend:** ✅ Bundled - no separate download needed. 🔑 License required - freely available, but registration or terms acceptance required. 🚧 Not yet - importer not yet implemented; open an issue. 🚫 Not planned - proprietary data that requires a paid license.
+**Legend:** ✅ Bundled - no separate download needed. 🔑 License required - freely available, but registration or terms acceptance required. 🚧 Not yet - importer not yet implemented; open an issue.
 
 - Bulk import CLI for all supported terminologies - see [Supported Terminologies](#supported-terminologies-1) for per-terminology instructions
 - Automatic format detection - no `--format` flag needed for most files
