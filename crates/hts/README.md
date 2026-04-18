@@ -185,11 +185,18 @@ cargo build --release -p helios-hts --features R4,R4B,R5,R6,sqlite
 
 Bulk-import a terminology package from the filesystem into the HTS database. Typically run before `hts run` so the server starts with terminology data already loaded.
 
-If the target SQLite database does not yet exist, `hts import` creates the file (default: `./data/hts.db`) and applies the schema automatically - no prior `hts run` is required.
+If the target SQLite database does not yet exist, `hts import` creates the file (default: `./data/hts.db`) and applies the schema automatically - no prior `hts run` is required. The same is true for PostgreSQL: pass `--storage-backend postgres` (or set `HTS_STORAGE_BACKEND=postgres`) along with a `postgresql://` connection string and the schema is created on first import.
+
+> **PostgreSQL note:** only the `hl7-npm` importer currently supports the PostgreSQL backend. All other formats (SNOMED, LOINC, ICD-10-CM, ICD-9-CM, RxNorm, UCUM, NCI Thesaurus, MeSH, DICOM, HL7 v2 tables, NUCC, NDC) require the SQLite backend.
 
 ```bash
 # HL7 FHIR NPM package (.tgz from https://terminology.hl7.org/en/downloads.html)
 hts import ./hl7.terminology.r4-6.0.0.tgz
+
+# Same import into PostgreSQL
+hts import ./hl7.terminology.r4-6.0.0.tgz \
+  --storage-backend postgres \
+  --database-url "postgresql://user:pass@localhost/hts"
 
 # SNOMED CT RF2 ZIP (requires NRC license)
 hts import ./SnomedCT_InternationalRF2_*.zip --format snomed-rf2
@@ -303,9 +310,13 @@ hts run --database-url ./my-terminology.db
 
 # Enable debug logging
 hts run --log-level debug
+
+# Use PostgreSQL instead of SQLite
+hts run --storage-backend postgres \
+  --database-url "postgresql://user:pass@localhost/hts"
 ```
 
-If `hts import` has not been run first, HTS creates the SQLite file (or `./data/hts.db` by default) and applies the schema automatically on startup. No migrations or init scripts are required.
+If `hts import` has not been run first, HTS creates the SQLite file (or `./data/hts.db` by default) and applies the schema automatically on startup. No migrations or init scripts are required. The PostgreSQL backend behaves the same way - the schema is created on first connection if it does not already exist. See [Storage Backends](#storage-backends) for backend details.
 
 ```
 Usage: hts run [OPTIONS]
