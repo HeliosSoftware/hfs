@@ -14,7 +14,7 @@ HTS supports both SQLite and PostgreSQL as database backends - see [Storage Back
 
 HTS is a terminology engine - it does not include terminology data by default. Each terminology must be imported from its issuing authority, and you are responsible for obtaining a license and the source data before importing.
 
-For terminologies where redistribution is permitted, we bundle the data directly in the release distribution, with the latest version available at the time of build for your convenience.
+For terminologies where redistribution is permitted, the latest available data is included directly in each release build - no separate download needed.
 
 ## Features
 
