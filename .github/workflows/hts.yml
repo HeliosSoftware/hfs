@@ -130,7 +130,7 @@ jobs:
         run: cargo build --release -p helios-hts --features "R4,R4B,R5"
 
       - name: Upload HTS binary
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: hts-binary
           path: target/release/hts
@@ -162,7 +162,7 @@ jobs:
           clean: false
 
       - name: Download HTS binary
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: hts-binary
           path: .

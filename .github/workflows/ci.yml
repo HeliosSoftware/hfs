@@ -303,7 +303,7 @@ jobs:
       # Upload coverage report as artifact
       - name: Upload Coverage Report
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: lcov.info
@@ -535,7 +535,7 @@ jobs:
 
       - name: Upload FhirPath Test Results
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: fhirpath-test-results
           path: fhirpath-results/
@@ -645,7 +645,7 @@ jobs:
 
       - name: Upload Rust build artifacts to GitHub
         if: matrix.os != 'Linux-ARM64'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: hfs-${{ matrix.target }}
           path: |
@@ -664,7 +664,7 @@ jobs:
 
       - name: Upload Rust build artifacts to GitHub (Cross-compile)
         if: matrix.os == 'Linux-ARM64'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: hfs-${{ matrix.target }}
           path: |
@@ -684,7 +684,7 @@ jobs:
 
       - name: Upload test_report.json to GitHub
         if: matrix.os == 'Linux-x86'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: test_report
           path: crates/sof/test_report.json
@@ -707,7 +707,7 @@ jobs:
         run: uv run maturin build --release -o dist --target aarch64-unknown-linux-gnu -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
 
       - name: Upload pysof artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: pysof-${{ matrix.target }}
           path: crates/pysof/dist/*
@@ -719,7 +719,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all pysof artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: pysof-*
           path: ./pysof-dist
@@ -763,7 +763,7 @@ jobs:
         working-directory: book
 
       - name: Download all pysof artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: test_report
           path: ./book/book/
@@ -790,13 +790,13 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: 'hfs-*'
           path: ./artifacts
 
       - name: Download pysof artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: 'pysof-*'
           path: ./artifacts
@@ -923,7 +923,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Download CI artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: hfs-${{ matrix.rust_target }}
           path: ./artifact

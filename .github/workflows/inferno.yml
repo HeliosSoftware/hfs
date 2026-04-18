@@ -40,7 +40,7 @@ jobs:
         run: cargo build -p helios-hfs --features R4,sqlite,elasticsearch,postgres,mongodb,s3
 
       - name: Upload HFS binary
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: hfs-binary
           path: target/debug/hfs
@@ -79,7 +79,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Download HFS binary
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: hfs-binary
           path: target/debug
@@ -566,7 +566,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: inferno-test-results-${{ matrix.suite_id }}-${{ matrix.backend }}
           path: inferno-results/
