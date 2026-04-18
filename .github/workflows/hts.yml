@@ -2,16 +2,6 @@ name: HTS Terminology Service CI
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, develop]
-    paths:
-      - "crates/hts/**"
-      - ".github/workflows/hts.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "crates/hts/**"
-      - ".github/workflows/hts.yml"
 
 env:
   CARGO_TERM_COLOR: always
