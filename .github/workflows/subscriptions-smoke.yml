@@ -18,7 +18,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -37,7 +37,7 @@ jobs:
         run: cargo build -p helios-hfs --features R4,subscriptions,sqlite,elasticsearch,postgres,mongodb,s3
 
       - name: Upload HFS binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: hfs-subscriptions-binary
           path: target/debug/hfs
@@ -59,10 +59,10 @@ jobs:
       RESULTS_DIR: subscriptions-smoke-results/${{ matrix.backend }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download HFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: hfs-subscriptions-binary
           path: target/debug
@@ -200,7 +200,7 @@ jobs:
 
       - name: Configure AWS credentials
         if: matrix.backend == 's3-elasticsearch'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
@@ -378,7 +378,7 @@ jobs:
 
       - name: Upload subscriptions smoke artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: subscriptions-smoke-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: subscriptions-smoke-results/${{ matrix.backend }}/

@@ -21,7 +21,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -40,7 +40,7 @@ jobs:
         run: cargo build -p helios-hfs --features R4,sqlite,elasticsearch,postgres,mongodb,s3
 
       - name: Upload HFS binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: hfs-binary
           path: target/debug/hfs
@@ -76,10 +76,10 @@ jobs:
           - { suite_id: us_core_v800, version_label: "v8.0.0" }
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download HFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: hfs-binary
           path: target/debug
@@ -256,7 +256,7 @@ jobs:
 
       - name: Configure AWS credentials
         if: matrix.backend == 's3-elasticsearch'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
@@ -566,7 +566,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: inferno-test-results-${{ matrix.suite_id }}-${{ matrix.backend }}
           path: inferno-results/

@@ -19,7 +19,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -38,7 +38,7 @@ jobs:
         run: cargo build -p helios-hfs --features R4,sqlite,elasticsearch,postgres,mongodb,s3,cloudwatch
 
       - name: Upload HFS binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: hfs-binary
           path: target/debug/hfs
@@ -50,10 +50,10 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download HFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: hfs-binary
           path: target/debug
@@ -160,7 +160,7 @@ jobs:
 
       - name: Upload CORS artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: cors-preflight-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -184,10 +184,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download HFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: hfs-binary
           path: target/debug
@@ -333,7 +333,7 @@ jobs:
 
       - name: Configure AWS credentials
         if: matrix.backend == 's3-elasticsearch' || matrix.backend == 'cloudwatch'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
@@ -744,7 +744,7 @@ jobs:
 
       - name: Upload audit artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: audit-events-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: audit-results/
@@ -789,10 +789,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download HFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: hfs-binary
           path: target/debug
@@ -904,7 +904,7 @@ jobs:
 
       - name: Configure AWS credentials
         if: matrix.backend == 's3'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
@@ -1184,7 +1184,7 @@ jobs:
 
       - name: Upload database-smoke artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: audit-db-smoke-${{ matrix.backend }}-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
