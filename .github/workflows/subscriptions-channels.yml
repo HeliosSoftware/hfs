@@ -2,16 +2,6 @@ name: Subscriptions Channel Integration
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, develop]
-    paths:
-      - "crates/subscriptions/**"
-      - ".github/workflows/subscriptions-channels.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "crates/subscriptions/**"
-      - ".github/workflows/subscriptions-channels.yml"
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,7 +14,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
 
