@@ -15,14 +15,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
 
-/// Top-level CLI for the Helios Terminology Service.
+/// Top-level CLI for the Helios Terminology Server.
 ///
 /// When no subcommand is provided the server starts with default settings,
 /// preserving backwards-compatible behaviour (`hts` == `hts serve`).
 #[derive(Parser, Debug)]
 #[command(
     name = "hts",
-    about = "Helios Terminology Service — FHIR Terminology Operations",
+    about = "Helios Terminology Server — FHIR Terminology Operations",
     version
 )]
 pub struct Cli {
@@ -40,7 +40,7 @@ pub enum Command {
 
 // ── Server config ─────────────────────────────────────────────────────────────
 
-/// Configuration for the Helios Terminology Service HTTP server.
+/// Configuration for the Helios Terminology Server HTTP server.
 #[derive(Parser, Debug, Clone)]
 pub struct HtsConfig {
     /// Server port

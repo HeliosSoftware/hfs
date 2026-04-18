@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
                 host = %config.host,
                 storage_backend = %config.storage_backend,
                 database_url = %config.database_url,
-                "Starting Helios Terminology Service"
+                "Starting Helios Terminology Server"
             );
             run_server(config).await
         }

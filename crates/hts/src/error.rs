@@ -1,4 +1,4 @@
-//! Error types for the Helios Terminology Service.
+//! Error types for the Helios Terminology Server.
 //!
 //! All fallible operations in HTS return [`HtsError`].  The [`IntoResponse`]
 //! implementation converts each variant to the appropriate HTTP status code and

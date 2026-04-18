@@ -1,4 +1,4 @@
-//! Trait definitions for the Helios Terminology Service.
+//! Trait definitions for the Helios Terminology Server.
 //!
 //! Each sub-module defines one slice of the backend contract:
 //!

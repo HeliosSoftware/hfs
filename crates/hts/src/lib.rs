@@ -1,4 +1,4 @@
-//! # Helios Terminology Service (HTS)
+//! # Helios Terminology Server (HTS)
 //!
 //! HTS is a FHIR R4 Terminology Service implementing the operations defined in
 //! the FHIR specification for CodeSystem, ValueSet, and ConceptMap resources.

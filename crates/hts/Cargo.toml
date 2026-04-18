@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/hts"
 rust-version.workspace = true
-description = "Helios Terminology Service — FHIR Terminology Operations"
+description = "Helios Terminology Server — FHIR Terminology Operations"
 keywords = ["helios-software", "hl7", "fhir", "terminology", "healthcare"]
 categories = ["web-programming"]
 

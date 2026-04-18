@@ -37,7 +37,7 @@ use crate::traits::{TerminologyBackend, TerminologyMetadata};
 use super::format::{fhir_respond, negotiate_format};
 
 const HTS_VERSION: &str = env!("CARGO_PKG_VERSION");
-const HTS_NAME: &str = "Helios Terminology Service";
+const HTS_NAME: &str = "Helios Terminology Server";
 
 /// Query parameters accepted by `GET /metadata`.
 #[derive(Debug, Default, Deserialize)]
@@ -132,7 +132,7 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
         }),
         implementation: Some(TerminologyCapabilitiesImplementation {
             description: Element {
-                value: Some("Helios Terminology Service SQLite backend".to_string()),
+                value: Some("Helios Terminology Server SQLite backend".to_string()),
                 ..Default::default()
             },
             ..Default::default()
@@ -238,7 +238,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
             "version": HTS_VERSION
         },
         "implementation": {
-            "description": "Helios Terminology Service SQLite backend"
+            "description": "Helios Terminology Server SQLite backend"
         },
         "rest": [{
             "mode": "server",

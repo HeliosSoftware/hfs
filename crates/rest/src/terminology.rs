@@ -1,7 +1,7 @@
 //! Terminology service client for HFS/HTS integration.
 //!
 //! This module provides an async HTTP client for communicating with the
-//! Helios Terminology Service (HTS) or any compatible FHIR terminology server.
+//! Helios Terminology Server (HTS) or any compatible FHIR terminology server.
 //! It is used internally by the FHIR search handler to resolve `:in` and `:not-in`
 //! search modifiers via `POST /ValueSet/$expand`.
 //!
@@ -74,7 +74,7 @@ impl ExpandedCode {
 /// Async HTTP client for FHIR terminology server operations.
 ///
 /// Used by the HFS REST layer to expand ValueSets when processing `:in` and
-/// `:not-in` search modifiers. Targets the Helios Terminology Service (HTS)
+/// `:not-in` search modifiers. Targets the Helios Terminology Server (HTS)
 /// by default but is compatible with any FHIR R4+ terminology server.
 #[derive(Clone)]
 pub struct TerminologyServiceClient {

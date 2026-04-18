@@ -367,7 +367,7 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
     pub elasticsearch_password: Option<String>,
 
-    /// URL of the Helios Terminology Service (HTS) for terminology operations.
+    /// URL of the Helios Terminology Server (HTS) for terminology operations.
     ///
     /// When set, HFS delegates the following operations to the HTS:
     /// - FHIR search `:in` modifier  → `POST /ValueSet/$expand`

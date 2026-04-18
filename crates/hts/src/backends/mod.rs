@@ -1,4 +1,4 @@
-//! Storage backend implementations for the Helios Terminology Service.
+//! Storage backend implementations for the Helios Terminology Server.
 //!
 //! Each sub-module provides a concrete implementation of [`TerminologyBackend`]
 //! gated by the corresponding feature flag.

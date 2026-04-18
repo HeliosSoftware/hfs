@@ -1,4 +1,4 @@
-//! Axum application router for the Helios Terminology Service.
+//! Axum application router for the Helios Terminology Server.
 //!
 //! [`create_app`] is the single entry point that wires every HTTP handler to
 //! its route and attaches middleware.  It is called from `main.rs` during

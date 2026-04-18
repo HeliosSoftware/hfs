@@ -1,4 +1,4 @@
-//! Integration tests for HTS (Helios Terminology Service) delegation.
+//! Integration tests for HTS (Helios Terminology Server) delegation.
 //!
 //! These tests verify that:
 //! 1. Search parameters with `:in` modifiers are expanded via `POST /ValueSet/$expand`
