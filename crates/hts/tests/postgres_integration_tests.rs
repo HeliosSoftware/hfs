@@ -1808,3 +1808,284 @@ async fn search_concept_maps_pagination() {
 
     assert_eq!(result.len(), 1, "Should find exactly the requested CM");
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Importer parity tests — verify a representative set of non-hl7-npm importers
+// runs end-to-end against the PostgreSQL backend.
+//
+// Each test uses `delete_normalized` to purge its CodeSystem by URL before
+// seeding, so it is robust to state left over by prior test runs or by other
+// tests running in parallel. Assertions are URL-scoped (via `lookup` or
+// URL-filtered SQL counts) rather than table-wide, so concurrent tests against
+// different CodeSystem URLs do not interfere.
+// ──────────────────────────────────────────────────────────────────────────────
+
+use helios_hts::import::dicom::import_dicom;
+use helios_hts::import::icd10_cm::import_icd10_cm;
+use helios_hts::import::loinc_csv::import_loinc_csv;
+use helios_hts::import::ucum::import_ucum;
+
+/// Scoped count of concepts registered under a specific CodeSystem URL.
+async fn count_concepts_for_url(backend: &PostgresTerminologyBackend, url: &str) -> i64 {
+    let client = backend.pool().get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) FROM concepts c \
+             JOIN code_systems cs ON cs.id = c.system_id \
+             WHERE cs.url = $1",
+            &[&url],
+        )
+        .await
+        .unwrap();
+    row.get(0)
+}
+
+/// Scoped count of hierarchy edges registered under a specific CodeSystem URL.
+async fn count_hierarchy_for_url(backend: &PostgresTerminologyBackend, url: &str) -> i64 {
+    let client = backend.pool().get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) FROM concept_hierarchy ch \
+             JOIN code_systems cs ON cs.id = ch.system_id \
+             WHERE cs.url = $1",
+            &[&url],
+        )
+        .await
+        .unwrap();
+    row.get(0)
+}
+
+/// UCUM parity — real distribution uses `http://unitsofmeasure.org`.
+#[tokio::test]
+async fn importer_ucum_runs_against_postgres() {
+    let backend = fresh_backend().await;
+    const UCUM_URL: &str = "http://unitsofmeasure.org";
+
+    // Purge any residual state from a prior run.
+    backend
+        .delete_normalized("CodeSystem", UCUM_URL)
+        .await
+        .unwrap();
+
+    // Minimal UCUM essence XML fixture — 3 codes.
+    const SAMPLE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns="http://unitsofmeasure.org/ucum-essence" version="2.1">
+  <prefix Code="k" CODE="K"><name>kilo</name></prefix>
+  <base-unit Code="m" CODE="M"><name>meter</name></base-unit>
+  <unit Code="[lb_av]" CODE="[LB_AV]"><name>pound</name></unit>
+</root>"#;
+
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
+    tmp.write_all(SAMPLE_XML.as_bytes()).unwrap();
+
+    let stats = import_ucum(&backend, &ctx(), tmp.path(), 500, false)
+        .await
+        .unwrap();
+
+    assert_eq!(stats.code_systems, 1);
+    assert_eq!(stats.concepts, 3);
+
+    // Virtual UCUM root + 3 unit codes.
+    assert_eq!(count_concepts_for_url(&backend, UCUM_URL).await, 4);
+    // 3 flat edges: UCUM → each code.
+    assert_eq!(count_hierarchy_for_url(&backend, UCUM_URL).await, 3);
+
+    // Round-trip via `$lookup` to confirm the data is queryable.
+    let resp = CodeSystemOperations::lookup(
+        &backend,
+        &ctx(),
+        LookupRequest {
+            system: UCUM_URL.into(),
+            code: "m".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.display.as_deref(), Some("meter"));
+
+    // Cleanup so we do not leak state into subsequent tests.
+    backend
+        .delete_normalized("CodeSystem", UCUM_URL)
+        .await
+        .unwrap();
+}
+
+/// LOINC parity — real distribution uses `http://loinc.org`.
+#[tokio::test]
+async fn importer_loinc_runs_against_postgres() {
+    let backend = fresh_backend().await;
+    const LOINC_URL: &str = "http://loinc.org";
+
+    backend
+        .delete_normalized("CodeSystem", LOINC_URL)
+        .await
+        .unwrap();
+
+    // Synthetic LoincTable + MultiAxialHierarchy CSVs, packed into a ZIP.
+    const LOINC_TABLE_CSV: &str = "LOINC_NUM,LONG_COMMON_NAME,ShortName,STATUS\r\n\
+2160-0,Creatinine [Mass/volume] in Serum or Plasma,Creat SerPl-mCnc,ACTIVE\r\n\
+718-7,Hemoglobin [Mass/volume] in Blood,Hgb Bld-mCnc,ACTIVE\r\n\
+99999-9,Old deprecated test,Old test,DEPRECATED\r\n";
+
+    const HIERARCHY_CSV: &str = "PATH_TO_ROOT,SEQUENCE,IMMEDIATE_PARENT,CODE,CODE_TEXT\r\n\
+LP7786-3,1,,LP7786-3,Laboratory\r\n\
+LP7786-3.LP29693-6,2,LP7786-3,LP29693-6,Chemistry\r\n\
+LP7786-3.LP29693-6.2160-0,3,LP29693-6,2160-0,Creatinine\r\n\
+LP7786-3.LP10156-0,2,LP7786-3,LP10156-0,Hematology\r\n\
+LP7786-3.LP10156-0.718-7,3,LP10156-0,718-7,Hemoglobin\r\n";
+
+    use std::io::Write;
+    let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+    {
+        let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+        let opts = zip::write::FileOptions::default();
+        zip.start_file("LoincTable.csv", opts).unwrap();
+        zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();
+        zip.start_file("MultiAxialHierarchy.csv", opts).unwrap();
+        zip.write_all(HIERARCHY_CSV.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    let stats = import_loinc_csv(&backend, &ctx(), tmp.path(), 500, false)
+        .await
+        .unwrap();
+
+    // 3 LOINC codes + 3 LP category nodes = 6 concepts.
+    assert_eq!(stats.concepts, 6);
+    assert_eq!(count_concepts_for_url(&backend, LOINC_URL).await, 6);
+    assert_eq!(count_hierarchy_for_url(&backend, LOINC_URL).await, 4);
+
+    // Deprecated codes carry their status in the `definition` column.
+    let resp = CodeSystemOperations::lookup(
+        &backend,
+        &ctx(),
+        LookupRequest {
+            system: LOINC_URL.into(),
+            code: "99999-9".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.display.as_deref(), Some("Old deprecated test"));
+
+    backend
+        .delete_normalized("CodeSystem", LOINC_URL)
+        .await
+        .unwrap();
+}
+
+/// ICD-10-CM parity — real distribution uses `http://hl7.org/fhir/sid/icd-10-cm`.
+#[tokio::test]
+async fn importer_icd10_cm_runs_against_postgres() {
+    let backend = fresh_backend().await;
+    const ICD10CM_URL: &str = "http://hl7.org/fhir/sid/icd-10-cm";
+
+    backend
+        .delete_normalized("CodeSystem", ICD10CM_URL)
+        .await
+        .unwrap();
+
+    const TABULAR_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ICD10CM.tabular>
+  <chapter>
+    <name>I</name>
+    <desc>Certain infectious and parasitic diseases</desc>
+    <section id="A00-A09">
+      <desc>Intestinal infectious diseases</desc>
+      <diag>
+        <name>A00</name>
+        <desc>Cholera</desc>
+        <diag><name>A00.0</name><desc>Cholera due to Vibrio cholerae 01, biovar cholerae</desc></diag>
+        <diag><name>A00.9</name><desc>Cholera, unspecified</desc></diag>
+      </diag>
+    </section>
+  </chapter>
+</ICD10CM.tabular>"#;
+
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::with_suffix(".xml").unwrap();
+    tmp.write_all(TABULAR_XML.as_bytes()).unwrap();
+
+    let stats = import_icd10_cm(&backend, &ctx(), tmp.path(), 500, false)
+        .await
+        .unwrap();
+
+    // Virtual root + 1 chapter + 1 section + 1 header + 2 billable = 6.
+    assert_eq!(stats.concepts, 6);
+    assert_eq!(count_concepts_for_url(&backend, ICD10CM_URL).await, 6);
+    // Every concept except the virtual root has a parent = 5 edges.
+    assert_eq!(count_hierarchy_for_url(&backend, ICD10CM_URL).await, 5);
+
+    let resp = CodeSystemOperations::lookup(
+        &backend,
+        &ctx(),
+        LookupRequest {
+            system: ICD10CM_URL.into(),
+            code: "A00.9".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.display.as_deref(), Some("Cholera, unspecified"));
+
+    backend
+        .delete_normalized("CodeSystem", ICD10CM_URL)
+        .await
+        .unwrap();
+}
+
+/// DICOM parity — small flat enumeration importer, covers the "no hierarchy
+/// beyond a virtual root" path.
+#[tokio::test]
+async fn importer_dicom_runs_against_postgres() {
+    let backend = fresh_backend().await;
+    const DICOM_URL: &str = "http://dicom.nema.org/resources/ontology/DCM";
+
+    backend
+        .delete_normalized("CodeSystem", DICOM_URL)
+        .await
+        .unwrap();
+
+    const SAMPLE_CSV: &str = "CodeValue,CodingSchemeDesignator,CodeMeaning\n\
+001,DCM,Quantitative Immunofluorescence\n\
+002,DCM,Qualitative Immunofluorescence\n";
+
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+    tmp.write_all(SAMPLE_CSV.as_bytes()).unwrap();
+
+    let stats = import_dicom(&backend, &ctx(), tmp.path(), 500, false)
+        .await
+        .unwrap();
+
+    assert_eq!(stats.concepts, 2);
+    // DCM virtual root + 2 real codes.
+    assert_eq!(count_concepts_for_url(&backend, DICOM_URL).await, 3);
+    // 2 flat edges.
+    assert_eq!(count_hierarchy_for_url(&backend, DICOM_URL).await, 2);
+
+    let resp = CodeSystemOperations::lookup(
+        &backend,
+        &ctx(),
+        LookupRequest {
+            system: DICOM_URL.into(),
+            code: "002".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.display.as_deref(),
+        Some("Qualitative Immunofluorescence")
+    );
+
+    backend
+        .delete_normalized("CodeSystem", DICOM_URL)
+        .await
+        .unwrap();
+}
