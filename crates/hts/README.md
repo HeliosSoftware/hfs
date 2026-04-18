@@ -181,49 +181,11 @@ cargo build --release -p helios-hts --features R4,R4B,R5,R6,sqlite
 
 ## Usage
 
-### `hts run`
-
-Start the FHIR Terminology HTTP server. This is the default command when no subcommand is given.
-
-```bash
-# Run with default settings (R4, SQLite, port 8090)
-hts run
-
-# Equivalent - run is the default
-hts
-
-# Specify a different port
-hts run --port 9090
-
-# Custom database path
-hts run --database-url ./my-terminology.db
-
-# Enable debug logging
-hts run --log-level debug
-```
-
-On first start HTS creates the SQLite file (or `./data/hts.db` by default) and applies the schema automatically. No migrations or init scripts are required.
-
-```
-Usage: hts run [OPTIONS]
-
-Options:
-      --port <PORT>                Server port [env: HTS_SERVER_PORT=] [default: 8090]
-      --host <HOST>                Host to bind [env: HTS_SERVER_HOST=] [default: 127.0.0.1]
-      --log-level <LOG_LEVEL>      Log level (error, warn, info, debug, trace)
-                                   [env: HTS_LOG_LEVEL=] [default: info]
-      --database-url <URL>         Database URL [env: HTS_DATABASE_URL=] [default: ./data/hts.db]
-      --storage-backend <BACKEND>  Storage backend [env: HTS_STORAGE_BACKEND=] [default: sqlite]
-      --enable-cors                Enable CORS [env: HTS_ENABLE_CORS=] [default: true]
-      --cors-origins <ORIGINS>     Allowed CORS origins [env: HTS_CORS_ORIGINS=] [default: *]
-      --max-expansion-size <N>     Max codes in a ValueSet expansion [env: HTS_MAX_EXPANSION_SIZE=]
-                                   [default: 3500]
-  -h, --help                       Print help
-```
-
 ### `hts import`
 
-Bulk-import a terminology package from the filesystem into the HTS database.
+Bulk-import a terminology package from the filesystem into the HTS database. Typically run before `hts run` so the server starts with terminology data already loaded.
+
+If the target SQLite database does not yet exist, `hts import` creates the file (default: `./data/hts.db`) and applies the schema automatically - no prior `hts run` is required.
 
 ```bash
 # HL7 FHIR NPM package (.tgz from https://terminology.hl7.org/en/downloads.html)
@@ -321,6 +283,46 @@ Options:
 | `0` | Success - all resources imported |
 | `1` | Fatal error - import aborted |
 | `2` | Success with non-fatal errors - some records skipped |
+
+### `hts run`
+
+Start the FHIR Terminology HTTP server. This is the default command when no subcommand is given.
+
+```bash
+# Run with default settings (R4, SQLite, port 8090)
+hts run
+
+# Equivalent - run is the default
+hts
+
+# Specify a different port
+hts run --port 9090
+
+# Custom database path
+hts run --database-url ./my-terminology.db
+
+# Enable debug logging
+hts run --log-level debug
+```
+
+If `hts import` has not been run first, HTS creates the SQLite file (or `./data/hts.db` by default) and applies the schema automatically on startup. No migrations or init scripts are required.
+
+```
+Usage: hts run [OPTIONS]
+
+Options:
+      --port <PORT>                Server port [env: HTS_SERVER_PORT=] [default: 8090]
+      --host <HOST>                Host to bind [env: HTS_SERVER_HOST=] [default: 127.0.0.1]
+      --log-level <LOG_LEVEL>      Log level (error, warn, info, debug, trace)
+                                   [env: HTS_LOG_LEVEL=] [default: info]
+      --database-url <URL>         Database URL [env: HTS_DATABASE_URL=] [default: ./data/hts.db]
+      --storage-backend <BACKEND>  Storage backend [env: HTS_STORAGE_BACKEND=] [default: sqlite]
+      --enable-cors                Enable CORS [env: HTS_ENABLE_CORS=] [default: true]
+      --cors-origins <ORIGINS>     Allowed CORS origins [env: HTS_CORS_ORIGINS=] [default: *]
+      --max-expansion-size <N>     Max codes in a ValueSet expansion [env: HTS_MAX_EXPANSION_SIZE=]
+                                   [default: 3500]
+  -h, --help                       Print help
+```
 
 ## Configuration
 
