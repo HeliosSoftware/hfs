@@ -1,4 +1,4 @@
-name: HTS Terminology Service CI
+name: HTS Terminology Server CI
 
 on:
   workflow_dispatch:

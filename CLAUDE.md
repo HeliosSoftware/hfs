@@ -146,7 +146,7 @@ The project is a Rust workspace with 12 crates (`pysof` excluded from default-me
 | `sof-cli` | helios-sof | SQL-on-FHIR CLI tool |
 | `sof-server` | helios-sof | SQL-on-FHIR HTTP server |
 | `config-advisor` | helios-persistence | Storage configuration advisor |
-| `hts` | helios-hts | FHIR Terminology Service (HTS) |
+| `hts` | helios-hts | FHIR Terminology Server (HTS) |
 
 ### Key Design Patterns
 
