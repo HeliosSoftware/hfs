@@ -74,7 +74,7 @@ where
         // ── Batch / transaction ───────────────────────────────────────────────
         .route("/", post(batch_handler::<B>))
         // ── Utility ──────────────────────────────────────────────────────────
-        .route("/health", get(health_handler))
+        .route("/health", get(health_handler::<B>))
         // ── Capabilities ─────────────────────────────────────────────────────
         .route("/metadata", get(metadata_handler::<B>))
         // ── CodeSystem operations ─────────────────────────────────────────────
