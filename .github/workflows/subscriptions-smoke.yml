@@ -1,0 +1,398 @@
+name: HFS Subscriptions External Smoke
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  HFS_PORT: 18088
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}
+
+jobs:
+  build:
+    name: Build HFS (subscriptions)
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Build HFS binary with subscriptions
+        run: cargo build -p helios-hfs --features R4,subscriptions,sqlite,elasticsearch,postgres,mongodb,s3
+
+      - name: Upload HFS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-subscriptions-binary
+          path: target/debug/hfs
+          retention-days: 1
+
+  subscriptions-smoke:
+    name: Subscriptions Smoke (${{ matrix.backend }})
+    needs: build
+    runs-on: [self-hosted, Linux]
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
+    env:
+      RESULTS_DIR: subscriptions-smoke-results/${{ matrix.backend }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-subscriptions-binary
+          path: target/debug
+
+      - name: Make executables available
+        run: |
+          chmod +x target/debug/hfs
+          chmod +x crates/hfs/tests/subscriptions/run_external_subscriptions_smoke.sh
+
+      - name: Determine runner and Docker host IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> $GITHUB_ENV
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      - name: Validate backend configuration
+        run: |
+          if [ "${{ matrix.backend }}" = "s3-elasticsearch" ] && [ -z "$HFS_S3_BUCKET" ]; then
+            echo "::error::s3-elasticsearch backend requires HFS_S3_BUCKET to be configured"
+            exit 1
+          fi
+
+      - name: Start Elasticsearch
+        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        run: |
+          ES_CONTAINER="es-subscriptions-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$ES_CONTAINER" -p 0:9200 \
+            -e "discovery.type=single-node" \
+            -e "xpack.security.enabled=false" \
+            -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+            elasticsearch:8.15.0
+
+          echo "ES_CONTAINER=$ES_CONTAINER" >> $GITHUB_ENV
+
+          echo "Waiting for Elasticsearch to be ready..."
+          for i in {1..30}; do
+            ES_PORT=$(docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$ES_PORT" ]; then
+              if curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" > /dev/null 2>&1; then
+                echo "Elasticsearch is ready on port $ES_PORT"
+                echo "ES_PORT=$ES_PORT" >> $GITHUB_ENV
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: Elasticsearch not ready yet..."
+            sleep 2
+          done
+
+          echo "Elasticsearch failed to start"
+          docker logs "$ES_CONTAINER"
+          exit 1
+
+      - name: Start PostgreSQL
+        if: matrix.backend == 'postgres'
+        run: |
+          PG_CONTAINER="pg-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PG_CONTAINER" -p 0:5432 \
+            -e POSTGRES_USER=helios \
+            -e POSTGRES_PASSWORD=helios \
+            -e POSTGRES_DB=helios \
+            postgres:16
+
+          echo "PG_CONTAINER=$PG_CONTAINER" >> $GITHUB_ENV
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..30}; do
+            if docker exec "$PG_CONTAINER" pg_isready -U helios > /dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PostgreSQL is ready on port $PG_PORT"
+                echo "PG_PORT=$PG_PORT" >> $GITHUB_ENV
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: PostgreSQL not ready yet..."
+            sleep 2
+          done
+
+          echo "PostgreSQL failed to start"
+          docker logs "$PG_CONTAINER"
+          exit 1
+
+      - name: Start MongoDB replica set
+        if: matrix.backend == 'mongodb'
+        run: |
+          MONGO_CONTAINER="mongo-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+
+          echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
+
+          READY=0
+          for i in {1..30}; do
+            if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' > /dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            echo "Attempt $i/30: MongoDB not ready yet..."
+            sleep 2
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "MongoDB failed to start"
+            docker logs "$MONGO_CONTAINER"
+            exit 1
+          fi
+
+          docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status(); } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] }); }' > /dev/null 2>&1
+
+          echo "Waiting for MongoDB replica set primary..."
+          for i in {1..60}; do
+            PRIMARY_STATE=$(docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status().myState } catch (e) { 0 }' | tr -d '\r\n ')
+            if [ "$PRIMARY_STATE" = "1" ]; then
+              MONGO_PORT=$(docker port "$MONGO_CONTAINER" 27017 | head -1 | sed 's/.*://')
+              echo "MongoDB replica set is ready on port $MONGO_PORT"
+              echo "MONGO_PORT=$MONGO_PORT" >> $GITHUB_ENV
+              exit 0
+            fi
+            echo "Attempt $i/60: MongoDB replica set not primary yet..."
+            sleep 2
+          done
+
+          echo "MongoDB replica set failed to become primary"
+          docker logs "$MONGO_CONTAINER"
+          exit 1
+
+      - name: Configure AWS credentials
+        if: matrix.backend == 's3-elasticsearch'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install AWS CLI
+        if: matrix.backend == 's3-elasticsearch'
+        run: |
+          if ! command -v aws &>/dev/null; then
+            if ! /tmp/aws-bin/aws --version &>/dev/null; then
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -qo /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
+              rm -rf /tmp/awscliv2.zip /tmp/aws
+            fi
+            echo "/tmp/aws-bin" >> $GITHUB_PATH
+          fi
+          aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
+      - name: Install websocat
+        run: |
+          if command -v websocat >/dev/null 2>&1; then
+            echo "WEBSOCAT_BIN=$(command -v websocat)" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64)
+              ASSET="websocat.x86_64-unknown-linux-musl"
+              ;;
+            aarch64|arm64)
+              ASSET="websocat.aarch64-unknown-linux-musl"
+              ;;
+            *)
+              echo "::error::Unsupported architecture for websocat install: $ARCH"
+              exit 1
+              ;;
+          esac
+
+          WEBSOCAT_PATH="/tmp/websocat"
+          curl -fsSL "https://github.com/vi/websocat/releases/download/v1.13.0/${ASSET}" -o "$WEBSOCAT_PATH"
+          chmod +x "$WEBSOCAT_PATH"
+          echo "WEBSOCAT_BIN=$WEBSOCAT_PATH" >> $GITHUB_ENV
+          "$WEBSOCAT_PATH" --version
+
+      - name: Start HFS server
+        run: |
+          case "${{ matrix.backend }}" in
+            sqlite) HFS_PORT=18088 ;;
+            sqlite-elasticsearch) HFS_PORT=18089 ;;
+            postgres) HFS_PORT=18090 ;;
+            mongodb) HFS_PORT=18091 ;;
+            s3-elasticsearch) HFS_PORT=18092 ;;
+            *) HFS_PORT=18088 ;;
+          esac
+          mkdir -p "$RESULTS_DIR"
+
+          HFS_LOG="$RESULTS_DIR/hfs.log"
+          echo "HFS_PORT=$HFS_PORT" >> $GITHUB_ENV
+          echo "RESULTS_DIR=$RESULTS_DIR" >> $GITHUB_ENV
+          echo "HFS_LOG=$HFS_LOG" >> $GITHUB_ENV
+
+          if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_STORAGE_BACKEND=sqlite-elasticsearch \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_STORAGE_BACKEND=postgres \
+            HFS_PG_HOST="$DOCKER_HOST_IP" \
+            HFS_PG_PORT="$PG_PORT" \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_STORAGE_BACKEND=mongodb \
+            HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_subscriptions_smoke_${{ github.run_id }}_${{ github.run_attempt }}" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            HFS_STORAGE_BACKEND=s3-elasticsearch \
+            HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
+            HFS_S3_PREFIX="ci/subscriptions-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.backend }}/" \
+            HFS_S3_VALIDATE_BUCKETS=false \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          else
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="http://localhost:$HFS_PORT" \
+            ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          fi
+
+          echo $! > /tmp/hfs-subscriptions-smoke.pid
+          echo "HFS_PID=$(cat /tmp/hfs-subscriptions-smoke.pid)" >> $GITHUB_ENV
+
+      - name: Wait for HFS to be ready
+        run: |
+          echo "Waiting for HFS to start..."
+          for i in {1..30}; do
+            if ! kill -0 "$HFS_PID" 2>/dev/null; then
+              echo "HFS process ($HFS_PID) exited"
+              cat "$HFS_LOG"
+              exit 1
+            fi
+            if curl -sf "http://localhost:$HFS_PORT/health" > /dev/null 2>&1; then
+              echo "HFS is ready"
+              exit 0
+            fi
+            echo "Attempt $i/30: HFS not ready yet..."
+            sleep 2
+          done
+
+          echo "HFS failed to start"
+          tail -50 "$HFS_LOG"
+          exit 1
+
+      - name: Run subscriptions smoke checks
+        run: |
+          BASE_URL="http://localhost:$HFS_PORT" \
+          RESULTS_DIR="$RESULTS_DIR" \
+          WEBSOCAT_BIN="$WEBSOCAT_BIN" \
+          ./crates/hfs/tests/subscriptions/run_external_subscriptions_smoke.sh
+
+      - name: Stop HFS gracefully
+        if: always()
+        run: |
+          if [ -f /tmp/hfs-subscriptions-smoke.pid ]; then
+            HFS_PID=$(cat /tmp/hfs-subscriptions-smoke.pid)
+            kill -INT "$HFS_PID" 2>/dev/null || true
+            for _ in {1..50}; do
+              if kill -0 "$HFS_PID" 2>/dev/null; then
+                sleep 0.2
+              else
+                break
+              fi
+            done
+            kill -9 "$HFS_PID" 2>/dev/null || true
+          fi
+          rm -f /tmp/hfs-subscriptions-smoke.pid
+
+      - name: Collect backend container logs
+        if: always()
+        run: |
+          RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results/${{ matrix.backend }}}"
+          mkdir -p "$RESULTS_DIR/backend-logs"
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker logs "$ES_CONTAINER" > "$RESULTS_DIR/backend-logs/elasticsearch.log" 2>&1 || true
+          fi
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker logs "$PG_CONTAINER" > "$RESULTS_DIR/backend-logs/postgres.log" 2>&1 || true
+          fi
+          if [ -n "${MONGO_CONTAINER:-}" ]; then
+            docker logs "$MONGO_CONTAINER" > "$RESULTS_DIR/backend-logs/mongodb.log" 2>&1 || true
+          fi
+
+      - name: Append smoke report to summary
+        if: always()
+        run: |
+          RESULTS_DIR="${RESULTS_DIR:-subscriptions-smoke-results/${{ matrix.backend }}}"
+          if [ -f "$RESULTS_DIR/summary.md" ]; then
+            cat "$RESULTS_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Subscriptions Smoke (${{ matrix.backend }})" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No summary produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload subscriptions smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: subscriptions-smoke-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: subscriptions-smoke-results/${{ matrix.backend }}/
+          retention-days: 30
+
+      - name: Cleanup containers
+        if: always()
+        run: |
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${MONGO_CONTAINER:-}" ]; then
+            docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          fi

@@ -80,7 +80,10 @@ neo4rs = { version = "0.8", optional = true }
 elasticsearch = { version = "8.15.0-alpha.1", optional = true }
 
 # S3 backend
-aws-sdk-s3 = { version = "1", optional = true }
+# Disable default features to avoid the legacy `rustls` feature that pulls
+# in vulnerable rustls 0.21 / rustls-webpki 0.101. `default-https-client`
+# uses the modern rustls-aws-lc path instead.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
 

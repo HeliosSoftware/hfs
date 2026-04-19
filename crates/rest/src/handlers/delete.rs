@@ -70,6 +70,18 @@ where
         "Resource deleted"
     );
 
+    // Emit subscription event
+    #[cfg(feature = "subscriptions")]
+    if let Some(engine) = state.subscription_engine() {
+        super::subscription_event::emit_delete_event(
+            engine,
+            tenant.context(),
+            &resource_type,
+            &id,
+            helios_fhir::FhirVersion::default(),
+        );
+    }
+
     // Return 204 No Content (or 200 with OperationOutcome)
     Ok(StatusCode::NO_CONTENT.into_response())
 }
