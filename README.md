@@ -269,14 +269,8 @@ The Helios FHIR Server is organized as a Rust workspace with modular components 
   - `hfs` - The main Helios FHIR Server application.
 
 ### 2. [`helios-hts`](crates/hts) - FHIR Terminology Server
-A standalone FHIR Terminology Server implementing the standard terminology operations.
 - **Executable:**
   - `hts` - The Helios Terminology Server (default port 8090)
-- Supports `$lookup`, `$validate-code`, `$subsumes`, `$expand`, `$translate`, and `$closure` operations
-- CRUD for `CodeSystem`, `ValueSet`, and `ConceptMap` resources
-- Storage backends: SQLite (default) and PostgreSQL
-- Bulk import CLI for HL7 FHIR NPM packages, SNOMED CT RF2, LOINC, ICD-10-CM, and RxNorm
-- Integrates with HFS via `HFS_TERMINOLOGY_SERVER` to power search `:in` modifiers and FHIRPath `memberOf()` / `subsumes()`
 
 ### 3. [`helios-fhir`](crates/fhir) - FHIR Data Models
 Generated from FHIR StructureDefinitions, type-safe Rust representations of all FHIR resources and data types.
