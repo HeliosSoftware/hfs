@@ -27,6 +27,7 @@ The Helios FHIR Server is an implementation of the [HL7® FHIR®](https://hl7.or
 The Helios FHIR Server includes several components:
 
 - **`hfs`** — the main FHIR server
+- **`hts`** — the FHIR Terminology Server
 - **`fhirpath-cli`** and **`fhirpath-server`** — FHIRPath evaluation
 - **`sof-cli`** and **`sof-server`** — SQL-on-FHIR transformation
 - **[`pysof`](https://pypi.org/project/pysof/)** — Python bindings for SQL-on-FHIR
@@ -46,6 +47,9 @@ The following are independent examples showing how to run each executable — pi
 ```bash
 # FHIR server (access at http://localhost:8080/metadata)
 ./hfs
+
+# FHIR Terminology Server (access at http://localhost:8090/metadata)
+./hts
 
 # Evaluate a FHIRPath expression
 echo '{"resourceType": "Patient", "id": "123"}' | ./fhirpath-cli 'Patient.id'
@@ -85,6 +89,12 @@ docker run -p 3000:3000 ghcr.io/heliossoftware/fhirpath-server:latest
 
 # SQL-on-FHIR Server (port 8080)
 docker run -p 8080:8080 ghcr.io/heliossoftware/sof-server:latest
+
+# FHIR Terminology Server (default: SQLite, port 8090)
+docker run -p 8090:8090 ghcr.io/heliossoftware/hts:latest
+
+# HTS with persistent SQLite storage
+docker run -p 8090:8090 -v hts-data:/data -e HTS_DATABASE_URL=/data/hts.db ghcr.io/heliossoftware/hts:latest
 ```
 
 See [Environment Variables](#environment-variables) for all available configuration options.
@@ -258,20 +268,30 @@ The Helios FHIR Server is organized as a Rust workspace with modular components 
 - **Executable:**
   - `hfs` - The main Helios FHIR Server application.
 
-### 2. [`helios-fhir`](crates/fhir) - FHIR Data Models
+### 2. [`helios-hts`](crates/hts) - FHIR Terminology Server
+A standalone FHIR Terminology Server implementing the standard terminology operations.
+- **Executable:**
+  - `hts` - The Helios Terminology Server (default port 8090)
+- Supports `$lookup`, `$validate-code`, `$subsumes`, `$expand`, `$translate`, and `$closure` operations
+- CRUD for `CodeSystem`, `ValueSet`, and `ConceptMap` resources
+- Storage backends: SQLite (default) and PostgreSQL
+- Bulk import CLI for HL7 FHIR NPM packages, SNOMED CT RF2, LOINC, ICD-10-CM, and RxNorm
+- Integrates with HFS via `HFS_TERMINOLOGY_SERVER` to power search `:in` modifiers and FHIRPath `memberOf()` / `subsumes()`
+
+### 3. [`helios-fhir`](crates/fhir) - FHIR Data Models
 Generated from FHIR StructureDefinitions, type-safe Rust representations of all FHIR resources and data types.
 - Supports FHIR R4, R4B, R5, and R6 via feature flags
 - JSON serialization/deserialization with full FHIR compliance
 - Precision decimal handling for clinical accuracy
 - Default: R4 (use `--all-features` for all versions)
 
-### 3. [`helios-fhir-gen`](crates/fhir-gen) - Code Generator
+### 4. [`helios-fhir-gen`](crates/fhir-gen) - Code Generator
 Generates the FHIR data models from official HL7 specifications.
 - Transforms FHIR StructureDefinitions into Rust types
 - Automatically downloads the latest R6 specs from the HL7 build server
 - See [Code Generation](#code-generation) section and [helios-fhir-gen README](crates/fhir-gen/README.md) for usage details
 
-### 4. [`helios-fhirpath`](crates/fhirpath) - FHIRPath Expression Engine
+### 5. [`helios-fhirpath`](crates/fhirpath) - FHIRPath Expression Engine
 Complete implementation of the [FHIRPath 3.0.0-ballot specification](https://hl7.org/fhirpath/2025Jan/).
 - **Executables:**
   - `fhirpath-cli` - Evaluate FHIRPath expressions from the command line
@@ -280,7 +300,7 @@ Complete implementation of the [FHIRPath 3.0.0-ballot specification](https://hl7
 - Comprehensive function library with version-aware type checking
 - Auto-detects FHIR version from input data
 
-### 5. [`helios-sof`](crates/sof) - SQL-on-FHIR Implementation
+### 6. [`helios-sof`](crates/sof) - SQL-on-FHIR Implementation
 Transform FHIR resources into tabular data using [ViewDefinitions](https://sql-on-fhir.org/ig/latest/index.html).
 - **Executables:**
   - `sof-cli` - Command-line tool for batch transformations
@@ -288,7 +308,7 @@ Transform FHIR resources into tabular data using [ViewDefinitions](https://sql-o
 - Supports multiple input formats: JSON, NDJSON, and FHIR Bundles from local/cloud storage
 - Supports multiple output formats: CSV, JSON, NDJSON, and Parquet
 
-### 6. [`pysof`](crates/pysof) - Python Bindings
+### 7. [`pysof`](crates/pysof) - Python Bindings
 Python bindings for SQL-on-FHIR using PyO3, bringing high-performance FHIR data transformation to Python.
 
 **Key Capabilities:**
@@ -321,22 +341,22 @@ result = pysof.run_view_definition(
 **Distribution:**
 - Cross-platform wheel distribution for Linux, Windows, and macOS available on [PyPi](https://pypi.org/project/pysof/)
 
-### 7. [`helios-cds-hooks`](crates/cds-hooks) - CDS Hooks Protocol Types
+### 8. [`helios-cds-hooks`](crates/cds-hooks) - CDS Hooks Protocol Types
 Rust types and traits for building [CDS Hooks](https://cds-hooks.hl7.org/) clinical decision support services.
 - Complete protocol types for discovery, requests, responses, cards, suggestions, and feedback
 - Strongly-typed context structs for all 10 hooks in the CDS Hooks Library
 - Async `CdsHooksService` trait compatible with any Rust web framework
 
-### 8. [`helios-fhir-macro`](crates/fhir-macro) - Procedural Macros
+### 9. [`helios-fhir-macro`](crates/fhir-macro) - Procedural Macros
 Helper macros for code generation used by other components.
 
-### 9. [`helios-fhirpath-support`](crates/fhirpath-support) - Shared Utilities
+### 10. [`helios-fhirpath-support`](crates/fhirpath-support) - Shared Utilities
 Common types and traits for FHIRPath evaluation.
 
-### 10. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
+### 11. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
 Storage backend abstraction supporting multiple database technologies optimized for different FHIR workloads.
 
-### 11. [`helios-audit`](crates/audit) - BALP Audit Logging
+### 12. [`helios-audit`](crates/audit) - BALP Audit Logging
 [IHE BALP](https://profiles.ihe.net/ITI/BALP/)-compliant `AuditEvent` logging for REST, auth, persistence, and lifecycle events. Supports file, database, and AWS CloudWatch Logs sinks. See the [helios-audit README](crates/audit/README.md) for full configuration details.
 
 ## Design Principles
