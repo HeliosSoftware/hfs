@@ -187,9 +187,9 @@ pub fn extract_parameters(params: FhirPathParameters) -> Result<ExtractedParamet
         }
         #[allow(unreachable_patterns)]
         _ => {
-            return Err(format!(
-                "FHIR version of Parameters resource is not enabled in this build",
-            ));
+            return Err(
+                "FHIR version of Parameters resource is not enabled in this build".to_string(),
+            );
         }
     }
 
