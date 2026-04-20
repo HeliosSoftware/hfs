@@ -148,6 +148,7 @@ pub mod responses;
 pub mod routing;
 pub mod state;
 pub mod tenant;
+pub mod terminology;
 
 // Re-export commonly used types
 pub use config::{MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode};
@@ -158,7 +159,7 @@ pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
 
 use std::sync::Arc;
 
-use axum::{extract::DefaultBodyLimit, Router};
+use axum::{Router, extract::DefaultBodyLimit};
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
 };

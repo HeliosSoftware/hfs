@@ -146,6 +146,7 @@ The project is a Rust workspace with 12 crates (`pysof` excluded from default-me
 | `sof-cli` | helios-sof | SQL-on-FHIR CLI tool |
 | `sof-server` | helios-sof | SQL-on-FHIR HTTP server |
 | `config-advisor` | helios-persistence | Storage configuration advisor |
+| `hts` | helios-hts | FHIR Terminology Server (HTS) |
 
 ### Key Design Patterns
 
@@ -372,6 +373,7 @@ FHIRPATH_SERVER_PORT=8080 FHIRPATH_SERVER_HOST=0.0.0.0 cargo run --bin fhirpath-
 | `SOF_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `SOF_ENABLE_CORS` | true | Enable CORS |
 | `SOF_CORS_ORIGINS` | * | Allowed origins |
+| `SOF_TERMINOLOGY_SERVER` | (none) | Terminology server URL for FHIRPath functions (memberOf, subsumes) |
 
 ### API Endpoints
 - `GET /metadata` - Returns CapabilityStatement
@@ -496,6 +498,119 @@ export CARGO_BUILD_JOBS=4
 - FHIR examples in `crates/fhir/tests/data/`
 - Search parameter definitions in `data/search-parameters-{r4,r4b,r5,r6}.json`
 - ViewDefinition examples in test files
+
+## HTS Server Configuration
+
+### Running HTS
+```bash
+# Default (SQLite, port 8090)
+cargo run --bin hts
+
+# Custom database path and port
+HTS_DATABASE_URL=./my-terminology.db HTS_SERVER_PORT=9090 cargo run --bin hts
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HTS_SERVER_PORT` | 8090 | Server port |
+| `HTS_SERVER_HOST` | 127.0.0.1 | Host to bind |
+| `HTS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
+| `HTS_DATABASE_URL` | ./data/hts.db | Database location — SQLite file path, or `postgresql://user:pass@host/db` for Postgres |
+| `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite` default; `postgres` when built with `--features postgres`) |
+| `HTS_ENABLE_CORS` | true | Enable CORS |
+| `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
+
+### API Endpoints
+
+| Operation | Method | URL |
+|-----------|--------|-----|
+| health | GET | `/health` |
+| capabilities | GET | `/metadata` |
+| $lookup | POST | `/CodeSystem/$lookup` |
+| $validate-code (CS) | POST | `/CodeSystem/$validate-code` |
+| $subsumes | POST | `/CodeSystem/$subsumes` |
+| $expand | POST | `/ValueSet/$expand` |
+| $validate-code (VS) | POST | `/ValueSet/$validate-code` |
+| $translate | POST | `/ConceptMap/$translate` |
+| $closure | POST | `/ConceptMap/$closure` |
+| import bundle | POST | `/import` |
+| CRUD | GET/POST/PUT/DELETE | `/CodeSystem/:id`, `/ValueSet/:id`, `/ConceptMap/:id` |
+
+### Quick Examples
+```bash
+# Import a FHIR Bundle containing CodeSystem/ValueSet/ConceptMap resources
+curl -X POST http://localhost:8090/import \
+  -H "Content-Type: application/fhir+json" \
+  -d @bundle.json
+
+# Lookup a concept
+curl -X POST http://localhost:8090/CodeSystem/\$lookup \
+  -H "Content-Type: application/fhir+json" \
+  -d '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"http://example.org/cs"},{"name":"code","valueCode":"ABC"}]}'
+
+# Expand a value set
+curl -X POST http://localhost:8090/ValueSet/\$expand \
+  -H "Content-Type: application/fhir+json" \
+  -d '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"http://example.org/vs"}]}'
+```
+
+### HFS Integration
+Set `HFS_TERMINOLOGY_SERVER=http://localhost:8090` on the HFS process to enable:
+- FHIR search `:in` modifier (expands ValueSet, filters by code)
+- FHIRPath `memberOf()` / `subsumes()` delegation via `FHIRPATH_TERMINOLOGY_SERVER`
+
+### Bulk Import CLI (`hts import`)
+
+Load terminology packages directly from the filesystem without going through the HTTP API.
+
+```bash
+# HL7 FHIR NPM package (.tgz from https://terminology.hl7.org/en/downloads.html)
+cargo run --bin hts -- import ./hl7.terminology.r4-6.0.0.tgz
+
+# SNOMED CT RF2 ZIP  ⚠️  requires NRC license
+cargo run --bin hts -- import ./SnomedCT_InternationalRF2_*.zip --format snomed-rf2
+
+# LOINC CSV ZIP  ⚠️  requires free Regenstrief registration at loinc.org
+cargo run --bin hts -- import ./Loinc_*.zip --format loinc
+
+# ICD-10-CM tabular XML (free, no license needed — from cms.gov)
+cargo run --bin hts -- import ./icd10cm_tabular_2025.xml
+
+# RxNorm RRF folder  ⚠️  requires free NLM terms-of-service at nlm.nih.gov
+cargo run --bin hts -- import ./RxNorm_full_current/rrf/
+
+# Common flags
+cargo run --bin hts -- import ./package.tgz \
+  --database-url ./data/hts.db \   # SQLite file (default: ./data/hts.db)
+  --batch-size 1000 \              # resources per batch (default: 500)
+  --dry-run \                      # parse only — no DB writes
+  --verbose                        # debug output to stderr
+```
+
+#### Format auto-detection
+
+| Extension / pattern | Detected format |
+|---------------------|-----------------|
+| `.tgz` / `.tar.gz` | `hl7-npm` |
+| `*_tabular*.xml` | `icd10-cm` |
+| `.rrf` or directory | `rxnorm` |
+| `.zip` containing RF2 files | `snomed-rf2` |
+| `.zip` containing `LoincTable.csv` | `loinc` |
+| `.zip` containing `RXNCONSO.RRF` | `rxnorm` |
+
+`.zip` files that cannot be auto-detected require `--format`.
+
+#### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success — all resources imported |
+| `1` | Fatal error — import aborted |
+| `2` | Success with non-fatal errors — some records skipped |
+
+---
 
 ## Docker
 

@@ -79,6 +79,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 url = "2.5"
 json-patch = "3"
 
+# HTTP client for terminology server integration (HTS)
+reqwest = { version = "0.12", features = ["json"] }
+
 [dev-dependencies]
 # HTTP testing
 axum-test = "18.0"

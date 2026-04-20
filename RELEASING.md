@@ -32,6 +32,15 @@ cargo fmt --all
 cargo test --workspace --all-features
 ```
 - Check in these changes.
+- Refresh the bundled HTS terminology data. These files live in [`crates/hts/terminology-data/`](crates/hts/terminology-data/) and ship inside every HTS release archive and Docker image, so customers get a working server with no extra downloads. The bundled terminologies have their own release cadences (ICD-10-CM annually in October, THO periodically, MeSH annually, etc.), so check each upstream source before tagging:
+  1. Review the upstream landing pages referenced alongside each block in [`crates/hts/scripts/download-bundled-terminologies.sh`](crates/hts/scripts/download-bundled-terminologies.sh). If newer versions are available, bump the `*_VERSION` / `*_YEAR` variables at the top of the script (and the matching `$Xxx` variables in the `.ps1` companion).
+  2. Refresh the checked-in data by re-running the script against the repo's data directory:
+     ```bash
+     ./crates/hts/scripts/download-bundled-terminologies.sh ./crates/hts/terminology-data
+     ```
+     The script skips files that already exist, so delete any stale pins first (or pass a clean output dir) to force a re-download.
+  3. `git add crates/hts/terminology-data/ && git commit` the refreshed files. Plain git works (no LFS) as long as every file stays under GitHub's 100 MB per-file limit — MeSH in particular must remain in its `.zip` form. If a new terminology exceeds the limit, either add a compressed variant the importer can read or introduce Git LFS.
+  4. Push and let CI verify the archive + Docker builds pick up the new files before cutting the release.
 - Ensure that your build in GitHub Actions has succeeded fully.  These are found in [ci.yml](.github/workflows/ci.yml).
 
 ### 2. Create a Release
