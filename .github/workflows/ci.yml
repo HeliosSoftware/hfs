@@ -26,7 +26,7 @@ jobs:
           exit 1
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
 
@@ -85,7 +85,7 @@ jobs:
     needs: [test-rust]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
 
@@ -137,7 +137,7 @@ jobs:
     runs-on: [self-hosted]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
 
@@ -204,7 +204,7 @@ jobs:
     needs: [lint]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
 
@@ -255,7 +255,7 @@ jobs:
     needs: [lint]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
 
@@ -303,7 +303,7 @@ jobs:
       # Upload coverage report as artifact
       - name: Upload Coverage Report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: lcov.info
@@ -319,7 +319,7 @@ jobs:
 
       # Upload to Codecov
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
@@ -331,13 +331,13 @@ jobs:
     needs: [test-rust]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
           fetch-depth: 0 # Need full history for change detection
 
       - name: Download FhirPath Validator
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
@@ -376,14 +376,14 @@ jobs:
             console.log('FhirPath Validator download completed');
 
       - name: Checkout FHIR Test Cases
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: FHIR/fhir-test-cases
           path: fhir-test-cases
           ref: master
 
       - name: Extract and Setup FhirPath Validator
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
@@ -486,7 +486,7 @@ jobs:
         run: if not exist fhirpath-results mkdir fhirpath-results
 
       - name: Run FhirPath Validation with FHIR Test Cases
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const { execSync } = require('child_process');
@@ -535,7 +535,7 @@ jobs:
 
       - name: Upload FhirPath Test Results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fhirpath-test-results
           path: fhirpath-results/
@@ -556,7 +556,7 @@ jobs:
   build:
     name: Build Release
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 1440 
+    timeout-minutes: 1440
     needs: [coverage, security, test-python, test-fhirpath]
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
@@ -581,7 +581,7 @@ jobs:
             archive_ext: tar.gz
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -645,7 +645,7 @@ jobs:
 
       - name: Upload Rust build artifacts to GitHub
         if: matrix.os != 'Linux-ARM64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hfs-${{ matrix.target }}
           path: |
@@ -664,7 +664,7 @@ jobs:
 
       - name: Upload Rust build artifacts to GitHub (Cross-compile)
         if: matrix.os == 'Linux-ARM64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hfs-${{ matrix.target }}
           path: |
@@ -684,7 +684,7 @@ jobs:
 
       - name: Upload test_report.json to GitHub
         if: matrix.os == 'Linux-x86'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test_report
           path: crates/sof/test_report.json
@@ -707,7 +707,7 @@ jobs:
         run: uv run maturin build --release -o dist --target aarch64-unknown-linux-gnu -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
 
       - name: Upload pysof artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pysof-${{ matrix.target }}
           path: crates/pysof/dist/*
@@ -719,7 +719,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all pysof artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: pysof-*
           path: ./pysof-dist
@@ -751,7 +751,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install mdBook
         run: |
@@ -763,7 +763,7 @@ jobs:
         working-directory: book
 
       - name: Download all pysof artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: test_report
           path: ./book/book/
@@ -776,7 +776,7 @@ jobs:
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
   release:
     name: Create GitHub Release
@@ -787,16 +787,16 @@ jobs:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: 'hfs-*'
           path: ./artifacts
 
       - name: Download pysof artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: 'pysof-*'
           path: ./artifacts
@@ -840,6 +840,13 @@ jobs:
                 cp -r "$dir/data" "$staging/"
               fi
 
+              # Bundle the checked-in terminology distribution files so
+              # release archives are self-contained: users extract and run
+              # `./hts import ./terminology-data` without fetching anything.
+              if [ -d "../crates/hts/terminology-data" ]; then
+                cp -r "../crates/hts/terminology-data" "$staging/terminology-data"
+              fi
+
               # Create combined archive with version in filename
               if [[ "$target" == *"windows"* ]]; then
                 cd "$staging" && zip -r "$OLDPWD/../releases/hfs-${version}-${target}.zip" . && cd "$OLDPWD"
@@ -863,7 +870,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             releases/*
@@ -889,6 +896,7 @@ jobs:
           - hfs
           - fhirpath-server
           - sof-server
+          - hts
         arch:
           - amd64
           - arm64
@@ -905,6 +913,11 @@ jobs:
             binary: sof-server
             port: 8080
             include_data: false
+          - image: hts
+            binary: hts
+            port: 8090
+            include_data: false
+            bootstrap_dir: /app/terminology-data
           - arch: amd64
             rust_target: x86_64-unknown-linux-gnu
             artifact_release_dir: target/release
@@ -913,7 +926,7 @@ jobs:
             artifact_release_dir: target/aarch64-unknown-linux-gnu/release
     steps:
       - name: Checkout (for Dockerfile)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Determine version
         id: version
@@ -923,7 +936,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Download CI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: hfs-${{ matrix.rust_target }}
           path: ./artifact
@@ -935,22 +948,29 @@ jobs:
           if [ "${{ matrix.include_data }}" = "true" ]; then
             cp -r artifact/data docker-context/data
           fi
+          # Bake the checked-in terminology distribution files into the hts
+          # image so first `docker run` produces a working server with no
+          # extra user steps. HTS_BOOTSTRAP_DIR (set via BOOTSTRAP_DIR build
+          # arg below) triggers auto-import on first launch.
+          if [ "${{ matrix.image }}" = "hts" ]; then
+            cp -r crates/hts/terminology-data docker-context/terminology-data
+          fi
 
       - name: Set up QEMU (for cross-arch builds)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push (${{ matrix.arch }})
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: docker-context
           file: Dockerfile
@@ -959,6 +979,7 @@ jobs:
           build-args: |
             BINARY_NAME=${{ matrix.binary }}
             EXPOSE_PORT=${{ matrix.port }}
+            BOOTSTRAP_DIR=${{ matrix.bootstrap_dir }}
           tags: ghcr.io/heliossoftware/${{ matrix.image }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
 
   docker-manifests:
@@ -975,6 +996,7 @@ jobs:
           - hfs
           - fhirpath-server
           - sof-server
+          - hts
     steps:
       - name: Determine version
         id: version
@@ -992,10 +1014,10 @@ jobs:
           echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1032,9 +1054,10 @@ jobs:
           - fhirpath-server
           - sof-server
           - hfs
+          - hts
     steps:
       - name: Download release binary
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
@@ -1084,9 +1107,9 @@ jobs:
 
       - name: Deploy binary and create service
         env:
-          DEPLOY_HOST: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_HOST || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_HOST || secrets.HFS_DEPLOY_HOST }}
-          DEPLOY_USER: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_USER || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_USER || secrets.HFS_DEPLOY_USER }}
-          DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
+          DEPLOY_HOST: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_HOST || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_HOST || matrix.server == 'hts' && secrets.HTS_DEPLOY_HOST || secrets.HFS_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_USER || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_USER || matrix.server == 'hts' && secrets.HTS_DEPLOY_USER || secrets.HFS_DEPLOY_USER }}
+          DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || matrix.server == 'hts' && secrets.HTS_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
           SERVER_NAME: ${{ matrix.server }}
           HFS_PUBLIC_URL: ${{ secrets.HFS_BASE_URL }}
         run: |

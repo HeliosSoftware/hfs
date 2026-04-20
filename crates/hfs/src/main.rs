@@ -652,6 +652,21 @@ async fn main() -> anyhow::Result<()> {
         .storage_backend_mode()
         .map_err(|e| anyhow::anyhow!("Invalid storage backend configuration: {}", e))?;
 
+    // Propagate HFS_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
+    // FHIRPath evaluation (CDS Hooks, _filter, etc.) delegates terminology
+    // operations (memberOf, subsumes) to the configured HTS instance.
+    if let Some(ref ts_url) = config.terminology_server {
+        if std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err() {
+            // Safety: single-threaded at this point (before tokio runtime hands
+            // off to worker threads), so set_var is safe here.
+            // SAFETY: called before any threads are spawned by the tokio runtime.
+            unsafe {
+                std::env::set_var("FHIRPATH_TERMINOLOGY_SERVER", ts_url);
+            }
+            info!(url = %ts_url, "HFS_TERMINOLOGY_SERVER wired to FHIRPath context");
+        }
+    }
+
     // Initialize audit subsystem
     let (audit_sink, audit_state) = init_audit(&config, backend_mode).await?;
 
@@ -665,6 +680,7 @@ async fn main() -> anyhow::Result<()> {
         host = %config.host,
         fhir_version = ?config.default_fhir_version,
         storage_backend = %backend_mode,
+        terminology_server = ?config.terminology_server,
         auth_enabled = auth_config.enabled,
         audit_backend = %audit_config.backend,
         "Starting Helios FHIR Server"
