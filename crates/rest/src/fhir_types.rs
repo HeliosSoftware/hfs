@@ -787,25 +787,37 @@ fn get_r4b_resource_types() -> &'static [&'static str] {
 
 #[cfg(feature = "R5")]
 fn get_r5_resource_types() -> &'static [&'static str] {
+    #[cfg(feature = "R4")]
+    {
+        R4_RESOURCE_TYPES
+    }
+    #[cfg(all(not(feature = "R4"), feature = "R4B"))]
+    {
+        R4B_RESOURCE_TYPES
+    }
     #[cfg(not(any(feature = "R4", feature = "R4B")))]
     {
         R5_RESOURCE_TYPES
-    }
-    #[cfg(any(feature = "R4", feature = "R4B"))]
-    {
-        R4_RESOURCE_TYPES
     }
 }
 
 #[cfg(feature = "R6")]
 fn get_r6_resource_types() -> &'static [&'static str] {
+    #[cfg(feature = "R4")]
+    {
+        R4_RESOURCE_TYPES
+    }
+    #[cfg(all(not(feature = "R4"), feature = "R4B"))]
+    {
+        R4B_RESOURCE_TYPES
+    }
+    #[cfg(all(not(any(feature = "R4", feature = "R4B")), feature = "R5"))]
+    {
+        R5_RESOURCE_TYPES
+    }
     #[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5")))]
     {
         R6_RESOURCE_TYPES
-    }
-    #[cfg(any(feature = "R4", feature = "R4B", feature = "R5"))]
-    {
-        R4_RESOURCE_TYPES
     }
 }
 
