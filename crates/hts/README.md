@@ -12,9 +12,7 @@ HTS supports both SQLite and PostgreSQL as database backends - see [Storage Back
 
 ### Terminology Data
 
-HTS is a terminology engine - it does not include terminology data by default. Each terminology must be imported from its issuing authority, and you are responsible for obtaining a license and the source data before importing.
-
-For terminologies where redistribution is permitted, the latest available data is included directly in each release build - no separate download needed.
+HTS ships the public-domain and permissively-licensed terminologies ("✅ Bundled" in the table below) directly inside every release archive and Docker image, so a fresh install can answer terminology requests with a single import command — no separate downloads, no account registration. Terminologies that require a license or registered account ("🔑") must be obtained and imported by you.
 
 ## Features
 
@@ -60,48 +58,58 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 | [CPT](https://www.ama-assn.org/practice-management/cpt) | [AMA](https://www.ama-assn.org) | 🚧 Not yet | Proprietary - paid AMA license required. [Contact AMA for licensing](https://www.ama-assn.org/practice-management/cpt/cpt-licensing-frequently-asked-questions-faqs). |
 | [MedDRA](https://www.meddra.org) | [MSSO](https://www.meddra.org) | 🚧 Not yet | Proprietary - paid MSSO license required. [Contact MedDRA](https://www.meddra.org). |
 
-**Legend:** ✅ Bundled - no separate download needed. 🔑 License required - freely available, but registration or terms acceptance required. 🚧 Not yet - importer not yet implemented; open an issue.
+**Legend:** ✅ Bundled - shipped inside every HTS release archive and Docker image under `terminology-data/`; no registration required. 🔑 License required - freely available, but registration or terms acceptance required; not shipped by HTS. 🚧 Not yet - importer not yet implemented; open an issue.
 
-- Bulk import CLI for all supported terminologies - see [Supported Terminologies](#supported-terminologies-1) for per-terminology instructions
+- `hts import <dir>` imports every bundled file in one command (auto-detects format per file)
 - Automatic format detection - no `--format` flag needed for most files
 - SQLite and PostgreSQL backends with auto-migration on startup (no manual schema setup)
+
+> **Maintainers:** the checked-in `crates/hts/terminology-data/` directory is refreshed before each release via `crates/hts/scripts/download-bundled-terminologies.sh` (Bash) or `.ps1` (PowerShell). See [RELEASING.md](../../RELEASING.md) for the refresh workflow. End users never need to run the scripts.
 
 ## Quick Start
 
 ### Using Release Binaries
 
-Pre-built binaries are available on the [GitHub Releases](https://github.com/HeliosSoftware/hfs/releases) page. Download the appropriate archive for your platform and extract it.
+Pre-built binaries are available on the [GitHub Releases](https://github.com/HeliosSoftware/hfs/releases) page. Download the appropriate archive for your platform and extract it — the archive already contains every bundled terminology under `terminology-data/`.
 
 > **Windows users:** Add `.exe` to the binary name (e.g., `hts.exe`).
 
 ```bash
-# Import a terminology package
-./hts import ./hl7.terminology.r4-6.0.0.tgz
+# 1. Import every bundled terminology in one pass (a few minutes)
+./hts import ./terminology-data
 
-# Start the server (R4, SQLite, port 8090)
+# 2. Start the server (R4, SQLite, port 8090)
 ./hts run
 
-# Verify
+# 3. Verify
 curl http://localhost:8090/health
 curl http://localhost:8090/metadata
 ```
 
 ### Using Docker Images
 
-Pre-built multi-arch Docker images (amd64/arm64) are available on GitHub Container Registry.
+Pre-built multi-arch Docker images (amd64/arm64) are available on GitHub Container Registry. The `hts` image ships with the bundled terminologies baked in at `/app/terminology-data/`, and `HTS_BOOTSTRAP_DIR` is preset to that path — so the first `docker run` against an empty database auto-imports everything before the server starts listening.
 
 ```bash
-# Import a terminology package via Docker
-docker run \
-  -v hts-data:/data \
-  -v $(pwd)/terminology:/terminology \
-  ghcr.io/heliossoftware/hts:latest \
-  import /terminology/hl7.terminology.r4-6.0.0.tgz
-
-# With persistent SQLite storage
+# First run: auto-imports bundled terminologies into the persistent volume
+# (takes a few minutes), then starts the server.
 docker run -p 8090:8090 \
   -v hts-data:/data \
   -e HTS_DATABASE_URL=/data/hts.db \
+  ghcr.io/heliossoftware/hts:latest
+
+# Subsequent runs: DB is populated, auto-bootstrap is a no-op; server starts
+# immediately.
+docker run -p 8090:8090 \
+  -v hts-data:/data \
+  -e HTS_DATABASE_URL=/data/hts.db \
+  ghcr.io/heliossoftware/hts:latest
+
+# Disable auto-bootstrap (e.g. to import from a mounted directory yourself):
+docker run -p 8090:8090 \
+  -v hts-data:/data \
+  -e HTS_DATABASE_URL=/data/hts.db \
+  -e HTS_BOOTSTRAP_DIR= \
   ghcr.io/heliossoftware/hts:latest
 ```
 
@@ -183,7 +191,12 @@ cargo build --release -p helios-hts --features R4,R4B,R5,R6,sqlite
 
 ### `hts import`
 
-Bulk-import a terminology package from the filesystem into the HTS database. Typically run before `hts run` so the server starts with terminology data already loaded.
+Bulk-import terminology data into the HTS database. `<PATH>` can be either a single distribution file or a **directory** — when given a directory, `hts import` iterates its entries, auto-detects each file's format, and imports them all in one pass (one broken file is logged and reported via exit code `2` rather than aborting the rest). The release archive's `terminology-data/` directory is designed for exactly this.
+
+```bash
+# One command — imports every bundled terminology that shipped in the release
+./hts import ./terminology-data
+```
 
 If the target SQLite database does not yet exist, `hts import` creates the file (default: `./data/hts.db`) and applies the schema automatically - no prior `hts run` is required. The same is true for PostgreSQL: pass `--storage-backend postgres` (or set `HTS_STORAGE_BACKEND=postgres`) along with a `postgresql://` connection string and the schema is created on first import.
 

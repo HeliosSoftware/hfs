@@ -8,7 +8,7 @@
 //!
 //! ICD-9-CM is a US government work in the public domain.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use helios_persistence::tenant::TenantContext;
@@ -139,8 +139,21 @@ fn read_text(path: &Path) -> Result<String, HtsError> {
     if ext == "zip" {
         read_text_from_zip(path)
     } else {
-        std::fs::read_to_string(path)
-            .map_err(|e| HtsError::InvalidRequest(format!("Cannot read '{}': {e}", path.display())))
+        let bytes = std::fs::read(path).map_err(|e| {
+            HtsError::InvalidRequest(format!("Cannot read '{}': {e}", path.display()))
+        })?;
+        Ok(decode_cms_text(bytes))
+    }
+}
+
+/// CMS publishes ICD-9 descriptions in Windows-1252 / Latin-1, not UTF-8.
+/// We try UTF-8 first (for any hand-edited or re-encoded copy) and fall
+/// back to a byte-wise Latin-1 → UTF-8 decode, which is lossless for every
+/// Latin-1 codepoint.
+fn decode_cms_text(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => e.into_bytes().into_iter().map(char::from).collect(),
     }
 }
 
@@ -184,12 +197,11 @@ fn read_text_from_zip(path: &Path) -> Result<String, HtsError> {
         .by_index(best_index)
         .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry: {e}")))?;
 
-    let mut buf = String::new();
-    entry
-        .read_to_string(&mut buf)
-        .map_err(|e| HtsError::InvalidRequest(format!("Cannot read text from ZIP: {e}")))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut bytes)
+        .map_err(|e| HtsError::InvalidRequest(format!("Cannot read bytes from ZIP: {e}")))?;
 
-    Ok(buf)
+    Ok(decode_cms_text(bytes))
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────

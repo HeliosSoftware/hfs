@@ -76,6 +76,16 @@ pub struct HtsConfig {
     /// code `too-costly`.
     #[arg(long, env = "HTS_MAX_EXPANSION_SIZE", default_value = "3500")]
     pub max_expansion_size: u32,
+
+    /// Directory of terminology distribution files to auto-import on first
+    /// run. When set and pointing at an existing directory, the server
+    /// checks whether the target database already contains any code
+    /// systems; if none, it imports every recognized file in the
+    /// directory before starting the HTTP listener. The Docker image ships
+    /// with this set to `/app/terminology-data` so first `docker run`
+    /// boots a populated server automatically. Leave empty to disable.
+    #[arg(long, env = "HTS_BOOTSTRAP_DIR", default_value = "")]
+    pub bootstrap_dir: String,
 }
 
 impl HtsConfig {
@@ -96,6 +106,7 @@ impl Default for HtsConfig {
             enable_cors: true,
             cors_origins: "*".into(),
             max_expansion_size: 10_000,
+            bootstrap_dir: String::new(),
         }
     }
 }

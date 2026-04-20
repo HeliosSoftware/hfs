@@ -66,6 +66,18 @@ impl ImportStats {
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
+
+    /// Accumulate counts and errors from another import into this one.
+    ///
+    /// Used when `hts import <dir>` imports multiple files in sequence and
+    /// needs to report an aggregate summary.
+    pub fn merge(&mut self, other: ImportStats) {
+        self.code_systems = self.code_systems.saturating_add(other.code_systems);
+        self.value_sets = self.value_sets.saturating_add(other.value_sets);
+        self.concept_maps = self.concept_maps.saturating_add(other.concept_maps);
+        self.concepts = self.concepts.saturating_add(other.concepts);
+        self.errors.extend(other.errors);
+    }
 }
 
 /// Outcome of a completed CLI import run.

@@ -72,6 +72,8 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
     let backend = SqliteTerminologyBackend::new(&config.database_url)?;
     let hts_pool = backend.pool().clone();
 
+    bootstrap_if_empty_sqlite(&backend, &config.bootstrap_dir).await?;
+
     let resource_store = SqliteBackend::open(&config.database_url)
         .map_err(|e| anyhow::anyhow!("Failed to open resource store: {e}"))?;
     resource_store
@@ -119,6 +121,8 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
 
+    bootstrap_if_empty_postgres(&backend, &config.bootstrap_dir).await?;
+
     let resource_store = PostgresBackend::from_connection_string(&config.database_url)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to open PostgreSQL resource store: {e}"))?;
@@ -143,44 +147,158 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+
+/// If `bootstrap_dir` is non-empty and points at an existing directory, and
+/// the connected database has no CodeSystems yet, import every recognized
+/// file in the directory before returning. Otherwise log and no-op.
+///
+/// Triggered by `HTS_BOOTSTRAP_DIR`; the Docker image sets this to
+/// `/app/terminology-data` so first `docker run` yields a populated server.
+#[cfg(feature = "sqlite")]
+async fn bootstrap_if_empty_sqlite(
+    backend: &SqliteTerminologyBackend,
+    bootstrap_dir: &str,
+) -> anyhow::Result<()> {
+    let Some(dir) = resolve_bootstrap_dir(bootstrap_dir) else {
+        return Ok(());
+    };
+
+    let pool = backend.pool().clone();
+    let count = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+        let conn = pool.get()?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM code_systems", [], |r| r.get(0))?;
+        Ok(n)
+    })
+    .await??;
+
+    if count > 0 {
+        info!(
+            bootstrap_dir = %dir.display(),
+            code_systems = count,
+            "bootstrap skipped: database already populated"
+        );
+        return Ok(());
+    }
+
+    info!(bootstrap_dir = %dir.display(), "bootstrap: database empty, importing");
+    let ctx = TenantContext::system();
+    let (stats, imported, skipped) = import_directory_files(backend, &ctx, &dir, 500, false)
+        .await
+        .map_err(|e| anyhow::anyhow!("bootstrap import failed: {e}"))?;
+    info!(
+        imported_files = imported,
+        skipped_files = skipped,
+        code_systems = stats.code_systems,
+        value_sets = stats.value_sets,
+        concept_maps = stats.concept_maps,
+        concepts = stats.concepts,
+        "bootstrap complete"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "postgres")]
+async fn bootstrap_if_empty_postgres(
+    backend: &PostgresTerminologyBackend,
+    bootstrap_dir: &str,
+) -> anyhow::Result<()> {
+    let Some(dir) = resolve_bootstrap_dir(bootstrap_dir) else {
+        return Ok(());
+    };
+
+    let client = backend.pool().get().await?;
+    let row = client
+        .query_one("SELECT COUNT(*)::bigint FROM code_systems", &[])
+        .await?;
+    let count: i64 = row.get(0);
+    drop(client);
+
+    if count > 0 {
+        info!(
+            bootstrap_dir = %dir.display(),
+            code_systems = count,
+            "bootstrap skipped: database already populated"
+        );
+        return Ok(());
+    }
+
+    info!(bootstrap_dir = %dir.display(), "bootstrap: database empty, importing");
+    let ctx = TenantContext::system();
+    let (stats, imported, skipped) = import_directory_files(backend, &ctx, &dir, 500, false)
+        .await
+        .map_err(|e| anyhow::anyhow!("bootstrap import failed: {e}"))?;
+    info!(
+        imported_files = imported,
+        skipped_files = skipped,
+        code_systems = stats.code_systems,
+        value_sets = stats.value_sets,
+        concept_maps = stats.concept_maps,
+        concepts = stats.concepts,
+        "bootstrap complete"
+    );
+    Ok(())
+}
+
+/// Parse `HTS_BOOTSTRAP_DIR`: empty string → no bootstrap, non-existent path
+/// → warn + no bootstrap, otherwise return the resolved path.
+fn resolve_bootstrap_dir(bootstrap_dir: &str) -> Option<std::path::PathBuf> {
+    if bootstrap_dir.is_empty() {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(bootstrap_dir);
+    if !dir.is_dir() {
+        tracing::warn!(
+            bootstrap_dir,
+            "HTS_BOOTSTRAP_DIR is set but does not point at an existing directory; skipping"
+        );
+        return None;
+    }
+    Some(dir)
+}
+
 // ── Import ────────────────────────────────────────────────────────────────────
 
 /// Returns the process exit code:
 /// - `0` — success, all resources imported
 /// - `1` — fatal error (propagated as `Err` by `?`)
 /// - `2` — success with non-fatal errors (some records skipped)
+///
+/// `args.path` may be a file (imports one format, optionally overridden by
+/// `--format`) or a directory (iterates entries, auto-detecting each file's
+/// format; `--format` is rejected in this mode).
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
     if !args.path.exists() {
         anyhow::bail!("Path does not exist: '{}'", args.path.display());
     }
 
-    let format = match args.format {
-        Some(f) => f,
-        None => detect_format(&args.path).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot auto-detect format from '{}'.\n\
-                 Use --format to specify one of:\n\
-                 hl7-npm | snomed-rf2 | loinc | icd10-cm | icd9-cm | rxnorm |\n\
-                 ucum | nci-thesaurus | mesh | dicom | hl7-v2-tables | nucc | ndc\n\
-                 Note: .zip files may require --format if auto-detection is ambiguous.",
-                args.path.display()
-            )
-        })?,
-    };
+    let is_dir = args.path.is_dir();
 
-    if args.dry_run {
-        eprintln!(
-            "[{format}] dry-run mode — parsing only, no changes will be written to the database"
+    // RxNorm's importer takes a directory containing RXNCONSO.RRF and
+    // friends, so treat such a directory as a single-format import. Every
+    // other directory means "iterate and auto-detect per file."
+    let rxnorm_dir =
+        is_dir && (args.format == Some(ImportFormat::Rxnorm) || contains_rxnorm_rrf(&args.path));
+
+    if is_dir && !rxnorm_dir && args.format.is_some() {
+        anyhow::bail!(
+            "--format is not compatible with a directory path; each file's \
+             format is auto-detected. Point --format at a single file, or \
+             remove --format to iterate the directory."
         );
     }
+
+    if args.dry_run {
+        eprintln!("[hts-import] dry-run mode — parsing only, no changes will be written");
+    }
     if args.verbose {
-        eprintln!("[{format}] verbose mode enabled — debug output active");
+        eprintln!("[hts-import] verbose mode enabled — debug output active");
     }
 
     info!(
         path = %args.path.display(),
-        format = %format,
+        is_dir,
         database_url = %args.database_url,
         storage_backend = %args.storage_backend,
         dry_run = args.dry_run,
@@ -191,11 +309,11 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
     let started = std::time::Instant::now();
     let ctx = TenantContext::system();
 
-    let stats = if args.storage_backend == "postgres" {
+    let (stats, label) = if args.storage_backend == "postgres" {
         #[cfg(feature = "postgres")]
         {
             let backend = PostgresTerminologyBackend::new(&args.database_url).await?;
-            dispatch_import(format, &backend, &ctx, &args).await?
+            run_import_for_path(&backend, &ctx, &args, rxnorm_dir).await?
         }
         #[cfg(not(feature = "postgres"))]
         anyhow::bail!(
@@ -213,7 +331,7 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
                 args.database_url.clone()
             };
             let backend = SqliteTerminologyBackend::new(&database_url)?;
-            dispatch_import(format, &backend, &ctx, &args).await?
+            run_import_for_path(&backend, &ctx, &args, rxnorm_dir).await?
         }
         #[cfg(not(feature = "sqlite"))]
         anyhow::bail!(
@@ -222,9 +340,8 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
         );
     };
 
-    let result = ImportResult::new(stats, format.to_string(), started.elapsed());
-
-    print_import_summary(&result, args.dry_run, &format.to_string());
+    let result = ImportResult::new(stats, label.clone(), started.elapsed());
+    print_import_summary(&result, args.dry_run, &label);
 
     if !result.stats.errors.is_empty() {
         return Ok(2);
@@ -232,12 +349,188 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+/// Returns `true` if `path` is a directory containing an `RXNCONSO.RRF`
+/// file (case-insensitive) — the hallmark of an extracted RxNorm RRF
+/// distribution. Used to keep the RxNorm importer reachable when the user
+/// points `hts import` at a flat RRF directory.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn contains_rxnorm_rrf(path: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|e| {
+        e.file_name()
+            .to_str()
+            .map(|n| n.eq_ignore_ascii_case("RXNCONSO.RRF"))
+            .unwrap_or(false)
+    })
+}
+
+/// Dispatch either a single-file or directory import against an open backend.
+/// Returns `(aggregated-stats, label-for-summary)`.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn run_import_for_path(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
+    args: &ImportArgs,
+    rxnorm_dir: bool,
+) -> Result<(ImportStats, String), helios_hts::error::HtsError> {
+    use helios_hts::error::HtsError;
+
+    if args.path.is_dir() && !rxnorm_dir {
+        return import_directory(backend, ctx, args).await;
+    }
+
+    let format = match args.format {
+        Some(f) => f,
+        None => detect_format(&args.path).ok_or_else(|| {
+            HtsError::InvalidRequest(format!(
+                "Cannot auto-detect format from '{}'. \
+                 Use --format to specify one of: hl7-npm, snomed-rf2, loinc, \
+                 icd10-cm, icd9-cm, rxnorm, ucum, nci-thesaurus, mesh, dicom, \
+                 hl7-v2-tables, nucc, ndc. Note: .zip files may require \
+                 --format if auto-detection is ambiguous.",
+                args.path.display()
+            ))
+        })?,
+    };
+
+    let stats = dispatch_import(
+        format,
+        backend,
+        ctx,
+        &args.path,
+        args.batch_size,
+        args.dry_run,
+    )
+    .await?;
+    Ok((stats, format.to_string()))
+}
+
+/// Iterate a directory, auto-detect each file's format, dispatch import for
+/// each, and aggregate stats. Files whose format can't be auto-detected and
+/// hidden files (dotfiles) are skipped with a warning.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn import_directory(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
+    args: &ImportArgs,
+) -> Result<(ImportStats, String), helios_hts::error::HtsError> {
+    let (stats, imported_count, skipped_count) =
+        import_directory_files(backend, ctx, &args.path, args.batch_size, args.dry_run).await?;
+    let label = format!("directory ({imported_count} imported, {skipped_count} skipped)");
+    Ok((stats, label))
+}
+
+/// Shared directory-iteration loop used by both `hts import <dir>` and the
+/// `HTS_BOOTSTRAP_DIR` first-run path. Returns (aggregated stats, imported
+/// file count, skipped file count).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn import_directory_files(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
+    dir: &std::path::Path,
+    batch_size: usize,
+    dry_run: bool,
+) -> Result<(ImportStats, usize, usize), helios_hts::error::HtsError> {
+    use helios_hts::error::HtsError;
+
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| {
+            HtsError::InvalidRequest(format!("Cannot read directory '{}': {e}", dir.display()))
+        })?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let hidden = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'));
+            !hidden
+        })
+        .collect();
+    entries.sort();
+
+    let mut stats = ImportStats::default();
+    let mut imported_count = 0usize;
+    let mut skipped_count = 0usize;
+    let total = entries.len();
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let fname = entry
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<non-utf8>");
+        if entry.is_dir() {
+            if contains_rxnorm_rrf(entry) {
+                eprintln!("[import] file {}/{total} (rxnorm): {fname}/", idx + 1);
+                match dispatch_import(
+                    ImportFormat::Rxnorm,
+                    backend,
+                    ctx,
+                    entry,
+                    batch_size,
+                    dry_run,
+                )
+                .await
+                {
+                    Ok(file_stats) => {
+                        stats.merge(file_stats);
+                        imported_count += 1;
+                    }
+                    Err(e) => {
+                        let msg = format!("[rxnorm] '{fname}/' failed: {e}");
+                        eprintln!("[error] {msg}");
+                        stats.errors.push(msg);
+                        skipped_count += 1;
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[skip] {}/{total} {fname}/: nested directory ignored",
+                    idx + 1
+                );
+                skipped_count += 1;
+            }
+            continue;
+        }
+        let Some(format) = detect_format(entry) else {
+            eprintln!(
+                "[skip] {}/{total} {fname}: format not auto-detected",
+                idx + 1
+            );
+            skipped_count += 1;
+            continue;
+        };
+        eprintln!("[import] file {}/{total} ({format}): {fname}", idx + 1);
+        match dispatch_import(format, backend, ctx, entry, batch_size, dry_run).await {
+            Ok(file_stats) => {
+                stats.merge(file_stats);
+                imported_count += 1;
+            }
+            Err(e) => {
+                // In directory-iteration mode we deliberately keep going so
+                // one broken file doesn't prevent the rest of the bundle
+                // from loading. The failure is still reported via
+                // ImportStats.errors, which drives exit code 2.
+                let msg = format!("[{format}] '{fname}' failed: {e}");
+                eprintln!("[error] {msg}");
+                stats.errors.push(msg);
+                skipped_count += 1;
+            }
+        }
+    }
+
+    Ok((stats, imported_count, skipped_count))
+}
+
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 async fn dispatch_import(
     format: ImportFormat,
     backend: &dyn BundleImportBackend,
     ctx: &TenantContext,
-    args: &ImportArgs,
+    path: &std::path::Path,
+    batch_size: usize,
+    dry_run: bool,
 ) -> Result<ImportStats, helios_hts::error::HtsError> {
     use helios_hts::import::{
         dicom::import_dicom, hl7_v2_tables::import_hl7_v2_tables, icd9_cm::import_icd9_cm,
@@ -248,45 +541,23 @@ async fn dispatch_import(
     };
 
     match format {
-        ImportFormat::Hl7Npm => {
-            import_tgz(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
-        ImportFormat::SnomedRf2 => {
-            import_snomed_rf2(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
-        ImportFormat::Loinc => {
-            import_loinc_csv(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
-        ImportFormat::Icd10Cm => {
-            import_icd10_cm(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
-        ImportFormat::Icd9Cm => {
-            import_icd9_cm(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
-        ImportFormat::Rxnorm => {
-            import_rxnorm_rrf(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
-        ImportFormat::Ucum => {
-            import_ucum(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
+        ImportFormat::Hl7Npm => import_tgz(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::SnomedRf2 => import_snomed_rf2(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::Loinc => import_loinc_csv(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::Icd10Cm => import_icd10_cm(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::Icd9Cm => import_icd9_cm(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::Rxnorm => import_rxnorm_rrf(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::Ucum => import_ucum(backend, ctx, path, batch_size, dry_run).await,
         ImportFormat::NciThesaurus => {
-            import_nci_thesaurus(backend, ctx, &args.path, args.batch_size, args.dry_run).await
+            import_nci_thesaurus(backend, ctx, path, batch_size, dry_run).await
         }
-        ImportFormat::Mesh => {
-            import_mesh(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
-        ImportFormat::Dicom => {
-            import_dicom(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
+        ImportFormat::Mesh => import_mesh(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::Dicom => import_dicom(backend, ctx, path, batch_size, dry_run).await,
         ImportFormat::Hl7V2Tables => {
-            import_hl7_v2_tables(backend, ctx, &args.path, args.batch_size, args.dry_run).await
+            import_hl7_v2_tables(backend, ctx, path, batch_size, dry_run).await
         }
-        ImportFormat::Nucc => {
-            import_nucc(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
-        ImportFormat::Ndc => {
-            import_ndc(backend, ctx, &args.path, args.batch_size, args.dry_run).await
-        }
+        ImportFormat::Nucc => import_nucc(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::Ndc => import_ndc(backend, ctx, path, batch_size, dry_run).await,
     }
 }
 
