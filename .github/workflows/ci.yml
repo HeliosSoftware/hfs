@@ -556,7 +556,7 @@ jobs:
   build:
     name: Build Release
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 1440 
+    timeout-minutes: 1440
     needs: [coverage, security, test-python, test-fhirpath]
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
@@ -840,6 +840,13 @@ jobs:
                 cp -r "$dir/data" "$staging/"
               fi
 
+              # Bundle the checked-in terminology distribution files so
+              # release archives are self-contained: users extract and run
+              # `./hts import ./terminology-data` without fetching anything.
+              if [ -d "../crates/hts/terminology-data" ]; then
+                cp -r "../crates/hts/terminology-data" "$staging/terminology-data"
+              fi
+
               # Create combined archive with version in filename
               if [[ "$target" == *"windows"* ]]; then
                 cd "$staging" && zip -r "$OLDPWD/../releases/hfs-${version}-${target}.zip" . && cd "$OLDPWD"
@@ -889,6 +896,7 @@ jobs:
           - hfs
           - fhirpath-server
           - sof-server
+          - hts
         arch:
           - amd64
           - arm64
@@ -905,6 +913,11 @@ jobs:
             binary: sof-server
             port: 8080
             include_data: false
+          - image: hts
+            binary: hts
+            port: 8090
+            include_data: false
+            bootstrap_dir: /app/terminology-data
           - arch: amd64
             rust_target: x86_64-unknown-linux-gnu
             artifact_release_dir: target/release
@@ -935,6 +948,13 @@ jobs:
           if [ "${{ matrix.include_data }}" = "true" ]; then
             cp -r artifact/data docker-context/data
           fi
+          # Bake the checked-in terminology distribution files into the hts
+          # image so first `docker run` produces a working server with no
+          # extra user steps. HTS_BOOTSTRAP_DIR (set via BOOTSTRAP_DIR build
+          # arg below) triggers auto-import on first launch.
+          if [ "${{ matrix.image }}" = "hts" ]; then
+            cp -r crates/hts/terminology-data docker-context/terminology-data
+          fi
 
       - name: Set up QEMU (for cross-arch builds)
         uses: docker/setup-qemu-action@v4
@@ -959,6 +979,7 @@ jobs:
           build-args: |
             BINARY_NAME=${{ matrix.binary }}
             EXPOSE_PORT=${{ matrix.port }}
+            BOOTSTRAP_DIR=${{ matrix.bootstrap_dir }}
           tags: ghcr.io/heliossoftware/${{ matrix.image }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
 
   docker-manifests:
@@ -975,6 +996,7 @@ jobs:
           - hfs
           - fhirpath-server
           - sof-server
+          - hts
     steps:
       - name: Determine version
         id: version
@@ -1032,6 +1054,7 @@ jobs:
           - fhirpath-server
           - sof-server
           - hfs
+          - hts
     steps:
       - name: Download release binary
         uses: actions/github-script@v8
@@ -1084,9 +1107,9 @@ jobs:
 
       - name: Deploy binary and create service
         env:
-          DEPLOY_HOST: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_HOST || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_HOST || secrets.HFS_DEPLOY_HOST }}
-          DEPLOY_USER: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_USER || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_USER || secrets.HFS_DEPLOY_USER }}
-          DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
+          DEPLOY_HOST: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_HOST || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_HOST || matrix.server == 'hts' && secrets.HTS_DEPLOY_HOST || secrets.HFS_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_USER || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_USER || matrix.server == 'hts' && secrets.HTS_DEPLOY_USER || secrets.HFS_DEPLOY_USER }}
+          DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || matrix.server == 'hts' && secrets.HTS_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
           SERVER_NAME: ${{ matrix.server }}
           HFS_PUBLIC_URL: ${{ secrets.HFS_BASE_URL }}
         run: |
