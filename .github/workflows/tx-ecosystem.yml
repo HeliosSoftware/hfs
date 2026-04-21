@@ -4,9 +4,9 @@ name: Tx Ecosystem IG conformance
 # (https://github.com/HL7/fhir-tx-ecosystem-ig) against a freshly built HTS
 # binary loaded with UTG + the tx-source corpora shipped in that repo.
 #
-# Informational only: the job never fails on test outcomes — pass/fail counts
-# are published to the step summary and failing-test JSONs are uploaded as an
-# artifact for offline triage.
+# The job fails if any tx-ecosystem test fails. Pass/fail counts are published
+# to the step summary and failing-test JSONs are uploaded as an artifact for
+# offline triage.
 
 on:
   workflow_dispatch:
@@ -267,7 +267,7 @@ jobs:
             -tx "http://localhost:${{ env.HTS_PORT }}" \
             -output ./tx-test-output \
             2>&1 | tee "/tmp/txtests-${{ matrix.label }}.log"
-          # Informational — capture exit code but don't fail the job.
+          # Capture exit code so the summary step runs before we assert on it.
           echo "TXTESTS_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
 
       - name: Summarize results
@@ -314,7 +314,7 @@ jobs:
             echo "| RxNorm | ${RXNORM_IMPORT_EXIT:-?} |"
             echo "| NDC    | ${NDC_IMPORT_EXIT:-?} |"
             echo ""
-            echo "> Informational run. 0 = success, 2 = success-with-warnings, 1 = fatal, skip = not attempted."
+            echo "> Import exit codes: 0 = success, 2 = success-with-warnings, 1 = fatal, skip = not attempted."
             echo "> Failing-test JSON diffs are published as the \`tx-test-output-${LABEL}\` artifact."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -338,6 +338,20 @@ jobs:
           path: /tmp/txtests-${{ matrix.label }}.log
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Assert all tx-ecosystem tests passed
+        run: |
+          set -e
+          if [ "${TXTESTS_EXIT:-1}" != "0" ]; then
+            echo "Validator exited with code ${TXTESTS_EXIT:-?} — failing job"
+            exit 1
+          fi
+          FAILED=$(find tx-test-output -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$FAILED" -gt 0 ]; then
+            echo "$FAILED tx-ecosystem tests failed — failing job"
+            exit 1
+          fi
+          echo "All tx-ecosystem tests passed"
 
       - name: Dump server log on failure
         if: failure()
