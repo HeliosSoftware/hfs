@@ -263,8 +263,7 @@ jobs:
         run: |
           set +e
           mkdir -p tx-test-output
-          java -jar validator.jar -txtests \
-            -source ./tx-ecosystem-ig \
+          java -jar validator.jar txTests \
             -tx "http://localhost:${{ env.HTS_PORT }}" \
             -output ./tx-test-output \
             2>&1 | tee "/tmp/txtests-${{ matrix.label }}.log"
