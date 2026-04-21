@@ -8,6 +8,8 @@ A FHIR Terminology Server built in Rust, implementing the [HL7 FHIR Terminology 
 
 It can also be used standalone as a general-purpose FHIR terminology service, independent of any other Helios Software component.
 
+An open test server will soon be available at https://hts.heliossoftware.com/ for experimentation and evaluation.
+
 HTS supports both SQLite and PostgreSQL as database backends - see [Storage Backends](#storage-backends) for details.
 
 ### Terminology Data

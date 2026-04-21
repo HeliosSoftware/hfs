@@ -726,6 +726,8 @@ fhirpath-cli -e "Patient.identifier" -r patient.json
 
 An HTTP server providing FHIRPath expression evaluation via a REST API, compatible with [fhirpath-lab](https://fhirpath-lab.com/). 
 
+An open test server is available at https://fhirpath.heliossoftware.com/ for experimentation and evaluation.
+
 #### Installation
 
 ```bash
