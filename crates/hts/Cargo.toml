@@ -23,10 +23,10 @@ path = "src/main.rs"
 default = ["sqlite", "R4"]
 sqlite = ["dep:rusqlite", "dep:r2d2", "dep:r2d2_sqlite"]
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "helios-persistence/postgres"]
-R4 = ["helios-fhir/R4"]
-R4B = ["helios-fhir/R4B"]
-R5 = ["helios-fhir/R5"]
-R6 = ["helios-fhir/R6"]
+R4 = ["helios-fhir/R4", "helios-persistence/R4"]
+R4B = ["helios-fhir/R4B", "helios-persistence/R4B"]
+R5 = ["helios-fhir/R5", "helios-persistence/R5"]
+R6 = ["helios-fhir/R6", "helios-persistence/R6"]
 
 [dependencies]
 helios-fhir = { workspace = true }

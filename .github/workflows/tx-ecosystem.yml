@@ -79,9 +79,9 @@ jobs:
           printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]\n' \
             > ~/.cargo/config.toml
 
-      - name: cargo build --release (${{ matrix.label }})
+      - name: cargo build (${{ matrix.label }})
         run: |
-          cargo build --release -p helios-hts \
+          cargo build -p helios-hts \
             --no-default-features \
             --features "${{ matrix.cargo_features }}"
 
@@ -89,7 +89,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: hts-binary-${{ matrix.label }}
-          path: target/release/hts
+          path: target/debug/hts
           retention-days: 1
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -109,11 +109,6 @@ jobs:
             utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r5.tgz
 
     steps:
-      - name: Install OS dependencies (jq, zip)
-        run: |
-          command -v jq  >/dev/null 2>&1 || sudo apt-get install -y jq
-          command -v zip >/dev/null 2>&1 || sudo apt-get install -y zip
-
       - name: Install Java 21 (for validator_cli.jar)
         uses: actions/setup-java@v5
         with:
