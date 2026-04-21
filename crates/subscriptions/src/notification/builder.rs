@@ -172,7 +172,7 @@ impl<'a> NotificationBundleBuilder<'a> {
         let mut notification_events = Vec::new();
         for event in events {
             notification_events.push(json!({
-                "eventNumber": event.event_number.to_string(),
+                "eventNumber": event.event_number,
                 "timestamp": event.timestamp.to_rfc3339(),
                 "focus": {
                     "reference": &event.focus_reference
@@ -184,7 +184,7 @@ impl<'a> NotificationBundleBuilder<'a> {
             "resourceType": "SubscriptionStatus",
             "status": self.subscription.status.as_fhir_str(),
             "type": self.notification_type.as_fhir_str(),
-            "eventsSinceSubscriptionStart": self.subscription.events_since_start.to_string(),
+            "eventsSinceSubscriptionStart": self.subscription.events_since_start,
             "subscription": {
                 "reference": format!("Subscription/{}", self.subscription.id)
             },

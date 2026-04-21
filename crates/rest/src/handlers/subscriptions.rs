@@ -19,7 +19,7 @@ use crate::state::AppState;
 
 /// Handler for the `$status` operation on Subscription resources.
 ///
-/// Returns a `SubscriptionStatus` (R5/R6) or `Parameters` (R4/R4B backport)
+/// Returns a `SubscriptionStatus` (R4B/R5/R6) or `Parameters` (R4 backport)
 /// resource reflecting the subscription's current runtime state.
 ///
 /// # HTTP Request
@@ -83,15 +83,17 @@ where
         })?;
 
     // Return a Bundle with a SubscriptionStatus indicating query-status
+    let bundle_type = sub.fhir_version.notification_bundle_type();
+
     let bundle = json!({
         "resourceType": "Bundle",
-        "type": "history",
+        "type": bundle_type,
         "entry": [{
             "resource": {
                 "resourceType": "SubscriptionStatus",
                 "status": sub.status.as_fhir_str(),
                 "type": "query-status",
-                "eventsSinceSubscriptionStart": sub.events_since_start.to_string(),
+                "eventsSinceSubscriptionStart": sub.events_since_start,
                 "subscription": {
                     "reference": format!("Subscription/{}", id)
                 },
@@ -103,6 +105,82 @@ where
     Ok((StatusCode::OK, Json(bundle)).into_response())
 }
 
+/// Handler for the `$get-ws-binding-token` operation on Subscription resources.
+///
+/// Returns a `Parameters` resource containing a short-lived token, expiration,
+/// and the WebSocket URL for binding.
+///
+/// # HTTP Request
+///
+/// `GET [base]/Subscription/{id}/$get-ws-binding-token`
+pub async fn get_ws_binding_token_handler<S>(
+    State(state): State<AppState<S>>,
+    Path((_resource_type, id)): Path<(String, String)>,
+    tenant: TenantExtractor,
+) -> RestResult<Response>
+where
+    S: ResourceStorage + Send + Sync,
+{
+    let engine = state
+        .subscription_engine()
+        .ok_or(RestError::NotImplemented {
+            feature: "Subscriptions".to_string(),
+        })?;
+
+    // Verify subscription exists.
+    let sub = engine
+        .manager()
+        .get_subscription(tenant.tenant_id(), &id)
+        .ok_or(RestError::NotFound {
+            resource_type: "Subscription".to_string(),
+            id: id.clone(),
+        })?;
+
+    // Verify it's a websocket subscription.
+    if sub.channel.channel_type != helios_subscriptions::manager::ChannelType::Websocket {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "$get-ws-binding-token is only valid for websocket subscriptions, \
+                 but this subscription uses channel type '{}'",
+                sub.channel.channel_type.as_fhir_str()
+            ),
+        });
+    }
+
+    // Generate binding token.
+    let (token, expiration) = engine
+        .ws_token_manager()
+        .generate_token(tenant.tenant_id(), &id);
+
+    // Build WebSocket URL from the base URL.
+    let ws_base = state
+        .base_url()
+        .replace("http://", "ws://")
+        .replace("https://", "wss://");
+    let ws_url = format!("{}/ws/subscriptions/bind", ws_base);
+
+    // Return Parameters resource per FHIR spec.
+    let parameters = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "token",
+                "valueString": token
+            },
+            {
+                "name": "expiration",
+                "valueDateTime": expiration.to_rfc3339()
+            },
+            {
+                "name": "websocket-url",
+                "valueUrl": ws_url
+            }
+        ]
+    });
+
+    Ok((StatusCode::OK, Json(parameters)).into_response())
+}
+
 /// Builds a SubscriptionStatus resource for the $status response.
 fn build_subscription_status(
     sub: &helios_subscriptions::manager::ActiveSubscription,
@@ -110,7 +188,7 @@ fn build_subscription_status(
     base_url: &str,
 ) -> serde_json::Value {
     if uses_backport_ig(sub.fhir_version) {
-        // R4/R4B backport: return Parameters resource
+        // R4 backport: return Parameters resource
         json!({
             "resourceType": "Parameters",
             "parameter": [
@@ -144,7 +222,7 @@ fn build_subscription_status(
             "resourceType": "SubscriptionStatus",
             "status": sub.status.as_fhir_str(),
             "type": "query-status",
-            "eventsSinceSubscriptionStart": sub.events_since_start.to_string(),
+            "eventsSinceSubscriptionStart": sub.events_since_start,
             "subscription": {
                 "reference": format!("Subscription/{}", id)
             },
@@ -154,7 +232,7 @@ fn build_subscription_status(
 }
 
 /// Returns true for FHIR versions that use the Subscriptions R5 Backport IG
-/// (R4 and R4B), false for versions with native subscription support (R5, R6).
+/// (R4), false for versions with native subscription support (R4B, R5, R6).
 fn uses_backport_ig(version: helios_fhir::FhirVersion) -> bool {
-    matches!(version.as_str(), "R4" | "R4B")
+    version.as_str() == "R4"
 }

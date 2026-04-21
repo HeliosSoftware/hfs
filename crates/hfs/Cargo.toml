@@ -46,12 +46,12 @@ cloudwatch = ["helios-audit/cloudwatch"]
 reqwest = { version = "0.12", features = ["blocking"] }
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.1.47" }
+helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
 helios-rest = { path = "../rest", version = "0.1.47", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false, features = ["audit"] }
 helios-auth = { path = "../auth", version = "0.1.47" }
 helios-audit = { path = "../audit", version = "0.1.47" }
-helios-subscriptions = { path = "../subscriptions", version = "0.1.47", optional = true }
+helios-subscriptions = { path = "../subscriptions", version = "0.1.47", optional = true, default-features = false }
 
 # Web framework
 axum = "0.8"
