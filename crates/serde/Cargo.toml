@@ -21,7 +21,7 @@ xml = ["dep:quick-xml", "helios-fhir/xml"]
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-helios-fhir = { path = "../fhir", version = "0.1.47" }
+helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
 helios-serde-support = { path = "../serde-support", version = "0.1.47" }
 quick-xml = { version = "0.38", features = ["serialize"], optional = true }
 rust_decimal = { version = "1.0", features = ["serde-with-arbitrary-precision"] }

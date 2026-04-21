@@ -59,6 +59,7 @@ pub fn emit_delete_event(
     resource_type: &str,
     resource_id: &str,
     fhir_version: FhirVersion,
+    previous_resource: Option<serde_json::Value>,
 ) {
     let event = ResourceEvent {
         tenant_id: tenant.tenant_id().clone(),
@@ -68,7 +69,7 @@ pub fn emit_delete_event(
         version_id: String::new(),
         event_type: ResourceEventType::Delete,
         resource: None,
-        previous_resource: None,
+        previous_resource,
         timestamp: chrono::Utc::now(),
     };
 
