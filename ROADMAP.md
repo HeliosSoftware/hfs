@@ -53,8 +53,8 @@ Work that is currently underway or planned for the near term.
 |------|------|--------|
 | **Standards** | [Terminology](https://github.com/HeliosSoftware/hfs/discussions/54) | 🟡 In progress |
 | **Standards** | FHIR Validation engine | 🔵 Design |
-| **Standards** | [FHIR Subscriptions — Topic-based notification support](https://github.com/HeliosSoftware/hfs/discussions/59) | 🔵 Design |
-| **Analytics** | [SQL on FHIR](https://sql-on-fhir.org/ig/latest/) — HFS integration and operations update | 🔵 Design |
+| **Standards** | [FHIR Subscriptions — Topic-based notification support](https://github.com/HeliosSoftware/hfs/discussions/59) | 🟡 In progress |
+| **Analytics** | [SQL on FHIR](https://sql-on-fhir.org/ig/latest/) — HFS integration and operations update | 🟡 In progress |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
 ### Discussion Documents
