@@ -1,0 +1,8 @@
+{
+  "resourceType": "Patient",
+  "meta": {
+    "profile": [
+      "http://atrius.health/fhir/StructureDefinition/missing-profile"
+    ]
+  }
+}

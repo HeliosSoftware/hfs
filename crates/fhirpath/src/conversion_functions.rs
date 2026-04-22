@@ -37,20 +37,20 @@ pub fn to_decimal_function(
     // Handle each type according to FHIRPath rules
     Ok(match invocation_base {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Boolean(b, _) => {
+        EvaluationResult::Boolean(b, _, _) => {
             EvaluationResult::decimal(if *b { Decimal::ONE } else { Decimal::ZERO })
         }
-        EvaluationResult::Integer(i, _) => EvaluationResult::decimal(Decimal::from(*i)),
+        EvaluationResult::Integer(i, _, _) => EvaluationResult::decimal(Decimal::from(*i)),
         #[cfg(not(any(feature = "R4", feature = "R4B")))]
         EvaluationResult::Integer64(i, _) => EvaluationResult::decimal(Decimal::from(*i)),
-        EvaluationResult::Decimal(d, _) => EvaluationResult::decimal(*d),
-        EvaluationResult::String(s, _) => {
+        EvaluationResult::Decimal(d, _, _) => EvaluationResult::decimal(*d),
+        EvaluationResult::String(s, _, _) => {
             // Try parsing as Decimal
             s.parse::<Decimal>()
                 .map(EvaluationResult::decimal)
                 .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
         }
-        EvaluationResult::Quantity(val, _, _) => EvaluationResult::decimal(*val),
+        EvaluationResult::Quantity(val, _, _, _) => EvaluationResult::decimal(*val),
         // Collections are handled by the count check above
         EvaluationResult::Collection { .. } => unreachable!(),
         // Other types are not convertible to Decimal
@@ -85,20 +85,20 @@ pub fn to_integer_function(
     // Handle each type according to FHIRPath rules
     Ok(match invocation_base {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Boolean(b, _) => EvaluationResult::integer(if *b { 1 } else { 0 }),
-        EvaluationResult::Integer(i, _) => EvaluationResult::integer(*i),
+        EvaluationResult::Boolean(b, _, _) => EvaluationResult::integer(if *b { 1 } else { 0 }),
+        EvaluationResult::Integer(i, _, _) => EvaluationResult::integer(*i),
         #[cfg(not(any(feature = "R4", feature = "R4B")))]
         EvaluationResult::Integer64(i, _) => EvaluationResult::integer(*i),
-        EvaluationResult::String(s, _) => {
+        EvaluationResult::String(s, _, _) => {
             // Try parsing as i64
             s.parse::<i64>()
                 .map(EvaluationResult::integer)
                 .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
         }
         // Per FHIRPath spec, Decimal cannot be converted to Integer via toInteger()
-        EvaluationResult::Decimal(_, _) => EvaluationResult::Empty,
+        EvaluationResult::Decimal(_, _, _) => EvaluationResult::Empty,
         // Quantity to Integer (returns value if integer, else empty)
-        EvaluationResult::Quantity(val, _, _) => {
+        EvaluationResult::Quantity(val, _, _, _) => {
             if val.is_integer() {
                 val.to_i64()
                     .map(EvaluationResult::integer)

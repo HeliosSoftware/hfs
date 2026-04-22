@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "Condition",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-04-17T19:51:19.540+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Condition",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "Condition",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-04-17T19:51:19+00:00",
   "publisher": "HL7 International / Patient Care",
   "contact": [
     {
@@ -63,7 +63,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "w5",
@@ -326,7 +326,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -589,7 +589,7 @@
           ],
           "strength": "required",
           "description": "The clinical status of the condition or diagnosis.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/condition-clinical|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/condition-clinical|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -650,7 +650,7 @@
           ],
           "strength": "required",
           "description": "The verification status to support or decline the clinical status of the condition or diagnosis.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/condition-ver-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/condition-ver-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1837,7 +1837,7 @@
           ],
           "strength": "required",
           "description": "The clinical status of the condition or diagnosis.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/condition-clinical|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/condition-clinical|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1884,7 +1884,7 @@
           ],
           "strength": "required",
           "description": "The verification status to support or decline the clinical status of the condition or diagnosis.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/condition-ver-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/condition-ver-status|6.0.0-ballot4"
         },
         "mapping": [
           {

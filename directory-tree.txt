@@ -1,0 +1,643 @@
+crates/
+├── fhir-gen/
+│   ├── resources/
+│   │   ├── R4/
+│   │   │   ├── compartmentdefinition-device.json
+│   │   │   ├── compartmentdefinition-encounter.json
+│   │   │   ├── compartmentdefinition-patient.json
+│   │   │   ├── compartmentdefinition-practitioner.json
+│   │   │   ├── compartmentdefinition-questionnaire.json
+│   │   │   ├── compartmentdefinition-relatedperson.json
+│   │   │   ├── conceptmaps.json
+│   │   │   ├── dataelements.json
+│   │   │   ├── fhir.schema.json.zip
+│   │   │   ├── profiles-others.json
+│   │   │   ├── profiles-resources.json
+│   │   │   ├── profiles-types.json
+│   │   │   ├── search-parameters.json
+│   │   │   ├── valuesets.json
+│   │   │   └── version.info
+│   │   ├── R4B/
+│   │   │   ├── compartmentdefinition-device.json
+│   │   │   ├── compartmentdefinition-encounter.json
+│   │   │   ├── compartmentdefinition-patient.json
+│   │   │   ├── compartmentdefinition-practitioner.json
+│   │   │   ├── compartmentdefinition-questionnaire.json
+│   │   │   ├── compartmentdefinition-relatedperson.json
+│   │   │   ├── conceptmaps.json
+│   │   │   ├── dataelements.json
+│   │   │   ├── fhir.schema.json.zip
+│   │   │   ├── profiles-others.json
+│   │   │   ├── profiles-resources.json
+│   │   │   ├── profiles-types.json
+│   │   │   ├── search-parameters.json
+│   │   │   ├── valuesets.json
+│   │   │   └── version.info
+│   │   ├── R5/
+│   │   │   ├── compartmentdefinition-device.json
+│   │   │   ├── compartmentdefinition-encounter.json
+│   │   │   ├── compartmentdefinition-patient.json
+│   │   │   ├── compartmentdefinition-practitioner.json
+│   │   │   ├── compartmentdefinition-questionnaire.json
+│   │   │   ├── compartmentdefinition-relatedperson.json
+│   │   │   ├── conceptmaps.json
+│   │   │   ├── dataelements.json
+│   │   │   ├── fhir.schema.json.zip
+│   │   │   ├── profiles-others.json
+│   │   │   ├── profiles-resources.json
+│   │   │   ├── profiles-types.json
+│   │   │   ├── search-parameters.json
+│   │   │   ├── valuesets.json
+│   │   │   └── version.info
+│   │   ├── R6/
+│   │       ├── compartmentdefinition-device.json
+│   │       ├── compartmentdefinition-encounter.json
+│   │       ├── compartmentdefinition-group.json
+│   │       ├── compartmentdefinition-patient.json
+│   │       ├── compartmentdefinition-practitioner.json
+│   │       ├── compartmentdefinition-relatedperson.json
+│   │       ├── conceptmaps.json
+│   │       ├── dataelements.json
+│   │       ├── download_metadata.json
+│   │       ├── fhir.schema.json.zip
+│   │       ├── profiles-others.json
+│   │       ├── profiles-resources.json
+│   │       ├── profiles-types.json
+│   │       ├── search-parameters.json
+│   │       ├── valuesets.json
+│   │       ├── version.info
+│   │       └── view-definition-bundle-entry.json
+│   ├── src/
+│   │   ├── directory_output_helpers.rs
+│   │   ├── initial_fhir_model.rs
+│   │   ├── lib.rs
+│   │   └── main.rs
+│   ├── Cargo.toml
+│   ├── README.md
+│   ├── build.rs
+│   └── fix_doc_comments.rs
+├── fhir-macro/
+│   ├── src/
+│   │   └── lib.rs
+│   ├── Cargo.toml
+│   └── README.md
+├── fhir-valueset-gen/
+│   ├── src/
+│   │   ├── main.rs
+│   │   └── models.rs
+│   └── Cargo.toml
+├── fhirpath/
+│   ├── benches/
+│   │   ├── cli_benches.rs
+│   │   ├── evaluator_benches.rs
+│   │   ├── parser_benches.rs
+│   │   └── server_benches.rs
+│   ├── examples/
+│   │   └── test_ucum.rs
+│   ├── grammar/
+│   │   └── fhirpath.g4
+│   ├── src/
+│   │   ├── bin/
+│   │   │   ├── fhirpath-cli.rs
+│   │   │   └── fhirpath-server.rs
+│   │   ├── aggregate_function.rs
+│   │   ├── boolean_functions.rs
+│   │   ├── boundary_functions.rs
+│   │   ├── cli.rs
+│   │   ├── collection_functions.rs
+│   │   ├── collection_navigation.rs
+│   │   ├── contains_function.rs
+│   │   ├── conversion_functions.rs
+│   │   ├── date_operation.rs
+│   │   ├── datetime_impl.rs
+│   │   ├── debug_trace.rs
+│   │   ├── distinct_functions.rs
+│   │   ├── error.rs
+│   │   ├── evaluator.rs
+│   │   ├── extension_function.rs
+│   │   ├── fhir_type_hierarchy.rs
+│   │   ├── handlers.rs
+│   │   ├── json_utils.rs
+│   │   ├── lib.rs
+│   │   ├── long_conversion.rs
+│   │   ├── models.rs
+│   │   ├── not_function.rs
+│   │   ├── parse_debug.rs
+│   │   ├── parser.rs
+│   │   ├── polymorphic_access.rs
+│   │   ├── reference_key_functions.rs
+│   │   ├── repeat_function.rs
+│   │   ├── resource_type.rs
+│   │   ├── server.rs
+│   │   ├── set_operations.rs
+│   │   ├── subset_functions.rs
+│   │   ├── terminology_client.rs
+│   │   ├── terminology_functions.rs
+│   │   ├── trace_function.rs
+│   │   ├── type_function.rs
+│   │   ├── type_inference.rs
+│   │   └── ucum.rs
+│   ├── tests/
+│   │   ├── common/
+│   │   │   ├── context.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── parser.rs
+│   │   │   └── runner.rs
+│   │   ├── data/
+│   │   │   ├── r4/
+│   │   │   │   ├── input/
+│   │   │   │   │   ├── observation-example.json
+│   │   │   │   │   ├── observation-example.xml
+│   │   │   │   │   ├── patient-example.json
+│   │   │   │   │   ├── patient-example.xml
+│   │   │   │   │   ├── questionnaire-example.json
+│   │   │   │   │   ├── questionnaire-example.xml
+│   │   │   │   │   ├── valueset-example-expansion.json
+│   │   │   │   │   └── valueset-example-expansion.xml
+│   │   │   │   └── tests-fhir-r4.xml
+│   │   │   ├── r5/
+│   │   │   │   ├── input/
+│   │   │   │   │   ├── appointment-examplereq.json
+│   │   │   │   │   ├── ccda.json
+│   │   │   │   │   ├── codesystem-example.json
+│   │   │   │   │   ├── conceptmap-example.json
+│   │   │   │   │   ├── explanationofbenefit-example.json
+│   │   │   │   │   ├── observation-example.json
+│   │   │   │   │   ├── observation-example.xml
+│   │   │   │   │   ├── parameters-example-types.json
+│   │   │   │   │   ├── patient-container-example.json
+│   │   │   │   │   ├── patient-example-name.json
+│   │   │   │   │   ├── patient-example-period.json
+│   │   │   │   │   ├── patient-example.json
+│   │   │   │   │   ├── patient-name-extensions.json
+│   │   │   │   │   ├── questionnaire-example.json
+│   │   │   │   │   └── valueset-example-expansion.json
+│   │   │   │   ├── known-test-failures.json
+│   │   │   │   └── tests-fhir-r5.xml
+│   │   │   └── testSchema.xsd
+│   │   ├── all_function_tests.rs
+│   │   ├── boundary_debug_tests.rs
+│   │   ├── boundary_function_integration_tests.rs
+│   │   ├── comment_test.rs
+│   │   ├── context_trace_test.rs
+│   │   ├── date_operation_tests.rs
+│   │   ├── datetime_boundary_tests.rs
+│   │   ├── debug_datetime_boundary.rs
+│   │   ├── debug_string_boundary_tests.rs
+│   │   ├── define_variable_test.rs
+│   │   ├── enhanced_variable_tests.rs
+│   │   ├── evaluator_tests.rs
+│   │   ├── extension_tests.rs
+│   │   ├── fhir_boundary_tests.rs
+│   │   ├── is_as_method_tests.rs
+│   │   ├── join_function_test.rs
+│   │   ├── oftype_datetime_tests.rs
+│   │   ├── parse_debug_test.rs
+│   │   ├── parser_tests.rs
+│   │   ├── polymorphic_r4_tests.rs
+│   │   ├── polymorphic_tests.rs
+│   │   ├── precision_tests.rs
+│   │   ├── r4_tests.rs
+│   │   ├── r5_tests.rs
+│   │   ├── reference_key_debug.rs
+│   │   ├── test_boundary_zero.rs
+│   │   ├── trace_api_test.rs
+│   │   ├── trace_tests.rs
+│   │   ├── tree_navigation_tests.rs
+│   │   ├── truncate_tests.rs
+│   │   ├── type_operation_tests.rs
+│   │   ├── type_preservation_integration_test.rs
+│   │   ├── type_reflection_tests.rs
+│   │   ├── uri_type_test.rs
+│   │   └── uuid_type_preservation_test.rs
+│   ├── Cargo.toml
+│   ├── PRECISION_LIMITATION.md
+│   ├── README.md
+│   └── server-api.md
+├── fhirpath-support/
+│   ├── src/
+│   │   ├── lib.rs
+│   │   └── type_info.rs
+│   ├── Cargo.toml
+│   └── README.md
+├── hfs/
+│   ├── src/
+│   │   └── main.rs
+│   ├── tests/
+│   │   ├── inferno/
+│   │       ├── cached_bulk_data_export.json
+│   │       ├── carin_2_1_SearchParameter-explanationofbenefit-insurer.json
+│   │       ├── carin_bundle_patient_888.json
+│   │       ├── carin_proxy_group_patient_888.json
+│   │       ├── combo_proxy_group.json
+│   │       ├── dtr_bundle_patient_pat015.json
+│   │       ├── install.sh
+│   │       ├── pdex_bundle_patient_999.json
+│   │       ├── pdex_proxy_group_patient_999.json
+│   │       ├── uscore_bundle_asserted-date.json
+│   │       ├── uscore_bundle_patient_355.json
+│   │       ├── uscore_bundle_patient_85.json
+│   │       ├── uscore_bundle_patient_907.json
+│   │       ├── uscore_bundle_patient_908.json
+│   │       ├── uscore_bundle_patient_client_test.json
+│   │       └── uscore_group_1a.json
+│   ├── Cargo.toml
+│   ├── README.md
+│   └── build.rs
+├── persistence/
+│   ├── src/
+│   │   ├── advisor/
+│   │   │   ├── analysis.rs
+│   │   │   ├── handlers.rs
+│   │   │   ├── main.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── server.rs
+│   │   │   └── suggestions.rs
+│   │   ├── backends/
+│   │   │   ├── elasticsearch/
+│   │   │   │   ├── search/
+│   │   │   │   │   ├── parameter_handlers/
+│   │   │   │   │   │   ├── composite.rs
+│   │   │   │   │   │   ├── date.rs
+│   │   │   │   │   │   ├── mod.rs
+│   │   │   │   │   │   ├── number.rs
+│   │   │   │   │   │   ├── quantity.rs
+│   │   │   │   │   │   ├── reference.rs
+│   │   │   │   │   │   ├── string.rs
+│   │   │   │   │   │   ├── token.rs
+│   │   │   │   │   │   └── uri.rs
+│   │   │   │   │   ├── fts.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   ├── modifier_handlers.rs
+│   │   │   │   │   └── query_builder.rs
+│   │   │   │   ├── backend.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── schema.rs
+│   │   │   │   ├── search_impl.rs
+│   │   │   │   └── storage.rs
+│   │   │   ├── postgres/
+│   │   │   │   ├── search/
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   ├── query_builder.rs
+│   │   │   │   │   └── writer.rs
+│   │   │   │   ├── backend.rs
+│   │   │   │   ├── bulk_export.rs
+│   │   │   │   ├── bulk_submit.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── schema.rs
+│   │   │   │   ├── search_impl.rs
+│   │   │   │   ├── storage.rs
+│   │   │   │   └── transaction.rs
+│   │   │   ├── sqlite/
+│   │   │   │   ├── search/
+│   │   │   │   │   ├── parameter_handlers/
+│   │   │   │   │   │   ├── composite.rs
+│   │   │   │   │   │   ├── date.rs
+│   │   │   │   │   │   ├── mod.rs
+│   │   │   │   │   │   ├── number.rs
+│   │   │   │   │   │   ├── quantity.rs
+│   │   │   │   │   │   ├── reference.rs
+│   │   │   │   │   │   ├── string.rs
+│   │   │   │   │   │   ├── token.rs
+│   │   │   │   │   │   └── uri.rs
+│   │   │   │   │   ├── chain_builder.rs
+│   │   │   │   │   ├── filter_parser.rs
+│   │   │   │   │   ├── fts.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   ├── modifier_handlers.rs
+│   │   │   │   │   ├── query_builder.rs
+│   │   │   │   │   ├── strategy.rs
+│   │   │   │   │   └── writer.rs
+│   │   │   │   ├── backend.rs
+│   │   │   │   ├── bulk_export.rs
+│   │   │   │   ├── bulk_submit.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── schema.rs
+│   │   │   │   ├── search_impl.rs
+│   │   │   │   ├── storage.rs
+│   │   │   │   └── transaction.rs
+│   │   │   └── mod.rs
+│   │   ├── composite/
+│   │   │   ├── analyzer.rs
+│   │   │   ├── config.rs
+│   │   │   ├── cost.rs
+│   │   │   ├── health.rs
+│   │   │   ├── merger.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── router.rs
+│   │   │   ├── storage.rs
+│   │   │   └── sync.rs
+│   │   ├── core/
+│   │   │   ├── backend.rs
+│   │   │   ├── bulk_export.rs
+│   │   │   ├── bulk_submit.rs
+│   │   │   ├── capabilities.rs
+│   │   │   ├── history.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── search.rs
+│   │   │   ├── storage.rs
+│   │   │   ├── transaction.rs
+│   │   │   └── versioned.rs
+│   │   ├── search/
+│   │   │   ├── converters.rs
+│   │   │   ├── errors.rs
+│   │   │   ├── extractor.rs
+│   │   │   ├── loader.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── registry.rs
+│   │   │   ├── reindex.rs
+│   │   │   └── writer.rs
+│   │   ├── strategy/
+│   │   │   ├── database_per_tenant.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── schema_per_tenant.rs
+│   │   │   └── shared_schema.rs
+│   │   ├── tenant/
+│   │   │   ├── context.rs
+│   │   │   ├── id.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── permissions.rs
+│   │   │   └── tenancy.rs
+│   │   ├── types/
+│   │   │   ├── mod.rs
+│   │   │   ├── pagination.rs
+│   │   │   ├── search_capabilities.rs
+│   │   │   ├── search_params.rs
+│   │   │   └── stored_resource.rs
+│   │   ├── error.rs
+│   │   └── lib.rs
+│   ├── tests/
+│   │   ├── common/
+│   │   │   ├── assertions.rs
+│   │   │   ├── capabilities.rs
+│   │   │   ├── fixtures.rs
+│   │   │   ├── harness.rs
+│   │   │   └── mod.rs
+│   │   ├── crud/
+│   │   │   ├── conditional_tests.rs
+│   │   │   ├── create_tests.rs
+│   │   │   ├── delete_tests.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── read_tests.rs
+│   │   │   └── update_tests.rs
+│   │   ├── fixtures/
+│   │   │   ├── observations.json
+│   │   │   ├── organizations.json
+│   │   │   └── patients.json
+│   │   ├── multitenancy/
+│   │   │   ├── cross_tenant_tests.rs
+│   │   │   ├── isolation_tests.rs
+│   │   │   └── mod.rs
+│   │   ├── search/
+│   │   │   ├── chained_tests.rs
+│   │   │   ├── date_tests.rs
+│   │   │   ├── include_tests.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── modifier_tests.rs
+│   │   │   ├── number_tests.rs
+│   │   │   ├── pagination_tests.rs
+│   │   │   ├── quantity_tests.rs
+│   │   │   ├── reference_tests.rs
+│   │   │   ├── string_tests.rs
+│   │   │   └── token_tests.rs
+│   │   ├── transactions/
+│   │   │   ├── basic_tests.rs
+│   │   │   ├── bundle_tests.rs
+│   │   │   ├── mod.rs
+│   │   │   └── rollback_tests.rs
+│   │   ├── versioning/
+│   │   │   ├── history_tests.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── optimistic_locking_tests.rs
+│   │   │   └── vread_tests.rs
+│   │   ├── composite_polyglot_tests.rs
+│   │   ├── composite_routing_tests.rs
+│   │   ├── elasticsearch_tests.rs
+│   │   ├── postgres_tests.rs
+│   │   └── sqlite_tests.rs
+│   ├── Cargo.toml
+│   └── README.md
+├── pysof/
+│   ├── python-tests/
+│   │   ├── __init__.py
+│   │   ├── test_content_types.py
+│   │   ├── test_core_functions.py
+│   │   ├── test_error_handling.py
+│   │   ├── test_fhir_versions.py
+│   │   ├── test_import.py
+│   │   ├── test_package_metadata.py
+│   │   └── test_source_errors.py
+│   ├── scripts/
+│   │   └── build-wheels.py
+│   ├── src/
+│   │   ├── pysof/
+│   │   │   ├── __init__.py
+│   │   │   ├── _pysof.cpython-311-darwin.so
+│   │   │   ├── _pysof.pyi
+│   │   │   └── py.typed
+│   │   └── lib.rs
+│   ├── tests/
+│   │   ├── integration/
+│   │   │   ├── content_types.rs
+│   │   │   ├── error_handling.rs
+│   │   │   ├── fhir_versions.rs
+│   │   │   └── mod.rs
+│   │   ├── integration.rs
+│   │   ├── lib_coverage_tests.rs
+│   │   ├── lib_tests.rs
+│   │   ├── multithreading_integration.rs
+│   │   └── threading_test.rs
+│   ├── Cargo.lock
+│   ├── Cargo.toml
+│   ├── Makefile
+│   ├── PYPI_CHECKLIST.md
+│   ├── README.md
+│   ├── WHEEL_BUILDING.md
+│   ├── multithreading_example.py
+│   ├── pyproject.toml
+│   ├── test_multithreading.py
+│   └── uv.lock
+├── rest/
+│   ├── src/
+│   │   ├── extractors/
+│   │   │   ├── fhir_resource.rs
+│   │   │   ├── fhir_version.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── pagination.rs
+│   │   │   ├── search_params.rs
+│   │   │   ├── search_query_builder.rs
+│   │   │   └── tenant.rs
+│   │   ├── handlers/
+│   │   │   ├── batch.rs
+│   │   │   ├── capabilities.rs
+│   │   │   ├── compartment.rs
+│   │   │   ├── create.rs
+│   │   │   ├── delete.rs
+│   │   │   ├── health.rs
+│   │   │   ├── history.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── patch.rs
+│   │   │   ├── read.rs
+│   │   │   ├── search.rs
+│   │   │   ├── update.rs
+│   │   │   ├── versions.rs
+│   │   │   └── vread.rs
+│   │   ├── middleware/
+│   │   │   ├── conditional.rs
+│   │   │   ├── content_type.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── prefer.rs
+│   │   │   ├── tenant.rs
+│   │   │   └── tenant_prefix.rs
+│   │   ├── responses/
+│   │   │   ├── bundle.rs
+│   │   │   ├── format.rs
+│   │   │   ├── headers.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── operation_outcome.rs
+│   │   │   └── subsetting.rs
+│   │   ├── routing/
+│   │   │   ├── fhir_routes.rs
+│   │   │   └── mod.rs
+│   │   ├── tenant/
+│   │   │   ├── mod.rs
+│   │   │   ├── resolver.rs
+│   │   │   ├── source.rs
+│   │   │   └── validation.rs
+│   │   ├── config.rs
+│   │   ├── error.rs
+│   │   ├── fhir_types.rs
+│   │   ├── lib.rs
+│   │   └── state.rs
+│   ├── tests/
+│   │   ├── common/
+│   │   │   ├── assertions.rs
+│   │   │   ├── backend_config.rs
+│   │   │   ├── fixtures.rs
+│   │   │   ├── harness.rs
+│   │   │   ├── mod.rs
+│   │   │   └── spec_loader.rs
+│   │   ├── specs/
+│   │   │   ├── crud/
+│   │   │       ├── create.json
+│   │   │       ├── delete.json
+│   │   │       ├── read.json
+│   │   │       └── update.json
+│   │   ├── rest_conformance.rs
+│   │   ├── search_integration.rs
+│   │   ├── tenant_resolution.rs
+│   │   └── xml_conformance.rs
+│   ├── Cargo.toml
+│   └── README.md
+├── serde/
+│   ├── src/
+│   │   ├── xml/
+│   │   │   ├── de.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── ser.rs
+│   │   │   └── utils.rs
+│   │   ├── error.rs
+│   │   ├── json.rs
+│   │   └── lib.rs
+│   ├── tests/
+│   │   ├── test_examples.rs
+│   │   ├── test_json_serde.rs
+│   │   ├── test_xml_fhir_serde.rs
+│   │   └── test_xml_serde.rs
+│   ├── Cargo.toml
+│   └── README.md
+├── serde-support/
+│   ├── src/
+│   │   └── lib.rs
+│   └── Cargo.toml
+├── sof/
+    ├── benches/
+    │   └── parallel_processing_bench.rs
+    ├── src/
+    │   ├── cli.rs
+    │   ├── data_source.rs
+    │   ├── error.rs
+    │   ├── handlers.rs
+    │   ├── lib.rs
+    │   ├── mod.rs
+    │   ├── models.rs
+    │   ├── parquet_schema.rs
+    │   ├── server.rs
+    │   ├── streaming.rs
+    │   └── traits.rs
+    ├── tests/
+    │   ├── common/
+    │   │   └── mod.rs
+    │   ├── sql-on-fhir-v2/
+    │   │   ├── tests/
+    │   │       ├── basic.json
+    │   │       ├── collection.json
+    │   │       ├── combinations.json
+    │   │       ├── constant.json
+    │   │       ├── constant_types.json
+    │   │       ├── fhirpath.json
+    │   │       ├── fhirpath_numbers.json
+    │   │       ├── fn_boundary.json
+    │   │       ├── fn_empty.json
+    │   │       ├── fn_extension.json
+    │   │       ├── fn_first.json
+    │   │       ├── fn_join.json
+    │   │       ├── fn_oftype.json
+    │   │       ├── fn_reference_keys.json
+    │   │       ├── foreach.json
+    │   │       ├── logic.json
+    │   │       ├── repeat.json
+    │   │       ├── union.json
+    │   │       ├── validate.json
+    │   │       ├── view_resource.json
+    │   │       └── where.json
+    │   ├── debug_boolean_test.rs
+    │   ├── debug_column_ordering.rs
+    │   ├── debug_datetime_instant_constants.rs
+    │   ├── debug_datetime_type_info.rs
+    │   ├── debug_enum_conversion.rs
+    │   ├── debug_evaluation_result_conversion.rs
+    │   ├── debug_extension_function.rs
+    │   ├── debug_extension_macro_fix.rs
+    │   ├── debug_extension_simple.rs
+    │   ├── debug_fhir_resource_structure.rs
+    │   ├── debug_foreach_combinations.rs
+    │   ├── debug_inequality.rs
+    │   ├── debug_instant_constant.rs
+    │   ├── debug_instant_type_info.rs
+    │   ├── debug_raw_resource.rs
+    │   ├── debug_reference_key_types.rs
+    │   ├── extension_debug_test.rs
+    │   ├── foreach_test.rs
+    │   ├── multiselect_test.rs
+    │   ├── run_foreach_tests.rs
+    │   ├── server_tests.rs
+    │   ├── sql_on_fhir_tests.rs
+    │   ├── test_base64_binary_constant.rs
+    │   ├── test_boolean_constant_debug.rs
+    │   ├── test_boolean_constant_debug2.rs
+    │   ├── test_boolean_constant_debug3.rs
+    │   ├── test_boolean_validation.rs
+    │   ├── test_chunked_processing.rs
+    │   ├── test_cli_file_source.rs
+    │   ├── test_csv_quote_handling.rs
+    │   ├── test_extension_fix_verification.rs
+    │   ├── test_extension_value_access.rs
+    │   ├── test_format_parameter_body.rs
+    │   ├── test_header_parameter_body.rs
+    │   ├── test_limit_parameter_body.rs
+    │   ├── test_ndjson_input.rs
+    │   ├── test_parallel_working.rs
+    │   ├── test_parameter_validation.rs
+    │   ├── test_parquet_export.rs
+    │   ├── test_parquet_large_dataset.rs
+    │   ├── test_parquet_server_options.rs
+    │   ├── test_patient_reference_formats.rs
+    │   ├── test_query_parameter_combinations.rs
+    │   ├── test_run_operation_parameters.rs
+    │   ├── test_runner_integration.rs
+    │   ├── test_shortened_format_names.rs
+    │   ├── test_where_clause_validation.rs
+    │   └── test_x_ndjson_support.rs
+    ├── Cargo.toml
+    └── README.md

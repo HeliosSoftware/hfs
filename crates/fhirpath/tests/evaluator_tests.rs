@@ -425,7 +425,7 @@ fn test_function_existence_distinct() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i, _) => i,
+                EvaluationResult::Integer(i, _, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Improved panic message
             })
             .collect();
@@ -889,7 +889,7 @@ fn test_function_subsetting_intersect() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i, _) => i,
+                EvaluationResult::Integer(i, _, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Improved panic message
             })
             .collect();
@@ -991,7 +991,7 @@ fn test_function_combining_union() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i, _) => i,
+                EvaluationResult::Integer(i, _, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Use pattern matching
             })
             .collect();
@@ -1005,7 +1005,7 @@ fn test_function_combining_union() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i, _) => i,
+                EvaluationResult::Integer(i, _, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Use pattern matching
             })
             .collect();
@@ -1046,7 +1046,7 @@ fn test_function_combining_combine() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i, _) => i,
+                EvaluationResult::Integer(i, _, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Use pattern matching
             })
             .collect();
@@ -1061,7 +1061,7 @@ fn test_function_combining_combine() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i, _) => i,
+                EvaluationResult::Integer(i, _, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Use pattern matching
             })
             .collect();
@@ -2573,7 +2573,7 @@ fn test_function_utility_now() {
     let context = EvaluationContext::new_empty_with_default_version();
     let result = eval("now()", &context).unwrap(); // Add unwrap
     // Check it's a DateTime, format might vary slightly
-    assert!(matches!(result, EvaluationResult::DateTime(_, _)));
+    assert!(matches!(result, EvaluationResult::DateTime(_, _, _)));
     // Check determinism (calling twice gives same result)
     //assert_eq!(
     //    eval("now() = now()", &context).unwrap(), // Use eval helper and unwrap
@@ -2587,7 +2587,7 @@ fn test_function_utility_time_of_day() {
     let context = EvaluationContext::new_empty_with_default_version();
     let result = eval("timeOfDay()", &context).unwrap(); // Add unwrap
     // Check it's a Time
-    assert!(matches!(result, EvaluationResult::Time(_, _)));
+    assert!(matches!(result, EvaluationResult::Time(_, _, _)));
     // Check determinism
     //let expr = parser().parse("timeOfDay() = timeOfDay()").unwrap();
     //assert_eq!(
@@ -2602,7 +2602,7 @@ fn test_function_utility_today() {
     let context = EvaluationContext::new_empty_with_default_version();
     let result = eval("today()", &context).unwrap(); // Add unwrap
     // Check it's a Date
-    assert!(matches!(result, EvaluationResult::Date(_, _)));
+    assert!(matches!(result, EvaluationResult::Date(_, _, _)));
     // Check determinism
     let expr = parser().parse("today() = today()").unwrap();
     assert_eq!(
@@ -3120,7 +3120,7 @@ fn test_operator_collections_union() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i, _) => i,
+                EvaluationResult::Integer(i, _, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Improved panic message
             })
             .collect();
@@ -3970,15 +3970,15 @@ fn test_resource_nested_field_access() {
 
     // TODO: Re-enable these tests when .id access on primitives is implemented
     // // Access element id - 'active' should allow .id access
-    // assert_eq!(
-    //     eval("active.id", &context),
-    //     EvaluationResult::string("active-id".to_string())
-    // );
+    assert_eq!(
+        eval("active.id", &context).unwrap(),
+        EvaluationResult::string("active-id".to_string())
+    );
     // // Access element id - 'birthDate' should allow .id access
-    // assert_eq!(
-    //     eval("birthDate.id", &context),
-    //     EvaluationResult::string("birthdate-id".to_string())
-    // );
+    assert_eq!(
+        eval("birthDate.id", &context).unwrap(),
+        EvaluationResult::string("birthdate-id".to_string())
+    );
 
     // Access id on complex type (HumanName) - this should still work
     let name_ids = eval("name.id", &context).unwrap(); // Add unwrap
@@ -3993,28 +3993,36 @@ fn test_resource_nested_field_access() {
         assert!(items.contains(&EvaluationResult::string("name2".to_string())));
     }
     // TODO: Re-enable this test when .id access on primitives is implemented
-    // let given_ids = eval("name.given.id", &context); // (empty for John), given2-id, (empty for Johnny), (empty for Jane)
-    // assert!(
-    //     matches!(given_ids, EvaluationResult::string(_)),
-    //     "Expected String for name.given.id, got {:?}",
-    //     given_ids
-    // ); // Only one ID present
-    // assert_eq!(given_ids, EvaluationResult::string("given2-id".to_string()));
+    let given_ids = eval("name.given.id", &context).unwrap(); // (empty for John), given2-id, (empty for Johnny), (empty for Jane)
+    let _s2 = EvaluationResult::string("given2-id".to_string());
+    assert!(
+        matches!(given_ids, ref _s2),
+        "Expected String for name.given.id, got {:?}",
+        given_ids
+    ); // Only one ID present
+    assert_eq!(given_ids, EvaluationResult::string("given2-id".to_string()));
 
     // TODO: Re-enable these tests when .extension access on primitives is implemented
-    // // Access extension (basic check, requires Extension conversion)
-    // let bday_ext = eval("birthDate.extension", &context);
-    // assert!(
-    //     matches!(bday_ext, EvaluationResult::Collection { .. }),
-    //     "Expected Collection for birthDate.extension, got {:?}", // This message belongs inside the assert!
-    //     bday_ext
-    // );
-    // if let EvaluationResult::Collection { items: exts, .. } = bday_ext {
-    //     assert_eq!(exts.len(), 1);
-    //     // Further checks require Extension object structure
-    //     // assert_eq!(eval("birthDate.extension.url", &context), EvaluationResult::string("http://example.com/precision".to_string()));
-    //     // assert_eq!(eval("birthDate.extension.valueString", &context), EvaluationResult::string("day".to_string()));
-    // }
+    // Access extension (basic check, requires Extension conversion)
+    let bday_ext = eval("birthDate.extension", &context).unwrap();
+    assert!(
+        matches!(bday_ext, EvaluationResult::Collection { .. }),
+        "Expected Collection for birthDate.extension, got {:?}", // This message belongs inside the assert!
+        bday_ext
+    );
+    let _bday_ext2 = eval("birthDate.extension", &context);
+    if let EvaluationResult::Collection { items: exts, .. } = bday_ext {
+        assert_eq!(exts.len(), 1);
+        // Further checks require Extension object structure
+        assert_eq!(
+            eval("birthDate.extension.url", &context).unwrap(),
+            EvaluationResult::string("http://example.com/precision".to_string())
+        );
+        assert_eq!(
+            eval("birthDate.extension.valueString", &context).unwrap(),
+            EvaluationResult::string("day".to_string())
+        );
+    }
 }
 
 #[test]
@@ -4816,7 +4824,10 @@ fn test_math_functions() {
 
         // Special handling for Decimal and Quantity types
         match (&result, &expected) {
-            (EvaluationResult::Decimal(actual, _), EvaluationResult::Decimal(expected, _)) => {
+            (
+                EvaluationResult::Decimal(actual, _, _),
+                EvaluationResult::Decimal(expected, _, _),
+            ) => {
                 // Check that the difference is very small (within 1e-10)
                 let diff = (*actual - *expected).abs();
                 let epsilon = Decimal::from_str_exact("0.0000000001").unwrap();
@@ -4831,8 +4842,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit, _),
-                EvaluationResult::Quantity(expected_val, expected_unit, _),
+                EvaluationResult::Quantity(actual_val, actual_unit, _, _),
+                EvaluationResult::Quantity(expected_val, expected_unit, _, _),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -4894,7 +4905,10 @@ fn test_math_functions() {
 
         // Special handling for Decimal and Quantity types
         match (&result, &expected) {
-            (EvaluationResult::Decimal(actual, _), EvaluationResult::Decimal(expected, _)) => {
+            (
+                EvaluationResult::Decimal(actual, _, _),
+                EvaluationResult::Decimal(expected, _, _),
+            ) => {
                 // Check that the difference is very small (within reasonable error margin)
                 let diff = (*actual - *expected).abs();
                 let epsilon = Decimal::from_str_exact("0.000001").unwrap();
@@ -4909,8 +4923,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit, _),
-                EvaluationResult::Quantity(expected_val, expected_unit, _),
+                EvaluationResult::Quantity(actual_val, actual_unit, _, _),
+                EvaluationResult::Quantity(expected_val, expected_unit, _, _),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -4945,7 +4959,10 @@ fn test_math_functions() {
 
         // Special handling for Decimal and Quantity types
         match (&result, &expected) {
-            (EvaluationResult::Decimal(actual, _), EvaluationResult::Decimal(expected, _)) => {
+            (
+                EvaluationResult::Decimal(actual, _, _),
+                EvaluationResult::Decimal(expected, _, _),
+            ) => {
                 // Check that the difference is very small (within reasonable error margin)
                 let diff = (*actual - *expected).abs();
                 let epsilon = Decimal::from_str_exact("0.000001").unwrap();
@@ -4960,8 +4977,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit, _),
-                EvaluationResult::Quantity(expected_val, expected_unit, _),
+                EvaluationResult::Quantity(actual_val, actual_unit, _, _),
+                EvaluationResult::Quantity(expected_val, expected_unit, _, _),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -4996,7 +5013,10 @@ fn test_math_functions() {
 
         // Special handling for Decimal and Quantity types
         match (&result, &expected) {
-            (EvaluationResult::Decimal(actual, _), EvaluationResult::Decimal(expected, _)) => {
+            (
+                EvaluationResult::Decimal(actual, _, _),
+                EvaluationResult::Decimal(expected, _, _),
+            ) => {
                 // Check that the difference is very small (within reasonable error margin)
                 let diff = (*actual - *expected).abs();
                 let epsilon = Decimal::from_str_exact("0.000001").unwrap();
@@ -5011,8 +5031,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit, _),
-                EvaluationResult::Quantity(expected_val, expected_unit, _),
+                EvaluationResult::Quantity(actual_val, actual_unit, _, _),
+                EvaluationResult::Quantity(expected_val, expected_unit, _, _),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -5047,7 +5067,10 @@ fn test_math_functions() {
 
         // Special handling for Decimal and Quantity types
         match (&result, &expected) {
-            (EvaluationResult::Decimal(actual, _), EvaluationResult::Decimal(expected, _)) => {
+            (
+                EvaluationResult::Decimal(actual, _, _),
+                EvaluationResult::Decimal(expected, _, _),
+            ) => {
                 // Check that the difference is very small (within reasonable error margin)
                 let diff = (*actual - *expected).abs();
                 let epsilon = Decimal::from_str_exact("0.000001").unwrap();
@@ -5062,8 +5085,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit, _),
-                EvaluationResult::Quantity(expected_val, expected_unit, _),
+                EvaluationResult::Quantity(actual_val, actual_unit, _, _),
+                EvaluationResult::Quantity(expected_val, expected_unit, _, _),
             ) => {
                 // Check units are the same
                 assert_eq!(

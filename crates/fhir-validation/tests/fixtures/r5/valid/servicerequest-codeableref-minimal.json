@@ -1,0 +1,20 @@
+{
+  "resourceType": "ServiceRequest",
+  "id": "minimal-codeableref",
+  "status": "active",
+  "intent": "order",
+  "subject": {
+    "reference": "Patient/example"
+  },
+  "code": {
+    "concept": {
+      "coding": [
+        {
+          "system": "http://snomed.info/sct",
+          "code": "3981005",
+          "display": "Carrier detection, molecular genetics (procedure)"
+        }
+      ]
+    }
+  }
+}

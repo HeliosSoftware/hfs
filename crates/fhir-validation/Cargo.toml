@@ -1,0 +1,28 @@
+[package]
+name = "fhir-validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["R4"]
+R4 = ["helios-fhir/R4", "helios-fhirpath/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhirpath/R5"]
+R6 = ["helios-fhir/R6", "helios-fhirpath/R6"]
+
+[dependencies]
+helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
+helios-fhirpath = { path = "../fhirpath", default-features = false}
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.47" }
+fhir-validation-types = { path = "../fhir-validation-types"}
+serde = { workspace = true }
+tracing = "0.1.0"
+reqwest = { version = "0.12", features = ["blocking"]}
+async-trait = "0.1"
+serde_json = "1.0.143"
+rust_decimal = { version = "1.40", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }

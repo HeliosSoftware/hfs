@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "medicinal-product-name-part-type",
   "meta": {
-    "lastUpdated": "2025-12-17T20:50:17.012+11:00",
+    "lastUpdated": "2026-04-18T06:51:19.540+11:00",
     "profile": [
       "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
     ]
@@ -32,7 +32,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.4.1924"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "ProductNamePartType",
   "title": "Product Name Part Type",
   "status": "active",

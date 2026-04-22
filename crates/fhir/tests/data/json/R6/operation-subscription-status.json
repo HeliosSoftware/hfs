@@ -20,13 +20,13 @@
     }
   ],
   "url": "http://hl7.org/fhir/OperationDefinition/Subscription-status",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "Status",
   "title": "Get Current Subscription Status for One or More Subscriptions",
   "status": "active",
   "kind": "operation",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-04-17T19:51:19+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -94,7 +94,7 @@
       "type": "code",
       "binding": {
         "strength": "required",
-        "valueSet": "http://hl7.org/fhir/ValueSet/subscription-status|6.0.0-ballot3"
+        "valueSet": "http://hl7.org/fhir/ValueSet/subscription-status|6.0.0-ballot4"
       }
     },
     {

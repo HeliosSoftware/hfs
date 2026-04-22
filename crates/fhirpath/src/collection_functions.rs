@@ -562,12 +562,12 @@ fn compare_evaluation_results(a: &EvaluationResult, b: &EvaluationResult) -> std
         (_, EvaluationResult::Empty) => Ordering::Greater,
 
         // Boolean comparison
-        (EvaluationResult::Boolean(a, _), EvaluationResult::Boolean(b, _)) => a.cmp(b),
+        (EvaluationResult::Boolean(a, _, _), EvaluationResult::Boolean(b, _, _)) => a.cmp(b),
 
         // Numeric comparisons
-        (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => a.cmp(b),
-        (EvaluationResult::Integer64(a, _), EvaluationResult::Integer64(b, _)) => a.cmp(b),
-        (EvaluationResult::Decimal(a, _), EvaluationResult::Decimal(b, _)) => {
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => a.cmp(b),
+        (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer64(b, _, _)) => a.cmp(b),
+        (EvaluationResult::Decimal(a, _, _), EvaluationResult::Decimal(b, _, _)) => {
             // Decimal doesn't implement Ord, so we need to handle it
             if a < b {
                 Ordering::Less
@@ -579,7 +579,7 @@ fn compare_evaluation_results(a: &EvaluationResult, b: &EvaluationResult) -> std
         }
 
         // Mixed numeric types - convert to Decimal for comparison
-        (EvaluationResult::Integer(a, _), EvaluationResult::Decimal(b, _)) => {
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Decimal(b, _, _)) => {
             let a_dec = Decimal::from(*a);
             if a_dec < *b {
                 Ordering::Less
@@ -589,7 +589,7 @@ fn compare_evaluation_results(a: &EvaluationResult, b: &EvaluationResult) -> std
                 Ordering::Equal
             }
         }
-        (EvaluationResult::Decimal(a, _), EvaluationResult::Integer(b, _)) => {
+        (EvaluationResult::Decimal(a, _, _), EvaluationResult::Integer(b, _, _)) => {
             let b_dec = Decimal::from(*b);
             if a < &b_dec {
                 Ordering::Less
@@ -599,21 +599,21 @@ fn compare_evaluation_results(a: &EvaluationResult, b: &EvaluationResult) -> std
                 Ordering::Equal
             }
         }
-        (EvaluationResult::Integer(a, _), EvaluationResult::Integer64(b, _)) => a.cmp(b),
-        (EvaluationResult::Integer64(a, _), EvaluationResult::Integer(b, _)) => a.cmp(b),
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer64(b, _, _)) => a.cmp(b),
+        (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer(b, _, _)) => a.cmp(b),
 
         // String comparison
-        (EvaluationResult::String(a, _), EvaluationResult::String(b, _)) => a.cmp(b),
+        (EvaluationResult::String(a, _, _), EvaluationResult::String(b, _, _)) => a.cmp(b),
 
         // Date/Time comparisons
-        (EvaluationResult::Date(a, _), EvaluationResult::Date(b, _)) => a.cmp(b),
-        (EvaluationResult::DateTime(a, _), EvaluationResult::DateTime(b, _)) => a.cmp(b),
-        (EvaluationResult::Time(a, _), EvaluationResult::Time(b, _)) => a.cmp(b),
+        (EvaluationResult::Date(a, _, _), EvaluationResult::Date(b, _, _)) => a.cmp(b),
+        (EvaluationResult::DateTime(a, _, _), EvaluationResult::DateTime(b, _, _)) => a.cmp(b),
+        (EvaluationResult::Time(a, _, _), EvaluationResult::Time(b, _, _)) => a.cmp(b),
 
         // Quantity comparison (only if same unit)
         (
-            EvaluationResult::Quantity(val_a, unit_a, _),
-            EvaluationResult::Quantity(val_b, unit_b, _),
+            EvaluationResult::Quantity(val_a, unit_a, _, _),
+            EvaluationResult::Quantity(val_b, unit_b, _, _),
         ) => {
             if unit_a == unit_b {
                 if val_a < val_b {
@@ -643,16 +643,16 @@ fn compare_evaluation_results(a: &EvaluationResult, b: &EvaluationResult) -> std
         // Different types - define a type ordering
         _ => {
             let type_order = |v: &EvaluationResult| match v {
-                EvaluationResult::Empty => 0,
-                EvaluationResult::Boolean(_, _) => 1,
-                EvaluationResult::Integer(_, _) => 2,
-                EvaluationResult::Integer64(_, _) => 3,
-                EvaluationResult::Decimal(_, _) => 4,
-                EvaluationResult::String(_, _) => 5,
-                EvaluationResult::Date(_, _) => 6,
-                EvaluationResult::DateTime(_, _) => 7,
-                EvaluationResult::Time(_, _) => 8,
-                EvaluationResult::Quantity(_, _, _) => 9,
+                EvaluationResult::Empty | EvaluationResult::EmptyWithMeta { .. } => 0,
+                EvaluationResult::Boolean(_, _, _) => 1,
+                EvaluationResult::Integer(_, _, _) => 2,
+                EvaluationResult::Integer64(_, _, _) => 3,
+                EvaluationResult::Decimal(_, _, _) => 4,
+                EvaluationResult::String(_, _, _) => 5,
+                EvaluationResult::Date(_, _, _) => 6,
+                EvaluationResult::DateTime(_, _, _) => 7,
+                EvaluationResult::Time(_, _, _) => 8,
+                EvaluationResult::Quantity(_, _, _, _) => 9,
                 EvaluationResult::Collection { .. } => 10,
                 EvaluationResult::Object { .. } => 11,
             };

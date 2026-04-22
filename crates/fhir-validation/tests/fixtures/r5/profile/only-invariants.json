@@ -1,0 +1,16 @@
+{
+  "resourceType": "Patient",
+  "meta": {
+    "profile": [
+      "http://atrius.health/fhir/StructureDefinition/atrius-patient"
+    ]
+  },
+  "active": true,
+  "identifier": [
+    {
+      "system": "http://atrius.health/mrn"
+    }
+  ],
+  "gender": "male",
+  "birthDate": "1980-01-01"
+}

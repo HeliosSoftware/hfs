@@ -1,0 +1,82 @@
+{
+  "resourceType" : "StructureDefinition",
+  "id" : "us-core-patient",
+  "language" : "lp",
+  "text" : {
+    "status" : "extensions",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n\t\t\t\u003ctable\u003e\n\t\t\t\t\u003ctbody\u003e\n\t\t\t\t\t\u003ctr\u003e\n\t\t\t\t\t\t\u003ctd\u003eName\u003c/td\u003e\n\t\t\t\t\t\t\u003ctd\u003ePeter James \n              \u003cb\u003eChalmers\u003c/b\u003e (\u0026quot;Jim\u0026quot;)\n            \u003c/td\u003e\n\t\t\t\t\t\u003c/tr\u003e\n\t\t\t\t\t\u003ctr\u003e\n\t\t\t\t\t\t\u003ctd\u003eAddress\u003c/td\u003e\n\t\t\t\t\t\t\u003ctd\u003e534 Erewhon, Pleasantville, Vic, 3999\u003c/td\u003e\n\t\t\t\t\t\u003c/tr\u003e\n\t\t\t\t\t\u003ctr\u003e\n\t\t\t\t\t\t\u003ctd\u003eContacts\u003c/td\u003e\n\t\t\t\t\t\t\u003ctd\u003eHome: unknown. Work: (03) 5555 6473\u003c/td\u003e\n\t\t\t\t\t\u003c/tr\u003e\n\t\t\t\t\t\u003ctr\u003e\n\t\t\t\t\t\t\u003ctd\u003eId\u003c/td\u003e\n\t\t\t\t\t\t\u003ctd\u003eMRN: 12345 (Acme Healthcare)\u003c/td\u003e\n\t\t\t\t\t\u003c/tr\u003e\n\t\t\t\t\u003c/tbody\u003e\n\t\t\t\u003c/table\u003e\n\t\t\u003c/div\u003e"
+  },
+  "url" : "http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient",
+  "version" : "6.0.0-preview",
+  "versionAlgorithmCoding": {
+    "system": "http://hl7.org/fhir/version-algorithm",
+    "code": "semver",
+    "display": "semver"
+  },
+  "name" : "USCorePatientProfile",
+  "title" : "US Core Patient Profile",
+  "status" : "active",
+  "experimental" : false,
+  "date" : "2022-09-30",
+  "publisher" : "HL7 International - Cross-Group Projects",
+  "contact" : [
+    {
+      "name" : "HL7 International - Cross-Group Projects",
+      "telecom" : [
+        {
+          "system" : "url",
+          "value" : "http://www.hl7.org/Special/committees/cgp"
+        },
+        {
+          "system" : "email",
+          "value" : "cgp@lists.HL7.org"
+        }
+      ]
+    }
+  ],
+  "description" : "The US Core Patient Profile meets the U.S. Core Data for Interoperability (USCDI) v3 'Patient Demographics' requirements. This profile sets minimum expectations for the Patient resource to record, search, and fetch basic demographics and other administrative information about an individual patient. It identifies which core elements, extensions, vocabularies, and value sets **SHALL** be present in the resource when using this profile to promote interoperability and adoption through common implementation.  It identifies which core elements, extensions, vocabularies, and value sets **SHALL** be present in the resource when using this profile.  It provides the floor for standards development for specific use cases.",
+  "jurisdiction" : [
+    {
+      "coding" : [
+        {
+          "system" : "urn:iso:std:iso:3166",
+          "code" : "US"
+        }
+      ]
+    }
+  ],
+  "copyright" : "Used by permission of HL7 International, all rights reserved Creative Commons License",
+  "fhirVersion" : "4.0.1",
+  "mapping" : [
+    {
+      "identity" : "rim",
+      "uri" : "http://hl7.org/v3",
+      "name" : "RIM Mapping"
+    },
+    {
+      "identity" : "cda",
+      "uri" : "http://hl7.org/v3/cda",
+      "name" : "CDA (R2)"
+    },
+    {
+      "identity" : "w5",
+      "uri" : "http://hl7.org/fhir/fivews",
+      "name" : "FiveWs Pattern Mapping"
+    },
+    {
+      "identity" : "v2",
+      "uri" : "http://hl7.org/v2",
+      "name" : "HL7 v2 Mapping"
+    },
+    {
+      "identity" : "loinc",
+      "uri" : "http://loinc.org",
+      "name" : "LOINC code for the element"
+    }
+  ],
+  "kind" : "resource",
+  "abstract" : false,
+  "type" : "Patient",
+  "baseDefinition" : "http://hl7.org/fhir/StructureDefinition/Patient",
+  "derivation" : "constraint"
+}

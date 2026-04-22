@@ -2044,7 +2044,7 @@ fn can_be_coerced_to_boolean(result: &EvaluationResult) -> bool {
     // Check if the result can be meaningfully used as a boolean in a where clause
     match result {
         // Boolean values are obviously OK
-        EvaluationResult::Boolean(_, _) => true,
+        EvaluationResult::Boolean(_, _, _) => true,
 
         // Empty is OK (evaluates to false)
         EvaluationResult::Empty => true,
@@ -2172,6 +2172,20 @@ fn get_column_names<S: ViewDefinitionSelectTrait>(select: &S) -> Result<Vec<Stri
     Ok(column_names)
 }
 
+// Debug helpers (opt-in via env var)
+fn sof_debug_where_enabled() -> bool {
+    std::env::var("SOF_DEBUG_WHERE").is_ok_and(|v| {
+        let v = v.to_ascii_lowercase();
+        v == "1" || v == "true" || v == "yes" || v == "on"
+    })
+}
+
+fn sof_debug_where_println(msg: impl AsRef<str>) {
+    if sof_debug_where_enabled() {
+        eprintln!("[sof][where] {}", msg.as_ref());
+    }
+}
+
 // Generic resource filtering
 fn filter_resources<'a, B: BundleTrait>(
     bundle: &'a B,
@@ -2198,6 +2212,19 @@ where
         let mut filtered = Vec::new();
 
         for resource in resources {
+            if sof_debug_where_enabled() {
+                // Best-effort resource id for debugging (FHIRPath: id)
+                let fhir_resource = resource.to_fhir_resource();
+                let mut dbg_ctx = EvaluationContext::new(vec![fhir_resource]);
+                for (name, value) in variables {
+                    dbg_ctx.set_variable_result(name, value.clone());
+                }
+                let rid = match evaluate_expression("id", &dbg_ctx) {
+                    Ok(r) => format!("{:?}", r),
+                    Err(e) => format!("<id eval error: {}>", e),
+                };
+                sof_debug_where_println(format!("resource.id = {}", rid));
+            }
             let mut include_resource = true;
 
             // All where clauses must evaluate to true for the resource to be included
@@ -2216,6 +2243,33 @@ where
 
                 match evaluate_expression(path, &context) {
                     Ok(result) => {
+                        if sof_debug_where_enabled() {
+                            // Log variables only once per where evaluation
+                            sof_debug_where_println(format!("where path: {}", path));
+                            // Log constants/variables visible in this evaluation
+                            for (k, v) in variables {
+                                sof_debug_where_println(format!("var {} = {:?}", k, v));
+                            }
+                            // Log raw result
+                            sof_debug_where_println(format!("result = {:?}", result));
+                            // Log type name
+                            sof_debug_where_println(format!(
+                                "result.type_name() = {}",
+                                result.type_name()
+                            ));
+                            // Log primitive meta presence (if any)
+                            let pm = result
+                                .primitive_meta()
+                                .map(|m| format!("{:?}", m))
+                                .unwrap_or_else(|| "<none>".to_string());
+                            sof_debug_where_println(format!("result.primitive_meta = {}", pm));
+                            // Log truthiness decision
+                            sof_debug_where_println(format!(
+                                "can_be_coerced_to_boolean = {}",
+                                can_be_coerced_to_boolean(&result)
+                            ));
+                            sof_debug_where_println(format!("is_truthy = {}", is_truthy(&result)));
+                        }
                         // Check if the result can be meaningfully used as a boolean
                         if !can_be_coerced_to_boolean(&result) {
                             return Err(SofError::InvalidViewDefinition(format!(
@@ -2260,7 +2314,7 @@ where
 fn is_truthy(result: &EvaluationResult) -> bool {
     match result {
         EvaluationResult::Empty => false,
-        EvaluationResult::Boolean(b, _) => *b,
+        EvaluationResult::Boolean(b, _, _) => *b,
         EvaluationResult::Collection { items, .. } => !items.is_empty(),
         _ => true, // Non-empty, non-false values are truthy
     }
@@ -2291,11 +2345,11 @@ fn fhirpath_result_to_json_value_collection(result: EvaluationResult) -> Option<
 fn fhirpath_result_to_json_value(result: EvaluationResult) -> Option<serde_json::Value> {
     match result {
         EvaluationResult::Empty => None,
-        EvaluationResult::Boolean(b, _) => Some(serde_json::Value::Bool(b)),
-        EvaluationResult::Integer(i, _) => {
+        EvaluationResult::Boolean(b, _, _) => Some(serde_json::Value::Bool(b)),
+        EvaluationResult::Integer(i, _, _) => {
             Some(serde_json::Value::Number(serde_json::Number::from(i)))
         }
-        EvaluationResult::Decimal(d, _) => {
+        EvaluationResult::Decimal(d, _, _) => {
             // Check if this Decimal represents a whole number
             if d.fract().is_zero() {
                 // Convert to integer if no fractional part
@@ -2318,14 +2372,14 @@ fn fhirpath_result_to_json_value(result: EvaluationResult) -> Option<serde_json:
                 }
             }
         }
-        EvaluationResult::String(s, _) => Some(serde_json::Value::String(s)),
-        EvaluationResult::Date(s, _) => Some(serde_json::Value::String(s)),
-        EvaluationResult::DateTime(s, _) => {
+        EvaluationResult::String(s, _, _) => Some(serde_json::Value::String(s)),
+        EvaluationResult::Date(s, _, _) => Some(serde_json::Value::String(s)),
+        EvaluationResult::DateTime(s, _, _) => {
             // Remove "@" prefix from datetime strings if present
             let cleaned = s.strip_prefix("@").unwrap_or(&s);
             Some(serde_json::Value::String(cleaned.to_string()))
         }
-        EvaluationResult::Time(s, _) => {
+        EvaluationResult::Time(s, _, _) => {
             // Remove "@T" prefix from time strings if present
             let cleaned = s.strip_prefix("@T").unwrap_or(&s);
             Some(serde_json::Value::String(cleaned.to_string()))

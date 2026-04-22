@@ -1,0 +1,9 @@
+{
+  "resourceType": "Patient",
+  "meta": {
+    "profile": [
+      "http://atrius.health/fhir/StructureDefinition/atrius-patient"
+    ]
+  },
+  "active": true
+}
