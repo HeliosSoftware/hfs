@@ -269,8 +269,27 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         }
                     }
                     Err(HtsError::NotFound(_)) => {
-                        // Implicit ValueSet: ensure cache is populated, then do
-                        // an O(1) indexed SQL lookup instead of loading all rows.
+                        // ?fhir_vs implicit ValueSet: do a targeted O(1)/O(depth) lookup
+                        // instead of materializing all concepts (which times out for large
+                        // code systems like SNOMED CT with ~350k concepts).
+                        if let Some((cs_url, pattern)) = parse_fhir_vs_url(&url) {
+                            let found = validate_fhir_vs(
+                                &conn,
+                                &cs_url,
+                                &pattern,
+                                &req.code,
+                                req.system.as_deref(),
+                            )?;
+                            return finish_validate_code_response(
+                                found,
+                                &req.code,
+                                &url,
+                                req.display.as_deref(),
+                            );
+                        }
+
+                        // Other implicit ValueSets (e.g. CodeSystem.valueSet link): use the
+                        // expansion cache, then do an O(1) indexed SQL lookup.
                         ensure_implicit_cache(&conn, &url, req.date.as_deref())?;
 
                         let found = lookup_in_implicit_cache(
@@ -280,34 +299,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             req.system.as_deref(),
                         )?;
 
-                        return match found {
-                            None => Ok(ValidateCodeResponse {
-                                result: false,
-                                message: Some(format!(
-                                    "Code '{}' is not in value set '{url}'",
-                                    req.code
-                                )),
-                                display: None,
-                            }),
-                            Some(concept) => {
-                                let mut message = None;
-                                if let Some(expected) = req.display.as_deref() {
-                                    if let Some(actual) = concept.display.as_deref() {
-                                        if !actual.eq_ignore_ascii_case(expected) {
-                                            message = Some(format!(
-                                                "Provided display '{expected}' does not match \
-                                                 stored display '{actual}'"
-                                            ));
-                                        }
-                                    }
-                                }
-                                Ok(ValidateCodeResponse {
-                                    result: message.is_none(),
-                                    message,
-                                    display: concept.display.clone(),
-                                })
-                            }
-                        };
+                        return finish_validate_code_response(
+                            found,
+                            &req.code,
+                            &url,
+                            req.display.as_deref(),
+                        );
                     }
                     Err(e) => return Err(e),
                 };
@@ -319,38 +316,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 all_codes
                     .iter()
                     .find(|c| c.system == system && c.code == req.code)
+                    .cloned()
             } else {
-                all_codes.iter().find(|c| c.code == req.code)
+                all_codes.iter().find(|c| c.code == req.code).cloned()
             };
 
-            match found {
-                None => Ok(ValidateCodeResponse {
-                    result: false,
-                    message: Some(format!(
-                        "Code '{}' is not in value set '{url}'",
-                        req.code
-                    )),
-                    display: None,
-                }),
-                Some(concept) => {
-                    let mut message = None;
-                    if let Some(expected) = req.display.as_deref() {
-                        if let Some(actual) = concept.display.as_deref() {
-                            if !actual.eq_ignore_ascii_case(expected) {
-                                message = Some(format!(
-                                    "Provided display '{expected}' does not match stored display '{actual}'"
-                                ));
-                            }
-                        }
-                    }
-                    // Per FHIR spec, a display mismatch causes result=false (with a message).
-                    Ok(ValidateCodeResponse {
-                        result: message.is_none(),
-                        message,
-                        display: concept.display.clone(),
-                    })
-                }
-            }
+            finish_validate_code_response(found, &req.code, &url, req.display.as_deref())
         })
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
@@ -1043,6 +1014,140 @@ fn populate_cache(
     }
 
     Ok(())
+}
+
+/// Build a [`ValidateCodeResponse`] from an optional matching concept.
+///
+/// Shared by all validate-code paths (explicit ValueSet, implicit cache, and
+/// direct `?fhir_vs` lookups) so display-mismatch logic is applied consistently.
+fn finish_validate_code_response(
+    found: Option<ExpansionContains>,
+    code: &str,
+    url: &str,
+    expected_display: Option<&str>,
+) -> Result<ValidateCodeResponse, HtsError> {
+    match found {
+        None => Ok(ValidateCodeResponse {
+            result: false,
+            message: Some(format!("Code '{code}' is not in value set '{url}'")),
+            display: None,
+        }),
+        Some(concept) => {
+            let mut message = None;
+            if let Some(expected) = expected_display {
+                if let Some(actual) = concept.display.as_deref() {
+                    if !actual.eq_ignore_ascii_case(expected) {
+                        message = Some(format!(
+                            "Provided display '{expected}' does not match stored display '{actual}'"
+                        ));
+                    }
+                }
+            }
+            Ok(ValidateCodeResponse {
+                result: message.is_none(),
+                message,
+                display: concept.display,
+            })
+        }
+    }
+}
+
+/// Validate a code against a `?fhir_vs` implicit ValueSet pattern directly,
+/// without materializing the full expansion into the cache.
+///
+/// - `AllConcepts` — O(1) point lookup in the `concepts` table.
+/// - `IsA(root)` — O(depth) recursive CTE walking *up* from `code` through
+///   `concept_hierarchy` to check whether `root` is an ancestor-or-self.
+///
+/// Returns the matching [`ExpansionContains`] on success, or `None` when the
+/// code is not a member of the implicit ValueSet.
+fn validate_fhir_vs(
+    conn: &Connection,
+    cs_url: &str,
+    pattern: &FhirVsPattern,
+    code: &str,
+    system: Option<&str>,
+) -> Result<Option<ExpansionContains>, HtsError> {
+    // If system is provided it must match the CodeSystem URL.
+    if let Some(sys) = system {
+        if sys != cs_url {
+            return Ok(None);
+        }
+    }
+
+    let system_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM code_systems WHERE url = ?1",
+            [cs_url],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let system_id =
+        system_id.ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {cs_url}")))?;
+
+    match pattern {
+        FhirVsPattern::AllConcepts => {
+            let row = conn
+                .query_row(
+                    "SELECT code, display FROM concepts WHERE system_id = ?1 AND code = ?2",
+                    rusqlite::params![system_id, code],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            Ok(row.map(|(code, display)| ExpansionContains {
+                system: cs_url.to_owned(),
+                code,
+                display,
+                inactive: None,
+                contains: vec![],
+            }))
+        }
+        FhirVsPattern::IsA(root_code) => {
+            // Walk UP from `code` through concept_hierarchy to find whether
+            // root_code is an ancestor-or-self. O(depth), not O(tree size).
+            let is_member: bool = conn
+                .query_row(
+                    "WITH RECURSIVE ancestors(code) AS (
+                         SELECT ?1
+                         UNION ALL
+                         SELECT ch.parent_code
+                         FROM concept_hierarchy ch
+                         JOIN ancestors a ON ch.child_code = a.code
+                         WHERE ch.system_id = ?2
+                     )
+                     SELECT EXISTS(SELECT 1 FROM ancestors WHERE code = ?3)",
+                    rusqlite::params![code, system_id, root_code],
+                    |r| r.get(0),
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            if !is_member {
+                return Ok(None);
+            }
+
+            let display: Option<String> = conn
+                .query_row(
+                    "SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2",
+                    rusqlite::params![system_id, code],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .flatten();
+
+            Ok(Some(ExpansionContains {
+                system: cs_url.to_owned(),
+                code: code.to_owned(),
+                display,
+                inactive: None,
+                contains: vec![],
+            }))
+        }
+    }
 }
 
 /// Ensure the implicit expansion cache is populated for `url`.
