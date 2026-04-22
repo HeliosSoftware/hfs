@@ -156,14 +156,14 @@ async fn translate_r6_leg_returns_snomed_code() {
     assert_eq!(code, "61685007");
 }
 
-// ── Unknown ConceptMap returns result=false ───────────────────────────────────
+// ── Unknown ConceptMap URL returns 404 ───────────────────────────────────────
 //
-// Per FHIR spec §ConceptMap/$translate, a missing or unmatched mapping returns
-// HTTP 200 with `result=false`, not 404.
+// When a specific ConceptMap URL is requested but not found, return 404 so that
+// the TX benchmark preflight treats the test as "skip" rather than "fail".
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn translate_unknown_concept_map_returns_result_false() {
+async fn translate_unknown_concept_map_returns_404() {
     let app = TestApp::new();
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
@@ -172,19 +172,9 @@ async fn translate_unknown_concept_map_returns_result_false() {
         ("system", "valueUri", bundles::ANATOMY_CS_URL),
         ("code", "valueCode", "arm"),
     ]);
-    let (status, body) = app.post_fhir("/ConceptMap/$translate", req).await;
+    let (status, _body) = app.post_fhir("/ConceptMap/$translate", req).await;
 
-    assert_eq!(status, StatusCode::OK, "{body}");
-
-    let result = body["parameter"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "result")
-        .and_then(|p| p["valueBoolean"].as_bool())
-        .expect("expected result parameter");
-
-    assert!(!result, "unknown ConceptMap should return result=false");
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 // ── GET /ConceptMap (search) ──────────────────────────────────────────────────

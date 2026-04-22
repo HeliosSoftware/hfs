@@ -46,7 +46,8 @@ use crate::types::{ExpandRequest, ExpansionContains};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
+    extract_parameter_array, find_resource_param, find_str_param, parse_query_string,
+    query_params_to_fhir_params,
 };
 
 /// Serialize a single [`ExpansionContains`] entry to a FHIR-compliant JSON value.
@@ -80,9 +81,18 @@ async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
-    let url = find_str_param(&params, "url").ok_or_else(|| {
-        HtsError::InvalidRequest("Missing required parameter: url (ValueSet canonical URL)".into())
-    })?;
+    let url = find_str_param(&params, "url");
+    let value_set = if url.is_none() {
+        find_resource_param(&params, "valueSet")
+    } else {
+        None
+    };
+
+    if url.is_none() && value_set.is_none() {
+        return Err(HtsError::InvalidRequest(
+            "Missing required parameter: url (ValueSet canonical URL) or valueSet (inline ValueSet resource)".into()
+        ));
+    }
 
     let filter = find_str_param(&params, "filter");
 
@@ -110,8 +120,8 @@ async fn process_expand<B: TerminologyBackend>(
     let hierarchical = find_str_param(&params, "hierarchical").map(|s| s == "true");
 
     let req = ExpandRequest {
-        url: Some(url),
-        value_set: None,
+        url,
+        value_set,
         filter,
         count,
         offset,

@@ -12,7 +12,7 @@ use r2d2::Pool;
 #[cfg(feature = "sqlite")]
 use r2d2_sqlite::SqliteConnectionManager;
 #[cfg(feature = "sqlite")]
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::HtsError;
 use crate::import::ImportStats;
@@ -104,16 +104,56 @@ fn write_code_system(
     let resource_json = serde_json::to_string(&cs.resource_json).ok();
     let now = utc_now();
 
-    // Non-destructive upsert: if a row with the same `url` already exists (e.g.
-    // from a prior chunk of a large CodeSystem), keep it and its concepts
-    // intact. Re-inserts with a different `id` are ignored rather than firing
-    // the `ON DELETE CASCADE` on the `concepts.system_id` FK.
+    // Resolve the id to use:
+    //   1. If a row for this URL already exists, reuse its id (in-place update).
+    //   2. Otherwise use cs.id, unless cs.id is already taken by a different URL
+    //      (can happen when two distinct CodeSystems share a short FHIR id like
+    //      "observation-status") — in that case mint a fresh UUID.
+    let existing_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM code_systems WHERE url = ?1",
+            rusqlite::params![cs.url],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let system_id: String = if let Some(id) = existing_id {
+        id
+    } else {
+        let id_taken: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_systems WHERE id = ?1",
+                rusqlite::params![cs.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            > 0;
+        if id_taken {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            cs.id.clone()
+        }
+    };
+
+    // Use ON CONFLICT(url) DO UPDATE instead of INSERT OR REPLACE to avoid
+    // triggering the ON DELETE CASCADE on concepts — a stub CodeSystem from
+    // an hl7-npm package (content=not-present) must never wipe existing
+    // RF2/LOINC concepts that were imported separately.
     conn.execute(
-        "INSERT OR IGNORE INTO code_systems
+        "INSERT INTO code_systems
          (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+         ON CONFLICT(url) DO UPDATE SET
+             version       = excluded.version,
+             name          = excluded.name,
+             title         = excluded.title,
+             status        = excluded.status,
+             content       = excluded.content,
+             resource_json = excluded.resource_json,
+             updated_at    = excluded.updated_at",
         rusqlite::params![
-            cs.id,
+            system_id,
             cs.url,
             cs.version,
             cs.name,
@@ -125,39 +165,6 @@ fn write_code_system(
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    conn.execute(
-        "UPDATE code_systems SET
-           version       = ?1,
-           name          = ?2,
-           title         = ?3,
-           status        = ?4,
-           content       = ?5,
-           resource_json = ?6,
-           updated_at    = ?7
-         WHERE url = ?8",
-        rusqlite::params![
-            cs.version,
-            cs.name,
-            cs.title,
-            cs.status,
-            cs.content,
-            resource_json,
-            now,
-            cs.url,
-        ],
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    // Concepts reference the authoritative `id` resolved by URL, which may
-    // differ from `cs.id` if a prior chunk created the row.
-    let system_id: String = conn
-        .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
-            rusqlite::params![cs.url],
-            |row| row.get(0),
-        )
-        .map_err(|e| HtsError::StorageError(format!("Failed to resolve CodeSystem id: {e}")))?;
 
     for concept in &cs.concepts {
         conn.execute(

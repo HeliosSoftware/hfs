@@ -103,6 +103,18 @@ pub fn extract_coding(params: &[Value], name: &str) -> Option<(String, String, O
     Some((system, code, display))
 }
 
+/// Extract a `resource`-typed parameter by name, returning the resource JSON.
+///
+/// FHIR Parameters can carry a full resource as `{"name": "...", "resource": {...}}`.
+/// This is used by operations like `$expand` which accept an inline `ValueSet`.
+pub fn find_resource_param(params: &[Value], name: &str) -> Option<Value> {
+    params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?
+        .get("resource")
+        .cloned()
+}
+
 /// Extract a `valueCodeableConcept` parameter, returning all `(system, code)` pairs.
 ///
 /// Looks for the first parameter named `name` that carries a

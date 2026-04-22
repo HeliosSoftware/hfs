@@ -63,11 +63,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         _ctx: &TenantContext,
         req: ExpandRequest,
     ) -> Result<ExpandResponse, HtsError> {
-        let url = req.url.clone().ok_or_else(|| {
-            HtsError::InvalidRequest(
+        if req.url.is_none() && req.value_set.is_none() {
+            return Err(HtsError::InvalidRequest(
                 "Missing required parameter: url (ValueSet canonical URL)".into(),
-            )
-        })?;
+            ));
+        }
 
         let pool = self.pool().clone();
 
@@ -76,54 +76,97 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-            // Resolve expansion codes — either from an explicit ValueSet or from an
-            // implicit one defined by `CodeSystem.valueSet`.
-            let all_codes = match resolve_value_set(&conn, &url, req.date.as_deref()) {
-                Ok((vs_id, compose_json)) => {
-                    // Normal path: try the expansion cache first.
-                    let cached = fetch_cache(&conn, &vs_id)?;
-                    if cached.is_empty() {
-                        let codes = compute_expansion(&conn, compose_json.as_deref())?;
-                        if let Some(limit) = req.max_expansion_size {
-                            if codes.len() as u64 > u64::from(limit) {
-                                return Err(HtsError::TooCostly(format!(
-                                    "ValueSet expansion contains {} codes which exceeds \
-                                     the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                                    codes.len(),
-                                    limit
+            let all_codes = if let Some(vs_resource) = req.value_set {
+                // Inline ValueSet: extract compose and expand directly.
+                // If any referenced system is unknown, return 404 so the caller
+                // knows we cannot service this request (e.g. SNOMED not loaded).
+                let compose = &vs_resource["compose"];
+                let empty_arr = vec![];
+                let includes = compose["include"].as_array().unwrap_or(&empty_arr);
+                for inc in includes {
+                    if let Some(system_url) = inc["system"].as_str() {
+                        let content: Option<String> = conn
+                            .query_row(
+                                "SELECT content FROM code_systems WHERE url = ?1",
+                                [system_url],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                        match content.as_deref() {
+                            None => {
+                                return Err(HtsError::NotFound(format!(
+                                    "CodeSystem not found: {system_url}"
                                 )));
                             }
-                        }
-                        populate_cache(&conn, &vs_id, &codes)?;
-                        codes
-                    } else {
-                        cached
-                    }
-                }
-                Err(HtsError::NotFound(_)) => {
-                    // Implicit ValueSet fallback: look for a CodeSystem whose
-                    // `$.valueSet` property equals the requested URL.
-                    let cs_url =
-                        find_cs_for_implicit_vs(&conn, &url, req.date.as_deref())?;
-                    let compose = serde_json::json!({
-                        "include": [{ "system": cs_url }]
-                    })
-                    .to_string();
-                    let codes = compute_expansion(&conn, Some(&compose))?;
-                    if let Some(limit) = req.max_expansion_size {
-                        if codes.len() as u64 > u64::from(limit) {
-                            return Err(HtsError::TooCostly(format!(
-                                "Implicit ValueSet expansion contains {} codes which exceeds \
-                                 the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                                codes.len(),
-                                limit
-                            )));
+                            Some("not-present") | Some("example") => {
+                                return Err(HtsError::NotFound(format!(
+                                    "CodeSystem has no content loaded: {system_url}"
+                                )));
+                            }
+                            _ => {}
                         }
                     }
-                    // No caching for implicit ValueSets (no row in value_sets table).
-                    codes
                 }
-                Err(e) => return Err(e),
+                let compose_str = compose.to_string();
+                compute_expansion(&conn, Some(&compose_str))?
+            } else {
+                let url = req.url.as_deref().unwrap();
+                // Resolve expansion codes — either from an explicit ValueSet or from an
+                // implicit one defined by `CodeSystem.valueSet`.
+                match resolve_value_set(&conn, url, req.date.as_deref()) {
+                    Ok((vs_id, compose_json)) => {
+                        // Normal path: try the expansion cache first.
+                        let cached = fetch_cache(&conn, &vs_id)?;
+                        if cached.is_empty() {
+                            let codes = compute_expansion(&conn, compose_json.as_deref())?;
+                            populate_cache(&conn, &vs_id, &codes)?;
+                            codes
+                        } else {
+                            cached
+                        }
+                    }
+                    Err(HtsError::NotFound(_)) => {
+                        // Implicit ValueSet: ensure the cache is populated (atomic
+                        // transaction write), then serve directly from SQL with
+                        // LIMIT/OFFSET so we never load the full expansion into memory.
+                        ensure_implicit_cache(&conn, url, req.date.as_deref())?;
+
+                        let filter_lower = req.filter.as_deref().map(|f| f.to_lowercase());
+                        let sql_offset = i64::from(req.offset.unwrap_or(0));
+                        let sql_limit = req.count.map(i64::from).unwrap_or(-1);
+
+                        let total = implicit_cache_count(&conn, url, filter_lower.as_deref())?;
+
+                        if req.count.is_none() {
+                            if let Some(cap) = req.max_expansion_size {
+                                if u64::from(total) > u64::from(cap) {
+                                    return Err(HtsError::TooCostly(format!(
+                                        "ValueSet expansion contains {} codes which exceeds \
+                                         the server limit of {} (set \
+                                         HTS_MAX_EXPANSION_SIZE to raise it)",
+                                        total, cap
+                                    )));
+                                }
+                            }
+                        }
+
+                        let page = implicit_cache_page(
+                            &conn,
+                            url,
+                            filter_lower.as_deref(),
+                            sql_limit,
+                            sql_offset,
+                        )?;
+
+                        return Ok(ExpandResponse {
+                            total: Some(total),
+                            offset: req.offset,
+                            contains: page,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
             };
 
             // Apply optional free-text filter (code or display substring match).
@@ -156,6 +199,22 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             }
 
             let total = filtered.len() as u32;
+
+            // Enforce the expansion size cap only when no explicit count (page size) was
+            // requested. When count is set, the response is already bounded and the limit
+            // would only reject valid paginated requests against large code systems.
+            if req.count.is_none() {
+                if let Some(limit) = req.max_expansion_size {
+                    if u64::from(total) > u64::from(limit) {
+                        return Err(HtsError::TooCostly(format!(
+                            "ValueSet expansion contains {} codes which exceeds the server \
+                             limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
+                            total, limit
+                        )));
+                    }
+                }
+            }
+
             let offset = req.offset.unwrap_or(0) as usize;
             let count = req.count.map(|c| c as usize).unwrap_or(usize::MAX);
 
@@ -195,28 +254,63 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-            // Unknown value set → false (not an error).
-            let (vs_id, compose_json) = match resolve_value_set(&conn, &url, req.date.as_deref()) {
-                Ok(vs) => vs,
-                Err(HtsError::NotFound(_)) => {
-                    return Ok(ValidateCodeResponse {
-                        result: false,
-                        message: Some(format!("Unknown value set: {url}")),
-                        display: None,
-                    });
-                }
-                Err(e) => return Err(e),
-            };
+            // Resolve the expansion — try explicit ValueSet first, then the two
+            // implicit-ValueSet fallbacks used by $expand.
+            let all_codes: Vec<ExpansionContains> =
+                match resolve_value_set(&conn, &url, req.date.as_deref()) {
+                    Ok((vs_id, compose_json)) => {
+                        let cached = fetch_cache(&conn, &vs_id)?;
+                        if cached.is_empty() {
+                            let codes = compute_expansion(&conn, compose_json.as_deref())?;
+                            populate_cache(&conn, &vs_id, &codes)?;
+                            codes
+                        } else {
+                            cached
+                        }
+                    }
+                    Err(HtsError::NotFound(_)) => {
+                        // Implicit ValueSet: ensure cache is populated, then do
+                        // an O(1) indexed SQL lookup instead of loading all rows.
+                        ensure_implicit_cache(&conn, &url, req.date.as_deref())?;
 
-            // Get or compute expansion.
-            let cached = fetch_cache(&conn, &vs_id)?;
-            let all_codes = if cached.is_empty() {
-                let codes = compute_expansion(&conn, compose_json.as_deref())?;
-                populate_cache(&conn, &vs_id, &codes)?;
-                codes
-            } else {
-                cached
-            };
+                        let found = lookup_in_implicit_cache(
+                            &conn,
+                            &url,
+                            &req.code,
+                            req.system.as_deref(),
+                        )?;
+
+                        return match found {
+                            None => Ok(ValidateCodeResponse {
+                                result: false,
+                                message: Some(format!(
+                                    "Code '{}' is not in value set '{url}'",
+                                    req.code
+                                )),
+                                display: None,
+                            }),
+                            Some(concept) => {
+                                let mut message = None;
+                                if let Some(expected) = req.display.as_deref() {
+                                    if let Some(actual) = concept.display.as_deref() {
+                                        if !actual.eq_ignore_ascii_case(expected) {
+                                            message = Some(format!(
+                                                "Provided display '{expected}' does not match \
+                                                 stored display '{actual}'"
+                                            ));
+                                        }
+                                    }
+                                }
+                                Ok(ValidateCodeResponse {
+                                    result: message.is_none(),
+                                    message,
+                                    display: concept.display.clone(),
+                                })
+                            }
+                        };
+                    }
+                    Err(e) => return Err(e),
+                };
 
             // Search the expansion for the requested code.
             // When `system` is provided, match on both system + code.
@@ -545,10 +639,12 @@ fn compute_expansion(
 ///
 /// # Recognised filters
 ///
-/// | `property`   | `op`   | Interpretation |
-/// |--------------|--------|----------------|
-/// | `constraint` | `=`    | Full ECL expression (e.g. `<< 404684003 \|Finding\|`) |
-/// | `concept`    | `is-a` | Subsumption shorthand — translated to `<< <value>` |
+/// | `property`    | `op`          | Interpretation |
+/// |---------------|---------------|----------------|
+/// | `constraint`  | `=`           | Full ECL expression (e.g. `<< 404684003`) |
+/// | `concept`     | `is-a`        | Subsumption — translated to `<< <value>` (descendants + self) |
+/// | `concept`     | `descendent-of` | Strict subsumption — translated to `< <value>` (descendants only) |
+/// | _any other_   | `=`           | Property equality — queries `concept_properties` table |
 ///
 /// Unrecognised `(property, op)` pairs emit a `WARN` trace event and are
 /// treated as yielding an empty set so they do not silently expand the whole
@@ -576,9 +672,25 @@ fn apply_compose_filters(
         let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
 
+        // Property equality: any property code with op "=" that is not the
+        // built-in "constraint" ECL keyword is a concept_properties lookup.
+        if op == "=" && property != "constraint" {
+            any_filter_seen = true;
+            let concepts = query_property_eq(conn, system_url, system_id, property, value)?;
+            match result.as_mut() {
+                Some(prev) => {
+                    let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
+                    prev.retain(|c| keep.contains(&c.code));
+                }
+                None => result = Some(concepts),
+            }
+            continue;
+        }
+
         let ecl_expr: String = match (property, op) {
             ("constraint", "=") => value.to_owned(),
             ("concept", "is-a") => format!("<< {value}"),
+            ("concept", "descendent-of") => format!("< {value}"),
             _ => {
                 tracing::warn!(
                     property,
@@ -626,6 +738,125 @@ fn apply_compose_filters(
     }
 
     Ok(result)
+}
+
+/// Look up all concepts in `system_id` that have a property matching
+/// `(property = value)` in the `concept_properties` table.
+fn query_property_eq(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.code, c.display
+             FROM concepts c
+             JOIN concept_properties cp ON cp.concept_id = c.id
+             WHERE c.system_id = ?1
+               AND cp.property = ?2
+               AND cp.value = ?3",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let rows = stmt
+        .query_map([system_id, property, value], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(code, display)| ExpansionContains {
+            system: system_url.to_owned(),
+            code,
+            display,
+            inactive: None,
+            contains: vec![],
+        })
+        .collect())
+}
+
+/// Pattern extracted from a `?fhir_vs` implicit ValueSet URL.
+///
+/// FHIR defines query-parameter patterns on a CodeSystem URL that implicitly
+/// describe a ValueSet (FHIR R4 §4.8.7):
+///
+/// | URL form | Pattern | Meaning |
+/// |---|---|---|
+/// | `<cs>?fhir_vs` | `AllConcepts` | Every code in the CodeSystem |
+/// | `<cs>?fhir_vs=isa/<code>` | `IsA(code)` | Descendants (subsumees) of `code` |
+#[derive(Debug)]
+enum FhirVsPattern {
+    AllConcepts,
+    IsA(String),
+}
+
+/// Parse a `?fhir_vs` implicit ValueSet URL.
+///
+/// Returns `Some((cs_url, pattern))` on a recognised pattern, `None` otherwise.
+fn parse_fhir_vs_url(url: &str) -> Option<(String, FhirVsPattern)> {
+    let (base, query) = url.split_once('?')?;
+    if !query.starts_with("fhir_vs") {
+        return None;
+    }
+    let rest = &query["fhir_vs".len()..];
+    if rest.is_empty() {
+        return Some((base.to_owned(), FhirVsPattern::AllConcepts));
+    }
+    let value = rest.strip_prefix('=')?;
+    if let Some(code) = value.strip_prefix("isa/") {
+        return Some((base.to_owned(), FhirVsPattern::IsA(code.to_owned())));
+    }
+    None
+}
+
+/// Expand a `?fhir_vs` implicit ValueSet pattern for a given CodeSystem URL.
+///
+/// - `AllConcepts` — returns every concept in the CodeSystem.
+/// - `IsA(code)` — returns all descendants of `code` via the ECL `<< <code>` expression.
+///
+/// Returns [`HtsError::NotFound`] when the CodeSystem is not loaded.
+fn expand_fhir_vs(
+    conn: &Connection,
+    cs_url: &str,
+    pattern: &FhirVsPattern,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let system_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM code_systems WHERE url = ?1",
+            [cs_url],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let system_id =
+        system_id.ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {cs_url}")))?;
+
+    match pattern {
+        FhirVsPattern::AllConcepts => {
+            let compose = serde_json::json!({ "include": [{ "system": cs_url }] }).to_string();
+            compute_expansion(conn, Some(&compose))
+        }
+        FhirVsPattern::IsA(code) => {
+            let ecl_expr = format!("<< {code}");
+            let resolved = crate::ecl::parse_and_evaluate(conn, &system_id, &ecl_expr)?;
+            Ok(resolved
+                .into_iter()
+                .map(|c| ExpansionContains {
+                    system: cs_url.to_owned(),
+                    code: c.code,
+                    display: c.display,
+                    inactive: None,
+                    contains: vec![],
+                })
+                .collect())
+        }
+    }
 }
 
 /// Find the canonical URL of a CodeSystem whose `valueSet` property equals `vs_url`.
@@ -812,6 +1043,304 @@ fn populate_cache(
     }
 
     Ok(())
+}
+
+/// Ensure the implicit expansion cache is populated for `url`.
+///
+/// If the cache already has entries the function returns immediately (fast path).
+/// Otherwise it computes the full expansion and writes it atomically in a single
+/// transaction via [`populate_implicit_cache`].
+fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Result<(), HtsError> {
+    let populated: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM implicit_expansion_cache WHERE url = ?1 LIMIT 1)",
+            [url],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    if populated {
+        return Ok(());
+    }
+
+    let codes = if let Ok(cs_url) = find_cs_for_implicit_vs(conn, url, date) {
+        let compose = serde_json::json!({ "include": [{ "system": cs_url }] }).to_string();
+        compute_expansion(conn, Some(&compose))?
+    } else if let Some((cs_url, pattern)) = parse_fhir_vs_url(url) {
+        expand_fhir_vs(conn, &cs_url, &pattern)?
+    } else {
+        return Err(HtsError::NotFound(format!("ValueSet not found: {url}")));
+    };
+
+    populate_implicit_cache(conn, url, &codes)
+}
+
+/// Look up a single code in the implicit expansion cache.
+///
+/// Returns the matching `ExpansionContains` when found, or `None` on a miss.
+fn lookup_in_implicit_cache(
+    conn: &Connection,
+    url: &str,
+    code: &str,
+    system: Option<&str>,
+) -> Result<Option<ExpansionContains>, HtsError> {
+    let row = if let Some(sys) = system {
+        conn.query_row(
+            "SELECT system_url, code, display
+             FROM implicit_expansion_cache
+             WHERE url = ?1 AND code = ?2 AND system_url = ?3
+             LIMIT 1",
+            rusqlite::params![url, code, sys],
+            |r| {
+                Ok(ExpansionContains {
+                    system: r.get(0)?,
+                    code: r.get(1)?,
+                    display: r.get(2)?,
+                    inactive: None,
+                    contains: vec![],
+                })
+            },
+        )
+    } else {
+        conn.query_row(
+            "SELECT system_url, code, display
+             FROM implicit_expansion_cache
+             WHERE url = ?1 AND code = ?2
+             LIMIT 1",
+            rusqlite::params![url, code],
+            |r| {
+                Ok(ExpansionContains {
+                    system: r.get(0)?,
+                    code: r.get(1)?,
+                    display: r.get(2)?,
+                    inactive: None,
+                    contains: vec![],
+                })
+            },
+        )
+    };
+
+    match row {
+        Ok(c) => Ok(Some(c)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(HtsError::StorageError(e.to_string())),
+    }
+}
+
+/// Wrap a search term as an FTS5 phrase literal.
+///
+/// Double-quotes the term so FTS5 treats it as a substring phrase rather than
+/// individual tokens.  Internal double-quote characters are escaped by doubling.
+fn fts5_quote(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
+}
+
+/// Count cached entries matching an optional filter for an implicit VS URL.
+///
+/// Ensure the FTS5 mirror of the implicit expansion cache is populated for `url`.
+///
+/// Populated lazily — only called when a text filter is actually needed so that
+/// unfiltered requests (e.g. EX01 hierarchy expansions) pay no FTS5 overhead.
+/// Reads rows from `implicit_expansion_cache` and bulk-inserts them into
+/// `implicit_expansion_fts` via a single `INSERT … SELECT` statement.
+fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
+    let populated: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM implicit_expansion_fts WHERE url = ?1 LIMIT 1)",
+            [url],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    if populated {
+        return Ok(());
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    tx.execute("DELETE FROM implicit_expansion_fts WHERE url = ?1", [url])
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    tx.execute(
+        "INSERT INTO implicit_expansion_fts (url, system_url, code, display)
+         SELECT url, system_url, code, display
+         FROM implicit_expansion_cache
+         WHERE url = ?1",
+        [url],
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// When `filter_lower` is provided and has ≥ 3 characters, the FTS5 trigram
+/// index on `implicit_expansion_fts` is used for fast O(log N) substring
+/// matching.  Shorter filters fall back to a LIKE scan (rare in practice).
+fn implicit_cache_count(
+    conn: &Connection,
+    url: &str,
+    filter_lower: Option<&str>,
+) -> Result<u32, HtsError> {
+    let n: i64 = match filter_lower {
+        Some(f) if f.len() >= 3 => {
+            ensure_implicit_fts(conn, url)?;
+            let match_expr = fts5_quote(f);
+            conn.query_row(
+                "SELECT COUNT(*) FROM implicit_expansion_fts
+                 WHERE implicit_expansion_fts MATCH ?1 AND url = ?2",
+                rusqlite::params![match_expr, url],
+                |r| r.get(0),
+            )
+        }
+        Some(f) => {
+            let pattern = format!("%{f}%");
+            conn.query_row(
+                "SELECT COUNT(*) FROM implicit_expansion_cache
+                 WHERE url = ?1
+                   AND (LOWER(code) LIKE ?2 OR LOWER(COALESCE(display,'')) LIKE ?2)",
+                rusqlite::params![url, pattern],
+                |r| r.get(0),
+            )
+        }
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM implicit_expansion_cache WHERE url = ?1",
+            [url],
+            |r| r.get(0),
+        ),
+    }
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(n as u32)
+}
+
+/// Return a paginated page of cached entries for an implicit VS URL.
+///
+/// When `filter_lower` is ≥ 3 characters the FTS5 trigram index is used;
+/// shorter filters fall back to a LIKE scan; no filter queries the plain cache.
+fn implicit_cache_page(
+    conn: &Connection,
+    url: &str,
+    filter_lower: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    match filter_lower {
+        Some(f) if f.len() >= 3 => {
+            ensure_implicit_fts(conn, url)?;
+            let match_expr = fts5_quote(f);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT system_url, code, display
+                     FROM implicit_expansion_fts
+                     WHERE implicit_expansion_fts MATCH ?1 AND url = ?2
+                     ORDER BY code
+                     LIMIT ?3 OFFSET ?4",
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            stmt.query_map(rusqlite::params![match_expr, url, limit, offset], |r| {
+                Ok(ExpansionContains {
+                    system: r.get(0)?,
+                    code: r.get(1)?,
+                    display: r.get(2)?,
+                    inactive: None,
+                    contains: vec![],
+                })
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))
+        }
+        Some(f) => {
+            let pattern = format!("%{f}%");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT system_url, code, display
+                     FROM implicit_expansion_cache
+                     WHERE url = ?1
+                       AND (LOWER(code) LIKE ?2 OR LOWER(COALESCE(display,'')) LIKE ?2)
+                     ORDER BY system_url, code
+                     LIMIT ?3 OFFSET ?4",
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            stmt.query_map(rusqlite::params![url, pattern, limit, offset], |r| {
+                Ok(ExpansionContains {
+                    system: r.get(0)?,
+                    code: r.get(1)?,
+                    display: r.get(2)?,
+                    inactive: None,
+                    contains: vec![],
+                })
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))
+        }
+        None => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT system_url, code, display
+                     FROM implicit_expansion_cache
+                     WHERE url = ?1
+                     ORDER BY system_url, code
+                     LIMIT ?2 OFFSET ?3",
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            stmt.query_map(rusqlite::params![url, limit, offset], |r| {
+                Ok(ExpansionContains {
+                    system: r.get(0)?,
+                    code: r.get(1)?,
+                    display: r.get(2)?,
+                    inactive: None,
+                    contains: vec![],
+                })
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))
+        }
+    }
+}
+
+/// Write computed expansion entries into `implicit_expansion_cache`.
+///
+/// The DELETE + all INSERTs run inside a single transaction so the cache is
+/// always either empty or fully populated — never a partial write.
+///
+/// The FTS5 mirror (`implicit_expansion_fts`) is **not** populated here; it is
+/// built lazily by [`ensure_implicit_fts`] the first time a text-filtered
+/// request arrives.  This keeps unfiltered expand requests (e.g. EX01
+/// hierarchy expansions) free of FTS5 write overhead.
+fn populate_implicit_cache(
+    conn: &Connection,
+    url: &str,
+    codes: &[ExpansionContains],
+) -> Result<(), HtsError> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    tx.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url])
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO implicit_expansion_cache
+                 (url, system_url, code, display)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        for item in codes {
+            stmt.execute(rusqlite::params![url, item.system, item.code, item.display])
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        }
+    }
+
+    tx.commit()
+        .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -1208,12 +1737,12 @@ mod tests {
         assert!(resp.message.is_some());
     }
 
-    // ── $validate-code: unknown value set returns false ────────────────────────
+    // ── $validate-code: unknown value set returns 404 ─────────────────────────
 
     #[tokio::test]
-    async fn validate_code_unknown_value_set_returns_false() {
+    async fn validate_code_unknown_value_set_returns_not_found() {
         let b = backend();
-        let resp = b
+        let err = b
             .validate_code(
                 &ctx(),
                 ValidateCodeRequest {
@@ -1223,9 +1752,8 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
-
-        assert!(!resp.result);
+            .unwrap_err();
+        assert!(matches!(err, HtsError::NotFound(_)));
     }
 
     // ── $validate-code: display mismatch returns false with message ───────────────
@@ -1658,6 +2186,170 @@ mod tests {
                 "children should have no sub-children"
             );
         }
+    }
+
+    // ── ?fhir_vs implicit ValueSet URL patterns ───────────────────────────────
+
+    /// Bundle with a simple 3-level hierarchy for testing ?fhir_vs=isa/.
+    fn bundle_fhir_vs_hierarchy() -> &'static str {
+        r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-fvs",
+              "url": "http://example.org/cs-fvs",
+              "status": "active",
+              "content": "complete",
+              "concept": [
+                {
+                  "code": "root",
+                  "display": "Root",
+                  "concept": [
+                    { "code": "child1", "display": "Child 1" },
+                    { "code": "child2", "display": "Child 2" }
+                  ]
+                },
+                { "code": "unrelated", "display": "Unrelated" }
+              ]
+            }
+          }]
+        }"#
+    }
+
+    #[tokio::test]
+    async fn expand_fhir_vs_all_concepts() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_fhir_vs_hierarchy().as_bytes())
+            .await
+            .unwrap();
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some("http://example.org/cs-fvs?fhir_vs".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.total, Some(4));
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(codes.contains(&"root"));
+        assert!(codes.contains(&"child1"));
+        assert!(codes.contains(&"child2"));
+        assert!(codes.contains(&"unrelated"));
+    }
+
+    #[tokio::test]
+    async fn expand_fhir_vs_isa_returns_descendants() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_fhir_vs_hierarchy().as_bytes())
+            .await
+            .unwrap();
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some("http://example.org/cs-fvs?fhir_vs=isa/root".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // << root includes root itself and all descendants (child1, child2)
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(codes.contains(&"root"), "root should subsume itself");
+        assert!(codes.contains(&"child1"));
+        assert!(codes.contains(&"child2"));
+        assert!(!codes.contains(&"unrelated"), "unrelated is not under root");
+    }
+
+    #[tokio::test]
+    async fn expand_fhir_vs_unknown_cs_returns_not_found() {
+        let b = backend();
+        let err = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some("http://no-such.org/cs?fhir_vs".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HtsError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_code_fhir_vs_all_concepts_code_present() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_fhir_vs_hierarchy().as_bytes())
+            .await
+            .unwrap();
+
+        let resp = b
+            .validate_code(
+                &ctx(),
+                ValidateCodeRequest {
+                    url: Some("http://example.org/cs-fvs?fhir_vs".into()),
+                    code: "child1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(resp.result);
+    }
+
+    #[tokio::test]
+    async fn validate_code_fhir_vs_isa_code_in_subtree() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_fhir_vs_hierarchy().as_bytes())
+            .await
+            .unwrap();
+
+        let resp = b
+            .validate_code(
+                &ctx(),
+                ValidateCodeRequest {
+                    url: Some("http://example.org/cs-fvs?fhir_vs=isa/root".into()),
+                    code: "child2".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(resp.result);
+    }
+
+    #[tokio::test]
+    async fn validate_code_fhir_vs_isa_code_outside_subtree_returns_false() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_fhir_vs_hierarchy().as_bytes())
+            .await
+            .unwrap();
+
+        let resp = b
+            .validate_code(
+                &ctx(),
+                ValidateCodeRequest {
+                    url: Some("http://example.org/cs-fvs?fhir_vs=isa/root".into()),
+                    code: "unrelated".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!resp.result);
     }
 
     // ── date parameter (point-in-time filtering for expand) ────────────────────

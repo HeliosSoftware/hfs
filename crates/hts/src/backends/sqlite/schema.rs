@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS concept_properties (
     value_type  TEXT NOT NULL,
     value       TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_concept_properties_lookup
+    ON concept_properties(concept_id, property, value);
 
 -- ── Designations (alternate names / translations) ─────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_designations (
@@ -90,6 +92,21 @@ CREATE TABLE IF NOT EXISTS value_set_expansions (
     PRIMARY KEY (value_set_id, system_url, code)
 );
 
+-- ── Implicit expansion cache ───────────────────────────────────────────────────
+-- Caches expansions for implicit ValueSet URLs (e.g. ?fhir_vs patterns) that
+-- have no corresponding row in value_sets. Keyed by the full URL string.
+CREATE TABLE IF NOT EXISTS implicit_expansion_cache (
+    url        TEXT NOT NULL,
+    system_url TEXT NOT NULL,
+    code       TEXT NOT NULL,
+    display    TEXT,
+    PRIMARY KEY (url, system_url, code)
+);
+CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url
+    ON implicit_expansion_cache(url);
+CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url_code
+    ON implicit_expansion_cache(url, code);
+
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_maps (
     id          TEXT PRIMARY KEY,
@@ -113,6 +130,15 @@ CREATE TABLE IF NOT EXISTS concept_map_elements (
 );
 CREATE INDEX IF NOT EXISTS idx_map_source
     ON concept_map_elements(map_id, source_system, source_code);
+
+-- ── FTS5 trigram index for implicit expansion text search ─────────────────────
+-- Enables fast substring matching on code and display in implicit_expansion_cache.
+-- url and system_url are UNINDEXED (stored, not tokenised).
+-- case_sensitive=0 makes queries match regardless of case.
+-- Requires SQLite ≥ 3.38 with FTS5 (provided by the bundled rusqlite feature).
+CREATE VIRTUAL TABLE IF NOT EXISTS implicit_expansion_fts
+USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
+           tokenize='trigram case_sensitive 0');
 ";
 
 /// Apply the HTS schema to the given database connection.
@@ -171,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn all_nine_tables_exist_after_migration() {
+    fn all_tables_exist_after_migration() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         apply(&conn).unwrap();
 
@@ -185,6 +211,8 @@ mod tests {
             "value_set_expansions",
             "concept_maps",
             "concept_map_elements",
+            "implicit_expansion_cache",
+            "implicit_expansion_fts",
         ];
 
         for table in &expected_tables {

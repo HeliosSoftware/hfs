@@ -56,20 +56,29 @@ impl SqliteTerminologyBackend {
     /// Returns [`HtsError::StorageError`] if the pool cannot be created or the
     /// schema migration fails.
     pub fn new(db_path: &str) -> Result<Self, HtsError> {
-        let manager = SqliteConnectionManager::file(db_path);
+        // Apply per-connection pragmas on every new connection from the pool.
+        // journal_mode is file-level (WAL persists); the rest are per-connection.
+        let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
+            conn.execute_batch(
+                "PRAGMA foreign_keys=ON;
+                 PRAGMA cache_size=-32768;
+                 PRAGMA temp_store=MEMORY;
+                 PRAGMA busy_timeout=30000;",
+            )
+        });
 
         let pool = Pool::builder()
             .max_size(8)
             .build(manager)
             .map_err(|e| HtsError::StorageError(format!("Failed to create SQLite pool: {e}")))?;
 
-        // Bootstrap: apply pragmas + schema on a single connection.
+        // Bootstrap: apply WAL + schema on a single connection.
         {
             let conn = pool.get().map_err(|e| {
                 HtsError::StorageError(format!("Failed to acquire connection for init: {e}"))
             })?;
 
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            conn.execute_batch("PRAGMA journal_mode=WAL;")
                 .map_err(|e| {
                     HtsError::StorageError(format!("Failed to configure SQLite pragmas: {e}"))
                 })?;
@@ -79,6 +88,21 @@ impl SqliteTerminologyBackend {
             schema::migrate_search_columns(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply search column migration: {e}"))
             })?;
+
+            // Clear the implicit expansion cache (and its FTS mirror) on every
+            // startup. Any partial writes from a previous interrupted session
+            // would leave the cache in an incomplete state; clearing it ensures
+            // the first request after startup recomputes atomically via the
+            // transaction in populate_implicit_cache.
+            let _ = conn.execute_batch(
+                "DELETE FROM implicit_expansion_cache;
+                 DELETE FROM implicit_expansion_fts;",
+            );
+
+            // Update query-planner statistics so recursive CTEs over large
+            // tables (e.g. concept_hierarchy with SNOMED's 500k+ edges) pick
+            // the right index.
+            let _ = conn.execute_batch("ANALYZE concept_hierarchy; ANALYZE concepts;");
         }
 
         info!(db_path, "SQLite terminology backend initialized");

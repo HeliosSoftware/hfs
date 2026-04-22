@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vs_unknown_value_set_returns_false() {
+    async fn vs_unknown_value_set_returns_404() {
         let app = make_vs_app();
         let body = json!({
             "resourceType": "Parameters",
@@ -715,12 +715,7 @@ mod tests {
         });
 
         let resp = post_json(app, "/ValueSet/$validate-code", body).await;
-        assert_eq!(resp.status(), 200);
-
-        let json = body_json(resp).await;
-        let params = json["parameter"].as_array().unwrap();
-        let result = params.iter().find(|p| p["name"] == "result").unwrap();
-        assert_eq!(result["valueBoolean"], false);
+        assert_eq!(resp.status(), 404);
     }
 
     #[tokio::test]

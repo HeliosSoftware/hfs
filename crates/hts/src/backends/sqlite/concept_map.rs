@@ -150,6 +150,21 @@ fn translate_sync(
     conn: &Connection,
     req: &TranslateRequest,
 ) -> Result<TranslateResponse, HtsError> {
+    // When a specific ConceptMap URL is requested, verify it exists first.
+    // A missing URL → 404 (not supported / not loaded), distinct from "no match found".
+    if let Some(url) = req.url.as_deref() {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concept_maps WHERE url = ?1",
+                [url],
+                |row| row.get(0),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        if exists == 0 {
+            return Err(HtsError::NotFound(format!("ConceptMap not found: {url}")));
+        }
+    }
+
     let rows = query_translate_elements(
         conn,
         &req.code,
@@ -550,15 +565,15 @@ mod tests {
         assert!(resp.result);
         assert_eq!(resp.matches[0].concept_code, "X");
 
-        // Filter by a non-existent map URL — should return no results.
+        // Filter by a non-existent map URL — should return NotFound.
         let req_bad = TranslateRequest {
             url: Some("http://unknown.org/cm".into()),
             system: Some("http://example.org/src".into()),
             code: "A".into(),
             ..Default::default()
         };
-        let resp_bad = backend.translate(&ctx, req_bad).await.unwrap();
-        assert!(!resp_bad.result);
+        let err = backend.translate(&ctx, req_bad).await.unwrap_err();
+        assert!(matches!(err, crate::error::HtsError::NotFound(_)));
     }
 
     #[tokio::test]

@@ -32,6 +32,18 @@ const TYPE_FSN: &str = "900000000000003001";
 const TYPE_SYNONYM: &str = "900000000000013009";
 const IS_A_TYPE: &str = "116680003";
 
+/// Map from concept code to a list of `(type_id, destination_code)` pairs.
+type RoleProps = HashMap<String, Vec<(String, String)>>;
+
+/// Known SNOMED association refset IDs with their FHIR equivalence codes.
+/// Each entry is (refset_id, fhir_equivalence, label_for_logging).
+const ASSOC_REFSET_EQUIVALENCES: &[(&str, &str, &str)] = &[
+    ("900000000000526001", "replaced-by", "REPLACED_BY"),
+    ("900000000000527005", "equal", "SAME_AS"),
+    ("900000000000528000", "wider", "WAS_A"),
+    ("900000000000523009", "inexact", "POSSIBLY_EQUIVALENT_TO"),
+];
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -40,6 +52,10 @@ struct SnomedParseResult {
     preferred_terms: HashMap<String, String>,
     /// (child, parent) is-a edges.
     is_a_edges: Vec<(String, String)>,
+    /// source_concept_id → Vec<(type_id, destination_concept_id)> for non-IS_A relationships.
+    role_relationships: RoleProps,
+    /// refset_id → Vec<(source_concept_id, target_concept_id)> from association refset files.
+    association_refsets: RoleProps,
     release_version: Option<String>,
     parse_errors: Vec<String>,
 }
@@ -57,12 +73,13 @@ pub async fn import_snomed_rf2(
 
     let path_owned = path.to_path_buf();
     let parsed = tokio::task::spawn_blocking(move || -> Result<SnomedParseResult, HtsError> {
-        let (concept_path, desc_path, rel_path) = find_rf2_paths(&path_owned)?;
+        let (concept_path, desc_path, rel_path, assoc_refset_paths) = find_rf2_paths(&path_owned)?;
 
         tracing::info!(
             concept_file = %concept_path,
             description_file = %desc_path,
             relationship_file = %rel_path,
+            assoc_refset_files = assoc_refset_paths.len(),
             "Located RF2 files in archive"
         );
 
@@ -84,12 +101,27 @@ pub async fn import_snomed_rf2(
             parse_preferred_terms(BufReader::new(entry), &active_concepts, &mut parse_errors)
         };
 
-        let is_a_edges = {
+        let (is_a_edges, role_relationships) = {
             let mut zip = open_zip(&path_owned)?;
             let entry = zip.by_name(&rel_path).map_err(|e| {
                 HtsError::InvalidRequest(format!("Cannot open relationship file: {e}"))
             })?;
-            parse_is_a_edges(BufReader::new(entry), &active_concepts, &mut parse_errors)
+            parse_relationships(BufReader::new(entry), &active_concepts, &mut parse_errors)
+        };
+
+        let association_refsets = {
+            let mut merged: RoleProps = HashMap::new();
+            for refset_path in &assoc_refset_paths {
+                let mut zip = open_zip(&path_owned)?;
+                let entry = zip.by_name(refset_path).map_err(|e| {
+                    HtsError::InvalidRequest(format!("Cannot open association refset file: {e}"))
+                })?;
+                let partial = parse_association_refsets(BufReader::new(entry), &mut parse_errors);
+                for (refset_id, mappings) in partial {
+                    merged.entry(refset_id).or_default().extend(mappings);
+                }
+            }
+            merged
         };
 
         let release_version = extract_release_date(&concept_path);
@@ -97,6 +129,8 @@ pub async fn import_snomed_rf2(
         Ok(SnomedParseResult {
             preferred_terms,
             is_a_edges,
+            role_relationships,
+            association_refsets,
             release_version,
             parse_errors,
         })
@@ -107,12 +141,16 @@ pub async fn import_snomed_rf2(
     let SnomedParseResult {
         preferred_terms,
         is_a_edges,
+        role_relationships,
+        association_refsets,
         release_version,
         parse_errors,
     } = parsed;
 
     let concept_count = preferred_terms.len() as u32;
     let edge_count = is_a_edges.len();
+    let role_count: usize = role_relationships.values().map(|v| v.len()).sum();
+    let assoc_count: usize = association_refsets.values().map(|v| v.len()).sum();
 
     let mut stats = ImportStats {
         code_systems: 1,
@@ -123,7 +161,8 @@ pub async fn import_snomed_rf2(
     if dry_run {
         stats.concepts = concept_count;
         eprintln!(
-            "[{FORMAT}] dry-run — would import {concept_count} concepts, {edge_count} Is-a edges"
+            "[{FORMAT}] dry-run — would import {concept_count} concepts, {edge_count} Is-a edges, \
+             {role_count} role relationships, {assoc_count} association refset mappings"
         );
         return Ok(stats);
     }
@@ -162,7 +201,8 @@ pub async fn import_snomed_rf2(
         let extras_per: Vec<Vec<BuilderProperty<'_>>> = chunk
             .iter()
             .map(|(code, _)| {
-                parents_of
+                // Additional parent edges (beyond the first, which goes in parent_code).
+                let parent_extras = parents_of
                     .get(code)
                     .map(|parents| {
                         parents
@@ -173,9 +213,26 @@ pub async fn import_snomed_rf2(
                                 value_key: "valueCode",
                                 value: p.as_str(),
                             })
-                            .collect()
+                            .collect::<Vec<_>>()
                     })
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+
+                // Non-IS_A role relationships stored as concept properties.
+                let role_extras = role_relationships
+                    .get(code)
+                    .map(|roles| {
+                        roles
+                            .iter()
+                            .map(|(type_id, dest_id)| BuilderProperty {
+                                code: type_id.as_str(),
+                                value_key: "valueCode",
+                                value: dest_id.as_str(),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                [parent_extras, role_extras].concat()
             })
             .collect();
 
@@ -206,6 +263,35 @@ pub async fn import_snomed_rf2(
         );
     }
 
+    // Import association refsets as ConceptMap resources.
+    if !association_refsets.is_empty() {
+        eprintln!(
+            "[{FORMAT}] importing {} association refset(s) as ConceptMaps…",
+            association_refsets.len()
+        );
+        for (refset_id, mappings) in &association_refsets {
+            let equivalence = ASSOC_REFSET_EQUIVALENCES
+                .iter()
+                .find(|(id, _, _)| *id == refset_id.as_str())
+                .map(|(_, eq, _)| *eq)
+                .unwrap_or("related-to");
+
+            let bytes = build_assoc_refset_concept_map_bundle(
+                refset_id,
+                equivalence,
+                mappings,
+                &meta_version,
+            );
+            let cm_stats = backend.import_bundle(ctx, &bytes).await?;
+            stats.concept_maps += cm_stats.concept_maps;
+            stats.errors.extend(cm_stats.errors);
+            eprintln!(
+                "[{FORMAT}] imported ConceptMap for refset {refset_id} ({} mappings, equivalence={equivalence})",
+                mappings.len()
+            );
+        }
+    }
+
     Ok(stats)
 }
 
@@ -218,12 +304,13 @@ fn open_zip(path: &Path) -> Result<ZipArchive<std::fs::File>, HtsError> {
         .map_err(|e| HtsError::InvalidRequest(format!("Not a valid ZIP archive: {e}")))
 }
 
-fn find_rf2_paths(path: &Path) -> Result<(String, String, String), HtsError> {
+fn find_rf2_paths(path: &Path) -> Result<(String, String, String, Vec<String>), HtsError> {
     let mut zip = open_zip(path)?;
 
     let mut concept_path: Option<String> = None;
     let mut desc_path: Option<String> = None;
     let mut rel_path: Option<String> = None;
+    let mut assoc_refset_paths: Vec<String> = Vec::new();
 
     for i in 0..zip.len() {
         let entry = zip
@@ -236,6 +323,9 @@ fn find_rf2_paths(path: &Path) -> Result<(String, String, String), HtsError> {
         }
         let lower = name.to_lowercase();
         if lower.contains("refset") {
+            if lower.contains("association") {
+                assoc_refset_paths.push(name);
+            }
             continue;
         }
 
@@ -251,19 +341,23 @@ fn find_rf2_paths(path: &Path) -> Result<(String, String, String), HtsError> {
     Ok((
         concept_path.ok_or_else(|| {
             HtsError::InvalidRequest(
-                "No Concept RF2 file found. Expected a file containing 'Concept_' in its path.".into(),
+                "No Concept RF2 file found. Expected a file containing 'Concept_' in its path."
+                    .into(),
             )
         })?,
         desc_path.ok_or_else(|| {
             HtsError::InvalidRequest(
-                "No Description RF2 file found. Expected a file containing 'Description_' in its path.".into(),
+                "No Description RF2 file found. Expected a file containing 'Description_' in its path."
+                    .into(),
             )
         })?,
         rel_path.ok_or_else(|| {
             HtsError::InvalidRequest(
-                "No Relationship RF2 file found. Expected a file containing 'Relationship_' in its path.".into(),
+                "No Relationship RF2 file found. Expected a file containing 'Relationship_' in its path."
+                    .into(),
             )
         })?,
+        assoc_refset_paths,
     ))
 }
 
@@ -367,13 +461,20 @@ fn parse_preferred_terms(
     terms
 }
 
-fn parse_is_a_edges(
+/// Parse the RF2 Relationship file, returning both IS_A edges and role relationships.
+///
+/// Returns `(is_a_edges, role_props)` where:
+/// - `is_a_edges`: Vec of `(child_code, parent_code)` for active IS_A relationships.
+/// - `role_props`: Map of `source_code → Vec<(type_id, destination_code)>` for all
+///   other active relationships where both endpoints are active concepts.
+fn parse_relationships(
     reader: impl BufRead,
     active_concepts: &HashSet<String>,
     errors: &mut Vec<String>,
-) -> Vec<(String, String)> {
-    let mut edges: Vec<(String, String)> = Vec::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+) -> (Vec<(String, String)>, RoleProps) {
+    let mut is_a_edges: Vec<(String, String)> = Vec::new();
+    let mut is_a_seen: HashSet<(String, String)> = HashSet::new();
+    let mut role_props: RoleProps = HashMap::new();
 
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = match line_result {
@@ -395,23 +496,120 @@ fn parse_is_a_edges(
         }
 
         let active = parts[2].trim() == "1";
-        let child = parts[4].trim();
-        let parent = parts[5].trim();
+        let source = parts[4].trim();
+        let destination = parts[5].trim();
         let type_id = parts[7].trim();
 
-        if !active || type_id != IS_A_TYPE {
-            continue;
-        }
-        if !active_concepts.contains(child) || !active_concepts.contains(parent) {
+        if !active || !active_concepts.contains(source) || !active_concepts.contains(destination) {
             continue;
         }
 
-        let edge = (child.to_string(), parent.to_string());
-        if seen.insert(edge.clone()) {
-            edges.push(edge);
+        if type_id == IS_A_TYPE {
+            let edge = (source.to_string(), destination.to_string());
+            if is_a_seen.insert(edge.clone()) {
+                is_a_edges.push(edge);
+            }
+        } else {
+            role_props
+                .entry(source.to_string())
+                .or_default()
+                .push((type_id.to_string(), destination.to_string()));
         }
     }
-    edges
+
+    (is_a_edges, role_props)
+}
+
+/// Parse an RF2 association refset file (7-column format).
+///
+/// Returns a map of `refset_id → Vec<(source_concept_id, target_concept_id)>`
+/// for all active entries.
+fn parse_association_refsets(reader: impl BufRead, errors: &mut Vec<String>) -> RoleProps {
+    let mut result: RoleProps = HashMap::new();
+
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line_num == 0 || line.is_empty() {
+            continue;
+        }
+
+        // Columns: id effectiveTime active moduleId refsetId referencedComponentId targetComponentId
+        let parts: Vec<&str> = line.splitn(8, '\t').collect();
+        if parts.len() < 7 {
+            errors.push(format!(
+                "Association refset line {}: expected ≥7 fields, got {} — skipped",
+                line_num + 1,
+                parts.len()
+            ));
+            continue;
+        }
+
+        let active = parts[2].trim() == "1";
+        let refset_id = parts[4].trim();
+        let source_id = parts[5].trim();
+        let target_id = parts[6].trim();
+
+        if !active || source_id.is_empty() || target_id.is_empty() {
+            continue;
+        }
+
+        result
+            .entry(refset_id.to_string())
+            .or_default()
+            .push((source_id.to_string(), target_id.to_string()));
+    }
+
+    result
+}
+
+/// Build a FHIR Bundle containing a ConceptMap for a SNOMED association refset.
+///
+/// The ConceptMap URL follows the FHIR implicit pattern:
+/// `http://snomed.info/sct?fhir_cm=<refset_id>`
+fn build_assoc_refset_concept_map_bundle(
+    refset_id: &str,
+    equivalence: &str,
+    mappings: &[(String, String)],
+    version: &str,
+) -> Vec<u8> {
+    use serde_json::json;
+
+    let url = format!("{SNOMED_URL}?fhir_cm={refset_id}");
+    let id = format!("snomed-assoc-{refset_id}");
+
+    let elements: Vec<serde_json::Value> = mappings
+        .iter()
+        .map(|(source, target)| {
+            json!({
+                "code": source,
+                "target": [{"code": target, "equivalence": equivalence}]
+            })
+        })
+        .collect();
+
+    let cm = json!({
+        "resourceType": "ConceptMap",
+        "id": id,
+        "url": url,
+        "version": version,
+        "status": "active",
+        "group": [{
+            "source": SNOMED_URL,
+            "target": SNOMED_URL,
+            "element": elements
+        }]
+    });
+
+    let bundle = json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{"resource": cm}]
+    });
+
+    serde_json::to_vec(&bundle).expect("serialise ConceptMap bundle")
 }
 
 fn extract_release_date(path: &str) -> Option<String> {
@@ -521,13 +719,17 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     }
 
     #[test]
-    fn parse_is_a_edges_returns_correct_pairs() {
+    fn parse_relationships_returns_correct_is_a_pairs() {
         let mut errors = Vec::new();
         let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
-        let edges = parse_is_a_edges(RELATIONSHIP_TSV.as_bytes(), &active, &mut errors);
+        let (edges, roles) = parse_relationships(RELATIONSHIP_TSV.as_bytes(), &active, &mut errors);
 
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0], ("789012001".to_string(), "123456001".to_string()));
+        assert!(
+            roles.is_empty(),
+            "no role relationships expected in test data"
+        );
     }
 
     #[test]
