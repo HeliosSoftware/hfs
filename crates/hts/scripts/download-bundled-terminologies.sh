@@ -38,6 +38,16 @@ NUCC_VERSION="251"            # https://www.nucc.org/index.php/code-sets-mainmen
 # records when the checked-in copy was last refreshed.
 NDC_TAG="current"
 
+# Commonly-used FHIR IG packages (latest versions). These bring in large sets
+# of ValueSets and CodeSystems that downstream implementers frequently need
+# alongside THO. Check packages.fhir.org/<name> for newer releases when
+# refreshing.
+R4_CORE_VERSION="4.0.1"       # https://packages.fhir.org/hl7.fhir.r4.core (R4 is frozen at 4.0.1)
+US_CORE_VERSION="8.0.1"       # https://packages.fhir.org/hl7.fhir.us.core
+VSAC_VERSION="0.17.0"         # https://packages.fhir.org/us.nlm.vsac
+UV_IPS_VERSION="2.0.0"        # https://packages.fhir.org/hl7.fhir.uv.ips
+PHINVADS_VERSION="0.12.0"     # https://packages.fhir.org/us.cdc.phinvads
+
 # ---------- helpers ------------------------------------------------------------
 RESULTS=()
 
@@ -85,6 +95,30 @@ try_download "HL7 THO (R4)" \
 try_download "HL7 THO (R5)" \
     "https://packages.fhir.org/hl7.terminology.r5/${THO_VERSION}" \
     "hl7.terminology.r5-${THO_VERSION}.tgz"
+
+# ---------- 1b. Common FHIR IG packages ---------------------------------------
+# Widely-used FHIR IGs whose ValueSets and CodeSystems reference THO and the
+# licensed terminologies. All are freely redistributable under the HL7 FHIR
+# License (with attribution).
+try_download "HL7 FHIR R4 core ${R4_CORE_VERSION}" \
+    "https://packages.fhir.org/hl7.fhir.r4.core/${R4_CORE_VERSION}" \
+    "hl7.fhir.r4.core-${R4_CORE_VERSION}.tgz"
+
+try_download "HL7 FHIR US Core ${US_CORE_VERSION}" \
+    "https://packages.fhir.org/hl7.fhir.us.core/${US_CORE_VERSION}" \
+    "hl7.fhir.us.core-${US_CORE_VERSION}.tgz"
+
+try_download "VSAC ${VSAC_VERSION}" \
+    "https://packages.fhir.org/us.nlm.vsac/${VSAC_VERSION}" \
+    "us.nlm.vsac-${VSAC_VERSION}.tgz"
+
+try_download "HL7 FHIR UV IPS ${UV_IPS_VERSION}" \
+    "https://packages.fhir.org/hl7.fhir.uv.ips/${UV_IPS_VERSION}" \
+    "hl7.fhir.uv.ips-${UV_IPS_VERSION}.tgz"
+
+try_download "CDC PHIN VADS ${PHINVADS_VERSION}" \
+    "https://packages.fhir.org/us.cdc.phinvads/${PHINVADS_VERSION}" \
+    "us.cdc.phinvads-${PHINVADS_VERSION}.tgz"
 
 # ---------- 2. ICD-10-CM (FY26) -----------------------------------------------
 # Landing page: https://www.cdc.gov/nchs/icd/icd-10-cm/files.html

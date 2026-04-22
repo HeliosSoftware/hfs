@@ -51,6 +51,16 @@ $NuccVersion    = '251'         # https://www.nucc.org/index.php/code-sets-mainm
 # records when the checked-in copy was last refreshed.
 $NdcTag         = 'current'
 
+# Commonly-used FHIR IG packages (latest versions). These bring in large
+# sets of ValueSets and CodeSystems that downstream implementers frequently
+# need alongside THO. Check packages.fhir.org/<name> for newer releases
+# when refreshing.
+$R4CoreVersion   = '4.0.1'      # https://packages.fhir.org/hl7.fhir.r4.core (R4 is frozen at 4.0.1)
+$UsCoreVersion   = '8.0.1'      # https://packages.fhir.org/hl7.fhir.us.core
+$VsacVersion     = '0.17.0'     # https://packages.fhir.org/us.nlm.vsac
+$UvIpsVersion    = '2.0.0'      # https://packages.fhir.org/hl7.fhir.uv.ips
+$PhinvadsVersion = '0.12.0'     # https://packages.fhir.org/us.cdc.phinvads
+
 # ---------- helpers ------------------------------------------------------------
 $Results = [System.Collections.Generic.List[string]]::new()
 
@@ -109,6 +119,30 @@ Invoke-Download 'HL7 THO (R4)' `
 Invoke-Download 'HL7 THO (R5)' `
     "https://packages.fhir.org/hl7.terminology.r5/$ThoVersion" `
     "hl7.terminology.r5-$ThoVersion.tgz"
+
+# ---------- 1b. Common FHIR IG packages ---------------------------------------
+# Widely-used FHIR IGs whose ValueSets and CodeSystems reference THO and the
+# licensed terminologies. All are freely redistributable under the HL7 FHIR
+# License (with attribution).
+Invoke-Download "HL7 FHIR R4 core $R4CoreVersion" `
+    "https://packages.fhir.org/hl7.fhir.r4.core/$R4CoreVersion" `
+    "hl7.fhir.r4.core-$R4CoreVersion.tgz"
+
+Invoke-Download "HL7 FHIR US Core $UsCoreVersion" `
+    "https://packages.fhir.org/hl7.fhir.us.core/$UsCoreVersion" `
+    "hl7.fhir.us.core-$UsCoreVersion.tgz"
+
+Invoke-Download "VSAC $VsacVersion" `
+    "https://packages.fhir.org/us.nlm.vsac/$VsacVersion" `
+    "us.nlm.vsac-$VsacVersion.tgz"
+
+Invoke-Download "HL7 FHIR UV IPS $UvIpsVersion" `
+    "https://packages.fhir.org/hl7.fhir.uv.ips/$UvIpsVersion" `
+    "hl7.fhir.uv.ips-$UvIpsVersion.tgz"
+
+Invoke-Download "CDC PHIN VADS $PhinvadsVersion" `
+    "https://packages.fhir.org/us.cdc.phinvads/$PhinvadsVersion" `
+    "us.cdc.phinvads-$PhinvadsVersion.tgz"
 
 # ---------- 2. ICD-10-CM -------------------------------------------------------
 # Landing page: https://www.cdc.gov/nchs/icd/icd-10-cm/files.html

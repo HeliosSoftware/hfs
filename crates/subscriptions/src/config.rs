@@ -28,6 +28,9 @@ pub struct SubscriptionConfig {
 
     /// Supported channel types.
     pub supported_channel_types: Vec<String>,
+
+    /// Lifetime of WebSocket binding tokens in seconds.
+    pub ws_token_lifetime_secs: i64,
 }
 
 impl Default for SubscriptionConfig {
@@ -41,6 +44,7 @@ impl Default for SubscriptionConfig {
             error_threshold: 3,
             off_threshold: 10,
             supported_channel_types: vec!["rest-hook".to_string()],
+            ws_token_lifetime_secs: 30,
         }
     }
 }

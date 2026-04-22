@@ -2,6 +2,8 @@
 
 A high-performance FHIR server built in Rust.
 
+An open test server is available at https://hfs.heliossoftware.com/ for experimentation and evaluation.
+
 ## Features
 
 - Full FHIR RESTful API support 

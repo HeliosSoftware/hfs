@@ -572,7 +572,7 @@ fn parse_fhir_resource(json: Value, version: FhirVersion) -> FhirPathResult<Fhir
                 .map_err(|e| FhirPathError::InvalidInput(format!("Invalid R6 resource: {}", e)))?;
             Ok(FhirResource::R6(Box::new(resource)))
         }
-        #[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6")))]
+        #[allow(unreachable_patterns)]
         _ => Err(FhirPathError::InvalidInput(format!(
             "FHIR version {:?} is not enabled",
             version

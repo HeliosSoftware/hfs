@@ -334,6 +334,7 @@ simple web service for SQL-on-FHIR implementations. Should you need to perform S
 transformations using server-stored ViewDefinitions and server-stored FHIR data, use the full
 capabilities of the Helios FHIR Server in [hfs](../hfs).
 
+An open test server is available at https://sof.heliossoftware.com/ for experimentation and evaluation.
 
 ```bash
 # Start server with defaults

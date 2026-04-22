@@ -684,6 +684,7 @@ See `RELEASING.md` for full details.
 ## Important Notes
 
 - Default FHIR version is R4 when no features specified
+- **FHIR version feature assumption:** Code MAY assume that at least one FHIR version feature is enabled at compile time, and SHOULD assume R4 is enabled when relying on `FhirVersion::default()` (which is gated on `feature = "R4"`). Avoid adding cfg-ladder fallbacks for the "no version enabled" case — that build target is not supported. Single-version minimal builds (e.g. R4B-only) are supported, but functions that need a default value should require R4 explicitly rather than enumerating versions in `#[cfg]` arms.
 - The project follows standard Rust conventions
 - `pysof` is excluded from default workspace members — `cargo build` from root skips it
 - Server returns appropriate HTTP status codes and FHIR OperationOutcomes for errors

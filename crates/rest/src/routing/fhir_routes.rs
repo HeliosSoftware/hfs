@@ -261,6 +261,14 @@ where
         .route(
             "/{resource_type}/{id}/$events",
             get(handlers::subscriptions::subscription_events_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$get-ws-binding-token",
+            get(handlers::subscriptions::get_ws_binding_token_handler::<S>),
+        )
+        .route(
+            "/ws/subscriptions/bind",
+            get(handlers::ws::ws_bind_handler::<S>),
         );
 
     // Compartment search: GET [base]/[compartment-type]/[id]/[target-type]?params

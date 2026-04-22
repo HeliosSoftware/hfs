@@ -12,7 +12,7 @@ use helios_persistence::core::{ConditionalStorage, ResourceStorage};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::TenantExtractor;
+use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::state::AppState;
 
 /// Handler for the delete interaction.
@@ -39,6 +39,7 @@ pub async fn delete_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
+    version: FhirVersionExtractor,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
@@ -57,6 +58,16 @@ where
         tenant = %tenant.tenant_id(),
         "Processing delete request"
     );
+
+    let existing_resource = state
+        .storage()
+        .read(tenant.context(), &resource_type, &id)
+        .await?;
+
+    let fhir_version = existing_resource
+        .as_ref()
+        .map(|stored| stored.fhir_version())
+        .unwrap_or_else(|| version.storage_version());
 
     // Perform the delete
     state
@@ -78,7 +89,8 @@ where
             tenant.context(),
             &resource_type,
             &id,
-            helios_fhir::FhirVersion::default(),
+            fhir_version,
+            existing_resource.map(|stored| stored.content().clone()),
         );
     }
 
