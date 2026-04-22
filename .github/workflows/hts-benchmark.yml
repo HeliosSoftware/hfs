@@ -3,10 +3,17 @@ name: HTS Terminology Benchmark
 # ──────────────────────────────────────────────────────────────────────────────
 # Manual trigger only — benchmarks are expensive and require licensed data.
 #
+# Terminology data is loaded from two locations:
+#   1. FHIR IG packages pulled directly from packages.fhir.org at the exact
+#      versions the benchmark corpus specifies (these differ from the latest
+#      versions shipped under crates/hts/terminology-data/, which is why
+#      the bundle is not used here).
+#   2. An S3 prefix containing the licensed distributions (SNOMED CT RF2 zips,
+#      LOINC zip, RxNorm RRF, etc.). Set via the HTS_LICENSED_S3_URI secret.
+#
 # Prerequisites on the self-hosted runner:
-#   • HTS_BENCH_DB_PATH secret (optional): absolute path to a pre-populated
-#     SQLite file (SNOMED + LOINC + ICD-10-CM).  If absent the workflow
-#     imports hl7.fhir.r4.core + hl7.terminology at runtime (free, no SNOMED).
+#   • HTS_LICENSED_S3_URI secret: s3://bucket/path/ — REQUIRED.
+#   • AWS_ROLE_ARN / AWS_REGION secrets (or vars) for OIDC role assumption.
 #   • k6 and bun are auto-installed if not already present.
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -31,10 +38,13 @@ env:
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
   HTS_PORT: 8092
+  # S3 prefix (s3://bucket/path/) containing licensed terminology
+  # distributions (SNOMED RF2, LOINC, RxNorm, etc.).
+  HTS_LICENSED_S3_URI: ${{ secrets.HTS_LICENSED_S3_URI }}
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
-  # Compile a release binary — shared with the benchmark job via artifact
+  # Compile a debug binary — shared with the benchmark job via artifact
   # ────────────────────────────────────────────────────────────────────────────
   build:
     name: Build HTS binary
@@ -58,14 +68,14 @@ jobs:
           printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]\n' \
             > ~/.cargo/config.toml
 
-      - name: Build release binary
-        run: cargo build --release -p helios-hts
+      - name: Build debug binary
+        run: cargo build -p helios-hts
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: hts-bench-binary-${{ github.run_id }}
-          path: target/release/hts
+          path: target/debug/hts
           retention-days: 1
 
   # ────────────────────────────────────────────────────────────────────────────
@@ -75,6 +85,9 @@ jobs:
     name: Benchmark
     runs-on: [self-hosted, Linux]
     needs: build
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout HTS
@@ -119,44 +132,95 @@ jobs:
       - name: Ensure jq is installed
         run: command -v jq || sudo apt-get install -y jq
 
+      # ── AWS (for syncing licensed terminology from S3) ───────────────────
+
+      - name: Validate HTS_LICENSED_S3_URI
+        run: |
+          if [ -z "$HTS_LICENSED_S3_URI" ]; then
+            echo "::error::HTS_LICENSED_S3_URI secret is required"
+            exit 1
+          fi
+          if [[ "$HTS_LICENSED_S3_URI" != s3://* ]]; then
+            echo "::error::HTS_LICENSED_S3_URI must be an s3:// URI (got: $HTS_LICENSED_S3_URI)"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws &>/dev/null; then
+            if ! /tmp/aws-bin/aws --version &>/dev/null; then
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -qo /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
+              rm -rf /tmp/awscliv2.zip /tmp/aws
+            fi
+            echo "/tmp/aws-bin" >> $GITHUB_PATH
+          fi
+          aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
       # ── Database ─────────────────────────────────────────────────────────
 
       - name: Prepare terminology database
         run: |
-          DB_PATH="${HTS_BENCH_DB_PATH:-}"
-          if [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ]; then
-            echo "DB_MODE=preloaded (SNOMED+LOINC+ICD-10-CM)" >> "$GITHUB_ENV"
-            echo "HTS_DB=$DB_PATH"                            >> "$GITHUB_ENV"
-            echo "Using pre-populated DB: $DB_PATH"
-          else
-            echo "No pre-populated DB — importing free HL7 packages (no SNOMED/LOINC)."
-            echo "To enable full SNOMED/LOINC coverage set the HTS_BENCH_DB_PATH secret."
-            DB_PATH="$GITHUB_WORKSPACE/bench.db"
-            echo "DB_MODE=free-only (hl7.fhir.r4.core + hl7.terminology)" >> "$GITHUB_ENV"
-            echo "HTS_DB=$DB_PATH"                                          >> "$GITHUB_ENV"
+          DB_PATH="$GITHUB_WORKSPACE/bench.db"
+          rm -f "$DB_PATH"
+          echo "HTS_DB=$DB_PATH" >> "$GITHUB_ENV"
 
-            mkdir -p /tmp/hts-bench-pkgs
+          # ── Source 1: FHIR IG packages from packages.fhir.org at the
+          # exact benchmark-pinned versions (older than the latest bundled
+          # versions maintained under crates/hts/terminology-data/).
+          PKGS=(
+            "hl7.fhir.r4.core@4.0.1"
+            "hl7.terminology@7.0.1"
+            "hl7.fhir.us.core@6.1.0"
+            "us.nlm.vsac@0.17.0"
+            "hl7.fhir.uv.ips@2.0.0"
+            "hl7.fhir.uv.ips@1.1.0"
+            "us.cdc.phinvads@0.12.0"
+          )
 
-            echo "Downloading hl7.fhir.r4.core 4.0.1..."
+          mkdir -p /tmp/hts-bench-pkgs
+
+          for PKG_SPEC in "${PKGS[@]}"; do
+            PKG="${PKG_SPEC%@*}"
+            VER="${PKG_SPEC#*@}"
+            FILE="/tmp/hts-bench-pkgs/${PKG}-${VER}.tgz"
+
+            echo "Downloading ${PKG} ${VER} from packages.fhir.org..."
             curl -fsSL --max-time 300 \
-              "https://packages.fhir.org/hl7.fhir.r4.core/4.0.1" \
-              -o /tmp/hts-bench-pkgs/r4core.tgz
+              "https://packages.fhir.org/${PKG}/${VER}" \
+              -o "$FILE"
 
-            echo "Downloading hl7.terminology.r4 7.1.0..."
-            curl -fsSL --max-time 300 \
-              "https://packages.fhir.org/hl7.terminology.r4/7.1.0" \
-              -o /tmp/hts-bench-pkgs/terminology.tgz
-
-            echo "Importing hl7.fhir.r4.core..."
-            ./hts import /tmp/hts-bench-pkgs/r4core.tgz \
+            echo "Importing ${PKG} ${VER}..."
+            ./hts import "$FILE" \
               --database-url "$DB_PATH" --batch-size 500 || true
+          done
 
-            echo "Importing hl7.terminology.r4..."
-            ./hts import /tmp/hts-bench-pkgs/terminology.tgz \
-              --database-url "$DB_PATH" --batch-size 500 || true
+          # ── Source 2: licensed distributions from S3 (SNOMED, LOINC, ...)
+          LICENSED_DIR="$GITHUB_WORKSPACE/licensed-terminology"
+          rm -rf "$LICENSED_DIR"
+          mkdir -p "$LICENSED_DIR"
+
+          echo "Syncing licensed terminology from $HTS_LICENSED_S3_URI ..."
+          aws s3 sync "$HTS_LICENSED_S3_URI" "$LICENSED_DIR"
+
+          if [ -z "$(ls -A "$LICENSED_DIR" 2>/dev/null)" ]; then
+            echo "ERROR: No files found under $HTS_LICENSED_S3_URI"
+            exit 1
           fi
-        env:
-          HTS_BENCH_DB_PATH: ${{ secrets.HTS_BENCH_DB_PATH }}
+
+          echo "Files synced:"
+          ls -lh "$LICENSED_DIR"
+
+          echo "Importing licensed terminology (directory auto-detects SNOMED RF2 / LOINC / RxNorm)..."
+          ./hts import "$LICENSED_DIR" \
+            --database-url "$DB_PATH" --batch-size 500
 
       # ── Server ───────────────────────────────────────────────────────────
 
@@ -270,7 +334,6 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| **Commit** | \`$(echo '${{ github.sha }}' | cut -c1-7)\` |"
-            echo "| **DB mode** | ${{ env.DB_MODE }} |"
             echo "| **Duration** | ${{ inputs.duration || '30s' }} per scenario |"
             echo "| **VUs** | ${{ inputs.vus || '1,10,50' }} |"
             echo ""
