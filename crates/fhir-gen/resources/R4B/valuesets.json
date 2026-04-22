@@ -68205,7 +68205,7 @@
         "definition" : "Indicated except when the other therapy is given"
       },
       {
-        "code" : "indicated-only-before",
+        "code" : "indicated-only-after",
         "display" : "Indicated only if the other therapy is planned to be given afterwards (prep)",
         "definition" : "Indicated only if the other therapy is planned to be given afterwards (prep)"
       },

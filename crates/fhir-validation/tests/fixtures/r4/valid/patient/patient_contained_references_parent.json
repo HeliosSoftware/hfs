@@ -1,0 +1,17 @@
+{
+  "resourceType": "Patient",
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n\t\t\t\u003ctable\u003e\n\t\t\t\t\u003ctbody\u003e\n\t\t\t\t\t\u003ctr\u003e\n\t\t\t\t\t\t\u003ctd\u003eName\u003c/td\u003e\n\t\t\t\t\t\t\u003ctd\u003ePeter James \n              \u003cb\u003eChalmers\u003c/b\u003e (\u0026quot;Jim\u0026quot;)\n            \u003c/td\u003e\n\t\t\t\t\t\u003c/tr\u003e\n\t\t\t\t\t\u003ctr\u003e\n\t\t\t\t\t\t\u003ctd\u003eAddress\u003c/td\u003e\n\t\t\t\t\t\t\u003ctd\u003e534 Erewhon, Pleasantville, Vic, 3999\u003c/td\u003e\n\t\t\t\t\t\u003c/tr\u003e\n\t\t\t\t\t\u003ctr\u003e\n\t\t\t\t\t\t\u003ctd\u003eContacts\u003c/td\u003e\n\t\t\t\t\t\t\u003ctd\u003eHome: unknown. Work: (03) 5555 6473\u003c/td\u003e\n\t\t\t\t\t\u003c/tr\u003e\n\t\t\t\t\t\u003ctr\u003e\n\t\t\t\t\t\t\u003ctd\u003eId\u003c/td\u003e\n\t\t\t\t\t\t\u003ctd\u003eMRN: 12345 (Acme Healthcare)\u003c/td\u003e\n\t\t\t\t\t\u003c/tr\u003e\n\t\t\t\t\u003c/tbody\u003e\n\t\t\t\u003c/table\u003e\n\t\t\u003c/div\u003e"
+  },
+  "contained": [
+    {
+      "resourceType": "Organization",
+      "id": "org1",
+      "name": "Acme Healthcare",
+      "partOf": {
+        "reference": "#"
+      }
+    }
+  ]
+}

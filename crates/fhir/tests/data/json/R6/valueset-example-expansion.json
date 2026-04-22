@@ -18,7 +18,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.3.3141"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "LOINCCodesForCholesterolInSerumPlasma",
   "title": "LOINC Codes for Cholesterol in Serum/Plasma",
   "status": "draft",

@@ -310,22 +310,22 @@ fn evaluation_result_to_json_values(
     result: &EvaluationResult,
 ) -> Result<Vec<Value>, ExtractionError> {
     match result {
-        EvaluationResult::Empty => Ok(Vec::new()),
-        EvaluationResult::Boolean(b, _) => Ok(vec![Value::Bool(*b)]),
-        EvaluationResult::String(s, _) => Ok(vec![Value::String(s.clone())]),
-        EvaluationResult::Integer(i, _) => Ok(vec![Value::Number((*i).into())]),
-        EvaluationResult::Integer64(i, _) => Ok(vec![Value::Number((*i).into())]),
-        EvaluationResult::Decimal(d, _) => {
+        EvaluationResult::Empty | EvaluationResult::EmptyWithMeta { .. } => Ok(Vec::new()),
+        EvaluationResult::Boolean(b, _, _) => Ok(vec![Value::Bool(*b)]),
+        EvaluationResult::String(s, _, _) => Ok(vec![Value::String(s.clone())]),
+        EvaluationResult::Integer(i, _, _) => Ok(vec![Value::Number((*i).into())]),
+        EvaluationResult::Integer64(i, _, _) => Ok(vec![Value::Number((*i).into())]),
+        EvaluationResult::Decimal(d, _, _) => {
             // Convert decimal to JSON number
             let f: f64 = (*d).try_into().unwrap_or(0.0);
             Ok(vec![Value::Number(
                 serde_json::Number::from_f64(f).unwrap_or_else(|| serde_json::Number::from(0)),
             )])
         }
-        EvaluationResult::Date(s, _) => Ok(vec![Value::String(s.clone())]),
-        EvaluationResult::DateTime(s, _) => Ok(vec![Value::String(s.clone())]),
-        EvaluationResult::Time(s, _) => Ok(vec![Value::String(s.clone())]),
-        EvaluationResult::Quantity(value, unit, _) => {
+        EvaluationResult::Date(s, _, _) => Ok(vec![Value::String(s.clone())]),
+        EvaluationResult::DateTime(s, _, _) => Ok(vec![Value::String(s.clone())]),
+        EvaluationResult::Time(s, _, _) => Ok(vec![Value::String(s.clone())]),
+        EvaluationResult::Quantity(value, unit, _, _) => {
             // Convert Quantity to JSON object
             let f: f64 = (*value).try_into().unwrap_or(0.0);
             Ok(vec![serde_json::json!({
@@ -625,17 +625,17 @@ mod tests {
 
         assert!(matches!(
             json_to_evaluation_result(&json!(true)).unwrap(),
-            EvaluationResult::Boolean(true, _)
+            EvaluationResult::Boolean(true, _, _)
         ));
 
         assert!(matches!(
             json_to_evaluation_result(&json!("test")).unwrap(),
-            EvaluationResult::String(s, _) if s == "test"
+            EvaluationResult::String(s, _, _) if s == "test"
         ));
 
         assert!(matches!(
             json_to_evaluation_result(&json!(42)).unwrap(),
-            EvaluationResult::Integer(42, _)
+            EvaluationResult::Integer(42, _, _)
         ));
 
         // Test array

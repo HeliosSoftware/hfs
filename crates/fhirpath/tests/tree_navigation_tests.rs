@@ -140,7 +140,7 @@ mod tests {
             EvaluationResult::Collection { items, .. } => {
                 // Check that resourceType is excluded
                 assert!(!items.iter().any(|item| {
-                    if let EvaluationResult::String(s, _) = item {
+                    if let EvaluationResult::String(s, _, _) = item {
                         s == "Patient"
                     } else {
                         false
@@ -153,7 +153,7 @@ mod tests {
 
                 // Check for specific expected values
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::String(s, _) = item {
+                    if let EvaluationResult::String(s, _, _) = item {
                         s == "123"
                     } else {
                         false
@@ -161,7 +161,7 @@ mod tests {
                 }));
 
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::Boolean(b_val, _) = item {
+                    if let EvaluationResult::Boolean(b_val, _, _) = item {
                         // Renamed to avoid confusion
                         *b_val // if b_val is &bool, dereference to get bool
                     } else {
@@ -230,7 +230,7 @@ mod tests {
 
                 // Check for specific expected values in the deep structure
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::String(s, _) = item {
+                    if let EvaluationResult::String(s, _, _) = item {
                         s == "official" // name.use value
                     } else {
                         false
@@ -238,7 +238,7 @@ mod tests {
                 }));
 
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::String(s, _) = item {
+                    if let EvaluationResult::String(s, _, _) = item {
                         s == "John" // One of the name.given values
                     } else {
                         false
@@ -246,7 +246,7 @@ mod tests {
                 }));
 
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::String(s, _) = item {
+                    if let EvaluationResult::String(s, _, _) = item {
                         s == "555-1234" // telecom[0].value
                     } else {
                         false
@@ -330,7 +330,7 @@ mod tests {
 
                 // Check that we get the id value
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::String(s, _) = item {
+                    if let EvaluationResult::String(s, _, _) = item {
                         s == "123" // id value
                     } else {
                         false

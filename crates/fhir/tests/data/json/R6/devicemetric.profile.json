@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "DeviceMetric",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-04-17T19:51:19.540+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,12 +27,12 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/DeviceMetric",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "DeviceMetric",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
-  "publisher": "HL7 International / Health Care Devices",
+  "date": "2026-04-17T19:51:19+00:00",
+  "publisher": "HL7 International / Devices",
   "contact": [
     {
       "telecom": [
@@ -63,7 +63,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "w5",
@@ -313,7 +313,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -568,7 +568,7 @@
           ],
           "strength": "required",
           "description": "Describes the status of the DeviceMetric.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/metric-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/metric-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -616,7 +616,7 @@
           ],
           "strength": "required",
           "description": "Describes the operational status of the DeviceMetric.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/metric-operational-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/metric-operational-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -885,7 +885,7 @@
         "binding": {
           "strength": "required",
           "description": "Describes the typical color of representation.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/color-codes|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/color-codes|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1219,7 +1219,7 @@
           ],
           "strength": "required",
           "description": "Describes the state of a metric calibration.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/metric-calibration-state|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/metric-calibration-state|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1342,7 +1342,7 @@
           ],
           "strength": "required",
           "description": "Describes the status of the DeviceMetric.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/metric-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/metric-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1376,7 +1376,7 @@
           ],
           "strength": "required",
           "description": "Describes the operational status of the DeviceMetric.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/metric-operational-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/metric-operational-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1575,7 +1575,7 @@
         "binding": {
           "strength": "required",
           "description": "Describes the typical color of representation.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/color-codes|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/color-codes|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1718,7 +1718,7 @@
           ],
           "strength": "required",
           "description": "Describes the state of a metric calibration.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/metric-calibration-state|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/metric-calibration-state|6.0.0-ballot4"
         },
         "mapping": [
           {

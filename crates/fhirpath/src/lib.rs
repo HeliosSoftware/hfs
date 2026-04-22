@@ -290,7 +290,7 @@ mod repeat_function;
 mod resource_type;
 mod set_operations;
 mod subset_functions;
-mod terminology_client;
+pub mod terminology_client;
 mod terminology_functions;
 mod trace_function;
 mod type_function;
@@ -309,6 +309,7 @@ pub mod evaluator;
 pub mod parser;
 
 // Public API exports - this is what users of the fhirpath crate should use
+use crate::parser::TypeSpecifier;
 pub use evaluator::EvaluationContext;
 pub use helios_fhirpath_support::EvaluationResult;
 
@@ -373,4 +374,126 @@ pub fn evaluate_expression(
             expression, e
         )
     })
+}
+
+// /// If `v` represents a FHIR primitive (either as a typed primitive result or as a typed Element object),
+// /// return a view of:
+// /// - its underlying primitive `value` (as EvaluationResult) if present
+// /// - whether it is a FHIR primitive and its FHIR primitive name if known
+// #[derive(Debug)]
+// struct FhirPrimitiveView<'a> {
+//     /// Underlying primitive value (System.* or already-evaluated primitive EvaluationResult)
+//     value: Option<&'a EvaluationResult>,
+//     /// True if this is *definitely* a FHIR primitive representation
+//     is_fhir_primitive: bool,
+//     /// Best-effort FHIR primitive name: "boolean", "string", "date", etc.
+//     fhir_name: Option<&'a str>,
+// }
+//
+// /// Try to interpret an EvaluationResult as a FHIR primitive (Option B compatible).
+// pub fn fhir_primitive_view<'a>(v: &'a EvaluationResult) -> FhirPrimitiveView<'a> {
+//     // Case A: value is already a typed FHIR primitive result (FHIR.boolean, FHIR.string, etc.)
+//     match v {
+//         EvaluationResult::Boolean(_, Some(ti)) if ti.namespace.eq_ignore_ascii_case("FHIR") => {
+//             return FhirPrimitiveView {
+//                 value: Some(v),
+//                 is_fhir_primitive: true,
+//                 fhir_name: Some(ti.name.as_str()), // e.g. "boolean"
+//             };
+//         }
+//         EvaluationResult::Integer(_, Some(ti)) if ti.namespace.eq_ignore_ascii_case("FHIR") => {
+//             return FhirPrimitiveView {
+//                 value: Some(v),
+//                 is_fhir_primitive: true,
+//                 fhir_name: Some(ti.name.as_str()),
+//             };
+//         }
+//         EvaluationResult::Decimal(_, Some(ti)) if ti.namespace.eq_ignore_ascii_case("FHIR") => {
+//             return FhirPrimitiveView {
+//                 value: Some(v),
+//                 is_fhir_primitive: true,
+//                 fhir_name: Some(ti.name.as_str()),
+//             };
+//         }
+//         EvaluationResult::String(_, Some(ti)) if ti.namespace.eq_ignore_ascii_case("FHIR") => {
+//             return FhirPrimitiveView {
+//                 value: Some(v),
+//                 is_fhir_primitive: true,
+//                 fhir_name: Some(ti.name.as_str()), // could be "string", "uri", etc
+//             };
+//         }
+//         EvaluationResult::DateTime(_, Some(ti)) if ti.namespace.eq_ignore_ascii_case("FHIR") => {
+//             return FhirPrimitiveView {
+//                 value: Some(v),
+//                 is_fhir_primitive: true,
+//                 fhir_name: Some(ti.name.as_str()), // "dateTime" / "instant"
+//             };
+//         }
+//         EvaluationResult::Date(_, Some(ti)) if ti.namespace.eq_ignore_ascii_case("FHIR") => {
+//             return FhirPrimitiveView {
+//                 value: Some(v),
+//                 is_fhir_primitive: true,
+//                 fhir_name: Some(ti.name.as_str()), // "date"
+//             };
+//         }
+//         EvaluationResult::Time(_, Some(ti)) if ti.namespace.eq_ignore_ascii_case("FHIR") => {
+//             return FhirPrimitiveView {
+//                 value: Some(v),
+//                 is_fhir_primitive: true,
+//                 fhir_name: Some(ti.name.as_str()), // "time"
+//             };
+//         }
+//         _ => {}
+//     }
+//
+//     // Case B: typed Element object that contains "value" (Option B wrapper)
+//     if let EvaluationResult::Object { map, type_info } = v {
+//         if let Some(ti) = type_info {
+//             if ti.namespace.eq_ignore_ascii_case("FHIR") && ti.name.eq_ignore_ascii_case("Element")
+//             {
+//                 // "value" can be missing if it's id/extension-only; still a FHIR primitive wrapper
+//                 let val = map.get("value");
+//                 // optional: support map.get("fhirType") if you store it
+//                 let fhir_name = map
+//                     .get("fhirType")
+//                     .and_then(|x| match x {
+//                         EvaluationResult::String(s, _) => Some(s.as_str()),
+//                         _ => None,
+//                     });
+//
+//                 return FhirPrimitiveView {
+//                     value: val,
+//                     is_fhir_primitive: true,
+//                     fhir_name,
+//                 };
+//             }
+//         }
+//     }
+//
+//     // Default: not recognized as a FHIR primitive wrapper
+//     FhirPrimitiveView {
+//         value: None,
+//         is_fhir_primitive: false,
+//         fhir_name: None,
+//     }
+// }
+//
+// pub fn primitive_system_value<'a>(v: &'a EvaluationResult) -> &'a EvaluationResult {
+//     let view = fhir_primitive_view(v);
+//     // If it's the object-wrapper (FHIR.Element), return the inner value when present.
+//     if view.is_fhir_primitive {
+//         if let Some(inner) = view.value {
+//             return inner;
+//         }
+//     }
+//     v
+// }
+
+pub fn type_spec_is_system(type_spec: &TypeSpecifier) -> bool {
+    matches!(type_spec,
+        TypeSpecifier::QualifiedIdentifier(ns, Some(_)) if ns.eq_ignore_ascii_case("System")
+    ) || matches!(type_spec,
+        TypeSpecifier::QualifiedIdentifier(t, None)
+            if matches!(t.as_str(), "Boolean"|"String"|"Integer"|"Decimal"|"Date"|"DateTime"|"Time"|"Quantity")
+    )
 }

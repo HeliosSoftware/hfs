@@ -5,7 +5,7 @@
 //! namespace and type name.
 
 /// Type information result for FHIRPath type() function
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct TypeInfoResult {
     pub namespace: String,
     pub name: String,

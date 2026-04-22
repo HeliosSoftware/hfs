@@ -1,0 +1,31 @@
+{
+  "resourceType": "Patient",
+  "id": "patient-nested-contained",
+  "text": {
+    "status": "generated",
+    "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Patient with illegally nested contained resource</div>"
+  },
+  "contained": [
+    {
+      "resourceType": "Organization",
+      "id": "Org1",
+      "text": {
+        "status": "generated",
+        "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Contained Organization 1</div>"
+      },
+      "meta": {
+        "lastUpdated": "2021-01-01T00:00:00Z"
+      }
+    }
+  ],
+  "name": [
+    {
+      "use": "official",
+      "family": "Nested",
+      "given": ["Contained"]
+    }
+  ],
+  "managingOrganization": {
+    "reference": "#Org1"
+  }
+}

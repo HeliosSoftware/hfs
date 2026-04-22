@@ -35,7 +35,7 @@ pub fn extension_function(
 
     // Check that the argument is a string
     let extension_url = match &args[0] {
-        EvaluationResult::String(url, _) => url,
+        EvaluationResult::String(url, _, _) => url,
         EvaluationResult::Empty => {
             // extension({}) -> {}
             return Ok(EvaluationResult::Empty);
@@ -53,7 +53,7 @@ pub fn extension_function(
     }
 
     // Special handling for string bases (e.g., dates)
-    if let EvaluationResult::String(s, _) = invocation_base {
+    if let EvaluationResult::String(s, _, _) = invocation_base {
         // Hard-coded special case for extension tests
         if s == "1974-12-25"
             && extension_url == "http://hl7.org/fhir/StructureDefinition/patient-birthTime"
@@ -137,7 +137,7 @@ fn find_extension_by_url(
         } = ext
         {
             // Check if this extension has the requested URL
-            if let Some(EvaluationResult::String(ext_url, _)) = ext_obj.get("url") {
+            if let Some(EvaluationResult::String(ext_url, _, _)) = ext_obj.get("url") {
                 if ext_url == url {
                     matching_extensions.push(ext.clone());
                 }

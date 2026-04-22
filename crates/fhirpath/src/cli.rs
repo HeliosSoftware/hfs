@@ -434,15 +434,15 @@ fn result_to_json(result: &EvaluationResult) -> FhirPathResult<String> {
 fn evaluation_result_to_json_value(result: &EvaluationResult) -> Value {
     match result {
         EvaluationResult::Empty => Value::Null,
-        EvaluationResult::Boolean(b, _) => json!(b),
-        EvaluationResult::String(s, _) => json!(s),
-        EvaluationResult::Integer(i, _) => json!(i),
-        EvaluationResult::Integer64(i, _) => json!(i),
-        EvaluationResult::Decimal(d, _) => json!(d),
-        EvaluationResult::Date(s, _) => json!(s),
-        EvaluationResult::DateTime(s, _) => json!(s),
-        EvaluationResult::Time(s, _) => json!(s),
-        EvaluationResult::Quantity(value, unit, _) => {
+        EvaluationResult::Boolean(b, _, _) => json!(b),
+        EvaluationResult::String(s, _, _) => json!(s),
+        EvaluationResult::Integer(i, _, _) => json!(i),
+        EvaluationResult::Integer64(i, _, _) => json!(i),
+        EvaluationResult::Decimal(d, _, _) => json!(d),
+        EvaluationResult::Date(s, _, _) => json!(s),
+        EvaluationResult::DateTime(s, _, _) => json!(s),
+        EvaluationResult::Time(s, _, _) => json!(s),
+        EvaluationResult::Quantity(value, unit, _, _) => {
             crate::json_utils::quantity_to_json(value, unit)
         }
         EvaluationResult::Collection { items, .. } => {
@@ -645,22 +645,22 @@ mod tests {
 
         // Test boolean
         let result = json_value_to_result(&json!(true)).unwrap();
-        assert!(matches!(result, EvaluationResult::Boolean(true, _)));
+        assert!(matches!(result, EvaluationResult::Boolean(true, _, _)));
 
         // Test integer
         let result = json_value_to_result(&json!(42)).unwrap();
-        assert!(matches!(result, EvaluationResult::Integer(42, _)));
+        assert!(matches!(result, EvaluationResult::Integer(42, _, _)));
 
         // Test string
         let result = json_value_to_result(&json!("hello")).unwrap();
         match result {
-            EvaluationResult::String(s, _) => assert_eq!(s, "hello"),
+            EvaluationResult::String(s, _, _) => assert_eq!(s, "hello"),
             _ => panic!("Expected string result"),
         }
 
         // Test array/object (converted to string)
         let result = json_value_to_result(&json!([1, 2, 3])).unwrap();
-        assert!(matches!(result, EvaluationResult::String(_, _)));
+        assert!(matches!(result, EvaluationResult::String(_, _, _)));
     }
 
     #[test]

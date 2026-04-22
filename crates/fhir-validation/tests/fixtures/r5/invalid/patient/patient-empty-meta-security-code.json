@@ -1,0 +1,8 @@
+{
+  "resourceType": "Patient",
+  "meta": {
+    "security": [
+      { "code": "" }
+    ]
+  }
+}

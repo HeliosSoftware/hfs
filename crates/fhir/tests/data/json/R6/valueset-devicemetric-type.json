@@ -2,11 +2,11 @@
   "resourceType": "ValueSet",
   "id": "devicemetric-type",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-04-17T19:51:19.540+00:00"
   },
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet devicemetric-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"devicemetric-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdevicemetric-type\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude all codes defined in \u003ccode\u003eurn:iso:std:iso:11073:10101\u003c/code\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet devicemetric-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"devicemetric-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdevicemetric-type\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude all codes defined in \u003ca href\u003d\"http://tx.fhir.org/r5\"\u003e\u003ccode\u003eurn:iso:std:iso:11073:10101\u003c/code\u003e\u003c/a\u003e\u003cspan style\u003d\"opacity: 0.5\" title\u003d\"Version is not explicitly stated. When building this specification, the most recent version 2024-12-05 has been used\"\u003e version ⏿2024-12-05\u003c/span\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -34,7 +34,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.3.895"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "DeviceMetricAndComponentTypes",
   "title": "Device Metric and Component Types",
   "status": "active",

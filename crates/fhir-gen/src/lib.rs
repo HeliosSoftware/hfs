@@ -32,12 +32,16 @@
 //! ```
 
 pub mod initial_fhir_model;
+// New
+pub mod directory_output_helpers;
 
+use crate::directory_output_helpers::{module_file_stem, write_mod_index};
 use crate::initial_fhir_model::{Bundle, CompartmentDefinition, Resource};
 use helios_fhir::FhirVersion;
 use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
 use serde_json::Result;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::{self, Write};
@@ -316,15 +320,52 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let version_dir = resources_dir.join(version.as_str());
     // Create output directory if it doesn't exist
+    // std::fs::create_dir_all(output_path.as_ref())?;
+
+    // New Code : Create output directory structure:
+    //   <output>/<version>/
+    //     mod.rs
+    //     primitives/
+    //     complex_types/
+    //     resources/
     std::fs::create_dir_all(output_path.as_ref())?;
 
-    let version_path = output_path
-        .as_ref()
-        .join(format!("{}.rs", version.as_str().to_lowercase()));
+    let version_mod_name = version.as_str().to_lowercase();
+    let version_out_dir = output_path.as_ref().join(&version_mod_name);
+    let primitives_dir = version_out_dir.join("primitives");
+    let complex_dir = version_out_dir.join("complex_types");
+    let resources_out_dir = version_out_dir.join("resources");
 
+    std::fs::create_dir_all(&primitives_dir)?;
+    std::fs::create_dir_all(&complex_dir)?;
+    std::fs::create_dir_all(&resources_out_dir)?;
+    // let version_path = output_path
+    //     .as_ref()
+    //     .join(format!("{}.rs", version.as_str().to_lowercase()));
+    // Root module file (acts like the old single huge <version>.rs)
+    let version_mod_rs = version_out_dir.join("mod.rs");
+
+    // Write header into the root module file
+    std::fs::write(&version_mod_rs, generate_version_header(version))?;
     // Create the version-specific output file with comprehensive header
-    std::fs::write(&version_path, generate_version_header(version))?;
+    // std::fs::write(&version_path, generate_version_header(version))?;
 
+    // New Code : Add submodule declarations; their own mod.rs will be generated later.
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&version_mod_rs)?;
+        writeln!(file, "pub mod primitives;")?;
+        writeln!(file, "pub mod complex_types;")?;
+        writeln!(file, "pub mod resources;")?;
+        writeln!(file, "pub mod terminology;")?;
+        writeln!(file)?;
+        writeln!(file, "pub use primitives::*;")?;
+        writeln!(file, "pub use complex_types::*;")?;
+        writeln!(file, "pub use resources::*;")?;
+        writeln!(file)?;
+    }
     // Collect all type hierarchy information across all bundles
     let mut global_type_hierarchy = std::collections::HashMap::new();
     let mut all_resources = Vec::new();
@@ -379,14 +420,14 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     let cycles = detect_struct_cycles(&all_elements);
 
     // Generate code for each StructureDefinition in sorted order
-    for def in all_struct_defs {
-        let content = structure_definition_to_rust(def, &cycles);
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&version_path)?;
-        write!(file, "{}", content)?;
-    }
+    // for def in all_struct_defs {
+    //     let content = structure_definition_to_rust(def, &cycles);
+    //     let mut file = std::fs::OpenOptions::new()
+    //         .create(true)
+    //         .append(true)
+    //         .open(&version_path)?;
+    //     write!(file, "{}", content)?;
+    // }
 
     // Sort for deterministic output
     all_resources.sort();
@@ -394,12 +435,60 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     all_complex_types.sort();
     all_complex_types.dedup();
 
+    let resources_set: HashSet<&str> = all_resources.iter().map(|s| s.as_str()).collect();
+    let complex_set: HashSet<&str> = all_complex_types.iter().map(|s| s.as_str()).collect();
+
+    // Keep track of which modules we generated under each directory to emit mod.rs indexes
+    let mut primitive_modules: Vec<String> = Vec::new();
+    let mut complex_modules: Vec<String> = Vec::new();
+    let mut resource_modules: Vec<String> = Vec::new();
+
+    // New Code : Generate code for each StructureDefinition into its own file
+    for def in all_struct_defs {
+        let type_name = def.name.as_str();
+
+        // Heuristic classification:
+        // - If it appears in extracted resources list => resource
+        // - Else if it appears in extracted complex types list => complex
+        // - Else => primitive (covers primitive-type and any leftover special cases)
+        let (target_dir, module_list) = if resources_set.contains(type_name) {
+            (&resources_out_dir, &mut resource_modules)
+        } else if complex_set.contains(type_name) {
+            (&complex_dir, &mut complex_modules)
+        } else {
+            (&primitives_dir, &mut primitive_modules)
+        };
+        let mod_stem = module_file_stem(type_name);
+        let out_file_path = target_dir.join(format!("{mod_stem}.rs"));
+
+        // Generate the Rust code body
+        let content = structure_definition_to_rust(def, &cycles);
+
+        // Prelude so each file can resolve references similarly to the monolithic module.
+        // This relies on `rX/mod.rs` re-exporting primitives/complex/resources.
+        let mut file = std::fs::File::create(&out_file_path)?;
+        writeln!(
+            file,
+            "// AUTO-GENERATED by atrius-fhir-generator ({} {})",
+            version.as_str(),
+            type_name
+        )?;
+        writeln!(file, "use crate::{}::*;", version_mod_name)?;
+        writeln!(file)?;
+        write!(file, "{}", content)?;
+
+        module_list.push(mod_stem);
+    }
+    // Write directory index mod.rs files
+    write_mod_index(&primitives_dir.join("mod.rs"), &primitive_modules)?;
+    write_mod_index(&complex_dir.join("mod.rs"), &complex_modules)?;
+    write_mod_index(&resources_out_dir.join("mod.rs"), &resource_modules)?;
     // Load compartment definitions for this version
     let compartment_definitions = load_compartment_definitions(&version_dir);
 
     // Generate global constructs once at the end
     generate_global_constructs(
-        &version_path,
+        &version_mod_rs,
         &global_type_hierarchy,
         &all_resources,
         &all_complex_types,
@@ -1120,7 +1209,7 @@ fn generate_type_hierarchy_module(
 /// assert_eq!(make_rust_safe("type"), "r#type");
 /// assert_eq!(make_rust_safe("abstract"), "r#abstract");
 /// ```
-fn make_rust_safe(input: &str) -> String {
+pub fn make_rust_safe(input: &str) -> String {
     let snake_case = input
         .chars()
         .enumerate()
@@ -2072,7 +2161,7 @@ fn generate_element_documentation(element: &ElementDefinition) -> String {
 /// - **Resources**: Generates structs that can be included in the Resource enum
 fn structure_definition_to_rust(
     sd: &StructureDefinition,
-    cycles: &std::collections::HashSet<(String, String)>,
+    cycles: &HashSet<(String, String)>,
 ) -> String {
     let mut output = String::new();
 
@@ -2868,8 +2957,8 @@ mod tests {
         // Test processing R4 version
         assert!(process_fhir_version(Some(FhirVersion::R4), &temp_dir).is_ok());
 
-        // Verify files were created
-        assert!(temp_dir.join("r4.rs").exists());
+        // New Code r4.rs to this Verify files were created
+        assert!(temp_dir.join("r4/mod.rs").exists());
 
         // Clean up
         std::fs::remove_dir_all(&temp_dir).expect("Failed to clean up temp directory");

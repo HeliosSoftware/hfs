@@ -110,12 +110,12 @@ fn test_basic_fhirpath_expressions() {
 
     // Test some basic expressions
     let test_cases = vec![
-        ("true", EvaluationResult::Boolean(true, None)),
-        ("false", EvaluationResult::Boolean(false, None)),
+        ("true", EvaluationResult::Boolean(true, None, None)),
+        ("false", EvaluationResult::Boolean(false, None, None)),
         ("1", EvaluationResult::integer(1)),
         (
             "'hello'",
-            EvaluationResult::String("hello".to_string(), None),
+            EvaluationResult::String("hello".to_string(), None, None),
         ),
         ("1 + 1", EvaluationResult::integer(2)),
         ("1 - 1", EvaluationResult::integer(0)),
@@ -123,20 +123,38 @@ fn test_basic_fhirpath_expressions() {
         ("10 / 2", EvaluationResult::decimal(Decimal::from(5))),
         ("10 div 3", EvaluationResult::integer(3)),
         ("10 mod 3", EvaluationResult::integer(1)),
-        ("true and true", EvaluationResult::Boolean(true, None)),
-        ("true and false", EvaluationResult::Boolean(false, None)),
-        ("true or false", EvaluationResult::Boolean(true, None)),
-        ("false or false", EvaluationResult::Boolean(false, None)),
-        ("true xor false", EvaluationResult::Boolean(true, None)),
-        ("true xor true", EvaluationResult::Boolean(false, None)),
-        ("1 < 2", EvaluationResult::Boolean(true, None)),
-        ("1 <= 1", EvaluationResult::Boolean(true, None)),
-        ("1 > 2", EvaluationResult::Boolean(false, None)),
-        ("2 >= 2", EvaluationResult::Boolean(true, None)),
-        ("1 = 1", EvaluationResult::Boolean(true, None)),
-        ("1 != 2", EvaluationResult::Boolean(true, None)),
-        ("'hello' = 'hello'", EvaluationResult::Boolean(true, None)),
-        ("'hello' != 'world'", EvaluationResult::Boolean(true, None)),
+        ("true and true", EvaluationResult::Boolean(true, None, None)),
+        (
+            "true and false",
+            EvaluationResult::Boolean(false, None, None),
+        ),
+        ("true or false", EvaluationResult::Boolean(true, None, None)),
+        (
+            "false or false",
+            EvaluationResult::Boolean(false, None, None),
+        ),
+        (
+            "true xor false",
+            EvaluationResult::Boolean(true, None, None),
+        ),
+        (
+            "true xor true",
+            EvaluationResult::Boolean(false, None, None),
+        ),
+        ("1 < 2", EvaluationResult::Boolean(true, None, None)),
+        ("1 <= 1", EvaluationResult::Boolean(true, None, None)),
+        ("1 > 2", EvaluationResult::Boolean(false, None, None)),
+        ("2 >= 2", EvaluationResult::Boolean(true, None, None)),
+        ("1 = 1", EvaluationResult::Boolean(true, None, None)),
+        ("1 != 2", EvaluationResult::Boolean(true, None, None)),
+        (
+            "'hello' = 'hello'",
+            EvaluationResult::Boolean(true, None, None),
+        ),
+        (
+            "'hello' != 'world'",
+            EvaluationResult::Boolean(true, None, None),
+        ),
     ];
 
     let mut passed = 0;
@@ -199,14 +217,17 @@ fn test_real_fhir_patient_type() {
     // Test active.type().namespace - should be FHIR
     let result = evaluate_expression("active.type().namespace", &context).unwrap();
     println!("Real active.type().namespace: {:?}", result);
-    assert_eq!(result, EvaluationResult::String("FHIR".to_string(), None));
+    assert_eq!(
+        result,
+        EvaluationResult::String("FHIR".to_string(), None, None)
+    );
 
     // Test active.type().name - should be boolean
     let result = evaluate_expression("active.type().name", &context).unwrap();
     println!("Real active.type().name: {:?}", result);
     assert_eq!(
         result,
-        EvaluationResult::String("boolean".to_string(), None)
+        EvaluationResult::String("boolean".to_string(), None, None),
     );
 }
 
@@ -231,7 +252,7 @@ fn test_patient_active_type() {
     let mut patient = HashMap::new();
     patient.insert(
         "resourceType".to_string(),
-        EvaluationResult::String("Patient".to_string(), None),
+        EvaluationResult::String("Patient".to_string(), None, None),
     );
     patient.insert("active".to_string(), EvaluationResult::fhir_boolean(true));
 

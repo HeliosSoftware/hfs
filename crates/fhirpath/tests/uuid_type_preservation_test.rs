@@ -39,7 +39,7 @@ fn test_uuid_type_preserved_in_evaluation() {
     println!("Result: {:?}", result);
 
     // Verify it has the correct type information
-    if let helios_fhirpath_support::EvaluationResult::String(value, type_info) = result {
+    if let helios_fhirpath_support::EvaluationResult::String(value, type_info, _) = result {
         assert_eq!(value, "550e8400-e29b-41d4-a716-446655440000");
 
         // Check that type info is preserved

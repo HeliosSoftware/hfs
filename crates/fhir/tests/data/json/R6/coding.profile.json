@@ -24,11 +24,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Coding",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "Coding",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-04-17T19:51:19+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -61,7 +61,7 @@
     }
   ],
   "purpose": "References to codes are very common in healthcare models.",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "v2",

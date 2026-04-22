@@ -1,0 +1,65 @@
+{
+  "resourceType": "StructureDefinition",
+  "id": "atrius-patient",
+  "url": "http://atrius.health/fhir/StructureDefinition/atrius-patient",
+  "version": "0.1.0",
+  "name": "AtriusPatient",
+  "title": "Atrius Patient Profile",
+  "status": "draft",
+  "date": "2026-01-01",
+  "publisher": "Atrius Health",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Patient",
+  "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+  "derivation": "constraint",
+
+  "differential": {
+    "element": [
+
+      {
+        "id": "Patient",
+        "path": "Patient",
+        "constraint": [
+          {
+            "key": "atrius-pat-1",
+            "severity": "error",
+            "human": "If patient is active, at least one name must be present",
+            "expression": "active = true implies name.exists()"
+          }
+        ]
+      },
+
+      {
+        "id": "Patient.identifier",
+        "path": "Patient.identifier",
+        "min": 1,
+        "constraint": [
+          {
+            "key": "atrius-pat-ident-1",
+            "severity": "error",
+            "human": "Each identifier must have a value",
+            "expression": "value.exists()"
+          }
+        ]
+      },
+
+      {
+        "id": "Patient.gender",
+        "path": "Patient.gender",
+        "min": 1,
+        "binding": {
+          "strength": "required",
+          "valueSet": "http://hl7.org/fhir/ValueSet/administrative-gender"
+        }
+      },
+
+      {
+        "id": "Patient.birthDate",
+        "path": "Patient.birthDate",
+        "min": 1
+      }
+
+    ]
+  }
+}

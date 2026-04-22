@@ -1,0 +1,80 @@
+{
+  "resourceType": "Observation",
+  "id": "obs1",
+  "text": {
+    "status": "generated",
+    "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">This is a simple <b>example</b></div>"
+  },
+  "contained": [
+    {
+      "resourceType": "Provenance",
+      "target": [
+        {
+          "reference": "#"
+        }
+      ]
+    }
+  ],
+  "code": {
+    "coding": [
+      {
+        "system": "http://loinc.org",
+        "code": "1-8",
+        "display": "something8"
+      }
+    ],
+    "_text": {
+      "extension": [
+        {
+          "url": "http://something11",
+          "valueString": "something12"
+        }
+      ]
+    }
+  },
+  "valueQuantity": {
+    "value": 1,
+    "system": "http://something9",
+    "code": "something10"
+  },
+  "dataAbsentReason": {
+    "coding": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/data-absent-reason",
+        "code": "temp-unknown",
+        "display": "something8"
+      }
+    ]
+  },
+  "category": [
+    {
+      "coding": [
+        {
+          "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+          "code": "imaging",
+          "display": "something8"
+        }
+      ]
+    }
+  ],
+  "bodySite": {
+    "coding": [
+      {
+        "system": "http://snomed.info/sct",
+        "code": "247005",
+        "display": "something8"
+      }
+    ]
+  },
+  "status": "corrected",
+  "effectiveDateTime": "2021-01-01",
+  "issued": "2021-01-01T00:00:00Z",
+  "performer": [
+    {
+      "reference": "Practitioner/123"
+    }
+  ],
+  "subject": {
+    "reference": "Patient/123"
+  }
+}
