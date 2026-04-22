@@ -520,19 +520,19 @@ fn compute_expansion(
         if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc)? {
             included.extend(filter_result);
         } else if let Some(explicit_codes) = inc["concept"].as_array() {
-            // Explicit code list: fetch display for each listed code.
+            // Explicit code list: batch-fetch displays for all listed codes.
+            // Using prepare_cached avoids re-compiling the same SQL for each code.
+            let mut stmt = conn
+                .prepare_cached("SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2")
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
             for entry in explicit_codes {
                 let code = match entry["code"].as_str() {
                     Some(c) => c.to_owned(),
                     None => continue,
                 };
 
-                let display: Option<String> = conn
-                    .query_row(
-                        "SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2",
-                        rusqlite::params![system_id, code],
-                        |row| row.get(0),
-                    )
+                let display: Option<String> = stmt
+                    .query_row(rusqlite::params![system_id, code], |row| row.get(0))
                     .optional()
                     .map_err(|e| HtsError::StorageError(e.to_string()))?
                     .flatten();
@@ -992,19 +992,27 @@ fn build_subtree(
 ///
 /// Any existing entries for `vs_id` are deleted first so re-computation
 /// (e.g. after a ValueSet update) always produces a clean cache.
+/// All inserts are wrapped in a single transaction for performance — without
+/// an explicit transaction, SQLite auto-commits each row individually, which
+/// for large ValueSets (e.g. 6000+ VSAC concepts) can easily exceed the
+/// 30-second request timeout.
 fn populate_cache(
     conn: &Connection,
     vs_id: &str,
     codes: &[ExpansionContains],
 ) -> Result<(), HtsError> {
-    conn.execute(
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    tx.execute(
         "DELETE FROM value_set_expansions WHERE value_set_id = ?1",
         [vs_id],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     for item in codes {
-        conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO value_set_expansions
              (value_set_id, system_url, code, display)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1013,7 +1021,8 @@ fn populate_cache(
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
     }
 
-    Ok(())
+    tx.commit()
+        .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
 /// Build a [`ValidateCodeResponse`] from an optional matching concept.
@@ -2508,6 +2517,85 @@ mod tests {
 
         assert_eq!(resp.total, Some(1));
         assert_eq!(resp.contains[0].code, "X");
+    }
+
+    // ── Inline ValueSet expand (EX02-style) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn expand_inline_valueset_with_descendent_of_filter() {
+        // Reproduces the EX02 benchmark pattern: POST /ValueSet/$expand with
+        // an inline ValueSet resource containing a "descendent-of" filter.
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_with_hierarchy().as_bytes())
+            .await
+            .unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-hier",
+                    "filter": [{ "property": "concept", "op": "descendent-of", "value": "root" }]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // descendent-of "root" = strict descendants (child1, child2) but NOT root itself.
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(
+            codes.contains(&"child1"),
+            "child1 should be a descendant of root"
+        );
+        assert!(
+            codes.contains(&"child2"),
+            "child2 should be a descendant of root"
+        );
+        assert!(
+            !codes.contains(&"root"),
+            "root itself must not appear (strict descendants)"
+        );
+        assert!(
+            !codes.contains(&"orphan"),
+            "orphan is not a descendant of root"
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_inline_valueset_unknown_system_returns_not_found() {
+        let b = backend();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{ "system": "http://unknown.system/cs" }]
+            }
+        });
+
+        let err = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, HtsError::NotFound(_)));
     }
 
     #[tokio::test]
