@@ -306,7 +306,10 @@ where
             .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
             .unwrap_or(false);
         if subscriptions_enabled {
-            let sub_config = helios_subscriptions::SubscriptionConfig::default();
+            let sub_config = helios_subscriptions::SubscriptionConfig {
+                supported_channel_types: vec!["rest-hook".to_string(), "websocket".to_string()],
+                ..Default::default()
+            };
             let engine =
                 helios_subscriptions::SubscriptionEngine::new(sub_config, config.base_url.clone());
             info!("Subscriptions engine ENABLED");

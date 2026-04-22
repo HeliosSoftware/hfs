@@ -79,7 +79,7 @@ pub fn not_function(
         FhirVersion::R4 => true,
         #[cfg(feature = "R4B")]
         FhirVersion::R4B => true,
-        #[cfg(any(feature = "R5", feature = "R6"))]
+        #[allow(unreachable_patterns)]
         _ => false,
     };
     let base_as_logic_bool = invocation_base.to_boolean_for_logic_with_r4_compat(r4_compat)?;

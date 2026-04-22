@@ -1813,6 +1813,25 @@ impl FhirVersion {
         })
     }
 
+    /// Returns the notification Bundle.type value used for FHIR Subscription
+    /// notifications in this version.
+    ///
+    /// R4 and R4B follow the R4 backport IG and emit `history` Bundles; R5 and
+    /// R6 emit native `subscription-notification` Bundles per the
+    /// [Subscription specification](https://build.fhir.org/subscription.html).
+    pub fn notification_bundle_type(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "R4")]
+            FhirVersion::R4 => "history",
+            #[cfg(feature = "R4B")]
+            FhirVersion::R4B => "history",
+            #[cfg(feature = "R5")]
+            FhirVersion::R5 => "subscription-notification",
+            #[cfg(feature = "R6")]
+            FhirVersion::R6 => "subscription-notification",
+        }
+    }
+
     /// Returns all enabled FHIR versions.
     ///
     /// This is useful for listing supported versions (e.g., in `$versions` operation).

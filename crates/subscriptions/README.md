@@ -2,7 +2,7 @@
 
 FHIR topic-based Subscriptions engine for the Helios FHIR Server, implementing the [FHIR Subscriptions Framework](https://build.fhir.org/subscriptions.html) across R4, R4B, R5, and R6.
 
-R4 and R4B use the [Subscriptions R5 Backport IG](https://build.fhir.org/ig/HL7/fhir-subscription-backport-ig/); R5 and R6 use the native Subscriptions Framework.
+R4 uses the [Subscriptions R5 Backport IG](https://build.fhir.org/ig/HL7/fhir-subscription-backport-ig/). R4B, R5, and R6 use native subscription resources.
 
 ## Overview
 
@@ -11,26 +11,28 @@ This crate implements topic-based subscriptions as an asynchronous pipeline that
 1. **Topic Registry** — stores `SubscriptionTopic` definitions and evaluates resource triggers
 2. **Subscription Manager** — tracks active `Subscription` resources and their runtime state
 3. **Event Evaluator** — matches write events against active subscriptions using topic triggers and filter criteria
-4. **Notification Builder** — constructs version-specific notification bundles (R4 Parameters-based backport, R5/R6 native `SubscriptionStatus`)
+4. **Notification Builder** — constructs version-specific notification bundles (R4 Parameters-based backport, R4B/R5/R6 native `SubscriptionStatus`)
 5. **Channel Dispatcher** — delivers notifications via pluggable channel implementations
 
 The `SubscriptionEngine` orchestrates all five concerns and is the main entry point, invoked via `tokio::spawn` after each resource create, update, patch, or delete — mirroring the fire-and-forget pattern used by the audit middleware.
 
 ## Features
 
-- **Version-aware parsing**: R4 reads the backport extension set (`backport-topic-canonical`, `backport-payload-content`, `backport-channel-type`, `backport-filter-criteria`); R5/R6 read native `topic`, `channelType`, `filterBy` fields
+- **Version-aware parsing**: R4 reads the backport extension set (`backport-topic-canonical`, `backport-payload-content`, `backport-channel-type`, `backport-filter-criteria`); R4B/R5/R6 read native `topic`, `channelType`, `filterBy` fields
+- **Topic lifecycle parity**: topic create/update/delete now updates the in-memory registry for both native `SubscriptionTopic` and R4 backport `Basic` topic resources
 - **Status state machine**: `Requested → Active → Error → Off` with validated transitions; subscriptions activate only after a successful handshake
 - **Exponential backoff retry**: configurable initial delay, max delay, backoff factor, and max attempts before transitioning to `error` or `off`
 - **Tenant isolation**: all in-memory maps are keyed by `(tenant_id, subscription_id)` — subscriptions in different tenants never interact
 - **TLS enforcement**: `full-resource` payload subscriptions over non-HTTPS endpoints are rejected at dispatch time
-- **Pluggable channels**: `ChannelDispatcher` trait allows new channel types (WebSocket, email, FHIR messaging) to be added without touching the engine
+- **WebSocket channel**: server-managed connection registry with short-lived binding tokens; clients connect to `/ws/subscriptions/bind`, then send `bind-with-token <token>` after calling `$get-ws-binding-token`
+- **Pluggable channels**: `ChannelDispatcher` trait allows new channel types (email, FHIR messaging) to be added without touching the engine
 
 ## Channel Support
 
 | Channel | Status | Notes |
 |---------|--------|-------|
 | `rest-hook` | Implemented | HTTP POST with custom headers, TLS enforcement for full-resource payloads |
-| `websocket` | Planned (Phase 2) | Binding token flow, per-subscription client registry |
+| `websocket` | Implemented | Binding token flow, per-subscription client registry, unidirectional server→client streaming |
 | `email` | Planned (Phase 3) | SMTP via `lettre` |
 | `fhir-messaging` | Planned (Phase 4) | Notification wrapped in a FHIR message Bundle |
 
@@ -43,7 +45,9 @@ ResourceEvent
 SubscriptionEngine.on_resource_event()
      │
      ├─ resource_type == "Subscription"   → SubscriptionManager.register() / deregister()
-     ├─ resource_type == "SubscriptionTopic" → InMemoryTopicRegistry.add_topic()
+     ├─ resource_type == "SubscriptionTopic" → add/update/remove topic in InMemoryTopicRegistry
+     ├─ resource_type == "Basic" && fhir_version == "R4"
+     │    → parse as R4 backport topic candidate; add/remove topic when valid
      │
      └─ otherwise:
            │
@@ -57,6 +61,7 @@ SubscriptionEngine.on_resource_event()
            ▼
        ChannelDispatcher.dispatch()
            │  rest-hook: HTTP POST with retry
+           │  websocket: broadcast to connected clients (best-effort)
            ▼
        handle_delivery_failure() on exhaustion
            │  consecutive_failures >= error_threshold → Error
@@ -96,24 +101,26 @@ SubscriptionEngine.on_resource_event()
 }
 ```
 
-### R5/R6 (Native)
+### R4B/R5/R6 (Native)
+
+`Bundle.type` is `history` for R4B and `subscription-notification` for R5/R6.
 
 ```json
 {
   "resourceType": "Bundle",
-  "type": "subscription-notification",
+  "type": "<history|subscription-notification>",
   "entry": [
     {
       "resource": {
         "resourceType": "SubscriptionStatus",
         "status": "active",
         "type": "event-notification",
-        "eventsSinceSubscriptionStart": "3",
+        "eventsSinceSubscriptionStart": 3,
         "subscription": { "reference": "Subscription/sub-1" },
         "topic": "http://example.org/topic/encounter-start",
         "notificationEvent": [
           {
-            "eventNumber": "3",
+            "eventNumber": 3,
             "timestamp": "2026-04-09T12:00:00Z",
             "focus": { "reference": "Encounter/enc-99" }
           }
@@ -126,7 +133,7 @@ SubscriptionEngine.on_resource_event()
 
 ## Filter Matching
 
-Filters use the R4 backport string format `ResourceType?parameter=value` (parsed by `parse_filter_string`) or the native R5 `filterBy` array. The evaluator supports:
+Filters use the R4 backport string format `ResourceType?parameter=value` (parsed by `parse_filter_string`) or the native R4B/R5/R6 `filterBy` array. The evaluator supports:
 
 | Filter parameter | Resolved from |
 |-----------------|---------------|
@@ -136,7 +143,7 @@ Filters use the R4 backport string format `ResourceType?parameter=value` (parsed
 | `identifier` | `identifier[].value` |
 | *(other)* | Direct JSON field lookup by name |
 
-Comparators supported: `eq` (default), `in`. FHIRPath evaluation is not used in Phase 1 — filters operate on the raw resource JSON.
+Comparators supported: `eq` (default), `in`. Native `filterBy.comparator` values are mapped into the internal filter form. FHIRPath evaluation is not used in Phase 2 — filters currently operate on the raw resource JSON.
 
 ## Configuration
 
@@ -151,6 +158,7 @@ Comparators supported: `eq` (default), `in`. FHIRPath evaluation is not used in 
 | `HFS_SUBSCRIPTION_HEARTBEAT_INTERVAL` | `30s` | How often to check for due heartbeats |
 | `HFS_SUBSCRIPTION_ERROR_THRESHOLD` | `3` | Consecutive failures before `error` status |
 | `HFS_SUBSCRIPTION_OFF_THRESHOLD` | `10` | Consecutive failures before `off` status |
+| `ws_token_lifetime_secs` *(config field)* | `30` | Binding token expiry in seconds (WebSocket only) |
 
 ## Enabling in HFS
 
@@ -163,6 +171,17 @@ cargo build --bin hfs --features subscriptions
 # Enable at runtime
 HFS_SUBSCRIPTIONS_ENABLED=true cargo run --bin hfs --features subscriptions
 ```
+
+For version-specific validation, use explicit feature selection:
+
+```bash
+cargo check -p helios-subscriptions --no-default-features --features R4
+cargo check -p helios-subscriptions --no-default-features --features R4B
+cargo check -p helios-subscriptions --no-default-features --features R5
+cargo check -p helios-subscriptions --no-default-features --features R6
+```
+
+External smoke script supports version selection through `FHIR_VERSION` (`R4`, `R4B`, `R5`, `R6`).
 
 When enabled, the engine auto-initializes with default configuration and begins processing events after the first resource write.
 
@@ -181,7 +200,9 @@ The spawned task calls `engine.on_resource_event(event).await`, which runs the f
 
 ### Registering a Topic
 
-POST a `SubscriptionTopic` resource (R5/R6) or a `Basic` resource with the backport profile (R4) to your HFS instance. The engine picks it up automatically on the next write:
+POST a `SubscriptionTopic` resource (R4B/R5/R6) or a `Basic` resource with the backport profile (R4) to your HFS instance. The engine picks it up automatically on the next write:
+
+**R4B/R5/R6 (native `SubscriptionTopic`)**
 
 ```bash
 curl -X POST http://localhost:8080/SubscriptionTopic \
@@ -197,6 +218,35 @@ curl -X POST http://localhost:8080/SubscriptionTopic \
     "canFilterBy": [{
       "resource": "Encounter",
       "filterParameter": "patient"
+    }]
+  }'
+```
+
+**R4 (backport `Basic` topic representation)**
+
+```bash
+curl -X POST http://localhost:8080/Basic \
+  -H "Content-Type: application/fhir+json" \
+  -d '{
+    "resourceType": "Basic",
+    "code": {
+      "coding": [{
+        "system": "http://hl7.org/fhir/fhir-types",
+        "code": "SubscriptionTopic"
+      }]
+    },
+    "extension": [{
+      "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url",
+      "valueUri": "http://example.org/topic/encounter-start"
+    }, {
+      "url": "http://hl7.org/fhir/4.3/StructureDefinition/extension-SubscriptionTopic.resourceTrigger",
+      "extension": [{
+        "url": "resource",
+        "valueUri": "http://hl7.org/fhir/StructureDefinition/Encounter"
+      }, {
+        "url": "supportedInteraction",
+        "valueCode": "create"
+      }]
     }]
   }'
 ```
@@ -222,13 +272,71 @@ curl -X POST http://localhost:8080/Subscription \
 
 The server will immediately send a handshake notification to the endpoint. On a successful 2xx response the subscription transitions to `active`.
 
+### Creating a WebSocket Subscription
+
+```bash
+curl -X POST http://localhost:8080/Subscription \
+  -H "Content-Type: application/fhir+json" \
+  -d '{
+    "resourceType": "Subscription",
+    "status": "requested",
+    "topic": "http://example.org/topic/encounter-start",
+    "channelType": { "code": "websocket" },
+    "content": "full-resource"
+  }'
+```
+
+WebSocket subscriptions activate immediately (no outbound handshake is required). The endpoint field is not used — the server provides the WebSocket URL via the binding token operation.
+
+### Connecting via WebSocket
+
+After creating a WebSocket subscription, clients connect using a short-lived binding token:
+
+**Step 1 — Get a binding token**
+
+```bash
+GET /Subscription/{id}/$get-ws-binding-token
+```
+
+Returns a `Parameters` resource:
+
+```json
+{
+  "resourceType": "Parameters",
+  "parameter": [
+    { "name": "token",         "valueString": "550e8400-e29b-41d4-a716-446655440000" },
+    { "name": "expiration",    "valueDateTime": "2026-04-12T10:00:30Z" },
+    { "name": "websocket-url", "valueUrl": "ws://localhost:8080/ws/subscriptions/bind" }
+  ]
+}
+```
+
+Tokens are single-use and expire after 30 seconds (configurable via `ws_token_lifetime_secs`).
+
+**Step 2 — Connect**
+
+```bash
+# Using websocat
+websocat ws://localhost:8080/ws/subscriptions/bind
+# Then send:
+bind-with-token 550e8400-e29b-41d4-a716-446655440000
+```
+
+After a successful bind message, the server sends a handshake notification bundle. Subsequent event notifications are pushed as JSON text frames as matching resources are written to the server.
+
+The WebSocket protocol is **unidirectional** (server → client) after binding. Additional bind messages on the same connection are rejected; close frames trigger graceful cleanup.
+
+**Multiple clients:** Multiple clients can bind to the same subscription simultaneously. All connected clients receive every notification.
+
+**Subscription deletion:** Deleting the `Subscription` resource closes all connected WebSocket clients for that subscription.
+
 ### Checking Subscription Status
 
 ```bash
 GET /Subscription/{id}/$status
 ```
 
-Returns a `Parameters` resource (R4) or `SubscriptionStatus` resource (R5/R6) with the current runtime status and event count.
+Returns a `Parameters` resource (R4) or `SubscriptionStatus` resource (R4B/R5/R6) with the current runtime status and event count.
 
 ## Features
 
@@ -237,7 +345,7 @@ FHIR version support via Cargo feature flags:
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `R4` | Yes | FHIR R4 with Subscriptions R5 Backport IG |
-| `R4B` | No | FHIR R4B with Subscriptions R5 Backport IG |
+| `R4B` | No | FHIR R4B with native Subscriptions resources |
 | `R5` | No | FHIR R5 with native Subscriptions Framework |
 | `R6` | No | FHIR R6 with native Subscriptions Framework |
 
@@ -340,9 +448,10 @@ A Kafka-backed architecture addresses most of the single-instance and performanc
 
 ## Current Limitations
 
-- FHIRPath filter criteria are not evaluated — Phase 1 uses direct JSON field matching only
+- FHIRPath filter criteria are not evaluated — Phase 2 uses direct JSON field matching only
 - Heartbeat delivery is not yet implemented — the `heartbeat_period` field is stored but no background task fires heartbeats
 - Batch and transaction bundle entries do not emit subscription events — only direct CRUD handlers (create, update, delete, patch) do
 - [`eventTrigger`](https://hl7.org/fhir/subscriptiontopic.html) is not supported — only `resourceTrigger` (create, update, delete) is implemented
 - The engine is in-memory only and single-instance — subscriptions and topics are not shared across cluster nodes or reloaded from storage on restart (see [Clustering](#clustering) above)
-- Only the `rest-hook` channel is implemented; WebSocket, email, and FHIR messaging are planned for subsequent phases
+- WebSocket notifications are best-effort — if no clients are connected when an event fires the notification is silently dropped; there is no replay or queueing for late-connecting clients
+- Email and FHIR messaging channels are not yet implemented (planned for subsequent phases)

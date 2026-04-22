@@ -8,6 +8,8 @@ A FHIR Terminology Server built in Rust, implementing the [HL7 FHIR Terminology 
 
 It can also be used standalone as a general-purpose FHIR terminology service, independent of any other Helios Software component.
 
+An open test server will soon be available at https://hts.heliossoftware.com/ for experimentation and evaluation.
+
 HTS supports both SQLite and PostgreSQL as database backends - see [Storage Backends](#storage-backends) for details.
 
 ### Terminology Data
@@ -50,6 +52,11 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 | [HL7 v2 tables](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | HL7 FHIR License (free with attribution) - also in the THO package |
 | [NUCC Provider Taxonomy](https://www.nucc.org) | [NUCC](https://www.nucc.org) | ✅ Bundled | Free |
 | [NDC](https://www.fda.gov/drugs/drug-approvals-and-databases/national-drug-code-directory) | [U.S. FDA](https://www.fda.gov) | ✅ Bundled | Public domain (US federal government work) |
+| [HL7 FHIR R4 core](http://hl7.org/fhir/R4/) | [HL7 International](https://www.hl7.org) | ✅ Bundled | HL7 FHIR License (free with attribution) |
+| [HL7 FHIR US Core](https://hl7.org/fhir/us/core/) | [HL7 International](https://www.hl7.org) | ✅ Bundled | HL7 FHIR License (free with attribution) |
+| [VSAC](https://vsac.nlm.nih.gov) | [U.S. National Library of Medicine](https://www.nlm.nih.gov) | ✅ Bundled | Public domain — individual value sets may require SNOMED/LOINC/CPT licenses for their content |
+| [HL7 FHIR International Patient Summary (IPS)](https://hl7.org/fhir/uv/ips/) | [HL7 International](https://www.hl7.org) | ✅ Bundled | HL7 FHIR License (free with attribution) |
+| [CDC PHIN VADS](https://phinvads.cdc.gov) | [U.S. CDC](https://www.cdc.gov) | ✅ Bundled | Public domain (US federal government work) |
 | [SNOMED CT](https://www.snomed.org) | [SNOMED International](https://www.snomed.org) | 🔑 License required | Free in [~50 member countries](https://www.snomed.org/snomed-ct/get-snomed); paid elsewhere. [Register via MLDS](https://mlds.ihtsdotools.org/) or your [National Release Center](https://www.snomed.org/snomed-ct/get-snomed). US users: [nlm.nih.gov/healthit/snomedct](https://www.nlm.nih.gov/healthit/snomedct/index.html). |
 | [LOINC](https://loinc.org) | [Regenstrief Institute](https://www.regenstrief.org) | 🔑 License required | Free - [create a free account at loinc.org](https://loinc.org/download/) to download. |
 | [RxNorm](https://www.nlm.nih.gov/research/umls/rxnorm/overview.html) | [U.S. National Library of Medicine](https://www.nlm.nih.gov) | 🔑 License required | Free - [create a free UMLS account at uts.nlm.nih.gov](https://uts.nlm.nih.gov) and accept the [NLM Terms of Service](https://www.nlm.nih.gov/research/umls/rxnorm/docs/termsofservice.html). |
