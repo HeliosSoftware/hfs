@@ -32,11 +32,22 @@ pub(crate) fn import_bundle_sync(
     data: &[u8],
 ) -> Result<ImportStats, HtsError> {
     let parsed = bundle_parser::parse_bundle(data)?;
-    let conn = pool
+    let mut conn = pool
         .get()
         .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
     let mut stats = ImportStats::default();
-    write_parsed_bundle(&conn, &parsed, &mut stats)?;
+
+    // Wrap the whole bundle in a single transaction so that the thousands of
+    // per-concept / per-property / per-designation inserts that a bulk
+    // terminology load produces commit once, not once per row. Combined with
+    // `prepare_cached` inside the `write_*` helpers, this is the dominant
+    // speed-up for `hts import`.
+    let tx = conn
+        .transaction()
+        .map_err(|e| HtsError::StorageError(format!("Begin transaction: {e}")))?;
+    write_parsed_bundle(&tx, &parsed, &mut stats)?;
+    tx.commit()
+        .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
     Ok(stats)
 }
 
@@ -110,23 +121,19 @@ fn write_code_system(
     //      (can happen when two distinct CodeSystems share a short FHIR id like
     //      "observation-status") — in that case mint a fresh UUID.
     let existing_id: Option<String> = conn
-        .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
-            rusqlite::params![cs.url],
-            |row| row.get(0),
-        )
-        .optional()
+        .prepare_cached("SELECT id FROM code_systems WHERE url = ?1")
+        .and_then(|mut s| {
+            s.query_row(rusqlite::params![cs.url], |row| row.get(0))
+                .optional()
+        })
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     let system_id: String = if let Some(id) = existing_id {
         id
     } else {
         let id_taken: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM code_systems WHERE id = ?1",
-                rusqlite::params![cs.id],
-                |row| row.get::<_, i64>(0),
-            )
+            .prepare_cached("SELECT COUNT(*) FROM code_systems WHERE id = ?1")
+            .and_then(|mut s| s.query_row(rusqlite::params![cs.id], |row| row.get::<_, i64>(0)))
             .map_err(|e| HtsError::StorageError(e.to_string()))?
             > 0;
         if id_taken {
@@ -140,7 +147,7 @@ fn write_code_system(
     // triggering the ON DELETE CASCADE on concepts — a stub CodeSystem from
     // an hl7-npm package (content=not-present) must never wipe existing
     // RF2/LOINC concepts that were imported separately.
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO code_systems
          (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
@@ -152,7 +159,9 @@ fn write_code_system(
              content       = excluded.content,
              resource_json = excluded.resource_json,
              updated_at    = excluded.updated_at",
-        rusqlite::params![
+    )
+    .and_then(|mut s| {
+        s.execute(rusqlite::params![
             system_id,
             cs.url,
             cs.version,
@@ -162,19 +171,38 @@ fn write_code_system(
             cs.content,
             resource_json,
             now
-        ],
-    )
+        ])
+    })
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    for concept in &cs.concepts {
-        conn.execute(
-            "INSERT OR REPLACE INTO concepts (system_id, code, display, definition)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![system_id, concept.code, concept.display, concept.definition],
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // Upsert the concept and read back its id in one round-trip via
+    // `RETURNING id` — replacing the previous INSERT OR REPLACE +
+    // last_insert_rowid() pattern, which forced a synchronous round-trip
+    // after every row. ON CONFLICT here avoids the row delete/reinsert that
+    // INSERT OR REPLACE would cause (and the cascade on concept_id children).
+    const UPSERT_CONCEPT_SQL: &str = "INSERT INTO concepts (system_id, code, display, definition)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(system_id, code) DO UPDATE SET
+             display    = excluded.display,
+             definition = excluded.definition
+         RETURNING id";
+    const INSERT_PROPERTY_SQL: &str =
+        "INSERT INTO concept_properties (concept_id, property, value_type, value)
+         VALUES (?1, ?2, ?3, ?4)";
+    const INSERT_DESIGNATION_SQL: &str = "INSERT INTO concept_designations
+         (concept_id, language, use_system, use_code, value)
+         VALUES (?1, ?2, ?3, ?4, ?5)";
 
-        let concept_id = conn.last_insert_rowid();
+    for concept in &cs.concepts {
+        let concept_id: i64 = conn
+            .prepare_cached(UPSERT_CONCEPT_SQL)
+            .and_then(|mut s| {
+                s.query_row(
+                    rusqlite::params![system_id, concept.code, concept.display, concept.definition],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
         // Hierarchy from nesting or "parent" property.
         if let Some(ref parent) = concept.parent_code {
@@ -186,12 +214,16 @@ fn write_code_system(
             if prop.value.is_empty() {
                 continue;
             }
-            conn.execute(
-                "INSERT INTO concept_properties (concept_id, property, value_type, value)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![concept_id, prop.code, prop.value_type, prop.value],
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            conn.prepare_cached(INSERT_PROPERTY_SQL)
+                .and_then(|mut s| {
+                    s.execute(rusqlite::params![
+                        concept_id,
+                        prop.code,
+                        prop.value_type,
+                        prop.value
+                    ])
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
             // Extra hierarchy edge from a "parent" property.
             if prop.is_parent_edge {
@@ -203,19 +235,17 @@ fn write_code_system(
 
         // Designations.
         for desig in &concept.designations {
-            conn.execute(
-                "INSERT INTO concept_designations
-                 (concept_id, language, use_system, use_code, value)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    concept_id,
-                    desig.language,
-                    desig.use_system,
-                    desig.use_code,
-                    desig.value
-                ],
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            conn.prepare_cached(INSERT_DESIGNATION_SQL)
+                .and_then(|mut s| {
+                    s.execute(rusqlite::params![
+                        concept_id,
+                        desig.language,
+                        desig.use_system,
+                        desig.use_code,
+                        desig.value
+                    ])
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
         }
 
         stats.concepts += 1;
@@ -232,11 +262,11 @@ fn insert_hierarchy(
     parent_code: &str,
     child_code: &str,
 ) -> Result<(), HtsError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code)
          VALUES (?1, ?2, ?3)",
-        rusqlite::params![system_id, parent_code, child_code],
     )
+    .and_then(|mut s| s.execute(rusqlite::params![system_id, parent_code, child_code]))
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
     Ok(())
 }
@@ -265,11 +295,13 @@ fn write_value_set(
     let resource_json = serde_json::to_string(&vs.resource_json).ok();
     let now = utc_now();
 
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR REPLACE INTO value_sets
          (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-        rusqlite::params![
+    )
+    .and_then(|mut s| {
+        s.execute(rusqlite::params![
             vs.id,
             vs.url,
             vs.version,
@@ -279,8 +311,8 @@ fn write_value_set(
             vs.compose_json,
             resource_json,
             now
-        ],
-    )
+        ])
+    })
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     stats.value_sets += 1;
@@ -313,11 +345,13 @@ fn write_concept_map(
     let resource_json = serde_json::to_string(&cm.resource_json).ok();
     let now = utc_now();
 
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR REPLACE INTO concept_maps
          (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        rusqlite::params![
+    )
+    .and_then(|mut s| {
+        s.execute(rusqlite::params![
             cm.id,
             cm.url,
             cm.version,
@@ -328,25 +362,26 @@ fn write_concept_map(
             cm.status,
             resource_json,
             now
-        ],
-    )
+        ])
+    })
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    const INSERT_ELEMENT_SQL: &str = "INSERT OR IGNORE INTO concept_map_elements
+         (map_id, source_system, source_code, target_system, target_code, equivalence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
     for el in &cm.elements {
-        conn.execute(
-            "INSERT OR IGNORE INTO concept_map_elements
-             (map_id, source_system, source_code, target_system, target_code, equivalence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                cm.id,
-                el.source_system,
-                el.source_code,
-                el.target_system,
-                el.target_code,
-                el.equivalence
-            ],
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        conn.prepare_cached(INSERT_ELEMENT_SQL)
+            .and_then(|mut s| {
+                s.execute(rusqlite::params![
+                    cm.id,
+                    el.source_system,
+                    el.source_code,
+                    el.target_system,
+                    el.target_code,
+                    el.equivalence
+                ])
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
     }
 
     stats.concept_maps += 1;

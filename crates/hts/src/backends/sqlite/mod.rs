@@ -58,12 +58,17 @@ impl SqliteTerminologyBackend {
     pub fn new(db_path: &str) -> Result<Self, HtsError> {
         // Apply per-connection pragmas on every new connection from the pool.
         // journal_mode is file-level (WAL persists); the rest are per-connection.
+        // `synchronous=NORMAL` is crash-safe under WAL (the journal mode set
+        // at bootstrap below) and avoids an fsync on every commit — a
+        // meaningful speed-up for bulk imports that commit one transaction
+        // per batch of ~500 concepts.
         let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
             conn.execute_batch(
                 "PRAGMA foreign_keys=ON;
                  PRAGMA cache_size=-32768;
                  PRAGMA temp_store=MEMORY;
-                 PRAGMA busy_timeout=30000;",
+                 PRAGMA busy_timeout=30000;
+                 PRAGMA synchronous=NORMAL;",
             )
         });
 
@@ -131,9 +136,10 @@ impl SqliteTerminologyBackend {
             let conn = pool.get().map_err(|e| {
                 HtsError::StorageError(format!("Failed to acquire in-memory connection: {e}"))
             })?;
-            conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(|e| {
-                HtsError::StorageError(format!("Failed to configure in-memory pragmas: {e}"))
-            })?;
+            conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")
+                .map_err(|e| {
+                    HtsError::StorageError(format!("Failed to configure in-memory pragmas: {e}"))
+                })?;
             schema::apply(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply in-memory schema: {e}"))
             })?;
