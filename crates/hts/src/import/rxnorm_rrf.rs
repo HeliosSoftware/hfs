@@ -29,6 +29,29 @@ const RXNORM_ID: &str = "rxnorm";
 const RXNORM_NAME: &str = "RxNorm";
 const RXNORM_TITLE: &str = "RxNorm — NLM Drug Terminology";
 
+// ── Relationship helpers ──────────────────────────────────────────────────────
+
+/// Returns the semantic inverse of a named RxNorm relationship, or `None` if
+/// we only need to store the relationship in the forward direction.
+///
+/// RxNorm RXNREL contains both directions for most relationships, but some
+/// datasets only include one direction. Generating the inverse ensures that
+/// FHIR property filters (e.g. `tradename_of=CUI:161`) work regardless of
+/// which direction the source file uses.
+fn inverse_rela(rela: &str) -> Option<&'static str> {
+    match rela {
+        "has_tradename"          => Some("tradename_of"),
+        "ingredient_of"          => Some("has_ingredient"),
+        "dose_form_of"           => Some("has_dose_form"),
+        "part_of"                => Some("has_part"),
+        "quantified_form_of"     => Some("has_quantified_form"),
+        "contained_in"           => Some("consists_of"),
+        "constitutes"            => Some("reformulated_to"),
+        "reformulation_of"       => Some("has_reformulated_drug"),
+        _ => None,
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Import an RxNorm RRF distribution through the given backend.
@@ -69,21 +92,6 @@ pub async fn import_rxnorm_rrf(
         ..Default::default()
     };
 
-    let tradename_of_count = relationships
-        .iter()
-        .filter(|(_, rela, _)| rela == "tradename_of")
-        .count();
-    eprintln!(
-        "[rxnorm] {} concepts, {} relationships ({} tradename_of, {} isa)",
-        concepts.len(),
-        relationships.len(),
-        tradename_of_count,
-        relationships
-            .iter()
-            .filter(|(_, rela, _)| rela == "isa")
-            .count(),
-    );
-
     if dry_run {
         stats.code_systems = 1;
         stats.concepts = concepts.len() as u32;
@@ -104,11 +112,29 @@ pub async fn import_rxnorm_rrf(
                 .or_default()
                 .push(rxcui2.clone());
         } else {
+            // Forward: store the relationship as-is on rxcui1.
             roles_of
                 .entry(rxcui1.clone())
                 .or_default()
                 .push((rela.clone(), format!("CUI:{rxcui2}")));
+            // Inverse: some relationships in RXNREL only appear in one direction
+            // (e.g. IN→has_tradename→BN but NOT BN→tradename_of→IN). Store the
+            // semantic inverse on rxcui2 so property filters work regardless of
+            // which direction the row appears in the source file.
+            if let Some(inv) = inverse_rela(rela) {
+                roles_of
+                    .entry(rxcui2.clone())
+                    .or_default()
+                    .push((inv.to_string(), format!("CUI:{rxcui1}")));
+            }
         }
+    }
+
+    // Remove duplicate (property, value) pairs that arise when both forward and
+    // inverse directions appear in RXNREL for the same concept pair.
+    for props in roles_of.values_mut() {
+        props.sort_unstable();
+        props.dedup();
     }
 
     let meta = CodeSystemMeta {
@@ -132,9 +158,8 @@ pub async fn import_rxnorm_rrf(
         .map(|(rxcui, (display, tty))| (rxcui, display, tty))
         .collect();
     let total = concept_list.len();
-    let total_batches = total.div_ceil(batch_size).max(1);
 
-    for (batch_idx, batch) in concept_list.chunks(batch_size).enumerate() {
+    for batch in concept_list.chunks(batch_size) {
         let extras_per: Vec<Vec<BuilderProperty<'_>>> = batch
             .iter()
             .map(|(code, _, tty)| {
@@ -186,22 +211,9 @@ pub async fn import_rxnorm_rrf(
         let bytes = build_code_system_bundle(&meta, &builder);
         let chunk = backend.import_bundle(ctx, &bytes).await?;
         stats.errors.extend(chunk.errors);
-
-        eprintln!(
-            "[rxnorm] concept batch {}/{total_batches} — +{} concepts (total: {})",
-            batch_idx + 1,
-            batch.len(),
-            ((batch_idx + 1) * batch_size).min(total)
-        );
     }
 
     stats.concepts = total as u32;
-    eprintln!(
-        "[rxnorm] import complete — {} concepts imported, {} concepts with role properties, {} with isa parents",
-        total,
-        roles_of.len(),
-        parents_of.len(),
-    );
     Ok(stats)
 }
 
@@ -782,6 +794,118 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         assert!(
             codes.contains(&"198444"),
             "Tylenol (198444) must be in results; got: {codes:?}"
+        );
+    }
+
+    /// Mirrors the CI scenario: RXNREL only has the `has_tradename` direction
+    /// (IN → has_tradename → BN) rather than the direct `tradename_of` row.
+    /// The inverse logic must produce `tradename_of=CUI:{IN}` on the BN concept
+    /// so that expand filters of the form `TTY=BN AND tradename_of=CUI:161` work.
+    #[tokio::test]
+    async fn expand_property_filters_via_inverse_has_tradename() {
+        use crate::traits::ValueSetOperations;
+        use crate::types::ExpandRequest;
+
+        // REL data with ONLY the inverse `has_tradename` direction (no direct tradename_of row).
+        let conso = "\
+1049502|ENG|P|L0000001|PF|S0000001|Y|1049502|||1049502|RXNORM|IN|1049502|acetaminophen|0|N|\n\
+198444|ENG|P|L0000002|PF|S0000002|Y|198444|||198444|RXNORM|BN|198444|Tylenol|0|N|\n";
+        let rels = "\
+1049502||RXCUI|RB|198444||RXCUI|has_tradename|RUI001||RXNORM|||N|N|N|\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            use std::io::Write;
+            std::fs::File::create(dir.path().join("RXNCONSO.RRF"))
+                .unwrap()
+                .write_all(conso.as_bytes())
+                .unwrap();
+            std::fs::File::create(dir.path().join("RXNREL.RRF"))
+                .unwrap()
+                .write_all(rels.as_bytes())
+                .unwrap();
+        }
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+
+        import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, false)
+            .await
+            .unwrap();
+
+        // Verify the inverse property was stored on the BN concept.
+        assert_eq!(
+            count_property(&backend, "tradename_of"),
+            1,
+            "tradename_of property must be derived from has_tradename inverse"
+        );
+
+        // Verify expand with TTY=BN AND tradename_of=CUI:1049502 returns Tylenol.
+        let resp = backend
+            .expand(
+                &ctx,
+                ExpandRequest {
+                    value_set: Some(serde_json::json!({
+                        "resourceType": "ValueSet",
+                        "compose": {
+                            "include": [{
+                                "system": RXNORM_URL,
+                                "filter": [
+                                    {"property": "TTY",          "op": "=", "value": "BN"},
+                                    {"property": "tradename_of", "op": "=", "value": "CUI:1049502"}
+                                ]
+                            }]
+                        }
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(
+            codes.contains(&"198444"),
+            "Tylenol (198444) must appear when filtering via inverse has_tradename; got: {codes:?}"
+        );
+    }
+
+    /// When RXNREL has BOTH directions for the same pair (tradename_of AND has_tradename),
+    /// dedup must prevent duplicate concept_properties rows.
+    #[tokio::test]
+    async fn inverse_rela_dedup_prevents_duplicate_properties() {
+        let conso = "\
+1049502|ENG|P|L0000001|PF|S0000001|Y|1049502|||1049502|RXNORM|IN|1049502|acetaminophen|0|N|\n\
+198444|ENG|P|L0000002|PF|S0000002|Y|198444|||198444|RXNORM|BN|198444|Tylenol|0|N|\n";
+        // Both directions present — dedup must keep only one tradename_of row.
+        let rels = "\
+198444||RXCUI|RN|1049502||RXCUI|tradename_of|RUI001||RXNORM|||N|N|N|\n\
+1049502||RXCUI|RB|198444||RXCUI|has_tradename|RUI002||RXNORM|||N|N|N|\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            use std::io::Write;
+            std::fs::File::create(dir.path().join("RXNCONSO.RRF"))
+                .unwrap()
+                .write_all(conso.as_bytes())
+                .unwrap();
+            std::fs::File::create(dir.path().join("RXNREL.RRF"))
+                .unwrap()
+                .write_all(rels.as_bytes())
+                .unwrap();
+        }
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, false)
+            .await
+            .unwrap();
+
+        // Dedup must eliminate the extra tradename_of generated by the inverse of has_tradename.
+        assert_eq!(
+            count_property(&backend, "tradename_of"),
+            1,
+            "dedup must prevent duplicate tradename_of rows when both directions are in RXNREL"
         );
     }
 
