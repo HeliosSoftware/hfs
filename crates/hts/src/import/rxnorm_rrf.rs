@@ -69,14 +69,25 @@ pub async fn import_rxnorm_rrf(
         ..Default::default()
     };
 
+    let tradename_of_count = relationships
+        .iter()
+        .filter(|(_, rela, _)| rela == "tradename_of")
+        .count();
+    eprintln!(
+        "[rxnorm] {} concepts, {} relationships ({} tradename_of, {} isa)",
+        concepts.len(),
+        relationships.len(),
+        tradename_of_count,
+        relationships
+            .iter()
+            .filter(|(_, rela, _)| rela == "isa")
+            .count(),
+    );
+
     if dry_run {
         stats.code_systems = 1;
         stats.concepts = concepts.len() as u32;
-        eprintln!(
-            "[rxnorm] dry-run — {} concepts, {} relationships parsed, no DB writes",
-            concepts.len(),
-            relationships.len()
-        );
+        eprintln!("[rxnorm] dry-run — no DB writes");
         return Ok(stats);
     }
 
@@ -185,6 +196,12 @@ pub async fn import_rxnorm_rrf(
     }
 
     stats.concepts = total as u32;
+    eprintln!(
+        "[rxnorm] import complete — {} concepts imported, {} concepts with role properties, {} with isa parents",
+        total,
+        roles_of.len(),
+        parents_of.len(),
+    );
     Ok(stats)
 }
 
@@ -717,6 +734,55 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
             .unwrap();
 
         assert_eq!(display, "acetaminophen 325 MG Oral Tablet");
+    }
+
+    #[tokio::test]
+    async fn expand_property_filters_tty_and_tradename_of() {
+        use crate::traits::ValueSetOperations;
+        use crate::types::ExpandRequest;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let dir = make_folder();
+
+        import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, false)
+            .await
+            .unwrap();
+
+        // Mirrors EX06: TTY=BN AND tradename_of=CUI:<acetaminophen-rxcui>
+        let resp = backend
+            .expand(
+                &ctx,
+                ExpandRequest {
+                    value_set: Some(serde_json::json!({
+                        "resourceType": "ValueSet",
+                        "compose": {
+                            "include": [{
+                                "system": RXNORM_URL,
+                                "filter": [
+                                    {"property": "TTY",          "op": "=", "value": "BN"},
+                                    {"property": "tradename_of", "op": "=", "value": "CUI:1049502"}
+                                ]
+                            }]
+                        }
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Tylenol (198444) has TTY=BN and tradename_of=CUI:1049502 (acetaminophen)
+        assert!(
+            !resp.contains.is_empty(),
+            "Expected at least one brand; got empty expansion. \
+             Concept properties may not be stored during import."
+        );
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(
+            codes.contains(&"198444"),
+            "Tylenol (198444) must be in results; got: {codes:?}"
+        );
     }
 
     #[tokio::test]
