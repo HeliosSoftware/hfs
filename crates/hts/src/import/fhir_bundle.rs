@@ -210,6 +210,18 @@ fn write_code_system(
         }
 
         // Properties.
+        // Delete existing rows first so reimports stay idempotent.  We only do
+        // this when the incoming concept carries at least one non-empty property
+        // so that stub "content=not-present" re-imports don't wipe RF2/LOINC
+        // properties that were loaded separately.
+        let has_props = concept.properties.iter().any(|p| !p.value.is_empty());
+        if has_props {
+            conn.execute(
+                "DELETE FROM concept_properties WHERE concept_id = ?1",
+                rusqlite::params![concept_id],
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        }
         for prop in &concept.properties {
             if prop.value.is_empty() {
                 continue;
@@ -233,7 +245,15 @@ fn write_code_system(
             }
         }
 
-        // Designations.
+        // Designations — same idempotency guard.
+        let has_desigs = !concept.designations.is_empty();
+        if has_desigs {
+            conn.execute(
+                "DELETE FROM concept_designations WHERE concept_id = ?1",
+                rusqlite::params![concept_id],
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        }
         for desig in &concept.designations {
             conn.prepare_cached(INSERT_DESIGNATION_SQL)
                 .and_then(|mut s| {

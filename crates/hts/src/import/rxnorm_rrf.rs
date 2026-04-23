@@ -1,8 +1,9 @@
 //! RxNorm RRF importer.
 //!
 //! Parses the NLM RxNorm full release distribution and imports drug concepts,
-//! preferred display names, and `isa` hierarchy edges into the HTS normalized
-//! schema.
+//! preferred display names, `isa` hierarchy edges, TTY term-type properties,
+//! and named role relationships (tradename_of, has_ingredient, has_dose_form,
+//! etc.) into the HTS normalized schema.
 //!
 //! # ⚠️  LICENSE REQUIRED
 //!
@@ -40,21 +41,25 @@ pub async fn import_rxnorm_rrf(
 ) -> Result<ImportStats, HtsError> {
     let batch_size = batch_size.max(1);
 
-    type RxnormParsed = (HashMap<String, String>, Vec<(String, String)>, Vec<String>);
+    // rxcui -> (display, tty)
+    type ConceptMap = HashMap<String, (String, String)>;
+    // (rxcui1, rela, rxcui2)
+    type RelVec = Vec<(String, String, String)>;
+    type RxnormParsed = (ConceptMap, RelVec, Vec<String>);
 
     let path_owned = path.to_path_buf();
-    let (concepts, edges, parse_errors) =
+    let (concepts, relationships, parse_errors) =
         tokio::task::spawn_blocking(move || -> Result<RxnormParsed, HtsError> {
             let (conso_bytes, rel_bytes) = read_rrf_files(&path_owned)?;
             let mut parse_errors: Vec<String> = Vec::new();
             let concepts =
                 parse_concepts(BufReader::new(conso_bytes.as_slice()), &mut parse_errors)?;
-            let edges = parse_relationships(
+            let relationships = parse_relationships(
                 BufReader::new(rel_bytes.as_slice()),
                 &concepts,
                 &mut parse_errors,
             )?;
-            Ok((concepts, edges, parse_errors))
+            Ok((concepts, relationships, parse_errors))
         })
         .await
         .map_err(|e| HtsError::Internal(format!("RxNorm parser panicked: {e}")))??;
@@ -68,20 +73,31 @@ pub async fn import_rxnorm_rrf(
         stats.code_systems = 1;
         stats.concepts = concepts.len() as u32;
         eprintln!(
-            "[rxnorm] dry-run — {} concepts, {} isa edges parsed, no DB writes",
+            "[rxnorm] dry-run — {} concepts, {} relationships parsed, no DB writes",
             concepts.len(),
-            edges.len()
+            relationships.len()
         );
         return Ok(stats);
     }
 
-    // Build child → parents map (a concept can have multiple parents).
+    // Build child → parents map (isa edges; a concept can have multiple parents).
     let mut parents_of: HashMap<String, Vec<String>> = HashMap::new();
-    for (child, parent) in &edges {
-        parents_of
-            .entry(child.clone())
-            .or_default()
-            .push(parent.clone());
+    // Build concept → role properties (tradename_of, has_ingredient, etc.)
+    // Values are stored as "CUI:{rxcui}" to match the FHIR property filter convention.
+    let mut roles_of: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+    for (rxcui1, rela, rxcui2) in &relationships {
+        if rela == "isa" {
+            parents_of
+                .entry(rxcui1.clone())
+                .or_default()
+                .push(rxcui2.clone());
+        } else {
+            roles_of
+                .entry(rxcui1.clone())
+                .or_default()
+                .push((rela.clone(), format!("CUI:{rxcui2}")));
+        }
     }
 
     let meta = CodeSystemMeta {
@@ -100,35 +116,52 @@ pub async fn import_rxnorm_rrf(
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
-    let concept_list: Vec<(String, String)> = concepts.into_iter().collect();
+    let concept_list: Vec<(String, String, String)> = concepts
+        .into_iter()
+        .map(|(rxcui, (display, tty))| (rxcui, display, tty))
+        .collect();
     let total = concept_list.len();
     let total_batches = total.div_ceil(batch_size).max(1);
 
     for (batch_idx, batch) in concept_list.chunks(batch_size).enumerate() {
         let extras_per: Vec<Vec<BuilderProperty<'_>>> = batch
             .iter()
-            .map(|(code, _)| {
-                parents_of
-                    .get(code)
-                    .map(|parents| {
-                        parents
-                            .iter()
-                            .skip(1)
-                            .map(|p| BuilderProperty {
-                                code: "parent",
-                                value_key: "valueCode",
-                                value: p.as_str(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
+            .map(|(code, _, tty)| {
+                let mut props: Vec<BuilderProperty<'_>> = Vec::new();
+                // TTY term type (IN, BN, SCD, SBD, MIN, SCDC, …)
+                props.push(BuilderProperty {
+                    code: "TTY",
+                    value_key: "valueCode",
+                    value: tty.as_str(),
+                });
+                // Additional isa parents beyond the first (first goes via parent_code)
+                if let Some(parents) = parents_of.get(code) {
+                    for p in parents.iter().skip(1) {
+                        props.push(BuilderProperty {
+                            code: "parent",
+                            value_key: "valueCode",
+                            value: p.as_str(),
+                        });
+                    }
+                }
+                // Role relationships: tradename_of, has_ingredient, has_dose_form, …
+                if let Some(roles) = roles_of.get(code) {
+                    for (rela, cui_val) in roles {
+                        props.push(BuilderProperty {
+                            code: rela.as_str(),
+                            value_key: "valueCode",
+                            value: cui_val.as_str(),
+                        });
+                    }
+                }
+                props
             })
             .collect();
 
         let builder: Vec<BuilderConcept<'_>> = batch
             .iter()
             .enumerate()
-            .map(|(i, (code, display))| BuilderConcept {
+            .map(|(i, (code, display, _tty))| BuilderConcept {
                 code: code.as_str(),
                 display: Some(display.as_str()),
                 parent_code: parents_of
@@ -218,12 +251,13 @@ fn read_zip_entry(
 
 // ── RRF parsers ───────────────────────────────────────────────────────────────
 
+/// Returns a map of RXCUI → (preferred display, TTY term type).
 fn parse_concepts(
     reader: impl BufRead,
     errors: &mut Vec<String>,
-) -> Result<HashMap<String, String>, HtsError> {
-    let mut concepts: HashMap<String, String> = HashMap::new();
-    let mut preferred: HashMap<String, bool> = HashMap::new();
+) -> Result<HashMap<String, (String, String)>, HtsError> {
+    // rxcui -> (display, tty, is_preferred)
+    let mut raw: HashMap<String, (String, String, bool)> = HashMap::new();
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| {
@@ -245,6 +279,7 @@ fn parse_concepts(
         let lat = fields[1];
         let ispref = fields[6];
         let sab = fields[11];
+        let tty = fields[12];
         let str_val = fields[14];
 
         if lat != "ENG" || sab != "RXNORM" {
@@ -258,25 +293,35 @@ fn parse_concepts(
         }
 
         let is_pref = ispref == "Y";
-        let already_preferred = *preferred.get(rxcui).unwrap_or(&false);
+        let already_preferred = raw.get(rxcui).map(|(_, _, p)| *p).unwrap_or(false);
 
-        if is_pref || !concepts.contains_key(rxcui) {
+        if is_pref || !raw.contains_key(rxcui) {
             if !already_preferred || is_pref {
-                concepts.insert(rxcui.to_string(), str_val.to_string());
-                preferred.insert(rxcui.to_string(), is_pref);
+                raw.insert(
+                    rxcui.to_string(),
+                    (str_val.to_string(), tty.to_string(), is_pref),
+                );
             }
         }
     }
 
-    Ok(concepts)
+    Ok(raw
+        .into_iter()
+        .map(|(rxcui, (display, tty, _))| (rxcui, (display, tty)))
+        .collect())
 }
 
+/// Returns all named RxNorm relationships as `(rxcui1, rela, rxcui2)` triples.
+///
+/// Includes `isa` hierarchy edges and role relationships such as `tradename_of`,
+/// `has_ingredient`, and `has_dose_form`.  Only rows where both endpoints are
+/// active concepts are kept.
 fn parse_relationships(
     reader: impl BufRead,
-    active_concepts: &HashMap<String, String>,
+    active_concepts: &HashMap<String, (String, String)>,
     errors: &mut Vec<String>,
-) -> Result<Vec<(String, String)>, HtsError> {
-    let mut edges: Vec<(String, String)> = Vec::new();
+) -> Result<Vec<(String, String, String)>, HtsError> {
+    let mut relationships: Vec<(String, String, String)> = Vec::new();
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| {
@@ -299,7 +344,8 @@ fn parse_relationships(
         let rela = fields[7];
         let sab = fields[10];
 
-        if sab != "RXNORM" || rela != "isa" {
+        // Only RxNorm-sourced, named relationships (rela must be non-empty).
+        if sab != "RXNORM" || rela.is_empty() {
             continue;
         }
         if fields.len() > 14 && fields[14] == "O" {
@@ -309,12 +355,12 @@ fn parse_relationships(
             continue;
         }
 
-        edges.push((rxcui1.to_string(), rxcui2.to_string()));
+        relationships.push((rxcui1.to_string(), rela.to_string(), rxcui2.to_string()));
     }
 
-    edges.sort_unstable();
-    edges.dedup();
-    Ok(edges)
+    relationships.sort_unstable();
+    relationships.dedup();
+    Ok(relationships)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -324,6 +370,7 @@ mod tests {
     use super::*;
     use crate::backends::SqliteTerminologyBackend;
 
+    // RXNCONSO fields: RXCUI|LAT|TS|LUI|STT|SUI|ISPREF|RXAUI|SAUI|SCUI|SDUI|SAB|TTY|CODE|STR|SRL|SUPPRESS|CVF
     const CONSO_RRF: &str = "\
 1049502|ENG|P|L0000001|PF|S0000001|Y|1049502|||1049502|RXNORM|IN|1049502|acetaminophen|0|N|\n\
 1049520|ENG|P|L0000002|PF|S0000002|Y|1049520|||1049520|RXNORM|IN|1049520|ibuprofen|0|N|\n\
@@ -331,16 +378,28 @@ mod tests {
 1049527|ENG|P|L0000004|PF|S0000004|Y|1049527|||1049527|RXNORM|SCD|1049527|acetaminophen 325 MG Oral Tablet|0|N|\n\
 9999999|ENG|P|L0000005|PF|S0000005|Y|9999999|||9999999|RXNORM|IN|9999999|suppressed_drug|0|O|\n";
 
+    // RXNREL fields: RXCUI1|RXAUI1|STYPE1|REL|RXCUI2|RXAUI2|STYPE2|RELA|RUI|SRUI|SAB|SL|DIR|RG|SUPPRESS|CVF
     const REL_RRF: &str = "\
 198444||RXCUI|RN|1049502||RXCUI|isa|RUI001||RXNORM|||N|N|N|\n\
 1049527||RXCUI|RN|1049502||RXCUI|isa|RUI002||RXNORM|||N|N|N|\n\
-9999999||RXCUI|RN|1049502||RXCUI|isa|RUI003||RXNORM|||N|N|O|\n";
+9999999||RXCUI|RN|1049502||RXCUI|isa|RUI003||RXNORM|||N|N|O|\n\
+198444||RXCUI|RO|1049502||RXCUI|tradename_of|RUI004||RXNORM|||N|N|N|\n";
 
     fn count_rows(backend: &SqliteTerminologyBackend, table: &str) -> i64 {
         let conn = backend.pool().get().unwrap();
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
             row.get(0)
         })
+        .unwrap()
+    }
+
+    fn count_property(backend: &SqliteTerminologyBackend, property: &str) -> i64 {
+        let conn = backend.pool().get().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM concept_properties WHERE property = ?1",
+            rusqlite::params![property],
+            |row| row.get(0),
+        )
         .unwrap()
     }
 
@@ -365,9 +424,18 @@ mod tests {
         let mut errors = Vec::new();
         let concepts = parse_concepts(BufReader::new(CONSO_RRF.as_bytes()), &mut errors).unwrap();
         assert_eq!(concepts.len(), 4);
-        assert_eq!(concepts["1049502"], "acetaminophen");
-        assert_eq!(concepts["198444"], "Tylenol");
+        assert_eq!(concepts["1049502"].0, "acetaminophen");
+        assert_eq!(concepts["198444"].0, "Tylenol");
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_concepts_stores_tty() {
+        let mut errors = Vec::new();
+        let concepts = parse_concepts(BufReader::new(CONSO_RRF.as_bytes()), &mut errors).unwrap();
+        assert_eq!(concepts["1049502"].1, "IN");
+        assert_eq!(concepts["198444"].1, "BN");
+        assert_eq!(concepts["1049527"].1, "SCD");
     }
 
     #[test]
@@ -394,33 +462,71 @@ mod tests {
 1049502|ENG|P|L1|PF|S2|Y|1049502|||1049502|RXNORM|IN|1049502|acetaminophen|0|N|\n";
         let mut errors = Vec::new();
         let concepts = parse_concepts(BufReader::new(data.as_bytes()), &mut errors).unwrap();
-        assert_eq!(concepts["1049502"], "acetaminophen");
+        assert_eq!(concepts["1049502"].0, "acetaminophen");
     }
 
     #[test]
-    fn parse_relationships_returns_two_isa_edges() {
+    fn parse_relationships_returns_isa_and_role_edges() {
         let mut errors = Vec::new();
         let concepts = parse_concepts(BufReader::new(CONSO_RRF.as_bytes()), &mut errors).unwrap();
-        let edges = parse_relationships(BufReader::new(REL_RRF.as_bytes()), &concepts, &mut errors)
+        let rels = parse_relationships(BufReader::new(REL_RRF.as_bytes()), &concepts, &mut errors)
             .unwrap();
-        assert_eq!(edges.len(), 2);
-        assert!(edges.contains(&("198444".to_string(), "1049502".to_string())));
-        assert!(edges.contains(&("1049527".to_string(), "1049502".to_string())));
+        // 2 isa edges + 1 tradename_of (suppressed isa skipped)
+        assert_eq!(rels.len(), 3);
+        assert!(rels.contains(&(
+            "198444".to_string(),
+            "isa".to_string(),
+            "1049502".to_string()
+        )));
+        assert!(rels.contains(&(
+            "1049527".to_string(),
+            "isa".to_string(),
+            "1049502".to_string()
+        )));
+        assert!(rels.contains(&(
+            "198444".to_string(),
+            "tradename_of".to_string(),
+            "1049502".to_string()
+        )));
     }
 
     #[test]
-    fn parse_relationships_skips_non_isa_rela() {
+    fn parse_relationships_stores_non_isa_rela() {
         let concepts = {
             let mut m = HashMap::new();
-            m.insert("A".to_string(), "Drug A".to_string());
-            m.insert("B".to_string(), "Drug B".to_string());
+            m.insert("A".to_string(), ("Drug A".to_string(), "IN".to_string()));
+            m.insert("B".to_string(), ("Drug B".to_string(), "IN".to_string()));
             m
         };
         let data = "A||RXCUI|RO|B||RXCUI|ingredient_of|RUI001||RXNORM||||N|\n";
         let mut errors = Vec::new();
-        let edges =
+        let rels =
             parse_relationships(BufReader::new(data.as_bytes()), &concepts, &mut errors).unwrap();
-        assert!(edges.is_empty());
+        assert_eq!(rels.len(), 1);
+        assert_eq!(
+            rels[0],
+            (
+                "A".to_string(),
+                "ingredient_of".to_string(),
+                "B".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_relationships_skips_empty_rela() {
+        let concepts = {
+            let mut m = HashMap::new();
+            m.insert("A".to_string(), ("Drug A".to_string(), "IN".to_string()));
+            m.insert("B".to_string(), ("Drug B".to_string(), "IN".to_string()));
+            m
+        };
+        // REL without a RELA value (unnamed relationship)
+        let data = "A||RXCUI|RO|B||RXCUI||RUI001||RXNORM||||N|\n";
+        let mut errors = Vec::new();
+        let rels =
+            parse_relationships(BufReader::new(data.as_bytes()), &concepts, &mut errors).unwrap();
+        assert!(rels.is_empty());
     }
 
     #[test]
@@ -481,6 +587,69 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         assert_eq!(count_rows(&backend, "code_systems"), 1);
         assert_eq!(count_rows(&backend, "concepts"), 4);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
+        // One TTY property per concept + one tradename_of for Tylenol
+        assert_eq!(count_property(&backend, "TTY"), 4);
+        assert_eq!(count_property(&backend, "tradename_of"), 1);
+    }
+
+    #[tokio::test]
+    async fn import_rxnorm_tty_property_values() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let dir = make_folder();
+
+        import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, false)
+            .await
+            .unwrap();
+
+        let conn = backend.pool().get().unwrap();
+        // Tylenol (198444) should have TTY = BN
+        let tty: String = conn
+            .query_row(
+                "SELECT cp.value FROM concept_properties cp
+                 JOIN concepts c ON c.id = cp.concept_id
+                 WHERE c.code = ?1 AND cp.property = 'TTY'",
+                rusqlite::params!["198444"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tty, "BN");
+
+        // acetaminophen (1049502) should have TTY = IN
+        let tty: String = conn
+            .query_row(
+                "SELECT cp.value FROM concept_properties cp
+                 JOIN concepts c ON c.id = cp.concept_id
+                 WHERE c.code = ?1 AND cp.property = 'TTY'",
+                rusqlite::params!["1049502"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tty, "IN");
+    }
+
+    #[tokio::test]
+    async fn import_rxnorm_tradename_of_property() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let dir = make_folder();
+
+        import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, false)
+            .await
+            .unwrap();
+
+        let conn = backend.pool().get().unwrap();
+        // Tylenol (198444) tradename_of acetaminophen (1049502) → value "CUI:1049502"
+        let val: String = conn
+            .query_row(
+                "SELECT cp.value FROM concept_properties cp
+                 JOIN concepts c ON c.id = cp.concept_id
+                 WHERE c.code = ?1 AND cp.property = 'tradename_of'",
+                rusqlite::params!["198444"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(val, "CUI:1049502");
     }
 
     #[tokio::test]
@@ -499,6 +668,8 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         assert_eq!(count_rows(&backend, "code_systems"), 1);
         assert_eq!(count_rows(&backend, "concepts"), 4);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
+        assert_eq!(count_property(&backend, "TTY"), 4);
+        assert_eq!(count_property(&backend, "tradename_of"), 1);
     }
 
     #[tokio::test]
@@ -514,6 +685,7 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         assert_eq!(stats.concepts, 4);
         assert_eq!(count_rows(&backend, "concepts"), 4);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
+        assert_eq!(count_property(&backend, "TTY"), 4);
     }
 
     #[tokio::test]
@@ -574,5 +746,7 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         assert_eq!(stats.concepts, 4);
         assert_eq!(count_rows(&backend, "concepts"), 4);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
+        assert_eq!(count_property(&backend, "TTY"), 4);
+        assert_eq!(count_property(&backend, "tradename_of"), 1);
     }
 }
