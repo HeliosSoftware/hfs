@@ -162,6 +162,55 @@ pub async fn import_rxnorm_rrf(
         props.dedup();
     }
 
+    // ── Diagnostics (temporary — understand BN→isa structure) ────────────────
+    {
+        let bn_concepts: Vec<&String> = concepts
+            .iter()
+            .filter(|(_, (_, tty))| tty == "BN")
+            .map(|(rxcui, _)| rxcui)
+            .collect();
+        let bn_with_any_isa = bn_concepts
+            .iter()
+            .filter(|rxcui| parents_of.contains_key(**rxcui))
+            .count();
+        let bn_with_in_parent = bn_concepts
+            .iter()
+            .filter(|rxcui| {
+                parents_of.get(**rxcui).map(|parents| {
+                    parents.iter().any(|p| {
+                        concepts.get(p).map(|(_, tty)| tty == "IN" || tty == "MIN").unwrap_or(false)
+                    })
+                }).unwrap_or(false)
+            })
+            .count();
+        // Show what isa parents exist for a sample BN concept (the first one that has isa parents)
+        let sample_bn_with_isa = bn_concepts.iter()
+            .find(|rxcui| parents_of.contains_key(**rxcui));
+        let sample_parents: Vec<(String, String)> = sample_bn_with_isa
+            .and_then(|rxcui| parents_of.get(*rxcui))
+            .map(|parents| parents.iter()
+                .take(5)
+                .map(|p| (p.clone(), concepts.get(p).map(|(_, tty)| tty.clone()).unwrap_or("?".into())))
+                .collect())
+            .unwrap_or_default();
+        // Show what relationships CUI:161 participates in (forward only)
+        let rels_involving_161: Vec<&(String, String, String)> = relationships.iter()
+            .filter(|(r1, _, r2)| r1 == "161" || r2 == "161")
+            .take(10)
+            .collect();
+        let tradename_of_derived = roles_of.values()
+            .filter(|props| props.iter().any(|(p, _)| p == "tradename_of"))
+            .count();
+        let tradename_of_161_count = roles_of.values()
+            .filter(|props| props.iter().any(|(p, v)| p == "tradename_of" && v == "CUI:161"))
+            .count();
+        eprintln!("[rxnorm-diag2] BN total={} with_isa={} with_IN_parent={} tradename_of_derived={} tradename_of→161={}",
+            bn_concepts.len(), bn_with_any_isa, bn_with_in_parent, tradename_of_derived, tradename_of_161_count);
+        eprintln!("[rxnorm-diag2] sample BN {:?} isa parents (rxcui,tty): {:?}", sample_bn_with_isa, sample_parents);
+        eprintln!("[rxnorm-diag2] rels involving CUI:161: {:?}", rels_involving_161);
+    }
+    // ── End diagnostics ──────────────────────────────────────────────────────
+
     let meta = CodeSystemMeta {
         id: RXNORM_ID,
         url: RXNORM_URL,
