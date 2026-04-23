@@ -137,6 +137,58 @@ pub async fn import_rxnorm_rrf(
         props.dedup();
     }
 
+    // ── Diagnostics (temporary — helps identify root cause of EX06) ──────────
+    {
+        let has_tradename_count = relationships
+            .iter()
+            .filter(|(_, r, _)| r == "has_tradename")
+            .count();
+        let tradename_of_count = relationships
+            .iter()
+            .filter(|(_, r, _)| r == "tradename_of")
+            .count();
+        let tradename_to_161 = relationships
+            .iter()
+            .filter(|(_, r, rxcui2)| r == "tradename_of" && rxcui2 == "161")
+            .count();
+        let has_tradename_from_161 = relationships
+            .iter()
+            .filter(|(rxcui1, r, _)| r == "has_tradename" && rxcui1 == "161")
+            .count();
+        let rxcui161_in_concepts = concepts.contains_key("161");
+        let bn_concepts_count = concepts.values().filter(|(_, tty)| tty == "BN").count();
+        // Sample the first 5 tradename_of relationships so we can see what rxcui2 values look like.
+        let sample: Vec<_> = relationships
+            .iter()
+            .filter(|(_, r, _)| r == "tradename_of")
+            .take(5)
+            .collect();
+        eprintln!(
+            "[rxnorm-diag] tradename_of={tradename_of_count} has_tradename={has_tradename_count} \
+             tradename_of→161={tradename_to_161} has_tradename_from_161={has_tradename_from_161} \
+             161_active={rxcui161_in_concepts} BN_concepts={bn_concepts_count}"
+        );
+        eprintln!("[rxnorm-diag] sample tradename_of rows (rxcui1,rxcui2): {sample:?}");
+        // Also show any roles stored on concept 161 and whether any concept has tradename_of=CUI:161.
+        if let Some(roles) = roles_of.get("161") {
+            eprintln!("[rxnorm-diag] roles on CUI:161 → {roles:?}");
+        } else {
+            eprintln!("[rxnorm-diag] CUI:161 has NO roles stored");
+        }
+        let tradename_of_161_count = roles_of
+            .values()
+            .filter(|props| {
+                props
+                    .iter()
+                    .any(|(p, v)| p == "tradename_of" && v == "CUI:161")
+            })
+            .count();
+        eprintln!(
+            "[rxnorm-diag] concepts with tradename_of=CUI:161 stored: {tradename_of_161_count}"
+        );
+    }
+    // ── End diagnostics ───────────────────────────────────────────────────────
+
     let meta = CodeSystemMeta {
         id: RXNORM_ID,
         url: RXNORM_URL,
