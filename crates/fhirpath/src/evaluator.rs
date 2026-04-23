@@ -3559,11 +3559,7 @@ fn call_function(
                 // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
                 // Collections handled by initial check
-                EvaluationResult::Collection {
-                    items: _,
-                    has_undefined_order: _,
-                    ..
-                } => unreachable!(),
+                EvaluationResult::Collection { .. } => unreachable!(),
                 // Check convertibility for single items
                 EvaluationResult::Boolean(_, _) => EvaluationResult::boolean(true), // Booleans can convert (1.0 or 0.0)
                 EvaluationResult::Integer(_, _) => EvaluationResult::boolean(true), // Integers can convert
@@ -3588,11 +3584,7 @@ fn call_function(
                 // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
                 // Collections handled by initial check
-                EvaluationResult::Collection {
-                    items: _,
-                    has_undefined_order: _,
-                    ..
-                } => unreachable!(),
+                EvaluationResult::Collection { .. } => unreachable!(),
                 // Check convertibility for single items
                 EvaluationResult::Integer(_, _) => EvaluationResult::boolean(true),
                 EvaluationResult::String(s, _) => {
@@ -6246,7 +6238,6 @@ fn call_function(
                         EvaluationResult::Empty => (),
                         EvaluationResult::Collection {
                             items: children_items,
-                            has_undefined_order: _, // Children's order doesn't change descendant's undefined nature
                             ..
                         } => {
                             all_descendants.extend(children_items.clone());
