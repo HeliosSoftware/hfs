@@ -425,6 +425,8 @@ fn parse_relationships(
     errors: &mut Vec<String>,
 ) -> Result<Vec<(String, String, String)>, HtsError> {
     let mut relationships: Vec<(String, String, String)> = Vec::new();
+    // Diagnostic: collect up to 20 RXNREL rows that involve a BN concept (any RELA/REL).
+    let mut bn_rows: Vec<String> = Vec::new();
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| {
@@ -444,8 +446,20 @@ fn parse_relationships(
 
         let rxcui1 = fields[0];
         let rxcui2 = fields[4];
-        let rela = fields[7];
-        let sab = fields[10];
+        let rel   = fields[3];
+        let rela  = fields[7];
+        let sab   = fields[10];
+
+        // Diagnostic: log raw RXNREL rows for BN concepts (before any filtering).
+        if bn_rows.len() < 20 && sab == "RXNORM" {
+            let c1_tty = active_concepts.get(rxcui1).map(|(_, t)| t.as_str()).unwrap_or("?");
+            let c2_tty = active_concepts.get(rxcui2).map(|(_, t)| t.as_str()).unwrap_or("?");
+            if c1_tty == "BN" || c2_tty == "BN" {
+                bn_rows.push(format!(
+                    "({rxcui1}/{c1_tty}) REL={rel} RELA={rela:?} ({rxcui2}/{c2_tty})"
+                ));
+            }
+        }
 
         // Only RxNorm-sourced, named relationships (rela must be non-empty).
         if sab != "RXNORM" || rela.is_empty() {
@@ -460,6 +474,8 @@ fn parse_relationships(
 
         relationships.push((rxcui1.to_string(), rela.to_string(), rxcui2.to_string()));
     }
+
+    eprintln!("[rxnorm-diag3] BN-related RXNREL rows (first 20, before filters): {bn_rows:?}");
 
     relationships.sort_unstable();
     relationships.dedup();
