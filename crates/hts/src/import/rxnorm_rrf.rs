@@ -40,6 +40,10 @@ const RXNORM_TITLE: &str = "RxNorm — NLM Drug Terminology";
 /// which direction the source file uses.
 fn inverse_rela(rela: &str) -> Option<&'static str> {
     match rela {
+        // tradename_of appears in RXNREL as (IN, tradename_of, BN): the BN is the
+        // tradename of the IN.  Storing the self-inverse gives BN: tradename_of=CUI:IN,
+        // which is what FHIR property filters (TTY=BN AND tradename_of=CUI:161) need.
+        "tradename_of" => Some("tradename_of"),
         "has_tradename" => Some("tradename_of"),
         "ingredient_of" => Some("has_ingredient"),
         "dose_form_of" => Some("has_dose_form"),
@@ -49,6 +53,18 @@ fn inverse_rela(rela: &str) -> Option<&'static str> {
         "constitutes" => Some("reformulated_to"),
         "reformulation_of" => Some("has_reformulated_drug"),
         _ => None,
+    }
+}
+
+/// Normalize a RXNREL RELA to the canonical FHIR property name for storage.
+///
+/// `has_tradename` (BN → IN direction in RXNREL) carries the same semantic as
+/// `tradename_of` and is stored under that name so FHIR property filters are
+/// direction-independent.
+fn canonical_rela(rela: &str) -> &str {
+    match rela {
+        "has_tradename" => "tradename_of",
+        other => other,
     }
 }
 
@@ -112,15 +128,17 @@ pub async fn import_rxnorm_rrf(
                 .or_default()
                 .push(rxcui2.clone());
         } else {
-            // Forward: store the relationship as-is on rxcui1.
+            // Forward: store the canonical property name on rxcui1.
+            // `has_tradename` (BN→IN) is normalized to `tradename_of` so BN concepts
+            // end up with tradename_of=CUI:IN matching FHIR property filter expectations.
+            let prop = canonical_rela(rela);
             roles_of
                 .entry(rxcui1.clone())
                 .or_default()
-                .push((rela.clone(), format!("CUI:{rxcui2}")));
-            // Inverse: some relationships in RXNREL only appear in one direction
-            // (e.g. IN→has_tradename→BN but NOT BN→tradename_of→IN). Store the
-            // semantic inverse on rxcui2 so property filters work regardless of
-            // which direction the row appears in the source file.
+                .push((prop.to_string(), format!("CUI:{rxcui2}")));
+            // Inverse: store the semantic inverse on rxcui2 so filters work regardless
+            // of which direction a relationship appears in the source file.
+            // tradename_of is self-inverse: (IN, tradename_of, BN) also gives BN: tradename_of=CUI:IN.
             if let Some(inv) = inverse_rela(rela) {
                 roles_of
                     .entry(rxcui2.clone())
@@ -136,80 +154,6 @@ pub async fn import_rxnorm_rrf(
         props.sort_unstable();
         props.dedup();
     }
-
-    // In RxNorm, BN (brand name) concepts are linked to their ingredient (IN/MIN) via `isa`
-    // hierarchy, not via a direct RXNREL `tradename_of` row. RXNREL `tradename_of` only
-    // appears between SBD (branded drug) and SCD (clinical drug) formulations. Derive the
-    // FHIR `tradename_of` property for each BN concept from its `isa` parents that are IN or MIN.
-    for (rxcui, (_, tty)) in &concepts {
-        if tty == "BN" {
-            if let Some(parents) = parents_of.get(rxcui) {
-                for parent_rxcui in parents {
-                    if let Some((_, parent_tty)) = concepts.get(parent_rxcui) {
-                        if parent_tty == "IN" || parent_tty == "MIN" {
-                            roles_of
-                                .entry(rxcui.clone())
-                                .or_default()
-                                .push(("tradename_of".to_string(), format!("CUI:{parent_rxcui}")));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for props in roles_of.values_mut() {
-        props.sort_unstable();
-        props.dedup();
-    }
-
-    // ── Diagnostics (temporary — understand BN→isa structure) ────────────────
-    {
-        let bn_concepts: Vec<&String> = concepts
-            .iter()
-            .filter(|(_, (_, tty))| tty == "BN")
-            .map(|(rxcui, _)| rxcui)
-            .collect();
-        let bn_with_any_isa = bn_concepts
-            .iter()
-            .filter(|rxcui| parents_of.contains_key(**rxcui))
-            .count();
-        let bn_with_in_parent = bn_concepts
-            .iter()
-            .filter(|rxcui| {
-                parents_of.get(**rxcui).map(|parents| {
-                    parents.iter().any(|p| {
-                        concepts.get(p).map(|(_, tty)| tty == "IN" || tty == "MIN").unwrap_or(false)
-                    })
-                }).unwrap_or(false)
-            })
-            .count();
-        // Show what isa parents exist for a sample BN concept (the first one that has isa parents)
-        let sample_bn_with_isa = bn_concepts.iter()
-            .find(|rxcui| parents_of.contains_key(**rxcui));
-        let sample_parents: Vec<(String, String)> = sample_bn_with_isa
-            .and_then(|rxcui| parents_of.get(*rxcui))
-            .map(|parents| parents.iter()
-                .take(5)
-                .map(|p| (p.clone(), concepts.get(p).map(|(_, tty)| tty.clone()).unwrap_or("?".into())))
-                .collect())
-            .unwrap_or_default();
-        // Show what relationships CUI:161 participates in (forward only)
-        let rels_involving_161: Vec<&(String, String, String)> = relationships.iter()
-            .filter(|(r1, _, r2)| r1 == "161" || r2 == "161")
-            .take(10)
-            .collect();
-        let tradename_of_derived = roles_of.values()
-            .filter(|props| props.iter().any(|(p, _)| p == "tradename_of"))
-            .count();
-        let tradename_of_161_count = roles_of.values()
-            .filter(|props| props.iter().any(|(p, v)| p == "tradename_of" && v == "CUI:161"))
-            .count();
-        eprintln!("[rxnorm-diag2] BN total={} with_isa={} with_IN_parent={} tradename_of_derived={} tradename_of→161={}",
-            bn_concepts.len(), bn_with_any_isa, bn_with_in_parent, tradename_of_derived, tradename_of_161_count);
-        eprintln!("[rxnorm-diag2] sample BN {:?} isa parents (rxcui,tty): {:?}", sample_bn_with_isa, sample_parents);
-        eprintln!("[rxnorm-diag2] rels involving CUI:161: {:?}", rels_involving_161);
-    }
-    // ── End diagnostics ──────────────────────────────────────────────────────
 
     let meta = CodeSystemMeta {
         id: RXNORM_ID,
@@ -425,8 +369,6 @@ fn parse_relationships(
     errors: &mut Vec<String>,
 ) -> Result<Vec<(String, String, String)>, HtsError> {
     let mut relationships: Vec<(String, String, String)> = Vec::new();
-    // Diagnostic: collect up to 20 RXNREL rows that involve a BN concept (any RELA/REL).
-    let mut bn_rows: Vec<String> = Vec::new();
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| {
@@ -446,20 +388,8 @@ fn parse_relationships(
 
         let rxcui1 = fields[0];
         let rxcui2 = fields[4];
-        let rel   = fields[3];
-        let rela  = fields[7];
-        let sab   = fields[10];
-
-        // Diagnostic: log raw RXNREL rows for BN concepts (before any filtering).
-        if bn_rows.len() < 20 && sab == "RXNORM" {
-            let c1_tty = active_concepts.get(rxcui1).map(|(_, t)| t.as_str()).unwrap_or("?");
-            let c2_tty = active_concepts.get(rxcui2).map(|(_, t)| t.as_str()).unwrap_or("?");
-            if c1_tty == "BN" || c2_tty == "BN" {
-                bn_rows.push(format!(
-                    "({rxcui1}/{c1_tty}) REL={rel} RELA={rela:?} ({rxcui2}/{c2_tty})"
-                ));
-            }
-        }
+        let rela = fields[7];
+        let sab = fields[10];
 
         // Only RxNorm-sourced, named relationships (rela must be non-empty).
         if sab != "RXNORM" || rela.is_empty() {
@@ -474,8 +404,6 @@ fn parse_relationships(
 
         relationships.push((rxcui1.to_string(), rela.to_string(), rxcui2.to_string()));
     }
-
-    eprintln!("[rxnorm-diag3] BN-related RXNREL rows (first 20, before filters): {bn_rows:?}");
 
     relationships.sort_unstable();
     relationships.dedup();
@@ -706,9 +634,9 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         assert_eq!(count_rows(&backend, "code_systems"), 1);
         assert_eq!(count_rows(&backend, "concepts"), 4);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
-        // One TTY property per concept + one tradename_of for Tylenol
+        // One TTY property per concept + two tradename_of rows (BN→IN and IN→BN endpoints).
         assert_eq!(count_property(&backend, "TTY"), 4);
-        assert_eq!(count_property(&backend, "tradename_of"), 1);
+        assert_eq!(count_property(&backend, "tradename_of"), 2);
     }
 
     #[tokio::test]
@@ -788,7 +716,7 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         assert_eq!(count_rows(&backend, "concepts"), 4);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
         assert_eq!(count_property(&backend, "TTY"), 4);
-        assert_eq!(count_property(&backend, "tradename_of"), 1);
+        assert_eq!(count_property(&backend, "tradename_of"), 2);
     }
 
     #[tokio::test]
@@ -923,11 +851,11 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
             .await
             .unwrap();
 
-        // Verify the inverse property was stored on the BN concept.
+        // tradename_of is stored on both endpoints: BN (→IN) and IN (→BN).
         assert_eq!(
             count_property(&backend, "tradename_of"),
-            1,
-            "tradename_of property must be derived from has_tradename inverse"
+            2,
+            "tradename_of must be stored on both BN and IN endpoints"
         );
 
         // Verify expand with TTY=BN AND tradename_of=CUI:1049502 returns Tylenol.
@@ -957,76 +885,6 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         assert!(
             codes.contains(&"198444"),
             "Tylenol (198444) must appear when filtering via inverse has_tradename; got: {codes:?}"
-        );
-    }
-
-    /// Real RxNorm: BN→IN linkage comes only from the `isa` hierarchy — no `tradename_of` or
-    /// `has_tradename` row exists in RXNREL for that pair.  This matches the CI finding
-    /// where acetaminophen (CUI:161) had zero tradename_of/has_tradename rows on either side.
-    #[tokio::test]
-    async fn expand_property_filters_via_isa_derived_tradename_of() {
-        use crate::traits::ValueSetOperations;
-        use crate::types::ExpandRequest;
-
-        let conso = "\
-1049502|ENG|P|L0000001|PF|S0000001|Y|1049502|||1049502|RXNORM|IN|1049502|acetaminophen|0|N|\n\
-198444|ENG|P|L0000002|PF|S0000002|Y|198444|||198444|RXNORM|BN|198444|Tylenol|0|N|\n";
-        // Only isa edge — no tradename_of or has_tradename in RXNREL.
-        let rels = "\
-198444||RXCUI|RN|1049502||RXCUI|isa|RUI001||RXNORM|||N|N|N|\n";
-
-        let dir = tempfile::tempdir().unwrap();
-        {
-            use std::io::Write;
-            std::fs::File::create(dir.path().join("RXNCONSO.RRF"))
-                .unwrap()
-                .write_all(conso.as_bytes())
-                .unwrap();
-            std::fs::File::create(dir.path().join("RXNREL.RRF"))
-                .unwrap()
-                .write_all(rels.as_bytes())
-                .unwrap();
-        }
-
-        let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let ctx = TenantContext::system();
-
-        import_rxnorm_rrf(&backend, &ctx, dir.path(), 500, false)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            count_property(&backend, "tradename_of"),
-            1,
-            "tradename_of must be derived from BN isa IN when no direct RXNREL row exists"
-        );
-
-        let resp = backend
-            .expand(
-                &ctx,
-                ExpandRequest {
-                    value_set: Some(serde_json::json!({
-                        "resourceType": "ValueSet",
-                        "compose": {
-                            "include": [{
-                                "system": RXNORM_URL,
-                                "filter": [
-                                    {"property": "TTY",          "op": "=", "value": "BN"},
-                                    {"property": "tradename_of", "op": "=", "value": "CUI:1049502"}
-                                ]
-                            }]
-                        }
-                    })),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
-        assert!(
-            codes.contains(&"198444"),
-            "Tylenol must appear when tradename_of is derived from isa hierarchy; got: {codes:?}"
         );
     }
 
@@ -1061,11 +919,11 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
             .await
             .unwrap();
 
-        // Dedup must eliminate the extra tradename_of generated by the inverse of has_tradename.
+        // After dedup: exactly one tradename_of per concept (BN→IN and IN→BN).
         assert_eq!(
             count_property(&backend, "tradename_of"),
-            1,
-            "dedup must prevent duplicate tradename_of rows when both directions are in RXNREL"
+            2,
+            "dedup must keep exactly one tradename_of per concept when both directions are in RXNREL"
         );
     }
 
@@ -1097,6 +955,6 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         assert_eq!(count_rows(&backend, "concepts"), 4);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 2);
         assert_eq!(count_property(&backend, "TTY"), 4);
-        assert_eq!(count_property(&backend, "tradename_of"), 1);
+        assert_eq!(count_property(&backend, "tradename_of"), 2);
     }
 }
