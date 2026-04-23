@@ -201,7 +201,7 @@ pub fn assert_has_info(issues: &[ValidationIssue]) {
 pub fn assert_no_errors(issues: &[ValidationIssue]) {
     let errors: Vec<_> = issues
         .iter()
-        .filter(|i| matches!(i.severity, Severity::Error | Severity::Fatal ))
+        .filter(|i| matches!(i.severity, Severity::Error | Severity::Fatal))
         .collect();
 
     assert!(

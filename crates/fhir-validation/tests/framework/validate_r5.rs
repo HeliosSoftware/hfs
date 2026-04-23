@@ -1,6 +1,6 @@
 mod tests {
 
-
+    use crate::common::fixtures::{load_profile, local_terminology_r5};
     use fhir_validation::profile::extract::extract_r5_structure_definition_profile;
     use fhir_validation::profile::profile_registry::ProfileRegistry;
     use fhir_validation::profile::types::{
@@ -16,7 +16,6 @@ mod tests {
     use helios_fhir::r5::StructureDefinition;
     use helios_fhir::r5::{Bundle, Parameters, Patient, Resource};
     use serde_json::json;
-    use crate::common::fixtures::{load_profile, local_terminology_r5};
 
     fn validator() -> Validator {
         Validator::default()
