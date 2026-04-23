@@ -280,6 +280,9 @@ jobs:
           echo "Running ${#TESTS[@]} test(s) × ${#VUS_LIST[@]} VU level(s) × $DURATION each"
           echo ""
 
+          # handleSummary() in k6/lib/runner.js writes to results/${RUN_ID}/${server}/benchmark/
+          mkdir -p "results/${{ github.run_id }}/hts/benchmark"
+
           for TEST in "${TESTS[@]}"; do
             TEST="${TEST// /}"
             [ -z "$TEST" ] && continue
@@ -292,6 +295,9 @@ jobs:
               k6 run \
                 --env BASE_URL="http://localhost:${{ env.HTS_PORT }}" \
                 --env SERVER_NAME=hts \
+                --env RUN_ID="${{ github.run_id }}" \
+                --env TEST_ID="$TEST" \
+                --env VUS="$VU" \
                 --duration "$DURATION" \
                 --vus "$VU" \
                 --summary-export "results/${{ github.run_id }}/hts/${TEST}_vu${VU}.json" \
