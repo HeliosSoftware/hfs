@@ -94,9 +94,16 @@ impl SearchResult {
             bundle = bundle.with_total(total);
         }
 
-        // Add next link if there's more data
+        // Add next link if there's more data. The self_link already contains
+        // the request's query string (potentially including a `_cursor` param
+        // from the previous page), so we strip any existing `_cursor=` and
+        // append the new one with the correct delimiter.
         if let Some(ref cursor) = self.resources.page_info.next_cursor {
-            bundle = bundle.with_next_link(format!("{}?_cursor={}", self_link, cursor));
+            bundle = bundle.with_next_link(replace_cursor_param(self_link, cursor));
+        }
+
+        if let Some(ref cursor) = self.resources.page_info.previous_cursor {
+            bundle = bundle.with_previous_link(replace_cursor_param(self_link, cursor));
         }
 
         // Add matching resources
@@ -119,6 +126,40 @@ impl SearchResult {
 
         bundle
     }
+}
+
+/// Returns `url` with any existing `_cursor=…` query parameter replaced by the
+/// supplied opaque `cursor` value. Used to build pagination links from the
+/// request's self URL.
+///
+/// Cursors are base64-url-safe so they don't need percent-encoding; the only
+/// surgery required is splitting on the first `?`, dropping any pre-existing
+/// `_cursor` pair, and re-joining with `&`. This is what makes the difference
+/// between
+///
+/// ```text
+/// .../Patient?_count=3&_elements=id?_cursor=…   // wrong: literal `?` mid-query
+/// ```
+///
+/// and the spec-compliant
+///
+/// ```text
+/// .../Patient?_count=3&_elements=id&_cursor=…
+/// ```
+fn replace_cursor_param(url: &str, cursor: &str) -> String {
+    let (base, query) = match url.find('?') {
+        Some(pos) => (&url[..pos], &url[pos + 1..]),
+        None => (url, ""),
+    };
+
+    let mut parts: Vec<String> = query
+        .split('&')
+        .filter(|p| !p.is_empty() && !p.starts_with("_cursor="))
+        .map(str::to_string)
+        .collect();
+    parts.push(format!("_cursor={}", cursor));
+
+    format!("{}?{}", base, parts.join("&"))
 }
 
 /// Basic search provider for single resource type queries.
@@ -475,5 +516,82 @@ mod tests {
 
         assert_eq!(bundle.total, Some(1));
         assert_eq!(bundle.entry.len(), 1);
+    }
+
+    /// Self-link has no query: cursor is appended with `?` (issue #69 bug 1).
+    #[test]
+    fn test_replace_cursor_param_no_query() {
+        let url = replace_cursor_param("http://example.com/fhir/Patient", "abc");
+        assert_eq!(url, "http://example.com/fhir/Patient?_cursor=abc");
+    }
+
+    /// Self-link already has params: cursor is joined with `&`, not `?`. This is
+    /// the core regression — see issue #69. A literal `?` mid-query made
+    /// `urljoin` percent-encode the cursor delimiter, breaking pagination.
+    #[test]
+    fn test_replace_cursor_param_with_existing_params() {
+        let url = replace_cursor_param(
+            "http://example.com/fhir/Patient?_count=3&_elements=id",
+            "abc",
+        );
+        assert_eq!(
+            url,
+            "http://example.com/fhir/Patient?_count=3&_elements=id&_cursor=abc"
+        );
+    }
+
+    /// When the self-link already carries the previous page's cursor (because
+    /// the request URL is reused as the self link), the old cursor is dropped
+    /// before the new one is appended — otherwise pages accumulate stale
+    /// cursors and the next link grows unbounded.
+    #[test]
+    fn test_replace_cursor_param_replaces_existing_cursor() {
+        let url = replace_cursor_param(
+            "http://example.com/fhir/Patient?_count=3&_cursor=old&_elements=id",
+            "new",
+        );
+        assert!(url.starts_with("http://example.com/fhir/Patient?"));
+        assert!(url.contains("_count=3"));
+        assert!(url.contains("_elements=id"));
+        assert!(url.contains("_cursor=new"));
+        assert!(!url.contains("_cursor=old"));
+        assert_eq!(url.matches("_cursor=").count(), 1);
+    }
+
+    /// `to_bundle` should produce a `next` link whose URL contains exactly one
+    /// `_cursor` and uses `&` between query params.
+    #[test]
+    fn test_to_bundle_next_link_format() {
+        let page = Page::new(
+            Vec::<StoredResource>::new(),
+            PageInfo {
+                next_cursor: Some("CURSOR_VALUE".to_string()),
+                previous_cursor: None,
+                total: None,
+                has_next: true,
+                has_previous: false,
+            },
+        );
+        let result = SearchResult::new(page);
+
+        let bundle = result.to_bundle(
+            "http://example.com/fhir",
+            "http://example.com/fhir/Patient?_count=3&_elements=id",
+        );
+
+        let next = bundle
+            .link
+            .iter()
+            .find(|l| l.relation == "next")
+            .expect("next link present");
+        assert_eq!(
+            next.url,
+            "http://example.com/fhir/Patient?_count=3&_elements=id&_cursor=CURSOR_VALUE"
+        );
+        assert_eq!(
+            next.url.matches('?').count(),
+            1,
+            "exactly one '?' delimiter"
+        );
     }
 }
