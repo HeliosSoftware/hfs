@@ -253,8 +253,20 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
         if entry_name.contains("concept_full") || entry_name.contains("description_full") {
             return Some(ImportFormat::SnomedRf2);
         }
-        if entry_name.ends_with("loinctable.csv") {
-            return Some(ImportFormat::Loinc);
+        // Match the LOINC main table however it is named inside the ZIP.
+        // Official LOINC ZIPs use various layouts:
+        //   - Flat:  LoincTable.csv  (older releases)
+        //   - Flat:  Loinc.csv       (some releases)
+        //   - Nested: Loinc_2.77/LoincTable.csv
+        //   - Nested: Loinc_2.77/Loinc.csv
+        // The importer's find_loinc_paths() accepts any file whose filename
+        // starts with "loinc" and does not contain "panel" (to exclude panel
+        // supplements). Mirror that logic here so detection and parsing agree.
+        {
+            let fname = entry_name.rsplit('/').next().unwrap_or(&entry_name);
+            if fname.ends_with(".csv") && fname.starts_with("loinc") && !fname.contains("panel") {
+                return Some(ImportFormat::Loinc);
+            }
         }
         if entry_name.ends_with("rxnconso.rrf") {
             return Some(ImportFormat::Rxnorm);
@@ -429,6 +441,37 @@ mod tests {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
             let opts = zip::write::FileOptions::default();
             zip.start_file("LoincTable.csv", opts).unwrap();
+            zip.write_all(b"dummy").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Loinc));
+    }
+
+    #[test]
+    fn detect_zip_loinc_plain_name() {
+        // Some LOINC releases ship as Loinc.csv (without "Table").
+        // detect_zip_format must still detect these as LOINC.
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("Loinc_2.80/Loinc.csv", opts).unwrap();
+            zip.write_all(b"dummy").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Loinc));
+    }
+
+    #[test]
+    fn detect_zip_loinc_nested_table() {
+        // LOINC ≥ 2.77 ships as Loinc_<ver>/LoincTable.csv (nested layout).
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("Loinc_2.77/LoincTable.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
         }
