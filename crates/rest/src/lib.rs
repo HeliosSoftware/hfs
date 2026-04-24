@@ -148,6 +148,7 @@ pub mod responses;
 pub mod routing;
 pub mod state;
 pub mod tenant;
+pub mod terminology;
 
 // Re-export commonly used types
 pub use config::{MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode};
@@ -158,7 +159,7 @@ pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
 
 use std::sync::Arc;
 
-use axum::Router;
+use axum::{Router, extract::DefaultBodyLimit};
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
 };
@@ -305,7 +306,10 @@ where
             .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
             .unwrap_or(false);
         if subscriptions_enabled {
-            let sub_config = helios_subscriptions::SubscriptionConfig::default();
+            let sub_config = helios_subscriptions::SubscriptionConfig {
+                supported_channel_types: vec!["rest-hook".to_string(), "websocket".to_string()],
+                ..Default::default()
+            };
             let engine =
                 helios_subscriptions::SubscriptionEngine::new(sub_config, config.base_url.clone());
             info!("Subscriptions engine ENABLED");
@@ -358,6 +362,15 @@ where
     } else {
         router
     };
+
+    // Raise the body-size limit from axum's 2 MiB default to the configured
+    // ceiling. Without this, `HFS_MAX_BODY_SIZE` / `--max-body-size` has no
+    // effect on the REST router: individual batch/transaction handlers read
+    // their body via `axum::body::to_bytes(..., config.max_body_size)`, but
+    // axum's `DefaultBodyLimit` extractor runs first and rejects any request
+    // > 2 MiB with 413 "length limit exceeded" before the handler is called.
+    // Mirrors the pattern already used in `crates/sof/src/server.rs`.
+    let router = router.layer(DefaultBodyLimit::max(config.max_body_size));
 
     // Apply remaining middleware
     router.layer(service_builder)

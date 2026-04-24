@@ -184,19 +184,17 @@ impl<S: ResourceStorage> AppState<S> {
         self.config.return_gone
     }
 
-    /// Returns the auth configuration.
+    /// Returns a reference to the auth configuration.
     pub fn auth_config(&self) -> &AuthConfig {
         &self.auth_config
     }
 
-    /// Returns the auth middleware state if auth is enabled.
-    pub fn auth_state(&self) -> Option<&Arc<AuthMiddlewareState>> {
-        self.auth.as_ref()
-    }
-
-    /// Returns whether authentication is enabled.
-    pub fn auth_enabled(&self) -> bool {
-        self.auth.is_some()
+    /// Returns the configured terminology server URL, if any.
+    ///
+    /// When `Some`, the search handler will use this URL to expand ValueSets
+    /// for `:in` and `:not-in` search modifiers.
+    pub fn terminology_server_url(&self) -> Option<&str> {
+        self.config.terminology_server.as_deref()
     }
 
     /// Returns the audit sink for handler-level audit emission, if configured.

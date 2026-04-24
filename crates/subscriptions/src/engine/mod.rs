@@ -8,9 +8,13 @@ pub mod retry;
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
 use crate::channels::rest_hook::RestHookChannel;
+use crate::channels::websocket::WebSocketChannel;
+use crate::channels::ws_manager::WebSocketManager;
+use crate::channels::ws_token::WsBindingTokenManager;
 use crate::channels::{ChannelDispatcher, DispatchResult};
 use crate::config::SubscriptionConfig;
 use crate::evaluator::EventEvaluator;
@@ -27,9 +31,13 @@ use crate::topics::InMemoryTopicRegistry;
 /// (fire-and-forget via `tokio::spawn`), mirroring the audit middleware pattern.
 pub struct SubscriptionEngine {
     topic_registry: Arc<InMemoryTopicRegistry>,
+    topic_resource_index: DashMap<(String, String, String), String>,
     manager: Arc<SubscriptionManager>,
     evaluator: EventEvaluator,
     rest_hook_channel: Arc<RestHookChannel>,
+    ws_manager: Arc<WebSocketManager>,
+    ws_channel: Arc<WebSocketChannel>,
+    ws_token_manager: Arc<WsBindingTokenManager>,
     config: SubscriptionConfig,
     base_url: String,
 }
@@ -44,12 +52,19 @@ impl SubscriptionEngine {
         ));
         let evaluator = EventEvaluator::new(Arc::clone(&topic_registry), Arc::clone(&manager));
         let rest_hook_channel = Arc::new(RestHookChannel::new());
+        let ws_manager = Arc::new(WebSocketManager::new());
+        let ws_channel = Arc::new(WebSocketChannel::new(Arc::clone(&ws_manager)));
+        let ws_token_manager = Arc::new(WsBindingTokenManager::new(config.ws_token_lifetime_secs));
 
         Self {
             topic_registry,
+            topic_resource_index: DashMap::new(),
             manager,
             evaluator,
             rest_hook_channel,
+            ws_manager,
+            ws_channel,
+            ws_token_manager,
             config,
             base_url,
         }
@@ -65,11 +80,21 @@ impl SubscriptionEngine {
         &self.manager
     }
 
+    /// Returns a reference to the WebSocket manager.
+    pub fn ws_manager(&self) -> &Arc<WebSocketManager> {
+        &self.ws_manager
+    }
+
+    /// Returns a reference to the WebSocket binding token manager.
+    pub fn ws_token_manager(&self) -> &Arc<WsBindingTokenManager> {
+        &self.ws_token_manager
+    }
+
     /// Called after a resource write has been committed.
     ///
     /// This method:
     /// 1. Handles subscription/topic lifecycle events (if the written resource
-    ///    is a Subscription or SubscriptionTopic).
+    ///    is a Subscription, SubscriptionTopic, or an R4 backport Basic topic).
     /// 2. Evaluates the event against all active subscriptions.
     /// 3. Builds and dispatches notifications.
     pub async fn on_resource_event(&self, event: ResourceEvent) {
@@ -82,6 +107,11 @@ impl SubscriptionEngine {
             "SubscriptionTopic" => {
                 self.handle_topic_event(&event).await;
                 return;
+            }
+            "Basic" => {
+                if self.handle_r4_basic_topic_event(&event).await {
+                    return;
+                }
             }
             _ => {}
         }
@@ -101,13 +131,15 @@ impl SubscriptionEngine {
 
         // Build and dispatch notifications for each match.
         for eval_match in matches {
-            let subscription = &eval_match.subscription;
+            let mut subscription = eval_match.subscription;
 
             // Increment event counter.
             let event_number = self
                 .manager
                 .increment_event_count(&subscription.tenant_id, &subscription.id)
                 .unwrap_or(0);
+            // Ensure notification metadata reflects the event being emitted.
+            subscription.events_since_start = event_number;
 
             let event_data = NotificationEventData {
                 event_number,
@@ -117,7 +149,7 @@ impl SubscriptionEngine {
 
             // Build notification bundle.
             let bundle = match notification::build_event_notification(
-                subscription,
+                &subscription,
                 event_data,
                 event.resource.as_ref(),
                 &self.base_url,
@@ -134,7 +166,7 @@ impl SubscriptionEngine {
             };
 
             // Dispatch with retry.
-            self.dispatch_with_retry(subscription, &bundle).await;
+            self.dispatch_with_retry(&subscription, &bundle).await;
         }
     }
 
@@ -146,6 +178,8 @@ impl SubscriptionEngine {
         match event.event_type {
             ResourceEventType::Delete => {
                 self.manager.deregister(&tenant_id, subscription_id);
+                self.ws_manager
+                    .remove_all_clients(&tenant_id, subscription_id);
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
@@ -177,22 +211,81 @@ impl SubscriptionEngine {
 
     /// Handle a SubscriptionTopic resource event.
     async fn handle_topic_event(&self, event: &ResourceEvent) {
+        let topic_key = (
+            event.tenant_id.to_string(),
+            event.resource_type.clone(),
+            event.resource_id.clone(),
+        );
+
         match event.event_type {
             ResourceEventType::Delete => {
-                // Remove topic by canonical URL (we'd need to look it up).
-                // For now, we can't easily remove without knowing the canonical URL.
-                // This will be handled via a full registry refresh.
-                info!(
-                    resource_id = %event.resource_id,
-                    "SubscriptionTopic deleted"
-                );
+                let mut candidate_urls = Vec::new();
+
+                if let Some((_, indexed_url)) = self.topic_resource_index.remove(&topic_key) {
+                    candidate_urls.push(indexed_url);
+                }
+
+                if let Some(resource) = &event.resource {
+                    match InMemoryTopicRegistry::parse_topic_resource(resource) {
+                        Ok(topic) => candidate_urls.push(topic.canonical_url),
+                        Err(e) => {
+                            warn!(
+                                resource_id = %event.resource_id,
+                                error = %e,
+                                "Failed to parse SubscriptionTopic delete payload"
+                            );
+                        }
+                    }
+                }
+
+                if let Some(previous_resource) = &event.previous_resource {
+                    match InMemoryTopicRegistry::parse_topic_resource(previous_resource) {
+                        Ok(topic) => candidate_urls.push(topic.canonical_url),
+                        Err(e) => {
+                            warn!(
+                                resource_id = %event.resource_id,
+                                error = %e,
+                                "Failed to parse previous SubscriptionTopic state"
+                            );
+                        }
+                    }
+                }
+
+                candidate_urls.sort();
+                candidate_urls.dedup();
+
+                if candidate_urls.is_empty() {
+                    warn!(
+                        resource_id = %event.resource_id,
+                        "SubscriptionTopic deleted but canonical URL could not be resolved"
+                    );
+                    return;
+                }
+
+                for canonical_url in candidate_urls {
+                    let removed = self.topic_registry.remove_topic(&canonical_url);
+                    info!(
+                        resource_id = %event.resource_id,
+                        topic_url = %canonical_url,
+                        removed,
+                        "SubscriptionTopic deleted"
+                    );
+                }
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
                     match InMemoryTopicRegistry::parse_topic_resource(resource) {
                         Ok(topic) => {
+                            let canonical_url = topic.canonical_url.clone();
+                            if let Some(previous_url) = self
+                                .topic_resource_index
+                                .insert(topic_key, canonical_url.clone())
+                                .filter(|previous_url| previous_url != &canonical_url)
+                            {
+                                let _ = self.topic_registry.remove_topic(&previous_url);
+                            }
                             info!(
-                                topic_url = %topic.canonical_url,
+                                topic_url = %canonical_url,
                                 "Registered SubscriptionTopic"
                             );
                             self.topic_registry.add_topic(topic);
@@ -205,6 +298,120 @@ impl SubscriptionEngine {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Handle an R4 backport `Basic` topic event.
+    ///
+    /// Returns `true` when the `Basic` resource was recognized as a topic lifecycle
+    /// event (including malformed topic candidates), `false` otherwise.
+    async fn handle_r4_basic_topic_event(&self, event: &ResourceEvent) -> bool {
+        if event.fhir_version.as_str() != "R4" {
+            return false;
+        }
+
+        let topic_key = (
+            event.tenant_id.to_string(),
+            event.resource_type.clone(),
+            event.resource_id.clone(),
+        );
+
+        match event.event_type {
+            ResourceEventType::Delete => {
+                let mut candidate_urls = Vec::new();
+                let mut recognized_topic = false;
+
+                if let Some((_, indexed_url)) = self.topic_resource_index.remove(&topic_key) {
+                    candidate_urls.push(indexed_url);
+                    recognized_topic = true;
+                }
+
+                if let Some(resource) = &event.resource {
+                    match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource) {
+                        Ok(Some(topic)) => {
+                            candidate_urls.push(topic.canonical_url);
+                            recognized_topic = true;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(
+                                resource_id = %event.resource_id,
+                                error = %e,
+                                "Failed to parse R4 Basic SubscriptionTopic delete payload"
+                            );
+                            recognized_topic = true;
+                        }
+                    }
+                }
+
+                if let Some(previous_resource) = &event.previous_resource {
+                    match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(
+                        previous_resource,
+                    ) {
+                        Ok(Some(topic)) => {
+                            candidate_urls.push(topic.canonical_url);
+                            recognized_topic = true;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(
+                                resource_id = %event.resource_id,
+                                error = %e,
+                                "Failed to parse previous R4 Basic SubscriptionTopic state"
+                            );
+                            recognized_topic = true;
+                        }
+                    }
+                }
+
+                candidate_urls.sort();
+                candidate_urls.dedup();
+
+                for canonical_url in candidate_urls {
+                    let removed = self.topic_registry.remove_topic(&canonical_url);
+                    info!(
+                        resource_id = %event.resource_id,
+                        topic_url = %canonical_url,
+                        removed,
+                        "R4 Basic SubscriptionTopic deleted"
+                    );
+                }
+
+                recognized_topic
+            }
+            ResourceEventType::Create | ResourceEventType::Update => {
+                if let Some(resource) = &event.resource {
+                    match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource) {
+                        Ok(Some(topic)) => {
+                            let canonical_url = topic.canonical_url.clone();
+                            if let Some(previous_url) = self
+                                .topic_resource_index
+                                .insert(topic_key, canonical_url.clone())
+                                .filter(|previous_url| previous_url != &canonical_url)
+                            {
+                                let _ = self.topic_registry.remove_topic(&previous_url);
+                            }
+                            info!(
+                                topic_url = %canonical_url,
+                                "Registered R4 Basic SubscriptionTopic"
+                            );
+                            self.topic_registry.add_topic(topic);
+                            true
+                        }
+                        Ok(None) => false,
+                        Err(e) => {
+                            warn!(
+                                resource_id = %event.resource_id,
+                                error = %e,
+                                "Failed to parse R4 Basic SubscriptionTopic"
+                            );
+                            true
+                        }
+                    }
+                } else {
+                    false
                 }
             }
         }
@@ -231,6 +438,11 @@ impl SubscriptionEngine {
         let result = match subscription.channel.channel_type {
             ChannelType::RestHook => {
                 self.rest_hook_channel
+                    .handshake(subscription, &handshake_bundle)
+                    .await
+            }
+            ChannelType::Websocket => {
+                self.ws_channel
                     .handshake(subscription, &handshake_bundle)
                     .await
             }
@@ -280,6 +492,7 @@ impl SubscriptionEngine {
 
         let dispatcher: &dyn ChannelDispatcher = match subscription.channel.channel_type {
             ChannelType::RestHook => self.rest_hook_channel.as_ref(),
+            ChannelType::Websocket => self.ws_channel.as_ref(),
             _ => {
                 warn!(
                     subscription_id = sub_id,
@@ -443,6 +656,40 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "R4")]
+    fn r4_basic_topic_event() -> ResourceEvent {
+        ResourceEvent {
+            tenant_id: TenantId::new("t1"),
+            fhir_version: FhirVersion::R4,
+            resource_type: "Basic".to_string(),
+            resource_id: "topic-basic-1".to_string(),
+            version_id: "1".to_string(),
+            event_type: ResourceEventType::Create,
+            resource: Some(json!({
+                "resourceType": "Basic",
+                "id": "topic-basic-1",
+                "code": {
+                    "coding": [{
+                        "system": "http://hl7.org/fhir/fhir-types",
+                        "code": "SubscriptionTopic"
+                    }]
+                },
+                "extension": [{
+                    "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url",
+                    "valueUri": "http://example.org/topic/encounter-start-basic"
+                }, {
+                    "url": "http://hl7.org/fhir/4.3/StructureDefinition/extension-SubscriptionTopic.resourceTrigger",
+                    "extension": [
+                        { "url": "resource", "valueUri": "http://hl7.org/fhir/StructureDefinition/Encounter" },
+                        { "url": "supportedInteraction", "valueCode": "create" }
+                    ]
+                }]
+            })),
+            previous_resource: None,
+            timestamp: Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn test_topic_event_registers_topic() {
         let engine = make_engine("http://localhost:8080");
@@ -454,6 +701,43 @@ mod tests {
         let topics = engine.topic_registry().list_topics();
         assert_eq!(topics.len(), 1);
         assert!(topics.contains(&"http://example.org/topic/encounter-start".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_topic_delete_event_removes_topic_without_payload() {
+        let engine = make_engine("http://localhost:8080");
+        engine.on_resource_event(topic_event()).await;
+
+        let delete_event = ResourceEvent {
+            tenant_id: TenantId::new("t1"),
+            fhir_version: FhirVersion::default(),
+            resource_type: "SubscriptionTopic".to_string(),
+            resource_id: "topic-1".to_string(),
+            version_id: "2".to_string(),
+            event_type: ResourceEventType::Delete,
+            resource: None,
+            previous_resource: None,
+            timestamp: Utc::now(),
+        };
+
+        engine.on_resource_event(delete_event).await;
+
+        let topics = engine.topic_registry().list_topics();
+        assert!(topics.is_empty());
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_r4_basic_topic_event_registers_topic() {
+        let engine = make_engine("http://localhost:8080");
+
+        assert!(engine.topic_registry().list_topics().is_empty());
+
+        engine.on_resource_event(r4_basic_topic_event()).await;
+
+        let topics = engine.topic_registry().list_topics();
+        assert_eq!(topics.len(), 1);
+        assert!(topics.contains(&"http://example.org/topic/encounter-start-basic".to_string()));
     }
 
     #[tokio::test]

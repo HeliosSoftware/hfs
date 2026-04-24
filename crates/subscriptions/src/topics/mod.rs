@@ -9,6 +9,14 @@ use std::sync::RwLock;
 use crate::error::SubscriptionError;
 use crate::event::ResourceEventType;
 
+const FHIR_TYPES_SYSTEM: &str = "http://hl7.org/fhir/fhir-types";
+const SUBSCRIPTION_TOPIC_CODE: &str = "SubscriptionTopic";
+const EXT_TOPIC_URL_SUFFIX: &str = "extension-SubscriptionTopic.url";
+const EXT_TOPIC_TITLE_SUFFIX: &str = "extension-SubscriptionTopic.title";
+const EXT_TOPIC_RESOURCE_TRIGGER_SUFFIX: &str = "extension-SubscriptionTopic.resourceTrigger";
+const EXT_TOPIC_CAN_FILTER_BY_SUFFIX: &str = "extension-SubscriptionTopic.canFilterBy";
+const EXT_TOPIC_NOTIFICATION_SHAPE_SUFFIX: &str = "extension-SubscriptionTopic.notificationShape";
+
 /// A version-agnostic representation of a `SubscriptionTopic`.
 #[derive(Debug, Clone)]
 pub struct TopicDefinition {
@@ -179,6 +187,55 @@ impl InMemoryTopicRegistry {
             notification_shape,
         })
     }
+
+    /// Parses an R4 backport `Basic` topic into a [`TopicDefinition`].
+    ///
+    /// Returns:
+    /// - `Ok(Some(topic))` when the resource is a strict backport topic
+    /// - `Ok(None)` when the resource is `Basic` but not a topic
+    /// - `Err` when the resource is marked as a topic but malformed
+    pub fn parse_r4_backport_basic_topic_resource(
+        resource: &serde_json::Value,
+    ) -> Result<Option<TopicDefinition>, SubscriptionError> {
+        if resource.get("resourceType").and_then(|v| v.as_str()) != Some("Basic") {
+            return Ok(None);
+        }
+
+        if !has_subscription_topic_basic_code(resource) {
+            return Ok(None);
+        }
+
+        let canonical_url =
+            find_top_level_extension_value_string(resource, EXT_TOPIC_URL_SUFFIX, &["valueUri"])
+                .ok_or_else(|| SubscriptionError::InvalidSubscription {
+                    message: "R4 Basic SubscriptionTopic missing canonical url extension"
+                        .to_string(),
+                })?;
+
+        let title = find_top_level_extension_value_string(
+            resource,
+            EXT_TOPIC_TITLE_SUFFIX,
+            &["valueString"],
+        );
+
+        let resource_triggers = parse_r4_basic_resource_triggers(resource)?;
+        if resource_triggers.is_empty() {
+            return Err(SubscriptionError::InvalidSubscription {
+                message: "R4 Basic SubscriptionTopic missing resourceTrigger extension".to_string(),
+            });
+        }
+
+        let can_filter_by = parse_r4_basic_can_filter_by(resource);
+        let notification_shape = parse_r4_basic_notification_shape(resource);
+
+        Ok(Some(TopicDefinition {
+            canonical_url,
+            title,
+            resource_triggers,
+            can_filter_by,
+            notification_shape,
+        }))
+    }
 }
 
 impl Default for InMemoryTopicRegistry {
@@ -314,6 +371,219 @@ fn parse_notification_shape(resource: &serde_json::Value) -> Vec<NotificationSha
                         .collect()
                 })
                 .unwrap_or_default();
+
+            Some(NotificationShape {
+                resource_type,
+                include,
+            })
+        })
+        .collect()
+}
+
+fn has_subscription_topic_basic_code(resource: &serde_json::Value) -> bool {
+    resource
+        .get("code")
+        .and_then(|v| v.get("coding"))
+        .and_then(|v| v.as_array())
+        .map(|coding| {
+            coding.iter().any(|entry| {
+                entry.get("system").and_then(|v| v.as_str()) == Some(FHIR_TYPES_SYSTEM)
+                    && entry.get("code").and_then(|v| v.as_str()) == Some(SUBSCRIPTION_TOPIC_CODE)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn extension_url_matches_suffix(ext: &serde_json::Value, suffix: &str) -> bool {
+    ext.get("url")
+        .and_then(|v| v.as_str())
+        .map(|url| url.ends_with(suffix))
+        .unwrap_or(false)
+}
+
+fn find_top_level_extension_value_string(
+    resource: &serde_json::Value,
+    suffix: &str,
+    value_keys: &[&str],
+) -> Option<String> {
+    resource
+        .get("extension")?
+        .as_array()?
+        .iter()
+        .find(|ext| extension_url_matches_suffix(ext, suffix))
+        .and_then(|ext| {
+            for key in value_keys {
+                if let Some(value) = ext.get(*key).and_then(|v| v.as_str()) {
+                    return Some(value.to_string());
+                }
+            }
+            None
+        })
+}
+
+fn find_nested_extension_value_string(
+    ext: &serde_json::Value,
+    key: &str,
+    value_keys: &[&str],
+) -> Option<String> {
+    ext.get("extension")?.as_array()?.iter().find_map(|nested| {
+        if nested.get("url").and_then(|v| v.as_str()) != Some(key) {
+            return None;
+        }
+
+        for value_key in value_keys {
+            if let Some(value) = nested.get(*value_key).and_then(|v| v.as_str()) {
+                return Some(value.to_string());
+            }
+        }
+        None
+    })
+}
+
+fn find_all_nested_extension_values_string(
+    ext: &serde_json::Value,
+    key: &str,
+    value_keys: &[&str],
+) -> Vec<String> {
+    ext.get("extension")
+        .and_then(|v| v.as_array())
+        .map(|nested| {
+            nested
+                .iter()
+                .filter(|item| item.get("url").and_then(|v| v.as_str()) == Some(key))
+                .filter_map(|item| {
+                    for value_key in value_keys {
+                        if let Some(value) = item.get(*value_key).and_then(|v| v.as_str()) {
+                            return Some(value.to_string());
+                        }
+                    }
+                    None
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_resource_type_from_uri(uri: &str) -> String {
+    if let Some(resource_type) = uri.rsplit('/').next() {
+        return resource_type.to_string();
+    }
+    uri.to_string()
+}
+
+fn parse_r4_basic_resource_triggers(
+    resource: &serde_json::Value,
+) -> Result<Vec<ResourceTrigger>, SubscriptionError> {
+    let trigger_exts = resource
+        .get("extension")
+        .and_then(|v| v.as_array())
+        .map(|exts| {
+            exts.iter()
+                .filter(|ext| extension_url_matches_suffix(ext, EXT_TOPIC_RESOURCE_TRIGGER_SUFFIX))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut triggers = Vec::new();
+    for trigger_ext in trigger_exts {
+        let resource_uri =
+            find_nested_extension_value_string(trigger_ext, "resource", &["valueUri"]).ok_or_else(
+                || SubscriptionError::InvalidSubscription {
+                    message: "R4 Basic SubscriptionTopic trigger missing resource".to_string(),
+                },
+            )?;
+        let resource_type = parse_resource_type_from_uri(&resource_uri);
+
+        let interactions = find_all_nested_extension_values_string(
+            trigger_ext,
+            "supportedInteraction",
+            &["valueCode"],
+        )
+        .iter()
+        .filter_map(|code| match code.as_str() {
+            "create" => Some(ResourceEventType::Create),
+            "update" => Some(ResourceEventType::Update),
+            "delete" => Some(ResourceEventType::Delete),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+        if interactions.is_empty() {
+            return Err(SubscriptionError::InvalidSubscription {
+                message: "R4 Basic SubscriptionTopic trigger missing supportedInteraction"
+                    .to_string(),
+            });
+        }
+
+        let fhirpath_criteria =
+            find_nested_extension_value_string(trigger_ext, "fhirPathCriteria", &["valueString"]);
+
+        triggers.push(ResourceTrigger {
+            resource_type,
+            interactions,
+            fhirpath_criteria,
+        });
+    }
+
+    Ok(triggers)
+}
+
+fn parse_r4_basic_can_filter_by(resource: &serde_json::Value) -> Vec<FilterDefinition> {
+    let can_filter_by_exts = resource
+        .get("extension")
+        .and_then(|v| v.as_array())
+        .map(|exts| {
+            exts.iter()
+                .filter(|ext| extension_url_matches_suffix(ext, EXT_TOPIC_CAN_FILTER_BY_SUFFIX))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    can_filter_by_exts
+        .iter()
+        .filter_map(|ext| {
+            let filter_parameter =
+                find_nested_extension_value_string(ext, "filterParameter", &["valueString"])?;
+
+            let resource_type =
+                find_nested_extension_value_string(ext, "resource", &["valueUri", "valueString"])
+                    .map(|value| parse_resource_type_from_uri(&value));
+
+            let comparators =
+                find_all_nested_extension_values_string(ext, "comparator", &["valueCode"]);
+            let modifiers =
+                find_all_nested_extension_values_string(ext, "modifier", &["valueCode"]);
+
+            Some(FilterDefinition {
+                resource_type,
+                filter_parameter,
+                comparators,
+                modifiers,
+            })
+        })
+        .collect()
+}
+
+fn parse_r4_basic_notification_shape(resource: &serde_json::Value) -> Vec<NotificationShape> {
+    let shape_exts = resource
+        .get("extension")
+        .and_then(|v| v.as_array())
+        .map(|exts| {
+            exts.iter()
+                .filter(|ext| {
+                    extension_url_matches_suffix(ext, EXT_TOPIC_NOTIFICATION_SHAPE_SUFFIX)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    shape_exts
+        .iter()
+        .filter_map(|ext| {
+            let resource_type =
+                find_nested_extension_value_string(ext, "resource", &["valueUri", "valueString"])
+                    .map(|value| parse_resource_type_from_uri(&value))?;
+            let include = find_all_nested_extension_values_string(ext, "include", &["valueString"]);
 
             Some(NotificationShape {
                 resource_type,
@@ -564,5 +834,92 @@ mod tests {
         let topic = InMemoryTopicRegistry::parse_topic_resource(&topic_json).unwrap();
         let trigger = &topic.resource_triggers[0];
         assert_eq!(trigger.interactions.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_r4_backport_basic_topic_resource() {
+        let topic_json = json!({
+            "resourceType": "Basic",
+            "id": "topic-basic-1",
+            "code": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/fhir-types",
+                    "code": "SubscriptionTopic"
+                }]
+            },
+            "extension": [
+                {
+                    "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url",
+                    "valueUri": "http://example.org/topic/basic-encounter"
+                },
+                {
+                    "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.title",
+                    "valueString": "Basic Encounter Topic"
+                },
+                {
+                    "url": "http://hl7.org/fhir/4.3/StructureDefinition/extension-SubscriptionTopic.resourceTrigger",
+                    "extension": [
+                        { "url": "resource", "valueUri": "http://hl7.org/fhir/StructureDefinition/Encounter" },
+                        { "url": "supportedInteraction", "valueCode": "create" }
+                    ]
+                }
+            ]
+        });
+
+        let topic = InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(&topic_json)
+            .unwrap()
+            .expect("basic topic should parse");
+        assert_eq!(
+            topic.canonical_url,
+            "http://example.org/topic/basic-encounter"
+        );
+        assert_eq!(topic.title.as_deref(), Some("Basic Encounter Topic"));
+        assert_eq!(topic.resource_triggers.len(), 1);
+        assert_eq!(topic.resource_triggers[0].resource_type, "Encounter");
+        assert_eq!(topic.resource_triggers[0].interactions.len(), 1);
+        assert!(
+            topic.resource_triggers[0]
+                .interactions
+                .contains(&ResourceEventType::Create)
+        );
+    }
+
+    #[test]
+    fn test_parse_r4_backport_basic_topic_requires_subscriptiontopic_code() {
+        let basic_json = json!({
+            "resourceType": "Basic",
+            "code": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/fhir-types",
+                    "code": "OtherType"
+                }]
+            },
+            "extension": [{
+                "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url",
+                "valueUri": "http://example.org/topic/basic-encounter"
+            }]
+        });
+
+        let result =
+            InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(&basic_json).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_r4_backport_basic_topic_missing_core_extensions_errors() {
+        let malformed_topic = json!({
+            "resourceType": "Basic",
+            "code": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/fhir-types",
+                    "code": "SubscriptionTopic"
+                }]
+            },
+            "extension": []
+        });
+
+        let result =
+            InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(&malformed_topic);
+        assert!(result.is_err());
     }
 }

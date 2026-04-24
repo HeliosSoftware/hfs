@@ -2,8 +2,9 @@
 //!
 //! This crate implements the [FHIR Subscriptions Framework](https://build.fhir.org/subscriptions.html)
 //! for the Helios FHIR Server. It supports topic-based subscriptions across all
-//! FHIR versions (R4, R4B, R5, R6), with R4/R4B using the
-//! [Subscriptions R5 Backport IG](https://build.fhir.org/ig/HL7/fhir-subscription-backport-ig/).
+//! FHIR versions (R4, R4B, R5, R6), with R4 using the
+//! [Subscriptions R5 Backport IG](https://build.fhir.org/ig/HL7/fhir-subscription-backport-ig/)
+//! and R4B/R5/R6 using native subscription resources.
 //!
 //! # Architecture
 //!
@@ -29,6 +30,8 @@ pub mod notification;
 pub mod topics;
 
 // Re-export key types for convenience.
+pub use channels::ws_manager::WebSocketManager;
+pub use channels::ws_token::WsBindingTokenManager;
 pub use config::SubscriptionConfig;
 pub use engine::SubscriptionEngine;
 pub use error::SubscriptionError;

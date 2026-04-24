@@ -431,10 +431,15 @@ fn extract_channel_config(
                 .unwrap_or_default();
 
             // Payload content from backport extension.
-            let payload_content = find_extension_value_code(
-                resource,
-                "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
-            )
+            // Prefer channel._payload extension (spec-compliant) and fall back
+            // to root extension for backward compatibility.
+            let payload_content = find_channel_payload_content_code(resource)
+                .or_else(|| {
+                    find_extension_value_code(
+                        resource,
+                        "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+                    )
+                })
             .and_then(|s| PayloadContent::from_fhir_str(&s))
             .unwrap_or(PayloadContent::IdOnly);
 
@@ -557,11 +562,16 @@ fn extract_filter_criteria(resource: &serde_json::Value, fhir_version: FhirVersi
                     let param = f.get("filterParameter")?.as_str()?;
                     let value = f.get("value")?.as_str()?;
                     let resource_type = f.get("resourceType").and_then(|v| v.as_str());
+                    let comparator = f.get("comparator").and_then(|v| v.as_str());
+                    let value_with_comparator = comparator
+                        .filter(|c| !c.is_empty())
+                        .map(|c| format!("{c}:{value}"))
+                        .unwrap_or_else(|| value.to_string());
 
                     let filter_str = if let Some(rt) = resource_type {
-                        format!("{rt}?{param}={value}")
+                        format!("{rt}?{param}={value_with_comparator}")
                     } else {
-                        format!("{param}={value}")
+                        format!("{param}={value_with_comparator}")
                     };
 
                     Some(filter_str)
@@ -574,6 +584,7 @@ fn extract_filter_criteria(resource: &serde_json::Value, fhir_version: FhirVersi
 // --- Extension helpers for R4 backport ---
 
 /// Find a single extension with the given URL and return its `valueUrl`.
+#[cfg(feature = "R4")]
 fn find_extension_value_url(resource: &serde_json::Value, url: &str) -> Option<String> {
     resource
         .get("extension")?
@@ -586,6 +597,7 @@ fn find_extension_value_url(resource: &serde_json::Value, url: &str) -> Option<S
 }
 
 /// Find a single extension with the given URL and return its `valueCode`.
+#[cfg(feature = "R4")]
 fn find_extension_value_code(resource: &serde_json::Value, url: &str) -> Option<String> {
     resource
         .get("extension")?
@@ -597,7 +609,27 @@ fn find_extension_value_code(resource: &serde_json::Value, url: &str) -> Option<
         .map(String::from)
 }
 
+#[cfg(feature = "R4")]
+fn find_channel_payload_content_code(resource: &serde_json::Value) -> Option<String> {
+    resource
+        .get("channel")?
+        .get("_payload")?
+        .get("extension")?
+        .as_array()?
+        .iter()
+        .find(|ext| {
+            ext.get("url").and_then(|v| v.as_str())
+                == Some(
+                    "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+                )
+        })
+        .and_then(|ext| ext.get("valueCode"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
 /// Find a single extension with the given URL and return its `valueUnsignedInt`.
+#[cfg(feature = "R4")]
 fn find_extension_value_unsigned_int(resource: &serde_json::Value, url: &str) -> Option<u32> {
     resource
         .get("extension")?
@@ -610,6 +642,7 @@ fn find_extension_value_unsigned_int(resource: &serde_json::Value, url: &str) ->
 }
 
 /// Find all extensions with the given URL and return their `valueString` values.
+#[cfg(feature = "R4")]
 fn find_all_extension_values_string(resource: &serde_json::Value, url: &str) -> Vec<String> {
     resource
         .get("extension")
@@ -730,6 +763,21 @@ pub(crate) mod tests {
         })
     }
 
+    #[cfg(feature = "R5")]
+    fn non_r4_test_version() -> FhirVersion {
+        FhirVersion::R5
+    }
+
+    #[cfg(all(not(feature = "R5"), feature = "R4B"))]
+    fn non_r4_test_version() -> FhirVersion {
+        FhirVersion::R4B
+    }
+
+    #[cfg(all(not(feature = "R5"), not(feature = "R4B"), feature = "R6"))]
+    fn non_r4_test_version() -> FhirVersion {
+        FhirVersion::R6
+    }
+
     #[test]
     fn test_register_r5_subscription() {
         let registry = create_test_registry();
@@ -752,6 +800,47 @@ pub(crate) mod tests {
         assert_eq!(sub.events_since_start, 0);
     }
 
+    #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
+    #[test]
+    fn test_register_native_subscription_topic_and_channeltype_parsing() {
+        let registry = create_test_registry();
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+
+        let resource = json!({
+            "resourceType": "Subscription",
+            "id": "sub-native-1",
+            "status": "requested",
+            "topic": "http://example.org/topic/encounter-start",
+            "channelType": {
+                "system": "http://terminology.hl7.org/CodeSystem/subscription-channel-type",
+                "code": "rest-hook"
+            },
+            "endpoint": "https://example.com/webhook",
+            "contentType": "application/fhir+json",
+            "content": "id-only",
+            "parameter": [{
+                "name": "Authorization",
+                "value": "Bearer native-token"
+            }]
+        });
+
+        let sub = manager
+            .register("tenant-1", "sub-native-1", &resource, non_r4_test_version())
+            .unwrap();
+
+        assert_eq!(sub.topic_url, "http://example.org/topic/encounter-start");
+        assert_eq!(sub.channel.channel_type, ChannelType::RestHook);
+        assert_eq!(
+            sub.channel.endpoint.as_deref(),
+            Some("https://example.com/webhook")
+        );
+        assert_eq!(sub.channel.payload_content, PayloadContent::IdOnly);
+        assert_eq!(
+            sub.channel.headers,
+            vec!["Authorization: Bearer native-token".to_string()]
+        );
+    }
+
     #[cfg(feature = "R4")]
     #[test]
     fn test_register_r4_subscription_with_backport_extensions() {
@@ -769,6 +858,37 @@ pub(crate) mod tests {
         assert_eq!(sub.channel.heartbeat_period, Some(60));
         assert_eq!(sub.channel.headers.len(), 1);
         assert!(sub.channel.headers[0].contains("Authorization"));
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn test_register_r4_subscription_payload_content_in_channel_payload_extension() {
+        let registry = create_test_registry();
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+
+        let resource = json!({
+            "resourceType": "Subscription",
+            "id": "sub-r4-2",
+            "status": "requested",
+            "criteria": "http://example.org/topic/encounter-start",
+            "channel": {
+                "type": "rest-hook",
+                "endpoint": "https://example.com/webhook",
+                "payload": "application/fhir+json",
+                "_payload": {
+                    "extension": [{
+                        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+                        "valueCode": "empty"
+                    }]
+                }
+            }
+        });
+
+        let sub = manager
+            .register("tenant-1", "sub-r4-2", &resource, FhirVersion::R4)
+            .unwrap();
+
+        assert_eq!(sub.channel.payload_content, PayloadContent::Empty);
     }
 
     /// Build a version-appropriate subscription JSON with custom topic/channel.
@@ -1007,46 +1127,55 @@ pub(crate) mod tests {
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         #[cfg(feature = "R4")]
-        let resource = json!({
-            "resourceType": "Subscription",
-            "status": "requested",
-            "criteria": "http://example.org/topic/encounter-start",
-            "channel": {
-                "type": "rest-hook",
-                "endpoint": "https://example.com/webhook"
-            },
-            "extension": [
-                {
-                    "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-topic-canonical",
-                    "valueCanonical": "http://example.org/topic/encounter-start"
+        let (resource, fhir_version) = (
+            json!({
+                "resourceType": "Subscription",
+                "status": "requested",
+                "criteria": "http://example.org/topic/encounter-start",
+                "channel": {
+                    "type": "rest-hook",
+                    "endpoint": "https://example.com/webhook"
                 },
-                {
-                    "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
-                    "valueCode": "full-resource"
-                },
-                {
-                    "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-filter-criteria",
-                    "valueString": "Encounter?patient=Patient/123"
-                }
-            ]
-        });
-        #[cfg(not(feature = "R4"))]
-        let resource = json!({
-            "resourceType": "Subscription",
-            "status": "requested",
-            "topic": "http://example.org/topic/encounter-start",
-            "channelType": { "code": "rest-hook" },
-            "endpoint": "https://example.com/webhook",
-            "content": "full-resource",
-            "filterBy": [{
-                "resourceType": "Encounter",
-                "filterParameter": "patient",
-                "value": "Patient/123"
-            }]
-        });
+                "extension": [
+                    {
+                        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-topic-canonical",
+                        "valueCanonical": "http://example.org/topic/encounter-start"
+                    },
+                    {
+                        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+                        "valueCode": "full-resource"
+                    },
+                    {
+                        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-filter-criteria",
+                        "valueString": "Encounter?patient=Patient/123"
+                    }
+                ]
+            }),
+            FhirVersion::R4,
+        );
+        #[cfg(all(
+            not(feature = "R4"),
+            any(feature = "R4B", feature = "R5", feature = "R6")
+        ))]
+        let (resource, fhir_version) = (
+            json!({
+                "resourceType": "Subscription",
+                "status": "requested",
+                "topic": "http://example.org/topic/encounter-start",
+                "channelType": { "code": "rest-hook" },
+                "endpoint": "https://example.com/webhook",
+                "content": "full-resource",
+                "filterBy": [{
+                    "resourceType": "Encounter",
+                    "filterParameter": "patient",
+                    "value": "Patient/123"
+                }]
+            }),
+            non_r4_test_version(),
+        );
 
         let sub = manager
-            .register("t1", "sub-1", &resource, FhirVersion::default())
+            .register("t1", "sub-1", &resource, fhir_version)
             .unwrap();
 
         assert_eq!(sub.filters.len(), 1);
@@ -1055,32 +1184,12 @@ pub(crate) mod tests {
         assert_eq!(sub.channel.payload_content, PayloadContent::FullResource);
     }
 
+    #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
     #[test]
-    fn test_register_with_invalid_filter() {
+    fn test_register_with_native_filter_by_comparator() {
         let registry = create_test_registry();
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
-        #[cfg(feature = "R4")]
-        let resource = json!({
-            "resourceType": "Subscription",
-            "status": "requested",
-            "criteria": "http://example.org/topic/encounter-start",
-            "channel": {
-                "type": "rest-hook",
-                "endpoint": "https://example.com/webhook"
-            },
-            "extension": [
-                {
-                    "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-topic-canonical",
-                    "valueCanonical": "http://example.org/topic/encounter-start"
-                },
-                {
-                    "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-filter-criteria",
-                    "valueString": "unknown-param=some-value"
-                }
-            ]
-        });
-        #[cfg(not(feature = "R4"))]
         let resource = json!({
             "resourceType": "Subscription",
             "status": "requested",
@@ -1088,12 +1197,71 @@ pub(crate) mod tests {
             "channelType": { "code": "rest-hook" },
             "endpoint": "https://example.com/webhook",
             "filterBy": [{
-                "filterParameter": "unknown-param",
-                "value": "some-value"
+                "resourceType": "Encounter",
+                "filterParameter": "patient",
+                "comparator": "eq",
+                "value": "Patient/123"
             }]
         });
 
-        let result = manager.register("t1", "sub-1", &resource, FhirVersion::default());
+        let sub = manager
+            .register("t1", "sub-1", &resource, non_r4_test_version())
+            .unwrap();
+
+        assert_eq!(sub.filters.len(), 1);
+        assert_eq!(sub.filters[0].filter_parameter, "patient");
+        assert_eq!(sub.filters[0].comparator, "eq");
+        assert_eq!(sub.filters[0].value, "Patient/123");
+    }
+
+    #[test]
+    fn test_register_with_invalid_filter() {
+        let registry = create_test_registry();
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+
+        #[cfg(feature = "R4")]
+        let (resource, fhir_version) = (
+            json!({
+                "resourceType": "Subscription",
+                "status": "requested",
+                "criteria": "http://example.org/topic/encounter-start",
+                "channel": {
+                    "type": "rest-hook",
+                    "endpoint": "https://example.com/webhook"
+                },
+                "extension": [
+                    {
+                        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-topic-canonical",
+                        "valueCanonical": "http://example.org/topic/encounter-start"
+                    },
+                    {
+                        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-filter-criteria",
+                        "valueString": "unknown-param=some-value"
+                    }
+                ]
+            }),
+            FhirVersion::R4,
+        );
+        #[cfg(all(
+            not(feature = "R4"),
+            any(feature = "R4B", feature = "R5", feature = "R6")
+        ))]
+        let (resource, fhir_version) = (
+            json!({
+                "resourceType": "Subscription",
+                "status": "requested",
+                "topic": "http://example.org/topic/encounter-start",
+                "channelType": { "code": "rest-hook" },
+                "endpoint": "https://example.com/webhook",
+                "filterBy": [{
+                    "filterParameter": "unknown-param",
+                    "value": "some-value"
+                }]
+            }),
+            non_r4_test_version(),
+        );
+
+        let result = manager.register("t1", "sub-1", &resource, fhir_version);
         assert!(matches!(
             result,
             Err(SubscriptionError::InvalidFilter { .. })

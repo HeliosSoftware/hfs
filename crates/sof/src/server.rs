@@ -70,6 +70,7 @@
 //! - `SOF_CORS_ORIGINS` / `--cors-origins`: Allowed origins, comma-separated (default: *)
 //! - `SOF_CORS_METHODS` / `--cors-methods`: Allowed methods, comma-separated (default: *)
 //! - `SOF_CORS_HEADERS` / `--cors-headers`: Allowed headers, comma-separated (default: *)
+//! - `SOF_TERMINOLOGY_SERVER` / `--terminology-server`: Terminology server URL for FHIRPath functions
 //!
 //! ## CORS Configuration Examples
 //!
@@ -130,6 +131,8 @@ pub struct ServerConfig {
     pub cors_methods: String,
     /// Allowed CORS headers (comma-separated list, "*" for any)
     pub cors_headers: String,
+    /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
+    pub terminology_server: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -144,6 +147,7 @@ impl Default for ServerConfig {
             cors_origins: "*".to_string(),
             cors_methods: "GET,POST,PUT,DELETE,OPTIONS".to_string(),
             cors_headers: "Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With".to_string(),
+            terminology_server: None,
         }
     }
 }
@@ -164,6 +168,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
         .init();
+
+    // Propagate SOF_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
+    // FHIRPath evaluation (memberOf, subsumes, etc.) delegates terminology
+    // operations to the configured HTS instance.
+    if let Some(ref ts_url) = config.terminology_server {
+        if std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err() {
+            // SAFETY: called before any threads are spawned by the tokio runtime.
+            unsafe {
+                std::env::set_var("FHIRPATH_TERMINOLOGY_SERVER", ts_url);
+            }
+            info!(url = %ts_url, "SOF_TERMINOLOGY_SERVER wired to FHIRPath context");
+        }
+    }
 
     info!("Starting SQL-on-FHIR server...");
     info!("Configuration: {:?}", config);
@@ -255,6 +272,10 @@ fn parse_args() -> ServerConfig {
             default_value = "Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With"
         )]
         cors_headers: String,
+
+        /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
+        #[arg(long, env = "SOF_TERMINOLOGY_SERVER")]
+        terminology_server: Option<String>,
     }
 
     let args = Args::parse();
@@ -269,6 +290,7 @@ fn parse_args() -> ServerConfig {
         cors_origins: args.cors_origins,
         cors_methods: args.cors_methods,
         cors_headers: args.cors_headers,
+        terminology_server: args.terminology_server,
     }
 }
 
