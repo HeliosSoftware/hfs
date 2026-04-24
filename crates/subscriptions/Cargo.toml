@@ -45,9 +45,14 @@ uuid = { version = "1", features = ["v4"] }
 # HTTP client (rest-hook channel)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# SMTP client (email channel)
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1", "tokio1-rustls-tls", "builder", "hostname"] }
+
 # Concurrent data structures
 dashmap = "6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
+testcontainers = "0.27"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
