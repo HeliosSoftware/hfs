@@ -78,40 +78,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             let all_codes = if let Some(vs_resource) = req.value_set {
                 // Inline ValueSet: extract compose and expand directly.
-                // If any referenced system is unknown, return 404 so the caller
-                // knows we cannot service this request (e.g. SNOMED not loaded).
+                // Systems not in the DB are skipped gracefully by both
+                // expand_inline_filtered and compute_expansion (warn + continue),
+                // so we dispatch without upfront validation to allow partial
+                // results when some systems (e.g. LOINC) are not loaded.
                 let compose = &vs_resource["compose"];
-                let empty_arr = vec![];
-                let includes = compose["include"].as_array().unwrap_or(&empty_arr);
-                for inc in includes {
-                    if let Some(system_url) = inc["system"].as_str() {
-                        let content: Option<String> = conn
-                            .query_row(
-                                "SELECT content FROM code_systems WHERE url = ?1",
-                                [system_url],
-                                |row| row.get(0),
-                            )
-                            .optional()
-                            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                        match content.as_deref() {
-                            None => {
-                                return Err(HtsError::NotFound(format!(
-                                    "CodeSystem not found: {system_url}"
-                                )));
-                            }
-                            Some("not-present") | Some("example") => {
-                                return Err(HtsError::NotFound(format!(
-                                    "CodeSystem has no content loaded: {system_url}"
-                                )));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                // When a text filter is present, push it into SQL so we avoid
-                // loading all concepts from large systems (SNOMED/LOINC/RxNorm)
-                // into memory before filtering.  Without a filter, fall through
-                // to compute_expansion which handles the full compose grammar.
                 if let Some(filter) = req.filter.as_deref() {
                     expand_inline_filtered(&conn, compose, filter)?
                 } else {
@@ -2699,7 +2670,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expand_inline_valueset_unknown_system_returns_not_found() {
+    async fn expand_inline_valueset_unknown_system_returns_empty() {
+        // Unknown systems are skipped gracefully (warn + continue) so the
+        // expansion succeeds with zero results rather than returning NotFound.
+        // This allows partial results when some systems in a multi-system
+        // inline ValueSet are loaded while others are not.
         let b = backend();
 
         let inline_vs = serde_json::json!({
@@ -2709,7 +2684,7 @@ mod tests {
             }
         });
 
-        let err = b
+        let resp = b
             .expand(
                 &ctx(),
                 ExpandRequest {
@@ -2719,9 +2694,10 @@ mod tests {
                 },
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(err, HtsError::NotFound(_)));
+        assert_eq!(resp.total, Some(0));
+        assert!(resp.contains.is_empty());
     }
 
     #[tokio::test]
