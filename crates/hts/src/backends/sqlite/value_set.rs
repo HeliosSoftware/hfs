@@ -108,8 +108,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         }
                     }
                 }
-                let compose_str = compose.to_string();
-                compute_expansion(&conn, Some(&compose_str))?
+                // When a text filter is present, push it into SQL so we avoid
+                // loading all concepts from large systems (SNOMED/LOINC/RxNorm)
+                // into memory before filtering.  Without a filter, fall through
+                // to compute_expansion which handles the full compose grammar.
+                if let Some(filter) = req.filter.as_deref() {
+                    expand_inline_filtered(&conn, compose, filter)?
+                } else {
+                    let compose_str = compose.to_string();
+                    compute_expansion(&conn, Some(&compose_str))?
+                }
             } else {
                 let url = req.url.as_deref().unwrap();
                 // Resolve expansion codes — either from an explicit ValueSet or from an
@@ -463,6 +471,124 @@ fn fetch_cache(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionContains>,
     .map_err(|e| HtsError::StorageError(e.to_string()))?
     .collect::<Result<Vec<_>, _>>()
     .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Expand an inline ValueSet compose with a text filter pushed down to SQL.
+///
+/// Called instead of `compute_expansion` when the request carries a `filter`
+/// parameter and the compose is provided inline (not by URL). For each include
+/// clause the filter is applied in the database rather than loading all concepts
+/// into memory first — critical for full-system includes over large code systems
+/// such as SNOMED CT, LOINC, or RxNorm (EX07: multi-system text filter).
+///
+/// Include clauses that carry compose `filter[]` entries (ECL / is-a) are
+/// evaluated by `apply_compose_filters` and the text filter is then applied in
+/// Rust over the (already bounded) result set.  Explicit `concept[]` lists are
+/// also filtered in Rust since they are already small.
+fn expand_inline_filtered(
+    conn: &Connection,
+    compose: &serde_json::Value,
+    text_filter: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let empty_arr = vec![];
+    let includes = compose["include"].as_array().unwrap_or(&empty_arr);
+    let filter_lower = text_filter.to_lowercase();
+    let sql_pat = format!("%{filter_lower}%");
+    let mut results: Vec<ExpansionContains> = Vec::new();
+
+    for inc in includes {
+        let system_url = match inc["system"].as_str() {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+
+        let system_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = ?1",
+                [system_url],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let system_id = match system_id {
+            Some(id) => id,
+            None => {
+                tracing::warn!(
+                    system_url,
+                    "Skipping unknown system in filtered inline expand"
+                );
+                continue;
+            }
+        };
+
+        if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc)? {
+            // Compose filters (ECL/is-a) already bounded the result — apply text filter in Rust.
+            results.extend(filter_result.into_iter().filter(|c| {
+                c.code.to_lowercase().contains(&filter_lower)
+                    || c.display
+                        .as_deref()
+                        .map(|d| d.to_lowercase().contains(&filter_lower))
+                        .unwrap_or(false)
+            }));
+        } else if let Some(explicit_codes) = inc["concept"].as_array() {
+            // Explicit code list — filter in Rust (bounded by the list length).
+            let mut stmt = conn
+                .prepare_cached("SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2")
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            for entry in explicit_codes {
+                let code = match entry["code"].as_str() {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let display: Option<String> = stmt
+                    .query_row(rusqlite::params![system_id, code], |row| row.get(0))
+                    .optional()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .flatten();
+                let matches = code.to_lowercase().contains(&filter_lower)
+                    || display
+                        .as_deref()
+                        .map(|d| d.to_lowercase().contains(&filter_lower))
+                        .unwrap_or(false);
+                if matches {
+                    results.push(ExpansionContains {
+                        system: system_url.to_owned(),
+                        code: code.to_owned(),
+                        display,
+                        inactive: None,
+                        contains: vec![],
+                    });
+                }
+            }
+        } else {
+            // Full-system include with no explicit codes: push filter into SQL so we
+            // never load the entire code system into memory.
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT code, display FROM concepts \
+                     WHERE system_id = ?1 \
+                       AND (LOWER(code) LIKE ?2 OR LOWER(display) LIKE ?2) \
+                     ORDER BY code",
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![system_id, sql_pat], |row| {
+                    Ok(ExpansionContains {
+                        system: system_url.to_owned(),
+                        code: row.get(0)?,
+                        display: row.get(1)?,
+                        inactive: None,
+                        contains: vec![],
+                    })
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            results.extend(rows);
+        }
+    }
+
+    Ok(results)
 }
 
 /// Compute an expansion from the raw `compose_json`.
@@ -2617,5 +2743,140 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, HtsError::NotFound(_)));
+    }
+
+    // ── EX07: multi-system inline $expand with text filter ────────────────────
+
+    /// Two code systems, three codes each.  An inline ValueSet includes both
+    /// systems without an explicit concept list.  A text `filter` should
+    /// match only the concepts whose code or display contains the substring,
+    /// using SQL pushdown instead of loading all concepts into memory.
+    #[tokio::test]
+    async fn expand_inline_multisystem_with_text_filter_uses_sql_pushdown() {
+        let b = backend();
+
+        let bundle = r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "cs-drugs",
+                "url": "http://example.org/drugs",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  { "code": "AMP01", "display": "Amphetamine base" },
+                  { "code": "MET01", "display": "Methylamine compound" },
+                  { "code": "COD01", "display": "Codeine" }
+                ]
+              }
+            },
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "cs-obs",
+                "url": "http://example.org/observations",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  { "code": "AMP-OBS", "display": "Amphetamine screening" },
+                  { "code": "HRT-OBS", "display": "Heart rate" },
+                  { "code": "BP-OBS",  "display": "Blood pressure" }
+                ]
+              }
+            }
+          ]
+        }"#;
+
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let vs_resource: serde_json::Value = serde_json::from_str(
+            r#"{
+          "resourceType": "ValueSet",
+          "compose": {
+            "include": [
+              { "system": "http://example.org/drugs" },
+              { "system": "http://example.org/observations" }
+            ]
+          }
+        }"#,
+        )
+        .unwrap();
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(vs_resource),
+                    filter: Some("amphetamine".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(
+            codes.contains(&"AMP01"),
+            "AMP01 display contains 'amphetamine'"
+        );
+        assert!(
+            codes.contains(&"AMP-OBS"),
+            "AMP-OBS display contains 'amphetamine'"
+        );
+        assert!(!codes.contains(&"MET01"), "MET01 should not match");
+        assert!(!codes.contains(&"HRT-OBS"), "HRT-OBS should not match");
+        assert_eq!(resp.contains.len(), 2);
+    }
+
+    /// Filter matching by code (not just display).
+    #[tokio::test]
+    async fn expand_inline_filter_matches_code_substring() {
+        let b = backend();
+
+        let bundle = r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-rx",
+              "url": "http://example.org/rx",
+              "status": "active",
+              "content": "complete",
+              "concept": [
+                { "code": "AMP01", "display": "Drug one" },
+                { "code": "COD01", "display": "Drug two" }
+              ]
+            }
+          }]
+        }"#;
+
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let vs_resource: serde_json::Value = serde_json::from_str(
+            r#"{
+          "resourceType": "ValueSet",
+          "compose": { "include": [{ "system": "http://example.org/rx" }] }
+        }"#,
+        )
+        .unwrap();
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(vs_resource),
+                    filter: Some("AMP".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.contains.len(), 1);
+        assert_eq!(resp.contains[0].code, "AMP01");
     }
 }

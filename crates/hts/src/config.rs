@@ -246,7 +246,9 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
     let mut zip = zip::ZipArchive::new(file).ok()?;
 
     for i in 0..zip.len() {
-        let entry = zip.by_index(i).ok()?;
+        let Ok(entry) = zip.by_index(i) else {
+            continue; // skip unreadable entries (zip64, encoding issues, etc.)
+        };
         let entry_name = entry.name().to_lowercase();
         if entry_name.contains("concept_full") || entry_name.contains("description_full") {
             return Some(ImportFormat::SnomedRf2);
