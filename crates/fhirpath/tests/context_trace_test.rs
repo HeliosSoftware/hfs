@@ -1,5 +1,3 @@
-#![cfg(feature = "R4")]
-
 use axum::Json;
 use helios_fhirpath::handlers::evaluate_fhirpath;
 use helios_fhirpath::models::FhirPathParameters;

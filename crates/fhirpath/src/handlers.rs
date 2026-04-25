@@ -1145,10 +1145,8 @@ fn evaluation_result_to_trace_parts(result: EvaluationResult) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(any(feature = "R4", feature = "R5"))]
     use crate::models::ExtractedParameters;
     use helios_fhirpath_support::{EvaluationResult, TypeInfoResult};
-    #[cfg(any(feature = "R4", feature = "R5"))]
     use serde_json::json;
 
     #[test]
@@ -1290,7 +1288,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "R4")]
     fn test_evaluator_format_r4() {
         let params = ExtractedParameters {
             expression: Some("Patient.name".to_string()),

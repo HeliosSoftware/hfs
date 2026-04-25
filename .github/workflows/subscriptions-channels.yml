@@ -83,12 +83,13 @@ jobs:
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
 
       - name: Run unit tests
-        # --tests skips doctests; many fhirpath doctests are R4-shaped and
-        # don't compile in single-version non-R4 builds. Doctest coverage is
-        # preserved in the main ci.yml run.
+        # Keep default features (R4 + sqlite + audit) and add the matrix's
+        # extra FHIR versions on top. helios-audit is structurally R4-only,
+        # so dropping defaults breaks builds; this matrix exercises adding
+        # additional versions to the R4 baseline.
         run: |
-          cargo test --tests --no-default-features \
-            --features "${{ matrix.features }},sqlite" \
+          cargo test \
+            --features "${{ matrix.features }}" \
             -p helios-subscriptions -p helios-rest -p helios-persistence -p helios-fhirpath
 
   rest-hook-integration:
@@ -123,7 +124,7 @@ jobs:
         env:
           HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
         run: |
-          cargo test -p helios-subscriptions --no-default-features \
+          cargo test -p helios-subscriptions \
             --features "${{ matrix.features }}" --test rest_hook_integration
 
   websocket-integration:
@@ -158,7 +159,7 @@ jobs:
         env:
           HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
         run: |
-          cargo test -p helios-subscriptions --no-default-features \
+          cargo test -p helios-subscriptions \
             --features "${{ matrix.features }}" --test websocket_integration
 
   email-integration:
@@ -193,5 +194,5 @@ jobs:
         env:
           HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
         run: |
-          cargo test -p helios-subscriptions --no-default-features \
+          cargo test -p helios-subscriptions \
             --features "${{ matrix.features }}" --test email_integration

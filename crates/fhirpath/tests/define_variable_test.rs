@@ -3,8 +3,6 @@
 //! NOTE: These tests document the current limitations of defineVariable.
 //! Proper implementation requires architectural changes to support context
 //! modification through expression chains.
-#![cfg(feature = "R4")]
-
 
 #[cfg(test)]
 mod tests {

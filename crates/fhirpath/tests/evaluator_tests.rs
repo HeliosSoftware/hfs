@@ -1,5 +1,3 @@
-#![cfg(feature = "R4")]
-
 use chumsky::Parser;
 use helios_fhir::FhirResource;
 use helios_fhir::r4::{self, Boolean, Code, Date, Extension, ExtensionValue, String as FhirString};
