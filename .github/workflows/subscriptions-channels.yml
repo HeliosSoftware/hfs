@@ -85,7 +85,7 @@ jobs:
       - name: Run unit tests
         run: |
           cargo test --no-default-features \
-            --features "${{ matrix.features }}" \
+            --features "${{ matrix.features }},sqlite" \
             -p helios-subscriptions -p helios-rest -p helios-persistence -p helios-fhirpath
 
   rest-hook-integration:
