@@ -65,7 +65,7 @@ jobs:
         include: ${{ fromJSON(needs.matrix-setup.outputs.build-matrix) }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
 
@@ -83,8 +83,11 @@ jobs:
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
 
       - name: Run unit tests
+        # --tests skips doctests; many fhirpath doctests are R4-shaped and
+        # don't compile in single-version non-R4 builds. Doctest coverage is
+        # preserved in the main ci.yml run.
         run: |
-          cargo test --no-default-features \
+          cargo test --tests --no-default-features \
             --features "${{ matrix.features }},sqlite" \
             -p helios-subscriptions -p helios-rest -p helios-persistence -p helios-fhirpath
 
@@ -134,7 +137,7 @@ jobs:
         include: ${{ fromJSON(needs.matrix-setup.outputs.integration-matrix) }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
 

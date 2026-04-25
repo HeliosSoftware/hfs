@@ -82,6 +82,33 @@ use crate::parse_debug::{expression_to_debug_tree, generate_parse_debug};
 use crate::{EvaluationResult, evaluate_expression};
 use helios_fhir::{FhirResource, FhirVersion};
 
+/// Picks a FHIR version to use as the CLI default and in tests, preferring R4
+/// when enabled and otherwise falling back to the first enabled feature. This
+/// keeps the CLI usable in single-version minimal builds (e.g. R4B-only).
+fn default_fhir_version() -> FhirVersion {
+    #[cfg(feature = "R4")]
+    {
+        FhirVersion::R4
+    }
+    #[cfg(all(not(feature = "R4"), feature = "R4B"))]
+    {
+        FhirVersion::R4B
+    }
+    #[cfg(all(not(feature = "R4"), not(feature = "R4B"), feature = "R5"))]
+    {
+        FhirVersion::R5
+    }
+    #[cfg(all(
+        not(feature = "R4"),
+        not(feature = "R4B"),
+        not(feature = "R5"),
+        feature = "R6"
+    ))]
+    {
+        FhirVersion::R6
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "fhirpath-cli")]
 #[command(about = "FHIRPath CLI tool for evaluating expressions against FHIR resources")]
@@ -126,7 +153,7 @@ pub struct Args {
     pub trace: bool,
 
     /// FHIR version to use for parsing resources
-    #[arg(long, value_enum, default_value_t = FhirVersion::R4)]
+    #[arg(long, value_enum, default_value_t = default_fhir_version())]
     pub fhir_version: FhirVersion,
 
     /// Validate expression before execution
@@ -486,7 +513,7 @@ mod tests {
             parse_debug_tree: false,
             parse_debug: false,
             trace: false,
-            fhir_version: FhirVersion::R4,
+            fhir_version: default_fhir_version(),
             validate: false,
             terminology_server: None,
         }

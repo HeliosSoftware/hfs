@@ -528,18 +528,44 @@ impl TerminologyClient {
 mod tests {
     use super::*;
 
+    /// Returns whichever FHIR version is enabled, so URL-normalization tests
+    /// compile under any single-version build.
+    fn any_version() -> FhirVersion {
+        #[cfg(feature = "R4")]
+        {
+            FhirVersion::R4
+        }
+        #[cfg(all(not(feature = "R4"), feature = "R4B"))]
+        {
+            FhirVersion::R4B
+        }
+        #[cfg(all(not(feature = "R4"), not(feature = "R4B"), feature = "R5"))]
+        {
+            FhirVersion::R5
+        }
+        #[cfg(all(
+            not(feature = "R4"),
+            not(feature = "R4B"),
+            not(feature = "R5"),
+            feature = "R6"
+        ))]
+        {
+            FhirVersion::R6
+        }
+    }
+
     #[test]
     fn test_terminology_client_creation() {
-        let client = TerminologyClient::new("https://tx.fhir.org/r4/".to_string(), FhirVersion::R4);
+        let client = TerminologyClient::new("https://tx.fhir.org/r4/".to_string(), any_version());
         assert_eq!(client.base_url, "https://tx.fhir.org/r4");
     }
 
     #[test]
     fn test_base_url_normalization() {
-        let client = TerminologyClient::new("https://tx.fhir.org/r4/".to_string(), FhirVersion::R4);
+        let client = TerminologyClient::new("https://tx.fhir.org/r4/".to_string(), any_version());
         assert_eq!(client.base_url, "https://tx.fhir.org/r4");
 
-        let client2 = TerminologyClient::new("https://tx.fhir.org/r4".to_string(), FhirVersion::R4);
+        let client2 = TerminologyClient::new("https://tx.fhir.org/r4".to_string(), any_version());
         assert_eq!(client2.base_url, "https://tx.fhir.org/r4");
     }
 }

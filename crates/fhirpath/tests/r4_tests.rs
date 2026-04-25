@@ -1,3 +1,5 @@
+#![cfg(feature = "R4")]
+
 mod common;
 
 use crate::common::*;

@@ -1,3 +1,5 @@
+#![cfg(feature = "R4")]
+
 use chumsky::Parser;
 use helios_fhir::FhirVersion;
 use helios_fhirpath::{

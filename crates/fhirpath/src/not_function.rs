@@ -96,7 +96,7 @@ pub fn not_function(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "R4"))]
 mod tests {
     use super::*;
     use crate::EvaluationContext;

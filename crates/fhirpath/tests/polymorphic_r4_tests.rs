@@ -1,3 +1,5 @@
+#![cfg(feature = "R4")]
+
 use helios_fhir::r4;
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
 use helios_fhirpath_support::EvaluationResult;
