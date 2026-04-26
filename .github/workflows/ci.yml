@@ -298,7 +298,9 @@ jobs:
         run: cargo install cargo-llvm-cov
 
       - name: Generate code coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        # Skip docker-dependent email integration tests; they run in
+        # subscriptions-channels.yml where mailpit is provisioned.
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info -- --skip email_
 
       # Upload coverage report as artifact
       - name: Upload Coverage Report

@@ -31,6 +31,9 @@ pub struct SubscriptionConfig {
 
     /// Lifetime of WebSocket binding tokens in seconds.
     pub ws_token_lifetime_secs: i64,
+
+    /// SMTP settings for the email channel. `None` disables the email dispatcher.
+    pub smtp: Option<SmtpSettings>,
 }
 
 impl Default for SubscriptionConfig {
@@ -45,6 +48,40 @@ impl Default for SubscriptionConfig {
             off_threshold: 10,
             supported_channel_types: vec!["rest-hook".to_string()],
             ws_token_lifetime_secs: 30,
+            smtp: None,
         }
     }
+}
+
+/// SMTP transport encryption mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtpEncryption {
+    /// Plain SMTP with no transport encryption.
+    None,
+    /// STARTTLS — begin in plaintext and upgrade before AUTH.
+    StartTls,
+    /// Implicit TLS from connect (SMTPS, typically port 465).
+    Tls,
+}
+
+/// SMTP client configuration for the email channel.
+#[derive(Debug, Clone)]
+pub struct SmtpSettings {
+    /// SMTP relay host.
+    pub host: String,
+    /// SMTP relay port.
+    pub port: u16,
+    /// Optional SMTP auth username.
+    pub username: Option<String>,
+    /// Optional SMTP auth password.
+    pub password: Option<String>,
+    /// Transport encryption mode.
+    pub encryption: SmtpEncryption,
+    /// Default `From:` mailbox (RFC 5322). Required when email is enabled;
+    /// subscription headers may override on a per-message basis.
+    pub from_address: String,
+    /// Optional default subject template. If absent, a built-in template is used.
+    pub default_subject: Option<String>,
+    /// Per-send timeout in seconds.
+    pub timeout_secs: u64,
 }

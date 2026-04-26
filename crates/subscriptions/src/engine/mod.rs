@@ -11,6 +11,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
+use crate::channels::email::EmailChannel;
 use crate::channels::rest_hook::RestHookChannel;
 use crate::channels::websocket::WebSocketChannel;
 use crate::channels::ws_manager::WebSocketManager;
@@ -38,6 +39,7 @@ pub struct SubscriptionEngine {
     ws_manager: Arc<WebSocketManager>,
     ws_channel: Arc<WebSocketChannel>,
     ws_token_manager: Arc<WsBindingTokenManager>,
+    email_channel: Option<Arc<EmailChannel>>,
     config: SubscriptionConfig,
     base_url: String,
 }
@@ -55,6 +57,16 @@ impl SubscriptionEngine {
         let ws_manager = Arc::new(WebSocketManager::new());
         let ws_channel = Arc::new(WebSocketChannel::new(Arc::clone(&ws_manager)));
         let ws_token_manager = Arc::new(WsBindingTokenManager::new(config.ws_token_lifetime_secs));
+        let email_channel = match &config.smtp {
+            Some(settings) => match EmailChannel::new(settings.clone()) {
+                Ok(ch) => Some(Arc::new(ch)),
+                Err(e) => {
+                    warn!(error = %e, "Failed to initialize email channel; email dispatch disabled");
+                    None
+                }
+            },
+            None => None,
+        };
 
         Self {
             topic_registry,
@@ -65,6 +77,7 @@ impl SubscriptionEngine {
             ws_manager,
             ws_channel,
             ws_token_manager,
+            email_channel,
             config,
             base_url,
         }
@@ -446,6 +459,21 @@ impl SubscriptionEngine {
                     .handshake(subscription, &handshake_bundle)
                     .await
             }
+            ChannelType::Email => match self.email_channel.as_ref() {
+                Some(ch) => ch.handshake(subscription, &handshake_bundle).await,
+                None => {
+                    warn!(
+                        subscription_id = sub_id,
+                        "Email channel requested but no SMTP settings configured"
+                    );
+                    let _ = self.manager.update_status(
+                        tenant_id,
+                        sub_id,
+                        SubscriptionStatusCode::Error,
+                    );
+                    return;
+                }
+            },
             _ => {
                 warn!(
                     subscription_id = sub_id,
@@ -493,6 +521,16 @@ impl SubscriptionEngine {
         let dispatcher: &dyn ChannelDispatcher = match subscription.channel.channel_type {
             ChannelType::RestHook => self.rest_hook_channel.as_ref(),
             ChannelType::Websocket => self.ws_channel.as_ref(),
+            ChannelType::Email => match self.email_channel.as_deref() {
+                Some(ch) => ch,
+                None => {
+                    warn!(
+                        subscription_id = sub_id,
+                        "Email dispatch requested but no SMTP settings configured"
+                    );
+                    return;
+                }
+            },
             _ => {
                 warn!(
                     subscription_id = sub_id,

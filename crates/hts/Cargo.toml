@@ -66,6 +66,6 @@ deadpool-postgres = { version = "0.14", optional = true }
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
-testcontainers = "0.27"
+testcontainers = { version = "0.27", features = ["watchdog"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 ctor = "0.2"

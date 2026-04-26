@@ -3,6 +3,7 @@
 //! Delivers notification bundles to subscriber endpoints via the configured
 //! channel type (rest-hook, WebSocket, email, FHIR messaging).
 
+pub mod email;
 pub mod rest_hook;
 pub mod websocket;
 pub mod ws_manager;

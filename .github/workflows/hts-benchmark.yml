@@ -52,7 +52,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
 
@@ -91,12 +91,12 @@ jobs:
 
     steps:
       - name: Checkout HTS
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
 
       - name: Checkout tx-benchmark
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: HealthSamurai/tx-benchmark
           path: tx-benchmark

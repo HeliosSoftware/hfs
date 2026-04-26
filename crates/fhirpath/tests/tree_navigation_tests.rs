@@ -341,7 +341,7 @@ mod tests {
                 assert!(
                     items
                         .iter()
-                        .any(|item| { matches!(item, EvaluationResult::Object { map: _, .. }) })
+                        .any(|item| { matches!(item, EvaluationResult::Object { .. }) })
                 );
             }
             _ => panic!("Expected Collection, got {:?}", result),
