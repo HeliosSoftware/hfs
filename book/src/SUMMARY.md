@@ -21,6 +21,7 @@
 - [Embedding HFS as a Library](ch12-embedding.md)
 - [Development Setup](ch13-dev-setup.md)
 - [Contributing Guidelines](ch14-contributing.md)
+- [Live API Demo](live-api-demo.md)
 
 ---
 
