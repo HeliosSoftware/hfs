@@ -8,7 +8,6 @@ env:
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   HFS_PORT: 8088
-  INFERNO_PORT: ${{ secrets.INFERNO_PORT || vars.INFERNO_PORT || '4568' }}
   # Remote Docker host (set via GitHub repository secrets or variables; leave unset for local Docker)
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
@@ -354,18 +353,65 @@ jobs:
             exit 1
           }
 
+      - name: Checkout us-core-test-kit
+        uses: actions/checkout@v5
+        with:
+          repository: HeliosSoftware/us-core-test-kit
+          path: us-core-test-kit-${{ matrix.suite_id }}-${{ matrix.backend }}
+
+      - name: Run us-core-test-kit setup
+        working-directory: us-core-test-kit-${{ matrix.suite_id }}-${{ matrix.backend }}
+        run: |
+          if [ -x ./setup.sh ]; then
+            ./setup.sh
+          else
+            echo "No setup.sh found in test-kit checkout, skipping"
+          fi
+
+      - name: Start Inferno test kit
+        working-directory: us-core-test-kit-${{ matrix.suite_id }}-${{ matrix.backend }}
+        run: |
+          PROJECT="inferno-${{ matrix.suite_id }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "INFERNO_PROJECT=$PROJECT" >> $GITHUB_ENV
+          echo "INFERNO_KIT_DIR=$PWD" >> $GITHUB_ENV
+
+          # Override the nginx host port to ephemeral so concurrent matrix jobs
+          # on the same Docker host don't clash on the test kit's default port.
+          cat > docker-compose.override.yml <<'EOF'
+          services:
+            nginx:
+              ports: !override
+                - "0:80"
+          EOF
+
+          docker compose -p "$PROJECT" up -d
+
+          # Discover the host port that Docker assigned for nginx:80.
+          INFERNO_PORT=$(docker compose -p "$PROJECT" port nginx 80 | head -1 | sed 's/.*://')
+          if [ -z "$INFERNO_PORT" ]; then
+            echo "Failed to discover Inferno host port"
+            docker compose -p "$PROJECT" ps
+            docker compose -p "$PROJECT" logs --tail 200
+            exit 1
+          fi
+          echo "INFERNO_PORT=$INFERNO_PORT" >> $GITHUB_ENV
+          echo "Inferno reachable on host port $INFERNO_PORT"
+
       - name: Wait for Inferno to be ready
         run: |
-          echo "Waiting for persistent Inferno container to respond..."
-          for i in {1..30}; do
-            if curl -sf "http://$DOCKER_HOST_IP:$INFERNO_PORT/api/test_suites" > /dev/null 2>&1; then
-              echo "Inferno is ready on $DOCKER_HOST_IP:$INFERNO_PORT"
+          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          echo "INFERNO_HOST=$INFERNO_HOST" >> $GITHUB_ENV
+          echo "Waiting for Inferno test kit to respond..."
+          for i in {1..60}; do
+            if curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null 2>&1; then
+              echo "Inferno is ready on $INFERNO_HOST:$INFERNO_PORT"
               exit 0
             fi
-            echo "Attempt $i/30: Inferno not ready yet..."
+            echo "Attempt $i/60: Inferno not ready yet..."
             sleep 2
           done
-          echo "Inferno is not reachable at http://$DOCKER_HOST_IP:$INFERNO_PORT"
+          echo "Inferno is not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+          (cd "$INFERNO_KIT_DIR" && docker compose -p "$INFERNO_PROJECT" ps && docker compose -p "$INFERNO_PROJECT" logs --tail 200) || true
           exit 1
 
       - name: Create results directory
@@ -377,7 +423,7 @@ jobs:
           # Retry to handle Inferno's SQLite "database is locked" errors under concurrent load
           echo "Creating test session for ${{ matrix.suite_id }}..."
           for attempt in $(seq 1 5); do
-            SESSION_RESPONSE=$(curl -s -X POST "http://$DOCKER_HOST_IP:$INFERNO_PORT/api/test_sessions?test_suite_id=${{ matrix.suite_id }}")
+            SESSION_RESPONSE=$(curl -s -X POST "http://$INFERNO_HOST:$INFERNO_PORT/api/test_sessions?test_suite_id=${{ matrix.suite_id }}")
             SESSION_ID=$(echo "$SESSION_RESPONSE" | jq -r '.id' 2>/dev/null) || true
 
             if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ]; then
@@ -401,7 +447,7 @@ jobs:
           # Note: smart_auth_info with auth_type=public allows testing without SMART OAuth
           echo "Starting test run..."
           for attempt in $(seq 1 5); do
-            RUN_RESPONSE=$(curl -s -X POST "http://$DOCKER_HOST_IP:$INFERNO_PORT/api/test_runs" \
+            RUN_RESPONSE=$(curl -s -X POST "http://$INFERNO_HOST:$INFERNO_PORT/api/test_runs" \
               -H "Content-Type: application/json" \
               -d "{
                 \"test_session_id\": \"$SESSION_ID\",
@@ -439,7 +485,7 @@ jobs:
 
           for i in $(seq 1 $MAX_POLLS); do
             # Check test run status directly (more reliable than counting results)
-            STATUS_RESPONSE=$(curl -s "http://$DOCKER_HOST_IP:$INFERNO_PORT/api/test_runs/$RUN_ID")
+            STATUS_RESPONSE=$(curl -s "http://$INFERNO_HOST:$INFERNO_PORT/api/test_runs/$RUN_ID")
             RUN_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status' 2>/dev/null) || true
 
             if [ -z "$RUN_STATUS" ] || [ "$RUN_STATUS" = "null" ]; then
@@ -459,7 +505,7 @@ jobs:
             API_ERRORS=0
 
             # Get results for progress display (filter to individual tests only, not group aggregations)
-            RESULTS=$(curl -s "http://$DOCKER_HOST_IP:$INFERNO_PORT/api/test_runs/$RUN_ID/results")
+            RESULTS=$(curl -s "http://$INFERNO_HOST:$INFERNO_PORT/api/test_runs/$RUN_ID/results")
             TOTAL=$(echo "$RESULTS" | jq '[.[] | select(.test_id)] | length' 2>/dev/null) || TOTAL="?"
             PASS=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "pass")] | length' 2>/dev/null) || PASS="?"
             FAIL=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "fail")] | length' 2>/dev/null) || FAIL="?"
@@ -579,6 +625,12 @@ jobs:
           if [ -f /tmp/hfs.pid ]; then
             kill $(cat /tmp/hfs.pid) 2>/dev/null || true
             rm -f /tmp/hfs.pid
+          fi
+
+          echo "Stopping Inferno test kit..."
+          if [ -n "${INFERNO_PROJECT:-}" ] && [ -n "${INFERNO_KIT_DIR:-}" ] && [ -d "$INFERNO_KIT_DIR" ]; then
+            (cd "$INFERNO_KIT_DIR" && docker compose -p "$INFERNO_PROJECT" down -v --remove-orphans) || true
+            rm -rf "$INFERNO_KIT_DIR" || true
           fi
 
           echo "Stopping Elasticsearch..."
