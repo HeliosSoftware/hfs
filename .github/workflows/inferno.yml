@@ -45,10 +45,103 @@ jobs:
           path: target/debug/hfs
           retention-days: 1
 
+  inferno-stack-up:
+    name: Start Shared Inferno Stack
+    runs-on: [self-hosted, Linux]
+    outputs:
+      port: ${{ steps.up.outputs.port }}
+      project: ${{ steps.up.outputs.project }}
+    steps:
+      - name: Checkout us-core-test-kit
+        uses: actions/checkout@v5
+        with:
+          repository: HeliosSoftware/us-core-test-kit
+          path: us-core-test-kit
+
+      - name: Run setup.sh under shared compose project
+        working-directory: us-core-test-kit
+        env:
+          COMPOSE_PROJECT_NAME: inferno-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          if [ -x ./setup.sh ]; then
+            ./setup.sh
+          else
+            echo "No setup.sh found in test-kit checkout, skipping"
+          fi
+
+      - name: Bring up shared Inferno stack
+        id: up
+        working-directory: us-core-test-kit
+        run: |
+          PROJECT="inferno-${{ github.run_id }}-${{ github.run_attempt }}"
+
+          # The upstream compose file bind-mounts ./config/nginx.conf and
+          # ./data/igs from the runner's filesystem. With a remote DOCKER_HOST
+          # those paths don't exist on the daemon — Docker auto-creates the
+          # missing source as a directory, which breaks the nginx file mount
+          # outright and silently leaves the validator with no IGs loaded.
+          # Bake both into one-off CI images instead, and assign an ephemeral
+          # nginx host port so the stack can coexist on a shared Docker host.
+          mkdir -p ci-images/nginx ci-images/validator
+          cat > ci-images/nginx/Dockerfile <<'EOF'
+          FROM nginx
+          COPY config/nginx.conf /etc/nginx/nginx.conf
+          EOF
+          cat > ci-images/validator/Dockerfile <<'EOF'
+          FROM infernocommunity/inferno-resource-validator
+          COPY data/igs /app/igs
+          EOF
+          cat > docker-compose.override.yml <<'EOF'
+          services:
+            nginx:
+              image: !reset null
+              build:
+                context: .
+                dockerfile: ci-images/nginx/Dockerfile
+              volumes: !override []
+              ports: !override
+                - "0:80"
+            hl7_validator_service:
+              image: !reset null
+              build:
+                context: .
+                dockerfile: ci-images/validator/Dockerfile
+              volumes: !override []
+          EOF
+
+          docker compose -p "$PROJECT" up -d
+
+          INFERNO_PORT=$(docker compose -p "$PROJECT" port nginx 80 | head -1 | sed 's/.*://')
+          if [ -z "$INFERNO_PORT" ]; then
+            echo "Failed to discover Inferno host port"
+            docker compose -p "$PROJECT" ps
+            docker compose -p "$PROJECT" logs --tail 200
+            exit 1
+          fi
+
+          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          echo "Waiting for Inferno test kit to respond on $INFERNO_HOST:$INFERNO_PORT..."
+          for i in {1..60}; do
+            if curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null 2>&1; then
+              echo "Inferno is ready"
+              echo "port=$INFERNO_PORT" >> $GITHUB_OUTPUT
+              echo "project=$PROJECT" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Attempt $i/60: Inferno not ready yet..."
+            sleep 2
+          done
+          echo "Inferno is not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+          docker compose -p "$PROJECT" ps
+          docker compose -p "$PROJECT" logs --tail 200
+          exit 1
+
   inferno-test:
     name: Inferno US Core ${{ matrix.version_label }} Tests (${{ matrix.backend }})
-    needs: build
+    needs: [build, inferno-stack-up]
     runs-on: [self-hosted, Linux]
+    env:
+      INFERNO_PORT: ${{ needs.inferno-stack-up.outputs.port }}
     permissions:
       id-token: write
       contents: read
@@ -353,66 +446,14 @@ jobs:
             exit 1
           }
 
-      - name: Checkout us-core-test-kit
-        uses: actions/checkout@v5
-        with:
-          repository: HeliosSoftware/us-core-test-kit
-          path: us-core-test-kit-${{ matrix.suite_id }}-${{ matrix.backend }}
-
-      - name: Run us-core-test-kit setup
-        working-directory: us-core-test-kit-${{ matrix.suite_id }}-${{ matrix.backend }}
-        run: |
-          if [ -x ./setup.sh ]; then
-            ./setup.sh
-          else
-            echo "No setup.sh found in test-kit checkout, skipping"
-          fi
-
-      - name: Start Inferno test kit
-        working-directory: us-core-test-kit-${{ matrix.suite_id }}-${{ matrix.backend }}
-        run: |
-          PROJECT="inferno-${{ matrix.suite_id }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          echo "INFERNO_PROJECT=$PROJECT" >> $GITHUB_ENV
-          echo "INFERNO_KIT_DIR=$PWD" >> $GITHUB_ENV
-
-          # Override the nginx host port to ephemeral so concurrent matrix jobs
-          # on the same Docker host don't clash on the test kit's default port.
-          cat > docker-compose.override.yml <<'EOF'
-          services:
-            nginx:
-              ports: !override
-                - "0:80"
-          EOF
-
-          docker compose -p "$PROJECT" up -d
-
-          # Discover the host port that Docker assigned for nginx:80.
-          INFERNO_PORT=$(docker compose -p "$PROJECT" port nginx 80 | head -1 | sed 's/.*://')
-          if [ -z "$INFERNO_PORT" ]; then
-            echo "Failed to discover Inferno host port"
-            docker compose -p "$PROJECT" ps
-            docker compose -p "$PROJECT" logs --tail 200
-            exit 1
-          fi
-          echo "INFERNO_PORT=$INFERNO_PORT" >> $GITHUB_ENV
-          echo "Inferno reachable on host port $INFERNO_PORT"
-
-      - name: Wait for Inferno to be ready
+      - name: Sanity-check shared Inferno stack
         run: |
           INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
           echo "INFERNO_HOST=$INFERNO_HOST" >> $GITHUB_ENV
-          echo "Waiting for Inferno test kit to respond..."
-          for i in {1..60}; do
-            if curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null 2>&1; then
-              echo "Inferno is ready on $INFERNO_HOST:$INFERNO_PORT"
-              exit 0
-            fi
-            echo "Attempt $i/60: Inferno not ready yet..."
-            sleep 2
-          done
-          echo "Inferno is not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
-          (cd "$INFERNO_KIT_DIR" && docker compose -p "$INFERNO_PROJECT" ps && docker compose -p "$INFERNO_PROJECT" logs --tail 200) || true
-          exit 1
+          if ! curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null; then
+            echo "Shared Inferno stack not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+            exit 1
+          fi
 
       - name: Create results directory
         run: mkdir -p inferno-results
@@ -627,12 +668,6 @@ jobs:
             rm -f /tmp/hfs.pid
           fi
 
-          echo "Stopping Inferno test kit..."
-          if [ -n "${INFERNO_PROJECT:-}" ] && [ -n "${INFERNO_KIT_DIR:-}" ] && [ -d "$INFERNO_KIT_DIR" ]; then
-            (cd "$INFERNO_KIT_DIR" && docker compose -p "$INFERNO_PROJECT" down -v --remove-orphans) || true
-            rm -rf "$INFERNO_KIT_DIR" || true
-          fi
-
           echo "Stopping Elasticsearch..."
           docker rm -f "${ES_CONTAINER:-none}" 2>/dev/null || true
 
@@ -643,3 +678,34 @@ jobs:
           docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Cleanup complete"
+
+  inferno-stack-down:
+    name: Stop Shared Inferno Stack
+    needs: [inferno-stack-up, inferno-test]
+    if: always() && needs.inferno-stack-up.result != 'skipped'
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Tear down Inferno stack by compose project label
+        run: |
+          PROJECT="${{ needs.inferno-stack-up.outputs.project }}"
+          if [ -z "$PROJECT" ]; then
+            PROJECT="inferno-${{ github.run_id }}-${{ github.run_attempt }}"
+          fi
+          echo "Tearing down compose project: $PROJECT"
+
+          IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
+          if [ -n "$IDS" ]; then
+            docker rm -f $IDS
+          fi
+
+          NETS=$(docker network ls --filter "label=com.docker.compose.project=$PROJECT" -q)
+          if [ -n "$NETS" ]; then
+            docker network rm $NETS || true
+          fi
+
+          VOLS=$(docker volume ls --filter "label=com.docker.compose.project=$PROJECT" -q)
+          if [ -n "$VOLS" ]; then
+            docker volume rm $VOLS || true
+          fi
+
+          echo "Inferno stack teardown complete"
