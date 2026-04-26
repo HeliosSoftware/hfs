@@ -17,7 +17,7 @@ env:
   HFS_PORT: 18088
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
-  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}
+  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
 
 jobs:
   matrix-setup:
@@ -258,8 +258,8 @@ jobs:
         if: matrix.backend == 's3-elasticsearch'
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Install AWS CLI
         if: matrix.backend == 's3-elasticsearch'
@@ -383,7 +383,7 @@ jobs:
             HFS_BASE_URL="http://localhost:$HFS_PORT" \
             HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
             HFS_STORAGE_BACKEND=s3-elasticsearch \
-            HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
+            HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET }}" \
             HFS_S3_PREFIX="ci/subscriptions-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.build_key }}/${{ matrix.fhir_version }}/${{ matrix.backend }}/" \
             HFS_S3_VALIDATE_BUCKETS=false \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
