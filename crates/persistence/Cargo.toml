@@ -104,7 +104,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
 tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
-testcontainers = "0.27"
+testcontainers = { version = "0.27", features = ["watchdog"] }
 testcontainers-modules = { version = "0.15", features = ["postgres", "elastic_search", "minio"] }
 paste = "1.0"
 
