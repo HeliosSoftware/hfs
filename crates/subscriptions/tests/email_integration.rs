@@ -237,7 +237,7 @@ impl MailpitHandle {
         let container = GenericImage::new("axllent/mailpit", "latest")
             .with_exposed_port(ContainerPort::Tcp(1025))
             .with_exposed_port(ContainerPort::Tcp(8025))
-            .with_wait_for(WaitFor::message_on_stderr("accessible via"))
+            .with_wait_for(WaitFor::message_on_stdout("accessible via"))
             .start()
             .await
             .expect("start mailpit container");
