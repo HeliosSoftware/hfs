@@ -65,9 +65,6 @@ jobs:
           echo 'linker = "clang"' >> ~/.cargo/config.toml
           echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
 
-      - name: Pre-pull mailpit Docker image
-        run: docker pull axllent/mailpit:latest
-
       - name: Run tests with all features
         run: |
           cargo test --workspace --all-features
