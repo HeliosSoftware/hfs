@@ -1917,7 +1917,7 @@ async fn mongodb_integration_resolve_include_and_revinclude() {
         iterate: false,
     };
     let included = backend
-        .resolve_includes(&tenant, &[observation.clone()], &[forward])
+        .resolve_includes(&tenant, std::slice::from_ref(&observation), &[forward])
         .await
         .expect("forward include resolution must succeed");
     assert_eq!(included.len(), 1, "exactly one Patient should be included");
@@ -1932,7 +1932,11 @@ async fn mongodb_integration_resolve_include_and_revinclude() {
         iterate: false,
     };
     let revincluded = backend
-        .resolve_revincludes(&tenant, &[patient.clone()], &[reverse.clone()])
+        .resolve_revincludes(
+            &tenant,
+            std::slice::from_ref(&patient),
+            std::slice::from_ref(&reverse),
+        )
         .await
         .expect("revinclude resolution must succeed");
     assert_eq!(
