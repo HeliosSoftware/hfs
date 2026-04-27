@@ -681,6 +681,15 @@ fn compute_expansion(
     compose_json: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
+    compute_expansion_depth(conn, compose_json, warnings, 0)
+}
+
+fn compute_expansion_depth(
+    conn: &Connection,
+    compose_json: Option<&str>,
+    warnings: &mut Vec<String>,
+    depth: u8,
+) -> Result<Vec<ExpansionContains>, HtsError> {
     let Some(raw) = compose_json else {
         return Ok(vec![]);
     };
@@ -693,6 +702,49 @@ fn compute_expansion(
     let mut included: Vec<ExpansionContains> = Vec::new();
 
     for inc in includes {
+        // Handle include.valueSet references (FHIR R4 §4.8.5):
+        // one ValueSet includes all concepts from another ValueSet by URL.
+        // These includes have no `system` and would otherwise be silently skipped.
+        if let Some(vs_refs) = inc["valueSet"].as_array() {
+            if !vs_refs.is_empty() {
+                if depth >= 4 {
+                    warnings.push(
+                        "Max ValueSet include depth (4) reached; skipping nested valueSet references"
+                            .to_owned(),
+                    );
+                    continue;
+                }
+                for vs_ref in vs_refs {
+                    let ref_url = match vs_ref.as_str() {
+                        Some(u) => u,
+                        None => continue,
+                    };
+                    match resolve_value_set(conn, ref_url, None) {
+                        Ok((ref_vs_id, ref_compose)) => {
+                            let cached = fetch_cache(conn, &ref_vs_id)?;
+                            if cached.is_empty() {
+                                let nested = compute_expansion_depth(
+                                    conn,
+                                    ref_compose.as_deref(),
+                                    warnings,
+                                    depth + 1,
+                                )?;
+                                included.extend(nested);
+                            } else {
+                                included.extend(cached);
+                            }
+                        }
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Referenced ValueSet {ref_url} not found; excluded from expansion"
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
         let system_url = match inc["system"].as_str() {
             Some(s) if !s.is_empty() => s,
             _ => continue,
@@ -1260,27 +1312,65 @@ fn populate_cache(
     vs_id: &str,
     codes: &[ExpansionContains],
 ) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
+    // BEGIN IMMEDIATE acquires the write lock upfront so concurrent callers
+    // cannot both see an empty cache and then duplicate-write the expansion.
+    conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    tx.execute(
+    // Re-check inside the lock: another VU may have populated this while we
+    // were waiting to acquire the write lock.
+    let already: bool = match conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM value_set_expansions WHERE value_set_id = ?1 LIMIT 1)",
+        [vs_id],
+        |r| r.get(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(HtsError::StorageError(e.to_string()));
+        }
+    };
+
+    if already {
+        conn.execute_batch("COMMIT")
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        return Ok(());
+    }
+
+    if let Err(e) = conn.execute(
         "DELETE FROM value_set_expansions WHERE value_set_id = ?1",
         [vs_id],
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(HtsError::StorageError(e.to_string()));
+    }
 
-    for item in codes {
-        tx.execute(
+    {
+        let mut stmt = match conn.prepare_cached(
             "INSERT OR IGNORE INTO value_set_expansions
              (value_set_id, system_url, code, display)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![vs_id, item.system, item.code, item.display],
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(HtsError::StorageError(e.to_string()));
+            }
+        };
+        for item in codes {
+            if let Err(e) = stmt.execute(rusqlite::params![
+                vs_id,
+                item.system,
+                item.code,
+                item.display
+            ]) {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(HtsError::StorageError(e.to_string()));
+            }
+        }
     }
 
-    tx.commit()
+    conn.execute_batch("COMMIT")
         .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
@@ -1459,26 +1549,46 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
     let system_id =
         system_id.ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {cs_url}")))?;
 
-    let tx = conn
-        .unchecked_transaction()
+    // BEGIN IMMEDIATE acquires the write lock upfront so concurrent callers
+    // cannot both see an empty cache and then duplicate-write the expansion.
+    conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    tx.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url])
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    match &pattern {
-        FhirVsPattern::AllConcepts => {
-            tx.execute(
-                "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
-                 SELECT ?1, ?2, code, display FROM concepts WHERE system_id = ?3",
-                rusqlite::params![url, cs_url, system_id],
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // Re-check inside the lock: another VU may have populated this while we
+    // were waiting to acquire the write lock.
+    let still_empty: bool = match conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM implicit_expansion_cache WHERE url = ?1 LIMIT 1)",
+        [url],
+        |r| r.get(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(HtsError::StorageError(e.to_string()));
         }
+    };
+
+    if !still_empty {
+        conn.execute_batch("COMMIT")
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        return Ok(());
+    }
+
+    if let Err(e) = conn.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url]) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(HtsError::StorageError(e.to_string()));
+    }
+
+    let insert_result = match &pattern {
+        FhirVsPattern::AllConcepts => conn.execute(
+            "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
+             SELECT ?1, ?2, code, display FROM concepts WHERE system_id = ?3",
+            rusqlite::params![url, cs_url, system_id],
+        ),
         FhirVsPattern::IsA(root_code) => {
             // Recursive CTE expands the descendant subtree directly in SQL.
             // The seed row is the root itself (<< semantics: self + descendants).
-            tx.execute(
+            conn.execute(
                 "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
                  WITH RECURSIVE desc_cte(code) AS (
                      SELECT ?4
@@ -1494,11 +1604,15 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
                  WHERE  c.system_id = ?3",
                 rusqlite::params![url, cs_url, system_id, root_code],
             )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
         }
+    };
+
+    if let Err(e) = insert_result {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(HtsError::StorageError(e.to_string()));
     }
 
-    tx.commit()
+    conn.execute_batch("COMMIT")
         .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
@@ -1782,29 +1896,59 @@ fn populate_implicit_cache(
     url: &str,
     codes: &[ExpansionContains],
 ) -> Result<(), HtsError> {
-    let tx = conn
-        .unchecked_transaction()
+    // BEGIN IMMEDIATE acquires the write lock upfront so concurrent callers
+    // cannot both see an empty cache and then duplicate-write the expansion.
+    conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    tx.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url])
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // Re-check inside the lock: another VU may have populated this while we
+    // were waiting to acquire the write lock.
+    let already: bool = match conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM implicit_expansion_cache WHERE url = ?1 LIMIT 1)",
+        [url],
+        |r| r.get(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(HtsError::StorageError(e.to_string()));
+        }
+    };
+
+    if already {
+        conn.execute_batch("COMMIT")
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        return Ok(());
+    }
+
+    if let Err(e) = conn.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url]) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(HtsError::StorageError(e.to_string()));
+    }
 
     {
-        let mut stmt = tx
-            .prepare_cached(
-                "INSERT OR IGNORE INTO implicit_expansion_cache
-                 (url, system_url, code, display)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
+        let mut stmt = match conn.prepare_cached(
+            "INSERT OR IGNORE INTO implicit_expansion_cache
+             (url, system_url, code, display)
+             VALUES (?1, ?2, ?3, ?4)",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(HtsError::StorageError(e.to_string()));
+            }
+        };
         for item in codes {
-            stmt.execute(rusqlite::params![url, item.system, item.code, item.display])
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            if let Err(e) =
+                stmt.execute(rusqlite::params![url, item.system, item.code, item.display])
+            {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(HtsError::StorageError(e.to_string()));
+            }
         }
     }
 
-    tx.commit()
+    conn.execute_batch("COMMIT")
         .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
