@@ -1784,8 +1784,7 @@ impl CompositeStorage {
                 &target_types[i - 1]
             };
 
-            let values: Vec<SearchValue> =
-                current_refs.iter().map(SearchValue::eq).collect();
+            let values: Vec<SearchValue> = current_refs.iter().map(SearchValue::eq).collect();
             let query = SearchQuery::new(parent_type).with_parameter(SearchParameter {
                 name: ref_param.to_string(),
                 param_type: crate::types::SearchParamType::Reference,
