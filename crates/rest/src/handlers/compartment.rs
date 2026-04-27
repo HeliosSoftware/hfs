@@ -138,8 +138,12 @@ where
         state.max_page_size(),
     );
 
-    // Convert REST params to persistence SearchQuery
-    let query = build_search_query_from_map(&target_type, &params)?;
+    // Convert REST params to persistence SearchQuery. Scope the registry read
+    // guard tightly so it doesn't span any await.
+    let query = {
+        let registry = state.storage().search_param_registry().read();
+        build_search_query_from_map(&target_type, &params, &registry)?
+    };
 
     // Execute the search
     let result = state

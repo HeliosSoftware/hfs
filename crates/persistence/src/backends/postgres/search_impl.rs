@@ -389,6 +389,12 @@ impl SearchProvider for PostgresBackend {
         let count: i64 = row.get(0);
         Ok(count as u64)
     }
+
+    fn search_param_registry(
+        &self,
+    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.search_registry()
+    }
 }
 
 #[async_trait]

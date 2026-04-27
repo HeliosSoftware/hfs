@@ -184,8 +184,13 @@ where
         params = expand_terminology_params(params, ts_url).await?;
     }
 
-    // Convert REST params to persistence SearchQuery
-    let query = build_search_query_from_map(resource_type, &params)?;
+    // Convert REST params to persistence SearchQuery. Scope the registry read
+    // guard tightly so it doesn't span any await — parking_lot guards aren't
+    // Send by default, which would make this async fn !Send.
+    let query = {
+        let registry = state.storage().search_param_registry().read();
+        build_search_query_from_map(resource_type, &params, &registry)?
+    };
 
     // Execute the search
     // Note: The search provider is responsible for resolving _include/_revinclude
@@ -258,8 +263,12 @@ where
         .map(|t| t.split(',').collect())
         .unwrap_or_default();
 
-    // Build a search query (resource type doesn't matter much for system search)
-    let query = build_search_query_from_map("Resource", &params)?;
+    // Build a search query (resource type doesn't matter much for system search).
+    // Scope the registry read guard tightly so it doesn't span any await.
+    let query = {
+        let registry = state.storage().search_param_registry().read();
+        build_search_query_from_map("Resource", &params, &registry)?
+    };
 
     // Execute the multi-type search
     let result = state

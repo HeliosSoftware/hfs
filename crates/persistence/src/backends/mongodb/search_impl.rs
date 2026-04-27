@@ -280,6 +280,12 @@ impl SearchProvider for MongoBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to count MongoDB search results: {}", e)))
     }
+
+    fn search_param_registry(
+        &self,
+    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.search_registry()
+    }
 }
 
 #[async_trait]
@@ -1023,46 +1029,20 @@ impl MongoBackend {
         params
             .iter()
             .map(|(name, value)| {
-                let param_type = self
-                    .lookup_param_type(&registry, resource_type, name)
-                    .unwrap_or(match name.as_str() {
-                        "_id" => SearchParamType::Token,
-                        "_lastUpdated" => SearchParamType::Date,
-                        "_tag" | "_profile" | "_security" => SearchParamType::Token,
-                        "identifier" => SearchParamType::Token,
-                        "patient" | "subject" | "encounter" | "performer" | "author"
-                        | "requester" | "recorder" | "asserter" | "practitioner"
-                        | "organization" | "location" | "device" => SearchParamType::Reference,
-                        _ => SearchParamType::String,
-                    });
+                let values = vec![SearchValue::parse(value)];
+                let param_type =
+                    crate::search::resolve_param_type(&registry, resource_type, name, &values);
 
                 SearchParameter {
                     name: name.clone(),
                     param_type,
                     modifier: None,
-                    values: vec![SearchValue::parse(value)],
+                    values,
                     chain: vec![],
                     components: vec![],
                 }
             })
             .collect()
-    }
-
-    fn lookup_param_type(
-        &self,
-        registry: &crate::search::SearchParameterRegistry,
-        resource_type: &str,
-        param_name: &str,
-    ) -> Option<SearchParamType> {
-        if let Some(def) = registry.get_param(resource_type, param_name) {
-            return Some(def.param_type);
-        }
-
-        if let Some(def) = registry.get_param("Resource", param_name) {
-            return Some(def.param_type);
-        }
-
-        None
     }
 
     fn merge_unique(target: &mut Vec<StoredResource>, additions: Vec<StoredResource>) {
