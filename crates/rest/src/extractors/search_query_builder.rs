@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use helios_persistence::search::{SearchParameterRegistry, resolve_param_type};
 use helios_persistence::types::{
-    IncludeDirective, IncludeType, ReverseChainedParameter, SearchModifier, SearchParameter,
-    SearchQuery, SearchValue, SortDirective, SummaryMode, TotalMode,
+    IncludeDirective, IncludeType, ReverseChainedParameter, SearchModifier, SearchParamType,
+    SearchParameter, SearchQuery, SearchValue, SortDirective, SummaryMode, TotalMode,
 };
 
 use super::SearchParams;
