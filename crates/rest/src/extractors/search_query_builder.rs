@@ -4,9 +4,10 @@
 
 use std::collections::HashMap;
 
+use helios_persistence::search::{SearchParameterRegistry, resolve_param_type};
 use helios_persistence::types::{
-    IncludeDirective, IncludeType, ReverseChainedParameter, SearchModifier, SearchParamType,
-    SearchParameter, SearchQuery, SearchValue, SortDirective, SummaryMode, TotalMode,
+    IncludeDirective, IncludeType, ReverseChainedParameter, SearchModifier, SearchParameter,
+    SearchQuery, SearchValue, SortDirective, SummaryMode, TotalMode,
 };
 
 use super::SearchParams;
@@ -25,6 +26,7 @@ use crate::error::RestError;
 pub fn build_search_query(
     resource_type: &str,
     params: &SearchParams,
+    registry: &SearchParameterRegistry,
 ) -> Result<SearchQuery, RestError> {
     let mut query = SearchQuery::new(resource_type);
 
@@ -100,7 +102,7 @@ pub fn build_search_query(
         }
 
         // Parse the parameter
-        let param = parse_search_parameter(name, value)?;
+        let param = parse_search_parameter(resource_type, name, value, registry)?;
         query.parameters.push(param);
     }
 
@@ -113,13 +115,19 @@ pub fn build_search_query(
 pub fn build_search_query_from_map(
     resource_type: &str,
     params: &HashMap<String, String>,
+    registry: &SearchParameterRegistry,
 ) -> Result<SearchQuery, RestError> {
     let search_params = SearchParams::from_map(params.clone());
-    build_search_query(resource_type, &search_params)
+    build_search_query(resource_type, &search_params, registry)
 }
 
 /// Parses a single search parameter with potential modifiers.
-fn parse_search_parameter(name: &str, value: &str) -> Result<SearchParameter, RestError> {
+fn parse_search_parameter(
+    resource_type: &str,
+    name: &str,
+    value: &str,
+    registry: &SearchParameterRegistry,
+) -> Result<SearchParameter, RestError> {
     let (param_name, modifier) = parse_parameter_name(name);
 
     // Check for chained parameters (e.g., "patient.name" or "subject:Patient.name")
@@ -131,8 +139,11 @@ fn parse_search_parameter(name: &str, value: &str) -> Result<SearchParameter, Re
         .map(|v| SearchValue::parse(v.trim()))
         .collect();
 
-    // Determine parameter type based on modifier or heuristics
-    let param_type = infer_param_type(base_name, &modifier, &values);
+    // Resolve the canonical type from the search parameter registry. This is
+    // deterministic for any registered parameter (which is everything in the
+    // FHIR spec); the value-shape heuristic is reached only for unregistered
+    // custom params. See `helios_persistence::search::resolve_param_type`.
+    let param_type = resolve_param_type(registry, resource_type, base_name, &values);
 
     let mut param = SearchParameter {
         name: base_name.to_string(),
@@ -406,152 +417,63 @@ fn parse_summary_mode(value: &str) -> Option<SummaryMode> {
     }
 }
 
-/// Infers parameter type based on heuristics.
-///
-/// In a full implementation, this would look up the SearchParameterRegistry
-/// to get the actual type. For now, we use heuristics based on:
-/// - Known common parameters
-/// - Modifier hints
-/// - Value format
-fn infer_param_type(
-    name: &str,
-    modifier: &Option<SearchModifier>,
-    values: &[SearchValue],
-) -> SearchParamType {
-    // Special parameters
-    match name {
-        "_id" | "_lastUpdated" | "_tag" | "_profile" | "_security" | "_source" | "_list"
-        | "_has" | "_type" | "_filter" | "_query" | "_text" | "_content" => {
-            return SearchParamType::Special;
-        }
-        _ => {}
-    }
-
-    // Infer from modifier
-    if let Some(mod_) = modifier {
-        match mod_ {
-            SearchModifier::Exact | SearchModifier::Contains => return SearchParamType::String,
-            SearchModifier::Text
-            | SearchModifier::In
-            | SearchModifier::NotIn
-            | SearchModifier::Above
-            | SearchModifier::Below
-            | SearchModifier::OfType
-            | SearchModifier::CodeOnly
-            | SearchModifier::CodeText => return SearchParamType::Token,
-            SearchModifier::Identifier | SearchModifier::Type(_) => {
-                return SearchParamType::Reference;
-            }
-            _ => {}
-        }
-    }
-
-    // Infer from common parameter names
-    match name {
-        // String parameters
-        "name" | "family" | "given" | "address" | "address-city" | "address-country"
-        | "address-postalcode" | "address-state" | "phonetic" | "text" => SearchParamType::String,
-
-        // Token parameters
-        "identifier" | "code" | "status" | "type" | "category" | "gender" | "language"
-        | "active" | "deceased" | "class" | "priority" | "intent" | "severity" => {
-            SearchParamType::Token
-        }
-
-        // Date parameters
-        "birthdate" | "date" | "issued" | "onset" | "recorded" | "authored" | "effective"
-        | "period" | "when" | "_lastUpdated" => SearchParamType::Date,
-
-        // Reference parameters
-        "patient"
-        | "subject"
-        | "encounter"
-        | "practitioner"
-        | "organization"
-        | "location"
-        | "device"
-        | "performer"
-        | "requester"
-        | "author"
-        | "recorder"
-        | "asserter"
-        | "source"
-        | "target"
-        | "agent"
-        | "entity"
-        | "focus"
-        | "based-on"
-        | "part-of"
-        | "derived-from"
-        | "specimen"
-        | "context"
-        | "service-provider"
-        | "general-practitioner"
-        | "link"
-        | "managing-organization" => SearchParamType::Reference,
-
-        // Number parameters
-        "probability" | "age" => SearchParamType::Number,
-
-        // Quantity parameters
-        "value-quantity" | "quantity" | "dose-quantity" | "component-value-quantity" => {
-            SearchParamType::Quantity
-        }
-
-        // URI parameters
-        "url" | "system" | "definition" | "derived-from-uri" => SearchParamType::Uri,
-
-        // Try to infer from value format
-        _ => infer_from_value(values),
-    }
-}
-
-/// Infers parameter type from value format.
-fn infer_from_value(values: &[SearchValue]) -> SearchParamType {
-    if values.is_empty() {
-        return SearchParamType::String;
-    }
-
-    let value = &values[0].value;
-
-    // Check for date format
-    if value.len() >= 4 && value.chars().take(4).all(|c| c.is_ascii_digit()) {
-        if value.len() >= 10
-            && value
-                .chars()
-                .enumerate()
-                .all(|(i, c)| (i == 4 || i == 7) && c == '-' || c.is_ascii_digit())
-        {
-            return SearchParamType::Date;
-        }
-    }
-
-    // Check for quantity format (number with units)
-    if value.contains('|') && value.split('|').count() >= 2 {
-        let parts: Vec<&str> = value.split('|').collect();
-        if !parts[0].is_empty()
-            && parts[0]
-                .chars()
-                .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
-        {
-            return SearchParamType::Quantity;
-        }
-        // Could also be a token with system|code
-        return SearchParamType::Token;
-    }
-
-    // Check for reference format
-    if value.contains('/') {
-        return SearchParamType::Reference;
-    }
-
-    // Default to string
-    SearchParamType::String
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_persistence::search::SearchParameterDefinition;
+    use helios_persistence::types::SearchParamType;
+
+    /// Builds a small registry covering just the params the tests exercise.
+    /// Keeps tests hermetic without depending on the embedded data set.
+    fn test_registry() -> SearchParameterRegistry {
+        let mut r = SearchParameterRegistry::new();
+        let entries = [
+            ("Patient-name", "name", SearchParamType::String, "Patient"),
+            (
+                "Patient-birthdate",
+                "birthdate",
+                SearchParamType::Date,
+                "Patient",
+            ),
+            (
+                "Observation-code",
+                "code",
+                SearchParamType::Token,
+                "Observation",
+            ),
+            (
+                "Observation-patient",
+                "patient",
+                SearchParamType::Reference,
+                "Observation",
+            ),
+            (
+                "Observation-subject",
+                "subject",
+                SearchParamType::Reference,
+                "Observation",
+            ),
+            (
+                "Observation-date",
+                "date",
+                SearchParamType::Date,
+                "Observation",
+            ),
+        ];
+        for (id, code, ty, base) in entries {
+            r.register(
+                SearchParameterDefinition::new(
+                    format!("http://hl7.org/fhir/SearchParameter/{}", id),
+                    code,
+                    ty,
+                    "ignored",
+                )
+                .with_base(vec![base]),
+            )
+            .unwrap();
+        }
+        r
+    }
 
     #[test]
     fn test_parse_parameter_name_simple() {
@@ -652,7 +574,7 @@ mod tests {
         params.insert("_count".to_string(), "10".to_string());
 
         let search_params = SearchParams::from_map(params);
-        let query = build_search_query("Patient", &search_params).unwrap();
+        let query = build_search_query("Patient", &search_params, &test_registry()).unwrap();
 
         assert_eq!(query.resource_type, "Patient");
         assert_eq!(query.count, Some(10));
@@ -666,7 +588,7 @@ mod tests {
         params.insert("name:exact".to_string(), "Smith".to_string());
 
         let search_params = SearchParams::from_map(params);
-        let query = build_search_query("Patient", &search_params).unwrap();
+        let query = build_search_query("Patient", &search_params, &test_registry()).unwrap();
 
         assert_eq!(query.parameters.len(), 1);
         assert_eq!(query.parameters[0].name, "name");
@@ -679,7 +601,7 @@ mod tests {
         params.insert("birthdate".to_string(), "gt2000-01-01".to_string());
 
         let search_params = SearchParams::from_map(params);
-        let query = build_search_query("Patient", &search_params).unwrap();
+        let query = build_search_query("Patient", &search_params, &test_registry()).unwrap();
 
         assert_eq!(query.parameters.len(), 1);
         assert_eq!(
@@ -695,7 +617,7 @@ mod tests {
         params.insert("_sort".to_string(), "-date,name".to_string());
 
         let search_params = SearchParams::from_map(params);
-        let query = build_search_query("Observation", &search_params).unwrap();
+        let query = build_search_query("Observation", &search_params, &test_registry()).unwrap();
 
         assert_eq!(query.sort.len(), 2);
         assert_eq!(query.sort[0].parameter, "date");
@@ -716,7 +638,7 @@ mod tests {
         params.insert("_include".to_string(), "Observation:patient".to_string());
 
         let search_params = SearchParams::from_map(params);
-        let query = build_search_query("Observation", &search_params).unwrap();
+        let query = build_search_query("Observation", &search_params, &test_registry()).unwrap();
 
         assert_eq!(query.includes.len(), 1);
         assert_eq!(query.includes[0].source_type, "Observation");
@@ -724,32 +646,28 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_param_type() {
-        // Known string params
-        assert_eq!(
-            infer_param_type("name", &None, &[]),
-            SearchParamType::String
-        );
+    fn test_param_type_resolved_from_registry() {
+        let registry = test_registry();
+        let name = parse_search_parameter("Patient", "name", "Smith", &registry).unwrap();
+        assert_eq!(name.param_type, SearchParamType::String);
 
-        // Known token params
-        assert_eq!(infer_param_type("code", &None, &[]), SearchParamType::Token);
+        let code = parse_search_parameter("Observation", "code", "1234-5", &registry).unwrap();
+        assert_eq!(code.param_type, SearchParamType::Token);
 
-        // Known reference params
-        assert_eq!(
-            infer_param_type("patient", &None, &[]),
-            SearchParamType::Reference
-        );
+        let patient =
+            parse_search_parameter("Observation", "patient", "Patient/1", &registry).unwrap();
+        assert_eq!(patient.param_type, SearchParamType::Reference);
+    }
 
-        // Modifier hints
-        assert_eq!(
-            infer_param_type("custom", &Some(SearchModifier::Exact), &[]),
-            SearchParamType::String
-        );
+    #[test]
+    fn test_param_type_unregistered_falls_back_to_value_shape() {
+        // No entry for "made-up" anywhere — value heuristic kicks in.
+        let registry = SearchParameterRegistry::new();
+        let date_param =
+            parse_search_parameter("Custom", "made-up", "2020-01-01", &registry).unwrap();
+        assert_eq!(date_param.param_type, SearchParamType::Date);
 
-        // Special params
-        assert_eq!(
-            infer_param_type("_id", &None, &[]),
-            SearchParamType::Special
-        );
+        let plain = parse_search_parameter("Custom", "made-up", "hello", &registry).unwrap();
+        assert_eq!(plain.param_type, SearchParamType::String);
     }
 }

@@ -923,6 +923,41 @@ impl SearchProvider for CompositeStorage {
             }))
         }
     }
+
+    fn search_param_registry(
+        &self,
+    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        // Same routing as `search`: prefer the dedicated Search backend's
+        // registry, fall back to primary, otherwise an empty registry. The
+        // returned reference outlives `&self` because both providers are
+        // owned by `self.search_providers` for the lifetime of the composite.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.search_param_registry();
+            }
+        }
+
+        if let Some(provider) = self
+            .search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+        {
+            return provider.search_param_registry();
+        }
+
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<
+            std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
+        > = OnceLock::new();
+        EMPTY.get_or_init(|| {
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::search::SearchParameterRegistry::new(),
+            ))
+        })
+    }
 }
 
 #[async_trait]
@@ -1934,6 +1969,20 @@ mod tests {
                 message: self.error_message.to_string(),
             }))
         }
+
+        fn search_param_registry(
+            &self,
+        ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+            use std::sync::OnceLock;
+            static EMPTY: OnceLock<
+                std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
+            > = OnceLock::new();
+            EMPTY.get_or_init(|| {
+                std::sync::Arc::new(parking_lot::RwLock::new(
+                    crate::search::SearchParameterRegistry::new(),
+                ))
+            })
+        }
     }
 
     /// Minimal mock storage for unit testing CompositeStorage.
@@ -2809,6 +2858,20 @@ mod tests {
             _query: &crate::types::SearchQuery,
         ) -> StorageResult<u64> {
             Ok(0)
+        }
+
+        fn search_param_registry(
+            &self,
+        ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+            use std::sync::OnceLock;
+            static EMPTY: OnceLock<
+                std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
+            > = OnceLock::new();
+            EMPTY.get_or_init(|| {
+                std::sync::Arc::new(parking_lot::RwLock::new(
+                    crate::search::SearchParameterRegistry::new(),
+                ))
+            })
         }
     }
 }

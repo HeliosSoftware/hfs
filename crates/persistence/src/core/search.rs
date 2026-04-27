@@ -9,9 +9,13 @@
 //! - [`TerminologySearchProvider`] - :above, :below, :in, :not-in
 //! - [`TextSearchProvider`] - Full-text search (_text, _content, :text)
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use parking_lot::RwLock;
 
 use crate::error::StorageResult;
+use crate::search::SearchParameterRegistry;
 use crate::tenant::TenantContext;
 use crate::types::{
     IncludeDirective, Page, ReverseChainedParameter, SearchBundle, SearchQuery, StoredResource,
@@ -227,6 +231,14 @@ pub trait SearchProvider: ResourceStorage {
     /// This is more efficient than search when you only need the count.
     async fn search_count(&self, tenant: &TenantContext, query: &SearchQuery)
     -> StorageResult<u64>;
+
+    /// Returns the backend's search parameter registry.
+    ///
+    /// The registry is the single source of truth for search parameter type
+    /// resolution (see [`crate::search::resolve_param_type`]). REST extractors
+    /// and chained-search builders both consult it so they cannot disagree on
+    /// whether a given param is a Date vs. Token vs. Reference, etc.
+    fn search_param_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>>;
 }
 
 /// Search provider that supports searching across multiple resource types.

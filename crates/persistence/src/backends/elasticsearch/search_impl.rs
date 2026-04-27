@@ -209,6 +209,12 @@ impl SearchProvider for ElasticsearchBackend {
             _ => Ok(0),
         }
     }
+
+    fn search_param_registry(
+        &self,
+    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.search_registry()
+    }
 }
 
 #[async_trait]
