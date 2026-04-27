@@ -138,6 +138,52 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     if let Some(cached) = from_cache {
                         cached
                     } else {
+                        // ── BFS fast path for simple hierarchy composes ───────────────
+                        // When the compose is a single include with a single is-a or
+                        // descendent-of filter (e.g. EX02: descendent-of Disease), use
+                        // BFS to serve the requested page immediately and cache the full
+                        // expansion in the background. Avoids >30 s ECL + INSERT timeout.
+                        if let Some(count) = req.count.filter(|&c| c > 0) {
+                            if let Some((sys_url, sys_id, root_code, include_root)) =
+                                extract_simple_hierarchy_compose(&conn, compose, &mut warnings)?
+                            {
+                                let bfs_offset = req.offset.unwrap_or(0) as usize;
+                                let page = bfs_isa_page(
+                                    &conn,
+                                    &sys_url,
+                                    &sys_id,
+                                    &root_code,
+                                    include_root,
+                                    bfs_offset,
+                                    count as usize,
+                                    None,
+                                )?;
+                                let key_bg = cache_key.clone();
+                                let compose_bg = compose_str.clone();
+                                let pool_bg = pool.clone();
+                                tokio::runtime::Handle::current().spawn_blocking(move || {
+                                    if let Ok(conn2) = pool_bg.get() {
+                                        let mut w = Vec::new();
+                                        if let Ok(codes) =
+                                            compute_expansion(&conn2, Some(&compose_bg), &mut w)
+                                        {
+                                            if w.is_empty() {
+                                                let _ = populate_implicit_cache(
+                                                    &conn2, &key_bg, &codes,
+                                                );
+                                            }
+                                        }
+                                    }
+                                });
+                                return Ok(ExpandResponse {
+                                    total: None,
+                                    offset: req.offset,
+                                    contains: page,
+                                    warnings,
+                                });
+                            }
+                        }
+
                         let codes = compute_expansion(&conn, Some(&compose_str), &mut warnings)?;
                         // Only cache when all systems were resolved (no warnings mean
                         // the expansion is complete and safe to reuse).
@@ -687,33 +733,72 @@ fn expand_inline_filtered(
             }
         } else {
             // Full-system include with no explicit codes.
-            // For filter strings ≥ 3 chars use the FTS5 trigram index on
-            // concepts_fts — O(matches) instead of O(total_concepts).
-            // Shorter strings fall back to LIKE (trigram needs ≥ 3 chars).
+            // For filter strings ≥ 3 chars: use the FTS5 trigram index when it is
+            // already built (O(matches)), otherwise fall back to a LIKE scan
+            // (O(N), ~200–500 ms for large systems) and spawn a background task to
+            // build the FTS5 index so future requests use the fast path.
+            // Shorter filter strings skip FTS5 because trigrams need ≥ 3 chars.
             if filter_lower.len() >= 3 {
-                ensure_concepts_fts(conn, &system_id)?;
-                let match_expr = fts5_quote(&filter_lower);
-                let mut stmt = conn
-                    .prepare_cached(
-                        "SELECT code, display FROM concepts_fts \
-                         WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
-                         ORDER BY code",
+                let fts_ready: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(\
+                             SELECT 1 FROM concepts_fts WHERE system_id = ?1 LIMIT 1)",
+                        [&system_id],
+                        |r| r.get(0),
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                let rows = stmt
-                    .query_map(rusqlite::params![match_expr, system_id], |row| {
-                        Ok(ExpansionContains {
-                            system: system_url.to_owned(),
-                            code: row.get(0)?,
-                            display: row.get(1)?,
-                            inactive: None,
-                            contains: vec![],
+
+                if fts_ready {
+                    let match_expr = fts5_quote(&filter_lower);
+                    let mut stmt = conn
+                        .prepare_cached(
+                            "SELECT code, display FROM concepts_fts \
+                             WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
+                             ORDER BY code",
+                        )
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![match_expr, system_id], |row| {
+                            Ok(ExpansionContains {
+                                system: system_url.to_owned(),
+                                code: row.get(0)?,
+                                display: row.get(1)?,
+                                inactive: None,
+                                contains: vec![],
+                            })
                         })
-                    })
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                results.extend(rows);
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    results.extend(rows);
+                } else {
+                    // FTS5 not yet built — use a LIKE scan for this request.
+                    // Future requests will hit the warm FTS5 index once it is
+                    // built (e.g. via the `ensure_concepts_fts` startup path).
+                    let mut stmt = conn
+                        .prepare_cached(
+                            "SELECT code, display FROM concepts \
+                             WHERE system_id = ?1 \
+                               AND (LOWER(code) LIKE ?2 \
+                                    OR LOWER(COALESCE(display,'')) LIKE ?2) \
+                             ORDER BY code",
+                        )
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![system_id, sql_pat], |row| {
+                            Ok(ExpansionContains {
+                                system: system_url.to_owned(),
+                                code: row.get(0)?,
+                                display: row.get(1)?,
+                                inactive: None,
+                                contains: vec![],
+                            })
+                        })
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    results.extend(rows);
+                }
             } else {
                 let mut stmt = conn
                     .prepare_cached(
@@ -1217,6 +1302,78 @@ fn parse_fhir_vs_url(url: &str) -> Option<(String, FhirVsPattern)> {
     None
 }
 
+/// Check whether a compose is a "simple hierarchy" and extract its parameters.
+///
+/// Matches composes with exactly one include clause that carries exactly one
+/// filter of type `concept is-a` or `concept descendent-of`.  Richer composes
+/// (multi-filter, property= filters, multiple includes) fall through to the
+/// slow blocking path so they benefit from caching on second call.
+///
+/// Returns `Some((system_url, system_id, root_code, include_root))` on a match,
+/// `None` when the compose does not fit the pattern.
+fn extract_simple_hierarchy_compose(
+    conn: &Connection,
+    compose: &serde_json::Value,
+    warnings: &mut Vec<String>,
+) -> Result<Option<(String, String, String, bool)>, HtsError> {
+    let includes = match compose["include"].as_array() {
+        Some(a) if a.len() == 1 => a,
+        _ => return Ok(None),
+    };
+    let inc = &includes[0];
+
+    let filters = match inc["filter"].as_array() {
+        Some(f) if f.len() == 1 => f,
+        _ => return Ok(None),
+    };
+    let f = &filters[0];
+
+    let property = f["property"].as_str().unwrap_or("");
+    let op = f["op"].as_str().unwrap_or("");
+    let root_code = f["value"].as_str().unwrap_or("");
+
+    if property != "concept" || root_code.is_empty() {
+        return Ok(None);
+    }
+
+    let include_root = match op {
+        "is-a" => true,
+        "descendent-of" => false,
+        _ => return Ok(None),
+    };
+
+    let system_url = match inc["system"].as_str() {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(None),
+    };
+
+    let system_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM code_systems WHERE url = ?1",
+            [system_url],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let system_id = match system_id {
+        Some(id) => id,
+        None => {
+            warnings.push(format!(
+                "CodeSystem {system_url} was not found and has been excluded from the expansion"
+            ));
+            return Ok(None);
+        }
+    };
+
+    Ok(Some((
+        system_url.to_owned(),
+        system_id,
+        root_code.to_owned(),
+        include_root,
+    )))
+}
+
 /// Serve a page of an implicit ValueSet without waiting for the full cache.
 ///
 /// Used as the "cold-cache fast path" when `ensure_implicit_cache` would block
@@ -1289,6 +1446,7 @@ fn bfs_expand_page(
             cs_url,
             system_id,
             root_code,
+            true, // ?fhir_vs=isa/X is self + descendants (<< semantics)
             offset,
             limit,
             filter_lower,
@@ -1296,7 +1454,7 @@ fn bfs_expand_page(
     }
 }
 
-/// BFS traversal of the `IsA` implicit ValueSet, returning exactly one page.
+/// BFS traversal of an `IsA` or `DescendentOf` hierarchy, returning one page.
 ///
 /// Visits nodes breadth-first, collecting those that pass the optional text
 /// filter, skipping the first `offset` and returning up to `limit` more.
@@ -1304,19 +1462,46 @@ fn bfs_expand_page(
 /// `offset + limit` nodes runs in O((offset+limit) × log N) — typically a
 /// few hundred milliseconds even at offset=500, versus 30+ seconds for the
 /// full recursive-CTE INSERT.
+///
+/// `include_root=true` adds `root_code` itself to the result set (is-a /
+/// `<<` semantics); `false` starts BFS from root's children (descendent-of /
+/// `<` semantics).
+#[allow(clippy::too_many_arguments)]
 fn bfs_isa_page(
     conn: &Connection,
     cs_url: &str,
     system_id: &str,
     root_code: &str,
+    include_root: bool,
     offset: usize,
     limit: usize,
     filter_lower: Option<&str>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let mut queue: VecDeque<String> = VecDeque::new();
-    queue.push_back(root_code.to_owned());
     let mut visited: HashSet<String> = HashSet::new();
     visited.insert(root_code.to_owned());
+
+    if include_root {
+        queue.push_back(root_code.to_owned());
+    } else {
+        // descendent-of: seed the queue with root's direct children
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT child_code FROM concept_hierarchy \
+                 WHERE system_id = ?1 AND parent_code = ?2 ORDER BY child_code",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let children: Vec<String> = stmt
+            .query_map(rusqlite::params![system_id, root_code], |r| r.get(0))
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        for child in children {
+            if visited.insert(child.clone()) {
+                queue.push_back(child);
+            }
+        }
+    }
 
     let mut visible: usize = 0; // count of nodes that passed the filter so far
     let mut page: Vec<ExpansionContains> = Vec::new();
@@ -1964,6 +2149,7 @@ fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
 /// Populated lazily on the first filtered inline expand for a given system.
 /// Cleared on server startup so a re-import followed by a restart always
 /// rebuilds from fresh data.
+#[allow(dead_code)]
 fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsError> {
     let populated: bool = conn
         .query_row(
@@ -1977,23 +2163,45 @@ fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsErro
         return Ok(());
     }
 
-    let tx = conn
-        .unchecked_transaction()
+    // BEGIN IMMEDIATE acquires the write lock upfront so concurrent background
+    // tasks don't each build the same index independently.
+    conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    // Delete any partial entries (defensive), then bulk-insert all concepts
-    // for this system. rowid matches concepts.id so callers can join if needed.
-    tx.execute("DELETE FROM concepts_fts WHERE system_id = ?1", [system_id])
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // Re-check inside the lock: another task may have built the index while we waited.
+    let still_empty: bool = match conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM concepts_fts WHERE system_id = ?1 LIMIT 1)",
+        [system_id],
+        |r| r.get(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(HtsError::StorageError(e.to_string()));
+        }
+    };
 
-    tx.execute(
+    if !still_empty {
+        conn.execute_batch("COMMIT")
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        return Ok(());
+    }
+
+    if let Err(e) = conn.execute("DELETE FROM concepts_fts WHERE system_id = ?1", [system_id]) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(HtsError::StorageError(e.to_string()));
+    }
+
+    if let Err(e) = conn.execute(
         "INSERT INTO concepts_fts(rowid, system_id, code, display)
          SELECT id, system_id, code, display FROM concepts WHERE system_id = ?1",
         [system_id],
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(HtsError::StorageError(e.to_string()));
+    }
 
-    tx.commit()
+    conn.execute_batch("COMMIT")
         .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
