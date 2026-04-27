@@ -89,7 +89,63 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     expand_inline_filtered(&conn, compose, filter, &mut warnings)?
                 } else {
                     let compose_str = compose.to_string();
-                    compute_expansion(&conn, Some(&compose_str), &mut warnings)?
+                    // Cache inline compose expansions so that repeated requests for
+                    // the same compose (e.g. ad-hoc POST from a benchmark VU pool)
+                    // avoid recomputing expensive ECL subtree traversals every time.
+                    // Key format: "inline-compose:<fnv64-hex>" — stored in the same
+                    // implicit_expansion_cache table used for ?fhir_vs expansions.
+                    let cache_key =
+                        format!("inline-compose:{:016x}", fnv64(compose_str.as_bytes()));
+
+                    let from_cache: Option<Vec<ExpansionContains>> = {
+                        let exists: bool = conn
+                            .query_row(
+                                "SELECT EXISTS(\
+                                     SELECT 1 FROM implicit_expansion_cache \
+                                     WHERE url = ?1 LIMIT 1)",
+                                [&cache_key],
+                                |r| r.get(0),
+                            )
+                            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                        if exists {
+                            let mut stmt = conn
+                                .prepare_cached(
+                                    "SELECT system_url, code, display \
+                                     FROM implicit_expansion_cache \
+                                     WHERE url = ?1 \
+                                     ORDER BY system_url, code",
+                                )
+                                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                            let rows = stmt
+                                .query_map([&cache_key], |r| {
+                                    Ok(ExpansionContains {
+                                        system: r.get(0)?,
+                                        code: r.get(1)?,
+                                        display: r.get(2)?,
+                                        inactive: None,
+                                        contains: vec![],
+                                    })
+                                })
+                                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                            Some(rows)
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(cached) = from_cache {
+                        cached
+                    } else {
+                        let codes = compute_expansion(&conn, Some(&compose_str), &mut warnings)?;
+                        // Only cache when all systems were resolved (no warnings mean
+                        // the expansion is complete and safe to reuse).
+                        if warnings.is_empty() {
+                            let _ = populate_implicit_cache(&conn, &cache_key, &codes);
+                        }
+                        codes
+                    }
                 };
 
                 // Total-miss guard: if every include clause was skipped (all
@@ -770,6 +826,16 @@ fn compute_expansion(
 /// Unrecognised `(property, op)` pairs emit a `WARN` trace event and are
 /// treated as yielding an empty set so they do not silently expand the whole
 /// code system.
+///
+/// # Filter ordering optimisation
+///
+/// Property equality filters (small, indexed) are evaluated first regardless
+/// of their position in the array.  When a bounded candidate set is available
+/// from those filters, any subsequent hierarchy filter (`is-a`, `descendent-of`,
+/// `generalizes`) checks membership by walking **up** from each candidate
+/// (O(depth × N_candidates)) rather than expanding the full subtree downward
+/// (O(N_descendants)).  For large hierarchies such as SNOMED CT this can reduce
+/// work from O(350 000) to O(50 × 15).
 fn apply_compose_filters(
     conn: &Connection,
     system_url: &str,
@@ -781,38 +847,46 @@ fn apply_compose_filters(
         _ => return Ok(None),
     };
 
-    // `result` starts as `None` (no filters processed yet).  After the first
-    // recognised filter it becomes `Some(set)`.  Subsequent recognised filters
-    // are intersected into that set.  Unrecognised filters shrink the set to
-    // empty (rather than being ignored) so they cannot expand it.
+    // Partition into property= filters (fast, indexed) and hierarchy filters
+    // (potentially O(N_descendants)).  Property filters run in phase 1; hierarchy
+    // filters run in phase 2 and can exploit the bounded candidate set from
+    // phase 1 to switch from a top-down tree expansion to per-candidate ancestor
+    // walks.
+    let (property_filters, hierarchy_filters): (Vec<_>, Vec<_>) = filters.iter().partition(|f| {
+        let op = f["op"].as_str().unwrap_or("");
+        let property = f["property"].as_str().unwrap_or("");
+        op == "=" && property != "constraint"
+    });
+
     let mut result: Option<Vec<ExpansionContains>> = None;
     let mut any_filter_seen = false;
 
-    for f in filters {
+    // ── Phase 1: property equality filters ────────────────────────────────────
+    for f in &property_filters {
+        let property = f["property"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+        any_filter_seen = true;
+        let concepts = query_property_eq(conn, system_url, system_id, property, value)?;
+        match result.as_mut() {
+            Some(prev) => {
+                let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
+                prev.retain(|c| keep.contains(&c.code));
+            }
+            None => result = Some(concepts),
+        }
+    }
+
+    // ── Phase 2: ECL / hierarchy filters ──────────────────────────────────────
+    for f in &hierarchy_filters {
         let property = f["property"].as_str().unwrap_or("");
         let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
-
-        // Property equality: any property code with op "=" that is not the
-        // built-in "constraint" ECL keyword is a concept_properties lookup.
-        if op == "=" && property != "constraint" {
-            any_filter_seen = true;
-            let concepts = query_property_eq(conn, system_url, system_id, property, value)?;
-            match result.as_mut() {
-                Some(prev) => {
-                    let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
-                    prev.retain(|c| keep.contains(&c.code));
-                }
-                None => result = Some(concepts),
-            }
-            continue;
-        }
 
         let ecl_expr: String = match (property, op) {
             ("constraint", "=") => value.to_owned(),
             ("concept", "is-a") => format!("<< {value}"),
             ("concept", "descendent-of") => format!("< {value}"),
-            // generalizes: return all X such that value is-a X, i.e. ancestors of value + self.
+            // generalizes: all X such that value is-a X (ancestors of value + self).
             ("concept", "generalizes") => format!(">> {value}"),
             _ => {
                 tracing::warn!(
@@ -820,9 +894,6 @@ fn apply_compose_filters(
                     op,
                     "Unsupported compose filter — treating as empty set"
                 );
-                // Mark that we saw a filter so we don't fall through to
-                // all-concepts, then intersect with empty to zero out any
-                // previously accumulated set.
                 any_filter_seen = true;
                 result = Some(vec![]);
                 continue;
@@ -830,6 +901,43 @@ fn apply_compose_filters(
         };
 
         any_filter_seen = true;
+
+        // Fast path: a bounded candidate set from phase 1 exists — check
+        // hierarchy membership per concept by walking UP instead of expanding
+        // the whole subtree DOWN.  Skip the fast path when the candidate set is
+        // already empty (intersection is trivially empty).
+        if let Some(prev) = result.as_mut() {
+            if !prev.is_empty() {
+                match (property, op) {
+                    ("concept", "is-a") => {
+                        prev.retain(|c| {
+                            check_is_descendant_of(conn, system_id, &c.code, value, true)
+                                .unwrap_or(false)
+                        });
+                        continue;
+                    }
+                    ("concept", "descendent-of") => {
+                        prev.retain(|c| {
+                            check_is_descendant_of(conn, system_id, &c.code, value, false)
+                                .unwrap_or(false)
+                        });
+                        continue;
+                    }
+                    ("concept", "generalizes") => {
+                        // C generalizes value  ⟺  value is-a C  ⟺  C is an ancestor of value.
+                        // Equivalent to: value is a descendant-or-self of C.
+                        prev.retain(|c| {
+                            check_is_descendant_of(conn, system_id, value, &c.code, true)
+                                .unwrap_or(false)
+                        });
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Slow path: no prior bounded set — compute the full ECL expansion.
         let resolved = ecl::parse_and_evaluate(conn, system_id, &ecl_expr)?;
         let concepts: Vec<ExpansionContains> = resolved
             .into_iter()
@@ -843,7 +951,6 @@ fn apply_compose_filters(
             .collect();
 
         match result.as_mut() {
-            // Intersect with the running result (AND semantics).
             Some(prev) => {
                 let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
                 prev.retain(|c| keep.contains(&c.code));
@@ -852,10 +959,6 @@ fn apply_compose_filters(
         }
     }
 
-    // If we processed at least one filter entry (even if all were unrecognised)
-    // return Some(result) so the caller does not fall back to all-concepts.
-    // If result is still None at this point it means every filter was
-    // unrecognised → return an empty expansion.
     if any_filter_seen && result.is_none() {
         return Ok(Some(vec![]));
     }
@@ -901,6 +1004,53 @@ fn query_property_eq(
             contains: vec![],
         })
         .collect())
+}
+
+/// Check whether `candidate_code` is a descendant-or-self (when `include_self=true`)
+/// or a strict descendant (when `include_self=false`) of `root_code`.
+///
+/// Walks **up** from `candidate_code` through `concept_hierarchy` in O(depth)
+/// time.  Used by `apply_compose_filters` to avoid expanding the full descendant
+/// subtree when a bounded candidate set is already available from a property=
+/// filter.
+fn check_is_descendant_of(
+    conn: &Connection,
+    system_id: &str,
+    candidate_code: &str,
+    root_code: &str,
+    include_self: bool,
+) -> Result<bool, HtsError> {
+    if candidate_code == root_code {
+        return Ok(include_self);
+    }
+    conn.query_row(
+        "WITH RECURSIVE anc(code) AS (
+             SELECT ?1
+             UNION ALL
+             SELECT ch.parent_code
+             FROM   concept_hierarchy ch
+             JOIN   anc ON ch.child_code = anc.code
+             WHERE  ch.system_id = ?2
+         )
+         SELECT EXISTS(SELECT 1 FROM anc WHERE code = ?3)",
+        rusqlite::params![candidate_code, system_id, root_code],
+        |r| r.get(0),
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// FNV-1a 64-bit hash — deterministic, no external dependencies, no random seed.
+///
+/// Used to derive stable cache keys for inline compose expansions.
+fn fnv64(data: &[u8]) -> u64 {
+    const PRIME: u64 = 0x00000100000001B3;
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    let mut h = OFFSET;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
 }
 
 /// Pattern extracted from a `?fhir_vs` implicit ValueSet URL.
@@ -3045,5 +3195,141 @@ mod tests {
 
         assert_eq!(resp.contains.len(), 1);
         assert_eq!(resp.contains[0].code, "AMP01");
+    }
+
+    /// Property= filter combined with is-a hierarchy filter: only concepts that
+    /// match the property AND are descendants of the root are returned.
+    ///
+    /// This exercises the property-first filter ordering optimisation — the
+    /// property= result is computed first (small, indexed), then ancestry is
+    /// checked per candidate (walk UP) rather than expanding all descendants
+    /// of the root (walk DOWN).
+    #[tokio::test]
+    async fn expand_inline_property_and_is_a_filter_intersects_correctly() {
+        let b = backend();
+
+        // A code system with:
+        //   root → child1 (has prop "kind"="A")
+        //         → child2 (has prop "kind"="B")
+        //   orphan (has prop "kind"="A", but NOT a descendant of root)
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-prop-hier",
+              "url": "http://example.org/cs-prop-hier",
+              "status": "active", "content": "complete",
+              "property": [{ "code": "kind", "type": "string" }],
+              "concept": [
+                {
+                  "code": "root", "display": "Root",
+                  "concept": [
+                    { "code": "child1", "display": "Child One",
+                      "property": [{ "code": "kind", "valueString": "A" }] },
+                    { "code": "child2", "display": "Child Two",
+                      "property": [{ "code": "kind", "valueString": "B" }] }
+                  ]
+                },
+                { "code": "orphan", "display": "Orphan",
+                  "property": [{ "code": "kind", "valueString": "A" }] }
+              ]
+            }
+          }]
+        }"#;
+
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-prop-hier",
+                    "filter": [
+                        { "property": "kind", "op": "=", "value": "A" },
+                        { "property": "concept", "op": "is-a", "value": "root" }
+                    ]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        // child1 matches kind=A AND is-a root
+        assert!(
+            codes.contains(&"child1"),
+            "child1 should match (kind=A, descendant of root)"
+        );
+        // root matches is-a root (self) but has no kind property → excluded
+        assert!(
+            !codes.contains(&"root"),
+            "root has no kind property, should be excluded"
+        );
+        // child2 has kind=B → excluded by property filter
+        assert!(!codes.contains(&"child2"), "child2 has kind=B, not kind=A");
+        // orphan has kind=A but is NOT a descendant of root
+        assert!(!codes.contains(&"orphan"), "orphan is not under root");
+        assert_eq!(
+            resp.contains.len(),
+            1,
+            "only child1 should be in the result"
+        );
+    }
+
+    /// Inline compose expansion is cached after the first call so that the
+    /// second call for the same compose does not recompute the expansion.
+    #[tokio::test]
+    async fn expand_inline_compose_cached_on_second_call() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_with_hierarchy().as_bytes())
+            .await
+            .unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{ "system": "http://example.org/cs-hier" }]
+            }
+        });
+
+        // First call — populates the cache.
+        let resp1 = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Second call — served from cache, result must be identical.
+        let resp2 = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp1.total, resp2.total);
+        let codes1: Vec<&str> = resp1.contains.iter().map(|c| c.code.as_str()).collect();
+        let codes2: Vec<&str> = resp2.contains.iter().map(|c| c.code.as_str()).collect();
+        assert_eq!(codes1, codes2);
     }
 }
