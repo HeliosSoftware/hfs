@@ -152,15 +152,16 @@ fn translate_sync(
 ) -> Result<TranslateResponse, HtsError> {
     // When a specific ConceptMap URL is requested, verify it exists first.
     // A missing URL → 404 (not supported / not loaded), distinct from "no match found".
+    // Using EXISTS short-circuits on the first matching row (faster than COUNT(*)).
     if let Some(url) = req.url.as_deref() {
-        let exists: i64 = conn
+        let exists: bool = conn
             .query_row(
-                "SELECT COUNT(*) FROM concept_maps WHERE url = ?1",
+                "SELECT EXISTS(SELECT 1 FROM concept_maps WHERE url = ?1)",
                 [url],
                 |row| row.get(0),
             )
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        if exists == 0 {
+        if !exists {
             return Err(HtsError::NotFound(format!("ConceptMap not found: {url}")));
         }
     }
@@ -264,7 +265,7 @@ fn query_translate_elements(
     );
 
     let mut stmt = conn
-        .prepare(&sql)
+        .prepare_cached(&sql)
         .map_err(|e| HtsError::StorageError(format!("Prepare error: {e}")))?;
 
     let rows = stmt

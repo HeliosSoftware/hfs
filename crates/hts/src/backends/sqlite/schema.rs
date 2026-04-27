@@ -134,6 +134,12 @@ CREATE TABLE IF NOT EXISTS concept_map_elements (
 );
 CREATE INDEX IF NOT EXISTS idx_map_source
     ON concept_map_elements(map_id, source_system, source_code);
+-- Forward and reverse lookup by code (without knowing map_id first).
+-- Needed when the caller knows only the source/target code and optionally system.
+CREATE INDEX IF NOT EXISTS idx_map_elements_source_code
+    ON concept_map_elements(source_code, source_system, map_id);
+CREATE INDEX IF NOT EXISTS idx_map_elements_target_code
+    ON concept_map_elements(target_code, target_system, map_id);
 
 -- ── FTS5 trigram index for implicit expansion text search ─────────────────────
 -- Enables fast substring matching on code and display in implicit_expansion_cache.
@@ -191,7 +197,11 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
     // Idempotent index additions (IF NOT EXISTS handles repeated runs).
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_concept_properties_value
-             ON concept_properties(property, value, concept_id);",
+             ON concept_properties(property, value, concept_id);
+         CREATE INDEX IF NOT EXISTS idx_map_elements_source_code
+             ON concept_map_elements(source_code, source_system, map_id);
+         CREATE INDEX IF NOT EXISTS idx_map_elements_target_code
+             ON concept_map_elements(target_code, target_system, map_id);",
     )?;
 
     Ok(())
