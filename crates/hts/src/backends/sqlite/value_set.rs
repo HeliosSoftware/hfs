@@ -76,19 +76,34 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
+            // Accumulates FHIR expansion warnings for unknown/skipped systems.
+            // Only populated by the inline ValueSet path.
+            let mut warnings: Vec<String> = Vec::new();
+
             let all_codes = if let Some(vs_resource) = req.value_set {
                 // Inline ValueSet: extract compose and expand directly.
-                // Systems not in the DB are skipped gracefully by both
-                // expand_inline_filtered and compute_expansion (warn + continue),
-                // so we dispatch without upfront validation to allow partial
-                // results when some systems (e.g. LOINC) are not loaded.
+                // Systems not in the DB push a warning and are skipped; callers
+                // receive partial results plus `expansion.parameter` warnings.
                 let compose = &vs_resource["compose"];
-                if let Some(filter) = req.filter.as_deref() {
-                    expand_inline_filtered(&conn, compose, filter)?
+                let codes = if let Some(filter) = req.filter.as_deref() {
+                    expand_inline_filtered(&conn, compose, filter, &mut warnings)?
                 } else {
                     let compose_str = compose.to_string();
-                    compute_expansion(&conn, Some(&compose_str))?
+                    compute_expansion(&conn, Some(&compose_str), &mut warnings)?
+                };
+
+                // Total-miss guard: if every include clause was skipped (all
+                // systems unknown), surface a NotFound rather than silently
+                // returning an empty expansion with no explanation.
+                let include_count = compose["include"].as_array().map_or(0, |a| a.len());
+                if include_count > 0 && warnings.len() >= include_count {
+                    return Err(HtsError::NotFound(
+                        "None of the systems in the inline ValueSet compose could be resolved"
+                            .into(),
+                    ));
                 }
+
+                codes
             } else {
                 let url = req.url.as_deref().unwrap();
                 // Resolve expansion codes — either from an explicit ValueSet or from an
@@ -98,7 +113,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // Normal path: try the expansion cache first.
                         let cached = fetch_cache(&conn, &vs_id)?;
                         if cached.is_empty() {
-                            let codes = compute_expansion(&conn, compose_json.as_deref())?;
+                            let codes =
+                                compute_expansion(&conn, compose_json.as_deref(), &mut vec![])?;
                             populate_cache(&conn, &vs_id, &codes)?;
                             codes
                         } else {
@@ -142,6 +158,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             total: Some(total),
                             offset: req.offset,
                             contains: page,
+                            warnings: vec![],
                         });
                     }
                     Err(e) => return Err(e),
@@ -174,6 +191,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     total: Some(total),
                     offset: None,
                     contains: tree,
+                    warnings,
                 });
             }
 
@@ -204,6 +222,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 total: Some(total),
                 offset: req.offset,
                 contains: page,
+                warnings,
             })
         })
         .await
@@ -240,7 +259,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     Ok((vs_id, compose_json)) => {
                         let cached = fetch_cache(&conn, &vs_id)?;
                         if cached.is_empty() {
-                            let codes = compute_expansion(&conn, compose_json.as_deref())?;
+                            let codes =
+                                compute_expansion(&conn, compose_json.as_deref(), &mut vec![])?;
                             populate_cache(&conn, &vs_id, &codes)?;
                             codes
                         } else {
@@ -460,6 +480,7 @@ fn expand_inline_filtered(
     conn: &Connection,
     compose: &serde_json::Value,
     text_filter: &str,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let empty_arr = vec![];
     let includes = compose["include"].as_array().unwrap_or(&empty_arr);
@@ -484,10 +505,11 @@ fn expand_inline_filtered(
         let system_id = match system_id {
             Some(id) => id,
             None => {
-                tracing::warn!(
-                    system_url,
-                    "Skipping unknown system in filtered inline expand"
+                let msg = format!(
+                    "CodeSystem {system_url} was not found and has been excluded from the expansion"
                 );
+                tracing::warn!(%system_url, "{msg}");
+                warnings.push(msg);
                 continue;
             }
         };
@@ -573,6 +595,7 @@ fn expand_inline_filtered(
 fn compute_expansion(
     conn: &Connection,
     compose_json: Option<&str>,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let Some(raw) = compose_json else {
         return Ok(vec![]);
@@ -604,10 +627,11 @@ fn compute_expansion(
         let system_id = match system_id {
             Some(id) => id,
             None => {
-                tracing::warn!(
-                    system_url,
-                    "Skipping unknown code system in ValueSet compose"
+                let msg = format!(
+                    "CodeSystem {system_url} was not found and has been excluded from the expansion"
                 );
+                tracing::warn!(%system_url, "{msg}");
+                warnings.push(msg);
                 continue;
             }
         };
@@ -908,7 +932,7 @@ fn expand_fhir_vs(
     match pattern {
         FhirVsPattern::AllConcepts => {
             let compose = serde_json::json!({ "include": [{ "system": cs_url }] }).to_string();
-            compute_expansion(conn, Some(&compose))
+            compute_expansion(conn, Some(&compose), &mut vec![])
         }
         FhirVsPattern::IsA(code) => {
             let ecl_expr = format!("<< {code}");
@@ -1276,7 +1300,7 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
 
     let codes = if let Ok(cs_url) = find_cs_for_implicit_vs(conn, url, date) {
         let compose = serde_json::json!({ "include": [{ "system": cs_url }] }).to_string();
-        compute_expansion(conn, Some(&compose))?
+        compute_expansion(conn, Some(&compose), &mut vec![])?
     } else if let Some((cs_url, pattern)) = parse_fhir_vs_url(url) {
         expand_fhir_vs(conn, &cs_url, &pattern)?
     } else {
@@ -2670,11 +2694,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expand_inline_valueset_unknown_system_returns_empty() {
-        // Unknown systems are skipped gracefully (warn + continue) so the
-        // expansion succeeds with zero results rather than returning NotFound.
-        // This allows partial results when some systems in a multi-system
-        // inline ValueSet are loaded while others are not.
+    async fn expand_inline_valueset_unknown_system_total_miss_returns_not_found() {
+        // When ALL include clauses reference unknown systems (total miss), the
+        // server returns NotFound rather than a silent empty expansion.
         let b = backend();
 
         let inline_vs = serde_json::json!({
@@ -2684,7 +2706,7 @@ mod tests {
             }
         });
 
-        let resp = b
+        let err = b
             .expand(
                 &ctx(),
                 ExpandRequest {
@@ -2694,10 +2716,61 @@ mod tests {
                 },
             )
             .await
+            .unwrap_err();
+
+        assert!(matches!(err, HtsError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn expand_inline_valueset_partial_miss_returns_results_with_warnings() {
+        // When only SOME include clauses reference unknown systems (partial
+        // miss), the server returns whatever it can and emits warnings for the
+        // skipped systems — matching the FHIR expansion.parameter warning spec.
+        let b = backend();
+
+        // Load one of the two referenced systems.
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-known",
+              "url": "http://known.system/cs",
+              "status": "active", "content": "complete",
+              "concept": [{ "code": "K1", "display": "Known One" }]
+            }
+          }]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [
+                    { "system": "http://known.system/cs" },
+                    { "system": "http://unknown.system/cs" }
+                ]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
 
-        assert_eq!(resp.total, Some(0));
-        assert!(resp.contains.is_empty());
+        // Results from the known system are returned.
+        assert_eq!(resp.total, Some(1));
+        assert_eq!(resp.contains[0].code, "K1");
+
+        // A warning is emitted for the unknown system.
+        assert_eq!(resp.warnings.len(), 1);
+        assert!(resp.warnings[0].contains("http://unknown.system/cs"));
     }
 
     #[tokio::test]

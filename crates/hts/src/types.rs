@@ -192,6 +192,11 @@ pub struct ExpandResponse {
     pub total: Option<u32>,
     pub offset: Option<u32>,
     pub contains: Vec<ExpansionContains>,
+    /// FHIR `expansion.parameter[].name = "warning"` messages emitted when
+    /// one or more systems in an inline compose were not loaded and were
+    /// silently excluded from the expansion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 // ─── $translate ───────────────────────────────────────────────────────────────

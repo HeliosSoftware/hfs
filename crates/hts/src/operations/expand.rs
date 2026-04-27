@@ -148,6 +148,14 @@ async fn process_expand<B: TerminologyBackend>(
     if let Some(off) = resp.offset {
         expansion["offset"] = json!(off);
     }
+    if !resp.warnings.is_empty() {
+        let params: Vec<Value> = resp
+            .warnings
+            .iter()
+            .map(|w| json!({ "name": "warning", "valueString": w }))
+            .collect();
+        expansion["parameter"] = json!(params);
+    }
 
     Ok(json!({
         "resourceType": "ValueSet",

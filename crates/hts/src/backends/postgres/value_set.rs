@@ -101,6 +101,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 total: Some(total),
                 offset: None,
                 contains: tree,
+                warnings: vec![],
             });
         }
 
@@ -114,6 +115,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             total: Some(total),
             offset: req.offset,
             contains: page,
+            warnings: vec![],
         })
     }
 
