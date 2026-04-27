@@ -39,7 +39,7 @@
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::ecl;
 use crate::error::HtsError;
@@ -178,9 +178,85 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         }
                     }
                     Err(HtsError::NotFound(_)) => {
-                        // Implicit ValueSet: ensure the cache is populated (atomic
-                        // transaction write), then serve directly from SQL with
-                        // LIMIT/OFFSET so we never load the full expansion into memory.
+                        // ── BFS fast path for cold-cache implicit ValueSets ───────────
+                        // When the cache is empty and the client requested a bounded page
+                        // (count > 0), serve it immediately from BFS/SQL traversal and
+                        // spawn the full cache population in the background.  This avoids
+                        // the >30 s timeout that a blocking recursive-CTE INSERT for
+                        // large code systems (e.g. SNOMED CT ~350 K concepts) would cause.
+                        let cache_populated: bool = conn
+                            .query_row(
+                                "SELECT EXISTS(\
+                                     SELECT 1 FROM implicit_expansion_cache \
+                                     WHERE url = ?1 LIMIT 1)",
+                                [url],
+                                |r| r.get(0),
+                            )
+                            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                        if !cache_populated {
+                            if let Some(count) = req.count.filter(|&c| c > 0) {
+                                let cs_pat = if let Ok(cs_url) =
+                                    find_cs_for_implicit_vs(&conn, url, req.date.as_deref())
+                                {
+                                    Some((cs_url, FhirVsPattern::AllConcepts))
+                                } else {
+                                    parse_fhir_vs_url(url)
+                                };
+
+                                if let Some((cs_url, pattern)) = cs_pat {
+                                    let system_id: Option<String> = conn
+                                        .query_row(
+                                            "SELECT id FROM code_systems WHERE url = ?1",
+                                            [&cs_url],
+                                            |r| r.get(0),
+                                        )
+                                        .optional()
+                                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                                    if let Some(system_id) = system_id {
+                                        let filter_lower =
+                                            req.filter.as_deref().map(|f| f.to_lowercase());
+                                        let bfs_offset = req.offset.unwrap_or(0) as usize;
+                                        let page = bfs_expand_page(
+                                            &conn,
+                                            &cs_url,
+                                            &system_id,
+                                            &pattern,
+                                            bfs_offset,
+                                            count as usize,
+                                            filter_lower.as_deref(),
+                                        )?;
+
+                                        // Kick off full cache population in the background so
+                                        // subsequent requests are served from the fast SQL path.
+                                        let url_bg = url.to_owned();
+                                        let date_bg = req.date.clone();
+                                        let pool_bg = pool.clone();
+                                        tokio::runtime::Handle::current().spawn_blocking(
+                                            move || {
+                                                if let Ok(conn2) = pool_bg.get() {
+                                                    let _ = ensure_implicit_cache(
+                                                        &conn2,
+                                                        &url_bg,
+                                                        date_bg.as_deref(),
+                                                    );
+                                                }
+                                            },
+                                        );
+
+                                        return Ok(ExpandResponse {
+                                            total: None,
+                                            offset: req.offset,
+                                            contains: page,
+                                            warnings: vec![],
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        // ── Blocking path: cache is warm, or count is None ────────────
                         ensure_implicit_cache(&conn, url, req.date.as_deref())?;
 
                         let filter_lower = req.filter.as_deref().map(|f| f.to_lowercase());
@@ -1139,6 +1215,172 @@ fn parse_fhir_vs_url(url: &str) -> Option<(String, FhirVsPattern)> {
         return Some((base.to_owned(), FhirVsPattern::IsA(code.to_owned())));
     }
     None
+}
+
+/// Serve a page of an implicit ValueSet without waiting for the full cache.
+///
+/// Used as the "cold-cache fast path" when `ensure_implicit_cache` would block
+/// for >30 s (e.g. SNOMED CT `?fhir_vs=isa/404684003` with ~350 K descendants).
+///
+/// - `AllConcepts`: direct indexed SQL `LIMIT/OFFSET` — O(log N).
+/// - `IsA`: BFS from the root, stopping after `offset + limit` nodes — O(offset+limit).
+fn bfs_expand_page(
+    conn: &Connection,
+    cs_url: &str,
+    system_id: &str,
+    pattern: &FhirVsPattern,
+    offset: usize,
+    limit: usize,
+    filter_lower: Option<&str>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    match pattern {
+        FhirVsPattern::AllConcepts => {
+            let sql_limit = limit as i64;
+            let sql_offset = offset as i64;
+            if let Some(f) = filter_lower {
+                let sql_pat = format!("%{f}%");
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT code, display FROM concepts \
+                         WHERE system_id = ?1 \
+                           AND (LOWER(code) LIKE ?2 \
+                                OR LOWER(COALESCE(display,'')) LIKE ?2) \
+                         ORDER BY code LIMIT ?3 OFFSET ?4",
+                    )
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                stmt.query_map(
+                    rusqlite::params![system_id, sql_pat, sql_limit, sql_offset],
+                    |r| {
+                        Ok(ExpansionContains {
+                            system: cs_url.to_owned(),
+                            code: r.get(0)?,
+                            display: r.get(1)?,
+                            inactive: None,
+                            contains: vec![],
+                        })
+                    },
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()))
+            } else {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT code, display FROM concepts \
+                         WHERE system_id = ?1 ORDER BY code LIMIT ?2 OFFSET ?3",
+                    )
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                stmt.query_map(rusqlite::params![system_id, sql_limit, sql_offset], |r| {
+                    Ok(ExpansionContains {
+                        system: cs_url.to_owned(),
+                        code: r.get(0)?,
+                        display: r.get(1)?,
+                        inactive: None,
+                        contains: vec![],
+                    })
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()))
+            }
+        }
+        FhirVsPattern::IsA(root_code) => bfs_isa_page(
+            conn,
+            cs_url,
+            system_id,
+            root_code,
+            offset,
+            limit,
+            filter_lower,
+        ),
+    }
+}
+
+/// BFS traversal of the `IsA` implicit ValueSet, returning exactly one page.
+///
+/// Visits nodes breadth-first, collecting those that pass the optional text
+/// filter, skipping the first `offset` and returning up to `limit` more.
+/// Each node costs two indexed SQL lookups (display + children), so visiting
+/// `offset + limit` nodes runs in O((offset+limit) × log N) — typically a
+/// few hundred milliseconds even at offset=500, versus 30+ seconds for the
+/// full recursive-CTE INSERT.
+fn bfs_isa_page(
+    conn: &Connection,
+    cs_url: &str,
+    system_id: &str,
+    root_code: &str,
+    offset: usize,
+    limit: usize,
+    filter_lower: Option<&str>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(root_code.to_owned());
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(root_code.to_owned());
+
+    let mut visible: usize = 0; // count of nodes that passed the filter so far
+    let mut page: Vec<ExpansionContains> = Vec::new();
+
+    while let Some(code) = queue.pop_front() {
+        let display: Option<String> = conn
+            .query_row(
+                "SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2",
+                rusqlite::params![system_id, code],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .flatten();
+
+        let passes = match filter_lower {
+            Some(f) => {
+                code.to_lowercase().contains(f)
+                    || display
+                        .as_deref()
+                        .map(|d| d.to_lowercase().contains(f))
+                        .unwrap_or(false)
+            }
+            None => true,
+        };
+
+        if passes {
+            if visible >= offset && page.len() < limit {
+                page.push(ExpansionContains {
+                    system: cs_url.to_owned(),
+                    code: code.clone(),
+                    display,
+                    inactive: None,
+                    contains: vec![],
+                });
+                if page.len() >= limit {
+                    break;
+                }
+            }
+            visible += 1;
+        }
+
+        // Fetch children (indexed lookup on PRIMARY KEY)
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT child_code FROM concept_hierarchy \
+                 WHERE system_id = ?1 AND parent_code = ?2 ORDER BY child_code",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        let children: Vec<String> = stmt
+            .query_map(rusqlite::params![system_id, code], |r| r.get(0))
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        for child in children {
+            if visited.insert(child.clone()) {
+                queue.push_back(child);
+            }
+        }
+    }
+
+    Ok(page)
 }
 
 /// Find the canonical URL of a CodeSystem whose `valueSet` property equals `vs_url`.
