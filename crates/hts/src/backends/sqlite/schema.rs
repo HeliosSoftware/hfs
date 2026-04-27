@@ -75,7 +75,10 @@ CREATE TABLE IF NOT EXISTS concept_designations (
     value       TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_code_systems_created_at ON code_systems(created_at);
+
 -- ── Value Sets ─────────────────────────────────────────────────────────────────
+
 CREATE TABLE IF NOT EXISTS value_sets (
     id          TEXT PRIMARY KEY,
     url         TEXT NOT NULL UNIQUE,
@@ -86,6 +89,7 @@ CREATE TABLE IF NOT EXISTS value_sets (
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_value_sets_created_at ON value_sets(created_at);
 
 -- ── Value Set Expansions (materialized cache) ─────────────────────────────────
 CREATE TABLE IF NOT EXISTS value_set_expansions (
@@ -201,7 +205,11 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
          CREATE INDEX IF NOT EXISTS idx_map_elements_source_code
              ON concept_map_elements(source_code, source_system, map_id);
          CREATE INDEX IF NOT EXISTS idx_map_elements_target_code
-             ON concept_map_elements(target_code, target_system, map_id);",
+             ON concept_map_elements(target_code, target_system, map_id);
+         CREATE INDEX IF NOT EXISTS idx_code_systems_created_at
+             ON code_systems(created_at);
+         CREATE INDEX IF NOT EXISTS idx_value_sets_created_at
+             ON value_sets(created_at);",
     )?;
 
     Ok(())

@@ -399,7 +399,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             let offset = i64::from(query.offset.unwrap_or(0));
 
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, url, version, name, title, status, resource_json
                      FROM value_sets
                      WHERE (?1 IS NULL OR url = ?1)
@@ -498,7 +498,7 @@ fn resolve_value_set(
 /// Returns an empty vec when no cached entries exist (cache miss).
 fn fetch_cache(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionContains>, HtsError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_cached(
             "SELECT system_url, code, display
              FROM value_set_expansions
              WHERE value_set_id = ?1
@@ -976,7 +976,7 @@ fn query_property_eq(
     value: &str,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_cached(
             "SELECT c.code, c.display
              FROM concepts c
              JOIN concept_properties cp ON cp.concept_id = c.id

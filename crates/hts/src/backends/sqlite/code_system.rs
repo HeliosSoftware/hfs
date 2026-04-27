@@ -262,7 +262,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let offset = i64::from(query.offset.unwrap_or(0));
 
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, url, version, name, title, status, resource_json
                      FROM code_systems
                      WHERE (?1 IS NULL OR url = ?1)
