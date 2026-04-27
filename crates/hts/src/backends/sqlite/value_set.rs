@@ -554,30 +554,58 @@ fn expand_inline_filtered(
                 }
             }
         } else {
-            // Full-system include with no explicit codes: push filter into SQL so we
-            // never load the entire code system into memory.
-            let mut stmt = conn
-                .prepare_cached(
-                    "SELECT code, display FROM concepts \
-                     WHERE system_id = ?1 \
-                       AND (LOWER(code) LIKE ?2 OR LOWER(display) LIKE ?2) \
-                     ORDER BY code",
-                )
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            let rows = stmt
-                .query_map(rusqlite::params![system_id, sql_pat], |row| {
-                    Ok(ExpansionContains {
-                        system: system_url.to_owned(),
-                        code: row.get(0)?,
-                        display: row.get(1)?,
-                        inactive: None,
-                        contains: vec![],
+            // Full-system include with no explicit codes.
+            // For filter strings ≥ 3 chars use the FTS5 trigram index on
+            // concepts_fts — O(matches) instead of O(total_concepts).
+            // Shorter strings fall back to LIKE (trigram needs ≥ 3 chars).
+            if filter_lower.len() >= 3 {
+                ensure_concepts_fts(conn, &system_id)?;
+                let match_expr = fts5_quote(&filter_lower);
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT code, display FROM concepts_fts \
+                         WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
+                         ORDER BY code",
+                    )
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![match_expr, system_id], |row| {
+                        Ok(ExpansionContains {
+                            system: system_url.to_owned(),
+                            code: row.get(0)?,
+                            display: row.get(1)?,
+                            inactive: None,
+                            contains: vec![],
+                        })
                     })
-                })
-                .map_err(|e| HtsError::StorageError(e.to_string()))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            results.extend(rows);
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                results.extend(rows);
+            } else {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT code, display FROM concepts \
+                         WHERE system_id = ?1 \
+                           AND (LOWER(code) LIKE ?2 OR LOWER(display) LIKE ?2) \
+                         ORDER BY code",
+                    )
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![system_id, sql_pat], |row| {
+                        Ok(ExpansionContains {
+                            system: system_url.to_owned(),
+                            code: row.get(0)?,
+                            display: row.get(1)?,
+                            inactive: None,
+                            contains: vec![],
+                        })
+                    })
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                results.extend(rows);
+            }
         }
     }
 
@@ -1404,6 +1432,44 @@ fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
          FROM implicit_expansion_cache
          WHERE url = ?1",
         [url],
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Ensure the FTS5 trigram index on `concepts_fts` is populated for `system_id`.
+///
+/// Populated lazily on the first filtered inline expand for a given system.
+/// Cleared on server startup so a re-import followed by a restart always
+/// rebuilds from fresh data.
+fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsError> {
+    let populated: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM concepts_fts WHERE system_id = ?1 LIMIT 1)",
+            [system_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    if populated {
+        return Ok(());
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    // Delete any partial entries (defensive), then bulk-insert all concepts
+    // for this system. rowid matches concepts.id so callers can join if needed.
+    tx.execute("DELETE FROM concepts_fts WHERE system_id = ?1", [system_id])
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    tx.execute(
+        "INSERT INTO concepts_fts(rowid, system_id, code, display)
+         SELECT id, system_id, code, display FROM concepts WHERE system_id = ?1",
+        [system_id],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 

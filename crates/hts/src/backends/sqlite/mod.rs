@@ -68,12 +68,13 @@ impl SqliteTerminologyBackend {
                  PRAGMA cache_size=-32768;
                  PRAGMA temp_store=MEMORY;
                  PRAGMA busy_timeout=30000;
-                 PRAGMA synchronous=NORMAL;",
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA mmap_size=268435456;",
             )
         });
 
         let pool = Pool::builder()
-            .max_size(8)
+            .max_size(20)
             .build(manager)
             .map_err(|e| HtsError::StorageError(format!("Failed to create SQLite pool: {e}")))?;
 
@@ -101,7 +102,8 @@ impl SqliteTerminologyBackend {
             // transaction in populate_implicit_cache.
             let _ = conn.execute_batch(
                 "DELETE FROM implicit_expansion_cache;
-                 DELETE FROM implicit_expansion_fts;",
+                 DELETE FROM implicit_expansion_fts;
+                 DELETE FROM concepts_fts;",
             );
 
             // Update query-planner statistics so recursive CTEs over large

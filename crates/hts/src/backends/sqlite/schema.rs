@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS concept_properties (
 );
 CREATE INDEX IF NOT EXISTS idx_concept_properties_lookup
     ON concept_properties(concept_id, property, value);
+-- Reverse index: supports property=value filter queries (e.g. EX06 tradename_of).
+-- The forward index starts with concept_id and cannot serve property-value lookups.
+CREATE INDEX IF NOT EXISTS idx_concept_properties_value
+    ON concept_properties(property, value, concept_id);
 
 -- ── Designations (alternate names / translations) ─────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_designations (
@@ -139,6 +143,15 @@ CREATE INDEX IF NOT EXISTS idx_map_source
 CREATE VIRTUAL TABLE IF NOT EXISTS implicit_expansion_fts
 USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
            tokenize='trigram case_sensitive 0');
+
+-- ── FTS5 trigram index for direct concept text search ─────────────────────────
+-- Enables fast substring matching on concepts.code and concepts.display.
+-- Used by expand_inline_filtered for full-system includes with a text filter.
+-- system_id is UNINDEXED: stored for post-filter, not tokenised.
+-- Populated lazily per system_id on first filtered expand; cleared on startup.
+CREATE VIRTUAL TABLE IF NOT EXISTS concepts_fts
+USING fts5(system_id UNINDEXED, code, display,
+           tokenize='trigram case_sensitive 0');
 ";
 
 /// Apply the HTS schema to the given database connection.
@@ -174,6 +187,13 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
             Err(e) => return Err(e),
         }
     }
+
+    // Idempotent index additions (IF NOT EXISTS handles repeated runs).
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_concept_properties_value
+             ON concept_properties(property, value, concept_id);",
+    )?;
+
     Ok(())
 }
 
