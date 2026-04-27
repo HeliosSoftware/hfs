@@ -451,7 +451,7 @@ fn fetch_properties(
     concept_id: i64,
 ) -> Result<Vec<PropertyValue>, HtsError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_cached(
             "SELECT property, value_type, value \
              FROM concept_properties WHERE concept_id = ?1 ORDER BY property",
         )
@@ -476,7 +476,7 @@ fn fetch_designations(
     concept_id: i64,
 ) -> Result<Vec<DesignationValue>, HtsError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_cached(
             "SELECT language, use_system, use_code, value \
              FROM concept_designations WHERE concept_id = ?1",
         )

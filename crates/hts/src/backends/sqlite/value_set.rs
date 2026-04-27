@@ -754,7 +754,9 @@ fn compute_expansion(
             // No explicit codes and no filters: include ALL concepts from the
             // referenced system.
             let mut stmt = conn
-                .prepare("SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code")
+                .prepare_cached(
+                    "SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code",
+                )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
             let rows = stmt
@@ -1170,7 +1172,7 @@ fn build_hierarchical_expansion(
 
     for (sys_url, sys_id) in &system_id_map {
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT parent_code, child_code
                  FROM concept_hierarchy
                  WHERE system_id = ?1",
@@ -1694,7 +1696,7 @@ fn implicit_cache_page(
             ensure_implicit_fts(conn, url)?;
             let match_expr = fts5_quote(f);
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT system_url, code, display
                      FROM implicit_expansion_fts
                      WHERE implicit_expansion_fts MATCH ?1 AND url = ?2
@@ -1718,7 +1720,7 @@ fn implicit_cache_page(
         Some(f) => {
             let pattern = format!("%{f}%");
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT system_url, code, display
                      FROM implicit_expansion_cache
                      WHERE url = ?1
@@ -1742,7 +1744,7 @@ fn implicit_cache_page(
         }
         None => {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT system_url, code, display
                      FROM implicit_expansion_cache
                      WHERE url = ?1
