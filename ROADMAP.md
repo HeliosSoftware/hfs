@@ -83,6 +83,7 @@ These items are well-understood and will be picked up once current work complete
 - **MCP Server for FHIR API** — Model Context Protocol integration for the FHIR REST API
 - **MCP Server for SQL on FHIR** — Model Context Protocol integration for analytics workflows
 - **Deployment Cookbooks** — Reference architectures and deployment templates covering standalone development servers, single-node production setups, composite storage configurations, and full CQRS architectures on AWS, Azure, and GCP
+- **Point internal build tools at hosted HTS** — Once `https://hts.heliossoftware.com` is available, switch `.github/workflows/inferno.yml` and any other internal build/CI tooling that needs a terminology service to point at the hosted endpoint (via `HFS_TERMINOLOGY_SERVER` / `FHIRPATH_TERMINOLOGY_SERVER`) 
 
 ---
 
