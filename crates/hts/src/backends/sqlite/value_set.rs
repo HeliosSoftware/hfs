@@ -764,6 +764,7 @@ fn compute_expansion(
 /// | `constraint`  | `=`           | Full ECL expression (e.g. `<< 404684003`) |
 /// | `concept`     | `is-a`        | Subsumption — translated to `<< <value>` (descendants + self) |
 /// | `concept`     | `descendent-of` | Strict subsumption — translated to `< <value>` (descendants only) |
+/// | `concept`     | `generalizes`   | Ancestors-of — translated to `>> <value>` (self + ancestors) |
 /// | _any other_   | `=`           | Property equality — queries `concept_properties` table |
 ///
 /// Unrecognised `(property, op)` pairs emit a `WARN` trace event and are
@@ -811,6 +812,8 @@ fn apply_compose_filters(
             ("constraint", "=") => value.to_owned(),
             ("concept", "is-a") => format!("<< {value}"),
             ("concept", "descendent-of") => format!("< {value}"),
+            // generalizes: return all X such that value is-a X, i.e. ancestors of value + self.
+            ("concept", "generalizes") => format!(">> {value}"),
             _ => {
                 tracing::warn!(
                     property,
@@ -2756,6 +2759,55 @@ mod tests {
         assert!(
             !codes.contains(&"orphan"),
             "orphan is not a descendant of root"
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_inline_valueset_with_generalizes_filter() {
+        // generalizes "child1" should return child1 itself plus its ancestors (root).
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_with_hierarchy().as_bytes())
+            .await
+            .unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-hier",
+                    "filter": [{ "property": "concept", "op": "generalizes", "value": "child1" }]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(
+            codes.contains(&"child1"),
+            "child1 itself must be included (self)"
+        );
+        assert!(
+            codes.contains(&"root"),
+            "root must be included (ancestor of child1)"
+        );
+        assert!(
+            !codes.contains(&"child2"),
+            "child2 is not an ancestor of child1"
+        );
+        assert!(
+            !codes.contains(&"orphan"),
+            "orphan is not an ancestor of child1"
         );
     }
 
