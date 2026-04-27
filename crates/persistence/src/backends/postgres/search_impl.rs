@@ -25,6 +25,7 @@ use crate::types::{
 };
 
 use super::PostgresBackend;
+use super::search::chain_builder::ChainQueryBuilder;
 use super::search::query_builder::{PostgresQueryBuilder, SqlParam};
 
 fn internal_error(message: String) -> StorageError {
@@ -646,55 +647,55 @@ impl ChainedSearchProvider for PostgresBackend {
         chain: &str,
         value: &str,
     ) -> StorageResult<Vec<String>> {
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-
         if chain.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Parse the chain path (e.g., "patient.organization.name")
-        let parts: Vec<&str> = chain.split('.').collect();
-        if parts.is_empty() {
-            return Ok(Vec::new());
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Build a multi-step chain query via the registry-driven builder.
+        // The builder produces a `r.id IN (... nested SELECTs ...)` fragment
+        // that handles arbitrary chain depth (was previously stubbed for >2
+        // segments).
+        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.search_registry().clone())
+            .with_param_offset(1);
+        let parsed = builder
+            .parse_chain(chain)
+            .map_err(|e| internal_error(format!("Failed to parse chain: {}", e)))?;
+        let parsed_value = crate::types::SearchValue::parse(value);
+        let fragment = builder.build_forward_chain_sql(&parsed, &parsed_value)?;
+
+        let sql = format!(
+            "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
+             AND r.resource_type = '{base}' AND r.is_deleted = FALSE AND {clause}",
+            base = base_type,
+            clause = fragment.sql,
+        );
+
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(tenant_id.to_string())];
+        for p in &fragment.params {
+            match p {
+                SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                SqlParam::Float(f) => params.push(Box::new(*f)),
+                SqlParam::Integer(i) => params.push(Box::new(*i)),
+                SqlParam::Bool(b) => params.push(Box::new(*b)),
+                SqlParam::Timestamp(dt) => params.push(Box::new(*dt)),
+                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+            }
         }
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
-        // Simple single-step chain: param_name.target_param = value
-        // For multi-step chains, build nested subqueries
-        if parts.len() == 2 {
-            // Single step: e.g., patient.name=Smith
-            // Find resources of the target type matching the value,
-            // then find base resources referencing them
-            let ref_param = parts[0];
-            let target_param = parts[1];
+        let rows = client
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| internal_error(format!("Failed to execute chain query: {}", e)))?;
 
-            let sql = format!(
-                "SELECT DISTINCT si_ref.resource_id
-                 FROM search_index si_ref
-                 WHERE si_ref.tenant_id = $1
-                   AND si_ref.resource_type = $2
-                   AND si_ref.param_name = '{}'
-                   AND si_ref.value_reference IN (
-                       SELECT resource_type || '/' || resource_id
-                       FROM search_index si_target
-                       WHERE si_target.tenant_id = $1
-                         AND si_target.param_name = '{}'
-                         AND si_target.value_string ILIKE $3
-                   )",
-                ref_param, target_param
-            );
-
-            let rows = client
-                .query(&sql, &[&tenant_id, &base_type, &format!("{}%", value)])
-                .await
-                .map_err(|e| internal_error(format!("Failed to execute chain query: {}", e)))?;
-
-            let ids: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
-            Ok(ids)
-        } else {
-            // Multi-step or single parameter chain - simplified implementation
-            Ok(Vec::new())
-        }
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
     async fn resolve_reverse_chain(
@@ -706,50 +707,43 @@ impl ChainedSearchProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        // _has:Observation:patient:code=1234-5
-        // Find Observations with code=1234-5, then find the Patient IDs they reference
-        let value_str = reverse_chain
-            .value
-            .as_ref()
-            .map(|v| v.value.clone())
-            .unwrap_or_default();
+        // Use the registry-driven builder so we handle nested `_has` chains
+        // and any param type (was previously single-level only with hardcoded
+        // token-or-string-or-empty fallback).
+        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.search_registry().clone())
+            .with_param_offset(1);
+        let fragment = builder.build_reverse_chain_sql(reverse_chain)?;
 
         let sql = format!(
-            "SELECT DISTINCT si_ref.value_reference
-             FROM search_index si_ref
-             INNER JOIN search_index si_val
-                ON si_ref.tenant_id = si_val.tenant_id
-                AND si_ref.resource_type = si_val.resource_type
-                AND si_ref.resource_id = si_val.resource_id
-             WHERE si_ref.tenant_id = $1
-               AND si_ref.resource_type = '{}'
-               AND si_ref.param_name = '{}'
-               AND si_val.param_name = '{}'
-               AND (si_val.value_token_code = $2
-                    OR si_val.value_string ILIKE $3)",
-            reverse_chain.source_type, reverse_chain.reference_param, reverse_chain.search_param
+            "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
+             AND r.resource_type = '{base}' AND r.is_deleted = FALSE AND {clause}",
+            base = base_type,
+            clause = fragment.sql,
         );
 
-        let like_value = format!("{}%", value_str);
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(tenant_id.to_string())];
+        for p in &fragment.params {
+            match p {
+                SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                SqlParam::Float(f) => params.push(Box::new(*f)),
+                SqlParam::Integer(i) => params.push(Box::new(*i)),
+                SqlParam::Bool(b) => params.push(Box::new(*b)),
+                SqlParam::Timestamp(dt) => params.push(Box::new(*dt)),
+                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+            }
+        }
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+
         let rows = client
-            .query(
-                &sql,
-                &[&tenant_id, &value_str.as_str(), &like_value.as_str()],
-            )
+            .query(&sql, &param_refs)
             .await
             .map_err(|e| internal_error(format!("Failed to execute reverse chain query: {}", e)))?;
 
-        let mut ids = Vec::new();
-        for row in &rows {
-            let reference: String = row.get(0);
-            // Extract ID from "ResourceType/ID" reference
-            let expected_prefix = format!("{}/", base_type);
-            if let Some(id) = reference.strip_prefix(&expected_prefix) {
-                ids.push(id.to_string());
-            }
-        }
-
-        Ok(ids)
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 }
 
