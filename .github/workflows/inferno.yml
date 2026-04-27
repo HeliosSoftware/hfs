@@ -219,6 +219,9 @@ jobs:
             us_core_v700|us_core_v800)
               # Inferno fhir_client gem bug with UUID-based Location references
               OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_location-${SUITE}_location_address_search_test\""
+              # smokingstatus/simple-observation: shared test data references SNOMED CT US-edition version (731000124108) not in International Edition; Inferno validator can't resolve it
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_smokingstatus-${SUITE}_smokingstatus_validation_test\""
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_simple_observation-${SUITE}_simple_observation_validation_test\""
               ;;
           esac
 

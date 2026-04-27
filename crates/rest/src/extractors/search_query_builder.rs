@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use helios_persistence::search::{SearchParameterRegistry, resolve_param_type};
 use helios_persistence::types::{
-    IncludeDirective, IncludeType, ReverseChainedParameter, SearchModifier, SearchParameter,
-    SearchQuery, SearchValue, SortDirective, SummaryMode, TotalMode,
+    IncludeDirective, IncludeType, ReverseChainedParameter, SearchModifier, SearchParamType,
+    SearchParameter, SearchQuery, SearchValue, SortDirective, SummaryMode, TotalMode,
 };
 
 use super::SearchParams;
@@ -133,17 +133,29 @@ fn parse_search_parameter(
     // Check for chained parameters (e.g., "patient.name" or "subject:Patient.name")
     let (base_name, chain) = parse_chain(param_name);
 
-    // Parse the value(s) - multiple values separated by comma are ORed
-    let values: Vec<SearchValue> = value
-        .split(',')
-        .map(|v| SearchValue::parse(v.trim()))
-        .collect();
+    // Parse the value(s) - multiple values separated by comma are ORed.
+    // Prefix extraction (gt/lt/ge/le/sa/eb/ap/eq/ne) is only meaningful for
+    // date/number/quantity types per FHIR. For tokens/strings/references/uris,
+    // the raw value is the value — e.g. status code "appended" must not be
+    // misread as Ap-prefix + "pended".
+    let raw_values: Vec<&str> = value.split(',').map(str::trim).collect();
+    let tentative_values: Vec<SearchValue> =
+        raw_values.iter().map(|v| SearchValue::parse(v)).collect();
 
     // Resolve the canonical type from the search parameter registry. This is
     // deterministic for any registered parameter (which is everything in the
     // FHIR spec); the value-shape heuristic is reached only for unregistered
     // custom params. See `helios_persistence::search::resolve_param_type`.
-    let param_type = resolve_param_type(registry, resource_type, base_name, &values);
+    let param_type = resolve_param_type(registry, resource_type, base_name, &tentative_values);
+
+    let values: Vec<SearchValue> = if matches!(
+        param_type,
+        SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity
+    ) {
+        tentative_values
+    } else {
+        raw_values.iter().map(|v| SearchValue::eq(*v)).collect()
+    };
 
     let mut param = SearchParameter {
         name: base_name.to_string(),
@@ -609,6 +621,42 @@ mod tests {
             helios_persistence::types::SearchPrefix::Gt
         );
         assert_eq!(query.parameters[0].values[0].value, "2000-01-01");
+    }
+
+    #[test]
+    fn test_token_value_starting_with_prefix_keyword_keeps_full_value() {
+        // Regression: status code "appended" used to be parsed as Ap-prefix +
+        // "pended", which made strict backends (MongoDB) reject the query
+        // with 400. Token values must not extract a prefix.
+        let mut registry = SearchParameterRegistry::new();
+        registry
+            .register(
+                helios_persistence::search::SearchParameterDefinition::new(
+                    "http://hl7.org/fhir/SearchParameter/DiagnosticReport-status",
+                    "status",
+                    SearchParamType::Token,
+                    "ignored",
+                )
+                .with_base(vec!["DiagnosticReport"]),
+            )
+            .unwrap();
+
+        let param = parse_search_parameter(
+            "DiagnosticReport",
+            "status",
+            "registered,partial,appended,entered-in-error",
+            &registry,
+        )
+        .unwrap();
+
+        assert_eq!(param.values.len(), 4);
+        for v in &param.values {
+            assert_eq!(v.prefix, helios_persistence::types::SearchPrefix::Eq);
+        }
+        assert_eq!(param.values[0].value, "registered");
+        assert_eq!(param.values[1].value, "partial");
+        assert_eq!(param.values[2].value, "appended");
+        assert_eq!(param.values[3].value, "entered-in-error");
     }
 
     #[test]
