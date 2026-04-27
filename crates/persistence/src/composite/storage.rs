@@ -1507,30 +1507,65 @@ impl CompositeStorage {
     }
 
     /// Extracts references from a resource for a given search parameter.
+    ///
+    /// Resolution order:
+    /// 1. Look up the search parameter in the registry and evaluate its
+    ///    FHIRPath `expression` via `SearchParameterExtractor` — the canonical
+    ///    FHIR source of truth for every standard parameter and any custom
+    ///    parameter the user has registered.
+    /// 2. Fall back to the prior heuristic (look for the search-param name as
+    ///    a JSON field, plus a small alias map for `patient`/`subject`/etc.)
+    ///    only when the registry doesn't know about the parameter at all.
+    ///    That keeps unregistered custom parameters working as they did
+    ///    before this change.
     fn extract_references(&self, resource: &StoredResource, search_param: &str) -> Vec<String> {
         let content = resource.content();
-        let mut refs = Vec::new();
+        let resource_type = resource.resource_type();
 
-        // Simple extraction - looks for the search param as a field
-        // A real implementation would use FHIRPath or search parameter definitions
+        let registered = {
+            let registry = self.search_param_registry().read();
+            registry
+                .get_param(resource_type, search_param)
+                .or_else(|| registry.get_param("Resource", search_param))
+        };
+
+        if let Some(param_def) = registered {
+            let extractor = crate::search::SearchParameterExtractor::new(Arc::clone(
+                self.search_param_registry(),
+            ));
+            if let Ok(values) = extractor.extract_for_param(content, &param_def) {
+                // Trust the registry: if the param is registered, return what
+                // the FHIRPath expression yields (even if empty) rather than
+                // also running the heuristic — otherwise an _include against
+                // a resource that genuinely has no matching reference would
+                // accidentally match an unrelated JSON field with the same
+                // name.
+                return values
+                    .into_iter()
+                    .filter_map(|v| match v.value {
+                        crate::search::IndexValue::Reference { reference, .. } => Some(reference),
+                        _ => None,
+                    })
+                    .collect();
+            }
+        }
+
+        // Heuristic fallback for unregistered custom parameters.
+        let mut refs = Vec::new();
         if let Some(value) = content.get(search_param) {
             Self::extract_reference_values(value, &mut refs);
         }
-
-        // Also check common reference field names
-        let field_name = match search_param {
+        let alias = match search_param {
             "patient" | "subject" => Some("subject"),
             "encounter" => Some("encounter"),
             "performer" => Some("performer"),
             _ => None,
         };
-
-        if let Some(field) = field_name {
+        if let Some(field) = alias {
             if let Some(value) = content.get(field) {
                 Self::extract_reference_values(value, &mut refs);
             }
         }
-
         refs
     }
 
@@ -2781,6 +2816,152 @@ mod tests {
         let mut refs = Vec::new();
         CompositeStorage::extract_reference_values(&val, &mut refs);
         assert!(refs.is_empty());
+    }
+
+    /// `extract_references` should consult the registry first and use the
+    /// FHIRPath `expression` from the registered SearchParameter, not the
+    /// hardcoded JSON-field-name heuristic. This exercises the new wiring
+    /// from PR #2 of the load-bearing-stub-fixes plan.
+    #[test]
+    fn test_extract_references_uses_registry_expression() {
+        use crate::search::{SearchParameterDefinition, SearchParameterRegistry};
+        use crate::tenant::TenantId;
+        use crate::types::SearchParamType;
+
+        // Composite wrapped around a backend whose registry has been seeded
+        // with an Encounter.subject param whose FHIRPath expression points at
+        // a JSON field name that is *different* from the search-param name —
+        // proving the registry's expression is what's evaluated, not the
+        // hardcoded "patient" -> "subject" alias.
+        let registry = Arc::new(parking_lot::RwLock::new(SearchParameterRegistry::new()));
+        registry
+            .write()
+            .register(
+                SearchParameterDefinition::new(
+                    "http://hl7.org/fhir/SearchParameter/Encounter-subject",
+                    "subject",
+                    SearchParamType::Reference,
+                    "Encounter.subject",
+                )
+                .with_base(vec!["Encounter"])
+                .with_targets(vec!["Patient", "Group"]),
+            )
+            .unwrap();
+
+        struct MockWithRegistry {
+            registry: Arc<parking_lot::RwLock<SearchParameterRegistry>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ResourceStorage for MockWithRegistry {
+            fn backend_name(&self) -> &'static str {
+                "mock-with-registry"
+            }
+            async fn create(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _resource: serde_json::Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<crate::types::StoredResource> {
+                unimplemented!()
+            }
+            async fn create_or_update(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+                _resource: serde_json::Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<(crate::types::StoredResource, bool)> {
+                unimplemented!()
+            }
+            async fn read(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+            ) -> StorageResult<Option<crate::types::StoredResource>> {
+                Ok(None)
+            }
+            async fn update(
+                &self,
+                _tenant: &TenantContext,
+                _current: &crate::types::StoredResource,
+                _resource: serde_json::Value,
+            ) -> StorageResult<crate::types::StoredResource> {
+                unimplemented!()
+            }
+            async fn delete(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+            ) -> StorageResult<()> {
+                Ok(())
+            }
+            async fn count(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: Option<&str>,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl SearchProvider for MockWithRegistry {
+            async fn search(
+                &self,
+                _tenant: &TenantContext,
+                _query: &crate::types::SearchQuery,
+            ) -> StorageResult<SearchResult> {
+                use crate::types::Page;
+                Ok(SearchResult::new(Page::empty()))
+            }
+            async fn search_count(
+                &self,
+                _tenant: &TenantContext,
+                _query: &crate::types::SearchQuery,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+            fn search_param_registry(&self) -> &Arc<parking_lot::RwLock<SearchParameterRegistry>> {
+                &self.registry
+            }
+        }
+
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .build()
+            .unwrap();
+        let backend = Arc::new(MockWithRegistry {
+            registry: Arc::clone(&registry),
+        });
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), backend.clone() as DynStorage);
+        let mut providers = HashMap::new();
+        providers.insert("primary".to_string(), backend.clone() as DynSearchProvider);
+        let composite = CompositeStorage::new(config, backends)
+            .unwrap()
+            .with_search_providers(providers);
+
+        // Encounter resource referencing Patient/p1 via subject.
+        let content = serde_json::json!({
+            "resourceType": "Encounter",
+            "id": "e1",
+            "subject": {"reference": "Patient/p1"},
+        });
+        let resource = crate::types::StoredResource::new(
+            "Encounter",
+            "e1",
+            TenantId::new("t"),
+            content,
+            FhirVersion::default(),
+        );
+
+        let refs = composite.extract_references(&resource, "subject");
+        assert_eq!(refs, vec!["Patient/p1".to_string()]);
     }
 
     #[test]
