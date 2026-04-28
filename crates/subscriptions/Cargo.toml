@@ -22,6 +22,9 @@ helios-fhir = { path = "../fhir", default-features = false }
 # Persistence (for TenantContext, StoredResource, etc.)
 helios-persistence = { path = "../persistence", default-features = false }
 
+# Outbound auth (OutboundAuthProvider trait + static-bearer impl)
+helios-auth = { path = "../auth" }
+
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
