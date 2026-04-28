@@ -425,8 +425,17 @@ fn parse_concept_map(cm: &Value) -> Option<ParsedConceptMap> {
         let group_elements = group["element"].as_array().unwrap_or(&empty);
 
         for element in group_elements {
-            let source_code = element["code"].as_str().unwrap_or("").to_owned();
+            let raw_source_code = element["code"].as_str().unwrap_or("").to_owned();
             let targets = element["target"].as_array().unwrap_or(&empty);
+
+            // HL7 terminology package sometimes encodes multiple source codes as a
+            // comma-separated string (e.g. "unconfirmed, provisional"). Split them
+            // so each code gets its own row in concept_map_elements.
+            let source_codes: Vec<String> = raw_source_code
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
 
             for target in targets {
                 let target_code = target["code"].as_str().unwrap_or("").to_owned();
@@ -435,17 +444,19 @@ fn parse_concept_map(cm: &Value) -> Option<ParsedConceptMap> {
                     .unwrap_or("equivalent")
                     .to_owned();
 
-                if source_code.is_empty() || target_code.is_empty() {
+                if raw_source_code.is_empty() || target_code.is_empty() {
                     continue;
                 }
 
-                elements.push(ParsedMapElement {
-                    source_system: source_system.clone(),
-                    source_code: source_code.clone(),
-                    target_system: target_system.clone(),
-                    target_code,
-                    equivalence,
-                });
+                for source_code in &source_codes {
+                    elements.push(ParsedMapElement {
+                        source_system: source_system.clone(),
+                        source_code: source_code.clone(),
+                        target_system: target_system.clone(),
+                        target_code: target_code.clone(),
+                        equivalence: equivalence.clone(),
+                    });
+                }
             }
         }
     }

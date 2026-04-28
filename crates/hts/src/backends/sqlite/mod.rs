@@ -110,6 +110,12 @@ impl SqliteTerminologyBackend {
             // tables (e.g. concept_hierarchy with SNOMED's 500k+ edges) pick
             // the right index.
             let _ = conn.execute_batch("ANALYZE concept_hierarchy; ANALYZE concepts;");
+
+            // Pre-populate the concepts_fts trigram index for every code system
+            // so that text-filtered $expand requests always use the fast FTS path.
+            // This runs synchronously before the server accepts requests; for large
+            // systems (SNOMED 638K, LOINC 181K) it can take 10–25 s total.
+            value_set::prebuild_concepts_fts(&conn);
         }
 
         info!(db_path, "SQLite terminology backend initialized");

@@ -166,7 +166,7 @@ fn translate_sync(
         }
     }
 
-    let rows = query_translate_elements(
+    let mut rows = query_translate_elements(
         conn,
         &req.code,
         req.system.as_deref(),
@@ -174,6 +174,32 @@ fn translate_sync(
         req.reverse,
         req.date.as_deref(),
     )?;
+
+    // Some terminology packages encode multiple source codes as a comma-separated
+    // string (e.g. "unconfirmed, provisional"). After import those are stored as
+    // individual rows, but clients may still send the original compound string.
+    // When no exact match is found and the code contains a comma, try each
+    // individual token so compound-code queries still resolve.
+    if rows.is_empty() && req.code.contains(',') {
+        for token in req.code.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let token_rows = query_translate_elements(
+                conn,
+                token,
+                req.system.as_deref(),
+                req.url.as_deref(),
+                req.reverse,
+                req.date.as_deref(),
+            )?;
+            if !token_rows.is_empty() {
+                rows = token_rows;
+                break;
+            }
+        }
+    }
 
     let matches: Vec<TranslationMatch> = rows
         .into_iter()

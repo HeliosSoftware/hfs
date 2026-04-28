@@ -377,22 +377,7 @@ fn resolve_code_system(
     version: Option<&str>,
     date: Option<&str>,
 ) -> Result<(String, String, Option<String>), HtsError> {
-    let result = if let Some(ver) = version {
-        conn.query_row(
-            "SELECT id, COALESCE(name, url), version \
-             FROM code_systems \
-             WHERE url = ?1 AND version = ?2 \
-               AND (?3 IS NULL OR json_extract(resource_json, '$.date') <= ?3)",
-            rusqlite::params![url, ver, date],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )
-    } else {
+    let no_version_query = |conn: &rusqlite::Connection| {
         conn.query_row(
             "SELECT id, COALESCE(name, url), version \
              FROM code_systems \
@@ -407,6 +392,33 @@ fn resolve_code_system(
                 ))
             },
         )
+    };
+
+    let result = if let Some(ver) = version {
+        // Try exact version first; fall back to any version of the same URL so
+        // clients that pass an informational version string (e.g. the pool was
+        // generated from v3-ActCode "9.0.0" but we have "2.1.0" imported) still
+        // get a result rather than a spurious 404.
+        let exact = conn.query_row(
+            "SELECT id, COALESCE(name, url), version \
+             FROM code_systems \
+             WHERE url = ?1 AND version = ?2 \
+               AND (?3 IS NULL OR json_extract(resource_json, '$.date') <= ?3)",
+            rusqlite::params![url, ver, date],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        );
+        match exact {
+            Err(rusqlite::Error::QueryReturnedNoRows) => no_version_query(conn),
+            other => other,
+        }
+    } else {
+        no_version_query(conn)
     };
 
     result.map_err(|e| match e {

@@ -97,42 +97,61 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     let cache_key =
                         format!("inline-compose:{:016x}", fnv64(compose_str.as_bytes()));
 
-                    let from_cache: Option<Vec<ExpansionContains>> = {
-                        let exists: bool = conn
-                            .query_row(
-                                "SELECT EXISTS(\
-                                     SELECT 1 FROM implicit_expansion_cache \
-                                     WHERE url = ?1 LIMIT 1)",
-                                [&cache_key],
-                                |r| r.get(0),
+                    let exists_in_cache: bool = conn
+                        .query_row(
+                            "SELECT EXISTS(\
+                                 SELECT 1 FROM implicit_expansion_cache \
+                                 WHERE url = ?1 LIMIT 1)",
+                            [&cache_key],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                    // When the cache is warm and we have a bounded request with no text
+                    // filter, serve the page directly via SQL rather than loading every
+                    // cached concept into memory (O(count) vs O(total_in_cache)).
+                    if exists_in_cache && req.filter.is_none() && req.hierarchical != Some(true) {
+                        if let Some(count) = req.count.filter(|&c| c > 0) {
+                            let offset = i64::from(req.offset.unwrap_or(0));
+                            let total = implicit_cache_count(&conn, &cache_key, None)?;
+                            let page =
+                                implicit_cache_page(&conn, &cache_key, None, count as i64, offset)?;
+                            return Ok(ExpandResponse {
+                                total: Some(total),
+                                offset: req.offset,
+                                contains: page,
+                                warnings,
+                            });
+                        }
+                    }
+
+                    // Fallback: load all cached rows for hierarchical mode, or
+                    // for filter cases where we need all codes in memory.
+                    let from_cache: Option<Vec<ExpansionContains>> = if exists_in_cache {
+                        let mut stmt = conn
+                            .prepare_cached(
+                                "SELECT system_url, code, display \
+                                 FROM implicit_expansion_cache \
+                                 WHERE url = ?1 \
+                                 ORDER BY system_url, code",
                             )
                             .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                        if exists {
-                            let mut stmt = conn
-                                .prepare_cached(
-                                    "SELECT system_url, code, display \
-                                     FROM implicit_expansion_cache \
-                                     WHERE url = ?1 \
-                                     ORDER BY system_url, code",
-                                )
-                                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                            let rows = stmt
-                                .query_map([&cache_key], |r| {
-                                    Ok(ExpansionContains {
-                                        system: r.get(0)?,
-                                        code: r.get(1)?,
-                                        display: r.get(2)?,
-                                        inactive: None,
-                                        contains: vec![],
-                                    })
+                        let rows = stmt
+                            .query_map([&cache_key], |r| {
+                                Ok(ExpansionContains {
+                                    system: r.get(0)?,
+                                    code: r.get(1)?,
+                                    display: r.get(2)?,
+                                    inactive: None,
+                                    contains: vec![],
                                 })
-                                .map_err(|e| HtsError::StorageError(e.to_string()))?
-                                .collect::<Result<Vec<_>, _>>()
-                                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                            Some(rows)
-                        } else {
-                            None
-                        }
+                            })
+                            .map_err(|e| HtsError::StorageError(e.to_string()))?
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                        Some(rows)
+                    } else {
+                        None
                     };
 
                     if let Some(cached) = from_cache {
@@ -146,10 +165,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // SNOMED hierarchies). We skip background cache population to
                         // avoid exhausting the r2d2 pool with long-running writes.
                         if let Some(count) = req.count.filter(|&c| c > 0) {
+                            let bfs_offset = req.offset.unwrap_or(0) as usize;
+
+                            // Single-include is-a / descendent-of: BFS with LIMIT.
                             if let Some((sys_url, sys_id, root_code, include_root)) =
                                 extract_simple_hierarchy_compose(&conn, compose, &mut warnings)?
                             {
-                                let bfs_offset = req.offset.unwrap_or(0) as usize;
                                 let page = bfs_isa_page(
                                     &conn,
                                     &sys_url,
@@ -160,6 +181,26 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     count as usize,
                                     None,
                                 )?;
+                                return Ok(ExpandResponse {
+                                    total: None,
+                                    offset: req.offset,
+                                    contains: page,
+                                    warnings,
+                                });
+                            }
+
+                            // Multi-include OR with only simple hierarchy filters:
+                            // BFS each branch with a bounded limit, merge, paginate.
+                            // Avoids full ECL expansion for each OR branch, which can
+                            // be O(N_descendants) per branch and blocks the connection
+                            // pool at high concurrency.
+                            if let Some(page) = try_multiinclude_hierarchy_page(
+                                &conn,
+                                compose,
+                                count as usize,
+                                bfs_offset,
+                                &mut warnings,
+                            )? {
                                 return Ok(ExpandResponse {
                                     total: None,
                                     offset: req.offset,
@@ -202,25 +243,24 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         if cached.is_empty() {
                             // Fast page for paginated requests on large extensional ValueSets
                             // (e.g. VSAC ValueSets with thousands of explicit codes).
-                            // Only used when there is no text filter — compose_page_fast
-                            // does not apply filter logic, so filtered requests fall through
-                            // to compute_expansion which handles filtering in-memory.
-                            if req.filter.is_none() {
-                                if let Some(count) = req.count.filter(|&c| c > 0) {
-                                    let page_offset = req.offset.unwrap_or(0) as usize;
-                                    if let Some((page, total)) = compose_page_fast(
-                                        &conn,
-                                        compose_json.as_deref(),
-                                        page_offset,
-                                        count as usize,
-                                    )? {
-                                        return Ok(ExpandResponse {
-                                            total: Some(total),
-                                            offset: req.offset,
-                                            contains: page,
-                                            warnings: vec![],
-                                        });
-                                    }
+                            // compose_page_fast now supports text filters by matching against
+                            // compose-embedded display names — no DB lookup or full expansion
+                            // needed even for filtered requests.
+                            if let Some(count) = req.count.filter(|&c| c > 0) {
+                                let page_offset = req.offset.unwrap_or(0) as usize;
+                                if let Some((page, total)) = compose_page_fast(
+                                    &conn,
+                                    compose_json.as_deref(),
+                                    page_offset,
+                                    count as usize,
+                                    req.filter.as_deref(),
+                                )? {
+                                    return Ok(ExpandResponse {
+                                        total: Some(total),
+                                        offset: req.offset,
+                                        contains: page,
+                                        warnings: vec![],
+                                    });
                                 }
                             }
                             let codes =
@@ -727,76 +767,40 @@ fn expand_inline_filtered(
             // For filter strings ≥ 3 chars: use the FTS5 trigram index when it is
             // already built (O(matches)), otherwise fall back to a LIKE scan
             // (O(N), ~200–500 ms for large systems) and spawn a background task to
-            // build the FTS5 index so future requests use the fast path.
-            // Shorter filter strings skip FTS5 because trigrams need ≥ 3 chars.
+            // Trigram FTS5 needs ≥ 3 chars; shorter filters fall back to LIKE.
+            // `ensure_concepts_fts` builds the index lazily on the first call
+            // (uses BEGIN IMMEDIATE so only one thread does the work).
             if filter_lower.len() >= 3 {
-                let fts_ready: bool = conn
-                    .query_row(
-                        "SELECT EXISTS(\
-                             SELECT 1 FROM concepts_fts WHERE system_id = ?1 LIMIT 1)",
-                        [&system_id],
-                        |r| r.get(0),
+                ensure_concepts_fts(conn, &system_id)?;
+                let match_expr = fts5_quote(&filter_lower);
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT code, display FROM concepts_fts \
+                         WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
+                         ORDER BY code LIMIT 5000",
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-                if fts_ready {
-                    let match_expr = fts5_quote(&filter_lower);
-                    let mut stmt = conn
-                        .prepare_cached(
-                            "SELECT code, display FROM concepts_fts \
-                             WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
-                             ORDER BY code",
-                        )
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                    let rows = stmt
-                        .query_map(rusqlite::params![match_expr, system_id], |row| {
-                            Ok(ExpansionContains {
-                                system: system_url.to_owned(),
-                                code: row.get(0)?,
-                                display: row.get(1)?,
-                                inactive: None,
-                                contains: vec![],
-                            })
+                let rows = stmt
+                    .query_map(rusqlite::params![match_expr, system_id], |row| {
+                        Ok(ExpansionContains {
+                            system: system_url.to_owned(),
+                            code: row.get(0)?,
+                            display: row.get(1)?,
+                            inactive: None,
+                            contains: vec![],
                         })
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                    results.extend(rows);
-                } else {
-                    // FTS5 not yet built — use a LIKE scan for this request.
-                    // Future requests will hit the warm FTS5 index once it is
-                    // built (e.g. via the `ensure_concepts_fts` startup path).
-                    let mut stmt = conn
-                        .prepare_cached(
-                            "SELECT code, display FROM concepts \
-                             WHERE system_id = ?1 \
-                               AND (LOWER(code) LIKE ?2 \
-                                    OR LOWER(COALESCE(display,'')) LIKE ?2) \
-                             ORDER BY code",
-                        )
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                    let rows = stmt
-                        .query_map(rusqlite::params![system_id, sql_pat], |row| {
-                            Ok(ExpansionContains {
-                                system: system_url.to_owned(),
-                                code: row.get(0)?,
-                                display: row.get(1)?,
-                                inactive: None,
-                                contains: vec![],
-                            })
-                        })
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                    results.extend(rows);
-                }
+                    })
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                results.extend(rows);
             } else {
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT code, display FROM concepts \
                          WHERE system_id = ?1 \
                            AND (LOWER(code) LIKE ?2 OR LOWER(display) LIKE ?2) \
-                         ORDER BY code",
+                         ORDER BY code LIMIT 5000",
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = stmt
@@ -1064,6 +1068,50 @@ fn apply_compose_filters(
         op == "=" && property != "constraint"
     });
 
+    // ── Fast path: single is-a / descendent-of + property= filters ────────────
+    // When there is exactly one hierarchy filter (is-a or descendent-of) and one
+    // or more property= filters we use a combined downward-CTE query that expands
+    // the subtree and filters by property in a single pass.  This avoids
+    // materialising potentially tens of thousands of candidates in Phase 1
+    // (property= globally) only to discard most of them in Phase 2.
+    let one_isa_hier = || {
+        hierarchy_filters.len() == 1 && {
+            let f = &hierarchy_filters[0];
+            let p = f["property"].as_str().unwrap_or("");
+            let o = f["op"].as_str().unwrap_or("");
+            p == "concept" && (o == "is-a" || o == "descendent-of")
+        }
+    };
+    if !property_filters.is_empty() && one_isa_hier() {
+        let hf = &hierarchy_filters[0];
+        let op = hf["op"].as_str().unwrap_or("");
+        let root_code = hf["value"].as_str().unwrap_or("");
+        let include_self = op == "is-a";
+
+        let mut result: Option<Vec<ExpansionContains>> = None;
+        for f in &property_filters {
+            let property = f["property"].as_str().unwrap_or("");
+            let value = f["value"].as_str().unwrap_or("");
+            let concepts = query_subtree_with_property(
+                conn,
+                system_url,
+                system_id,
+                root_code,
+                include_self,
+                property,
+                value,
+            )?;
+            match result.as_mut() {
+                Some(prev) => {
+                    let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
+                    prev.retain(|c| keep.contains(&c.code));
+                }
+                None => result = Some(concepts),
+            }
+        }
+        return Ok(result.or_else(|| Some(vec![])));
+    }
+
     let mut result: Option<Vec<ExpansionContains>> = None;
     let mut any_filter_seen = false;
 
@@ -1108,39 +1156,51 @@ fn apply_compose_filters(
 
         any_filter_seen = true;
 
-        // Fast path: a bounded candidate set from phase 1 exists — check
-        // hierarchy membership per concept by walking UP instead of expanding
-        // the whole subtree DOWN.  Skip the fast path when the candidate set is
-        // already empty (intersection is trivially empty).
+        // Fast path: a bounded candidate set from phase 1 exists — batch-check
+        // hierarchy membership in a single recursive CTE instead of N individual
+        // ancestor walks.  When the candidate set is already empty, skip all
+        // remaining hierarchy filters (intersection of ∅ is always ∅).
         if let Some(prev) = result.as_mut() {
-            if !prev.is_empty() {
-                match (property, op) {
-                    ("concept", "is-a") => {
-                        prev.retain(|c| {
-                            check_is_descendant_of(conn, system_id, &c.code, value, true)
-                                .unwrap_or(false)
-                        });
-                        continue;
-                    }
-                    ("concept", "descendent-of") => {
-                        prev.retain(|c| {
-                            check_is_descendant_of(conn, system_id, &c.code, value, false)
-                                .unwrap_or(false)
-                        });
-                        continue;
-                    }
-                    ("concept", "generalizes") => {
-                        // C generalizes value  ⟺  value is-a C  ⟺  C is an ancestor of value.
-                        // Equivalent to: value is a descendant-or-self of C.
-                        prev.retain(|c| {
-                            check_is_descendant_of(conn, system_id, value, &c.code, true)
-                                .unwrap_or(false)
-                        });
-                        continue;
-                    }
-                    _ => {}
-                }
+            if prev.is_empty() {
+                continue;
             }
+            match (property, op) {
+                ("concept", "is-a") => {
+                    let codes: Vec<String> = prev.iter().map(|c| c.code.clone()).collect();
+                    let valid = batch_descendants_in_set(conn, system_id, value, true, &codes)?;
+                    prev.retain(|c| valid.contains(&c.code));
+                    continue;
+                }
+                ("concept", "descendent-of") => {
+                    let codes: Vec<String> = prev.iter().map(|c| c.code.clone()).collect();
+                    let valid = batch_descendants_in_set(conn, system_id, value, false, &codes)?;
+                    prev.retain(|c| valid.contains(&c.code));
+                    continue;
+                }
+                ("concept", "generalizes") => {
+                    // C generalizes value  ⟺  C is an ancestor-or-self of value.
+                    let codes: Vec<String> = prev.iter().map(|c| c.code.clone()).collect();
+                    let valid = batch_ancestors_in_set(conn, system_id, value, &codes)?;
+                    prev.retain(|c| valid.contains(&c.code));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Fast path for generalizes with no prior candidate set: ancestors are
+        // few (≤ ~20 in SNOMED), so a recursive CTE is O(depth) — much faster
+        // than full ECL evaluation which resolves the entire ancestor chain.
+        if property == "concept" && op == "generalizes" {
+            let ancestors = query_ancestors_full(conn, system_url, system_id, value)?;
+            match result.as_mut() {
+                Some(prev) => {
+                    let keep: HashSet<String> = ancestors.iter().map(|c| c.code.clone()).collect();
+                    prev.retain(|c| keep.contains(&c.code));
+                }
+                None => result = Some(ancestors),
+            }
+            continue;
         }
 
         // Slow path: no prior bounded set — compute the full ECL expansion.
@@ -1170,6 +1230,69 @@ fn apply_compose_filters(
     }
 
     Ok(result)
+}
+
+/// Expand the subtree of `root_code` downward and immediately filter by
+/// a property equality constraint, all in a single recursive CTE query.
+///
+/// This is the fast path for the common compose pattern:
+/// `{ filter: [{ concept is-a/descendent-of X }, { property=value }] }`
+///
+/// By expanding the subtree (bounded by its size — e.g., ~2 000 for "Allergic
+/// disorder") and joining with `concept_properties` in one pass we avoid
+/// materialising the global property candidates (~10 000–24 000 rows) that
+/// the two-phase approach would produce.
+fn query_subtree_with_property(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    root_code: &str,
+    include_self: bool,
+    property: &str,
+    value: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    // ?1 = root_code, ?2 = system_id, ?3 = property, ?4 = value
+    // `d.code != ?1 OR ?5` enforces descendent-of vs is-a.
+    // UNION (not UNION ALL) prevents path explosion in polyhierarchies.
+    let mut stmt = conn
+        .prepare_cached(
+            "WITH RECURSIVE desc(code) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT ch.child_code
+                 FROM   concept_hierarchy ch
+                 JOIN   desc ON ch.parent_code = desc.code
+                 WHERE  ch.system_id = ?2
+             )
+             SELECT c.code, c.display
+             FROM   desc d
+             JOIN   concepts c ON c.system_id = ?2 AND c.code = d.code
+             JOIN   concept_properties cp ON cp.concept_id = c.id
+             WHERE  cp.property = ?3
+               AND  cp.value = ?4
+               AND  (d.code != ?1 OR ?5)",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let include_self_i = i64::from(include_self);
+    let rows = stmt
+        .query_map(
+            rusqlite::params![root_code, system_id, property, value, include_self_i],
+            |row| {
+                Ok(ExpansionContains {
+                    system: system_url.to_owned(),
+                    code: row.get(0)?,
+                    display: row.get(1)?,
+                    inactive: None,
+                    contains: vec![],
+                })
+            },
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    Ok(rows)
 }
 
 /// Look up all concepts in `system_id` that have a property matching
@@ -1212,37 +1335,280 @@ fn query_property_eq(
         .collect())
 }
 
-/// Check whether `candidate_code` is a descendant-or-self (when `include_self=true`)
-/// or a strict descendant (when `include_self=false`) of `root_code`.
+/// Returns the subset of `candidates` that are descendants (or self, when
+/// `include_self=true`) of `root_code`.
 ///
-/// Walks **up** from `candidate_code` through `concept_hierarchy` in O(depth)
-/// time.  Used by `apply_compose_filters` to avoid expanding the full descendant
-/// subtree when a bounded candidate set is already available from a property=
-/// filter.
-fn check_is_descendant_of(
+/// Uses an **upward** recursive CTE that walks from each candidate toward the
+/// root of the hierarchy, stopping as soon as `root_code` is found.
+///
+/// Complexity: O(N_candidates × depth) — far cheaper than the alternative
+/// O(N_subtree) downward expansion when the subtree is large (e.g. SNOMED CT
+/// "Disease" has ~50 000 descendants) but the candidate set is small (e.g.
+/// a few hundred codes returned by a property-equality pre-filter).
+fn batch_descendants_in_set(
     conn: &Connection,
     system_id: &str,
-    candidate_code: &str,
     root_code: &str,
     include_self: bool,
-) -> Result<bool, HtsError> {
-    if candidate_code == root_code {
-        return Ok(include_self);
+    candidates: &[String],
+) -> Result<HashSet<String>, HtsError> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
     }
-    conn.query_row(
-        "WITH RECURSIVE anc(code) AS (
-             SELECT ?1
-             UNION ALL
-             SELECT ch.parent_code
-             FROM   concept_hierarchy ch
-             JOIN   anc ON ch.child_code = anc.code
-             WHERE  ch.system_id = ?2
-         )
-         SELECT EXISTS(SELECT 1 FROM anc WHERE code = ?3)",
-        rusqlite::params![candidate_code, system_id, root_code],
-        |r| r.get(0),
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))
+    let json_candidates =
+        serde_json::to_string(candidates).map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    // Walk UPWARD from each candidate.  UNION (not UNION ALL) deduplicates
+    // (start_code, current_code) pairs so that SNOMED polyhierarchy — where a
+    // concept can have many parents — doesn't cause path explosion.
+    let mut stmt = conn
+        .prepare_cached(
+            "WITH RECURSIVE anc(start_code, current_code) AS (
+                 SELECT j.value, j.value FROM json_each(?3) j
+                 UNION
+                 SELECT anc.start_code, ch.parent_code
+                 FROM   concept_hierarchy ch
+                 JOIN   anc ON ch.child_code = anc.current_code
+                          AND anc.current_code != ?1
+                 WHERE  ch.system_id = ?2
+             )
+             SELECT DISTINCT start_code FROM anc WHERE current_code = ?1",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let mut codes = stmt
+        .query_map(
+            rusqlite::params![root_code, system_id, json_candidates],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<HashSet<String>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    // descendent-of (strict): root_code is not its own descendant
+    if !include_self {
+        codes.remove(root_code);
+    }
+
+    Ok(codes)
+}
+
+/// Returns the subset of `candidates` that are ancestors-or-self of `value_code`,
+/// using a single upward recursive CTE.
+///
+/// Used for the `generalizes` compose filter: `C generalizes value` ⟺
+/// C is an ancestor (or self) of `value`.
+fn batch_ancestors_in_set(
+    conn: &Connection,
+    system_id: &str,
+    value_code: &str,
+    candidates: &[String],
+) -> Result<HashSet<String>, HtsError> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let json_candidates =
+        serde_json::to_string(candidates).map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let mut stmt = conn
+        .prepare_cached(
+            "WITH RECURSIVE anc(code) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT ch.parent_code
+                 FROM   concept_hierarchy ch
+                 JOIN   anc ON ch.child_code = anc.code
+                 WHERE  ch.system_id = ?2
+             )
+             SELECT a.code
+             FROM   anc a
+             JOIN   json_each(?3) j ON j.value = a.code",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let codes = stmt
+        .query_map(
+            rusqlite::params![value_code, system_id, json_candidates],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<HashSet<String>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    Ok(codes)
+}
+
+/// Return all ancestors (including self) of `value_code` in `system_id`.
+///
+/// Uses a single recursive CTE walking UP the `concept_hierarchy` table.
+/// Ancestor chains in SNOMED CT are ≤ ~20 hops, so this is O(depth) and
+/// much faster than full ECL evaluation for the `generalizes` operator.
+fn query_ancestors_full(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    value_code: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "WITH RECURSIVE anc(code) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT ch.parent_code
+                 FROM   concept_hierarchy ch
+                 JOIN   anc ON ch.child_code = anc.code
+                 WHERE  ch.system_id = ?2
+             )
+             SELECT a.code, c.display
+             FROM   anc a
+             JOIN   concepts c ON c.system_id = ?2 AND c.code = a.code",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let rows = stmt
+        .query_map(rusqlite::params![value_code, system_id], |r| {
+            Ok(ExpansionContains {
+                system: system_url.to_owned(),
+                code: r.get(0)?,
+                display: r.get(1)?,
+                inactive: None,
+                contains: vec![],
+            })
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    Ok(rows)
+}
+
+/// Fast path for multi-include OR composes where every include is a single
+/// hierarchy filter (`is-a`, `descendent-of`, or `generalizes`).
+///
+/// Each include is expanded with a bounded BFS (limit = `offset + count`),
+/// results are unioned and deduplicated, then the requested page is returned.
+/// This avoids full ECL subtree expansion for each OR branch, which can block
+/// a connection for >30 s on large SNOMED hierarchies at high concurrency.
+///
+/// Returns `None` when the compose is not a qualifying multi-include (caller
+/// should fall through to `compute_expansion`).
+fn try_multiinclude_hierarchy_page(
+    conn: &Connection,
+    compose: &serde_json::Value,
+    count: usize,
+    offset: usize,
+    warnings: &mut Vec<String>,
+) -> Result<Option<Vec<ExpansionContains>>, HtsError> {
+    let includes = match compose["include"].as_array() {
+        Some(a) if a.len() >= 2 => a,
+        _ => return Ok(None),
+    };
+
+    struct Entry {
+        sys_url: String,
+        sys_id: String,
+        root_code: String,
+        include_root: bool,
+        is_generalizes: bool,
+    }
+
+    let mut entries: Vec<Entry> = Vec::new();
+
+    for inc in includes {
+        // Must be a single-filter hierarchy — no explicit concept lists,
+        // no nested valueSet refs, exactly one filter entry.
+        if inc["concept"].as_array().is_some_and(|a| !a.is_empty()) {
+            return Ok(None);
+        }
+        if inc["valueSet"].as_array().is_some_and(|a| !a.is_empty()) {
+            return Ok(None);
+        }
+        let filters = match inc["filter"].as_array() {
+            Some(f) if f.len() == 1 => f,
+            _ => return Ok(None),
+        };
+        let f = &filters[0];
+        let property = f["property"].as_str().unwrap_or("");
+        let op = f["op"].as_str().unwrap_or("");
+        let root_code = f["value"].as_str().unwrap_or("");
+
+        if property != "concept" || root_code.is_empty() {
+            return Ok(None);
+        }
+
+        let (include_root, is_generalizes) = match op {
+            "is-a" => (true, false),
+            "descendent-of" => (false, false),
+            "generalizes" => (true, true),
+            _ => return Ok(None),
+        };
+
+        let system_url = match inc["system"].as_str() {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(None),
+        };
+
+        let system_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = ?1",
+                [system_url],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        match system_id {
+            Some(id) => entries.push(Entry {
+                sys_url: system_url.to_owned(),
+                sys_id: id,
+                root_code: root_code.to_owned(),
+                include_root,
+                is_generalizes,
+            }),
+            None => {
+                warnings.push(format!(
+                    "CodeSystem {system_url} was not found and has been excluded from the expansion"
+                ));
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    // Union-BFS: expand each include branch up to `offset + count` items so
+    // the merged, deduplicated set covers the requested page.
+    let per_branch_limit = offset + count;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut all: Vec<ExpansionContains> = Vec::new();
+
+    for e in &entries {
+        let concepts = if e.is_generalizes {
+            // Ancestors are tiny (≤ ~20), fetch all.
+            query_ancestors_full(conn, &e.sys_url, &e.sys_id, &e.root_code)?
+        } else {
+            bfs_isa_page(
+                conn,
+                &e.sys_url,
+                &e.sys_id,
+                &e.root_code,
+                e.include_root,
+                0,
+                per_branch_limit,
+                None,
+            )?
+        };
+        for c in concepts {
+            if seen.insert(c.code.clone()) {
+                all.push(c);
+            }
+        }
+    }
+
+    let start = offset.min(all.len());
+    let end = (offset + count).min(all.len());
+    Ok(Some(all[start..end].to_vec()))
 }
 
 /// FNV-1a 64-bit hash — deterministic, no external dependencies, no random seed.
@@ -1311,6 +1677,7 @@ fn compose_page_fast(
     compose_json: Option<&str>,
     offset: usize,
     limit: usize,
+    filter: Option<&str>,
 ) -> Result<Option<(Vec<ExpansionContains>, u32)>, HtsError> {
     let compose: serde_json::Value = match compose_json {
         Some(s) => match serde_json::from_str(s) {
@@ -1336,8 +1703,11 @@ fn compose_page_fast(
         }
     }
 
-    // Collect (system_url, code) pairs in compose order.
-    let mut all_pairs: Vec<(String, String)> = Vec::new();
+    // Collect (system_url, code, embedded_display) triples in compose order.
+    // Using the compose-embedded display avoids per-code DB lookups for systems
+    // not in the DB (e.g. VSAC ValueSets with RxNorm codes) and also enables
+    // filter matching against embedded display names.
+    let mut all_triples: Vec<(String, String, Option<String>)> = Vec::new();
     for inc in includes {
         let system_url = match inc["system"].as_str() {
             Some(s) if !s.is_empty() => s.to_owned(),
@@ -1346,7 +1716,8 @@ fn compose_page_fast(
         if let Some(concepts) = inc["concept"].as_array() {
             for c in concepts {
                 if let Some(code) = c["code"].as_str() {
-                    all_pairs.push((system_url.clone(), code.to_owned()));
+                    let display = c["display"].as_str().map(|s| s.to_owned());
+                    all_triples.push((system_url.clone(), code.to_owned(), display));
                 }
             }
         }
@@ -1367,50 +1738,71 @@ fn compose_page_fast(
                     }
                 }
             }
-            all_pairs.retain(|p| !exclude_set.contains(p));
+            all_triples
+                .retain(|(sys, code, _)| !exclude_set.contains(&(sys.clone(), code.clone())));
         }
     }
 
-    let total = all_pairs.len() as u32;
+    // Apply text filter against compose-embedded code and display — pure in-memory,
+    // no DB required.  This makes filtered requests on large extensional ValueSets
+    // (e.g. VSAC Medication ValueSets with 33K RxNorm codes) fast even when the
+    // referenced system is not present in the local concepts table.
+    if let Some(f) = filter {
+        let lower = f.to_lowercase();
+        all_triples.retain(|(_, code, display)| {
+            code.to_lowercase().contains(&lower)
+                || display
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(&lower))
+                    .unwrap_or(false)
+        });
+    }
+
+    let total = all_triples.len() as u32;
 
     // Paginate: take only the slice we need.
-    let page_pairs: Vec<(String, String)> =
-        all_pairs.into_iter().skip(offset).take(limit).collect();
+    let page_triples: Vec<(String, String, Option<String>)> =
+        all_triples.into_iter().skip(offset).take(limit).collect();
 
-    if page_pairs.is_empty() {
+    if page_triples.is_empty() {
         return Ok(Some((vec![], total)));
     }
 
-    // Look up displays for only the page slice — O(limit) queries.
-    let mut result = Vec::with_capacity(page_pairs.len());
+    // Use compose-embedded display; fall back to DB lookup only when the
+    // embedded display is absent (rare — VSAC always includes display names).
+    let mut result = Vec::with_capacity(page_triples.len());
     let mut system_cache: HashMap<String, Option<String>> = HashMap::new();
 
-    for (system_url, code) in &page_pairs {
-        let system_id: Option<String> = system_cache
-            .entry(system_url.clone())
-            .or_insert_with(|| {
+    for (system_url, code, embedded_display) in &page_triples {
+        let display = if embedded_display.is_some() {
+            embedded_display.clone()
+        } else {
+            let system_id: Option<String> = system_cache
+                .entry(system_url.clone())
+                .or_insert_with(|| {
+                    conn.query_row(
+                        "SELECT id FROM code_systems WHERE url = ?1",
+                        [system_url.as_str()],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                })
+                .clone();
+
+            if let Some(sid) = system_id {
                 conn.query_row(
-                    "SELECT id FROM code_systems WHERE url = ?1",
-                    [system_url.as_str()],
+                    "SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2",
+                    rusqlite::params![sid, code],
                     |r| r.get(0),
                 )
                 .optional()
-                .ok()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
                 .flatten()
-            })
-            .clone();
-
-        let display: Option<String> = if let Some(sid) = system_id {
-            conn.query_row(
-                "SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2",
-                rusqlite::params![sid, code],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-            .flatten()
-        } else {
-            None
+            } else {
+                None
+            }
         };
 
         result.push(ExpansionContains {
@@ -1516,6 +1908,34 @@ fn bfs_expand_page(
             let sql_limit = limit as i64;
             let sql_offset = offset as i64;
             if let Some(f) = filter_lower {
+                if f.len() >= 3 {
+                    // Build FTS5 index lazily (no-op if already populated).
+                    ensure_concepts_fts(conn, system_id)?;
+                    let match_expr = fts5_quote(f);
+                    let mut stmt = conn
+                        .prepare_cached(
+                            "SELECT code, display FROM concepts_fts \
+                             WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
+                             ORDER BY code LIMIT ?3 OFFSET ?4",
+                        )
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    return stmt
+                        .query_map(
+                            rusqlite::params![match_expr, system_id, sql_limit, sql_offset],
+                            |r| {
+                                Ok(ExpansionContains {
+                                    system: cs_url.to_owned(),
+                                    code: r.get(0)?,
+                                    display: r.get(1)?,
+                                    inactive: None,
+                                    contains: vec![],
+                                })
+                            },
+                        )
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| HtsError::StorageError(e.to_string()));
+                }
                 let sql_pat = format!("%{f}%");
                 let mut stmt = conn
                     .prepare_cached(
@@ -2315,7 +2735,6 @@ fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
 /// Populated lazily on the first filtered inline expand for a given system.
 /// Cleared on server startup so a re-import followed by a restart always
 /// rebuilds from fresh data.
-#[allow(dead_code)]
 fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsError> {
     let populated: bool = conn
         .query_row(
@@ -2566,6 +2985,38 @@ fn populate_implicit_cache(
 
     conn.execute_batch("COMMIT")
         .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Pre-populate `concepts_fts` for every code system currently in the DB.
+///
+/// Called once at server startup (after clearing `concepts_fts`) so that
+/// filtered `$expand` requests always use the fast FTS path rather than
+/// triggering a blocking per-system build on the first filtered request.
+/// Uses a single bulk INSERT inside one transaction — much faster than
+/// building per-system (1 transaction per system × 1217 systems would take
+/// several minutes; the bulk approach finishes in under 30 s).
+pub(crate) fn prebuild_concepts_fts(conn: &Connection) {
+    if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+        tracing::warn!("prebuild_concepts_fts: could not begin transaction: {e}");
+        return;
+    }
+
+    let result = conn.execute(
+        "INSERT INTO concepts_fts(rowid, system_id, code, display)
+         SELECT id, system_id, code, display FROM concepts",
+        [],
+    );
+
+    match result {
+        Ok(n) => {
+            let _ = conn.execute_batch("COMMIT");
+            tracing::info!(rows = n, "concepts_fts pre-populated");
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            tracing::warn!("prebuild_concepts_fts: INSERT failed: {e}");
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
