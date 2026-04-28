@@ -141,8 +141,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // ── BFS fast path for simple hierarchy composes ───────────────
                         // When the compose is a single include with a single is-a or
                         // descendent-of filter (e.g. EX02: descendent-of Disease), use
-                        // BFS to serve the requested page immediately and cache the full
-                        // expansion in the background. Avoids >30 s ECL + INSERT timeout.
+                        // BFS to serve the requested page immediately instead of blocking
+                        // on the full ECL expansion (which can take >30 s for large
+                        // SNOMED hierarchies). We skip background cache population to
+                        // avoid exhausting the r2d2 pool with long-running writes.
                         if let Some(count) = req.count.filter(|&c| c > 0) {
                             if let Some((sys_url, sys_id, root_code, include_root)) =
                                 extract_simple_hierarchy_compose(&conn, compose, &mut warnings)?
@@ -158,23 +160,6 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     count as usize,
                                     None,
                                 )?;
-                                let key_bg = cache_key.clone();
-                                let compose_bg = compose_str.clone();
-                                let pool_bg = pool.clone();
-                                tokio::runtime::Handle::current().spawn_blocking(move || {
-                                    if let Ok(conn2) = pool_bg.get() {
-                                        let mut w = Vec::new();
-                                        if let Ok(codes) =
-                                            compute_expansion(&conn2, Some(&compose_bg), &mut w)
-                                        {
-                                            if w.is_empty() {
-                                                let _ = populate_implicit_cache(
-                                                    &conn2, &key_bg, &codes,
-                                                );
-                                            }
-                                        }
-                                    }
-                                });
                                 return Ok(ExpandResponse {
                                     total: None,
                                     offset: req.offset,
@@ -215,6 +200,26 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // Normal path: try the expansion cache first.
                         let cached = fetch_cache(&conn, &vs_id)?;
                         if cached.is_empty() {
+                            // Fast page for paginated requests on large ValueSets
+                            // (e.g. VSAC ValueSets with thousands of explicit codes).
+                            // Serves offset+limit codes directly from the compose JSON
+                            // without computing the full expansion, avoiding >30 s timeouts.
+                            if let Some(count) = req.count.filter(|&c| c > 0) {
+                                let page_offset = req.offset.unwrap_or(0) as usize;
+                                if let Some((page, total)) = compose_page_fast(
+                                    &conn,
+                                    compose_json.as_deref(),
+                                    page_offset,
+                                    count as usize,
+                                )? {
+                                    return Ok(ExpandResponse {
+                                        total: Some(total),
+                                        offset: req.offset,
+                                        contains: page,
+                                        warnings: vec![],
+                                    });
+                                }
+                            }
                             let codes =
                                 compute_expansion(&conn, compose_json.as_deref(), &mut vec![])?;
                             populate_cache(&conn, &vs_id, &codes)?;
@@ -273,23 +278,6 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             count as usize,
                                             filter_lower.as_deref(),
                                         )?;
-
-                                        // Kick off full cache population in the background so
-                                        // subsequent requests are served from the fast SQL path.
-                                        let url_bg = url.to_owned();
-                                        let date_bg = req.date.clone();
-                                        let pool_bg = pool.clone();
-                                        tokio::runtime::Handle::current().spawn_blocking(
-                                            move || {
-                                                if let Ok(conn2) = pool_bg.get() {
-                                                    let _ = ensure_implicit_cache(
-                                                        &conn2,
-                                                        &url_bg,
-                                                        date_bg.as_deref(),
-                                                    );
-                                                }
-                                            },
-                                        );
 
                                         return Ok(ExpandResponse {
                                             total: None,
@@ -1304,6 +1292,136 @@ fn parse_fhir_vs_url(url: &str) -> Option<(String, FhirVsPattern)> {
 
 /// Check whether a compose is a "simple hierarchy" and extract its parameters.
 ///
+/// Serve a paginated page from a purely extensional compose (all includes have
+/// explicit `concept[]` lists, no `filter[]`).
+///
+/// Returns `Some(page)` when the compose is fully extensional and we can serve
+/// `offset..offset+limit` codes by looking up only those rows in the database.
+/// Returns `None` when any include has filters or no explicit code list, so the
+/// caller falls through to the full `compute_expansion` path.
+///
+/// This lets large VSAC ValueSets (thousands of explicit codes spread across
+/// one or more systems) serve the first page in milliseconds instead of
+/// requiring a full DB scan that can exceed the 30 s request timeout.
+fn compose_page_fast(
+    conn: &Connection,
+    compose_json: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<Option<(Vec<ExpansionContains>, u32)>, HtsError> {
+    let compose: serde_json::Value = match compose_json {
+        Some(s) => match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+
+    let includes = match compose["include"].as_array() {
+        Some(a) if !a.is_empty() => a,
+        _ => return Ok(None),
+    };
+
+    // Only handle purely extensional composes: every include must have concept[]
+    // and no filter[].  Mixed or intensional includes fall through to slow path.
+    for inc in includes {
+        if inc["concept"].as_array().is_none() {
+            return Ok(None);
+        }
+        if inc["filter"].as_array().is_some_and(|f| !f.is_empty()) {
+            return Ok(None);
+        }
+    }
+
+    // Collect (system_url, code) pairs in compose order.
+    let mut all_pairs: Vec<(String, String)> = Vec::new();
+    for inc in includes {
+        let system_url = match inc["system"].as_str() {
+            Some(s) if !s.is_empty() => s.to_owned(),
+            _ => continue,
+        };
+        if let Some(concepts) = inc["concept"].as_array() {
+            for c in concepts {
+                if let Some(code) = c["code"].as_str() {
+                    all_pairs.push((system_url.clone(), code.to_owned()));
+                }
+            }
+        }
+    }
+
+    // Apply exclusions (purely code-based).
+    let excludes = compose["exclude"].as_array();
+    if let Some(excl) = excludes {
+        if !excl.is_empty() {
+            let mut exclude_set: HashSet<(String, String)> = HashSet::new();
+            for exc in excl {
+                let sys = exc["system"].as_str().unwrap_or("").to_owned();
+                if let Some(concepts) = exc["concept"].as_array() {
+                    for c in concepts {
+                        if let Some(code) = c["code"].as_str() {
+                            exclude_set.insert((sys.clone(), code.to_owned()));
+                        }
+                    }
+                }
+            }
+            all_pairs.retain(|p| !exclude_set.contains(p));
+        }
+    }
+
+    let total = all_pairs.len() as u32;
+
+    // Paginate: take only the slice we need.
+    let page_pairs: Vec<(String, String)> =
+        all_pairs.into_iter().skip(offset).take(limit).collect();
+
+    if page_pairs.is_empty() {
+        return Ok(Some((vec![], total)));
+    }
+
+    // Look up displays for only the page slice — O(limit) queries.
+    let mut result = Vec::with_capacity(page_pairs.len());
+    let mut system_cache: HashMap<String, Option<String>> = HashMap::new();
+
+    for (system_url, code) in &page_pairs {
+        let system_id: Option<String> = system_cache
+            .entry(system_url.clone())
+            .or_insert_with(|| {
+                conn.query_row(
+                    "SELECT id FROM code_systems WHERE url = ?1",
+                    [system_url.as_str()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            })
+            .clone();
+
+        let display: Option<String> = if let Some(sid) = system_id {
+            conn.query_row(
+                "SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2",
+                rusqlite::params![sid, code],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .flatten()
+        } else {
+            None
+        };
+
+        result.push(ExpansionContains {
+            system: system_url.clone(),
+            code: code.clone(),
+            display,
+            inactive: None,
+            contains: vec![],
+        });
+    }
+
+    Ok(Some((result, total)))
+}
+
 /// Matches composes with exactly one include clause that carries exactly one
 /// filter of type `concept is-a` or `concept descendent-of`.  Richer composes
 /// (multi-filter, property= filters, multiple includes) fall through to the
