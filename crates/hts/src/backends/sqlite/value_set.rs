@@ -723,6 +723,39 @@ fn expand_inline_filtered(
             }
         };
 
+        // ── FTS-first: text ≥ 3 chars + batchable compose filters (EX08 fast path) ──
+        // Instead of expanding the full hierarchy (potentially tens of thousands of
+        // descendants) and filtering in Rust, query FTS5 first to get a small set of
+        // text-matching candidates, then apply compose filters to that bounded set.
+        // Skipped for ECL `constraint` filters (requires full ECL evaluation).
+        let compose_filters: &[serde_json::Value] = inc["filter"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        let all_batchable = !compose_filters.is_empty()
+            && compose_filters.iter().all(|f| {
+                let op = f["op"].as_str().unwrap_or("");
+                let prop = f["property"].as_str().unwrap_or("");
+                (op == "=" && prop != "constraint")
+                    || (prop == "concept" && matches!(op, "is-a" | "descendent-of" | "generalizes"))
+            });
+
+        if filter_lower.len() >= 3 && all_batchable {
+            ensure_concepts_fts(conn, &system_id)?;
+            let candidates =
+                fts_candidates_for_system(conn, &system_id, system_url, &filter_lower)?;
+            if !candidates.is_empty() {
+                let filtered = apply_compose_filters_to_candidates(
+                    conn,
+                    &system_id,
+                    compose_filters,
+                    candidates,
+                )?;
+                results.extend(filtered);
+            }
+            continue;
+        }
+
         if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc)? {
             // Compose filters (ECL/is-a) already bounded the result — apply text filter in Rust.
             results.extend(filter_result.into_iter().filter(|c| {
@@ -1480,6 +1513,131 @@ fn query_ancestors_full(
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     Ok(rows)
+}
+
+/// Return all concepts in `system_id` matching `filter_lower` via FTS5 trigram.
+///
+/// The caller is responsible for calling [`ensure_concepts_fts`] first.
+/// Returns at most 5 000 entries (sufficient for any realistic text filter result).
+fn fts_candidates_for_system(
+    conn: &Connection,
+    system_id: &str,
+    system_url: &str,
+    filter_lower: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let match_expr = fts5_quote(filter_lower);
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT code, display FROM concepts_fts \
+             WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
+             ORDER BY code LIMIT 5000",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![match_expr, system_id], |row| {
+            Ok(ExpansionContains {
+                system: system_url.to_owned(),
+                code: row.get(0)?,
+                display: row.get(1)?,
+                inactive: None,
+                contains: vec![],
+            })
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(rows)
+}
+
+/// Apply compose `filter[]` entries to an already-bounded candidate set.
+///
+/// Used by the FTS-first path in [`expand_inline_filtered`]: FTS gives a small
+/// set of text-matching candidates; this function checks each one against the
+/// hierarchy / property filters without expanding the full subtree.
+///
+/// Supported filter types:
+/// - `concept is-a / descendent-of / generalizes` → batch ancestor walk
+/// - `<property> = <value>` (non-ECL) → batch property equality lookup
+///
+/// ECL `constraint` filters are NOT handled here — callers must verify
+/// `all_batchable` before invoking this function.
+fn apply_compose_filters_to_candidates(
+    conn: &Connection,
+    system_id: &str,
+    filters: &[serde_json::Value],
+    mut candidates: Vec<ExpansionContains>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    for f in filters {
+        if candidates.is_empty() {
+            break;
+        }
+        let property = f["property"].as_str().unwrap_or("");
+        let op = f["op"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+
+        match (property, op) {
+            ("concept", "is-a") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let valid = batch_descendants_in_set(conn, system_id, value, true, &codes)?;
+                candidates.retain(|c| valid.contains(&c.code));
+            }
+            ("concept", "descendent-of") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let valid = batch_descendants_in_set(conn, system_id, value, false, &codes)?;
+                candidates.retain(|c| valid.contains(&c.code));
+            }
+            ("concept", "generalizes") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let valid = batch_ancestors_in_set(conn, system_id, value, &codes)?;
+                candidates.retain(|c| valid.contains(&c.code));
+            }
+            (_, "=") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let valid = batch_property_eq_in_set(conn, system_id, property, value, &codes)?;
+                candidates.retain(|c| valid.contains(&c.code));
+            }
+            _ => {}
+        }
+    }
+    Ok(candidates)
+}
+
+/// Check which of `candidates` have `(property = value)` in `concept_properties`.
+///
+/// Uses `json_each` to pass the candidate codes as a JSON array, avoiding N+1
+/// queries.  Returns a `HashSet` of the codes that matched.
+fn batch_property_eq_in_set(
+    conn: &Connection,
+    system_id: &str,
+    property: &str,
+    value: &str,
+    candidates: &[String],
+) -> Result<HashSet<String>, HtsError> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let json_candidates =
+        serde_json::to_string(candidates).map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT c.code
+             FROM   concepts c
+             JOIN   concept_properties cp ON cp.concept_id = c.id
+             WHERE  c.system_id = ?1
+               AND  cp.property = ?2
+               AND  cp.value = ?3
+               AND  c.code IN (SELECT value FROM json_each(?4))",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let codes = stmt
+        .query_map(
+            rusqlite::params![system_id, property, value, json_candidates],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(codes)
 }
 
 /// Fast path for multi-include OR composes where every include is a single
