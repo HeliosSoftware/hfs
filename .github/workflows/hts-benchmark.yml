@@ -228,6 +228,22 @@ jobs:
             sleep 2
           done
 
+      # ── Tools (k6) ───────────────────────────────────────────────────────
+
+      - name: Install k6
+        run: |
+          if ! command -v k6 &>/dev/null; then
+            sudo gpg --no-default-keyring \
+              --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+              --keyserver hkp://keyserver.ubuntu.com:80 \
+              --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+            echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+              | sudo tee /etc/apt/sources.list.d/k6.list
+            sudo apt-get update -qq
+            sudo apt-get install -y k6
+          fi
+          k6 version
+
       # ── Preflight ────────────────────────────────────────────────────────
 
       - name: Run preflight
@@ -253,7 +269,7 @@ jobs:
             echo "Passing tests: $PASSING"
           else
             # Preflight JSON was not written (path collision with colons on some runners)
-            PASSING="FS01,LK01,LK02,LK03,LK05,SS01,CM02"
+            PASSING="FS01,LK01,LK02,LK03,LK05,VC01,VC02,VC03,EX01,EX02,EX03,EX04,EX05,EX07,EX08,SS01,CM01,CM02"
             echo "passing_tests=$PASSING" >> "$GITHUB_OUTPUT"
             echo "Warning: preflight.json not found — using fallback test list: $PASSING"
           fi
