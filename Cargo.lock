@@ -2937,6 +2937,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -3254,6 +3255,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
+ "helios-auth",
  "helios-fhir",
  "helios-persistence",
  "lettre",
