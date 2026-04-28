@@ -673,6 +673,15 @@ jobs:
           path: inferno-results/
           retention-days: 30
 
+      - name: Upload HFS server log on failure
+        if: failure() && env.HFS_LOG != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-log-${{ matrix.suite_id }}-${{ matrix.backend }}
+          path: ${{ env.HFS_LOG }}
+          retention-days: 30
+          if-no-files-found: ignore
+
       - name: Cleanup
         if: always()
         run: |
