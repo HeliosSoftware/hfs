@@ -289,6 +289,11 @@ where
         })
         .unwrap_or((None, "Device/hfs".to_string()));
 
+    // Build the outbound auth provider before moving auth_config into the
+    // app state — the subscription engine (constructed below) consumes it.
+    #[cfg(feature = "subscriptions")]
+    let outbound_auth_provider = auth_config.outbound_provider();
+
     // Create application state
     let state = AppState::with_auth_and_audit(
         Arc::new(storage),
@@ -307,18 +312,29 @@ where
             .unwrap_or(false);
         if subscriptions_enabled {
             let smtp = build_smtp_settings_from_env();
+            let messaging = build_messaging_settings_from_env(&config.base_url);
             let mut supported = vec!["rest-hook".to_string(), "websocket".to_string()];
             if smtp.is_some() {
                 supported.push("email".to_string());
                 info!("Email subscription channel ENABLED");
             }
+            if messaging.is_some() {
+                supported.push("message".to_string());
+                info!("FHIR Messaging subscription channel ENABLED");
+            }
             let sub_config = helios_subscriptions::SubscriptionConfig {
                 supported_channel_types: supported,
                 smtp,
+                messaging,
                 ..Default::default()
             };
-            let engine =
-                helios_subscriptions::SubscriptionEngine::new(sub_config, config.base_url.clone());
+            // Outbound auth provider was built above (static bearer when
+            // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
+            let engine = helios_subscriptions::SubscriptionEngine::with_outbound_auth(
+                sub_config,
+                config.base_url.clone(),
+                outbound_auth_provider,
+            );
             info!("Subscriptions engine ENABLED");
             state.with_subscription_engine(Arc::new(engine))
         } else {
@@ -436,6 +452,34 @@ fn build_smtp_settings_from_env() -> Option<helios_subscriptions::config::SmtpSe
         from_address,
         default_subject,
         timeout_secs,
+    })
+}
+
+#[cfg(feature = "subscriptions")]
+fn build_messaging_settings_from_env(
+    base_url: &str,
+) -> Option<helios_subscriptions::config::MessagingSettings> {
+    use helios_subscriptions::config::MessagingSettings;
+
+    let enabled = std::env::var("HFS_SUBSCRIPTION_MESSAGING_ENABLED")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    let source_endpoint = std::env::var("HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| base_url.to_string());
+
+    let allow_private_endpoints = std::env::var("HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false);
+
+    Some(MessagingSettings {
+        source_endpoint,
+        allow_private_endpoints,
     })
 }
 
