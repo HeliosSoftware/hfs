@@ -34,6 +34,22 @@ pub struct SubscriptionConfig {
 
     /// SMTP settings for the email channel. `None` disables the email dispatcher.
     pub smtp: Option<SmtpSettings>,
+
+    /// FHIR Messaging channel settings. `None` disables the messaging dispatcher.
+    pub messaging: Option<MessagingSettings>,
+}
+
+/// FHIR Messaging channel configuration.
+#[derive(Debug, Clone)]
+pub struct MessagingSettings {
+    /// Endpoint URL placed in `MessageHeader.source.endpoint`. Typically the
+    /// HFS base URL (`HFS_BASE_URL`).
+    pub source_endpoint: String,
+
+    /// When `true`, dispatch to private/loopback/link-local IPs is permitted.
+    /// Default `false` (SSRF guard on). Set
+    /// `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true` to opt in.
+    pub allow_private_endpoints: bool,
 }
 
 impl Default for SubscriptionConfig {
@@ -49,6 +65,7 @@ impl Default for SubscriptionConfig {
             supported_channel_types: vec!["rest-hook".to_string()],
             ws_token_lifetime_secs: 30,
             smtp: None,
+            messaging: None,
         }
     }
 }
