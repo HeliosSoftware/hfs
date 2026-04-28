@@ -670,6 +670,132 @@ else
   log "MAILPIT_HTTP_URL not set; skipping email channel smoke"
 fi
 
+# --- FHIR Messaging channel smoke ----------------------------------------
+# Reuses the existing webhook capture but posts to /process-message so the
+# captured bundles can be filtered by .type == "message".
+MSG_SMOKE_TOTAL=0
+MSG_SUB_ID="sub-msg-$ID_SUFFIX"
+MSG_ENCOUNTER_ID="enc-msg-$ID_SUFFIX"
+MSG_DIR="$RESULTS_DIR/messaging"
+mkdir -p "$MSG_DIR"
+
+if [ "$USE_BACKPORT" -eq 1 ]; then
+  cat > "$HTTP_DIR/msg-subscription.request.json" <<EOF
+{
+  "resourceType": "Subscription",
+  "id": "$MSG_SUB_ID",
+  "status": "requested",
+  "reason": "R4 backport messaging subscriptions smoke test",
+  "meta": {
+    "profile": [
+      "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-subscription"
+    ]
+  },
+  "criteria": "$TOPIC_URL",
+  "channel": {
+    "type": "message",
+    "endpoint": "http://127.0.0.1:$WEBHOOK_PORT/process-message",
+    "payload": "application/fhir+json",
+    "_payload": {
+      "extension": [{
+        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+        "valueCode": "id-only"
+      }]
+    }
+  }
+}
+EOF
+else
+  cat > "$HTTP_DIR/msg-subscription.request.json" <<EOF
+{
+  "resourceType": "Subscription",
+  "id": "$MSG_SUB_ID",
+  "status": "requested",
+  "reason": "Native messaging subscriptions smoke test",
+  "topic": "$TOPIC_URL",
+  "channelType": {
+    "system": "http://terminology.hl7.org/CodeSystem/subscription-channel-type",
+    "code": "message"
+  },
+  "endpoint": "http://127.0.0.1:$WEBHOOK_PORT/process-message",
+  "contentType": "application/fhir+json",
+  "content": "id-only"
+}
+EOF
+fi
+
+MSG_SUB_STATUS="$(curl -sS -o "$HTTP_DIR/msg-subscription.response.json" -w "%{http_code}" \
+  -X POST "$BASE_URL/Subscription" \
+  -H "Content-Type: $FHIR_CT" \
+  -H "Accept: $FHIR_ACCEPT" \
+  --data-binary @"$HTTP_DIR/msg-subscription.request.json")"
+
+if [ "$MSG_SUB_STATUS" != "200" ] && [ "$MSG_SUB_STATUS" != "201" ]; then
+  log "messaging Subscription creation returned $MSG_SUB_STATUS — messaging channel likely not enabled on this HFS; skipping messaging smoke"
+else
+  MSG_HEADER_EVENT_JQ='
+    if (.entry[0].resource.eventCoding.code // "") != "" then
+      .entry[0].resource.eventCoding.code
+    elif (.entry[0].resource.eventUri // "") != "" then
+      "topic"
+    else
+      ""
+    end
+  '
+
+  wait_for_value_count "$REST_CAPTURE_FILE" \
+    "select(.type==\"message\") | $MSG_HEADER_EVENT_JQ | select(. == \"handshake\" or . == \"topic\")" \
+    1 30 "messaging handshake notification"
+
+  cat > "$HTTP_DIR/msg-encounter.request.json" <<EOF
+{
+  "resourceType": "Encounter",
+  "id": "$MSG_ENCOUNTER_ID",
+  "status": "in-progress"
+}
+EOF
+
+  MSG_ENC_STATUS="$(curl -sS -o "$HTTP_DIR/msg-encounter.response.json" -w "%{http_code}" \
+    -X POST "$BASE_URL/Encounter" \
+    -H "Content-Type: $FHIR_CT" \
+    -H "Accept: $FHIR_ACCEPT" \
+    --data-binary @"$HTTP_DIR/msg-encounter.request.json")"
+  expect_created "$MSG_ENC_STATUS" "create Encounter for messaging smoke" "$HTTP_DIR/msg-encounter.response.json"
+
+  # Wait for the messaging event-notification: a Bundle(type=message) whose
+  # MessageHeader points at our subscription's id.
+  wait_for_value_count "$REST_CAPTURE_FILE" \
+    "select(.type==\"message\") | select((.entry[0].resource.focus[0].reference // \"\") == \"Subscription/$MSG_SUB_ID\") | select(any(.entry[]?; (.request.url // \"\") == \"Encounter/$MSG_ENCOUNTER_ID\"))" \
+    1 30 "messaging event-notification"
+
+  # Capture the first messaging handshake + event bundles for shape assertions.
+  jq -c "select(.type==\"message\") | select((.entry[0].resource.focus[0].reference // \"\") == \"Subscription/$MSG_SUB_ID\") | select(all(.entry[]?; (.request.url // \"\") != \"Encounter/$MSG_ENCOUNTER_ID\"))" \
+    "$REST_CAPTURE_FILE" | head -n 1 > "$MSG_DIR/handshake.json"
+  jq -c "select(.type==\"message\") | select((.entry[0].resource.focus[0].reference // \"\") == \"Subscription/$MSG_SUB_ID\") | select(any(.entry[]?; (.request.url // \"\") == \"Encounter/$MSG_ENCOUNTER_ID\"))" \
+    "$REST_CAPTURE_FILE" | head -n 1 > "$MSG_DIR/event-notification.json"
+
+  [ -s "$MSG_DIR/handshake.json" ] || fail "missing captured messaging handshake bundle"
+  [ -s "$MSG_DIR/event-notification.json" ] || fail "missing captured messaging event bundle"
+
+  jq -e '
+    .resourceType=="Bundle" and .type=="message"
+    and .entry[0].resource.resourceType=="MessageHeader"
+    and ((.entry[0].resource.destination[0].endpoint // "") | endswith("/process-message"))
+    and ((.entry[0].resource.focus[0].reference // "") | startswith("Subscription/"))
+  ' "$MSG_DIR/handshake.json" >/dev/null \
+    || fail "messaging handshake bundle shape mismatch"
+
+  jq -e --arg focus "Encounter/$MSG_ENCOUNTER_ID" '
+    .resourceType=="Bundle" and .type=="message"
+    and .entry[0].resource.resourceType=="MessageHeader"
+    and any(.entry[]?; (.request.url // "") == $focus)
+  ' "$MSG_DIR/event-notification.json" >/dev/null \
+    || fail "messaging event bundle missing expected focus"
+
+  MSG_SMOKE_TOTAL=2
+  pass "messaging smoke assertions passed (handshake + event-notification)"
+fi
+
 REST_TOTAL="$(wc -l < "$REST_CAPTURE_FILE" 2>/dev/null | tr -d ' ')"
 WS_TOTAL="$(wc -l < "$WS_FRAMES" 2>/dev/null | tr -d ' ')"
 
@@ -678,6 +804,7 @@ cat >> "$SUMMARY_FILE" <<EOF
 - Rest-hook notifications captured: $REST_TOTAL
 - WebSocket frames captured: $WS_TOTAL
 - Email notifications captured: $EMAIL_SMOKE_TOTAL
+- Messaging notifications captured: $MSG_SMOKE_TOTAL
 
 All subscriptions smoke checks completed successfully.
 EOF
