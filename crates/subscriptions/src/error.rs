@@ -47,3 +47,11 @@ impl From<helios_persistence::error::StorageError> for SubscriptionError {
         Self::Storage(e.to_string())
     }
 }
+
+impl From<helios_auth::AuthError> for SubscriptionError {
+    fn from(e: helios_auth::AuthError) -> Self {
+        Self::DeliveryFailed {
+            message: format!("outbound auth failed: {e}"),
+        }
+    }
+}
