@@ -99,15 +99,13 @@ mod tests {
     #[test]
     fn test_patient_contact_backbone_lookup() {
         // Type inference walks the schema: Patient.contact (PatientContact backbone) → name (HumanName).
-        // Collection-ness propagation is not currently modelled; this test documents the
-        // schema-driven lookup, not FHIRPath collection semantics.
         assert_eq!(
             infer_display("contact.name", "Patient").as_deref(),
-            Some("HumanName")
+            Some("HumanName[]")
         );
         assert_eq!(
             infer_display("contact.name.family", "Patient").as_deref(),
-            Some("system.String")
+            Some("system.String[]")
         );
     }
 

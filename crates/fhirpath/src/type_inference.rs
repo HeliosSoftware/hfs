@@ -251,7 +251,7 @@ fn infer_member_type(
     } else {
         InferredType::fhir(ty)
     };
-    if is_collection {
+    if is_collection || input_type.is_collection {
         inferred = inferred.collection();
     }
     Some(inferred)
