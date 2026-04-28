@@ -86,7 +86,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 // receive partial results plus `expansion.parameter` warnings.
                 let compose = &vs_resource["compose"];
                 let codes = if let Some(filter) = req.filter.as_deref() {
-                    expand_inline_filtered(&conn, compose, filter, &mut warnings)?
+                    let limit_hint = req.count.map(|c| ((c as usize) * 3).max(100));
+                    expand_inline_filtered(&conn, compose, filter, limit_hint, &mut warnings)?
                 } else {
                     let compose_str = compose.to_string();
                     // Cache inline compose expansions so that repeated requests for
@@ -700,6 +701,7 @@ fn expand_inline_filtered(
     conn: &Connection,
     compose: &serde_json::Value,
     text_filter: &str,
+    limit_hint: Option<usize>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let empty_arr = vec![];
@@ -817,46 +819,60 @@ fn expand_inline_filtered(
             if filter_lower.len() >= 3 {
                 ensure_concepts_fts(conn, &system_id)?;
                 let match_expr = fts5_quote(&filter_lower);
+                // Per-system FTS limit: use hint×3 headroom (multi-system requests need surplus),
+                // but cap at 5000 for safety. Minimum 100 so tiny counts still get results.
+                let per_sys_limit = limit_hint
+                    .map(|h| (h * 3).max(100).min(5000))
+                    .unwrap_or(5000) as i64;
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT code, display FROM concepts_fts \
                          WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
-                         ORDER BY code LIMIT 5000",
+                         ORDER BY code LIMIT ?3",
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = stmt
-                    .query_map(rusqlite::params![match_expr, system_id], |row| {
-                        Ok(ExpansionContains {
-                            system: system_url.to_owned(),
-                            code: row.get(0)?,
-                            display: row.get(1)?,
-                            inactive: None,
-                            contains: vec![],
-                        })
-                    })
+                    .query_map(
+                        rusqlite::params![match_expr, system_id, per_sys_limit],
+                        |row| {
+                            Ok(ExpansionContains {
+                                system: system_url.to_owned(),
+                                code: row.get(0)?,
+                                display: row.get(1)?,
+                                inactive: None,
+                                contains: vec![],
+                            })
+                        },
+                    )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 results.extend(rows);
             } else {
+                let per_sys_limit = limit_hint
+                    .map(|h| (h * 3).max(100).min(5000))
+                    .unwrap_or(5000) as i64;
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT code, display FROM concepts \
                          WHERE system_id = ?1 \
                            AND (LOWER(code) LIKE ?2 OR LOWER(display) LIKE ?2) \
-                         ORDER BY code LIMIT 5000",
+                         ORDER BY code LIMIT ?3",
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = stmt
-                    .query_map(rusqlite::params![system_id, sql_pat], |row| {
-                        Ok(ExpansionContains {
-                            system: system_url.to_owned(),
-                            code: row.get(0)?,
-                            display: row.get(1)?,
-                            inactive: None,
-                            contains: vec![],
-                        })
-                    })
+                    .query_map(
+                        rusqlite::params![system_id, sql_pat, per_sys_limit],
+                        |row| {
+                            Ok(ExpansionContains {
+                                system: system_url.to_owned(),
+                                code: row.get(0)?,
+                                display: row.get(1)?,
+                                inactive: None,
+                                contains: vec![],
+                            })
+                        },
+                    )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
