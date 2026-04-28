@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
 use crate::channels::email::EmailChannel;
+use crate::channels::messaging::MessagingChannel;
 use crate::channels::rest_hook::RestHookChannel;
 use crate::channels::websocket::WebSocketChannel;
 use crate::channels::ws_manager::WebSocketManager;
@@ -25,6 +26,7 @@ use crate::manager::{
 };
 use crate::notification::{self, NotificationEventData};
 use crate::topics::InMemoryTopicRegistry;
+use helios_auth::{NoOpOutboundAuthProvider, OutboundAuthProvider};
 
 /// The subscription engine orchestrates the entire subscription pipeline.
 ///
@@ -40,13 +42,28 @@ pub struct SubscriptionEngine {
     ws_channel: Arc<WebSocketChannel>,
     ws_token_manager: Arc<WsBindingTokenManager>,
     email_channel: Option<Arc<EmailChannel>>,
+    messaging_channel: Option<Arc<MessagingChannel>>,
     config: SubscriptionConfig,
     base_url: String,
 }
 
 impl SubscriptionEngine {
-    /// Creates a new subscription engine.
+    /// Creates a new subscription engine with a no-op outbound auth provider.
     pub fn new(config: SubscriptionConfig, base_url: String) -> Self {
+        Self::with_outbound_auth(config, base_url, Arc::new(NoOpOutboundAuthProvider))
+    }
+
+    /// Creates a new subscription engine with a custom outbound auth provider.
+    ///
+    /// The provider is used by channels that initiate outbound HTTP requests
+    /// (currently the FHIR Messaging channel) to attach server-side
+    /// credentials when the subscription does not supply its own
+    /// `Authorization` header.
+    pub fn with_outbound_auth(
+        config: SubscriptionConfig,
+        base_url: String,
+        outbound_auth: Arc<dyn OutboundAuthProvider>,
+    ) -> Self {
         let topic_registry = Arc::new(InMemoryTopicRegistry::new());
         let manager = Arc::new(SubscriptionManager::new(
             Arc::clone(&topic_registry),
@@ -67,6 +84,12 @@ impl SubscriptionEngine {
             },
             None => None,
         };
+        let messaging_channel = config.messaging.as_ref().map(|settings| {
+            Arc::new(
+                MessagingChannel::new(settings.source_endpoint.clone(), Arc::clone(&outbound_auth))
+                    .with_private_endpoints_allowed(settings.allow_private_endpoints),
+            )
+        });
 
         Self {
             topic_registry,
@@ -78,6 +101,7 @@ impl SubscriptionEngine {
             ws_channel,
             ws_token_manager,
             email_channel,
+            messaging_channel,
             config,
             base_url,
         }
@@ -474,6 +498,21 @@ impl SubscriptionEngine {
                     return;
                 }
             },
+            ChannelType::Message => match self.messaging_channel.as_ref() {
+                Some(ch) => ch.handshake(subscription, &handshake_bundle).await,
+                None => {
+                    warn!(
+                        subscription_id = sub_id,
+                        "Messaging channel requested but messaging settings not configured"
+                    );
+                    let _ = self.manager.update_status(
+                        tenant_id,
+                        sub_id,
+                        SubscriptionStatusCode::Error,
+                    );
+                    return;
+                }
+            },
             _ => {
                 warn!(
                     subscription_id = sub_id,
@@ -527,6 +566,16 @@ impl SubscriptionEngine {
                     warn!(
                         subscription_id = sub_id,
                         "Email dispatch requested but no SMTP settings configured"
+                    );
+                    return;
+                }
+            },
+            ChannelType::Message => match self.messaging_channel.as_deref() {
+                Some(ch) => ch,
+                None => {
+                    warn!(
+                        subscription_id = sub_id,
+                        "Messaging dispatch requested but messaging settings not configured"
                     );
                     return;
                 }
