@@ -175,6 +175,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS concepts_fts
 USING fts5(system_id UNINDEXED, code, display,
            tokenize='trigram case_sensitive 0');
 
+-- ── FTS5 word-prefix index for short-filter concept search ───────────────────
+-- Complements concepts_fts (trigram, ≥ 3-char terms) for 1–2 character filters.
+-- Uses the unicode61 tokenizer so that `a*` matches any token starting with 'a'
+-- rather than requiring a full trigram.  system_id is UNINDEXED (stored only).
+-- Populated at startup alongside concepts_fts; cleared on startup.
+CREATE VIRTUAL TABLE IF NOT EXISTS concepts_word_fts
+USING fts5(system_id UNINDEXED, code, display,
+           tokenize='unicode61 remove_diacritics 1');
+
 -- ── FTS build tracker ─────────────────────────────────────────────────────────
 -- O(1) lookup to check whether concepts_fts is populated for a given system_id.
 -- Replaces the slow FTS content scan (O(N_total_concepts)) used previously.
@@ -364,6 +373,8 @@ mod tests {
             "concept_map_elements",
             "implicit_expansion_cache",
             "implicit_expansion_fts",
+            "concepts_word_fts",
+            "concepts_fts_built",
         ];
 
         for table in &expected_tables {

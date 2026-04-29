@@ -2280,18 +2280,19 @@ fn bfs_expand_page(
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| HtsError::StorageError(e.to_string()));
                 }
-                let sql_pat = format!("%{f}%");
+                // Short filter (1–2 chars): use word-prefix FTS so `a*` matches any
+                // token starting with 'a' — O(log N) vs O(N) LIKE scan.
+                ensure_concepts_fts(conn, system_id)?;
+                let prefix_expr = fts5_word_prefix(f);
                 let mut stmt = conn
                     .prepare_cached(
-                        "SELECT code, display FROM concepts \
-                         WHERE system_id = ?1 \
-                           AND (LOWER(code) LIKE ?2 \
-                                OR LOWER(COALESCE(display,'')) LIKE ?2) \
-                         ORDER BY code LIMIT ?3 OFFSET ?4",
+                        "SELECT code, display FROM concepts_word_fts \
+                         WHERE concepts_word_fts MATCH ?1 AND system_id = ?2 \
+                         LIMIT ?3 OFFSET ?4",
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 stmt.query_map(
-                    rusqlite::params![system_id, sql_pat, sql_limit, sql_offset],
+                    rusqlite::params![prefix_expr, system_id, sql_limit, sql_offset],
                     |r| {
                         Ok(ExpansionContains {
                             system: cs_url.to_owned(),
@@ -2985,6 +2986,15 @@ fn fts5_quote(term: &str) -> String {
     format!("\"{}\"", term.replace('"', "\"\""))
 }
 
+/// Build an FTS5 prefix query expression for the `concepts_word_fts` table.
+///
+/// Appends `*` to the term so FTS5 with the `unicode61` tokenizer matches any
+/// token that *starts with* `term`.  Internal double-quotes are escaped.
+/// Used for short (< 3 char) filter terms that the trigram index cannot serve.
+fn fts5_word_prefix(term: &str) -> String {
+    format!("{}*", term.replace('"', "\"\""))
+}
+
 /// Count cached entries matching an optional filter for an implicit VS URL.
 ///
 /// Ensure the FTS5 mirror of the implicit expansion cache is populated for `url`.
@@ -3077,6 +3087,23 @@ fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsErro
 
     if let Err(e) = conn.execute(
         "INSERT INTO concepts_fts(rowid, system_id, code, display)
+         SELECT id, system_id, code, display FROM concepts WHERE system_id = ?1",
+        [system_id],
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(HtsError::StorageError(e.to_string()));
+    }
+
+    // Also populate the word-prefix FTS used for short (< 3 char) filter terms.
+    if let Err(e) = conn.execute(
+        "DELETE FROM concepts_word_fts WHERE system_id = ?1",
+        [system_id],
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(HtsError::StorageError(e.to_string()));
+    }
+    if let Err(e) = conn.execute(
+        "INSERT INTO concepts_word_fts(rowid, system_id, code, display)
          SELECT id, system_id, code, display FROM concepts WHERE system_id = ?1",
         [system_id],
     ) {
@@ -3317,10 +3344,21 @@ pub(crate) fn prebuild_concepts_fts(conn: &Connection) {
         Ok(n) => n,
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
-            tracing::warn!("prebuild_concepts_fts: INSERT failed: {e}");
+            tracing::warn!("prebuild_concepts_fts: trigram INSERT failed: {e}");
             return;
         }
     };
+
+    // Also populate the word-prefix FTS (unicode61) used for short filter terms.
+    if let Err(e) = conn.execute(
+        "INSERT INTO concepts_word_fts(rowid, system_id, code, display)
+         SELECT id, system_id, code, display FROM concepts",
+        [],
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        tracing::warn!("prebuild_concepts_fts: word-prefix INSERT failed: {e}");
+        return;
+    }
 
     // Populate the O(1) tracker so ensure_concepts_fts avoids FTS content scans.
     if let Err(e) = conn.execute_batch(
@@ -3333,7 +3371,10 @@ pub(crate) fn prebuild_concepts_fts(conn: &Connection) {
     }
 
     let _ = conn.execute_batch("COMMIT");
-    tracing::info!(rows = n, "concepts_fts pre-populated");
+    tracing::info!(
+        rows = n,
+        "concepts_fts pre-populated (trigram + word-prefix)"
+    );
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

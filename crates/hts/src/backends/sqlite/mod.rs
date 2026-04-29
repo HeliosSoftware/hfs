@@ -110,7 +110,8 @@ impl SqliteTerminologyBackend {
             // (see fhir_bundle::write_code_system).
             let _ = conn.execute_batch(
                 "DELETE FROM concepts_fts;
-                 DELETE FROM concepts_fts_built;",
+                 DELETE FROM concepts_fts_built;
+                 DELETE FROM concepts_word_fts;",
             );
 
             // Update query-planner statistics for large tables.
