@@ -74,7 +74,7 @@ impl SqliteTerminologyBackend {
         });
 
         let pool = Pool::builder()
-            .max_size(20)
+            .max_size(50)
             .build(manager)
             .map_err(|e| HtsError::StorageError(format!("Failed to create SQLite pool: {e}")))?;
 
