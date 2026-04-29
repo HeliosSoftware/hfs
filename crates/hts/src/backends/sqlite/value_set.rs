@@ -754,17 +754,38 @@ fn expand_inline_filtered(
             });
 
         if filter_lower.len() >= 3 && all_batchable {
-            ensure_concepts_fts(conn, &system_id)?;
-            let candidates =
-                fts_candidates_for_system(conn, &system_id, system_url, &filter_lower)?;
-            if !candidates.is_empty() {
-                let filtered = apply_compose_filters_to_candidates(
+            // If any filter is a property= filter, use property-first approach:
+            // query the bounded property index first, text-filter in Rust, then
+            // apply hierarchy checks to the small surviving set.
+            // This beats FTS-first when property= dramatically reduces candidates
+            // before the expensive hierarchy (is-a/descendent-of) check.
+            let has_eq_filter = compose_filters.iter().any(|f| {
+                f["op"].as_str().unwrap_or("") == "="
+                    && f["property"].as_str().unwrap_or("") != "constraint"
+            });
+            if has_eq_filter {
+                let filtered = property_first_filtered(
                     conn,
                     &system_id,
+                    system_url,
                     compose_filters,
-                    candidates,
+                    &filter_lower,
                 )?;
                 results.extend(filtered);
+            } else {
+                // Pure-hierarchy + text: FTS-first is optimal (no property index).
+                ensure_concepts_fts(conn, &system_id)?;
+                let candidates =
+                    fts_candidates_for_system(conn, &system_id, system_url, &filter_lower)?;
+                if !candidates.is_empty() {
+                    let filtered = apply_compose_filters_to_candidates(
+                        conn,
+                        &system_id,
+                        compose_filters,
+                        candidates,
+                    )?;
+                    results.extend(filtered);
+                }
             }
             continue;
         }
@@ -828,7 +849,7 @@ fn expand_inline_filtered(
                     .prepare_cached(
                         "SELECT code, display FROM concepts_fts \
                          WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
-                         ORDER BY code LIMIT ?3",
+                         LIMIT ?3",
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = stmt
@@ -1557,7 +1578,7 @@ fn fts_candidates_for_system(
         .prepare_cached(
             "SELECT code, display FROM concepts_fts \
              WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
-             ORDER BY code LIMIT 5000",
+             LIMIT 5000",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
     let rows = stmt
@@ -1626,6 +1647,92 @@ fn apply_compose_filters_to_candidates(
             _ => {}
         }
     }
+    Ok(candidates)
+}
+
+/// Property-first approach for (property=) + optional hierarchy + text filter.
+///
+/// When a compose includes `property = value` filters, query them globally
+/// (indexed lookup, O(N_property)), text-filter the result in Rust (zero DB
+/// queries), and only then apply the much-cheaper hierarchy check to the small
+/// surviving set.  This beats FTS-first when the property= index is more
+/// selective than the FTS trigram index (e.g. EX08: 5 000 FTS "fracture"
+/// candidates → 100 K upward-CTE steps vs. ~300 property hits → Rust text
+/// filter → ~50 upward-CTE steps).
+fn property_first_filtered(
+    conn: &Connection,
+    system_id: &str,
+    system_url: &str,
+    filters: &[serde_json::Value],
+    filter_lower: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let (eq_filters, hier_filters): (Vec<&serde_json::Value>, Vec<&serde_json::Value>) =
+        filters.iter().partition(|f| {
+            f["op"].as_str().unwrap_or("") == "="
+                && f["property"].as_str().unwrap_or("") != "constraint"
+        });
+
+    // Phase 1: property= filters — indexed, bounded result set.
+    let mut candidates: Option<Vec<ExpansionContains>> = None;
+    for f in &eq_filters {
+        let property = f["property"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+        if property.is_empty() || value.is_empty() {
+            continue;
+        }
+        let from_db = query_property_eq(conn, system_url, system_id, property, value)?;
+        match candidates.as_mut() {
+            Some(prev) => {
+                let keep: HashSet<String> = from_db.iter().map(|c| c.code.clone()).collect();
+                prev.retain(|c| keep.contains(&c.code));
+            }
+            None => candidates = Some(from_db),
+        }
+    }
+
+    let mut candidates = candidates.unwrap_or_default();
+
+    // Phase 2: text filter in Rust — zero additional DB queries.
+    candidates.retain(|c| {
+        c.code.to_lowercase().contains(filter_lower)
+            || c.display
+                .as_deref()
+                .map(|d| d.to_lowercase().contains(filter_lower))
+                .unwrap_or(false)
+    });
+
+    if hier_filters.is_empty() || candidates.is_empty() {
+        return Ok(candidates);
+    }
+
+    // Phase 3: hierarchy filters on the now-small candidate set.
+    for f in &hier_filters {
+        if candidates.is_empty() {
+            break;
+        }
+        let property = f["property"].as_str().unwrap_or("");
+        let op = f["op"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+        match (property, op) {
+            ("concept", "is-a") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let valid = batch_descendants_in_set(conn, system_id, value, true, &codes)?;
+                candidates.retain(|c| valid.contains(&c.code));
+            }
+            ("concept", "descendent-of") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let valid = batch_descendants_in_set(conn, system_id, value, false, &codes)?;
+                candidates.retain(|c| valid.contains(&c.code));
+            }
+            ("concept", "generalizes") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let valid = batch_ancestors_in_set(conn, system_id, value, &codes)?;
+                candidates.retain(|c| valid.contains(&c.code));
+            }
+            _ => {}
+        }
+    }
+
     Ok(candidates)
 }
 
@@ -2101,7 +2208,7 @@ fn bfs_expand_page(
                         .prepare_cached(
                             "SELECT code, display FROM concepts_fts \
                              WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
-                             ORDER BY code LIMIT ?3 OFFSET ?4",
+                             LIMIT ?3 OFFSET ?4",
                         )
                         .map_err(|e| HtsError::StorageError(e.to_string()))?;
                     return stmt
