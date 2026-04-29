@@ -30,14 +30,13 @@
 //!
 //! <https://hl7.org/fhir/valueset-operation-expand.html>
 
-use std::sync::Arc;
-
 use axum::{
     Json,
     extract::{Path, RawQuery, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     response::Response,
 };
+use bytes::Bytes;
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
@@ -46,7 +45,7 @@ use crate::state::{AppState, EXPAND_CACHE_MAX, ExpandCacheKey};
 use crate::traits::{TerminologyBackend, ValueSetOperations};
 use crate::types::{ExpandRequest, ExpansionContains};
 
-use super::format::{fhir_respond, negotiate_format};
+use super::format::{ResponseFormat, json_to_fhir_xml, negotiate_format};
 use super::params::{
     extract_parameter_array, find_resource_param, find_str_param, parse_query_string,
     query_params_to_fhir_params,
@@ -79,10 +78,16 @@ fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
     item
 }
 
+/// Expand a ValueSet and return the result as pre-serialized JSON bytes.
+///
+/// Bytes are cached keyed on request parameters.  On a cache hit the stored
+/// [`Bytes`] handle is cloned in O(1) (reference-count bump only — no heap
+/// allocation or JSON re-serialization).  On a cache miss the result is
+/// serialized once, stored, and returned.
 async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
-) -> Result<Value, HtsError> {
+) -> Result<Bytes, HtsError> {
     let url = find_str_param(&params, "url");
     let value_set = if url.is_none() {
         find_resource_param(&params, "valueSet")
@@ -140,7 +145,8 @@ async fn process_expand<B: TerminologyBackend>(
 
     if let Ok(cache) = state.expand_cache.read() {
         if let Some(cached) = cache.get(&cache_key) {
-            return Ok((**cached).clone());
+            // O(1) clone — just bumps the reference count on the shared buffer.
+            return Ok(cached.clone());
         }
     }
 
@@ -188,14 +194,50 @@ async fn process_expand<B: TerminologyBackend>(
         "expansion": expansion,
     });
 
-    // ── Store in cache ────────────────────────────────────────────────────────
+    // ── Serialize once, cache, return ─────────────────────────────────────────
+    // `serde_json::to_vec` writes directly into a Vec<u8>; wrapping in
+    // `Bytes::from` transfers ownership without copying.
+    let bytes = Bytes::from(
+        serde_json::to_vec(&response)
+            .map_err(|e| HtsError::Internal(format!("JSON serialization failed: {e}")))?,
+    );
+
     if let Ok(mut cache) = state.expand_cache.write() {
         if cache.len() < EXPAND_CACHE_MAX {
-            cache.insert(cache_key, Arc::new(response.clone()));
+            // `Bytes::clone` is O(1); storing it here and returning the clone
+            // below means both the cache and the caller share the same buffer.
+            cache.insert(cache_key, bytes.clone());
         }
     }
 
-    Ok(response)
+    Ok(bytes)
+}
+
+/// Turn pre-serialized JSON bytes into an HTTP response.
+///
+/// For JSON format: the bytes are returned directly with no extra copy.
+/// For XML format: the bytes are deserialized back to a `Value` first (rare
+/// code path — the benchmark always uses JSON).
+fn expand_bytes_respond(bytes: Bytes, format: ResponseFormat) -> Response {
+    use axum::response::IntoResponse;
+    match format {
+        ResponseFormat::Json => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/fhir+json; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        ResponseFormat::Xml => {
+            let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let xml = json_to_fhir_xml(&value);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/fhir+xml; charset=utf-8")],
+                xml,
+            )
+                .into_response()
+        }
+    }
 }
 
 /// `POST /ValueSet/$expand`
@@ -212,7 +254,10 @@ pub async fn expand_handler<B: TerminologyBackend>(
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
     let params = extract_parameter_array(&body)?;
-    Ok(fhir_respond(process_expand(&state, params).await?, format))
+    Ok(expand_bytes_respond(
+        process_expand(&state, params).await?,
+        format,
+    ))
 }
 
 /// `GET /ValueSet/$expand?url=<url>`
@@ -229,7 +274,10 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    Ok(fhir_respond(process_expand(&state, params).await?, format))
+    Ok(expand_bytes_respond(
+        process_expand(&state, params).await?,
+        format,
+    ))
 }
 
 /// Inject (or replace) the `url` parameter in a params list.
@@ -265,7 +313,7 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
     let raw_params = body
         .and_then(|Json(v)| extract_parameter_array(&v).ok())
         .unwrap_or_default();
-    Ok(fhir_respond(
+    Ok(expand_bytes_respond(
         process_expand(&state, inject_url(raw_params, url)).await?,
         format,
     ))
@@ -293,7 +341,7 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
 
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    Ok(fhir_respond(
+    Ok(expand_bytes_respond(
         process_expand(&state, inject_url(params, url)).await?,
         format,
     ))

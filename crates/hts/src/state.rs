@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use bytes::Bytes;
 use helios_persistence::ResourceStorage;
 #[cfg(feature = "postgres")]
 use helios_persistence::backends::postgres::PostgresBackend;
@@ -20,7 +21,6 @@ use helios_persistence::backends::sqlite::SqliteBackend;
 use r2d2::Pool;
 #[cfg(feature = "sqlite")]
 use r2d2_sqlite::SqliteConnectionManager;
-use serde_json::Value;
 
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
@@ -48,11 +48,12 @@ pub struct ExpandCacheKey {
 
 /// Thread-safe in-process cache for `$expand` responses.
 ///
-/// Keyed on [`ExpandCacheKey`]; values are the ready-to-send FHIR JSON
-/// `ValueSet` objects wrapped in `Arc` to avoid cloning on every hit.
+/// Keyed on [`ExpandCacheKey`]; values are pre-serialized FHIR JSON bytes
+/// stored as [`bytes::Bytes`] — a reference-counted buffer that can be cloned
+/// in O(1) and sent as an HTTP body without an extra allocation.
 /// Bounded to [`EXPAND_CACHE_MAX`] entries; once full, new entries are
 /// silently dropped (the benchmark never exceeds ~50 unique keys).
-pub type ExpandCache = Arc<RwLock<HashMap<ExpandCacheKey, Arc<Value>>>>;
+pub type ExpandCache = Arc<RwLock<HashMap<ExpandCacheKey, Bytes>>>;
 
 pub const EXPAND_CACHE_MAX: usize = 2048;
 

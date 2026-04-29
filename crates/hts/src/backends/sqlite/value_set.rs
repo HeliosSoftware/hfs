@@ -843,7 +843,7 @@ fn expand_inline_filtered(
                 // Per-system FTS limit: use hint×3 headroom (multi-system requests need surplus),
                 // but cap at 5000 for safety. Minimum 100 so tiny counts still get results.
                 let per_sys_limit = limit_hint
-                    .map(|h| (h * 3).max(100).min(5000))
+                    .map(|h| (h * 3).clamp(100, 5000))
                     .unwrap_or(5000) as i64;
                 let mut stmt = conn
                     .prepare_cached(
@@ -871,7 +871,7 @@ fn expand_inline_filtered(
                 results.extend(rows);
             } else {
                 let per_sys_limit = limit_hint
-                    .map(|h| (h * 3).max(100).min(5000))
+                    .map(|h| (h * 3).clamp(100, 5000))
                     .unwrap_or(5000) as i64;
                 let mut stmt = conn
                     .prepare_cached(
