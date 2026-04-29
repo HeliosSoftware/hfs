@@ -685,6 +685,109 @@ fn fetch_cache(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionContains>,
     .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
+/// Fast path for text-filtered expansions where every include is a plain
+/// full-system include (no compose filters, no explicit concept list).
+///
+/// Runs a **single** FTS query across all systems using `json_each` instead of
+/// N sequential per-system queries.  This eliminates N−1 FTS round-trips and is
+/// the dominant win for multi-system text-filter requests (EX07 pattern).
+///
+/// Returns `None` if any include is not a plain full-system include so the
+/// caller can fall through to the general path.
+fn expand_inline_plain_fts(
+    conn: &Connection,
+    includes: &[serde_json::Value],
+    filter_lower: &str,
+    limit_hint: Option<usize>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    // Resolve (system_url, system_id) for each include.
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(includes.len());
+    for inc in includes {
+        let system_url = inc["system"].as_str().unwrap_or("");
+        match conn
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = ?1",
+                [system_url],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+        {
+            Some(id) => pairs.push((system_url.to_owned(), id)),
+            None => {
+                let msg = format!(
+                    "CodeSystem {system_url} was not found and has been excluded from the expansion"
+                );
+                tracing::warn!(%system_url, "{msg}");
+                warnings.push(msg);
+            }
+        }
+    }
+
+    if pairs.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Ensure the FTS index is built for every participating system.
+    for (_, system_id) in &pairs {
+        ensure_concepts_fts(conn, system_id)?;
+    }
+
+    // Build a JSON array of system_ids for the IN clause and an id→url map.
+    let ids_json =
+        serde_json::to_string(&pairs.iter().map(|(_, id)| id.as_str()).collect::<Vec<_>>())
+            .unwrap_or_else(|_| "[]".to_owned());
+
+    let id_to_url: std::collections::HashMap<&str, &str> = pairs
+        .iter()
+        .map(|(url, id)| (id.as_str(), url.as_str()))
+        .collect();
+
+    let match_expr = fts5_quote(filter_lower);
+    let total_limit = limit_hint.map(|h| (h * 3).clamp(100, 5000)).unwrap_or(5000) as i64;
+
+    // Single FTS query across all systems — FTS5 evaluates MATCH first (fast),
+    // then applies the system_id IN post-filter to the small matching set.
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT system_id, code, display FROM concepts_fts \
+             WHERE concepts_fts MATCH ?1 \
+               AND system_id IN (SELECT value FROM json_each(?2)) \
+             LIMIT ?3",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let rows = stmt
+        .query_map(
+            rusqlite::params![match_expr, ids_json, total_limit],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let mut results = Vec::with_capacity(rows.len());
+    for (system_id, code, display) in rows {
+        if let Some(&system_url) = id_to_url.get(system_id.as_str()) {
+            results.push(ExpansionContains {
+                system: system_url.to_owned(),
+                code,
+                display,
+                inactive: None,
+                contains: vec![],
+            });
+        }
+    }
+    Ok(results)
+}
+
 /// Expand an inline ValueSet compose with a text filter pushed down to SQL.
 ///
 /// Called instead of `compute_expansion` when the request carries a `filter`
@@ -709,6 +812,23 @@ fn expand_inline_filtered(
     let filter_lower = text_filter.to_lowercase();
     let sql_pat = format!("%{filter_lower}%");
     let mut results: Vec<ExpansionContains> = Vec::new();
+
+    // ── Unified multi-system FTS fast path (EX07) ─────────────────────────────
+    // When filter ≥ 3 chars and every include is a plain full-system include
+    // (no compose filters, no explicit concept list, no nested valueSets), issue
+    // a single FTS query across all systems instead of N sequential per-system
+    // queries.  The single MATCH eliminates N−1 FTS round-trips.
+    if filter_lower.len() >= 3 && !includes.is_empty() {
+        let all_plain = includes.iter().all(|inc| {
+            inc["system"].as_str().is_some_and(|s| !s.is_empty())
+                && inc["filter"].as_array().is_none_or(|a| a.is_empty())
+                && inc["concept"].as_array().is_none_or(|a| a.is_empty())
+                && inc["valueSet"].as_array().is_none_or(|a| a.is_empty())
+        });
+        if all_plain {
+            return expand_inline_plain_fts(conn, includes, &filter_lower, limit_hint, warnings);
+        }
+    }
 
     for inc in includes {
         let system_url = match inc["system"].as_str() {
@@ -2950,9 +3070,11 @@ fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
 /// Cleared on server startup so a re-import followed by a restart always
 /// rebuilds from fresh data.
 fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsError> {
+    // O(1) primary-key lookup via the tracker table; avoids the old O(N_total)
+    // FTS content scan that read through every row before finding the target system.
     let populated: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM concepts_fts WHERE system_id = ?1 LIMIT 1)",
+            "SELECT EXISTS(SELECT 1 FROM concepts_fts_built WHERE system_id = ?1)",
             [system_id],
             |r| r.get(0),
         )
@@ -2969,7 +3091,7 @@ fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsErro
 
     // Re-check inside the lock: another task may have built the index while we waited.
     let still_empty: bool = match conn.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM concepts_fts WHERE system_id = ?1 LIMIT 1)",
+        "SELECT NOT EXISTS(SELECT 1 FROM concepts_fts_built WHERE system_id = ?1)",
         [system_id],
         |r| r.get(0),
     ) {
@@ -2994,6 +3116,14 @@ fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsErro
     if let Err(e) = conn.execute(
         "INSERT INTO concepts_fts(rowid, system_id, code, display)
          SELECT id, system_id, code, display FROM concepts WHERE system_id = ?1",
+        [system_id],
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(HtsError::StorageError(e.to_string()));
+    }
+
+    if let Err(e) = conn.execute(
+        "INSERT OR IGNORE INTO concepts_fts_built (system_id) VALUES (?1)",
         [system_id],
     ) {
         let _ = conn.execute_batch("ROLLBACK");
@@ -3215,22 +3345,33 @@ pub(crate) fn prebuild_concepts_fts(conn: &Connection) {
         return;
     }
 
-    let result = conn.execute(
+    let fts_result = conn.execute(
         "INSERT INTO concepts_fts(rowid, system_id, code, display)
          SELECT id, system_id, code, display FROM concepts",
         [],
     );
 
-    match result {
-        Ok(n) => {
-            let _ = conn.execute_batch("COMMIT");
-            tracing::info!(rows = n, "concepts_fts pre-populated");
-        }
+    let n = match fts_result {
+        Ok(n) => n,
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             tracing::warn!("prebuild_concepts_fts: INSERT failed: {e}");
+            return;
         }
+    };
+
+    // Populate the O(1) tracker so ensure_concepts_fts avoids FTS content scans.
+    if let Err(e) = conn.execute_batch(
+        "INSERT OR IGNORE INTO concepts_fts_built (system_id)
+         SELECT DISTINCT id FROM code_systems",
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        tracing::warn!("prebuild_concepts_fts: tracker INSERT failed: {e}");
+        return;
     }
+
+    let _ = conn.execute_batch("COMMIT");
+    tracing::info!(rows = n, "concepts_fts pre-populated");
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

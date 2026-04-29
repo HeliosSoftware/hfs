@@ -163,6 +163,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS concepts_fts
 USING fts5(system_id UNINDEXED, code, display,
            tokenize='trigram case_sensitive 0');
 
+-- ── FTS build tracker ─────────────────────────────────────────────────────────
+-- O(1) lookup to check whether concepts_fts is populated for a given system_id.
+-- Replaces the slow FTS content scan (O(N_total_concepts)) used previously.
+-- Cleared on startup alongside concepts_fts; populated in ensure_concepts_fts
+-- and prebuild_concepts_fts.
+CREATE TABLE IF NOT EXISTS concepts_fts_built (
+    system_id TEXT PRIMARY KEY
+);
+
 -- ── Transitive ancestor closure ───────────────────────────────────────────────
 -- Precomputed (ancestor, descendant) pairs for every code system, including
 -- self-links (code, code).  Populated at import time for each code system so

@@ -106,7 +106,8 @@ impl SqliteTerminologyBackend {
             let _ = conn.execute_batch(
                 "DELETE FROM implicit_expansion_cache;
                  DELETE FROM implicit_expansion_fts;
-                 DELETE FROM concepts_fts;",
+                 DELETE FROM concepts_fts;
+                 DELETE FROM concepts_fts_built;",
             );
 
             // Update query-planner statistics for large tables.
