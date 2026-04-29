@@ -878,7 +878,7 @@ fn expand_inline_filtered(
                         "SELECT code, display FROM concepts \
                          WHERE system_id = ?1 \
                            AND (LOWER(code) LIKE ?2 OR LOWER(display) LIKE ?2) \
-                         LIMIT ?3",
+                         ORDER BY code LIMIT ?3",
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = stmt
@@ -2235,7 +2235,7 @@ fn bfs_expand_page(
                          WHERE system_id = ?1 \
                            AND (LOWER(code) LIKE ?2 \
                                 OR LOWER(COALESCE(display,'')) LIKE ?2) \
-                         LIMIT ?3 OFFSET ?4",
+                         ORDER BY code LIMIT ?3 OFFSET ?4",
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 stmt.query_map(
