@@ -8,17 +8,18 @@
 //! the order guaranteed by [`bundle_parser::parse_bundle`].
 
 #[cfg(feature = "sqlite")]
-use r2d2::Pool;
-#[cfg(feature = "sqlite")]
-use r2d2_sqlite::SqliteConnectionManager;
-#[cfg(feature = "sqlite")]
-use rusqlite::{Connection, OptionalExtension};
-
+use crate::backends::sqlite::schema;
 use crate::error::HtsError;
 use crate::import::ImportStats;
 use crate::import::bundle_parser::{
     self, ParsedBundle, ParsedCodeSystem, ParsedConceptMap, ParsedValueSet,
 };
+#[cfg(feature = "sqlite")]
+use r2d2::Pool;
+#[cfg(feature = "sqlite")]
+use r2d2_sqlite::SqliteConnectionManager;
+#[cfg(feature = "sqlite")]
+use rusqlite::{Connection, OptionalExtension};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -270,6 +271,11 @@ fn write_code_system(
 
         stats.concepts += 1;
     }
+
+    // Build (or rebuild) the transitive ancestor closure for this code system.
+    // Runs inside the same transaction as the concept/hierarchy inserts above.
+    schema::build_concept_closure(conn, &system_id)
+        .map_err(|e| HtsError::StorageError(format!("Closure build failed: {e}")))?;
 
     stats.code_systems += 1;
     Ok(())

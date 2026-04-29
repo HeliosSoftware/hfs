@@ -39,7 +39,7 @@
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use crate::ecl;
 use crate::error::HtsError;
@@ -842,9 +842,8 @@ fn expand_inline_filtered(
                 let match_expr = fts5_quote(&filter_lower);
                 // Per-system FTS limit: use hint×3 headroom (multi-system requests need surplus),
                 // but cap at 5000 for safety. Minimum 100 so tiny counts still get results.
-                let per_sys_limit = limit_hint
-                    .map(|h| (h * 3).clamp(100, 5000))
-                    .unwrap_or(5000) as i64;
+                let per_sys_limit =
+                    limit_hint.map(|h| (h * 3).clamp(100, 5000)).unwrap_or(5000) as i64;
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT code, display FROM concepts_fts \
@@ -870,9 +869,8 @@ fn expand_inline_filtered(
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 results.extend(rows);
             } else {
-                let per_sys_limit = limit_hint
-                    .map(|h| (h * 3).clamp(100, 5000))
-                    .unwrap_or(5000) as i64;
+                let per_sys_limit =
+                    limit_hint.map(|h| (h * 3).clamp(100, 5000)).unwrap_or(5000) as i64;
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT code, display FROM concepts \
@@ -1332,26 +1330,19 @@ fn query_subtree_with_property(
     property: &str,
     value: &str,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
-    // ?1 = root_code, ?2 = system_id, ?3 = property, ?4 = value
-    // `d.code != ?1 OR ?5` enforces descendent-of vs is-a.
-    // UNION (not UNION ALL) prevents path explosion in polyhierarchies.
+    // O(1) closure JOIN replaces the previous recursive CTE.
+    // `cc.descendant_code != ?1 OR ?5` enforces descendent-of vs is-a.
     let mut stmt = conn
         .prepare_cached(
-            "WITH RECURSIVE desc(code) AS (
-                 SELECT ?1
-                 UNION
-                 SELECT ch.child_code
-                 FROM   concept_hierarchy ch
-                 JOIN   desc ON ch.parent_code = desc.code
-                 WHERE  ch.system_id = ?2
-             )
-             SELECT c.code, c.display
-             FROM   desc d
-             JOIN   concepts c ON c.system_id = ?2 AND c.code = d.code
+            "SELECT c.code, c.display
+             FROM   concept_closure cc
+             JOIN   concepts c ON c.system_id = ?2 AND c.code = cc.descendant_code
              JOIN   concept_properties cp ON cp.concept_id = c.id
-             WHERE  cp.property = ?3
+             WHERE  cc.system_id = ?2
+               AND  cc.ancestor_code = ?1
+               AND  cp.property = ?3
                AND  cp.value = ?4
-               AND  (d.code != ?1 OR ?5)",
+               AND  (cc.descendant_code != ?1 OR ?5)",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -1439,37 +1430,28 @@ fn batch_descendants_in_set(
     let json_candidates =
         serde_json::to_string(candidates).map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    // Walk UPWARD from each candidate.  UNION (not UNION ALL) deduplicates
-    // (start_code, current_code) pairs so that SNOMED polyhierarchy — where a
-    // concept can have many parents — doesn't cause path explosion.
+    // O(1) closure lookup per candidate via a single JOIN.
+    // The closure stores self-links so include_self is handled by the
+    // `(j.value != ?1 OR ?4)` predicate (1 = include self, 0 = exclude).
     let mut stmt = conn
         .prepare_cached(
-            "WITH RECURSIVE anc(start_code, current_code) AS (
-                 SELECT j.value, j.value FROM json_each(?3) j
-                 UNION
-                 SELECT anc.start_code, ch.parent_code
-                 FROM   concept_hierarchy ch
-                 JOIN   anc ON ch.child_code = anc.current_code
-                          AND anc.current_code != ?1
-                 WHERE  ch.system_id = ?2
-             )
-             SELECT DISTINCT start_code FROM anc WHERE current_code = ?1",
+            "SELECT j.value
+             FROM   json_each(?3) j
+             JOIN   concept_closure cc
+                    ON cc.system_id = ?2 AND cc.ancestor_code = ?1 AND cc.descendant_code = j.value
+             WHERE  (j.value != ?1 OR ?4)",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    let mut codes = stmt
+    let include_self_i = i64::from(include_self);
+    let codes = stmt
         .query_map(
-            rusqlite::params![root_code, system_id, json_candidates],
+            rusqlite::params![root_code, system_id, json_candidates, include_self_i],
             |r| r.get(0),
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?
         .collect::<rusqlite::Result<HashSet<String>>>()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    // descendent-of (strict): root_code is not its own descendant
-    if !include_self {
-        codes.remove(root_code);
-    }
 
     Ok(codes)
 }
@@ -1491,19 +1473,14 @@ fn batch_ancestors_in_set(
     let json_candidates =
         serde_json::to_string(candidates).map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    // O(1) closure lookup: `generalizes value` ⟺ C is ancestor-or-self of value.
+    // The closure stores self-links so this naturally returns value_code itself.
     let mut stmt = conn
         .prepare_cached(
-            "WITH RECURSIVE anc(code) AS (
-                 SELECT ?1
-                 UNION
-                 SELECT ch.parent_code
-                 FROM   concept_hierarchy ch
-                 JOIN   anc ON ch.child_code = anc.code
-                 WHERE  ch.system_id = ?2
-             )
-             SELECT a.code
-             FROM   anc a
-             JOIN   json_each(?3) j ON j.value = a.code",
+            "SELECT j.value
+             FROM   json_each(?3) j
+             JOIN   concept_closure cc
+                    ON cc.system_id = ?2 AND cc.descendant_code = ?1 AND cc.ancestor_code = j.value",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -1532,17 +1509,10 @@ fn query_ancestors_full(
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let mut stmt = conn
         .prepare_cached(
-            "WITH RECURSIVE anc(code) AS (
-                 SELECT ?1
-                 UNION
-                 SELECT ch.parent_code
-                 FROM   concept_hierarchy ch
-                 JOIN   anc ON ch.child_code = anc.code
-                 WHERE  ch.system_id = ?2
-             )
-             SELECT a.code, c.display
-             FROM   anc a
-             JOIN   concepts c ON c.system_id = ?2 AND c.code = a.code",
+            "SELECT cc.ancestor_code, c.display
+             FROM   concept_closure cc
+             JOIN   concepts c ON c.system_id = ?2 AND c.code = cc.ancestor_code
+             WHERE  cc.system_id = ?2 AND cc.descendant_code = ?1",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -2287,18 +2257,16 @@ fn bfs_expand_page(
     }
 }
 
-/// BFS traversal of an `IsA` or `DescendentOf` hierarchy, returning one page.
+/// Return one page of `IsA` or `DescendentOf` hierarchy descendants.
 ///
-/// Processes nodes in batches of [`BFS_BATCH`] using `json_each()` so that
-/// each batch costs **two** SQL queries (one for displays, one for children)
-/// instead of two per node.  For pool entries with `offset=500, count=1000`
-/// the old per-node approach required ~3 000 queries; the batched approach
-/// needs ~6.  This reduces cold-cache latency from 30 s to <500 ms on slow
-/// Windows I/O.
+/// Replaces the previous in-memory BFS with a single SQL query against the
+/// precomputed `concept_closure` table, which makes every call O(1) with
+/// respect to total descendants — the planner uses the covering index on
+/// `(system_id, ancestor_code, descendant_code)` and returns exactly
+/// `limit` rows after `offset` without touching the rest of the tree.
 ///
-/// `include_root=true` adds `root_code` itself to the result set (is-a /
-/// `<<` semantics); `false` starts BFS from root's children (descendent-of /
-/// `<` semantics).
+/// `include_root=true` — is-a / `<<` semantics (self + descendants).
+/// `include_root=false` — descendent-of / `<` semantics (descendants only).
 #[allow(clippy::too_many_arguments)]
 fn bfs_isa_page(
     conn: &Connection,
@@ -2310,140 +2278,108 @@ fn bfs_isa_page(
     limit: usize,
     filter_lower: Option<&str>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
-    const BFS_BATCH: usize = 500;
+    let sql_limit = limit as i64;
+    let sql_offset = offset as i64;
+    // 1 = include root (is-a), 0 = exclude (descendent-of)
+    let include_root_i = i64::from(include_root);
 
-    let mut queue: VecDeque<String> = VecDeque::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(root_code.to_owned());
-
-    if include_root {
-        queue.push_back(root_code.to_owned());
-    } else {
-        // descendent-of: seed with root's direct children (single batch query)
-        for child in batch_hierarchy_children(conn, system_id, &[root_code.to_owned()])? {
-            if visited.insert(child.clone()) {
-                queue.push_back(child);
-            }
-        }
-    }
-
-    let mut visible: usize = 0;
-    let mut page: Vec<ExpansionContains> = Vec::new();
-
-    while !queue.is_empty() && page.len() < limit {
-        // Drain up to BFS_BATCH nodes from the front of the queue.
-        let drain_len = queue.len().min(BFS_BATCH);
-        let batch: Vec<String> = queue.drain(..drain_len).collect();
-
-        // Batch-fetch displays for all nodes in this batch (1 query).
-        let display_map = batch_concept_displays(conn, system_id, &batch)?;
-
-        let mut full = false;
-        for code in &batch {
-            let display = display_map.get(code).and_then(|d| d.clone());
-            let passes = match filter_lower {
-                Some(f) => {
-                    code.to_lowercase().contains(f)
-                        || display
-                            .as_deref()
-                            .map(|d| d.to_lowercase().contains(f))
-                            .unwrap_or(false)
-                }
-                None => true,
-            };
-            if passes {
-                if visible >= offset {
-                    page.push(ExpansionContains {
-                        system: cs_url.to_owned(),
-                        code: code.clone(),
-                        display,
-                        inactive: None,
-                        contains: vec![],
-                    });
-                    if page.len() >= limit {
-                        full = true;
-                        break;
-                    }
-                }
-                visible += 1;
-            }
-        }
-
-        if full {
-            break;
-        }
-
-        // Batch-fetch children of all nodes in this batch (1 query).
-        for child in batch_hierarchy_children(conn, system_id, &batch)? {
-            if visited.insert(child.clone()) {
-                queue.push_back(child);
-            }
-        }
-    }
-
-    Ok(page)
-}
-
-/// Batch-fetch displays for a slice of concept codes using `json_each()`.
-///
-/// Returns a map of `code → Option<display>`.  Codes not found in the
-/// `concepts` table are absent from the map (callers treat missing as `None`).
-/// Uses a single SQL statement regardless of batch size, so `prepare_cached`
-/// can be used even when the batch size varies.
-fn batch_concept_displays(
-    conn: &Connection,
-    system_id: &str,
-    codes: &[String],
-) -> Result<HashMap<String, Option<String>>, HtsError> {
-    if codes.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let codes_json = serde_json::to_string(codes)
-        .map_err(|e| HtsError::Internal(format!("json encode: {e}")))?;
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT c.code, c.display \
-             FROM json_each(?1) e \
-             JOIN concepts c ON c.system_id = ?2 AND c.code = e.value",
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-    let rows = stmt
-        .query_map(rusqlite::params![codes_json, system_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    let row_mapper = |r: &rusqlite::Row<'_>| {
+        Ok(ExpansionContains {
+            system: cs_url.to_owned(),
+            code: r.get(0)?,
+            display: r.get(1)?,
+            inactive: None,
+            contains: vec![],
         })
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-    Ok(rows.into_iter().collect())
-}
+    };
 
-/// Batch-fetch children of a slice of parent codes using `json_each()`.
-///
-/// Returns a flat list of child codes, ordered by `(parent_code, child_code)`
-/// so the BFS ordering matches the old single-node approach.
-fn batch_hierarchy_children(
-    conn: &Connection,
-    system_id: &str,
-    parent_codes: &[String],
-) -> Result<Vec<String>, HtsError> {
-    if parent_codes.is_empty() {
-        return Ok(vec![]);
+    if let Some(f) = filter_lower {
+        if f.len() >= 3 {
+            ensure_concepts_fts(conn, system_id)?;
+            let match_expr = fts5_quote(f);
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT cf.code, cf.display
+                     FROM   concepts_fts cf
+                     JOIN   concept_closure cc
+                            ON cc.system_id = ?5 AND cc.ancestor_code = ?4
+                            AND cc.descendant_code = cf.code
+                     WHERE  cf.system_id = ?5
+                       AND  concepts_fts MATCH ?1
+                       AND  (cf.code != ?4 OR ?6)
+                     ORDER BY cf.code
+                     LIMIT ?2 OFFSET ?3",
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            return stmt
+                .query_map(
+                    rusqlite::params![
+                        match_expr,
+                        sql_limit,
+                        sql_offset,
+                        root_code,
+                        system_id,
+                        include_root_i
+                    ],
+                    row_mapper,
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()));
+        }
+        // Short filter (< 3 chars): LIKE scan on the closure join.
+        let sql_pat = format!("%{f}%");
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code, c.display
+                 FROM   concept_closure cc
+                 JOIN   concepts c ON c.system_id = ?5 AND c.code = cc.descendant_code
+                 WHERE  cc.system_id = ?5
+                   AND  cc.ancestor_code = ?4
+                   AND  (cc.descendant_code != ?4 OR ?6)
+                   AND  (LOWER(c.code) LIKE ?1 OR LOWER(COALESCE(c.display,'')) LIKE ?1)
+                 ORDER BY c.code
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        return stmt
+            .query_map(
+                rusqlite::params![
+                    sql_pat,
+                    sql_limit,
+                    sql_offset,
+                    root_code,
+                    system_id,
+                    include_root_i
+                ],
+                row_mapper,
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()));
     }
-    let codes_json = serde_json::to_string(parent_codes)
-        .map_err(|e| HtsError::Internal(format!("json encode: {e}")))?;
+
+    // No filter: pure closure lookup.
     let mut stmt = conn
         .prepare_cached(
-            "SELECT ch.child_code \
-             FROM concept_hierarchy ch \
-             JOIN json_each(?1) e ON ch.parent_code = e.value \
-             WHERE ch.system_id = ?2 \
-             ORDER BY ch.parent_code, ch.child_code",
+            "SELECT c.code, c.display
+             FROM   concept_closure cc
+             JOIN   concepts c ON c.system_id = ?4 AND c.code = cc.descendant_code
+             WHERE  cc.system_id = ?4
+               AND  cc.ancestor_code = ?1
+               AND  (cc.descendant_code != ?1 OR ?5)
+             ORDER BY c.code
+             LIMIT ?2 OFFSET ?3",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
-    stmt.query_map(rusqlite::params![codes_json, system_id], |row| row.get(0))
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-        .collect::<Result<Vec<String>, _>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))
+
+    stmt.query_map(
+        rusqlite::params![root_code, sql_limit, sql_offset, system_id, include_root_i],
+        row_mapper,
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
 /// Find the canonical URL of a CodeSystem whose `valueSet` property equals `vs_url`.
@@ -2770,20 +2706,14 @@ fn validate_fhir_vs(
             }))
         }
         FhirVsPattern::IsA(root_code) => {
-            // Walk UP from `code` through concept_hierarchy to find whether
-            // root_code is an ancestor-or-self. O(depth), not O(tree size).
+            // O(1) closure lookup: is root_code an ancestor-or-self of code?
             let is_member: bool = conn
                 .query_row(
-                    "WITH RECURSIVE ancestors(code) AS (
-                         SELECT ?1
-                         UNION ALL
-                         SELECT ch.parent_code
-                         FROM concept_hierarchy ch
-                         JOIN ancestors a ON ch.child_code = a.code
-                         WHERE ch.system_id = ?2
-                     )
-                     SELECT EXISTS(SELECT 1 FROM ancestors WHERE code = ?3)",
-                    rusqlite::params![code, system_id, root_code],
+                    "SELECT EXISTS(
+                         SELECT 1 FROM concept_closure
+                         WHERE system_id = ?1 AND ancestor_code = ?3 AND descendant_code = ?2
+                     )",
+                    rusqlite::params![system_id, code, root_code],
                     |r| r.get(0),
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -2891,22 +2821,14 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
             rusqlite::params![url, cs_url, system_id],
         ),
         FhirVsPattern::IsA(root_code) => {
-            // Recursive CTE expands the descendant subtree directly in SQL.
-            // The seed row is the root itself (<< semantics: self + descendants).
+            // O(1) closure JOIN replaces the recursive CTE.
+            // << semantics: all descendants plus the root itself (self-link in closure).
             conn.execute(
                 "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
-                 WITH RECURSIVE desc_cte(code) AS (
-                     SELECT ?4
-                     UNION ALL
-                     SELECT h.child_code
-                     FROM   concept_hierarchy h
-                     JOIN   desc_cte d ON h.parent_code = d.code
-                     WHERE  h.system_id = ?3
-                 )
                  SELECT ?1, ?2, c.code, c.display
-                 FROM   concepts c
-                 JOIN   desc_cte d ON c.code = d.code
-                 WHERE  c.system_id = ?3",
+                 FROM   concept_closure cc
+                 JOIN   concepts c ON c.system_id = ?3 AND c.code = cc.descendant_code
+                 WHERE  cc.system_id = ?3 AND cc.ancestor_code = ?4",
                 rusqlite::params![url, cs_url, system_id, root_code],
             )
         }

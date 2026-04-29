@@ -162,6 +162,21 @@ USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
 CREATE VIRTUAL TABLE IF NOT EXISTS concepts_fts
 USING fts5(system_id UNINDEXED, code, display,
            tokenize='trigram case_sensitive 0');
+
+-- ── Transitive ancestor closure ───────────────────────────────────────────────
+-- Precomputed (ancestor, descendant) pairs for every code system, including
+-- self-links (code, code).  Populated at import time for each code system so
+-- that is-a, descendent-of, generalizes, and $subsumes queries are O(1) index
+-- lookups rather than O(depth) recursive CTEs at request time.
+CREATE TABLE IF NOT EXISTS concept_closure (
+    system_id       TEXT NOT NULL,
+    ancestor_code   TEXT NOT NULL,
+    descendant_code TEXT NOT NULL,
+    PRIMARY KEY (system_id, ancestor_code, descendant_code)
+);
+-- Reverse lookup: all ancestors of a given descendant code.
+CREATE INDEX IF NOT EXISTS idx_closure_descendant
+    ON concept_closure(system_id, descendant_code);
 ";
 
 /// Apply the HTS schema to the given database connection.
@@ -169,6 +184,78 @@ USING fts5(system_id UNINDEXED, code, display,
 /// Safe to call on every startup — all statements are idempotent.
 pub fn apply(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA)
+}
+
+/// Build (or rebuild) the transitive ancestor closure for one code system.
+///
+/// Deletes any existing closure rows for `system_id`, then recomputes the
+/// full set of `(ancestor, descendant)` pairs — including self-links
+/// `(code, code)` — in a single recursive SQL pass.  The UNION (not UNION
+/// ALL) prevents path explosion in SNOMED polyhierarchies.
+///
+/// Runs inside whatever transaction the caller has open; call after all
+/// `concept_hierarchy` rows for the system have been inserted.
+pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM concept_closure WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO concept_closure (system_id, ancestor_code, descendant_code)
+         WITH RECURSIVE closure(anc, desc) AS (
+             SELECT code, code FROM concepts WHERE system_id = ?1
+             UNION
+             SELECT c.anc, h.child_code
+             FROM   closure c
+             JOIN   concept_hierarchy h
+                    ON h.parent_code = c.desc AND h.system_id = ?1
+         )
+         SELECT ?1, anc, desc FROM closure",
+        rusqlite::params![system_id],
+    )?;
+
+    Ok(())
+}
+
+/// Populate `concept_closure` for all code systems that currently have
+/// hierarchy edges but no closure rows.
+///
+/// Called once at startup so that existing databases (imported before the
+/// closure table was introduced) are migrated automatically.
+pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_hierarchy: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM concept_hierarchy LIMIT 1)",
+        [],
+        |r| r.get(0),
+    )?;
+
+    if !has_hierarchy {
+        return Ok(());
+    }
+
+    let closure_populated: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM concept_closure LIMIT 1)",
+        [],
+        |r| r.get(0),
+    )?;
+
+    if closure_populated {
+        return Ok(());
+    }
+
+    // No closure yet — build for every code system with hierarchy data.
+    let system_ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT system_id FROM concept_hierarchy")?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+
+    for sid in &system_ids {
+        build_concept_closure(conn, sid)?;
+    }
+
+    Ok(())
 }
 
 /// Add search-related columns to the existing tables.
@@ -243,6 +330,7 @@ mod tests {
             "code_systems",
             "concepts",
             "concept_hierarchy",
+            "concept_closure",
             "concept_properties",
             "concept_designations",
             "value_sets",

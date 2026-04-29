@@ -332,9 +332,9 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
 /// Return `true` if `ancestor_code` is a (possibly indirect) ancestor of
 /// `descendant_code` within the given code system.
 ///
-/// Uses a recursive CTE to walk up the parent chain from `descendant_code`.
-/// This handles both pre-computed transitive-closure tables (one lookup) and
-/// tables that store only direct parent→child edges (multi-hop traversal).
+/// O(1) PRIMARY KEY lookup against the precomputed `concept_closure` table.
+/// Self-links are stored in the closure, so `ancestor_code == descendant_code`
+/// returns `true`.
 fn check_ancestor(
     conn: &rusqlite::Connection,
     system_id: &str,
@@ -345,17 +345,9 @@ fn check_ancestor(
 
     let found: Option<i64> = conn
         .query_row(
-            "WITH RECURSIVE ancestors(code) AS (
-                 SELECT parent_code
-                 FROM   concept_hierarchy
-                 WHERE  system_id = ?1 AND child_code = ?3
-                 UNION
-                 SELECT h.parent_code
-                 FROM   concept_hierarchy h
-                 INNER JOIN ancestors a ON a.code = h.child_code
-                 WHERE  h.system_id = ?1
-             )
-             SELECT 1 FROM ancestors WHERE code = ?2 LIMIT 1",
+            "SELECT 1 FROM concept_closure
+             WHERE system_id = ?1 AND ancestor_code = ?2 AND descendant_code = ?3
+             LIMIT 1",
             rusqlite::params![system_id, ancestor_code, descendant_code],
             |row| row.get(0),
         )
@@ -844,6 +836,7 @@ mod tests {
                     ('cs2', 'B', 'C');",
         )
         .unwrap();
+        crate::backends::sqlite::schema::build_concept_closure(&conn, "cs2").unwrap();
     }
 
     fn req(code_a: &str, code_b: &str) -> SubsumesRequest {

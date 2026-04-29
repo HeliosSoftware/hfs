@@ -94,6 +94,9 @@ impl SqliteTerminologyBackend {
             schema::migrate_search_columns(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply search column migration: {e}"))
             })?;
+            schema::migrate_concept_closure(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
+            })?;
 
             // Clear the implicit expansion cache (and its FTS mirror) on every
             // startup. Any partial writes from a previous interrupted session
@@ -106,10 +109,10 @@ impl SqliteTerminologyBackend {
                  DELETE FROM concepts_fts;",
             );
 
-            // Update query-planner statistics so recursive CTEs over large
-            // tables (e.g. concept_hierarchy with SNOMED's 500k+ edges) pick
-            // the right index.
-            let _ = conn.execute_batch("ANALYZE concept_hierarchy; ANALYZE concepts;");
+            // Update query-planner statistics for large tables.
+            let _ = conn.execute_batch(
+                "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure;",
+            );
 
             // Pre-populate the concepts_fts trigram index for every code system
             // so that text-filtered $expand requests always use the fast FTS path.
