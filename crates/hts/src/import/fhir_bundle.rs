@@ -277,6 +277,18 @@ fn write_code_system(
     schema::build_concept_closure(conn, &system_id)
         .map_err(|e| HtsError::StorageError(format!("Closure build failed: {e}")))?;
 
+    // Invalidate any cached implicit-ValueSet expansions for this code system.
+    // The implicit_expansion_cache is otherwise persistent across restarts; stale
+    // entries from a previous version of this system must be evicted on re-import.
+    let _ = conn.execute(
+        "DELETE FROM implicit_expansion_cache WHERE system_url = ?1",
+        rusqlite::params![cs.url],
+    );
+    let _ = conn.execute(
+        "DELETE FROM implicit_expansion_fts WHERE system_url = ?1",
+        rusqlite::params![cs.url],
+    );
+
     stats.code_systems += 1;
     Ok(())
 }

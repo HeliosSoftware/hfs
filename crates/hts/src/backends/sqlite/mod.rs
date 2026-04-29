@@ -98,15 +98,18 @@ impl SqliteTerminologyBackend {
                 HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
             })?;
 
-            // Clear the implicit expansion cache (and its FTS mirror) on every
-            // startup. Any partial writes from a previous interrupted session
-            // would leave the cache in an incomplete state; clearing it ensures
-            // the first request after startup recomputes atomically via the
-            // transaction in populate_implicit_cache.
+            // Clear the concept FTS index on every startup — it is always rebuilt
+            // synchronously by prebuild_concepts_fts below, so stale rows from a
+            // previous run must be removed first.
+            // The implicit_expansion_cache is intentionally kept across restarts:
+            // populate_implicit_cache runs inside a BEGIN EXCLUSIVE transaction, so
+            // SQLite rolls back any partial write on crash — the entries are always
+            // fully committed or fully absent.  Persisting the cache means repeated
+            // server restarts (e.g. benchmark reruns) start warm rather than cold.
+            // Cache entries are invalidated per-code-system when new data is imported
+            // (see fhir_bundle::write_code_system).
             let _ = conn.execute_batch(
-                "DELETE FROM implicit_expansion_cache;
-                 DELETE FROM implicit_expansion_fts;
-                 DELETE FROM concepts_fts;
+                "DELETE FROM concepts_fts;
                  DELETE FROM concepts_fts_built;",
             );
 
