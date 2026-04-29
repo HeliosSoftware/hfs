@@ -57,6 +57,10 @@ where
 
     match state.backend.import_bundle(&ctx, &body).await {
         Ok(stats) => {
+            // Invalidate cached expansions — newly imported terminology may
+            // change which codes belong to a ValueSet.
+            state.clear_expand_cache();
+
             // Return 207 Multi-Status when non-fatal errors were encountered so
             // callers can distinguish a clean import from a partial one.
             let status = if stats.has_errors() {

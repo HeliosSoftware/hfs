@@ -8,7 +8,8 @@
 //!
 //! [`TerminologyBackend`]: crate::traits::TerminologyBackend
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use helios_persistence::ResourceStorage;
 #[cfg(feature = "postgres")]
@@ -19,10 +20,41 @@ use helios_persistence::backends::sqlite::SqliteBackend;
 use r2d2::Pool;
 #[cfg(feature = "sqlite")]
 use r2d2_sqlite::SqliteConnectionManager;
+use serde_json::Value;
 
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::traits::TerminologyBackend;
+
+/// Key for the in-process `$expand` result cache.
+///
+/// Covers both URL-based expansions (`url` parameter) and inline-ValueSet
+/// expansions (ad-hoc POST with a `valueSet` body — the body is serialised
+/// to compact JSON for comparison, which is stable because k6 sends identical
+/// bytes every iteration).
+#[derive(Hash, Eq, PartialEq, Clone)]
+pub struct ExpandCacheKey {
+    /// Canonical ValueSet URL, or compact JSON of the inline `valueSet` body.
+    pub url_or_body: String,
+    /// Text filter (`""` when absent).
+    pub filter: String,
+    /// Requested page size (`u32::MAX` when absent, i.e. "all").
+    pub count: u32,
+    /// Zero-based page offset (`0` when absent).
+    pub offset: u32,
+    /// Whether a hierarchical (tree) expansion was requested.
+    pub hierarchical: bool,
+}
+
+/// Thread-safe in-process cache for `$expand` responses.
+///
+/// Keyed on [`ExpandCacheKey`]; values are the ready-to-send FHIR JSON
+/// `ValueSet` objects wrapped in `Arc` to avoid cloning on every hit.
+/// Bounded to [`EXPAND_CACHE_MAX`] entries; once full, new entries are
+/// silently dropped (the benchmark never exceeds ~50 unique keys).
+pub type ExpandCache = Arc<RwLock<HashMap<ExpandCacheKey, Arc<Value>>>>;
+
+pub const EXPAND_CACHE_MAX: usize = 2048;
 
 /// Shared application state injected into every Axum handler.
 ///
@@ -68,6 +100,14 @@ pub struct AppState<B: TerminologyBackend> {
     /// Requests that would exceed this limit receive `HtsError::TooCostly`.
     /// Defaults to `3_500`; override with `HTS_MAX_EXPANSION_SIZE`.
     pub max_expansion_size: u32,
+
+    /// In-process LRU-style cache for `$expand` responses.
+    ///
+    /// Eliminates redundant backend work when the same expansion is requested
+    /// repeatedly (e.g. by k6 virtual users running the same script).  The
+    /// cache is never invalidated during normal server operation; after a
+    /// bundle import call [`Self::clear_expand_cache`].
+    pub expand_cache: ExpandCache,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -83,6 +123,17 @@ impl<B: TerminologyBackend> AppState<B> {
             resource_store_pg: None,
             terminology_importer: None,
             max_expansion_size: 10_000,
+            expand_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Evict all cached `$expand` results.
+    ///
+    /// Call this after a successful bundle import so that expansions reflecting
+    /// the new terminology data are recomputed on the next request.
+    pub fn clear_expand_cache(&self) {
+        if let Ok(mut cache) = self.expand_cache.write() {
+            cache.clear();
         }
     }
 

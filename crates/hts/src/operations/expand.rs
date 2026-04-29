@@ -30,6 +30,8 @@
 //!
 //! <https://hl7.org/fhir/valueset-operation-expand.html>
 
+use std::sync::Arc;
+
 use axum::{
     Json,
     extract::{Path, RawQuery, State},
@@ -40,7 +42,7 @@ use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
 use crate::error::HtsError;
-use crate::state::AppState;
+use crate::state::{AppState, EXPAND_CACHE_MAX, ExpandCacheKey};
 use crate::traits::{TerminologyBackend, ValueSetOperations};
 use crate::types::{ExpandRequest, ExpansionContains};
 
@@ -119,6 +121,30 @@ async fn process_expand<B: TerminologyBackend>(
 
     let hierarchical = find_str_param(&params, "hierarchical").map(|s| s == "true");
 
+    // ── Cache lookup ─────────────────────────────────────────────────────────
+    // Build a stable key from the request parameters. For inline ValueSets
+    // (ad-hoc POST) we serialise the body to compact JSON; k6 sends identical
+    // bytes each iteration so the string is a reliable cache discriminator.
+    let cache_key = ExpandCacheKey {
+        url_or_body: url.clone().unwrap_or_else(|| {
+            value_set
+                .as_ref()
+                .and_then(|vs| serde_json::to_string(vs).ok())
+                .unwrap_or_default()
+        }),
+        filter: filter.clone().unwrap_or_default(),
+        count: count.unwrap_or(u32::MAX),
+        offset: offset.unwrap_or(0),
+        hierarchical: hierarchical.unwrap_or(false),
+    };
+
+    if let Ok(cache) = state.expand_cache.read() {
+        if let Some(cached) = cache.get(&cache_key) {
+            return Ok((**cached).clone());
+        }
+    }
+
+    // ── Cache miss: compute ───────────────────────────────────────────────────
     let req = ExpandRequest {
         url,
         value_set,
@@ -157,10 +183,19 @@ async fn process_expand<B: TerminologyBackend>(
         expansion["parameter"] = json!(params);
     }
 
-    Ok(json!({
+    let response = json!({
         "resourceType": "ValueSet",
         "expansion": expansion,
-    }))
+    });
+
+    // ── Store in cache ────────────────────────────────────────────────────────
+    if let Ok(mut cache) = state.expand_cache.write() {
+        if cache.len() < EXPAND_CACHE_MAX {
+            cache.insert(cache_key, Arc::new(response.clone()));
+        }
+    }
+
+    Ok(response)
 }
 
 /// `POST /ValueSet/$expand`
