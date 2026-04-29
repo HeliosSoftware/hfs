@@ -269,6 +269,10 @@ pub struct ResourceSearchQuery {
     /// Zero-based offset for pagination (default: 0).
     #[serde(rename = "_offset")]
     pub offset: Option<u32>,
+    /// When `"true"`, return a summary representation without large data arrays.
+    /// Avoids reading the `resource_json` blob; returns a synthetic summary instead.
+    #[serde(rename = "_summary")]
+    pub summary: Option<String>,
 }
 
 // ─── $closure ─────────────────────────────────────────────────────────────────

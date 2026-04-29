@@ -20,14 +20,16 @@
 pub const SCHEMA: &str = "
 -- ── Code Systems ──────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS code_systems (
-    id          TEXT PRIMARY KEY,
-    url         TEXT NOT NULL UNIQUE,
-    version     TEXT,
-    name        TEXT,
-    status      TEXT NOT NULL DEFAULT 'active',
-    content     TEXT NOT NULL DEFAULT 'complete',
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    id            TEXT PRIMARY KEY,
+    url           TEXT NOT NULL UNIQUE,
+    version       TEXT,
+    name          TEXT,
+    title         TEXT,
+    status        TEXT NOT NULL DEFAULT 'active',
+    content       TEXT NOT NULL DEFAULT 'complete',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    resource_json TEXT
 );
 
 -- ── Concepts ───────────────────────────────────────────────────────────────────
@@ -76,20 +78,30 @@ CREATE TABLE IF NOT EXISTS concept_designations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_code_systems_created_at ON code_systems(created_at);
+-- Covering index for metadata-only list queries (summary=true / _count without resource_json).
+-- Allows ORDER BY created_at LIMIT N to be served entirely from the index,
+-- with no main B-tree access for the large resource_json column.
+CREATE INDEX IF NOT EXISTS idx_code_systems_meta
+    ON code_systems(created_at, id, url, version, name, title, status);
 
 -- ── Value Sets ─────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS value_sets (
-    id          TEXT PRIMARY KEY,
-    url         TEXT NOT NULL UNIQUE,
-    version     TEXT,
-    name        TEXT,
-    status      TEXT NOT NULL DEFAULT 'active',
-    compose_json TEXT,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    id            TEXT PRIMARY KEY,
+    url           TEXT NOT NULL UNIQUE,
+    version       TEXT,
+    name          TEXT,
+    title         TEXT,
+    status        TEXT NOT NULL DEFAULT 'active',
+    compose_json  TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    resource_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_value_sets_created_at ON value_sets(created_at);
+-- Covering index for metadata-only list queries (analogous to idx_code_systems_meta).
+CREATE INDEX IF NOT EXISTS idx_value_sets_meta
+    ON value_sets(created_at, id, url, version, name, title, status);
 
 -- ── Value Set Expansions (materialized cache) ─────────────────────────────────
 CREATE TABLE IF NOT EXISTS value_set_expansions (
@@ -305,7 +317,11 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
          CREATE INDEX IF NOT EXISTS idx_code_systems_created_at
              ON code_systems(created_at);
          CREATE INDEX IF NOT EXISTS idx_value_sets_created_at
-             ON value_sets(created_at);",
+             ON value_sets(created_at);
+         CREATE INDEX IF NOT EXISTS idx_code_systems_meta
+             ON code_systems(created_at, id, url, version, name, title, status);
+         CREATE INDEX IF NOT EXISTS idx_value_sets_meta
+             ON value_sets(created_at, id, url, version, name, title, status);",
     )?;
 
     Ok(())

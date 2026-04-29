@@ -562,6 +562,69 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             let limit = i64::from(query.count.unwrap_or(20));
             let offset = i64::from(query.offset.unwrap_or(0));
+            let want_summary = query.summary.as_deref() == Some("true");
+
+            // Summary path: avoid reading resource_json blob; the covering index
+            // idx_value_sets_meta serves this query without touching the main table.
+            if want_summary
+                || query.url.is_none()
+                    && query.version.is_none()
+                    && query.name.is_none()
+                    && query.title.is_none()
+                    && query.status.is_none()
+            {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT id, url, version, name, title, status
+                         FROM value_sets
+                         WHERE (?1 IS NULL OR url = ?1)
+                           AND (?2 IS NULL OR version = ?2)
+                           AND (?3 IS NULL OR name = ?3)
+                           AND (?4 IS NULL OR title = ?4)
+                           AND (?5 IS NULL OR status = ?5)
+                         ORDER BY created_at
+                         LIMIT ?6 OFFSET ?7",
+                    )
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![
+                            query.url,
+                            query.version,
+                            query.name,
+                            query.title,
+                            query.status,
+                            limit,
+                            offset
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, String>(5)?,
+                            ))
+                        },
+                    )
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let mut results = Vec::new();
+                for row in rows {
+                    let (id, url, version, name, title, status) =
+                        row.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    results.push(super::code_system::build_synthetic_resource(
+                        "ValueSet",
+                        &id,
+                        &url,
+                        version.as_deref(),
+                        name.as_deref(),
+                        title.as_deref(),
+                        &status,
+                    ));
+                }
+                return Ok(results);
+            }
 
             let mut stmt = conn
                 .prepare_cached(

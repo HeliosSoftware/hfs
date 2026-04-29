@@ -112,7 +112,8 @@ impl SqliteTerminologyBackend {
 
             // Update query-planner statistics for large tables.
             let _ = conn.execute_batch(
-                "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure;",
+                "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+                 ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
             );
 
             // Pre-populate the concepts_fts trigram index for every code system
