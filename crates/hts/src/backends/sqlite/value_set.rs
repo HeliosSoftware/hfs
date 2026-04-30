@@ -942,7 +942,24 @@ fn expand_inline_filtered(
                     || (prop == "concept" && matches!(op, "is-a" | "descendent-of" | "generalizes"))
             });
 
-        if filter_lower.len() >= 3 && all_batchable {
+        // FTS-first is only beneficial when there is NO property= filter.
+        // When a property= filter is present, `apply_compose_filters` →
+        // `query_subtree_with_property` starts from the (property, value) index
+        // (O(K_property) rows) and is not affected by FTS scan width.
+        // FTS-first with a property= filter is problematic: the FTS scans
+        // `concepts_fts` in rowid order and must traverse all non-SNOMED rows
+        // (HL7 packages, imported first) before reaching SNOMED matches.
+        // For common filter terms ("card", "other") this cold scan takes
+        // 10–18 s on EBS-backed storage, causing the 30 s timeout at high VU.
+        let has_eq_filter = compose_filters.iter().any(|f| {
+            f["op"].as_str().unwrap_or("") == "="
+                && f["property"].as_str().unwrap_or("") != "constraint"
+        });
+
+        if filter_lower.len() >= 3 && all_batchable && !has_eq_filter {
+            // Pure hierarchy + text (no property= filter): FTS-first is optimal
+            // because FTS narrows to text-matching candidates before the
+            // potentially large hierarchy traversal.
             ensure_concepts_fts(conn, &system_id)?;
             let candidates =
                 fts_candidates_for_system(conn, &system_id, system_url, &filter_lower)?;
