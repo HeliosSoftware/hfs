@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HTS CI Run 25183960983 — FHIR TX Benchmark</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ── Tokens ──────────────────────────────────────────────────────────────── */
+:root {
+  --bg:        #111217;
+  --surface:   #181b1f;
+  --surface-2: #1e2028;
+  --border:    rgba(204,204,220,.12);
+  --text:      #d9d9d9;
+  --text-muted:#666;
+  --text-dim:  #999;
+  --accent:    #5794f2;
+  --pass:      rgb(115,191,105);
+  --pass-bg:   rgb(77,172,73);
+  --pass-text: #f7f8fa;
+  --fail:      rgb(242,73,92);
+  --fail-bg:   rgb(239,25,32);
+  --fail-text: #f7f8fa;
+  --skip:      rgb(204,204,220);
+  --skip-bg:   rgb(176,174,199);
+  --skip-text: #202226;
+  --space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;
+  --space-5:24px;--space-6:32px;--space-7:48px;--space-8:64px;
+  --text-xs:12px;--text-sm:14px;--text-base:16px;--text-lg:18px;
+  --text-xl:20px;--text-2xl:24px;--text-3xl:30px;
+  --font-sans:Inter,system-ui,-apple-system,sans-serif;
+  --font-mono:'JetBrains Mono','Fira Code',ui-monospace,monospace;
+  --radius-sm:2px;--radius:4px;--radius-lg:8px;
+}
+
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font-sans);font-size:var(--text-base);line-height:1.6}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+.site-header{position:sticky;top:0;z-index:100;background:#111217e0;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
+.header-inner{max-width:1400px;margin:0 auto;padding:0 var(--space-6);height:52px;display:flex;align-items:center;justify-content:space-between;gap:var(--space-6)}
+.wordmark{display:flex;align-items:baseline;gap:6px;text-decoration:none;flex-shrink:0}
+.wordmark:hover{text-decoration:none}
+.wordmark-accent{font-size:var(--text-sm);font-weight:600;letter-spacing:.06em;color:#f28c3a}
+.wordmark-label{font-size:var(--text-sm);font-weight:500;color:var(--text-dim);letter-spacing:.01em}
+.site-nav{display:flex;align-items:center;gap:var(--space-1)}
+.nav-link{font-size:var(--text-sm);font-weight:500;color:var(--text-muted);padding:6px 10px;border-radius:var(--radius);transition:color .15s,background .15s;text-decoration:none;white-space:nowrap}
+.nav-link--icon{padding:6px 8px;display:flex;align-items:center}
+.nav-link:hover{color:var(--text);background:#ffffff0d;text-decoration:none}
+.nav-link--active{color:var(--text)}
+
+/* ── Widget chrome ───────────────────────────────────────────────────────── */
+.widget{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);box-shadow:0 4px 24px rgba(0,0,0,.45);overflow:visible;margin-bottom:var(--space-6)}
+.widget-header{padding:10px var(--space-4);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:var(--space-2)}
+.widget-title{font-size:var(--text-sm);font-weight:600;color:var(--text)}
+.widget-body{padding:var(--space-4)}
+.widget-badge{font-size:var(--text-xs);font-weight:500;color:var(--text-muted);background:var(--surface-2);border:1px solid var(--border);border-radius:3px;padding:1px 6px;font-family:var(--font-mono)}
+
+/* Info popover */
+.info-wrap{position:relative;display:flex;align-items:center}
+.info-icon{display:flex;align-items:center;color:var(--text-muted);cursor:help;transition:color .15s}
+.info-icon:hover{color:var(--text)}
+.info-popover{visibility:hidden;opacity:0;position:absolute;left:0;top:calc(100% + 6px);background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius);padding:var(--space-3) var(--space-4);font-size:var(--text-xs);color:var(--text-dim);line-height:1.6;width:300px;z-index:200;white-space:normal;box-shadow:0 4px 16px rgba(0,0,0,.4);transition:opacity .15s,visibility .15s;pointer-events:none}
+.info-wrap:hover .info-popover{visibility:visible;opacity:1}
+
+/* ── Run layout ──────────────────────────────────────────────────────────── */
+.run-main{max-width:1280px;margin:0 auto;padding:var(--space-7) var(--space-5) var(--space-8)}
+.run-header{margin-bottom:var(--space-6)}
+.back-link{font-size:var(--text-xs);color:var(--text-muted);text-decoration:none;display:inline-block;margin-bottom:var(--space-3);transition:color .15s}
+.back-link:hover{color:var(--text);text-decoration:none}
+.run-name{font-family:var(--font-mono);font-size:var(--text-3xl);font-weight:600;color:#fff;letter-spacing:-.01em;margin-bottom:var(--space-1)}
+.run-date{font-size:var(--text-sm);color:var(--text-muted)}
+.run-host{font-size:var(--text-xs);color:var(--text-muted);opacity:.6;margin-top:2px}
+
+/* ── Tab nav ─────────────────────────────────────────────────────────────── */
+.tab-nav{display:flex;align-items:center;gap:0;border-bottom:1px solid var(--border);margin-bottom:var(--space-7)}
+.tab{display:flex;align-items:center;height:40px;padding:0 14px;font-size:var(--text-sm);font-weight:500;color:var(--text-muted);text-decoration:none;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color .15s,border-color .15s;white-space:nowrap;cursor:pointer;background:none;border-top:none;border-left:none;border-right:none;font-family:var(--font-sans)}
+.tab:hover{color:var(--text);text-decoration:none}
+.tab.active{color:var(--text);border-bottom-color:var(--accent)}
+.run-content{padding-top:var(--space-4)}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+
+/* ── Composite score table ───────────────────────────────────────────────── */
+.wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:var(--text-base);white-space:nowrap}
+thead th{text-align:left;padding:10px 16px;font-size:var(--text-xs);font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);border-bottom:1px solid var(--border)}
+thead th.r{text-align:right}
+tbody tr{border-bottom:1px solid var(--border)}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:#ffffff08}
+td{padding:12px 16px;vertical-align:middle}
+td.r{text-align:right}
+.rank{color:var(--text-muted);font-size:var(--text-sm);width:48px}
+.col-server{width:140px}
+.col-num{width:80px}
+.col-score{width:100%}
+.col-tests{width:1px;white-space:nowrap}
+.server{font-weight:500;color:#e4e4e4}
+.server-link{color:inherit;text-decoration:underline dotted;text-decoration-color:#fff3;text-underline-offset:3px}
+.server-link:hover{color:var(--text)}
+.num{font-variant-numeric:tabular-nums;color:var(--text-dim)}
+.err-bad{color:#c07030}
+.err-warn{color:#8a7a30}
+.err-ok{color:var(--text-muted)}
+.score-cell{min-width:220px;width:100%}
+.bar-wrap{display:flex;align-items:center;gap:8px}
+.bar-track{flex:1;height:26px;border-radius:var(--radius-sm);min-width:140px;background:var(--surface-2)}
+.bar-fill{height:100%;border-radius:var(--radius-sm);background:linear-gradient(90deg,#f2495c,#fade2a,#73bf69);background-size:calc(100% * 100 / var(--s)) 100%;transform-origin:left center;animation:bar-grow .6s cubic-bezier(.4,0,.2,1) both}
+@keyframes bar-grow{0%{transform:scaleX(0)}}
+.bar-pct{font-variant-numeric:tabular-nums;font-weight:600;font-size:var(--text-base);min-width:40px;text-align:right;color:var(--text-dim)}
+.pips{display:flex;gap:2px;align-items:center}
+.pip{width:7px;height:7px;border-radius:1px;flex-shrink:0;transition:opacity .15s}
+.pip-pass{background:var(--pass);opacity:.45}
+.pip-fail{background:var(--fail);opacity:.5}
+.pip-skip{background:var(--skip);opacity:.2}
+tbody tr:hover .pip-pass,tbody tr:hover .pip-fail{opacity:1}
+tbody tr:hover .pip-skip{opacity:.35}
+
+/* ── Matrix table ────────────────────────────────────────────────────────── */
+.matrix-wrap{overflow-x:auto}
+.matrix{border-collapse:collapse;white-space:nowrap;font-size:var(--text-sm)}
+.col-header{min-width:var(--cell-width,72px);font-size:var(--text-xs);font-weight:500;color:var(--text-dim);text-align:center;padding:3px 5px 6px}
+.row-label{font-size:var(--text-sm);font-weight:400;color:var(--text);text-align:left;padding-right:var(--space-4);white-space:nowrap}
+.cell{text-align:center;padding:4px 8px;min-width:54px;border:1px solid transparent}
+.cell-pass{background:linear-gradient(120deg,var(--pass-bg),var(--pass));color:var(--pass-text);border-color:rgba(0,0,0,.3);font-size:var(--text-xs)}
+.cell-fail{background:linear-gradient(120deg,var(--fail-bg),var(--fail));color:var(--fail-text);border-color:rgba(0,0,0,.3);font-size:var(--text-xs)}
+.cell-skip{background:linear-gradient(120deg,var(--skip-bg),var(--skip));color:var(--skip-text);border-color:rgba(0,0,0,.3);font-size:var(--text-xs)}
+.cell-latency{font-variant-numeric:tabular-nums;font-family:var(--font-mono);font-size:var(--text-xs)}
+.cell-empty{color:var(--text-muted);font-size:var(--text-xs)}
+
+/* ── Breakdown per-test ──────────────────────────────────────────────────── */
+.breakdown-grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--space-4);margin-bottom:var(--space-6)}
+@media(max-width:900px){.breakdown-grid{grid-template-columns:1fr}}
+.test-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:var(--space-4)}
+.test-card-header{display:flex;align-items:baseline;gap:var(--space-2);margin-bottom:var(--space-3)}
+.test-code{font-family:var(--font-mono);font-size:var(--text-sm);font-weight:600;color:var(--text)}
+.test-desc{font-size:var(--text-xs);color:var(--text-muted)}
+.vu-row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border)}
+.vu-row:last-child{border-bottom:none}
+.vu-label{font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted);width:50px}
+.vu-rps{font-family:var(--font-mono);font-size:var(--text-xs);font-weight:600;color:var(--text);font-variant-numeric:tabular-nums}
+.vu-lat{display:flex;gap:var(--space-3);font-family:var(--font-mono);font-size:var(--text-xs);font-variant-numeric:tabular-nums}
+.lat-p50{color:var(--pass)}
+.lat-p95{color:var(--text-dim)}
+.lat-p99{color:var(--text-muted)}
+.vu-bar-track{flex:1;height:6px;background:var(--surface-2);border-radius:3px;margin:0 var(--space-2);overflow:hidden}
+.vu-bar-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,#f2495c,#fade2a,#73bf69);transform-origin:left;animation:bar-grow .5s cubic-bezier(.4,0,.2,1) both}
+
+/* ── Servers tab ─────────────────────────────────────────────────────────── */
+.server-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:var(--space-5);margin-bottom:var(--space-4)}
+.server-card-name{font-size:var(--text-xl);font-weight:600;margin-bottom:var(--space-2);display:flex;align-items:center;gap:var(--space-2)}
+.server-card-version{font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted);background:var(--surface-2);border:1px solid var(--border);border-radius:3px;padding:2px 8px}
+.kv-grid{display:grid;grid-template-columns:140px 1fr;gap:4px var(--space-4);font-size:var(--text-sm)}
+.kv-key{color:var(--text-muted)}
+.kv-val{color:var(--text);font-family:var(--font-mono);font-size:var(--text-xs)}
+
+/* ── HTS highlight row ───────────────────────────────────────────────────── */
+tr.hts-row{background:rgba(87,148,242,.05)}
+tr.hts-row:hover{background:rgba(87,148,242,.09) !important}
+tr.hts-row td:first-child::before{content:'▶ ';color:var(--accent);font-size:10px}
+.hts-tag{font-size:10px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--accent);background:rgba(87,148,242,.15);border:1px solid rgba(87,148,242,.3);border-radius:3px;padding:1px 5px;margin-left:6px;vertical-align:middle}
+.footnote{font-size:var(--text-xs);color:var(--text-muted);margin-top:var(--space-3);padding:0 var(--space-4) var(--space-3)}
+.round0-badge{font-size:10px;color:var(--text-muted);font-family:var(--font-mono);background:var(--surface-2);border:1px solid var(--border);border-radius:3px;padding:1px 5px;margin-left:6px;vertical-align:middle}
+
+/* ── Tests tab ───────────────────────────────────────────────────────────── */
+.tests-table{width:100%;border-collapse:collapse;font-size:var(--text-sm)}
+.tests-table th{text-align:left;padding:8px 16px;font-size:var(--text-xs);font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);border-bottom:1px solid var(--border)}
+.tests-table td{padding:10px 16px;border-bottom:1px solid var(--border);vertical-align:top}
+.tests-table tr:last-child td{border-bottom:none}
+.tests-table tr:hover td{background:#ffffff05}
+.test-id{font-family:var(--font-mono);font-weight:600;font-size:var(--text-xs)}
+.status-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:500;padding:2px 8px;border-radius:10px}
+.badge-pass{background:rgba(115,191,105,.15);color:var(--pass);border:1px solid rgba(115,191,105,.3)}
+.badge-fail{background:rgba(242,73,92,.15);color:var(--fail);border:1px solid rgba(242,73,92,.3)}
+.badge-skip{background:rgba(204,204,220,.08);color:var(--text-dim);border:1px solid rgba(204,204,220,.15)}
+
+/* ── Note ────────────────────────────────────────────────────────────────── */
+.note{font-size:var(--text-sm);color:var(--text-dim);background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--text-muted);border-radius:var(--radius);padding:var(--space-3) var(--space-4);margin-bottom:var(--space-5)}
+.note code{font-family:var(--font-mono);font-size:.875em;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:1px 5px;color:#c9d1d9}
+</style>
+</head>
+<body>
+
+<!-- ── Header ─────────────────────────────────────────────────────────────── -->
+<header class="site-header">
+  <div class="header-inner">
+    <a href="#" class="wordmark">
+      <span class="wordmark-accent">FHIR</span>
+      <span class="wordmark-label">TX Benchmark</span>
+    </a>
+    <nav class="site-nav">
+      <a href="#" class="nav-link nav-link--active">Runs</a>
+      <a href="https://github.com/HealthSamurai/tx-benchmark" class="nav-link" target="_blank" rel="noopener">Docs</a>
+      <a href="https://github.com/HeliosSoftware/hfs" class="nav-link nav-link--icon" target="_blank" rel="noopener">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-label="GitHub">
+          <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path>
+        </svg>
+      </a>
+    </nav>
+  </div>
+</header>
+
+<!-- ── Main ───────────────────────────────────────────────────────────────── -->
+<main>
+  <div class="run-main">
+
+    <!-- Run identity -->
+    <div class="run-header">
+      <a href="#" class="back-link">← All runs</a>
+      <h1 class="run-name">HTS CI Run — 2026-04-30</h1>
+      <p class="run-date">2026-04-30 · GH CI run 25183960983 · 20/20 pass · 0% errors · wRPS 66.4K · EX08 fixed (47.1 RPS @50VU)</p>
+      <p class="run-host">helios-hts · SQLite WAL · pool=20 · FTS5 trigram · in-process LRU expand cache (Bytes pre-serialized) · self-hosted Linux · full SNOMED CT + LOINC + RxNorm + VSAC</p>
+    </div>
+
+    <!-- Tab nav -->
+    <nav class="tab-nav">
+      <button class="tab active" data-tab="overview">Overview</button>
+      <button class="tab" data-tab="breakdown">Breakdown</button>
+      <button class="tab" data-tab="servers">Servers</button>
+      <button class="tab" data-tab="tests">Tests</button>
+    </nav>
+
+    <div class="run-content">
+
+      <!-- ═══════════════════════ OVERVIEW TAB ═══════════════════════════════ -->
+      <div class="tab-panel active" id="tab-overview">
+
+        <div class="note">
+          Competitors are from <strong>Round 0</strong> (Apple M3, full SNOMED+LOINC+RxNorm data). HTS results from <strong>GH CI run 25183960983</strong> (2026-04-30, self-hosted Linux, full SNOMED+LOINC+RxNorm+VSAC). <strong>20/20 tests pass · 0% error rate · wRPS 66.4K.</strong> EX08 regression fixed: restored <code>has_eq_filter</code> guard so property= filters skip FTS-first and use <code>query_subtree_with_property</code> directly — EX08 recovered to 47.1 RPS @50VU (36× improvement, up from 1.3 RPS). SS01 doubled to 7.3K RPS. Notable improvements vs run 25173303533 (63.4K): SS01 +88% (7.3K vs 3.9K), EX02 p95 54ms vs prior (cache warmed), EX07 p95 243ms.
+        </div>
+
+        <!-- Composite Score -->
+        <div class="widget">
+          <div class="widget-header">
+            <span class="widget-title">Composite Score</span>
+            <span class="info-wrap">
+              <span class="info-icon">
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zm0 3.5a1 1 0 1 1 0 2 1 1 0 0 1 0-2zM7 7h2v5H7V7z"/></svg>
+              </span>
+              <div class="info-popover">Servers ranked by weighted throughput (wRPS) = sum of RPS across all passing tests at 50 VUs. Round 0 competitors ran on Apple M3 with full SNOMED/LOINC data. HTS (★): 20/20 passing tests at preflight on Windows 11 (2026-04-28) — not directly comparable to Round 0 results.</div>
+            </span>
+          </div>
+          <div class="widget-body">
+            <div class="wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="rank">#</th>
+                    <th class="col-server">Server</th>
+                    <th class="col-num r">wRPS</th>
+                    <th class="col-score">Score</th>
+                    <th class="col-num r">Errors</th>
+                    <th class="col-tests">Tests</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="rank">1</td>
+                    <td class="server"><a class="server-link" href="https://healthsamurai.github.io/tx-benchmark/results/round-0/servers/termbox" target="_blank">termbox</a><span class="round0-badge">Round 0</span></td>
+                    <td class="num r">102.7K</td>
+                    <td class="score-cell">
+                      <div class="bar-wrap">
+                        <div class="bar-track"><div class="bar-fill" style="width:100%;--s:100;animation-delay:0ms"></div></div>
+                        <span class="bar-pct">100%</span>
+                      </div>
+                    </td>
+                    <td class="num r err-ok">0.00%</td>
+                    <td><div class="pips">
+                      <span class="pip pip-pass" title="FS01: pass"></span><span class="pip pip-pass" title="LK01: pass"></span><span class="pip pip-pass" title="LK02: pass"></span><span class="pip pip-pass" title="LK03: pass"></span><span class="pip pip-pass" title="LK04: pass"></span><span class="pip pip-pass" title="LK05: pass"></span><span class="pip pip-pass" title="VC01: pass"></span><span class="pip pip-pass" title="VC02: pass"></span><span class="pip pip-pass" title="VC03: pass"></span><span class="pip pip-pass" title="EX01: pass"></span><span class="pip pip-pass" title="EX02: pass"></span><span class="pip pip-pass" title="EX03: pass"></span><span class="pip pip-pass" title="EX04: pass"></span><span class="pip pip-pass" title="EX05: pass"></span><span class="pip pip-pass" title="EX06: pass"></span><span class="pip pip-pass" title="EX07: pass"></span><span class="pip pip-pass" title="EX08: pass"></span><span class="pip pip-pass" title="SS01: pass"></span><span class="pip pip-skip" title="CM01: skip"></span><span class="pip pip-skip" title="CM02: skip"></span>
+                    </div></td>
+                  </tr>
+                  <tr>
+                    <td class="rank">2</td>
+                    <td class="server"><a class="server-link" href="https://healthsamurai.github.io/tx-benchmark/results/round-0/servers/fhirsmith" target="_blank">fhirsmith</a><span class="round0-badge">Round 0</span></td>
+                    <td class="num r">38.7K</td>
+                    <td class="score-cell">
+                      <div class="bar-wrap">
+                        <div class="bar-track"><div class="bar-fill" style="width:37.7%;--s:37.7;animation-delay:60ms"></div></div>
+                        <span class="bar-pct">38%</span>
+                      </div>
+                    </td>
+                    <td class="num r err-ok">0.00%</td>
+                    <td><div class="pips">
+                      <span class="pip pip-pass" title="FS01: pass"></span><span class="pip pip-pass" title="LK01: pass"></span><span class="pip pip-pass" title="LK02: pass"></span><span class="pip pip-pass" title="LK03: pass"></span><span class="pip pip-pass" title="LK04: pass"></span><span class="pip pip-pass" title="LK05: pass"></span><span class="pip pip-pass" title="VC01: pass"></span><span class="pip pip-pass" title="VC02: pass"></span><span class="pip pip-pass" title="VC03: pass"></span><span class="pip pip-pass" title="EX01: pass"></span><span class="pip pip-pass" title="EX02: pass"></span><span class="pip pip-pass" title="EX03: pass"></span><span class="pip pip-pass" title="EX04: pass"></span><span class="pip pip-pass" title="EX05: pass"></span><span class="pip pip-pass" title="EX06: pass"></span><span class="pip pip-pass" title="EX07: pass"></span><span class="pip pip-pass" title="EX08: pass"></span><span class="pip pip-pass" title="SS01: pass"></span><span class="pip pip-pass" title="CM01: pass"></span><span class="pip pip-pass" title="CM02: pass"></span>
+                    </div></td>
+                  </tr>
+                  <tr>
+                    <td class="rank">3</td>
+                    <td class="server"><a class="server-link" href="https://healthsamurai.github.io/tx-benchmark/results/round-0/servers/ontoserver" target="_blank">ontoserver</a><span class="round0-badge">Round 0</span></td>
+                    <td class="num r">21.8K</td>
+                    <td class="score-cell">
+                      <div class="bar-wrap">
+                        <div class="bar-track"><div class="bar-fill" style="width:21.2%;--s:21.2;animation-delay:120ms"></div></div>
+                        <span class="bar-pct">21%</span>
+                      </div>
+                    </td>
+                    <td class="num r err-warn">0.88%</td>
+                    <td><div class="pips">
+                      <span class="pip pip-pass" title="FS01: pass"></span><span class="pip pip-pass" title="LK01: pass"></span><span class="pip pip-pass" title="LK02: pass"></span><span class="pip pip-pass" title="LK03: pass"></span><span class="pip pip-pass" title="LK04: pass"></span><span class="pip pip-pass" title="LK05: pass"></span><span class="pip pip-pass" title="VC01: pass"></span><span class="pip pip-pass" title="VC02: pass"></span><span class="pip pip-pass" title="VC03: pass"></span><span class="pip pip-pass" title="EX01: pass"></span><span class="pip pip-pass" title="EX02: pass"></span><span class="pip pip-pass" title="EX03: pass"></span><span class="pip pip-pass" title="EX04: pass"></span><span class="pip pip-pass" title="EX05: pass"></span><span class="pip pip-pass" title="EX06: pass"></span><span class="pip pip-pass" title="EX07: pass"></span><span class="pip pip-pass" title="EX08: pass"></span><span class="pip pip-pass" title="SS01: pass"></span><span class="pip pip-pass" title="CM01: pass"></span><span class="pip pip-pass" title="CM02: pass"></span>
+                    </div></td>
+                  </tr>
+                  <tr>
+                    <td class="rank">4</td>
+                    <td class="server"><a class="server-link" href="https://healthsamurai.github.io/tx-benchmark/results/round-0/servers/snowstorm" target="_blank">snowstorm</a><span class="round0-badge">Round 0</span></td>
+                    <td class="num r">7.4K</td>
+                    <td class="score-cell">
+                      <div class="bar-wrap">
+                        <div class="bar-track"><div class="bar-fill" style="width:7.2%;--s:7.2;animation-delay:180ms"></div></div>
+                        <span class="bar-pct">7%</span>
+                      </div>
+                    </td>
+                    <td class="num r err-bad">1.30%</td>
+                    <td><div class="pips">
+                      <span class="pip pip-pass" title="FS01: pass"></span><span class="pip pip-pass" title="LK01: pass"></span><span class="pip pip-skip" title="LK02: skip"></span><span class="pip pip-pass" title="LK03: pass"></span><span class="pip pip-skip" title="LK04: skip"></span><span class="pip pip-pass" title="LK05: pass"></span><span class="pip pip-pass" title="VC01: pass"></span><span class="pip pip-pass" title="VC02: pass"></span><span class="pip pip-pass" title="VC03: pass"></span><span class="pip pip-pass" title="EX01: pass"></span><span class="pip pip-fail" title="EX02: fail"></span><span class="pip pip-pass" title="EX03: pass"></span><span class="pip pip-pass" title="EX04: pass"></span><span class="pip pip-fail" title="EX05: fail"></span><span class="pip pip-skip" title="EX06: skip"></span><span class="pip pip-skip" title="EX07: skip"></span><span class="pip pip-fail" title="EX08: fail"></span><span class="pip pip-pass" title="SS01: pass"></span><span class="pip pip-skip" title="CM01: skip"></span><span class="pip pip-skip" title="CM02: skip"></span>
+                    </div></td>
+                  </tr>
+                  <tr>
+                    <td class="rank">5</td>
+                    <td class="server"><a class="server-link" href="https://healthsamurai.github.io/tx-benchmark/results/round-0/servers/hades" target="_blank">hades</a><span class="round0-badge">Round 0</span></td>
+                    <td class="num r">5.8K</td>
+                    <td class="score-cell">
+                      <div class="bar-wrap">
+                        <div class="bar-track"><div class="bar-fill" style="width:5.6%;--s:5.6;animation-delay:240ms"></div></div>
+                        <span class="bar-pct">6%</span>
+                      </div>
+                    </td>
+                    <td class="num r err-ok">0.00%</td>
+                    <td><div class="pips">
+                      <span class="pip pip-skip" title="FS01: skip"></span><span class="pip pip-pass" title="LK01: pass"></span><span class="pip pip-fail" title="LK02: fail"></span><span class="pip pip-fail" title="LK03: fail"></span><span class="pip pip-fail" title="LK04: fail"></span><span class="pip pip-fail" title="LK05: fail"></span><span class="pip pip-skip" title="VC01: skip"></span><span class="pip pip-skip" title="VC02: skip"></span><span class="pip pip-skip" title="VC03: skip"></span><span class="pip pip-pass" title="EX01: pass"></span><span class="pip pip-skip" title="EX02: skip"></span><span class="pip pip-skip" title="EX03: skip"></span><span class="pip pip-skip" title="EX04: skip"></span><span class="pip pip-skip" title="EX05: skip"></span><span class="pip pip-skip" title="EX06: skip"></span><span class="pip pip-skip" title="EX07: skip"></span><span class="pip pip-skip" title="EX08: skip"></span><span class="pip pip-skip" title="SS01: skip"></span><span class="pip pip-skip" title="CM01: skip"></span><span class="pip pip-skip" title="CM02: skip"></span>
+                    </div></td>
+                  </tr>
+                  <tr class="hts-row">
+                    <td class="rank">2*</td>
+                    <td class="server">hts<span class="hts-tag" style="margin-left:4px">★</span></td>
+                    <td class="num r">66.4K</td>
+                    <td class="score-cell">
+                      <div class="bar-wrap">
+                        <div class="bar-track"><div class="bar-fill" style="width:64.7%;--s:64.7;animation-delay:300ms"></div></div>
+                        <span class="bar-pct">64.7%*</span>
+                      </div>
+                    </td>
+                    <td class="num r err-ok">0.00%</td>
+                    <td><div class="pips">
+                      <span class="pip pip-pass" title="FS01: pass"></span><span class="pip pip-pass" title="LK01: pass"></span><span class="pip pip-pass" title="LK02: pass"></span><span class="pip pip-pass" title="LK03: pass"></span><span class="pip pip-pass" title="LK04: pass"></span><span class="pip pip-pass" title="LK05: pass"></span><span class="pip pip-pass" title="VC01: pass"></span><span class="pip pip-pass" title="VC02: pass"></span><span class="pip pip-pass" title="VC03: pass"></span><span class="pip pip-pass" title="EX01: pass"></span><span class="pip pip-pass" title="EX02: pass"></span><span class="pip pip-pass" title="EX03: pass"></span><span class="pip pip-pass" title="EX04: pass"></span><span class="pip pip-pass" title="EX05: pass"></span><span class="pip pip-pass" title="EX06: pass"></span><span class="pip pip-pass" title="EX07: pass"></span><span class="pip pip-pass" title="EX08: pass"></span><span class="pip pip-pass" title="SS01: pass"></span><span class="pip pip-pass" title="CM01: pass"></span><span class="pip pip-pass" title="CM02: pass"></span>
+                    </div></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="footnote">* HTS results from GH CI run 25183960983 (2026-04-30, self-hosted Linux, full SNOMED+LOINC+RxNorm+VSAC). 20/20 tests pass at 0% error rate. wRPS = sum of RPS across all 20 tests at 50VU. Round 0 competitors ran on Apple M3 — hardware not directly comparable. wRPS improved from 63.4K (run 25173303533) to 66.4K. EX08 fixed: property-first dispatch restored, 47.1 RPS @50VU (was 1.3 RPS). SS01 +88% (7.3K vs 3.9K).</p>
+          </div>
+        </div>
+
+        <!-- Throughput @ 50 VUs -->
+        <div class="widget">
+          <div class="widget-header">
+            <span class="widget-title">Throughput</span>
+            <span class="widget-badge">50 VUs · 30s</span>
+            <span class="info-wrap">
+              <span class="info-icon"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zm0 3.5a1 1 0 1 1 0 2 1 1 0 0 1 0-2zM7 7h2v5H7V7z"/></svg></span>
+              <div class="info-popover">Requests per second at 50 virtual users for each benchmarked test. Tests marked — were not benchmarked (skip or fail at preflight).</div>
+            </span>
+          </div>
+          <div class="widget-body">
+            <div class="matrix-wrap" style="--cell-width:80px">
+              <table class="matrix">
+                <thead>
+                  <tr>
+                    <th class="row-label"></th>
+                    <th class="col-header">FS01</th>
+                    <th class="col-header">LK01</th>
+                    <th class="col-header">LK02</th>
+                    <th class="col-header">LK03</th>
+                    <th class="col-header">LK04</th>
+                    <th class="col-header">LK05</th>
+                    <th class="col-header">VC01</th>
+                    <th class="col-header">VC02</th>
+                    <th class="col-header">VC03</th>
+                    <th class="col-header">EX01</th>
+                    <th class="col-header">EX02</th>
+                    <th class="col-header">EX03</th>
+                    <th class="col-header">EX04</th>
+                    <th class="col-header">EX05</th>
+                    <th class="col-header">EX06</th>
+                    <th class="col-header">EX07</th>
+                    <th class="col-header">EX08</th>
+                    <th class="col-header">SS01</th>
+                    <th class="col-header">CM01</th>
+                    <th class="col-header">CM02</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr class="hts-row">
+                    <td class="row-label">hts<span class="hts-tag" style="margin-left:4px">★</span></td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/FS01: 736 RPS @50VU">736</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK01: 3,293 RPS @50VU">3.3K</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK02: 3,493 RPS @50VU">3.5K</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK03: 3,421 RPS @50VU">3.4K</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK04: 2,705 RPS @50VU">2.7K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/LK05: 8,297 RPS @50VU">8.3K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC01: 7,324 RPS @50VU">7.3K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC02: 6,995 RPS @50VU">7.0K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC03: 7,025 RPS @50VU">7.0K</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX01: 115 RPS @50VU">115</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX02: 1,716 RPS @50VU">1.7K</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX03: 55 RPS @50VU">55</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX04: 88 RPS @50VU">88</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX05: 1,639 RPS @50VU">1.6K</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX06: 213 RPS @50VU">213</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX07: 338 RPS @50VU">338</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX08: 47 RPS @50VU">47</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/SS01: 7,287 RPS @50VU">7.3K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM01: 5,446 RPS @50VU">5.4K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM02: 6,193 RPS @50VU">6.2K</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /overview -->
+
+
+      <!-- ═══════════════════════ BREAKDOWN TAB ══════════════════════════════ -->
+      <div class="tab-panel" id="tab-breakdown">
+
+        <!-- Capability matrix -->
+        <div class="widget">
+          <div class="widget-header">
+            <span class="widget-title">Capability Matrix</span>
+            <span class="info-wrap">
+              <span class="info-icon"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zm0 3.5a1 1 0 1 1 0 2 1 1 0 0 1 0-2zM7 7h2v5H7V7z"/></svg></span>
+              <div class="info-popover">Whether each test passed, failed, or was skipped during preflight. Skip = server did not support the operation or required data was not loaded.</div>
+            </span>
+          </div>
+          <div class="widget-body">
+            <div class="matrix-wrap" style="--cell-width:55px">
+              <table class="matrix">
+                <thead>
+                  <tr>
+                    <th class="row-label"></th>
+                    <th class="col-header">FS01</th><th class="col-header">LK01</th><th class="col-header">LK02</th>
+                    <th class="col-header">LK03</th><th class="col-header">LK04</th><th class="col-header">LK05</th>
+                    <th class="col-header">VC01</th><th class="col-header">VC02</th><th class="col-header">VC03</th>
+                    <th class="col-header">EX01</th><th class="col-header">EX02</th><th class="col-header">EX03</th>
+                    <th class="col-header">EX04</th><th class="col-header">EX05</th><th class="col-header">EX06</th>
+                    <th class="col-header">EX07</th><th class="col-header">EX08</th><th class="col-header">SS01</th>
+                    <th class="col-header">CM01</th><th class="col-header">CM02</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="row-label">termbox<span class="round0-badge" style="margin-left:4px">R0</span></td>
+                    <td class="cell cell-pass" title="termbox/FS01: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/LK01: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/LK02: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/LK03: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/LK04: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/LK05: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/VC01: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/VC02: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/VC03: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/EX01: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/EX02: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/EX03: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/EX04: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/EX05: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/EX06: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/EX07: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/EX08: pass">✓</td>
+                    <td class="cell cell-pass" title="termbox/SS01: pass">✓</td>
+                    <td class="cell cell-skip" title="termbox/CM01: skip">~</td>
+                    <td class="cell cell-skip" title="termbox/CM02: skip">~</td>
+                  </tr>
+                  <tr>
+                    <td class="row-label">fhirsmith<span class="round0-badge" style="margin-left:4px">R0</span></td>
+                    <td class="cell cell-pass" title="fhirsmith/FS01: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/LK01: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/LK02: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/LK03: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/LK04: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/LK05: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/VC01: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/VC02: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/VC03: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/EX01: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/EX02: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/EX03: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/EX04: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/EX05: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/EX06: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/EX07: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/EX08: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/SS01: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/CM01: pass">✓</td>
+                    <td class="cell cell-pass" title="fhirsmith/CM02: pass">✓</td>
+                  </tr>
+                  <tr>
+                    <td class="row-label">ontoserver<span class="round0-badge" style="margin-left:4px">R0</span></td>
+                    <td class="cell cell-pass" title="ontoserver/FS01: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/LK01: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/LK02: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/LK03: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/LK04: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/LK05: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/VC01: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/VC02: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/VC03: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/EX01: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/EX02: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/EX03: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/EX04: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/EX05: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/EX06: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/EX07: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/EX08: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/SS01: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/CM01: pass">✓</td>
+                    <td class="cell cell-pass" title="ontoserver/CM02: pass">✓</td>
+                  </tr>
+                  <tr>
+                    <td class="row-label">snowstorm<span class="round0-badge" style="margin-left:4px">R0</span></td>
+                    <td class="cell cell-pass" title="snowstorm/FS01: pass">✓</td>
+                    <td class="cell cell-pass" title="snowstorm/LK01: pass">✓</td>
+                    <td class="cell cell-skip" title="snowstorm/LK02: skip">~</td>
+                    <td class="cell cell-pass" title="snowstorm/LK03: pass">✓</td>
+                    <td class="cell cell-skip" title="snowstorm/LK04: skip">~</td>
+                    <td class="cell cell-pass" title="snowstorm/LK05: pass">✓</td>
+                    <td class="cell cell-pass" title="snowstorm/VC01: pass">✓</td>
+                    <td class="cell cell-pass" title="snowstorm/VC02: pass">✓</td>
+                    <td class="cell cell-pass" title="snowstorm/VC03: pass">✓</td>
+                    <td class="cell cell-pass" title="snowstorm/EX01: pass">✓</td>
+                    <td class="cell cell-fail" title="snowstorm/EX02: fail">✗</td>
+                    <td class="cell cell-pass" title="snowstorm/EX03: pass">✓</td>
+                    <td class="cell cell-pass" title="snowstorm/EX04: pass">✓</td>
+                    <td class="cell cell-fail" title="snowstorm/EX05: fail">✗</td>
+                    <td class="cell cell-skip" title="snowstorm/EX06: skip">~</td>
+                    <td class="cell cell-skip" title="snowstorm/EX07: skip">~</td>
+                    <td class="cell cell-fail" title="snowstorm/EX08: fail">✗</td>
+                    <td class="cell cell-pass" title="snowstorm/SS01: pass">✓</td>
+                    <td class="cell cell-skip" title="snowstorm/CM01: skip">~</td>
+                    <td class="cell cell-skip" title="snowstorm/CM02: skip">~</td>
+                  </tr>
+                  <tr>
+                    <td class="row-label">hades<span class="round0-badge" style="margin-left:4px">R0</span></td>
+                    <td class="cell cell-skip" title="hades/FS01: skip">~</td>
+                    <td class="cell cell-pass" title="hades/LK01: pass">✓</td>
+                    <td class="cell cell-fail" title="hades/LK02: fail">✗</td>
+                    <td class="cell cell-fail" title="hades/LK03: fail">✗</td>
+                    <td class="cell cell-fail" title="hades/LK04: fail">✗</td>
+                    <td class="cell cell-fail" title="hades/LK05: fail">✗</td>
+                    <td class="cell cell-skip" title="hades/VC01: skip">~</td>
+                    <td class="cell cell-skip" title="hades/VC02: skip">~</td>
+                    <td class="cell cell-skip" title="hades/VC03: skip">~</td>
+                    <td class="cell cell-pass" title="hades/EX01: pass">✓</td>
+                    <td class="cell cell-skip" title="hades/EX02: skip">~</td>
+                    <td class="cell cell-skip" title="hades/EX03: skip">~</td>
+                    <td class="cell cell-skip" title="hades/EX04: skip">~</td>
+                    <td class="cell cell-skip" title="hades/EX05: skip">~</td>
+                    <td class="cell cell-skip" title="hades/EX06: skip">~</td>
+                    <td class="cell cell-skip" title="hades/EX07: skip">~</td>
+                    <td class="cell cell-fail" title="hades/EX08: fail">✗</td>
+                    <td class="cell cell-skip" title="hades/SS01: skip">~</td>
+                    <td class="cell cell-skip" title="hades/CM01: skip">~</td>
+                    <td class="cell cell-skip" title="hades/CM02: skip">~</td>
+                  </tr>
+                  <tr class="hts-row">
+                    <td class="row-label">hts<span class="hts-tag" style="margin-left:4px">★</span></td>
+                    <td class="cell cell-pass" title="hts/FS01: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/LK01: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/LK02: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/LK03: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/LK04: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/LK05: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/VC01: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/VC02: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/VC03: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/EX01: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/EX02: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/EX03: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/EX04: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/EX05: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/EX06: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/EX07: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/EX08: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/SS01: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/CM01: pass">✓</td>
+                    <td class="cell cell-pass" title="hts/CM02: pass">✓</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- p95 Latency -->
+        <div class="widget">
+          <div class="widget-header">
+            <span class="widget-title">p95 Latency</span>
+            <span class="widget-badge">50 VUs</span>
+            <span class="info-wrap">
+              <span class="info-icon"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zm0 3.5a1 1 0 1 1 0 2 1 1 0 0 1 0-2zM7 7h2v5H7V7z"/></svg></span>
+              <div class="info-popover">95th-percentile response time at 50 virtual users. — means the test was skipped or failed at preflight and was not benchmarked.</div>
+            </span>
+          </div>
+          <div class="widget-body">
+            <div class="matrix-wrap" style="--cell-width:55px">
+              <table class="matrix">
+                <thead>
+                  <tr>
+                    <th class="row-label"></th>
+                    <th class="col-header">FS01</th><th class="col-header">LK01</th><th class="col-header">LK02</th>
+                    <th class="col-header">LK03</th><th class="col-header">LK04</th><th class="col-header">LK05</th>
+                    <th class="col-header">VC01</th><th class="col-header">VC02</th><th class="col-header">VC03</th>
+                    <th class="col-header">EX01</th><th class="col-header">EX02</th><th class="col-header">EX03</th>
+                    <th class="col-header">EX04</th><th class="col-header">EX05</th><th class="col-header">EX06</th>
+                    <th class="col-header">EX07</th><th class="col-header">EX08</th><th class="col-header">SS01</th>
+                    <th class="col-header">CM01</th><th class="col-header">CM02</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="row-label">termbox<span class="round0-badge" style="margin-left:4px">R0</span></td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="termbox/FS01: 25ms p95">25ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="termbox/LK01: 11ms p95">11ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="termbox/LK02: 11ms p95">11ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="termbox/LK03: 8ms p95">8ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="termbox/LK04: 8ms p95">8ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="termbox/LK05: 9ms p95">9ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="termbox/VC01: 11ms p95">11ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="termbox/VC02: 11ms p95">11ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="termbox/VC03: 12ms p95">12ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="termbox/EX01: 327ms p95">327ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="termbox/EX02: 90ms p95">90ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="termbox/EX03: 290ms p95">290ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="termbox/EX04: 366ms p95">366ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="termbox/EX05: 69ms p95">69ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="termbox/EX06: 68ms p95">68ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="termbox/EX07: 111ms p95">111ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="termbox/EX08: 51ms p95">51ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="termbox/SS01: 9ms p95">9ms</td>
+                    <td class="cell cell-empty" title="termbox/CM01: skip">—</td>
+                    <td class="cell cell-empty" title="termbox/CM02: skip">—</td>
+                  </tr>
+                  <tr>
+                    <td class="row-label">fhirsmith<span class="round0-badge" style="margin-left:4px">R0</span></td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="fhirsmith/FS01: 342ms p95">342ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="fhirsmith/LK01: 17ms p95">17ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="fhirsmith/LK02: 48ms p95">48ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="fhirsmith/LK03: 13ms p95">13ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="fhirsmith/LK04: 31ms p95">31ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="fhirsmith/LK05: 12ms p95">12ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="fhirsmith/VC01: 17ms p95">17ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="fhirsmith/VC02: 19ms p95">19ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="fhirsmith/VC03: 55ms p95">55ms</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="fhirsmith/EX01: 25.3s p95">25.3s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="fhirsmith/EX02: 1.34s p95">1.34s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="fhirsmith/EX03: 51.7s p95">51.7s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="fhirsmith/EX04: 1.44s p95">1.44s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="fhirsmith/EX05: 33.6s p95">33.6s</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="fhirsmith/EX06: 19ms p95">19ms</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="fhirsmith/EX07: 31.1s p95">31.1s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="fhirsmith/EX08: 41.1s p95">41.1s</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="fhirsmith/SS01: 13ms p95">13ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="fhirsmith/CM01: 78ms p95">78ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="fhirsmith/CM02: 10ms p95">10ms</td>
+                  </tr>
+                  <tr>
+                    <td class="row-label">ontoserver<span class="round0-badge" style="margin-left:4px">R0</span></td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="ontoserver/FS01: 51.4s p95">51.4s</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="ontoserver/LK01: 298ms p95">298ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="ontoserver/LK02: 118ms p95">118ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="ontoserver/LK03: 73ms p95">73ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="ontoserver/LK04: 116ms p95">116ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="ontoserver/LK05: 274ms p95">274ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="ontoserver/VC01: 300ms p95">300ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="ontoserver/VC02: 292ms p95">292ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="ontoserver/VC03: 290ms p95">290ms</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="ontoserver/EX01: 825ms p95">825ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="ontoserver/EX02: 377ms p95">377ms</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="ontoserver/EX03: 9.88s p95">9.88s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="ontoserver/EX04: 29.1s p95">29.1s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="ontoserver/EX05: 1.49s p95">1.49s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="ontoserver/EX06: 789ms p95">789ms</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="ontoserver/EX07: 4.49s p95">4.49s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="ontoserver/EX08: 13.8s p95">13.8s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="ontoserver/SS01: 1.52s p95">1.52s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="ontoserver/CM01: 1.94s p95">1.94s</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="ontoserver/CM02: 109ms p95">109ms</td>
+                  </tr>
+                  <tr>
+                    <td class="row-label">snowstorm<span class="round0-badge" style="margin-left:4px">R0</span></td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="snowstorm/FS01: 458ms p95">458ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="snowstorm/LK01: 436ms p95">436ms</td>
+                    <td class="cell cell-empty" title="snowstorm/LK02: skip">—</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="snowstorm/LK03: 40ms p95">40ms</td>
+                    <td class="cell cell-empty" title="snowstorm/LK04: skip">—</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="snowstorm/LK05: 143ms p95">143ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="snowstorm/VC01: 256ms p95">256ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="snowstorm/VC02: 289ms p95">289ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="snowstorm/VC03: 221ms p95">221ms</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="snowstorm/EX01: 4.65s p95">4.65s</td>
+                    <td class="cell cell-empty" title="snowstorm/EX02: fail">—</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="snowstorm/EX03: 2.71s p95">2.71s</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="snowstorm/EX04: 1.36s p95">1.36s</td>
+                    <td class="cell cell-empty" title="snowstorm/EX05: fail">—</td>
+                    <td class="cell cell-empty" title="snowstorm/EX06: skip">—</td>
+                    <td class="cell cell-empty" title="snowstorm/EX07: skip">—</td>
+                    <td class="cell cell-empty" title="snowstorm/EX08: fail">—</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="snowstorm/SS01: 231ms p95">231ms</td>
+                    <td class="cell cell-empty" title="snowstorm/CM01: skip">—</td>
+                    <td class="cell cell-empty" title="snowstorm/CM02: skip">—</td>
+                  </tr>
+                  <tr>
+                    <td class="row-label">hades<span class="round0-badge" style="margin-left:4px">R0</span></td>
+                    <td class="cell cell-empty" title="hades/FS01: skip">—</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hades/LK01: 62ms p95">62ms</td>
+                    <td class="cell cell-empty" title="hades/LK02: fail">—</td>
+                    <td class="cell cell-empty" title="hades/LK03: fail">—</td>
+                    <td class="cell cell-empty" title="hades/LK04: fail">—</td>
+                    <td class="cell cell-empty" title="hades/LK05: fail">—</td>
+                    <td class="cell cell-empty" title="hades/VC01: skip">—</td>
+                    <td class="cell cell-empty" title="hades/VC02: skip">—</td>
+                    <td class="cell cell-empty" title="hades/VC03: skip">—</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="hades/EX01: 55s p95">55s</td>
+                    <td class="cell cell-empty" title="hades/EX02: skip">—</td>
+                    <td class="cell cell-empty" title="hades/EX03: skip">—</td>
+                    <td class="cell cell-empty" title="hades/EX04: skip">—</td>
+                    <td class="cell cell-empty" title="hades/EX05: skip">—</td>
+                    <td class="cell cell-empty" title="hades/EX06: skip">—</td>
+                    <td class="cell cell-empty" title="hades/EX07: skip">—</td>
+                    <td class="cell cell-empty" title="hades/EX08: fail">—</td>
+                    <td class="cell cell-empty" title="hades/SS01: skip">—</td>
+                    <td class="cell cell-empty" title="hades/CM01: skip">—</td>
+                    <td class="cell cell-empty" title="hades/CM02: skip">—</td>
+                  </tr>
+                  <tr class="hts-row">
+                    <td class="row-label">hts<span class="hts-tag" style="margin-left:4px">★</span></td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/FS01: 118ms p95 @50VU">118ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK01: 25ms p95 @50VU">25ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK02: 24ms p95 @50VU">24ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK03: 24ms p95 @50VU">24ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK04: 31ms p95 @50VU">31ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/LK05: 11ms p95 @50VU">11ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC01: 12ms p95 @50VU">12ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC02: 13ms p95 @50VU">13ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC03: 13ms p95 @50VU">13ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX01: 839ms p95 @50VU">839ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/EX02: 53ms p95 @50VU">53ms</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX03: 1.49s p95 @50VU">1.49s</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX04: 846ms p95 @50VU">846ms</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/EX05: 54ms p95 @50VU">54ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX06: 667ms p95 @50VU">667ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX07: 243ms p95 @50VU">243ms</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX08: 1.79s p95 @50VU">1.79s</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/SS01: 12ms p95 @50VU">12ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM01: 15ms p95 @50VU">15ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM02: 14ms p95 @50VU">14ms</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Per-test throughput cards -->
+        <div class="widget">
+          <div class="widget-header">
+            <span class="widget-title">Per-Test Throughput</span>
+            <span class="widget-badge">VUs: 1 · 10 · 50</span>
+          </div>
+          <div class="widget-body">
+            <div class="breakdown-grid" id="breakdown-grid"></div>
+          </div>
+        </div>
+
+      </div><!-- /breakdown -->
+
+
+      <!-- ═══════════════════════ SERVERS TAB ════════════════════════════════ -->
+      <div class="tab-panel" id="tab-servers">
+        <div class="server-card">
+          <div class="server-card-name">
+            hts
+            <span class="server-card-version">v0.1.47</span>
+          </div>
+          <div class="kv-grid">
+            <span class="kv-key">Full name</span>      <span class="kv-val">Helios Terminology Server (HTS)</span>
+            <span class="kv-key">Repository</span>     <span class="kv-val"><a href="https://github.com/HeliosSoftware/hfs" target="_blank">github.com/HeliosSoftware/hfs</a></span>
+            <span class="kv-key">Binary</span>         <span class="kv-val">cargo run --bin hts</span>
+            <span class="kv-key">Storage</span>        <span class="kv-val">SQLite (r2d2 pool, WAL mode, pool=20, mmap=256MB, FTS5 trigram index, in-process LRU expand cache, Bytes pre-serialized)</span>
+            <span class="kv-key">Base URL</span>       <span class="kv-val">http://localhost:8090</span>
+            <span class="kv-key">FHIR version</span>   <span class="kv-val">R4 (resource CRUD) · terminology is version-agnostic</span>
+            <span class="kv-key">Data loaded</span>    <span class="kv-val">SNOMED CT US 2025-09 · LOINC 2.82 · ICD-10-CM 2026 · hl7.terminology 7.1.0</span>
+            <span class="kv-key">CodeSystems</span>    <span class="kv-val">1,217 · 638,604 concepts</span>
+            <span class="kv-key">ValueSets</span>      <span class="kv-val">included in hl7.terminology package</span>
+            <span class="kv-key">ConceptMaps</span>    <span class="kv-val">96 (incl. 4 IPS CMs added 2026-04-28)</span>
+            <span class="kv-key">Host</span>           <span class="kv-val">self-hosted Linux (GitHub Actions · run 25183960983 · build 14s · benchmark ~40m)</span>
+            <span class="kv-key">Run date</span>       <span class="kv-val">2026-04-30 · GH CI run 25183960983 · 20/20 pass · 0% errors · wRPS 66.4K · EX08 fixed</span>
+          </div>
+        </div>
+      </div><!-- /servers -->
+
+
+      <!-- ═══════════════════════ TESTS TAB ══════════════════════════════════ -->
+      <div class="tab-panel" id="tab-tests">
+        <div class="widget">
+          <div class="widget-header">
+            <span class="widget-title">Test Definitions</span>
+            <span class="widget-badge">20 tests</span>
+          </div>
+          <div class="widget-body" style="padding:0">
+            <table class="tests-table">
+              <thead>
+                <tr>
+                  <th style="width:70px">ID</th>
+                  <th style="width:90px">Status</th>
+                  <th>Description</th>
+                  <th>Notes</th>
+                </tr>
+              </thead>
+              <tbody id="tests-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div><!-- /tests -->
+
+    </div><!-- /run-content -->
+  </div><!-- /run-main -->
+</main>
+
+<script>
+// ── Tab switching ────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+
+// ── Benchmark data ───────────────────────────────────────────────────────────
+const RESULTS = [
+  // GH CI run 25183960983 · 2026-04-30 · self-hosted Linux · pool=20 + Bytes LRU cache · 20/20 pass · 0% errors · EX08 fixed
+  { test:'CM01', desc:'ConceptMap/$translate — SNOMED REPLACED BY map',          vu:1,  rps:2459.1, p50:0.33,   p95:0.38,    p99:0.52    },
+  { test:'CM01', desc:'ConceptMap/$translate — SNOMED REPLACED BY map',          vu:10, rps:5741.5, p50:1.58,   p95:3.14,    p99:4.93    },
+  { test:'CM01', desc:'ConceptMap/$translate — SNOMED REPLACED BY map',          vu:50, rps:5446.5, p50:8.80,   p95:15.34,   p99:19.44   },
+  { test:'CM02', desc:'ConceptMap/$translate — R4 core+IPS',                     vu:1,  rps:2460.3, p50:0.32,   p95:0.38,    p99:0.64    },
+  { test:'CM02', desc:'ConceptMap/$translate — R4 core+IPS',                     vu:10, rps:6223.3, p50:1.44,   p95:2.85,    p99:5.23    },
+  { test:'CM02', desc:'ConceptMap/$translate — R4 core+IPS',                     vu:50, rps:6193.0, p50:7.67,   p95:13.89,   p99:18.50   },
+  { test:'EX01', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)',              vu:1,  rps:40.2,   p50:24.72,  p95:39.45,   p99:41.50   },
+  { test:'EX01', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)',              vu:10, rps:102.2,  p50:105.92, p95:208.60,  p99:252.77  },
+  { test:'EX01', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)',              vu:50, rps:115.4,  p50:538.32, p95:838.86,  p99:1002.48 },
+  { test:'EX02', desc:'ValueSet/$expand — SNOMED filters (ad-hoc POST)',         vu:1,  rps:431.2,  p50:0.63,   p95:7.12,    p99:24.97   },
+  { test:'EX02', desc:'ValueSet/$expand — SNOMED filters (ad-hoc POST)',         vu:10, rps:1397.1, p50:4.95,   p95:19.29,   p99:37.08   },
+  { test:'EX02', desc:'ValueSet/$expand — SNOMED filters (ad-hoc POST)',         vu:50, rps:1716.0, p50:27.26,  p95:52.76,   p99:66.62   },
+  { test:'EX03', desc:'ValueSet/$expand — SNOMED implicit VS + text filter',     vu:1,  rps:24.8,   p50:20.45,  p95:181.31,  p99:415.62  },
+  { test:'EX03', desc:'ValueSet/$expand — SNOMED implicit VS + text filter',     vu:10, rps:65.8,   p50:115.40, p95:295.48,  p99:846.78  },
+  { test:'EX03', desc:'ValueSet/$expand — SNOMED implicit VS + text filter',     vu:50, rps:55.0,   p50:735.87, p95:1493.57, p99:4808.43 },
+  { test:'EX04', desc:'ValueSet/$expand — VSAC extensional',                     vu:1,  rps:49.1,   p50:30.74,  p95:33.79,   p99:34.81   },
+  { test:'EX04', desc:'ValueSet/$expand — VSAC extensional',                     vu:10, rps:89.3,   p50:111.68, p95:225.76,  p99:248.47  },
+  { test:'EX04', desc:'ValueSet/$expand — VSAC extensional',                     vu:50, rps:88.4,   p50:565.35, p95:846.15,  p99:1005.50 },
+  { test:'EX05', desc:'ValueSet/$expand — SNOMED intensional (ad-hoc POST)',     vu:1,  rps:66.9,   p50:1.38,   p95:88.89,   p99:181.61  },
+  { test:'EX05', desc:'ValueSet/$expand — SNOMED intensional (ad-hoc POST)',     vu:10, rps:1694.2, p50:4.45,   p95:12.19,   p99:22.04   },
+  { test:'EX05', desc:'ValueSet/$expand — SNOMED intensional (ad-hoc POST)',     vu:50, rps:1638.8, p50:28.44,  p95:54.23,   p99:71.13   },
+  { test:'EX06', desc:'ValueSet/$expand — RxNorm intensional',                   vu:1,  rps:73.3,   p50:1.07,   p95:88.44,   p99:95.79   },
+  { test:'EX06', desc:'ValueSet/$expand — RxNorm intensional',                   vu:10, rps:219.2,  p50:8.15,   p95:267.05,  p99:330.61  },
+  { test:'EX06', desc:'ValueSet/$expand — RxNorm intensional',                   vu:50, rps:213.2,  p50:183.59, p95:667.46,  p99:856.40  },
+  { test:'EX07', desc:'ValueSet/$expand — multi-system text filter',             vu:1,  rps:259.0,  p50:3.39,   p95:6.64,    p99:8.82    },
+  { test:'EX07', desc:'ValueSet/$expand — multi-system text filter',             vu:10, rps:373.9,  p50:24.54,  p95:50.71,   p99:67.66   },
+  { test:'EX07', desc:'ValueSet/$expand — multi-system text filter',             vu:50, rps:338.5,  p50:141.79, p95:242.97,  p99:303.48  },
+  { test:'EX08', desc:'ValueSet/$expand — SNOMED combined filters (ad-hoc POST)',vu:1,  rps:11.9,   p50:38.38,  p95:208.35,  p99:599.65  },
+  { test:'EX08', desc:'ValueSet/$expand — SNOMED combined filters (ad-hoc POST)',vu:10, rps:57.2,   p50:86.58,  p95:483.92,  p99:1848.13 },
+  { test:'EX08', desc:'ValueSet/$expand — SNOMED combined filters (ad-hoc POST)',vu:50, rps:47.1,   p50:887.84, p95:1787.78, p99:6160.17 },
+  { test:'FS01', desc:'FHIR Search — ValueSet + CodeSystem',                     vu:1,  rps:332.3,  p50:2.01,   p95:4.30,    p99:8.90    },
+  { test:'FS01', desc:'FHIR Search — ValueSet + CodeSystem',                     vu:10, rps:751.1,  p50:10.91,  p95:25.96,   p99:41.38   },
+  { test:'FS01', desc:'FHIR Search — ValueSet + CodeSystem',                     vu:50, rps:736.3,  p50:62.19,  p95:118.34,  p99:161.38  },
+  { test:'LK01', desc:'CodeSystem/$lookup — SNOMED CT codes',                    vu:1,  rps:1514.2, p50:0.56,   p95:0.68,    p99:0.97    },
+  { test:'LK01', desc:'CodeSystem/$lookup — SNOMED CT codes',                    vu:10, rps:3157.7, p50:2.77,   p95:5.95,    p99:9.62    },
+  { test:'LK01', desc:'CodeSystem/$lookup — SNOMED CT codes',                    vu:50, rps:3292.6, p50:14.51,  p95:25.44,   p99:32.83   },
+  { test:'LK02', desc:'CodeSystem/$lookup — LOINC codes',                        vu:1,  rps:1575.8, p50:0.56,   p95:0.63,    p99:0.78    },
+  { test:'LK02', desc:'CodeSystem/$lookup — LOINC codes',                        vu:10, rps:3339.0, p50:2.61,   p95:5.65,    p99:8.82    },
+  { test:'LK02', desc:'CodeSystem/$lookup — LOINC codes',                        vu:50, rps:3492.8, p50:13.72,  p95:24.07,   p99:30.88   },
+  { test:'LK03', desc:'CodeSystem/$lookup — HL7 terminology',                    vu:1,  rps:1531.4, p50:0.56,   p95:0.67,    p99:0.87    },
+  { test:'LK03', desc:'CodeSystem/$lookup — HL7 terminology',                    vu:10, rps:3323.7, p50:2.68,   p95:5.53,    p99:7.69    },
+  { test:'LK03', desc:'CodeSystem/$lookup — HL7 terminology',                    vu:50, rps:3420.6, p50:14.15,  p95:23.71,   p99:29.08   },
+  { test:'LK04', desc:'CodeSystem/$lookup — RxNorm codes',                       vu:1,  rps:1289.8, p50:0.62,   p95:0.76,    p99:1.58    },
+  { test:'LK04', desc:'CodeSystem/$lookup — RxNorm codes',                       vu:10, rps:2645.9, p50:3.25,   p95:7.25,    p99:11.39   },
+  { test:'LK04', desc:'CodeSystem/$lookup — RxNorm codes',                       vu:50, rps:2705.0, p50:17.32,  p95:31.35,   p99:43.74   },
+  { test:'LK05', desc:'CodeSystem/$lookup — negative codes',                     vu:1,  rps:3126.7, p50:0.24,   p95:0.31,    p99:0.37    },
+  { test:'LK05', desc:'CodeSystem/$lookup — negative codes',                     vu:10, rps:7882.2, p50:1.10,   p95:2.25,    p99:5.46    },
+  { test:'LK05', desc:'CodeSystem/$lookup — negative codes',                     vu:50, rps:8297.1, p50:5.63,   p95:10.71,   p99:17.17   },
+  { test:'SS01', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy',              vu:1,  rps:2834.1, p50:0.27,   p95:0.34,    p99:0.47    },
+  { test:'SS01', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy',              vu:10, rps:6879.6, p50:1.24,   p95:2.65,    p99:5.34    },
+  { test:'SS01', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy',              vu:50, rps:7287.0, p50:6.44,   p95:12.10,   p99:16.83   },
+  { test:'VC01', desc:'ValueSet/$validate-code — SNOMED implicit VS',            vu:1,  rps:2904.3, p50:0.25,   p95:0.34,    p99:0.42    },
+  { test:'VC01', desc:'ValueSet/$validate-code — SNOMED implicit VS',            vu:10, rps:7020.6, p50:1.22,   p95:2.60,    p99:5.69    },
+  { test:'VC01', desc:'ValueSet/$validate-code — SNOMED implicit VS',            vu:50, rps:7323.8, p50:6.37,   p95:12.17,   p99:18.93   },
+  { test:'VC02', desc:'ValueSet/$validate-code — SNOMED implicit VS + display',  vu:1,  rps:2729.1, p50:0.28,   p95:0.34,    p99:0.45    },
+  { test:'VC02', desc:'ValueSet/$validate-code — SNOMED implicit VS + display',  vu:10, rps:6764.7, p50:1.27,   p95:2.69,    p99:5.87    },
+  { test:'VC02', desc:'ValueSet/$validate-code — SNOMED implicit VS + display',  vu:50, rps:6995.0, p50:6.66,   p95:12.63,   p99:19.86   },
+  { test:'VC03', desc:'ValueSet/$validate-code — SNOMED isa hierarchy',          vu:1,  rps:2723.5, p50:0.28,   p95:0.35,    p99:0.43    },
+  { test:'VC03', desc:'ValueSet/$validate-code — SNOMED isa hierarchy',          vu:10, rps:6660.5, p50:1.28,   p95:2.73,    p99:5.67    },
+  { test:'VC03', desc:'ValueSet/$validate-code — SNOMED isa hierarchy',          vu:50, rps:7025.2, p50:6.64,   p95:12.58,   p99:18.62   },
+];
+
+const MAX_RPS = Math.max(...RESULTS.map(r => r.rps));
+const tests = [...new Set(RESULTS.map(r => r.test))];
+
+function fmtRps(n) { return n >= 1000 ? (n/1000).toFixed(1)+'K' : n.toFixed(0); }
+function fmtMs(n)  { return n.toFixed(2)+'ms'; }
+
+// ── Build breakdown cards ───────────────────────────────────────────────────
+const grid = document.getElementById('breakdown-grid');
+tests.forEach(t => {
+  const rows = RESULTS.filter(r => r.test === t);
+  const desc = rows[0].desc;
+  const maxRps = Math.max(...rows.map(r => r.rps));
+  let html = `<div class="test-card">
+    <div class="test-card-header">
+      <span class="test-code">${t}</span>
+      <span class="test-desc">${desc}</span>
+    </div>`;
+  rows.forEach((r, i) => {
+    const pct = (r.rps / MAX_RPS * 100).toFixed(1);
+    const delay = i * 80;
+    html += `<div class="vu-row">
+      <span class="vu-label">${r.vu} VU${r.vu>1?'s':''}</span>
+      <div class="vu-bar-track"><div class="vu-bar-fill" style="width:${pct}%;animation-delay:${delay}ms"></div></div>
+      <span class="vu-rps">${fmtRps(r.rps)}</span>
+      <div class="vu-lat">
+        <span class="lat-p50">${fmtMs(r.p50)}</span>
+        <span class="lat-p95">${fmtMs(r.p95)}</span>
+        <span class="lat-p99">${fmtMs(r.p99)}</span>
+      </div>
+    </div>`;
+  });
+  html += `</div>`;
+  grid.insertAdjacentHTML('beforeend', html);
+});
+
+// ── Build tests table ───────────────────────────────────────────────────────
+const TESTS_DEF = [
+  { id:'FS01', status:'pass', desc:'FHIR Search — ValueSet and CodeSystem', note:'Search with varied parameters: url, name, _count, _offset' },
+  { id:'LK01', status:'pass', desc:'CodeSystem/$lookup — SNOMED CT codes', note:'Passes with SNOMED CT loaded' },
+  { id:'LK02', status:'pass', desc:'CodeSystem/$lookup — LOINC codes', note:'Passes: LOINC zip detection fixed to match nested Loinc_<ver>/Loinc.csv layout used by Regenstrief releases (CI run 2026-04-24)' },
+  { id:'LK03', status:'pass', desc:'CodeSystem/$lookup — HL7 v2/v3 codes', note:'Uses codes from free HL7 terminology packages' },
+  { id:'LK04', status:'pass', desc:'CodeSystem/$lookup — RxNorm codes', note:'Requires RxNorm (licensed)' },
+  { id:'LK05', status:'pass', desc:'CodeSystem/$lookup — non-existent SNOMED codes', note:'Negative test; server correctly returns false result' },
+  { id:'VC01', status:'pass', desc:'ValueSet/$validate-code — SNOMED implicit VS', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
+  { id:'VC02', status:'pass', desc:'ValueSet/$validate-code — SNOMED implicit VS + display', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
+  { id:'VC03', status:'pass', desc:'ValueSet/$validate-code — SNOMED isa hierarchy', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
+  { id:'EX01', status:'pass', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
+  { id:'EX02', status:'pass', desc:'ValueSet/$expand — SNOMED filters (ad-hoc POST)', note:'Timeout-under-load fixed 2026-04-28 by batch BFS traversal. GH CI run 25123155690: 105 RPS @ 50VU, 1.07s p95.' },
+  { id:'EX03', status:'pass', desc:'ValueSet/$expand — SNOMED implicit VS + text filter', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
+  { id:'EX04', status:'pass', desc:'ValueSet/$expand — VSAC extensional (SNOMED/LOINC/RxNorm)', note:'Improved 2026-04-28: compose_page_fast with text-filter support. GH CI run 25123155690: 56 RPS @ 50VU, 1.30s p95.' },
+  { id:'EX05', status:'pass', desc:'ValueSet/$expand — SNOMED intensional (ad-hoc POST)', note:'LRU cache (pre-serialized Bytes) delivers cache-saturated bursts. 954-entry pool fills in ~3.6s at 50VU, remaining 26s served from cache at O(1) cost. CI run 25183960983: 1639 RPS @ 50VU, 54ms p95.' },
+  { id:'EX06', status:'pass', desc:'ValueSet/$expand — RxNorm intensional (ad-hoc POST)', note:'RxNorm tradename_of stored on BN concepts via canonical_rela normalization. Bytes cache fills in <1s (39-entry pool); cache-saturated. CI run 25183960983: 213 RPS @ 50VU, 667ms p95.' },
+  { id:'EX07', status:'pass', desc:'ValueSet/$expand — multi-system text filter (ad-hoc POST)', note:'Passes: partial-miss returns 200 + FHIR expansion.parameter warnings; total-miss returns 404. FTS5 trigram index pre-built at startup. CI run 25183960983: 338 RPS @ 50VU, 243ms p95 (FTS5 scan over 640K+ concepts).' },
+  { id:'EX08', status:'pass', desc:'ValueSet/$expand — SNOMED combined filters (ad-hoc POST)', note:'Property-first dispatch restored: when compose contains property= filter, skip FTS-first and route through apply_compose_filters → query_subtree_with_property (O(K_property) vs full FTS rowid scan). CI run 25183960983: 47.1 RPS @ 50VU, 1.79s p95 (recovered from 1.3 RPS timeout regression in run 25173303533).' },
+  { id:'SS01', status:'pass', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy', note:'Passes with SNOMED CT loaded' },
+  { id:'CM01', status:'pass', desc:'ConceptMap/$translate — SNOMED REPLACED BY map', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
+  { id:'CM02', status:'pass', desc:'ConceptMap/$translate — FHIR R4 core + IPS ConceptMaps', note:'Uses ConceptMaps from free hl7.fhir.r4.core and IPS packages' },
+];
+
+const statusLabel = { pass:'Pass', fail:'Fail', skip:'Skip' };
+const tbody = document.getElementById('tests-tbody');
+TESTS_DEF.forEach(t => {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td><span class="test-id">${t.id}</span></td>
+    <td><span class="status-badge badge-${t.status}">${statusLabel[t.status]}</span></td>
+    <td style="color:var(--text-dim);font-size:var(--text-sm)">${t.desc}</td>
+    <td style="color:var(--text-muted);font-size:var(--text-xs)">${t.note}</td>
+  `;
+  tbody.appendChild(tr);
+});
+</script>
+</body>
+</html>
