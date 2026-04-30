@@ -919,17 +919,33 @@ fn expand_inline_filtered(
             }
         };
 
-        // ── FTS-first: text ≥ 3 chars + batchable compose filters ───────────────
-        // Query FTS5 first to get a small, bounded candidate set, then apply
-        // compose filters (hierarchy and/or property=) to that set.
-        // Skipped for ECL `constraint` filters (requires full ECL evaluation).
+        // ── Routing: FTS-first vs. property-first ────────────────────────────────
+        // When the request carries both a text filter and compose filter(s), two
+        // strategies are possible:
         //
-        // This is universally faster than property-first: property= indexes are
-        // often non-selective (e.g. SNOMED morphology properties return tens of
-        // thousands of concepts), while FTS trigram search for display terms is
-        // highly selective (typically <1 000 candidates for a 3+-char filter).
-        // apply_compose_filters_to_candidates handles both hierarchy and property=
-        // filters on the already-small FTS result set.
+        //   FTS-first — query `concepts_fts` by display text → bounded candidate
+        //               set → apply hierarchy/property= in Rust.  Optimal when
+        //               there is NO property= filter: a 3+-char trigram query is
+        //               highly selective (<1 000 candidates), and an is-a walk
+        //               over that small set is cheap.
+        //
+        //   Property-first — start from `idx_concept_properties_value` (property,
+        //               value, concept_id) → O(K_property) rows → text filter in
+        //               Rust via `apply_compose_filters → query_subtree_with_property`.
+        //               Optimal when a property= filter is present: the property
+        //               index is far more selective than FTS on common display
+        //               terms ("card", "structure", "right") that appear in tens
+        //               of thousands of HL7-package concepts.  Those concepts have
+        //               lower FTS rowids (imported first) and are scanned before
+        //               SNOMED on cold EBS storage, causing 10–18 s per request
+        //               and 30 s timeouts at high concurrency.
+        //
+        // `all_batchable` — true when every compose filter is either a property=
+        // or a hierarchy op (is-a / descendent-of / generalizes); false for ECL
+        // `constraint` filters which need full ECL evaluation.
+        //
+        // `has_eq_filter` guards the FTS-first branch: any property= filter forces
+        // fall-through to `apply_compose_filters` (property-first path).
         let compose_filters: &[serde_json::Value] = inc["filter"]
             .as_array()
             .map(|a| a.as_slice())
@@ -941,25 +957,15 @@ fn expand_inline_filtered(
                 (op == "=" && prop != "constraint")
                     || (prop == "concept" && matches!(op, "is-a" | "descendent-of" | "generalizes"))
             });
-
-        // FTS-first is only beneficial when there is NO property= filter.
-        // When a property= filter is present, `apply_compose_filters` →
-        // `query_subtree_with_property` starts from the (property, value) index
-        // (O(K_property) rows) and is not affected by FTS scan width.
-        // FTS-first with a property= filter is problematic: the FTS scans
-        // `concepts_fts` in rowid order and must traverse all non-SNOMED rows
-        // (HL7 packages, imported first) before reaching SNOMED matches.
-        // For common filter terms ("card", "other") this cold scan takes
-        // 10–18 s on EBS-backed storage, causing the 30 s timeout at high VU.
         let has_eq_filter = compose_filters.iter().any(|f| {
             f["op"].as_str().unwrap_or("") == "="
                 && f["property"].as_str().unwrap_or("") != "constraint"
         });
 
         if filter_lower.len() >= 3 && all_batchable && !has_eq_filter {
-            // Pure hierarchy + text (no property= filter): FTS-first is optimal
-            // because FTS narrows to text-matching candidates before the
-            // potentially large hierarchy traversal.
+            // FTS-first path: hierarchy + text, no property= filter.
+            // FTS narrows to text-matching candidates; hierarchy walk runs on
+            // the already-small set via apply_compose_filters_to_candidates.
             ensure_concepts_fts(conn, &system_id)?;
             let candidates =
                 fts_candidates_for_system(conn, &system_id, system_url, &filter_lower)?;
