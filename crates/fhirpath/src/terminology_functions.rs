@@ -67,7 +67,7 @@ impl TerminologyFunctions {
     ) -> Result<EvaluationResult, EvaluationError> {
         // Extract ValueSet URL
         let value_set_url = match value_set {
-            EvaluationResult::String(url, _) => url.clone(),
+            EvaluationResult::String(url, _, _) => url.clone(),
             _ => {
                 return Err(EvaluationError::TypeError(
                     "expand() requires a ValueSet URL as string".to_string(),
@@ -129,7 +129,7 @@ impl TerminologyFunctions {
     ) -> Result<EvaluationResult, EvaluationError> {
         // Extract ValueSet URL
         let value_set_url = match value_set {
-            EvaluationResult::String(url, _) => url.clone(),
+            EvaluationResult::String(url, _, _) => url.clone(),
             _ => {
                 return Err(EvaluationError::TypeError(
                     "validateVS() requires a ValueSet URL as string".to_string(),
@@ -179,7 +179,7 @@ impl TerminologyFunctions {
     ) -> Result<EvaluationResult, EvaluationError> {
         // Extract CodeSystem URL
         let code_system_url = match code_system {
-            EvaluationResult::String(url, _) => url.clone(),
+            EvaluationResult::String(url, _, _) => url.clone(),
             _ => {
                 return Err(EvaluationError::TypeError(
                     "validateCS() requires a CodeSystem URL as string".to_string(),
@@ -224,7 +224,7 @@ impl TerminologyFunctions {
     ) -> Result<EvaluationResult, EvaluationError> {
         // Extract system URL
         let system_url = match system {
-            EvaluationResult::String(url, _) => url.clone(),
+            EvaluationResult::String(url, _, _) => url.clone(),
             _ => {
                 return Err(EvaluationError::TypeError(
                     "subsumes() requires a system URL as string".to_string(),
@@ -281,7 +281,7 @@ impl TerminologyFunctions {
     ) -> Result<EvaluationResult, EvaluationError> {
         // Extract ConceptMap URL
         let concept_map_url = match concept_map {
-            EvaluationResult::String(url, _) => url.clone(),
+            EvaluationResult::String(url, _, _) => url.clone(),
             _ => {
                 return Err(EvaluationError::TypeError(
                     "translate() requires a ConceptMap URL as string".to_string(),
@@ -326,14 +326,14 @@ impl TerminologyFunctions {
 fn extract_coding(coded: &EvaluationResult) -> Result<(String, String), EvaluationError> {
     match coded {
         // Direct code string
-        EvaluationResult::String(code, _) => Ok((String::new(), code.clone())),
+        EvaluationResult::String(code, _, _) => Ok((String::new(), code.clone())),
 
         // Coding object
         EvaluationResult::Object { map, .. } => {
             let system = map
                 .get("system")
                 .and_then(|v| match v {
-                    EvaluationResult::String(s, _) => Some(s.clone()),
+                    EvaluationResult::String(s, _, _) => Some(s.clone()),
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -341,7 +341,7 @@ fn extract_coding(coded: &EvaluationResult) -> Result<(String, String), Evaluati
             let code = map
                 .get("code")
                 .and_then(|v| match v {
-                    EvaluationResult::String(c, _) => Some(c.clone()),
+                    EvaluationResult::String(c, _, _) => Some(c.clone()),
                     _ => None,
                 })
                 .ok_or_else(|| {
@@ -363,14 +363,14 @@ fn extract_coding_with_display(
 ) -> Result<(String, String, Option<String>), EvaluationError> {
     match coded {
         // Direct code string
-        EvaluationResult::String(code, _) => Ok((String::new(), code.clone(), None)),
+        EvaluationResult::String(code, _, _) => Ok((String::new(), code.clone(), None)),
 
         // Coding object
         EvaluationResult::Object { map, .. } => {
             let system = map
                 .get("system")
                 .and_then(|v| match v {
-                    EvaluationResult::String(s, _) => Some(s.clone()),
+                    EvaluationResult::String(s, _, _) => Some(s.clone()),
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -378,7 +378,7 @@ fn extract_coding_with_display(
             let code = map
                 .get("code")
                 .and_then(|v| match v {
-                    EvaluationResult::String(c, _) => Some(c.clone()),
+                    EvaluationResult::String(c, _, _) => Some(c.clone()),
                     _ => None,
                 })
                 .ok_or_else(|| {
@@ -386,7 +386,7 @@ fn extract_coding_with_display(
                 })?;
 
             let display = map.get("display").and_then(|v| match v {
-                EvaluationResult::String(d, _) => Some(d.clone()),
+                EvaluationResult::String(d, _, _) => Some(d.clone()),
                 _ => None,
             });
 
@@ -415,7 +415,7 @@ fn extract_params_map(
                     if let EvaluationResult::Object { map: param_map, .. } = item {
                         if let (Some(name), Some(value)) = (
                             param_map.get("name").and_then(|n| match n {
-                                EvaluationResult::String(s, _) => Some(s),
+                                EvaluationResult::String(s, _, _) => Some(s),
                                 _ => None,
                             }),
                             extract_parameter_value(param_map),
@@ -427,7 +427,7 @@ fn extract_params_map(
             } else {
                 // Treat as simple key-value map
                 for (key, value) in map {
-                    if let EvaluationResult::String(v, _) = value {
+                    if let EvaluationResult::String(v, _, _) = value {
                         params_map.insert(key.clone(), v.clone());
                     }
                 }
@@ -447,10 +447,10 @@ fn extract_parameter_value(param_map: &HashMap<String, EvaluationResult>) -> Opt
     for (key, value) in param_map {
         if key.starts_with("value") {
             match value {
-                EvaluationResult::String(s, _) => return Some(s.clone()),
-                EvaluationResult::Boolean(b, _) => return Some(b.to_string()),
-                EvaluationResult::Integer(i, _) => return Some(i.to_string()),
-                EvaluationResult::Decimal(d, _) => return Some(d.to_string()),
+                EvaluationResult::String(s, _, _) => return Some(s.clone()),
+                EvaluationResult::Boolean(b, _, _) => return Some(b.to_string()),
+                EvaluationResult::Integer(i, _, _) => return Some(i.to_string()),
+                EvaluationResult::Decimal(d, _, _) => return Some(d.to_string()),
                 _ => {}
             }
         }
@@ -520,15 +520,15 @@ pub fn member_of(
             for item in items {
                 if let EvaluationResult::Object { map: param_map, .. } = item {
                     if param_map.get("name").and_then(|n| match n {
-                        EvaluationResult::String(s, _) => Some(s.as_str()),
+                        EvaluationResult::String(s, _, _) => Some(s.as_str()),
                         _ => None,
                     }) == Some("result")
                     {
                         // Return the boolean value
-                        if let Some(EvaluationResult::Boolean(result, type_info)) =
+                        if let Some(EvaluationResult::Boolean(result, type_info, _)) =
                             param_map.get("valueBoolean")
                         {
-                            return Ok(EvaluationResult::Boolean(*result, type_info.clone()));
+                            return Ok(EvaluationResult::Boolean(*result, type_info.clone(), None));
                         }
                     }
                 }

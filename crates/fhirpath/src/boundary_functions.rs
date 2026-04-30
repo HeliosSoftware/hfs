@@ -42,7 +42,7 @@ pub fn low_boundary_function(
         None
     } else if args.len() == 1 {
         match &args[0] {
-            EvaluationResult::Integer(p, _) => {
+            EvaluationResult::Integer(p, _, _) => {
                 if *p < 0 {
                     return Err(EvaluationError::InvalidArgument(
                         "lowBoundary precision must be >= 0".to_string(),
@@ -70,38 +70,38 @@ pub fn low_boundary_function(
     // Handle each type according to FHIRPath boundary rules
     Ok(match invocation_base {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Decimal(d, _) => {
+        EvaluationResult::Decimal(d, _, _) => {
             // For decimals, the low boundary depends on the precision
             let precision = precision_param.unwrap_or(8); // Default precision is 8 
             let low_bound = calculate_decimal_low_boundary(*d, precision);
             EvaluationResult::decimal(low_bound)
         }
-        EvaluationResult::Integer(i, _) => {
+        EvaluationResult::Integer(i, _, _) => {
             // For integers, treat as decimal
             let decimal_val = Decimal::from(*i);
             let precision = precision_param.unwrap_or(8); // Default precision is 8
             let low_bound = calculate_decimal_low_boundary(decimal_val, precision);
             EvaluationResult::decimal(low_bound)
         }
-        EvaluationResult::Quantity(value, unit, _) => {
+        EvaluationResult::Quantity(value, unit, _, _) => {
             // For quantities, apply boundary to the value part
             let precision = precision_param.unwrap_or(8); // Default precision is 8
             let low_bound = calculate_decimal_low_boundary(*value, precision);
             EvaluationResult::quantity(low_bound, unit.clone())
         }
-        EvaluationResult::Date(date_str, _) => {
+        EvaluationResult::Date(date_str, _, _) => {
             // For dates, return the earliest possible date given the precision
             calculate_date_low_boundary(date_str, precision_param)
         }
-        EvaluationResult::DateTime(datetime_str, _) => {
+        EvaluationResult::DateTime(datetime_str, _, _) => {
             // For datetimes, return the earliest possible datetime given the precision
             calculate_datetime_low_boundary(datetime_str, precision_param)
         }
-        EvaluationResult::Time(time_str, _) => {
+        EvaluationResult::Time(time_str, _, _) => {
             // For times, return the earliest possible time given the precision
             calculate_time_low_boundary(time_str, precision_param)
         }
-        EvaluationResult::String(s, type_info) => {
+        EvaluationResult::String(s, type_info, _) => {
             // Handle FHIR primitive values that are represented as strings
             if let Some(ti) = type_info {
                 match ti.name.to_lowercase().as_str() {
@@ -174,7 +174,7 @@ pub fn high_boundary_function(
         None
     } else if args.len() == 1 {
         match &args[0] {
-            EvaluationResult::Integer(p, _) => {
+            EvaluationResult::Integer(p, _, _) => {
                 if *p < 0 {
                     return Err(EvaluationError::InvalidArgument(
                         "highBoundary precision must be >= 0".to_string(),
@@ -202,39 +202,39 @@ pub fn high_boundary_function(
     // Handle each type according to FHIRPath boundary rules
     Ok(match invocation_base {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Decimal(d, _) => {
+        EvaluationResult::Decimal(d, _, _) => {
             // For decimals, the high boundary depends on the precision
             // Default precision is 8 for decimals
             let precision = precision_param.unwrap_or(8);
             let high_bound = calculate_decimal_high_boundary(*d, precision);
             EvaluationResult::decimal(high_bound)
         }
-        EvaluationResult::Integer(i, _) => {
+        EvaluationResult::Integer(i, _, _) => {
             // For integers, treat as decimal
             let decimal_val = Decimal::from(*i);
             let precision = precision_param.unwrap_or(8); // Default precision is 8
             let high_bound = calculate_decimal_high_boundary(decimal_val, precision);
             EvaluationResult::decimal(high_bound)
         }
-        EvaluationResult::Quantity(value, unit, _) => {
+        EvaluationResult::Quantity(value, unit, _, _) => {
             // For quantities, apply boundary to the value part
             let precision = precision_param.unwrap_or(8); // Default precision is 8
             let high_bound = calculate_decimal_high_boundary(*value, precision);
             EvaluationResult::quantity(high_bound, unit.clone())
         }
-        EvaluationResult::Date(date_str, _) => {
+        EvaluationResult::Date(date_str, _, _) => {
             // For dates, return the latest possible date given the precision
             calculate_date_high_boundary(date_str, precision_param)
         }
-        EvaluationResult::DateTime(datetime_str, _) => {
+        EvaluationResult::DateTime(datetime_str, _, _) => {
             // For datetimes, return the latest possible datetime given the precision
             calculate_datetime_high_boundary(datetime_str, precision_param)
         }
-        EvaluationResult::Time(time_str, _) => {
+        EvaluationResult::Time(time_str, _, _) => {
             // For times, return the latest possible time given the precision
             calculate_time_high_boundary(time_str, precision_param)
         }
-        EvaluationResult::String(s, type_info) => {
+        EvaluationResult::String(s, type_info, _) => {
             // Handle FHIR primitive values that are represented as strings
             if let Some(ti) = type_info {
                 match ti.name.to_lowercase().as_str() {
@@ -635,7 +635,7 @@ fn calculate_datetime_low_boundary(
     } else {
         // No time part, treat as date-only but convert to datetime with earliest timezone
         let low_date = match calculate_date_low_boundary(datetime_str, None) {
-            EvaluationResult::Date(d, _) => d,
+            EvaluationResult::Date(d, _, _) => d,
             _ => datetime_str.to_string(),
         };
         EvaluationResult::datetime(format!("@{}T00:00:00.000+14:00", low_date))
@@ -690,7 +690,7 @@ fn calculate_datetime_high_boundary(
     } else {
         // No time part, treat as date-only but convert to datetime with latest timezone
         let high_date = match calculate_date_high_boundary(datetime_str, None) {
-            EvaluationResult::Date(d, _) => d,
+            EvaluationResult::Date(d, _, _) => d,
             _ => datetime_str.to_string(),
         };
         EvaluationResult::datetime(format!("@{}T23:59:59.999-12:00", high_date))
