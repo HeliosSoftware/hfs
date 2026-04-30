@@ -1,9 +1,12 @@
 //! SearchProvider, TextSearchProvider, IncludeProvider, and RevincludeProvider
 //! implementations for the Elasticsearch backend.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use elasticsearch::SearchParts;
 use serde_json::{Value, json};
+use tokio::time::sleep;
 
 use crate::core::ResourceStorage;
 use crate::core::search::{
@@ -29,6 +32,130 @@ fn internal_error(message: String) -> crate::error::StorageError {
     })
 }
 
+/// Maximum retry attempts for transient ES search failures (in addition to the
+/// initial attempt). Transient failures observed in CI: shard allocation
+/// flapping during recovery/relocation, brief master-node hiccups.
+const MAX_SEARCH_RETRIES: u32 = 2;
+
+/// Initial backoff before retrying a transient ES error. Doubled per attempt.
+const RETRY_BASE_DELAY_MS: u64 = 100;
+
+/// Returns true if an ES failure response indicates a transient,
+/// safe-to-retry condition rather than a permanent error.
+///
+/// `no_shard_available_action_exception` and `search_phase_execution_exception`
+/// are documented as retryable; HTTP 503 covers the general "service
+/// unavailable" case (often surfaced when shards are still recovering).
+fn is_transient_es_error(status: u16, body: &str) -> bool {
+    status == 503
+        || body.contains("no_shard_available_action_exception")
+        || body.contains("search_phase_execution_exception")
+}
+
+/// Result of a single search attempt: either a parsed body, an empty
+/// "index does not exist" sentinel, or a (possibly transient) failure.
+enum SearchAttempt {
+    Body(Value),
+    EmptyIndex,
+    Transient { status: u16, body: String },
+    Permanent(crate::error::StorageError),
+}
+
+/// Sends a single ES search request and classifies the response.
+async fn send_search_once(
+    backend: &ElasticsearchBackend,
+    index: &str,
+    body: Value,
+) -> SearchAttempt {
+    let response = backend
+        .client()
+        .search(SearchParts::Index(&[index]))
+        .body(body)
+        .send()
+        .await;
+
+    let response = match response {
+        Ok(r) => r,
+        Err(e) => {
+            // Connection-level failure — treat the same as missing index so
+            // searches don't 500 against a backend that isn't ready yet.
+            tracing::debug!("ES search request failed (index may not exist): {}", e);
+            return SearchAttempt::EmptyIndex;
+        }
+    };
+
+    if response.status_code().is_success() {
+        return match response.json::<Value>().await {
+            Ok(v) => SearchAttempt::Body(v),
+            Err(e) => SearchAttempt::Permanent(internal_error(format!(
+                "Failed to parse search response: {}",
+                e
+            ))),
+        };
+    }
+
+    let status = response.status_code().as_u16();
+    let resp_body = response.text().await.unwrap_or_default();
+
+    if resp_body.contains("index_not_found_exception") {
+        return SearchAttempt::EmptyIndex;
+    }
+
+    if is_transient_es_error(status, &resp_body) {
+        SearchAttempt::Transient {
+            status,
+            body: resp_body,
+        }
+    } else {
+        SearchAttempt::Permanent(internal_error(format!("Search failed: {}", resp_body)))
+    }
+}
+
+/// Sends an ES search and retries on transient errors with exponential backoff.
+///
+/// Returns:
+/// - `Ok(Some(value))` — successful response, parsed JSON body
+/// - `Ok(None)` — index does not exist (caller returns empty results)
+/// - `Err(...)` — non-transient failure, or transient retries exhausted
+async fn send_search_with_retry(
+    backend: &ElasticsearchBackend,
+    index: &str,
+    body: Value,
+) -> StorageResult<Option<Value>> {
+    let mut last_transient: Option<(u16, String)> = None;
+
+    for attempt in 0..=MAX_SEARCH_RETRIES {
+        match send_search_once(backend, index, body.clone()).await {
+            SearchAttempt::Body(v) => return Ok(Some(v)),
+            SearchAttempt::EmptyIndex => return Ok(None),
+            SearchAttempt::Permanent(e) => return Err(e),
+            SearchAttempt::Transient { status, body } => {
+                if attempt < MAX_SEARCH_RETRIES {
+                    let delay_ms = RETRY_BASE_DELAY_MS << attempt;
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max = MAX_SEARCH_RETRIES + 1,
+                        delay_ms,
+                        status,
+                        index,
+                        "Transient ES search failure, retrying"
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+                last_transient = Some((status, body));
+            }
+        }
+    }
+
+    let (status, body) = last_transient.expect("transient branch always sets last_transient");
+    Err(internal_error(format!(
+        "Search failed after {} attempts (status {}): {}",
+        MAX_SEARCH_RETRIES + 1,
+        status,
+        body
+    )))
+}
+
 #[async_trait]
 impl SearchProvider for ElasticsearchBackend {
     async fn search(
@@ -44,36 +171,11 @@ impl SearchProvider for ElasticsearchBackend {
         let builder = EsQueryBuilder::new(tenant_id, resource_type, index.clone());
         let es_query = builder.build(query);
 
-        // Execute search
-        let response = self
-            .client()
-            .search(SearchParts::Index(&[&index]))
-            .body(es_query.body)
-            .send()
-            .await;
-
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
-                // Index might not exist yet - return empty results
-                tracing::debug!("ES search failed (index may not exist): {}", e);
-                return Ok(SearchResult::new(Page::new(vec![], PageInfo::end())));
-            }
+        // Execute search (with retry on transient shard-availability errors)
+        let body = match send_search_with_retry(self, &index, es_query.body).await? {
+            Some(v) => v,
+            None => return Ok(SearchResult::new(Page::new(vec![], PageInfo::end()))),
         };
-
-        if !response.status_code().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            // 404 means index doesn't exist - return empty results
-            if body.contains("index_not_found_exception") {
-                return Ok(SearchResult::new(Page::new(vec![], PageInfo::end())));
-            }
-            return Err(internal_error(format!("Search failed: {}", body)));
-        }
-
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| internal_error(format!("Failed to parse search response: {}", e)))?;
 
         // Parse hits
         let hits = body
@@ -293,32 +395,10 @@ async fn execute_text_search(
     body: Value,
     tenant: &TenantContext,
 ) -> StorageResult<SearchResult> {
-    let response = backend
-        .client()
-        .search(SearchParts::Index(&[index]))
-        .body(body)
-        .send()
-        .await;
-
-    let response = match response {
-        Ok(r) => r,
-        Err(_) => {
-            return Ok(SearchResult::new(Page::new(vec![], PageInfo::end())));
-        }
+    let body = match send_search_with_retry(backend, index, body).await? {
+        Some(v) => v,
+        None => return Ok(SearchResult::new(Page::new(vec![], PageInfo::end()))),
     };
-
-    if !response.status_code().is_success() {
-        let body = response.text().await.unwrap_or_default();
-        if body.contains("index_not_found_exception") {
-            return Ok(SearchResult::new(Page::new(vec![], PageInfo::end())));
-        }
-        return Err(internal_error(format!("Text search failed: {}", body)));
-    }
-
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| internal_error(format!("Failed to parse response: {}", e)))?;
 
     let hits = body
         .get("hits")
@@ -560,4 +640,32 @@ fn parse_reference_string(reference: &str) -> Option<(String, String)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_es_error_classification() {
+        // Real failure body observed in CI (HFS log):
+        let no_shard = r#"{"error":{"root_cause":[{"type":"no_shard_available_action_exception","reason":"..."}],"type":"search_phase_execution_exception","reason":"all shards failed"},"status":503}"#;
+        assert!(is_transient_es_error(500, no_shard));
+        assert!(is_transient_es_error(503, ""));
+        assert!(is_transient_es_error(
+            500,
+            r#"{"error":{"type":"search_phase_execution_exception"}}"#
+        ));
+
+        // Permanent failures must not be retried.
+        assert!(!is_transient_es_error(
+            400,
+            r#"{"error":{"type":"parsing_exception"}}"#
+        ));
+        assert!(!is_transient_es_error(
+            500,
+            r#"{"error":{"type":"illegal_argument_exception"}}"#
+        ));
+        assert!(!is_transient_es_error(404, "index_not_found_exception"));
+    }
 }
