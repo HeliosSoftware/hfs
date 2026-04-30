@@ -381,6 +381,11 @@ mod inner {
             importer.delete_normalized(resource_type, url).await?;
         }
 
+        // Evict any cached $expand results so deleted ValueSets (and CodeSystems
+        // whose concepts would otherwise stay in cached expansions) are not served
+        // from the in-memory cache after deletion.
+        state.clear_expand_cache();
+
         Ok(StatusCode::NO_CONTENT.into_response())
     }
 
