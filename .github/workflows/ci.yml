@@ -298,7 +298,9 @@ jobs:
         run: cargo install cargo-llvm-cov
 
       - name: Generate code coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        # Skip docker-dependent email integration tests; they run in
+        # subscriptions-channels.yml where mailpit is provisioned.
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info -- --skip email_
 
       # Upload coverage report as artifact
       - name: Upload Coverage Report
@@ -1111,7 +1113,7 @@ jobs:
           DEPLOY_USER: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_USER || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_USER || matrix.server == 'hts' && secrets.HTS_DEPLOY_USER || secrets.HFS_DEPLOY_USER }}
           DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || matrix.server == 'hts' && secrets.HTS_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
           SERVER_NAME: ${{ matrix.server }}
-          HFS_PUBLIC_URL: ${{ secrets.HFS_BASE_URL }}
+          HFS_PUBLIC_URL: ${{ secrets.HFS_PUBLIC_URL }}
         run: |
           # Define SSH command with proper options (runner's own key is trusted by targets)
           SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"

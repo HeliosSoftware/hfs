@@ -360,8 +360,8 @@ The matrix below shows which FHIR operations each backend supports. This reflect
 | **Advanced Search**                                                         |
 | [Chained Parameters](https://build.fhir.org/search.html#chaining)           | ✓      | ◐          | ○       | ✗         | ○     | ✗             | ✗   |
 | [Reverse Chaining (\_has)](https://build.fhir.org/search.html#has)          | ✓      | ◐          | ○       | ✗         | ○     | ✗             | ✗   |
-| [\_include](https://build.fhir.org/search.html#include)                     | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
-| [\_revinclude](https://build.fhir.org/search.html#revinclude)               | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
+| [\_include](https://build.fhir.org/search.html#include)                     | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
+| [\_revinclude](https://build.fhir.org/search.html#revinclude)               | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | **[Pagination](https://build.fhir.org/http.html#paging)**                   |
 | Offset                                                                      | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | Cursor (keyset)                                                             | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
@@ -535,6 +535,7 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 - Versioning and history providers (`vread`, instance/type/system history)
 - Transaction bundles with urn:uuid reference resolution (requires replica set)
 - Native search (string, token, reference, date, number, URI parameters)
+- `_include` and `_revinclude` resolution
 - Conditional create, update, and delete operations
 - Cursor and offset pagination with multi-field sorting
 - Shared-schema multitenancy with strict tenant filtering
