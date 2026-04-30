@@ -235,7 +235,8 @@ fn handle_parse_debug(args: &Args) -> FhirPathResult<()> {
     let output = if args.parse_debug_tree {
         // Generate JSON debug tree
         // Create a default type context for CLI usage
-        let type_context = crate::type_inference::TypeContext::new();
+        let type_context =
+            crate::type_inference::TypeContext::new().with_version(args.fhir_version);
         let debug_tree = expression_to_debug_tree(&parsed, &type_context);
         serde_json::to_string_pretty(&debug_tree)?
     } else {

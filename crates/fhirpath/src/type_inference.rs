@@ -4,6 +4,7 @@
 //! determining the return type of expressions without evaluating them.
 
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
+use helios_fhir::FhirVersion;
 use std::collections::HashMap;
 
 /// Represents a type in the FHIRPath type system
@@ -71,6 +72,8 @@ pub struct TypeContext {
     pub current_type: Option<InferredType>,
     /// Variables and their types
     pub variables: HashMap<String, InferredType>,
+    /// FHIR version used for field-type lookup. When unset, defaults to R4.
+    pub version: Option<FhirVersion>,
 }
 
 impl TypeContext {
@@ -81,6 +84,11 @@ impl TypeContext {
     pub fn with_root_type(mut self, root_type: InferredType) -> Self {
         self.current_type = Some(root_type.clone());
         self.root_type = Some(root_type);
+        self
+    }
+
+    pub fn with_version(mut self, version: FhirVersion) -> Self {
+        self.version = Some(version);
         self
     }
 }
@@ -214,7 +222,7 @@ fn infer_literal_type(literal: &Literal) -> Option<InferredType> {
 fn infer_invocation_type(
     invocation: &Invocation,
     input_type: &InferredType,
-    _context: &TypeContext,
+    context: &TypeContext,
 ) -> Option<InferredType> {
     match invocation {
         Invocation::Function(name, args) => {
@@ -222,7 +230,7 @@ fn infer_invocation_type(
         }
         Invocation::Member(name) => {
             // Member access depends on the input type
-            infer_member_type(name, input_type)
+            infer_member_type(name, input_type, context)
         }
         Invocation::This => Some(input_type.clone()),
         Invocation::Index => Some(InferredType::system("Integer")),
@@ -230,28 +238,86 @@ fn infer_invocation_type(
     }
 }
 
-fn infer_member_type(member_name: &str, input_type: &InferredType) -> Option<InferredType> {
-    // This is a simplified version - in reality, we'd need the full FHIR schema
-    match input_type.name.as_str() {
-        "Patient" => match member_name {
-            "name" => Some(InferredType::fhir("HumanName").collection()),
-            "birthDate" => Some(InferredType::system("Date")),
-            "gender" => Some(InferredType::system("code")),
-            "identifier" => Some(InferredType::fhir("Identifier").collection()),
-            _ => Some(InferredType::system("String")), // Default fallback
-        },
-        "HumanName" => match member_name {
-            "family" => Some(InferredType::system("String")),
-            "given" => Some(InferredType::system("String").collection()),
-            "text" => Some(InferredType::system("String")),
-            "use" => Some(InferredType::system("code")),
-            _ => Some(InferredType::system("String")),
-        },
-        _ => {
-            // Generic fallback - could be improved with full schema
-            Some(InferredType::system("String"))
-        }
+fn infer_member_type(
+    member_name: &str,
+    input_type: &InferredType,
+    context: &TypeContext,
+) -> Option<InferredType> {
+    let version = context.version.unwrap_or_default();
+    let (ty, is_collection) = lookup_field_type(version, &input_type.name, member_name)?;
+
+    let mut inferred = if is_system_primitive(ty) {
+        InferredType::system(ty)
+    } else {
+        InferredType::fhir(ty)
+    };
+    if is_collection || input_type.is_collection {
+        inferred = inferred.collection();
     }
+    Some(inferred)
+}
+
+/// Dispatches a field-type lookup to the per-version generated table in `helios-fhir`.
+fn lookup_field_type(
+    version: FhirVersion,
+    parent_type: &str,
+    field_name: &str,
+) -> Option<(&'static str, bool)> {
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => helios_fhir::r4::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => helios_fhir::r4b::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => helios_fhir::r5::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => helios_fhir::r6::get_field_type(parent_type, field_name),
+    }
+}
+
+/// Returns true if the given FHIR type code corresponds to a FHIRPath system primitive.
+///
+/// FHIR primitive datatypes (lowercase, e.g. `boolean`, `integer`, `string`) and the
+/// `System.*` URL forms (already stripped to `Boolean`, `Integer`, `String` by the
+/// generator) project to the FHIRPath `system` namespace; everything else is `FHIR.<Name>`.
+fn is_system_primitive(ty: &str) -> bool {
+    matches!(
+        ty,
+        // Lowercase FHIR primitive type codes
+        "boolean"
+            | "integer"
+            | "integer64"
+            | "decimal"
+            | "string"
+            | "code"
+            | "id"
+            | "uri"
+            | "url"
+            | "canonical"
+            | "oid"
+            | "uuid"
+            | "markdown"
+            | "base64Binary"
+            | "instant"
+            | "date"
+            | "dateTime"
+            | "time"
+            | "positiveInt"
+            | "unsignedInt"
+            | "xhtml"
+            // Capitalized System.* names (FHIRPath system primitives) — note
+            // we deliberately exclude `Quantity` because the FHIR complex type
+            // `Quantity` shares the same name and is the overwhelmingly common
+            // referent.
+            | "Boolean"
+            | "Integer"
+            | "Long"
+            | "Decimal"
+            | "String"
+            | "Date"
+            | "DateTime"
+            | "Time"
+    )
 }
 
 fn infer_function_return_type(

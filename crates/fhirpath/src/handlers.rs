@@ -70,8 +70,8 @@ pub async fn evaluate_fhirpath(
             .into_result()
         {
             Ok(spanned) => {
-                // Create a type context with the resource type
-                let mut type_context = TypeContext::new();
+                // Create a type context with the resource type and FHIR version
+                let mut type_context = TypeContext::new().with_version(fhir_version);
 
                 // Try to infer the root resource type from the resource JSON
                 if let Some(resource_type) =
@@ -261,6 +261,7 @@ async fn evaluate_fhirpath_with_version(
 
     // Parse resource with specific version
     let fhir_resource = parse_fhir_resource(resource_json.clone(), version)?;
+    let fhir_version = version;
 
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
@@ -287,8 +288,8 @@ async fn evaluate_fhirpath_with_version(
             .into_result()
         {
             Ok(spanned) => {
-                // Create a type context with the resource type
-                let mut type_context = TypeContext::new();
+                // Create a type context with the resource type and FHIR version
+                let mut type_context = TypeContext::new().with_version(fhir_version);
 
                 // Try to infer the root resource type from the resource JSON
                 if let Some(resource_type) =
