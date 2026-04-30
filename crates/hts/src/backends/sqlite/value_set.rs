@@ -2342,11 +2342,12 @@ fn bfs_expand_page(
 
 /// Return one page of `IsA` or `DescendentOf` hierarchy descendants.
 ///
-/// Replaces the previous in-memory BFS with a single SQL query against the
-/// precomputed `concept_closure` table, which makes every call O(1) with
-/// respect to total descendants — the planner uses the covering index on
-/// `(system_id, ancestor_code, descendant_code)` and returns exactly
-/// `limit` rows after `offset` without touching the rest of the tree.
+/// Queries the precomputed `concept_closure` table.  The closure primary key
+/// `(system_id, ancestor_code, descendant_code)` already delivers rows in
+/// `descendant_code` order — no explicit ORDER BY is needed, and SQLite can
+/// stop the join after `limit` rows rather than materialising all descendants
+/// to sort them.  This reduces EX02-style hierarchy page requests from
+/// O(N_descendants) to O(limit).
 ///
 /// `include_root=true` — is-a / `<<` semantics (self + descendants).
 /// `include_root=false` — descendent-of / `<` semantics (descendants only).
@@ -2390,7 +2391,6 @@ fn bfs_isa_page(
                      WHERE  cf.system_id = ?5
                        AND  concepts_fts MATCH ?1
                        AND  (cf.code != ?4 OR ?6)
-                     ORDER BY cf.code
                      LIMIT ?2 OFFSET ?3",
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -2421,7 +2421,6 @@ fn bfs_isa_page(
                    AND  cc.ancestor_code = ?4
                    AND  (cc.descendant_code != ?4 OR ?6)
                    AND  (LOWER(c.code) LIKE ?1 OR LOWER(COALESCE(c.display,'')) LIKE ?1)
-                 ORDER BY c.code
                  LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -2443,6 +2442,9 @@ fn bfs_isa_page(
     }
 
     // No filter: pure closure lookup.
+    // No ORDER BY: the closure PK (system_id, ancestor_code, descendant_code)
+    // already delivers rows in descendant_code order, so SQLite can stop the
+    // nested-loop join at LIMIT without materialising all descendants.
     let mut stmt = conn
         .prepare_cached(
             "SELECT c.code, c.display
@@ -2451,7 +2453,6 @@ fn bfs_isa_page(
              WHERE  cc.system_id = ?4
                AND  cc.ancestor_code = ?1
                AND  (cc.descendant_code != ?1 OR ?5)
-             ORDER BY c.code
              LIMIT ?2 OFFSET ?3",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
