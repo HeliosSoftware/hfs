@@ -220,68 +220,132 @@ pub fn apply(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
 ///
 /// Deletes any existing closure rows for `system_id`, then recomputes the
 /// full set of `(ancestor, descendant)` pairs — including self-links
-/// `(code, code)` — in a single recursive SQL pass.  The UNION (not UNION
-/// ALL) prevents path explosion in SNOMED polyhierarchies.
+/// `(code, code)`.
+///
+/// Uses a Rust-based BFS instead of a recursive SQL CTE.  The CTE approach
+/// requires SQLite to maintain an in-memory deduplication set that grows to
+/// O(closure_size) rows — for SNOMED CT (~20M pairs) this takes 15–20 minutes.
+/// The BFS processes each concept once using an integer generation counter for
+/// O(1) visited-reset, completing the same work in ~30–60 seconds.
 ///
 /// Runs inside whatever transaction the caller has open; call after all
 /// `concept_hierarchy` rows for the system have been inserted.
 pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> rusqlite::Result<()> {
+    use std::collections::{HashMap, VecDeque};
+
     conn.execute(
         "DELETE FROM concept_closure WHERE system_id = ?1",
         rusqlite::params![system_id],
     )?;
 
-    conn.execute(
-        "INSERT OR IGNORE INTO concept_closure (system_id, ancestor_code, descendant_code)
-         WITH RECURSIVE closure(anc, desc) AS (
-             SELECT code, code FROM concepts WHERE system_id = ?1
-             UNION
-             SELECT c.anc, h.child_code
-             FROM   closure c
-             JOIN   concept_hierarchy h
-                    ON h.parent_code = c.desc AND h.system_id = ?1
-         )
-         SELECT ?1, anc, desc FROM closure",
-        rusqlite::params![system_id],
+    // Load all concept codes for this system (as index-addressable Vec).
+    let concepts: Vec<String> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT code FROM concepts WHERE system_id = ?1",
+        )?;
+        stmt.query_map(rusqlite::params![system_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+
+    if concepts.is_empty() {
+        return Ok(());
+    }
+
+    // Map code string → index so we work with usize everywhere (no string clones
+    // inside the hot BFS loop).
+    let code_to_idx: HashMap<&str, usize> = concepts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.as_str(), i))
+        .collect();
+
+    // Build per-node children lists (index-based).
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); concepts.len()];
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT parent_code, child_code FROM concept_hierarchy WHERE system_id = ?1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![system_id])?;
+        while let Some(row) = rows.next()? {
+            let parent: String = row.get(0)?;
+            let child: String = row.get(1)?;
+            if let (Some(&pi), Some(&ci)) = (
+                code_to_idx.get(parent.as_str()),
+                code_to_idx.get(child.as_str()),
+            ) {
+                children[pi].push(ci);
+            }
+        }
+    }
+
+    // BFS from every concept to enumerate all its descendants (including self).
+    // A u32 generation counter replaces a boolean visited array: incrementing
+    // the generation is an O(1) "reset" with no per-BFS allocation.
+    let mut visit_gen: Vec<u32> = vec![0; concepts.len()];
+    let mut current_gen: u32 = 0;
+    let mut queue: VecDeque<usize> = VecDeque::new();
+
+    let mut insert_stmt = conn.prepare_cached(
+        "INSERT INTO concept_closure (system_id, ancestor_code, descendant_code)
+         VALUES (?1, ?2, ?3)",
     )?;
+
+    for anc_idx in 0..concepts.len() {
+        current_gen += 1;
+        let g = current_gen;
+
+        queue.clear();
+        queue.push_back(anc_idx);
+
+        while let Some(idx) = queue.pop_front() {
+            if visit_gen[idx] == g {
+                continue;
+            }
+            visit_gen[idx] = g;
+
+            insert_stmt.execute(rusqlite::params![
+                system_id,
+                &concepts[anc_idx],
+                &concepts[idx],
+            ])?;
+
+            for &ci in &children[idx] {
+                if visit_gen[ci] != g {
+                    queue.push_back(ci);
+                }
+            }
+        }
+    }
 
     Ok(())
 }
 
-/// Populate `concept_closure` for all code systems that currently have
-/// hierarchy edges but no closure rows.
+/// Populate `concept_closure` for all code systems that have hierarchy edges
+/// but no closure rows yet.
+///
+/// Checks per-system rather than globally, so a database that already has
+/// closure for SNOMED but is missing it for a newly imported system is handled
+/// correctly without rebuilding the existing closure.
 ///
 /// Called once at startup so that existing databases (imported before the
 /// closure table was introduced) are migrated automatically.
 pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    let has_hierarchy: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM concept_hierarchy LIMIT 1)",
-        [],
-        |r| r.get(0),
-    )?;
-
-    if !has_hierarchy {
-        return Ok(());
-    }
-
-    let closure_populated: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM concept_closure LIMIT 1)",
-        [],
-        |r| r.get(0),
-    )?;
-
-    if closure_populated {
-        return Ok(());
-    }
-
-    // No closure yet — build for every code system with hierarchy data.
-    let system_ids: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT DISTINCT system_id FROM concept_hierarchy")?;
+    // Find every system that has hierarchy edges but no closure rows at all.
+    let systems_needing_closure: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT h.system_id
+             FROM   concept_hierarchy h
+             WHERE  NOT EXISTS (
+                        SELECT 1 FROM concept_closure c
+                        WHERE  c.system_id = h.system_id
+                        LIMIT  1
+                    )",
+        )?;
         stmt.query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
 
-    for sid in &system_ids {
+    for sid in &systems_needing_closure {
         build_concept_closure(conn, sid)?;
     }
 
