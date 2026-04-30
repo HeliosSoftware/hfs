@@ -1509,19 +1509,23 @@ fn query_subtree_with_property(
     property: &str,
     value: &str,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
-    // O(1) closure JOIN replaces the previous recursive CTE.
-    // `cc.descendant_code != ?1 OR ?5` enforces descendent-of vs is-a.
+    // Property-first: idx_concept_properties_value narrows candidates to
+    // O(K_property) rows before the closure PK checks ancestry.
+    // For large SNOMED subtrees (e.g. "Disease" → 50 K descendants) with a
+    // selective property (e.g. finding-site = Airway → 100 concepts) this is
+    // several orders of magnitude faster than the closure-first approach.
     let mut stmt = conn
         .prepare_cached(
             "SELECT c.code, c.display
-             FROM   concept_closure cc
-             JOIN   concepts c ON c.system_id = ?2 AND c.code = cc.descendant_code
-             JOIN   concept_properties cp ON cp.concept_id = c.id
-             WHERE  cc.system_id = ?2
-               AND  cc.ancestor_code = ?1
-               AND  cp.property = ?3
+             FROM   concept_properties cp
+             JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?2
+             JOIN   concept_closure cc
+                    ON cc.system_id = ?2
+                    AND cc.ancestor_code = ?1
+                    AND cc.descendant_code = c.code
+             WHERE  cp.property = ?3
                AND  cp.value = ?4
-               AND  (cc.descendant_code != ?1 OR ?5)",
+               AND  (c.code != ?1 OR ?5)",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -1555,13 +1559,14 @@ fn query_property_eq(
     property: &str,
     value: &str,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
+    // Property-first: idx_concept_properties_value (property, value, concept_id)
+    // narrows to O(K) candidates before filtering by system_id from concepts.
     let mut stmt = conn
         .prepare_cached(
             "SELECT c.code, c.display
-             FROM concepts c
-             JOIN concept_properties cp ON cp.concept_id = c.id
-             WHERE c.system_id = ?1
-               AND cp.property = ?2
+             FROM concept_properties cp
+             JOIN concepts c ON c.id = cp.concept_id AND c.system_id = ?1
+             WHERE cp.property = ?2
                AND cp.value = ?3",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
