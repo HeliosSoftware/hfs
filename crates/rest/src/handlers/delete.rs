@@ -39,6 +39,7 @@ pub async fn delete_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
+    #[cfg_attr(not(feature = "subscriptions"), allow(unused_variables))]
     version: FhirVersionExtractor,
 ) -> RestResult<Response>
 where
@@ -59,11 +60,13 @@ where
         "Processing delete request"
     );
 
+    #[cfg(feature = "subscriptions")]
     let existing_resource = state
         .storage()
         .read(tenant.context(), &resource_type, &id)
         .await?;
 
+    #[cfg(feature = "subscriptions")]
     let fhir_version = existing_resource
         .as_ref()
         .map(|stored| stored.fhir_version())

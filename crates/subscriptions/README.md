@@ -33,7 +33,7 @@ The `SubscriptionEngine` orchestrates all five concerns and is the main entry po
 |---------|--------|-------|
 | `rest-hook` | Implemented | HTTP POST with custom headers, TLS enforcement for full-resource payloads |
 | `websocket` | Implemented | Binding token flow, per-subscription client registry, unidirectional server→client streaming |
-| `email` | Planned (Phase 3) | SMTP via `lettre` |
+| `email` | Implemented | SMTP via `lettre`; plain-text body + `notification.json` attachment for FHIR JSON payloads; encrypted SMTP (STARTTLS/TLS) required for `full-resource` payloads |
 | `fhir-messaging` | Planned (Phase 4) | Notification wrapped in a FHIR message Bundle |
 
 ## Architecture
@@ -159,6 +159,23 @@ Comparators supported: `eq` (default), `in`. Native `filterBy.comparator` values
 | `HFS_SUBSCRIPTION_ERROR_THRESHOLD` | `3` | Consecutive failures before `error` status |
 | `HFS_SUBSCRIPTION_OFF_THRESHOLD` | `10` | Consecutive failures before `off` status |
 | `ws_token_lifetime_secs` *(config field)* | `30` | Binding token expiry in seconds (WebSocket only) |
+
+### Email channel (SMTP)
+
+The email channel is enabled only when `HFS_SUBSCRIPTION_SMTP_HOST` and `HFS_SUBSCRIPTION_SMTP_FROM` are both set. With either missing, `email` is omitted from the server's supported channel list and any email `Subscription` is rejected with an `unsupported channel type` OperationOutcome.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_SUBSCRIPTION_SMTP_HOST` | (unset → email disabled) | SMTP relay host. |
+| `HFS_SUBSCRIPTION_SMTP_PORT` | `25` | SMTP relay port. |
+| `HFS_SUBSCRIPTION_SMTP_USERNAME` | (none) | SMTP auth username. |
+| `HFS_SUBSCRIPTION_SMTP_PASSWORD` | (none) | SMTP auth password. |
+| `HFS_SUBSCRIPTION_SMTP_ENCRYPTION` | `starttls` | `none` \| `starttls` \| `tls`. |
+| `HFS_SUBSCRIPTION_SMTP_FROM` | (unset → email disabled) | Default `From:` mailbox (RFC 5322). |
+| `HFS_SUBSCRIPTION_SMTP_DEFAULT_SUBJECT` | built-in template | Default `Subject:` template. Supports `{notification-type}`, `{topic-url}`, `{event-number}`. |
+| `HFS_SUBSCRIPTION_SMTP_TIMEOUT_SECS` | `30` | Per-send timeout. |
+
+Subscription `header` entries (R4 backport `channel.header`, native `Subscription.parameter`) named `Subject`, `From`, `Reply-To`, and `Cc` override the server defaults on a per-subscription basis. Subscriptions requesting `content=full-resource` over an `HFS_SUBSCRIPTION_SMTP_ENCRYPTION=none` transport are rejected at dispatch time (analogous to the HTTPS requirement on the rest-hook channel).
 
 ## Enabling in HFS
 
@@ -287,6 +304,30 @@ curl -X POST http://localhost:8080/Subscription \
 ```
 
 WebSocket subscriptions activate immediately (no outbound handshake is required). The endpoint field is not used — the server provides the WebSocket URL via the binding token operation.
+
+### Creating an Email Subscription
+
+With the server configured per the SMTP env vars above:
+
+```bash
+curl -X POST http://localhost:8080/Subscription \
+  -H "Content-Type: application/fhir+json" \
+  -d '{
+    "resourceType": "Subscription",
+    "status": "requested",
+    "topic": "http://example.org/topic/encounter-start",
+    "channelType": { "code": "email" },
+    "endpoint": "mailto:nurse@example.com",
+    "contentType": "application/fhir+json",
+    "content": "id-only",
+    "parameter": [
+      { "name": "Subject", "value": "Encounter started" },
+      { "name": "Reply-To", "value": "ops@example.com" }
+    ]
+  }'
+```
+
+The handshake notification is delivered as an email whose body is a short human-readable summary and whose `notification.json` attachment carries the full FHIR notification Bundle. Subsequent event notifications follow the same shape.
 
 ### Connecting via WebSocket
 

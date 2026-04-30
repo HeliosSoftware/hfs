@@ -196,6 +196,25 @@ impl SubscriptionManager {
             });
         }
 
+        // Validate email endpoint is a non-empty mailto: URI.
+        if channel.channel_type == ChannelType::Email {
+            let endpoint =
+                channel
+                    .endpoint
+                    .as_deref()
+                    .ok_or_else(|| SubscriptionError::InvalidEndpoint {
+                        message: "email channel requires a mailto: endpoint".to_string(),
+                    })?;
+            match endpoint.strip_prefix("mailto:") {
+                Some(rest) if !rest.trim().is_empty() => {}
+                _ => {
+                    return Err(SubscriptionError::InvalidEndpoint {
+                        message: "email endpoint must be a non-empty mailto: URI".to_string(),
+                    });
+                }
+            }
+        }
+
         // Parse and validate filters.
         let mut parsed_filters = Vec::new();
         for filter_str in &filter_strings {

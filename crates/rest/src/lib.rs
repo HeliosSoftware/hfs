@@ -306,8 +306,15 @@ where
             .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
             .unwrap_or(false);
         if subscriptions_enabled {
+            let smtp = build_smtp_settings_from_env();
+            let mut supported = vec!["rest-hook".to_string(), "websocket".to_string()];
+            if smtp.is_some() {
+                supported.push("email".to_string());
+                info!("Email subscription channel ENABLED");
+            }
             let sub_config = helios_subscriptions::SubscriptionConfig {
-                supported_channel_types: vec!["rest-hook".to_string(), "websocket".to_string()],
+                supported_channel_types: supported,
+                smtp,
                 ..Default::default()
             };
             let engine =
@@ -374,6 +381,62 @@ where
 
     // Apply remaining middleware
     router.layer(service_builder)
+}
+
+/// Build SMTP settings for the email subscription channel from `HFS_SUBSCRIPTION_SMTP_*`
+/// environment variables. Returns `None` when `HOST` or `FROM` is unset — in that
+/// case the email channel is not advertised and any email Subscription is rejected.
+#[cfg(feature = "subscriptions")]
+fn build_smtp_settings_from_env() -> Option<helios_subscriptions::config::SmtpSettings> {
+    use helios_subscriptions::config::{SmtpEncryption, SmtpSettings};
+
+    let host = std::env::var("HFS_SUBSCRIPTION_SMTP_HOST").ok()?;
+    let from_address = std::env::var("HFS_SUBSCRIPTION_SMTP_FROM").ok()?;
+    if host.trim().is_empty() || from_address.trim().is_empty() {
+        return None;
+    }
+
+    let port = std::env::var("HFS_SUBSCRIPTION_SMTP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+    let encryption = std::env::var("HFS_SUBSCRIPTION_SMTP_ENCRYPTION")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+        .and_then(|v| match v {
+            "none" => Some(SmtpEncryption::None),
+            "starttls" => Some(SmtpEncryption::StartTls),
+            "tls" => Some(SmtpEncryption::Tls),
+            _ => None,
+        })
+        .unwrap_or(SmtpEncryption::StartTls);
+    let username = std::env::var("HFS_SUBSCRIPTION_SMTP_USERNAME")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let password = std::env::var("HFS_SUBSCRIPTION_SMTP_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let default_subject = std::env::var("HFS_SUBSCRIPTION_SMTP_DEFAULT_SUBJECT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let timeout_secs = std::env::var("HFS_SUBSCRIPTION_SMTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
+    Some(SmtpSettings {
+        host,
+        port,
+        username,
+        password,
+        encryption,
+        from_address,
+        default_subject,
+        timeout_secs,
+    })
 }
 
 /// Builds the CORS layer based on configuration.

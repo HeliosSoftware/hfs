@@ -17,7 +17,7 @@ env:
   HFS_PORT: 18088
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
-  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}
+  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
 
 jobs:
   matrix-setup:
@@ -258,8 +258,8 @@ jobs:
         if: matrix.backend == 's3-elasticsearch'
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Install AWS CLI
         if: matrix.backend == 's3-elasticsearch'
@@ -274,6 +274,39 @@ jobs:
             echo "/tmp/aws-bin" >> $GITHUB_PATH
           fi
           aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
+      - name: Start mailpit (email channel sink)
+        run: |
+          MP_CONTAINER="mailpit-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_key }}-${{ matrix.fhir_version }}-${{ matrix.backend }}"
+          docker rm -f "$MP_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MP_CONTAINER" -p 0:1025 -p 0:8025 axllent/mailpit:latest
+          echo "MP_CONTAINER=$MP_CONTAINER" >> $GITHUB_ENV
+
+          echo "Waiting for mailpit to be ready..."
+          READY=0
+          for i in {1..30}; do
+            MP_SMTP_PORT=$(docker port "$MP_CONTAINER" 1025 2>/dev/null | head -1 | sed 's/.*://')
+            MP_HTTP_PORT=$(docker port "$MP_CONTAINER" 8025 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$MP_SMTP_PORT" ] && [ -n "$MP_HTTP_PORT" ] \
+                 && curl -sf "http://$DOCKER_HOST_IP:$MP_HTTP_PORT/api/v1/info" >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            echo "Attempt $i/30: mailpit not ready yet..."
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "mailpit failed to start"
+            docker logs "$MP_CONTAINER" || true
+            exit 1
+          fi
+
+          echo "mailpit ready on SMTP $MP_SMTP_PORT, HTTP $MP_HTTP_PORT"
+          echo "HFS_SUBSCRIPTION_SMTP_HOST=$DOCKER_HOST_IP" >> $GITHUB_ENV
+          echo "HFS_SUBSCRIPTION_SMTP_PORT=$MP_SMTP_PORT" >> $GITHUB_ENV
+          echo "HFS_SUBSCRIPTION_SMTP_ENCRYPTION=none" >> $GITHUB_ENV
+          echo "HFS_SUBSCRIPTION_SMTP_FROM=hfs@smoke.test" >> $GITHUB_ENV
+          echo "MAILPIT_HTTP_URL=http://$DOCKER_HOST_IP:$MP_HTTP_PORT" >> $GITHUB_ENV
 
       - name: Install websocat
         run: |
@@ -350,7 +383,7 @@ jobs:
             HFS_BASE_URL="http://localhost:$HFS_PORT" \
             HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}" \
             HFS_STORAGE_BACKEND=s3-elasticsearch \
-            HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
+            HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET }}" \
             HFS_S3_PREFIX="ci/subscriptions-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.build_key }}/${{ matrix.fhir_version }}/${{ matrix.backend }}/" \
             HFS_S3_VALIDATE_BUCKETS=false \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
@@ -426,6 +459,9 @@ jobs:
           if [ -n "${MONGO_CONTAINER:-}" ]; then
             docker logs "$MONGO_CONTAINER" > "$RESULTS_DIR/backend-logs/mongodb.log" 2>&1 || true
           fi
+          if [ -n "${MP_CONTAINER:-}" ]; then
+            docker logs "$MP_CONTAINER" > "$RESULTS_DIR/backend-logs/mailpit.log" 2>&1 || true
+          fi
 
       - name: Append smoke report to summary
         if: always()
@@ -458,4 +494,7 @@ jobs:
           fi
           if [ -n "${MONGO_CONTAINER:-}" ]; then
             docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${MP_CONTAINER:-}" ]; then
+            docker rm -f "$MP_CONTAINER" 2>/dev/null || true
           fi

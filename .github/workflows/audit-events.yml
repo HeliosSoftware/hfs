@@ -10,7 +10,7 @@ env:
   HFS_PORT: 8088
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
-  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}
+  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
   HFS_AUDIT_CLOUDWATCH_LOG_GROUP: ${{ vars.HFS_AUDIT_CLOUDWATCH_LOG_GROUP }}
 
 jobs:
@@ -335,8 +335,8 @@ jobs:
         if: matrix.backend == 's3-elasticsearch' || matrix.backend == 'cloudwatch'
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Install AWS CLI
         if: matrix.backend == 's3-elasticsearch' || matrix.backend == 'cloudwatch'
@@ -355,7 +355,7 @@ jobs:
       - name: Empty S3 prefix
         if: matrix.backend == 's3-elasticsearch'
         run: |
-          BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}"
+          BUCKET="${{ secrets.HFS_S3_BUCKET }}"
           PRIMARY_PREFIX="ci-audit/${{ github.run_id }}/${{ github.run_attempt }}/primary/"
           AUDIT_PREFIX="ci-audit/${{ github.run_id }}/${{ github.run_attempt }}/audit/"
           echo "PRIMARY_S3_PREFIX=$PRIMARY_PREFIX" >> $GITHUB_ENV
@@ -492,7 +492,7 @@ jobs:
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=s3-elasticsearch \
-            HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
+            HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET }}" \
             HFS_S3_PREFIX="$PRIMARY_S3_PREFIX" \
             HFS_S3_VALIDATE_BUCKETS=false \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
@@ -512,7 +512,7 @@ jobs:
             HFS_AUDIT_BACKEND=cloudwatch \
             HFS_AUDIT_CLOUDWATCH_LOG_GROUP="$CLOUDWATCH_LOG_GROUP" \
             HFS_AUDIT_CLOUDWATCH_LOG_STREAM="$CLOUDWATCH_LOG_STREAM" \
-            HFS_AUDIT_CLOUDWATCH_REGION="${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}" \
+            HFS_AUDIT_CLOUDWATCH_REGION="${{ vars.AWS_REGION || 'us-east-1' }}" \
             HFS_ENABLE_CORS=false \
             HFS_AUTH_ENABLED=true \
             HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
@@ -906,8 +906,8 @@ jobs:
         if: matrix.backend == 's3'
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Install AWS CLI
         if: matrix.backend == 's3'
@@ -926,7 +926,7 @@ jobs:
       - name: Prepare S3 prefixes
         if: matrix.backend == 's3'
         run: |
-          BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}"
+          BUCKET="${{ secrets.HFS_S3_BUCKET }}"
           PRIMARY_PREFIX="ci-audit-db/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.mode }}/primary/"
           AUDIT_PREFIX="ci-audit-db/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.mode }}/audit/"
           echo "PRIMARY_S3_PREFIX=$PRIMARY_PREFIX" >> $GITHUB_ENV
@@ -1012,7 +1012,7 @@ jobs:
           else
             if [ "${{ matrix.mode }}" = "dedicated" ]; then
               HFS_STORAGE_BACKEND=s3 \
-              HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
+              HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET }}" \
               HFS_S3_PREFIX="$PRIMARY_S3_PREFIX" \
               HFS_S3_VALIDATE_BUCKETS=false \
               HFS_AUDIT_BACKEND=database \
@@ -1023,7 +1023,7 @@ jobs:
               ./target/debug/hfs --log-level info --port "$HFS_PORT_SMOKE" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
             else
               HFS_STORAGE_BACKEND=s3 \
-              HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}" \
+              HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET }}" \
               HFS_S3_PREFIX="$PRIMARY_S3_PREFIX" \
               HFS_S3_VALIDATE_BUCKETS=false \
               HFS_AUDIT_BACKEND=database \
