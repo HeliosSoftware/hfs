@@ -1,8 +1,7 @@
 //! Subscription event emission helper.
 //!
-//! Constructs a `ResourceEvent` from handler context and spawns the
-//! subscription engine's event handler asynchronously, mirroring the
-//! fire-and-forget pattern used by the audit middleware.
+//! Constructs a `ResourceEvent` from handler context and dispatches it to the
+//! subscription engine.
 
 use std::sync::Arc;
 
@@ -15,9 +14,11 @@ use tracing::debug;
 /// Emits a subscription event for a successful resource write.
 ///
 /// This function constructs a `ResourceEvent` from the handler context and
-/// spawns the subscription engine's `on_resource_event` asynchronously.
+/// dispatches it to the subscription engine. Subscription lifecycle resources
+/// are handled inline so their in-memory state is visible before the HTTP
+/// response returns; ordinary data-resource events remain fire-and-forget.
 /// It is a no-op if the subscription engine is not configured.
-pub fn emit_subscription_event(
+pub async fn emit_subscription_event(
     engine: &Arc<SubscriptionEngine>,
     tenant: &TenantContext,
     stored: &StoredResource,
@@ -45,6 +46,11 @@ pub fn emit_subscription_event(
         "Emitting subscription event"
     );
 
+    if should_handle_inline(&event.resource_type, event.fhir_version) {
+        engine.on_resource_event(event).await;
+        return;
+    }
+
     tokio::spawn(async move {
         engine.on_resource_event(event).await;
     });
@@ -53,7 +59,7 @@ pub fn emit_subscription_event(
 /// Emits a subscription event for a resource delete.
 ///
 /// Delete events carry the resource type and ID but no resource content.
-pub fn emit_delete_event(
+pub async fn emit_delete_event(
     engine: &Arc<SubscriptionEngine>,
     tenant: &TenantContext,
     resource_type: &str,
@@ -81,7 +87,45 @@ pub fn emit_delete_event(
         "Emitting subscription delete event"
     );
 
+    if should_handle_inline(&event.resource_type, event.fhir_version) {
+        engine.on_resource_event(event).await;
+        return;
+    }
+
     tokio::spawn(async move {
         engine.on_resource_event(event).await;
     });
+}
+
+fn should_handle_inline(resource_type: &str, fhir_version: FhirVersion) -> bool {
+    match resource_type {
+        "Subscription" | "SubscriptionTopic" => true,
+        #[cfg(feature = "R4")]
+        "Basic" if fhir_version == FhirVersion::R4 => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_lifecycle_resources_are_inline() {
+        let version = FhirVersion::default();
+
+        assert!(should_handle_inline("Subscription", version));
+        assert!(should_handle_inline("SubscriptionTopic", version));
+    }
+
+    #[test]
+    fn ordinary_resource_events_are_not_inline() {
+        assert!(!should_handle_inline("Encounter", FhirVersion::default()));
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn r4_basic_events_are_inline_for_backport_topic_detection() {
+        assert!(should_handle_inline("Basic", FhirVersion::R4));
+    }
 }

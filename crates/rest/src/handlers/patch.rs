@@ -141,7 +141,8 @@ where
             &stored,
             stored.fhir_version(),
             helios_subscriptions::ResourceEventType::Update,
-        );
+        )
+        .await;
     }
 
     build_patch_response(&stored, headers, &prefer).map(|mut response| {

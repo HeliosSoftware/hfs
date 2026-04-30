@@ -210,7 +210,8 @@ where
             &stored,
             fhir_version,
             helios_subscriptions::ResourceEventType::Create,
-        );
+        )
+        .await;
     }
 
     build_create_response(
