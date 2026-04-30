@@ -38,6 +38,37 @@ pub(crate) fn import_bundle_sync(
         .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
     let mut stats = ImportStats::default();
 
+    // Before the transaction: record which code systems currently have zero
+    // concepts in the DB. After the transaction commits, only these systems
+    // get an immediate closure rebuild — they are either brand-new systems or
+    // empty stubs, so the build is fast (at most a few thousand pairs).
+    //
+    // Systems that already have concepts are being updated in a batch (e.g.
+    // SNOMED RF2 chunks). Building the closure after every batch is O(n²) for
+    // SNOMED CT (~640K concepts, ~1 280 batches = hours). Skipping per-batch
+    // rebuilds is safe: write_code_system deletes the stale closure, and
+    // migrate_concept_closure at server startup rebuilds it exactly once.
+    let systems_needing_closure: Vec<String> = parsed
+        .code_systems
+        .iter()
+        .filter_map(|cs| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM concepts c
+                     JOIN code_systems s ON c.system_id = s.id
+                     WHERE s.url = ?1",
+                    rusqlite::params![cs.url],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if count == 0 {
+                Some(cs.url.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Wrap the whole bundle in a single transaction so that the thousands of
     // per-concept / per-property / per-designation inserts that a bulk
     // terminology load produces commit once, not once per row. Combined with
@@ -49,6 +80,33 @@ pub(crate) fn import_bundle_sync(
     write_parsed_bundle(&tx, &parsed, &mut stats)?;
     tx.commit()
         .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
+
+    // Rebuild concept closure for newly imported (previously empty) code systems.
+    // Skipped for batch imports of existing systems (see comment above).
+    for url in &systems_needing_closure {
+        let system_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = ?1",
+                rusqlite::params![url],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(sid) = system_id {
+            let has_hierarchy: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = ?1 LIMIT 1)",
+                    rusqlite::params![sid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_hierarchy {
+                if let Err(e) = schema::build_concept_closure(&conn, &sid) {
+                    tracing::warn!(system_id = %sid, error = %e, "Failed to build concept closure after import");
+                }
+            }
+        }
+    }
+
     Ok(stats)
 }
 
@@ -272,10 +330,14 @@ fn write_code_system(
         stats.concepts += 1;
     }
 
-    // Build (or rebuild) the transitive ancestor closure for this code system.
-    // Runs inside the same transaction as the concept/hierarchy inserts above.
-    schema::build_concept_closure(conn, &system_id)
-        .map_err(|e| HtsError::StorageError(format!("Closure build failed: {e}")))?;
+    // Invalidate stale closure rows so that migrate_concept_closure at server
+    // startup knows to (re)build the full closure once all batches are loaded.
+    // Without this, a previous partial closure (from a re-import or an earlier
+    // batch in the same session) would be mistakenly treated as complete.
+    let _ = conn.execute(
+        "DELETE FROM concept_closure WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    );
 
     // Invalidate any cached implicit-ValueSet expansions for this code system.
     // The implicit_expansion_cache is otherwise persistent across restarts; stale

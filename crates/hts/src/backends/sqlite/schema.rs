@@ -240,9 +240,7 @@ pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> ru
 
     // Load all concept codes for this system (as index-addressable Vec).
     let concepts: Vec<String> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT code FROM concepts WHERE system_id = ?1",
-        )?;
+        let mut stmt = conn.prepare_cached("SELECT code FROM concepts WHERE system_id = ?1")?;
         stmt.query_map(rusqlite::params![system_id], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?
     };
@@ -279,10 +277,11 @@ pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> ru
     }
 
     // BFS from every concept to enumerate all its descendants (including self).
-    // A u32 generation counter replaces a boolean visited array: incrementing
-    // the generation is an O(1) "reset" with no per-BFS allocation.
+    // A u32 generation counter replaces a boolean visited array: the generation
+    // for BFS from concept at index anc_idx is anc_idx+1, which is always
+    // distinct from all previous and future BFS generations. No per-BFS
+    // allocation or array clearing is needed.
     let mut visit_gen: Vec<u32> = vec![0; concepts.len()];
-    let mut current_gen: u32 = 0;
     let mut queue: VecDeque<usize> = VecDeque::new();
 
     let mut insert_stmt = conn.prepare_cached(
@@ -291,8 +290,7 @@ pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> ru
     )?;
 
     for anc_idx in 0..concepts.len() {
-        current_gen += 1;
-        let g = current_gen;
+        let g = (anc_idx as u32) + 1;
 
         queue.clear();
         queue.push_back(anc_idx);
