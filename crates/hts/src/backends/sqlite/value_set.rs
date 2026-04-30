@@ -1180,23 +1180,34 @@ fn compute_expansion_depth(
         if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc)? {
             included.extend(filter_result);
         } else if let Some(explicit_codes) = inc["concept"].as_array() {
-            // Explicit code list: batch-fetch displays for all listed codes.
-            // Using prepare_cached avoids re-compiling the same SQL for each code.
+            // Explicit code list: single json_each batch join instead of N
+            // individual point lookups.  For large VSAC ValueSets (6000+ codes)
+            // this reduces the round-trips from O(N) to O(1).
+            let codes_json: serde_json::Value = explicit_codes
+                .iter()
+                .filter_map(|e| e["code"].as_str())
+                .collect::<Vec<_>>()
+                .into();
+            let codes_str = codes_json.to_string();
+
             let mut stmt = conn
-                .prepare_cached("SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2")
+                .prepare_cached(
+                    "SELECT je.value, c.display
+                     FROM json_each(?1) je
+                     LEFT JOIN concepts c
+                         ON c.system_id = ?2 AND c.code = je.value",
+                )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            for entry in explicit_codes {
-                let code = match entry["code"].as_str() {
-                    Some(c) => c.to_owned(),
-                    None => continue,
-                };
 
-                let display: Option<String> = stmt
-                    .query_row(rusqlite::params![system_id, code], |row| row.get(0))
-                    .optional()
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?
-                    .flatten();
+            let rows = stmt
+                .query_map(rusqlite::params![codes_str, system_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+            for (code, display) in rows {
                 included.push(ExpansionContains {
                     system: system_url.to_owned(),
                     code,
