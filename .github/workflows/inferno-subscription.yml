@@ -48,10 +48,8 @@ jobs:
     name: Start Shared Inferno Subscriptions Stack
     runs-on: [self-hosted, Linux]
     outputs:
-      host: ${{ steps.up.outputs.host }}
       port: ${{ steps.up.outputs.port }}
       project: ${{ steps.up.outputs.project }}
-      base-url: ${{ steps.up.outputs.base-url }}
     steps:
       - name: Checkout subscriptions-test-kit
         uses: actions/checkout@v5
@@ -128,10 +126,8 @@ jobs:
           for i in {1..60}; do
             if curl -sf "$INFERNO_BASE_URL/api/test_suites" > /dev/null 2>&1; then
               echo "Inferno is ready"
-              echo "host=$INFERNO_HOST" >> "$GITHUB_OUTPUT"
               echo "port=$INFERNO_PORT" >> "$GITHUB_OUTPUT"
               echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
-              echo "base-url=$INFERNO_BASE_URL" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             echo "Attempt $i/60: Inferno not ready yet..."
@@ -163,7 +159,7 @@ jobs:
           - { backend: s3-elasticsearch, hfs_port: 18092 }
     env:
       HFS_PORT: ${{ matrix.hfs_port }}
-      INFERNO_BASE_URL: ${{ needs.inferno-stack-up.outputs.base-url }}
+      INFERNO_PORT: ${{ needs.inferno-stack-up.outputs.port }}
       RESULTS_DIR: inferno-subscription-results/${{ matrix.backend }}
       SUITE_ID: subscriptions_r5_backport_r4_server
       TEST_GROUP_ID: subscriptions_r5_backport_r4_server-subscriptions_r4_server_workflow
@@ -190,6 +186,7 @@ jobs:
           fi
           echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
           echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "INFERNO_BASE_URL=http://$EFFECTIVE_DOCKER_HOST_IP:$INFERNO_PORT" >> "$GITHUB_ENV"
           echo "Runner IP: $RUNNER_IP"
           echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
 
