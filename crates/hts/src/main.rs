@@ -331,7 +331,31 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
                 args.database_url.clone()
             };
             let backend = SqliteTerminologyBackend::new(&database_url)?;
-            run_import_for_path(&backend, &ctx, &args, rxnorm_dir).await?
+            let result = run_import_for_path(&backend, &ctx, &args, rxnorm_dir).await?;
+
+            // Pre-build concept closures now so server startup only needs to
+            // rebuild the FTS index (~10–25 s) instead of also running
+            // migrate_concept_closure (~40 s for SNOMED). Without this, the
+            // combined startup time can exceed the 60-second health-check timeout.
+            if !args.dry_run {
+                info!("Building concept closures (this may take ~40 s for SNOMED CT)…");
+                let pool = backend.pool().clone();
+                tokio::task::spawn_blocking(move || {
+                    let conn = pool.get().map_err(|e| {
+                        rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                            Some(format!("pool error: {e}")),
+                        )
+                    })?;
+                    helios_hts::backends::sqlite::schema::migrate_concept_closure(&conn)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("task join error: {e}"))?
+                .map_err(|e| anyhow::anyhow!("failed to build concept closures: {e}"))?;
+                info!("Concept closures ready");
+            }
+
+            result
         }
         #[cfg(not(feature = "sqlite"))]
         anyhow::bail!(
