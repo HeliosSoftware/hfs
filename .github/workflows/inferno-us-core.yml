@@ -441,6 +441,16 @@ jobs:
             exit 1
           }
 
+      - name: Refresh Elasticsearch indices
+        # ES indexes asynchronously (default refresh_interval=1s). The data load
+        # returns as soon as HFS finishes writing, but the first search may run
+        # before ES has refreshed, producing missing-data failures. Force a
+        # refresh on all hfs_* indices so the first test batch sees fresh data.
+        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        run: |
+          curl -sf -X POST "http://$DOCKER_HOST_IP:$ES_PORT/hfs_*/_refresh" > /dev/null \
+            || echo "::warning::Elasticsearch refresh request did not return success — proceeding anyway"
+
       - name: Sanity-check shared Inferno stack
         run: |
           INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
@@ -575,18 +585,23 @@ jobs:
 
           RESULTS=$(cat inferno-results/results.json)
 
-          # Count failures excluding omitted tests
+          # Inferno records the same test_id multiple times when a test is part
+          # of multiple test groups. Count failures based on the LATEST result
+          # for each test_id so transient flakes that subsequently passed do not
+          # fail the build.
+          LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
+
           FAIL=$(echo "$RESULTS" | jq --argjson omit "$OMITTED_TESTS" \
-            '[.[] | select(.test_id and (.result == "fail" or .result == "error") and (.test_id | IN($omit[]) | not))] | length')
+            "[$LATEST | .[] | select((.result == \"fail\" or .result == \"error\") and (.test_id | IN(\$omit[]) | not))] | length")
           OMITTED_COUNT=$(echo "$RESULTS" | jq --argjson omit "$OMITTED_TESTS" \
-            '[.[] | select(.test_id and (.test_id | IN($omit[])))] | length')
+            "[$LATEST | .[] | select(.test_id | IN(\$omit[]))] | length")
 
           echo "Failures (excluding $OMITTED_COUNT omitted tests): $FAIL"
 
           if [ "$FAIL" -gt 0 ]; then
             echo "::error::$FAIL test(s) failed (excluding omitted)"
             echo "$RESULTS" | jq -r --argjson omit "$OMITTED_TESTS" \
-              '.[] | select(.test_id and (.result == "fail" or .result == "error") and (.test_id | IN($omit[]) | not)) | "  \(.test_id): \(.result) - \(.result_message // "No message" | .[0:200])"'
+              "$LATEST | .[] | select((.result == \"fail\" or .result == \"error\") and (.test_id | IN(\$omit[]) | not)) | \"  \(.test_id): \(.result) - \(.result_message // \"No message\" | .[0:200])\""
             exit 1
           fi
 
@@ -601,17 +616,21 @@ jobs:
 
             RESULTS=$(cat inferno-results/results.json)
 
-            # Count only individual tests (exclude group aggregations which have test_group_id instead of test_id)
-            TOTAL=$(echo "$RESULTS" | jq '[.[] | select(.test_id)] | length')
-            PASS=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "pass")] | length')
+            # Count only the LATEST result for each test_id (Inferno re-runs the
+            # same test for every group it belongs to). This matches the build
+            # gate in the "Check test results" step.
+            LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
+
+            TOTAL=$(echo "$RESULTS" | jq "[$LATEST | .[]] | length")
+            PASS=$(echo "$RESULTS" | jq "[$LATEST | .[] | select(.result == \"pass\")] | length")
             FAIL=$(echo "$RESULTS" | jq --argjson omit "$OMITTED_TESTS" \
-              '[.[] | select(.test_id and .result == "fail" and (.test_id | IN($omit[]) | not))] | length')
-            SKIP=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "skip")] | length')
+              "[$LATEST | .[] | select(.result == \"fail\" and (.test_id | IN(\$omit[]) | not))] | length")
+            SKIP=$(echo "$RESULTS" | jq "[$LATEST | .[] | select(.result == \"skip\")] | length")
             ERROR=$(echo "$RESULTS" | jq --argjson omit "$OMITTED_TESTS" \
-              '[.[] | select(.test_id and .result == "error" and (.test_id | IN($omit[]) | not))] | length')
-            OMIT=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "omit")] | length')
+              "[$LATEST | .[] | select(.result == \"error\" and (.test_id | IN(\$omit[]) | not))] | length")
+            OMIT=$(echo "$RESULTS" | jq "[$LATEST | .[] | select(.result == \"omit\")] | length")
             OMITTED_COUNT=$(echo "$RESULTS" | jq --argjson omit "$OMITTED_TESTS" \
-              '[.[] | select(.test_id and (.test_id | IN($omit[])))] | length')
+              "[$LATEST | .[] | select(.test_id | IN(\$omit[]))] | length")
 
             echo "| Status | Count |" >> $GITHUB_STEP_SUMMARY
             echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
@@ -624,21 +643,21 @@ jobs:
             echo "| **Total** | **$TOTAL** |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
 
-            # List omitted tests
+            # List omitted tests (latest result per test_id)
             if [ "$OMITTED_COUNT" -gt 0 ]; then
               echo "### Omitted Tests (known expected failures)" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
               echo "$RESULTS" | jq -r --argjson omit "$OMITTED_TESTS" \
-                '.[] | select(.test_id and (.test_id | IN($omit[]))) | "- **\(.test_id)**: \(.result) - \(.result_message // "No message" | .[0:200])"' >> $GITHUB_STEP_SUMMARY
+                "$LATEST | .[] | select(.test_id | IN(\$omit[])) | \"- **\(.test_id)**: \(.result) - \(.result_message // \"No message\" | .[0:200])\"" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
             fi
 
-            # List failed tests (excluding omitted)
+            # List failed tests (latest result per test_id, excluding omitted)
             if [ "$FAIL" -gt 0 ] || [ "$ERROR" -gt 0 ]; then
               echo "### Failed/Error Tests" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
               echo "$RESULTS" | jq -r --argjson omit "$OMITTED_TESTS" \
-                '.[] | select((.result == "fail" or .result == "error") and .test_id and (.test_id | IN($omit[]) | not)) | "- **\(.test_id)**: \(.result) - \(.result_message // "No message" | .[0:200])"' >> $GITHUB_STEP_SUMMARY
+                "$LATEST | .[] | select((.result == \"fail\" or .result == \"error\") and (.test_id | IN(\$omit[]) | not)) | \"- **\(.test_id)**: \(.result) - \(.result_message // \"No message\" | .[0:200])\"" >> $GITHUB_STEP_SUMMARY
             fi
           else
             echo "## Inferno US Core ${{ matrix.version_label }} Test Results" >> $GITHUB_STEP_SUMMARY
@@ -653,6 +672,15 @@ jobs:
           name: inferno-test-results-${{ matrix.suite_id }}-${{ matrix.backend }}
           path: inferno-results/
           retention-days: 30
+
+      - name: Upload HFS server log on failure
+        if: failure() && env.HFS_LOG != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-log-${{ matrix.suite_id }}-${{ matrix.backend }}
+          path: ${{ env.HFS_LOG }}
+          retention-days: 30
+          if-no-files-found: ignore
 
       - name: Cleanup
         if: always()
