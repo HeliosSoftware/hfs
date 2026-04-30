@@ -177,6 +177,16 @@ The email channel is enabled only when `HFS_SUBSCRIPTION_SMTP_HOST` and `HFS_SUB
 
 Subscription `header` entries (R4 backport `channel.header`, native `Subscription.parameter`) named `Subject`, `From`, `Reply-To`, and `Cc` override the server defaults on a per-subscription basis. Subscriptions requesting `content=full-resource` over an `HFS_SUBSCRIPTION_SMTP_ENCRYPTION=none` transport are rejected at dispatch time (analogous to the HTTPS requirement on the rest-hook channel).
 
+### FHIR Messaging channel
+
+The FHIR Messaging channel is disabled by default and is enabled only when `HFS_SUBSCRIPTION_MESSAGING_ENABLED=true`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel. |
+| `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers. |
+| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow delivery to private or loopback endpoint hosts; intended for local development and CI only. |
+
 ## Enabling in HFS
 
 The subscription engine is an optional feature in `helios-rest` and `helios-hfs`:
