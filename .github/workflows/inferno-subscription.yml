@@ -412,7 +412,7 @@ jobs:
         run: |
           mkdir -p "$RESULTS_DIR"
           ACCESS_TOKEN="inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
-          TOPIC_URL="http://example.org/topic/inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
+          TOPIC_URL="https://github.com/HeliosSoftware/hfs/subscription-topic/inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
           ENCOUNTER_ID="inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
 
           echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> "$GITHUB_ENV"
