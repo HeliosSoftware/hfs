@@ -2044,7 +2044,7 @@ fn can_be_coerced_to_boolean(result: &EvaluationResult) -> bool {
     // Check if the result can be meaningfully used as a boolean in a where clause
     match result {
         // Boolean values are obviously OK
-        EvaluationResult::Boolean(_, _) => true,
+        EvaluationResult::Boolean(_, _, _) => true,
 
         // Empty is OK (evaluates to false)
         EvaluationResult::Empty => true,
@@ -2260,7 +2260,7 @@ where
 fn is_truthy(result: &EvaluationResult) -> bool {
     match result {
         EvaluationResult::Empty => false,
-        EvaluationResult::Boolean(b, _) => *b,
+        EvaluationResult::Boolean(b, _, _) => *b,
         EvaluationResult::Collection { items, .. } => !items.is_empty(),
         _ => true, // Non-empty, non-false values are truthy
     }
@@ -2291,11 +2291,11 @@ fn fhirpath_result_to_json_value_collection(result: EvaluationResult) -> Option<
 fn fhirpath_result_to_json_value(result: EvaluationResult) -> Option<serde_json::Value> {
     match result {
         EvaluationResult::Empty => None,
-        EvaluationResult::Boolean(b, _) => Some(serde_json::Value::Bool(b)),
-        EvaluationResult::Integer(i, _) => {
+        EvaluationResult::Boolean(b, _, _) => Some(serde_json::Value::Bool(b)),
+        EvaluationResult::Integer(i, _, _) => {
             Some(serde_json::Value::Number(serde_json::Number::from(i)))
         }
-        EvaluationResult::Decimal(d, _) => {
+        EvaluationResult::Decimal(d, _, _) => {
             // Check if this Decimal represents a whole number
             if d.fract().is_zero() {
                 // Convert to integer if no fractional part
@@ -2318,14 +2318,14 @@ fn fhirpath_result_to_json_value(result: EvaluationResult) -> Option<serde_json:
                 }
             }
         }
-        EvaluationResult::String(s, _) => Some(serde_json::Value::String(s)),
-        EvaluationResult::Date(s, _) => Some(serde_json::Value::String(s)),
-        EvaluationResult::DateTime(s, _) => {
+        EvaluationResult::String(s, _, _) => Some(serde_json::Value::String(s)),
+        EvaluationResult::Date(s, _, _) => Some(serde_json::Value::String(s)),
+        EvaluationResult::DateTime(s, _, _) => {
             // Remove "@" prefix from datetime strings if present
             let cleaned = s.strip_prefix("@").unwrap_or(&s);
             Some(serde_json::Value::String(cleaned.to_string()))
         }
-        EvaluationResult::Time(s, _) => {
+        EvaluationResult::Time(s, _, _) => {
             // Remove "@T" prefix from time strings if present
             let cleaned = s.strip_prefix("@T").unwrap_or(&s);
             Some(serde_json::Value::String(cleaned.to_string()))

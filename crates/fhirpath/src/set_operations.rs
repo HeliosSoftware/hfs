@@ -329,22 +329,22 @@ fn equal_helper(
 
     // Direct primitive value comparisons
     match (left, right) {
-        (EvaluationResult::Boolean(l, _), EvaluationResult::Boolean(r, _)) => l == r,
-        (EvaluationResult::String(l, _), EvaluationResult::String(r, _)) => l == r,
-        (EvaluationResult::Integer(l, _), EvaluationResult::Integer(r, _)) => l == r,
-        (EvaluationResult::Decimal(l, _), EvaluationResult::Decimal(r, _)) => l == r,
-        (EvaluationResult::Decimal(l, _), EvaluationResult::Integer(r, _)) => {
+        (EvaluationResult::Boolean(l, _, _), EvaluationResult::Boolean(r, _, _)) => l == r,
+        (EvaluationResult::String(l, _, _), EvaluationResult::String(r, _, _)) => l == r,
+        (EvaluationResult::Integer(l, _, _), EvaluationResult::Integer(r, _, _)) => l == r,
+        (EvaluationResult::Decimal(l, _, _), EvaluationResult::Decimal(r, _, _)) => l == r,
+        (EvaluationResult::Decimal(l, _, _), EvaluationResult::Integer(r, _, _)) => {
             *l == rust_decimal::Decimal::from(*r)
         }
-        (EvaluationResult::Integer(l, _), EvaluationResult::Decimal(r, _)) => {
+        (EvaluationResult::Integer(l, _, _), EvaluationResult::Decimal(r, _, _)) => {
             rust_decimal::Decimal::from(*l) == *r
         }
-        (EvaluationResult::Date(l, _), EvaluationResult::Date(r, _)) => l == r,
-        (EvaluationResult::DateTime(l, _), EvaluationResult::DateTime(r, _)) => l == r,
-        (EvaluationResult::Time(l, _), EvaluationResult::Time(r, _)) => l == r,
+        (EvaluationResult::Date(l, _, _), EvaluationResult::Date(r, _, _)) => l == r,
+        (EvaluationResult::DateTime(l, _, _), EvaluationResult::DateTime(r, _, _)) => l == r,
+        (EvaluationResult::Time(l, _, _), EvaluationResult::Time(r, _, _)) => l == r,
         (
-            EvaluationResult::Quantity(l_val, l_unit, _),
-            EvaluationResult::Quantity(r_val, r_unit, _),
+            EvaluationResult::Quantity(l_val, l_unit, _, _),
+            EvaluationResult::Quantity(r_val, r_unit, _, _),
         ) => l_val == r_val && units_are_equivalent(l_unit, r_unit),
         // Fallback: not equal for different types
         _ => false,
@@ -918,9 +918,9 @@ mod tests {
 
                 for item in items {
                     match item {
-                        EvaluationResult::Integer(1, _) => count_1 += 1,
-                        EvaluationResult::Integer(2, _) => count_2 += 1,
-                        EvaluationResult::Integer(3, _) => count_3 += 1,
+                        EvaluationResult::Integer(1, _, _) => count_1 += 1,
+                        EvaluationResult::Integer(2, _, _) => count_2 += 1,
+                        EvaluationResult::Integer(3, _, _) => count_3 += 1,
                         _ => panic!("Unexpected item in collection"),
                     }
                 }

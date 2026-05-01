@@ -89,8 +89,8 @@ pub fn not_function(
     // not(false) -> true
     // not({}) -> {}
     match base_as_logic_bool {
-        EvaluationResult::Boolean(true, _) => Ok(EvaluationResult::boolean(false)),
-        EvaluationResult::Boolean(false, _) => Ok(EvaluationResult::boolean(true)),
+        EvaluationResult::Boolean(true, _, _) => Ok(EvaluationResult::boolean(false)),
+        EvaluationResult::Boolean(false, _, _) => Ok(EvaluationResult::boolean(true)),
         EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         _ => unreachable!("to_boolean_for_logic should only return Boolean or Empty on Ok"),
     }

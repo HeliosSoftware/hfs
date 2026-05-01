@@ -106,7 +106,7 @@ mod tests {
 
         // Simulate computing $this + $total
         match (this, total) {
-            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
+            (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => {
                 Ok(EvaluationResult::integer(a + b))
             }
             _ => Ok(EvaluationResult::Empty),
@@ -133,7 +133,7 @@ mod tests {
 
         // Otherwise compare this and total
         match (this, total) {
-            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
+            (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => {
                 if a < b {
                     Ok(this.clone())
                 } else {
@@ -164,7 +164,7 @@ mod tests {
 
         // Otherwise compare this and total
         match (this, total) {
-            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
+            (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => {
                 if a > b {
                     Ok(this.clone())
                 } else {
