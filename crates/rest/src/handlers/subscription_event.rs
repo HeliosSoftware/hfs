@@ -14,9 +14,10 @@ use tracing::debug;
 /// Emits a subscription event for a successful resource write.
 ///
 /// This function constructs a `ResourceEvent` from the handler context and
-/// dispatches it to the subscription engine. Subscription lifecycle resources
-/// are handled inline so their in-memory state is visible before the HTTP
-/// response returns; ordinary data-resource events remain fire-and-forget.
+/// dispatches it to the subscription engine. Topic lifecycle resources are
+/// handled inline so their in-memory state is visible before the HTTP response
+/// returns; subscriptions and ordinary data-resource events remain
+/// fire-and-forget.
 /// It is a no-op if the subscription engine is not configured.
 pub async fn emit_subscription_event(
     engine: &Arc<SubscriptionEngine>,
@@ -99,7 +100,7 @@ pub async fn emit_delete_event(
 
 fn should_handle_inline(resource_type: &str, fhir_version: FhirVersion) -> bool {
     match resource_type {
-        "Subscription" | "SubscriptionTopic" => true,
+        "SubscriptionTopic" => true,
         #[cfg(feature = "R4")]
         "Basic" if fhir_version == FhirVersion::R4 => true,
         _ => false,
@@ -111,11 +112,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscription_lifecycle_resources_are_inline() {
+    fn topic_lifecycle_resources_are_inline() {
         let version = FhirVersion::default();
 
-        assert!(should_handle_inline("Subscription", version));
         assert!(should_handle_inline("SubscriptionTopic", version));
+    }
+
+    #[test]
+    fn subscriptions_are_not_inline() {
+        assert!(!should_handle_inline("Subscription", FhirVersion::default()));
     }
 
     #[test]

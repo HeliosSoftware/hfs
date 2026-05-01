@@ -214,16 +214,16 @@ When enabled, the engine auto-initializes with default configuration and begins 
 
 ## Integration
 
-The engine integrates into `helios-rest` via the `AppState::with_subscription_engine()` builder. After each successful write, handlers call `emit_subscription_event()` which spawns an async task:
+The engine integrates into `helios-rest` via the `AppState::with_subscription_engine()` builder. After each successful write, handlers call `emit_subscription_event()`. Topic lifecycle writes are processed inline so the topic registry is up to date before the HTTP response returns; subscription activation and ordinary resource notifications are dispatched asynchronously:
 
 ```rust,ignore
 // In create handler (simplified)
 if let Some(engine) = state.subscription_engine() {
-    emit_subscription_event(engine, tenant.context(), &stored, fhir_version, ResourceEventType::Create);
+    emit_subscription_event(engine, tenant.context(), &stored, fhir_version, ResourceEventType::Create).await;
 }
 ```
 
-The spawned task calls `engine.on_resource_event(event).await`, which runs the full evaluation → notification → dispatch pipeline without blocking the HTTP response.
+For asynchronous events, the spawned task calls `engine.on_resource_event(event).await`, which runs the full evaluation -> notification -> dispatch pipeline without blocking the HTTP response.
 
 ### Registering a Topic
 
