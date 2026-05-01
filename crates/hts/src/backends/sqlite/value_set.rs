@@ -1105,9 +1105,6 @@ fn expand_inline_filtered(
         // `all_batchable` — true when every compose filter is either a property=
         // or a hierarchy op (is-a / descendent-of / generalizes); false for ECL
         // `constraint` filters which need full ECL evaluation.
-        //
-        // `has_eq_filter` guards the FTS-first branch: any property= filter forces
-        // fall-through to `apply_compose_filters` (property-first path).
         let compose_filters: &[serde_json::Value] = inc["filter"]
             .as_array()
             .map(|a| a.as_slice())
@@ -1119,15 +1116,13 @@ fn expand_inline_filtered(
                 (op == "=" && prop != "constraint")
                     || (prop == "concept" && matches!(op, "is-a" | "descendent-of" | "generalizes"))
             });
-        let has_eq_filter = compose_filters.iter().any(|f| {
-            f["op"].as_str().unwrap_or("") == "="
-                && f["property"].as_str().unwrap_or("") != "constraint"
-        });
 
-        if filter_lower.len() >= 3 && all_batchable && !has_eq_filter {
-            // FTS-first path: hierarchy + text, no property= filter.
-            // FTS narrows to text-matching candidates; hierarchy walk runs on
-            // the already-small set via apply_compose_filters_to_candidates.
+        if filter_lower.len() >= 3 && all_batchable {
+            // FTS-first path: text filter ≥ 3 chars narrows to a small candidate
+            // set; apply_compose_filters_to_candidates then validates hierarchy
+            // (is-a / descendent-of) AND property= filters on that small set.
+            // This handles EX08-style combined filters without the 3-way JOIN
+            // over potentially thousands of property-matching descendants.
             ensure_concepts_fts(conn, &system_id)?;
             let candidates =
                 fts_candidates_for_system(conn, &system_id, system_url, &filter_lower)?;
