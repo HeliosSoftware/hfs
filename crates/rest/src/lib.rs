@@ -538,8 +538,8 @@ pub fn init_logging(level: &str) {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(format!(
-            "helios_hfs={},helios_rest={},helios_persistence={},tower_http=debug",
-            level, level, level
+            "helios_hfs={},helios_rest={},helios_persistence={},helios_subscriptions={},tower_http=debug",
+            level, level, level, level
         ))
     });
 
