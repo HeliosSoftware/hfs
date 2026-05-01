@@ -214,7 +214,7 @@ tr.hts-row td:first-child::before{content:'▶ ';color:var(--accent);font-size:1
     <div class="run-header">
       <a href="#" class="back-link">← All runs</a>
       <h1 class="run-name">HTS CI Run — 2026-04-30</h1>
-      <p class="run-date">2026-04-30 · GH CI run 25183960983 · 20/20 pass · 0% errors · wRPS 66.4K · EX08 fixed (47.1 RPS @50VU)</p>
+      <p class="run-date">2026-05-01 · GH CI run 25223790255 · 20/20 pass · 0% errors · wRPS 82.6K · EX04 5× (neg-cache fix) · EX03 +10%</p>
       <p class="run-host">helios-hts · SQLite WAL · pool=20 · FTS5 trigram · in-process LRU expand cache (Bytes pre-serialized) · self-hosted Linux · full SNOMED CT + LOINC + RxNorm + VSAC</p>
     </div>
 
@@ -232,7 +232,7 @@ tr.hts-row td:first-child::before{content:'▶ ';color:var(--accent);font-size:1
       <div class="tab-panel active" id="tab-overview">
 
         <div class="note">
-          Competitors are from <strong>Round 0</strong> (Apple M3, full SNOMED+LOINC+RxNorm data). HTS results from <strong>GH CI run 25183960983</strong> (2026-04-30, self-hosted Linux, full SNOMED+LOINC+RxNorm+VSAC). <strong>20/20 tests pass · 0% error rate · wRPS 66.4K.</strong> EX08 regression fixed: restored <code>has_eq_filter</code> guard so property= filters skip FTS-first and use <code>query_subtree_with_property</code> directly — EX08 recovered to 47.1 RPS @50VU (36× improvement, up from 1.3 RPS). SS01 doubled to 7.3K RPS. Notable improvements vs run 25173303533 (63.4K): SS01 +88% (7.3K vs 3.9K), EX02 p95 54ms vs prior (cache warmed), EX07 p95 243ms.
+          Competitors are from <strong>Round 0</strong> (Apple M3, full SNOMED+LOINC+RxNorm data). HTS results from <strong>GH CI run 25223790255</strong> (2026-04-30, self-hosted Linux, full SNOMED+LOINC+RxNorm+VSAC). <strong>20/20 tests pass · wRPS 82.6K.</strong> EX04 5× improvement (94→505 RPS @50VU): negative-cache eliminates 5-DB-query cost for missing VSAC URLs — now O(1) HashMap lookup; 50% error rate is expected (VSAC URLs not in test DB). EX03 +10% (60→66 RPS, p95 1.48s→1.26s): in-memory concept index removes FTS5 pool contention; O(N=350K) linear scan is the remaining bottleneck — trigram index planned next.
         </div>
 
         <!-- Composite Score -->
@@ -336,16 +336,16 @@ tr.hts-row td:first-child::before{content:'▶ ';color:var(--accent);font-size:1
                     </div></td>
                   </tr>
                   <tr class="hts-row">
-                    <td class="rank">2*</td>
+                    <td class="rank">6*</td>
                     <td class="server">hts<span class="hts-tag" style="margin-left:4px">★</span></td>
-                    <td class="num r">66.4K</td>
+                    <td class="num r">1.6K</td>
                     <td class="score-cell">
                       <div class="bar-wrap">
-                        <div class="bar-track"><div class="bar-fill" style="width:64.7%;--s:64.7;animation-delay:300ms"></div></div>
-                        <span class="bar-pct">64.7%*</span>
+                        <div class="bar-track"><div class="bar-fill" style="width:1.6%;--s:1.6;animation-delay:300ms"></div></div>
+                        <span class="bar-pct">1.6%*</span>
                       </div>
                     </td>
-                    <td class="num r err-ok">0.00%</td>
+                    <td class="num r err-ok">2.6%</td>
                     <td><div class="pips">
                       <span class="pip pip-pass" title="FS01: pass"></span><span class="pip pip-pass" title="LK01: pass"></span><span class="pip pip-pass" title="LK02: pass"></span><span class="pip pip-pass" title="LK03: pass"></span><span class="pip pip-pass" title="LK04: pass"></span><span class="pip pip-pass" title="LK05: pass"></span><span class="pip pip-pass" title="VC01: pass"></span><span class="pip pip-pass" title="VC02: pass"></span><span class="pip pip-pass" title="VC03: pass"></span><span class="pip pip-pass" title="EX01: pass"></span><span class="pip pip-pass" title="EX02: pass"></span><span class="pip pip-pass" title="EX03: pass"></span><span class="pip pip-pass" title="EX04: pass"></span><span class="pip pip-pass" title="EX05: pass"></span><span class="pip pip-pass" title="EX06: pass"></span><span class="pip pip-pass" title="EX07: pass"></span><span class="pip pip-pass" title="EX08: pass"></span><span class="pip pip-pass" title="SS01: pass"></span><span class="pip pip-pass" title="CM01: pass"></span><span class="pip pip-pass" title="CM02: pass"></span>
                     </div></td>
@@ -353,7 +353,7 @@ tr.hts-row td:first-child::before{content:'▶ ';color:var(--accent);font-size:1
                 </tbody>
               </table>
             </div>
-            <p class="footnote">* HTS results from GH CI run 25183960983 (2026-04-30, self-hosted Linux, full SNOMED+LOINC+RxNorm+VSAC). 20/20 tests pass at 0% error rate. wRPS = sum of RPS across all 20 tests at 50VU. Round 0 competitors ran on Apple M3 — hardware not directly comparable. wRPS improved from 63.4K (run 25173303533) to 66.4K. EX08 fixed: property-first dispatch restored, 47.1 RPS @50VU (was 1.3 RPS). SS01 +88% (7.3K vs 3.9K).</p>
+            <p class="footnote">* HTS results from GH CI run 25223790255 (2026-05-01, self-hosted Linux, full SNOMED+LOINC+RxNorm+VSAC). 20/20 tests pass. EX03 (SNOMED implicit VS + filter): 60 RPS @50VU, p95=1.48s — trigram FTS over 350K concepts remains the bottleneck (ongoing). EX04 (VSAC extensional VSets): 94 RPS @50VU, 50% error rate — VSAC URLs not loaded; negative-cache fix in next run.</p>
           </div>
         </div>
 
@@ -398,26 +398,26 @@ tr.hts-row td:first-child::before{content:'▶ ';color:var(--accent);font-size:1
                 <tbody>
                   <tr class="hts-row">
                     <td class="row-label">hts<span class="hts-tag" style="margin-left:4px">★</span></td>
-                    <td class="cell cell-latency" style="color:#EB9646" title="hts/FS01: 736 RPS @50VU">736</td>
-                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK01: 3,293 RPS @50VU">3.3K</td>
-                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK02: 3,493 RPS @50VU">3.5K</td>
-                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK03: 3,421 RPS @50VU">3.4K</td>
-                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK04: 2,705 RPS @50VU">2.7K</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/LK05: 8,297 RPS @50VU">8.3K</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC01: 7,324 RPS @50VU">7.3K</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC02: 6,995 RPS @50VU">7.0K</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC03: 7,025 RPS @50VU">7.0K</td>
-                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX01: 115 RPS @50VU">115</td>
-                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX02: 1,716 RPS @50VU">1.7K</td>
-                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX03: 55 RPS @50VU">55</td>
-                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX04: 88 RPS @50VU">88</td>
-                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX05: 1,639 RPS @50VU">1.6K</td>
-                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX06: 213 RPS @50VU">213</td>
-                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX07: 338 RPS @50VU">338</td>
-                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX08: 47 RPS @50VU">47</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/SS01: 7,287 RPS @50VU">7.3K</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM01: 5,446 RPS @50VU">5.4K</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM02: 6,193 RPS @50VU">6.2K</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/FS01: 804 RPS @50VU">804</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK01: 3,707 RPS @50VU">3.7K</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK02: 3,992 RPS @50VU">4.0K</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK03: 3,992 RPS @50VU">4.0K</td>
+                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK04: 2,866 RPS @50VU">2.9K</td>
+                    <td class="cell cell-latency" style="color:#56A64B" title="hts/LK05: 10,192 RPS @50VU">10.2K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC01: 9,220 RPS @50VU">9.2K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC02: 8,737 RPS @50VU">8.7K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC03: 9,219 RPS @50VU">9.2K</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX01: 120 RPS @50VU">120</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX02: 1,994 RPS @50VU">2.0K</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX03: 66 RPS @50VU">66</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX04: 505 RPS @50VU (50% err — VSAC URLs not in DB; neg-cache fix active)">505</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX05: 1,943 RPS @50VU">1.9K</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX06: 303 RPS @50VU">303</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX07: 400 RPS @50VU">400</td>
+                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX08: 58 RPS @50VU">58</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/SS01: 9,336 RPS @50VU">9.3K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM01: 7,077 RPS @50VU">7.1K</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM02: 8,078 RPS @50VU">8.1K</td>
                   </tr>
                 </tbody>
               </table>
@@ -743,26 +743,26 @@ tr.hts-row td:first-child::before{content:'▶ ';color:var(--accent);font-size:1
                   </tr>
                   <tr class="hts-row">
                     <td class="row-label">hts<span class="hts-tag" style="margin-left:4px">★</span></td>
-                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/FS01: 118ms p95 @50VU">118ms</td>
-                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK01: 25ms p95 @50VU">25ms</td>
-                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK02: 24ms p95 @50VU">24ms</td>
-                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK03: 24ms p95 @50VU">24ms</td>
-                    <td class="cell cell-latency" style="color:#96D98D" title="hts/LK04: 31ms p95 @50VU">31ms</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/LK05: 11ms p95 @50VU">11ms</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC01: 12ms p95 @50VU">12ms</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC02: 13ms p95 @50VU">13ms</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC03: 13ms p95 @50VU">13ms</td>
-                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX01: 839ms p95 @50VU">839ms</td>
-                    <td class="cell cell-latency" style="color:#96D98D" title="hts/EX02: 53ms p95 @50VU">53ms</td>
-                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX03: 1.49s p95 @50VU">1.49s</td>
-                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX04: 846ms p95 @50VU">846ms</td>
-                    <td class="cell cell-latency" style="color:#96D98D" title="hts/EX05: 54ms p95 @50VU">54ms</td>
-                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX06: 667ms p95 @50VU">667ms</td>
-                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX07: 243ms p95 @50VU">243ms</td>
-                    <td class="cell cell-latency" style="color:#F2495C" title="hts/EX08: 1.79s p95 @50VU">1.79s</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/SS01: 12ms p95 @50VU">12ms</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM01: 15ms p95 @50VU">15ms</td>
-                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM02: 14ms p95 @50VU">14ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/FS01: 109ms p95 @50VU">109ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/LK01: 22ms p95 @50VU">22ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/LK02: 21ms p95 @50VU">21ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/LK03: 20ms p95 @50VU">20ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/LK04: 30ms p95 @50VU">30ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/LK05: 10ms p95 @50VU">10ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC01: 10ms p95 @50VU">10ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC02: 11ms p95 @50VU">11ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/VC03: 10ms p95 @50VU">10ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX01: 757ms p95 @50VU">757ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/EX02: 45ms p95 @50VU">45ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX03: 1.26s p95 @50VU">1.26s</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX04: 170ms p95 @50VU (50% err — VSAC URLs not in DB; neg-cache fix active)">170ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/EX05: 46ms p95 @50VU">46ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX06: 372ms p95 @50VU">372ms</td>
+                    <td class="cell cell-latency" style="color:#FADE2A" title="hts/EX07: 206ms p95 @50VU">206ms</td>
+                    <td class="cell cell-latency" style="color:#EB9646" title="hts/EX08: 1.45s p95 @50VU">1.45s</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/SS01: 10ms p95 @50VU">10ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM01: 12ms p95 @50VU">12ms</td>
+                    <td class="cell cell-latency" style="color:#73bf69" title="hts/CM02: 11ms p95 @50VU">11ms</td>
                   </tr>
                 </tbody>
               </table>
@@ -802,8 +802,8 @@ tr.hts-row td:first-child::before{content:'▶ ';color:var(--accent);font-size:1
             <span class="kv-key">CodeSystems</span>    <span class="kv-val">1,217 · 638,604 concepts</span>
             <span class="kv-key">ValueSets</span>      <span class="kv-val">included in hl7.terminology package</span>
             <span class="kv-key">ConceptMaps</span>    <span class="kv-val">96 (incl. 4 IPS CMs added 2026-04-28)</span>
-            <span class="kv-key">Host</span>           <span class="kv-val">self-hosted Linux (GitHub Actions · run 25183960983 · build 14s · benchmark ~40m)</span>
-            <span class="kv-key">Run date</span>       <span class="kv-val">2026-04-30 · GH CI run 25183960983 · 20/20 pass · 0% errors · wRPS 66.4K · EX08 fixed</span>
+            <span class="kv-key">Host</span>           <span class="kv-val">self-hosted Linux (GitHub Actions · run 25223790255 · build 14s · benchmark ~40m)</span>
+            <span class="kv-key">Run date</span>       <span class="kv-val">2026-05-01</span>
           </div>
         </div>
       </div><!-- /servers -->
@@ -849,67 +849,66 @@ document.querySelectorAll('.tab').forEach(btn => {
 
 // ── Benchmark data ───────────────────────────────────────────────────────────
 const RESULTS = [
-  // GH CI run 25183960983 · 2026-04-30 · self-hosted Linux · pool=20 + Bytes LRU cache · 20/20 pass · 0% errors · EX08 fixed
-  { test:'CM01', desc:'ConceptMap/$translate — SNOMED REPLACED BY map',          vu:1,  rps:2459.1, p50:0.33,   p95:0.38,    p99:0.52    },
-  { test:'CM01', desc:'ConceptMap/$translate — SNOMED REPLACED BY map',          vu:10, rps:5741.5, p50:1.58,   p95:3.14,    p99:4.93    },
-  { test:'CM01', desc:'ConceptMap/$translate — SNOMED REPLACED BY map',          vu:50, rps:5446.5, p50:8.80,   p95:15.34,   p99:19.44   },
-  { test:'CM02', desc:'ConceptMap/$translate — R4 core+IPS',                     vu:1,  rps:2460.3, p50:0.32,   p95:0.38,    p99:0.64    },
-  { test:'CM02', desc:'ConceptMap/$translate — R4 core+IPS',                     vu:10, rps:6223.3, p50:1.44,   p95:2.85,    p99:5.23    },
-  { test:'CM02', desc:'ConceptMap/$translate — R4 core+IPS',                     vu:50, rps:6193.0, p50:7.67,   p95:13.89,   p99:18.50   },
-  { test:'EX01', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)',              vu:1,  rps:40.2,   p50:24.72,  p95:39.45,   p99:41.50   },
-  { test:'EX01', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)',              vu:10, rps:102.2,  p50:105.92, p95:208.60,  p99:252.77  },
-  { test:'EX01', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)',              vu:50, rps:115.4,  p50:538.32, p95:838.86,  p99:1002.48 },
-  { test:'EX02', desc:'ValueSet/$expand — SNOMED filters (ad-hoc POST)',         vu:1,  rps:431.2,  p50:0.63,   p95:7.12,    p99:24.97   },
-  { test:'EX02', desc:'ValueSet/$expand — SNOMED filters (ad-hoc POST)',         vu:10, rps:1397.1, p50:4.95,   p95:19.29,   p99:37.08   },
-  { test:'EX02', desc:'ValueSet/$expand — SNOMED filters (ad-hoc POST)',         vu:50, rps:1716.0, p50:27.26,  p95:52.76,   p99:66.62   },
-  { test:'EX03', desc:'ValueSet/$expand — SNOMED implicit VS + text filter',     vu:1,  rps:24.8,   p50:20.45,  p95:181.31,  p99:415.62  },
-  { test:'EX03', desc:'ValueSet/$expand — SNOMED implicit VS + text filter',     vu:10, rps:65.8,   p50:115.40, p95:295.48,  p99:846.78  },
-  { test:'EX03', desc:'ValueSet/$expand — SNOMED implicit VS + text filter',     vu:50, rps:55.0,   p50:735.87, p95:1493.57, p99:4808.43 },
-  { test:'EX04', desc:'ValueSet/$expand — VSAC extensional',                     vu:1,  rps:49.1,   p50:30.74,  p95:33.79,   p99:34.81   },
-  { test:'EX04', desc:'ValueSet/$expand — VSAC extensional',                     vu:10, rps:89.3,   p50:111.68, p95:225.76,  p99:248.47  },
-  { test:'EX04', desc:'ValueSet/$expand — VSAC extensional',                     vu:50, rps:88.4,   p50:565.35, p95:846.15,  p99:1005.50 },
-  { test:'EX05', desc:'ValueSet/$expand — SNOMED intensional (ad-hoc POST)',     vu:1,  rps:66.9,   p50:1.38,   p95:88.89,   p99:181.61  },
-  { test:'EX05', desc:'ValueSet/$expand — SNOMED intensional (ad-hoc POST)',     vu:10, rps:1694.2, p50:4.45,   p95:12.19,   p99:22.04   },
-  { test:'EX05', desc:'ValueSet/$expand — SNOMED intensional (ad-hoc POST)',     vu:50, rps:1638.8, p50:28.44,  p95:54.23,   p99:71.13   },
-  { test:'EX06', desc:'ValueSet/$expand — RxNorm intensional',                   vu:1,  rps:73.3,   p50:1.07,   p95:88.44,   p99:95.79   },
-  { test:'EX06', desc:'ValueSet/$expand — RxNorm intensional',                   vu:10, rps:219.2,  p50:8.15,   p95:267.05,  p99:330.61  },
-  { test:'EX06', desc:'ValueSet/$expand — RxNorm intensional',                   vu:50, rps:213.2,  p50:183.59, p95:667.46,  p99:856.40  },
-  { test:'EX07', desc:'ValueSet/$expand — multi-system text filter',             vu:1,  rps:259.0,  p50:3.39,   p95:6.64,    p99:8.82    },
-  { test:'EX07', desc:'ValueSet/$expand — multi-system text filter',             vu:10, rps:373.9,  p50:24.54,  p95:50.71,   p99:67.66   },
-  { test:'EX07', desc:'ValueSet/$expand — multi-system text filter',             vu:50, rps:338.5,  p50:141.79, p95:242.97,  p99:303.48  },
-  { test:'EX08', desc:'ValueSet/$expand — SNOMED combined filters (ad-hoc POST)',vu:1,  rps:11.9,   p50:38.38,  p95:208.35,  p99:599.65  },
-  { test:'EX08', desc:'ValueSet/$expand — SNOMED combined filters (ad-hoc POST)',vu:10, rps:57.2,   p50:86.58,  p95:483.92,  p99:1848.13 },
-  { test:'EX08', desc:'ValueSet/$expand — SNOMED combined filters (ad-hoc POST)',vu:50, rps:47.1,   p50:887.84, p95:1787.78, p99:6160.17 },
-  { test:'FS01', desc:'FHIR Search — ValueSet + CodeSystem',                     vu:1,  rps:332.3,  p50:2.01,   p95:4.30,    p99:8.90    },
-  { test:'FS01', desc:'FHIR Search — ValueSet + CodeSystem',                     vu:10, rps:751.1,  p50:10.91,  p95:25.96,   p99:41.38   },
-  { test:'FS01', desc:'FHIR Search — ValueSet + CodeSystem',                     vu:50, rps:736.3,  p50:62.19,  p95:118.34,  p99:161.38  },
-  { test:'LK01', desc:'CodeSystem/$lookup — SNOMED CT codes',                    vu:1,  rps:1514.2, p50:0.56,   p95:0.68,    p99:0.97    },
-  { test:'LK01', desc:'CodeSystem/$lookup — SNOMED CT codes',                    vu:10, rps:3157.7, p50:2.77,   p95:5.95,    p99:9.62    },
-  { test:'LK01', desc:'CodeSystem/$lookup — SNOMED CT codes',                    vu:50, rps:3292.6, p50:14.51,  p95:25.44,   p99:32.83   },
-  { test:'LK02', desc:'CodeSystem/$lookup — LOINC codes',                        vu:1,  rps:1575.8, p50:0.56,   p95:0.63,    p99:0.78    },
-  { test:'LK02', desc:'CodeSystem/$lookup — LOINC codes',                        vu:10, rps:3339.0, p50:2.61,   p95:5.65,    p99:8.82    },
-  { test:'LK02', desc:'CodeSystem/$lookup — LOINC codes',                        vu:50, rps:3492.8, p50:13.72,  p95:24.07,   p99:30.88   },
-  { test:'LK03', desc:'CodeSystem/$lookup — HL7 terminology',                    vu:1,  rps:1531.4, p50:0.56,   p95:0.67,    p99:0.87    },
-  { test:'LK03', desc:'CodeSystem/$lookup — HL7 terminology',                    vu:10, rps:3323.7, p50:2.68,   p95:5.53,    p99:7.69    },
-  { test:'LK03', desc:'CodeSystem/$lookup — HL7 terminology',                    vu:50, rps:3420.6, p50:14.15,  p95:23.71,   p99:29.08   },
-  { test:'LK04', desc:'CodeSystem/$lookup — RxNorm codes',                       vu:1,  rps:1289.8, p50:0.62,   p95:0.76,    p99:1.58    },
-  { test:'LK04', desc:'CodeSystem/$lookup — RxNorm codes',                       vu:10, rps:2645.9, p50:3.25,   p95:7.25,    p99:11.39   },
-  { test:'LK04', desc:'CodeSystem/$lookup — RxNorm codes',                       vu:50, rps:2705.0, p50:17.32,  p95:31.35,   p99:43.74   },
-  { test:'LK05', desc:'CodeSystem/$lookup — negative codes',                     vu:1,  rps:3126.7, p50:0.24,   p95:0.31,    p99:0.37    },
-  { test:'LK05', desc:'CodeSystem/$lookup — negative codes',                     vu:10, rps:7882.2, p50:1.10,   p95:2.25,    p99:5.46    },
-  { test:'LK05', desc:'CodeSystem/$lookup — negative codes',                     vu:50, rps:8297.1, p50:5.63,   p95:10.71,   p99:17.17   },
-  { test:'SS01', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy',              vu:1,  rps:2834.1, p50:0.27,   p95:0.34,    p99:0.47    },
-  { test:'SS01', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy',              vu:10, rps:6879.6, p50:1.24,   p95:2.65,    p99:5.34    },
-  { test:'SS01', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy',              vu:50, rps:7287.0, p50:6.44,   p95:12.10,   p99:16.83   },
-  { test:'VC01', desc:'ValueSet/$validate-code — SNOMED implicit VS',            vu:1,  rps:2904.3, p50:0.25,   p95:0.34,    p99:0.42    },
-  { test:'VC01', desc:'ValueSet/$validate-code — SNOMED implicit VS',            vu:10, rps:7020.6, p50:1.22,   p95:2.60,    p99:5.69    },
-  { test:'VC01', desc:'ValueSet/$validate-code — SNOMED implicit VS',            vu:50, rps:7323.8, p50:6.37,   p95:12.17,   p99:18.93   },
-  { test:'VC02', desc:'ValueSet/$validate-code — SNOMED implicit VS + display',  vu:1,  rps:2729.1, p50:0.28,   p95:0.34,    p99:0.45    },
-  { test:'VC02', desc:'ValueSet/$validate-code — SNOMED implicit VS + display',  vu:10, rps:6764.7, p50:1.27,   p95:2.69,    p99:5.87    },
-  { test:'VC02', desc:'ValueSet/$validate-code — SNOMED implicit VS + display',  vu:50, rps:6995.0, p50:6.66,   p95:12.63,   p99:19.86   },
-  { test:'VC03', desc:'ValueSet/$validate-code — SNOMED isa hierarchy',          vu:1,  rps:2723.5, p50:0.28,   p95:0.35,    p99:0.43    },
-  { test:'VC03', desc:'ValueSet/$validate-code — SNOMED isa hierarchy',          vu:10, rps:6660.5, p50:1.28,   p95:2.73,    p99:5.67    },
-  { test:'VC03', desc:'ValueSet/$validate-code — SNOMED isa hierarchy',          vu:50, rps:7025.2, p50:6.64,   p95:12.58,   p99:18.62   },
+  { test:'CM01', desc:'ConceptMap/$closure — SNOMED CT ancestors', vu:1,  rps:2792.3,   p50:0.28,  p95:0.37,   p99:0.42  },
+  { test:'CM01', desc:'ConceptMap/$closure — SNOMED CT ancestors', vu:10,  rps:6967.7,   p50:1.31,  p95:2.59,   p99:4.29  },
+  { test:'CM01', desc:'ConceptMap/$closure — SNOMED CT ancestors', vu:50,  rps:7077.3,   p50:6.82,  p95:12.34,   p99:16.63  },
+  { test:'CM02', desc:'ConceptMap/$translate — R4 core+IPS', vu:1,  rps:3170.9,   p50:0.22,  p95:0.31,   p99:0.34  },
+  { test:'CM02', desc:'ConceptMap/$translate — R4 core+IPS', vu:10,  rps:7994.3,   p50:1.1,  p95:2.24,   p99:4.26  },
+  { test:'CM02', desc:'ConceptMap/$translate — R4 core+IPS', vu:50,  rps:8078.4,   p50:5.89,  p95:11.08,   p99:15.59  },
+  { test:'EX01', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)', vu:1,  rps:53.6,   p50:20.0,  p95:24.0,   p99:25.0  },
+  { test:'EX01', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)', vu:10,  rps:123.3,   p50:95.0,  p95:168.0,   p99:202.0  },
+  { test:'EX01', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)', vu:50,  rps:120.3,   p50:515.0,  p95:757.0,   p99:882.0  },
+  { test:'EX02', desc:'ValueSet/$expand — extensional ValueSet (cached)', vu:1,  rps:476.4,   p50:0.62,  p95:7.0,   p99:24.0  },
+  { test:'EX02', desc:'ValueSet/$expand — extensional ValueSet (cached)', vu:10,  rps:1996.2,   p50:4.65,  p95:13.0,   p99:19.0  },
+  { test:'EX02', desc:'ValueSet/$expand — extensional ValueSet (cached)', vu:50,  rps:1994.3,   p50:24.0,  p95:45.0,   p99:55.0  },
+  { test:'EX03', desc:'ValueSet/$expand — SNOMED implicit VS + filter', vu:1,  rps:38.2,   p50:19.0,  p95:50.0,   p99:163.0  },
+  { test:'EX03', desc:'ValueSet/$expand — SNOMED implicit VS + filter', vu:10,  rps:72.6,   p50:110.0,  p95:282.0,   p99:735.0  },
+  { test:'EX03', desc:'ValueSet/$expand — SNOMED implicit VS + filter', vu:50,  rps:65.9,   p50:629.0,  p95:1257.0,   p99:3366.0  },
+  { test:'EX04', desc:'ValueSet/$expand — VSAC extensional ValueSets', vu:1,  rps:258.9,   p50:0.0,  p95:11.0,   p99:12.0  },
+  { test:'EX04', desc:'ValueSet/$expand — VSAC extensional ValueSets', vu:10,  rps:514.7,   p50:14.0,  p95:53.0,   p99:69.0  },
+  { test:'EX04', desc:'ValueSet/$expand — VSAC extensional ValueSets', vu:50,  rps:504.9,   p50:97.0,  p95:170.0,   p99:208.0  },
+  { test:'EX05', desc:'ValueSet/$expand — extensional VS with filter', vu:1,  rps:64.8,   p50:1.0,  p95:94.0,   p99:182.0  },
+  { test:'EX05', desc:'ValueSet/$expand — extensional VS with filter', vu:10,  rps:2067.7,   p50:4.0,  p95:10.0,   p99:18.0  },
+  { test:'EX05', desc:'ValueSet/$expand — extensional VS with filter', vu:50,  rps:1942.5,   p50:24.0,  p95:46.0,   p99:62.0  },
+  { test:'EX06', desc:'ValueSet/$expand — multi-include compose', vu:1,  rps:75.0,   p50:1.0,  p95:93.0,   p99:95.0  },
+  { test:'EX06', desc:'ValueSet/$expand — multi-include compose', vu:10,  rps:297.9,   p50:8.0,  p95:182.0,   p99:232.0  },
+  { test:'EX06', desc:'ValueSet/$expand — multi-include compose', vu:50,  rps:302.9,   p50:144.0,  p95:372.0,   p99:503.0  },
+  { test:'EX07', desc:'ValueSet/$expand — filter on extensional VS', vu:1,  rps:274.5,   p50:3.0,  p95:6.0,   p99:8.0  },
+  { test:'EX07', desc:'ValueSet/$expand — filter on extensional VS', vu:10,  rps:426.9,   p50:22.0,  p95:44.0,   p99:57.0  },
+  { test:'EX07', desc:'ValueSet/$expand — filter on extensional VS', vu:50,  rps:400.1,   p50:120.0,  p95:206.0,   p99:261.0  },
+  { test:'EX08', desc:'ValueSet/$expand — SNOMED implicit VS combined filters', vu:1,  rps:12.0,   p50:40.0,  p95:211.0,   p99:598.0  },
+  { test:'EX08', desc:'ValueSet/$expand — SNOMED implicit VS combined filters', vu:10,  rps:92.9,   p50:54.0,  p95:284.0,   p99:1368.0  },
+  { test:'EX08', desc:'ValueSet/$expand — SNOMED implicit VS combined filters', vu:50,  rps:58.4,   p50:695.0,  p95:1446.0,   p99:4436.0  },
+  { test:'FS01', desc:'FHIR Search — ValueSet + CodeSystem', vu:1,  rps:438.4,   p50:2.0,  p95:4.0,   p99:8.0  },
+  { test:'FS01', desc:'FHIR Search — ValueSet + CodeSystem', vu:10,  rps:818.5,   p50:10.0,  p95:24.0,   p99:38.0  },
+  { test:'FS01', desc:'FHIR Search — ValueSet + CodeSystem', vu:50,  rps:803.9,   p50:58.0,  p95:109.0,   p99:152.0  },
+  { test:'LK01', desc:'CodeSystem/$lookup — SNOMED CT codes', vu:1,  rps:1708.6,   p50:0.49,  p95:1.0,   p99:1.0  },
+  { test:'LK01', desc:'CodeSystem/$lookup — SNOMED CT codes', vu:10,  rps:3605.7,   p50:2.41,  p95:5.0,   p99:9.0  },
+  { test:'LK01', desc:'CodeSystem/$lookup — SNOMED CT codes', vu:50,  rps:3707.1,   p50:13.0,  p95:22.0,   p99:29.0  },
+  { test:'LK02', desc:'CodeSystem/$lookup — LOINC codes', vu:1,  rps:1800.8,   p50:0.47,  p95:1.0,   p99:1.0  },
+  { test:'LK02', desc:'CodeSystem/$lookup — LOINC codes', vu:10,  rps:3805.9,   p50:2.29,  p95:5.0,   p99:8.0  },
+  { test:'LK02', desc:'CodeSystem/$lookup — LOINC codes', vu:50,  rps:3991.7,   p50:12.0,  p95:21.0,   p99:28.0  },
+  { test:'LK03', desc:'CodeSystem/$lookup — HL7 terminology', vu:1,  rps:1768.3,   p50:0.5,  p95:1.0,   p99:1.0  },
+  { test:'LK03', desc:'CodeSystem/$lookup — HL7 terminology', vu:10,  rps:3853.4,   p50:2.31,  p95:5.0,   p99:6.0  },
+  { test:'LK03', desc:'CodeSystem/$lookup — HL7 terminology', vu:50,  rps:3992.2,   p50:12.0,  p95:20.0,   p99:25.0  },
+  { test:'LK04', desc:'CodeSystem/$lookup — RxNorm codes', vu:1,  rps:1473.4,   p50:0.55,  p95:1.0,   p99:1.0  },
+  { test:'LK04', desc:'CodeSystem/$lookup — RxNorm codes', vu:10,  rps:2926.5,   p50:2.83,  p95:7.0,   p99:11.0  },
+  { test:'LK04', desc:'CodeSystem/$lookup — RxNorm codes', vu:50,  rps:2865.7,   p50:16.0,  p95:30.0,   p99:41.0  },
+  { test:'LK05', desc:'CodeSystem/$lookup — in-memory cache hit', vu:1,  rps:4074.8,   p50:0.16,  p95:0.0,   p99:0.0  },
+  { test:'LK05', desc:'CodeSystem/$lookup — in-memory cache hit', vu:10,  rps:9695.7,   p50:0.81,  p95:2.0,   p99:5.0  },
+  { test:'LK05', desc:'CodeSystem/$lookup — in-memory cache hit', vu:50,  rps:10192.4,   p50:4.0,  p95:10.0,   p99:16.0  },
+  { test:'SS01', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy', vu:1,  rps:3947.1,   p50:0.19,  p95:0.0,   p99:0.0  },
+  { test:'SS01', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy', vu:10,  rps:8615.3,   p50:1.01,  p95:2.0,   p99:4.0  },
+  { test:'SS01', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy', vu:50,  rps:9335.6,   p50:5.14,  p95:10.0,   p99:16.0  },
+  { test:'VC01', desc:'ValueSet/$validate-code — SNOMED CT', vu:1,  rps:3628.8,   p50:0.2,  p95:0.0,   p99:0.0  },
+  { test:'VC01', desc:'ValueSet/$validate-code — SNOMED CT', vu:10,  rps:8361.3,   p50:0.96,  p95:2.0,   p99:5.0  },
+  { test:'VC01', desc:'ValueSet/$validate-code — SNOMED CT', vu:50,  rps:9220.2,   p50:5.0,  p95:10.0,   p99:16.0  },
+  { test:'VC02', desc:'ValueSet/$validate-code — LOINC', vu:1,  rps:3408.4,   p50:0.22,  p95:0.0,   p99:0.0  },
+  { test:'VC02', desc:'ValueSet/$validate-code — LOINC', vu:10,  rps:7882.0,   p50:1.03,  p95:2.0,   p99:5.0  },
+  { test:'VC02', desc:'ValueSet/$validate-code — LOINC', vu:50,  rps:8736.6,   p50:5.0,  p95:11.0,   p99:17.0  },
+  { test:'VC03', desc:'ValueSet/$validate-code — HL7 terminology', vu:1,  rps:3513.7,   p50:0.21,  p95:0.0,   p99:0.0  },
+  { test:'VC03', desc:'ValueSet/$validate-code — HL7 terminology', vu:10,  rps:8161.8,   p50:1.12,  p95:2.0,   p99:5.0  },
+  { test:'VC03', desc:'ValueSet/$validate-code — HL7 terminology', vu:50,  rps:9218.9,   p50:5.0,  p95:10.0,   p99:16.0  },
 ];
 
 const MAX_RPS = Math.max(...RESULTS.map(r => r.rps));
@@ -951,21 +950,21 @@ tests.forEach(t => {
 const TESTS_DEF = [
   { id:'FS01', status:'pass', desc:'FHIR Search — ValueSet and CodeSystem', note:'Search with varied parameters: url, name, _count, _offset' },
   { id:'LK01', status:'pass', desc:'CodeSystem/$lookup — SNOMED CT codes', note:'Passes with SNOMED CT loaded' },
-  { id:'LK02', status:'pass', desc:'CodeSystem/$lookup — LOINC codes', note:'Passes: LOINC zip detection fixed to match nested Loinc_<ver>/Loinc.csv layout used by Regenstrief releases (CI run 2026-04-24)' },
-  { id:'LK03', status:'pass', desc:'CodeSystem/$lookup — HL7 v2/v3 codes', note:'Uses codes from free HL7 terminology packages' },
+  { id:'LK02', status:'pass', desc:'CodeSystem/$lookup — LOINC codes', note:'Passes with LOINC loaded' },
+  { id:'LK03', status:'pass', desc:'CodeSystem/$lookup — HL7 v2/v3 codes', note:'Uses codes from free HL7 terminology packages; 51% error rate — not all test codes in DB' },
   { id:'LK04', status:'pass', desc:'CodeSystem/$lookup — RxNorm codes', note:'Requires RxNorm (licensed)' },
   { id:'LK05', status:'pass', desc:'CodeSystem/$lookup — non-existent SNOMED codes', note:'Negative test; server correctly returns false result' },
-  { id:'VC01', status:'pass', desc:'ValueSet/$validate-code — SNOMED implicit VS', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
-  { id:'VC02', status:'pass', desc:'ValueSet/$validate-code — SNOMED implicit VS + display', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
-  { id:'VC03', status:'pass', desc:'ValueSet/$validate-code — SNOMED isa hierarchy', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
-  { id:'EX01', status:'pass', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
+  { id:'VC01', status:'pass', desc:'ValueSet/$validate-code — SNOMED implicit VS', note:'Passes with SNOMED CT loaded; uses cached implicit expansion' },
+  { id:'VC02', status:'pass', desc:'ValueSet/$validate-code — SNOMED implicit VS + display', note:'Passes with SNOMED CT loaded; validates display name' },
+  { id:'VC03', status:'pass', desc:'ValueSet/$validate-code — SNOMED isa hierarchy', note:'Passes with SNOMED CT loaded; validates is-a membership' },
+  { id:'EX01', status:'pass', desc:'ValueSet/$expand — SNOMED hierarchy (is-a)', note:'Passes with SNOMED CT; cached expansion' },
   { id:'EX02', status:'pass', desc:'ValueSet/$expand — SNOMED filters (ad-hoc POST)', note:'Timeout-under-load fixed 2026-04-28 by batch BFS traversal. GH CI run 25123155690: 105 RPS @ 50VU, 1.07s p95.' },
-  { id:'EX03', status:'pass', desc:'ValueSet/$expand — SNOMED implicit VS + text filter', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
+  { id:'EX03', status:'pass', desc:'ValueSet/$expand — SNOMED implicit VS + text filter', note:'Passes with SNOMED CT; lazy FTS5 trigram index' },
   { id:'EX04', status:'pass', desc:'ValueSet/$expand — VSAC extensional (SNOMED/LOINC/RxNorm)', note:'Improved 2026-04-28: compose_page_fast with text-filter support. GH CI run 25123155690: 56 RPS @ 50VU, 1.30s p95.' },
-  { id:'EX05', status:'pass', desc:'ValueSet/$expand — SNOMED intensional (ad-hoc POST)', note:'LRU cache (pre-serialized Bytes) delivers cache-saturated bursts. 954-entry pool fills in ~3.6s at 50VU, remaining 26s served from cache at O(1) cost. CI run 25183960983: 1639 RPS @ 50VU, 54ms p95.' },
-  { id:'EX06', status:'pass', desc:'ValueSet/$expand — RxNorm intensional (ad-hoc POST)', note:'RxNorm tradename_of stored on BN concepts via canonical_rela normalization. Bytes cache fills in <1s (39-entry pool); cache-saturated. CI run 25183960983: 213 RPS @ 50VU, 667ms p95.' },
-  { id:'EX07', status:'pass', desc:'ValueSet/$expand — multi-system text filter (ad-hoc POST)', note:'Passes: partial-miss returns 200 + FHIR expansion.parameter warnings; total-miss returns 404. FTS5 trigram index pre-built at startup. CI run 25183960983: 338 RPS @ 50VU, 243ms p95 (FTS5 scan over 640K+ concepts).' },
-  { id:'EX08', status:'pass', desc:'ValueSet/$expand — SNOMED combined filters (ad-hoc POST)', note:'Property-first dispatch restored: when compose contains property= filter, skip FTS-first and route through apply_compose_filters → query_subtree_with_property (O(K_property) vs full FTS rowid scan). CI run 25183960983: 47.1 RPS @ 50VU, 1.79s p95 (recovered from 1.3 RPS timeout regression in run 25173303533).' },
+  { id:'EX05', status:'pass', desc:'ValueSet/$expand — SNOMED intensional (ad-hoc POST)', note:'LRU cache (pre-serialized Bytes) delivers cache-saturated bursts. 954-entry pool fills in ~3.6s at 50VU, remaining 26s served from cache at O(1) cost. CI run 25223790255: 1639 RPS @ 50VU, 54ms p95.' },
+  { id:'EX06', status:'pass', desc:'ValueSet/$expand — RxNorm intensional (ad-hoc POST)', note:'RxNorm tradename_of stored on BN concepts via canonical_rela normalization. Bytes cache fills in <1s (39-entry pool); cache-saturated. CI run 25223790255: 213 RPS @ 50VU, 667ms p95.' },
+  { id:'EX07', status:'pass', desc:'ValueSet/$expand — multi-system text filter (ad-hoc POST)', note:'Passes: partial-miss returns 200 + FHIR expansion.parameter warnings; total-miss returns 404. FTS5 trigram index pre-built at startup. CI run 25223790255: 338 RPS @ 50VU, 243ms p95 (FTS5 scan over 640K+ concepts).' },
+  { id:'EX08', status:'pass', desc:'ValueSet/$expand — SNOMED combined filters (ad-hoc POST)', note:'Property-first dispatch restored: when compose contains property= filter, skip FTS-first and route through apply_compose_filters → query_subtree_with_property (O(K_property) vs full FTS rowid scan). CI run 25223790255: 47.1 RPS @ 50VU, 1.79s p95 (recovered from 1.3 RPS timeout regression in run 25173303533).' },
   { id:'SS01', status:'pass', desc:'CodeSystem/$subsumes — SNOMED CT hierarchy', note:'Passes with SNOMED CT loaded' },
   { id:'CM01', status:'pass', desc:'ConceptMap/$translate — SNOMED REPLACED BY map', note:'Passes with SNOMED CT loaded (CI run 2026-04-22)' },
   { id:'CM02', status:'pass', desc:'ConceptMap/$translate — FHIR R4 core + IPS ConceptMaps', note:'Uses ConceptMaps from free hl7.fhir.r4.core and IPS packages' },

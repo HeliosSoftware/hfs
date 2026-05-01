@@ -31,8 +31,10 @@ use crate::traits::TerminologyMetadata;
 use helios_persistence::tenant::TenantContext;
 
 /// Shared in-memory index for text-filtered implicit ValueSet expansions.
-pub(crate) type ImplicitIndex =
-    Arc<RwLock<HashMap<String, Arc<[value_set::ImplicitConceptEntry]>>>>;
+///
+/// Keyed by the implicit ValueSet URL.  Values are the combined entry list
+/// plus a trigram inverted index that enables O(k) filtered queries.
+pub(crate) type ImplicitIndex = Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
 
 /// SQLite-backed terminology service backend.
 ///

@@ -66,6 +66,20 @@ pub(crate) struct ImplicitConceptEntry {
     pub display_lower: String,
 }
 
+/// Combined in-memory index for a single implicit ValueSet URL.
+///
+/// `entries` is the full sorted concept list (by system_url, code).
+/// `trigram_idx` maps every 3-byte sequence found in `code_lower` or
+/// `display_lower` to the sorted list of entry indices that contain it.
+///
+/// Filtered queries with `filter.len() >= 3` intersect posting lists to
+/// obtain a candidate set in O(k) time instead of scanning all N entries.
+/// Shorter filters fall back to the O(N) linear scan.
+pub(crate) struct ImplicitConceptIndex {
+    pub entries: Box<[ImplicitConceptEntry]>,
+    pub trigram_idx: HashMap<[u8; 3], Box<[u32]>>,
+}
+
 #[async_trait]
 impl ValueSetOperations for SqliteTerminologyBackend {
     /// Expand a value set by URL, returning all contained codes.
@@ -371,11 +385,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // filter/pagination once the index is warm.
                         let in_mem = implicit_index.read().ok().and_then(|g| g.get(url).cloned());
 
-                        if let Some(entries) = in_mem {
+                        if let Some(concept_idx) = in_mem {
                             let total = if skip_count {
                                 None
                             } else {
-                                let n = count_in_memory(&entries, filter_lower.as_deref());
+                                let n = count_in_memory(&concept_idx, filter_lower.as_deref());
                                 if req.count.is_none() {
                                     if let Some(cap) = req.max_expansion_size {
                                         if u64::from(n) > u64::from(cap) {
@@ -391,7 +405,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 Some(n)
                             };
                             let page = page_in_memory(
-                                &entries,
+                                &concept_idx,
                                 filter_lower.as_deref(),
                                 sql_offset,
                                 sql_limit,
@@ -3106,7 +3120,7 @@ fn ensure_implicit_index(
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    let entries: Arc<[ImplicitConceptEntry]> = stmt
+    let entries: Vec<ImplicitConceptEntry> = stmt
         .query_map([url], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -3132,63 +3146,212 @@ fn ensure_implicit_index(
                 display_lower,
             }
         })
-        .collect::<Vec<_>>()
-        .into();
+        .collect();
+
+    // Build trigram inverted index: for each entry, emit every distinct 3-byte
+    // sequence found in code_lower or display_lower.  Posting lists are appended
+    // in ascending entry-index order (they are inherently sorted since we process
+    // entries 0..N in order), so no sort step is needed after construction.
+    let mut trigram_idx: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
+    let mut seen: Vec<[u8; 3]> = Vec::with_capacity(64);
+    for (i, entry) in entries.iter().enumerate() {
+        seen.clear();
+        let idx = i as u32;
+        for text in [entry.code_lower.as_str(), entry.display_lower.as_str()] {
+            let bytes = text.as_bytes();
+            for w in bytes.windows(3) {
+                let tri = [w[0], w[1], w[2]];
+                // Deduplicate: don't add the same trigram for the same entry twice.
+                if !seen.contains(&tri) {
+                    seen.push(tri);
+                    trigram_idx.entry(tri).or_default().push(idx);
+                }
+            }
+        }
+    }
+    let trigram_idx: HashMap<[u8; 3], Box<[u32]>> = trigram_idx
+        .into_iter()
+        .map(|(k, v)| (k, v.into_boxed_slice()))
+        .collect();
+
+    let combined = Arc::new(ImplicitConceptIndex {
+        entries: entries.into_boxed_slice(),
+        trigram_idx,
+    });
 
     {
         let mut guard = index
             .write()
             .map_err(|_| HtsError::Internal("implicit index lock poisoned".into()))?;
-        guard.entry(url.to_string()).or_insert(entries);
+        guard.entry(url.to_string()).or_insert(combined);
     }
 
     Ok(())
 }
 
+/// Intersect two sorted posting lists using a merge-join — O(a + b).
+fn merge_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut result = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                result.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    result
+}
+
+/// Return candidate entry indices whose `code_lower` or `display_lower`
+/// contains all trigrams of `filter`.
+///
+/// Returns `None` when `filter` is shorter than 3 bytes (no trigrams can be
+/// formed), signalling the caller to fall back to a linear scan.
+/// Returns `Some(vec![])` when any trigram has an empty posting list
+/// (guaranteed no matches).
+fn trigram_candidates(idx: &HashMap<[u8; 3], Box<[u32]>>, filter: &str) -> Option<Vec<u32>> {
+    let bytes = filter.as_bytes();
+    if bytes.len() < 3 {
+        return None;
+    }
+
+    // Collect distinct trigrams from the filter string.
+    let mut trigrams: Vec<[u8; 3]> = Vec::new();
+    for w in bytes.windows(3) {
+        let tri = [w[0], w[1], w[2]];
+        if !trigrams.contains(&tri) {
+            trigrams.push(tri);
+        }
+    }
+
+    // Look up each trigram.  Sort by posting-list length so the first
+    // intersection starts from the smallest (cheapest) list.
+    let mut lists: Vec<&[u32]> = trigrams
+        .iter()
+        .filter_map(|t| idx.get(t).map(Box::as_ref))
+        .collect();
+
+    if lists.len() < trigrams.len() {
+        // At least one trigram has no posting list → guaranteed empty result.
+        return Some(vec![]);
+    }
+
+    lists.sort_unstable_by_key(|l| l.len());
+
+    let mut candidates: Vec<u32> = lists[0].to_vec();
+    for list in &lists[1..] {
+        if candidates.is_empty() {
+            break;
+        }
+        candidates = merge_intersect(&candidates, list);
+    }
+
+    Some(candidates)
+}
+
 /// Count entries in the in-memory index that match an optional filter.
-fn count_in_memory(entries: &[ImplicitConceptEntry], filter_lower: Option<&str>) -> u32 {
-    match filter_lower {
-        None => entries.len() as u32,
-        Some(f) => entries
-            .iter()
-            .filter(|e| e.code_lower.contains(f) || e.display_lower.contains(f))
-            .count() as u32,
+///
+/// Uses the trigram index for O(k) lookup when `filter` is ≥ 3 bytes;
+/// falls back to a linear scan for shorter filters.
+fn count_in_memory(idx: &ImplicitConceptIndex, filter_lower: Option<&str>) -> u32 {
+    let Some(f) = filter_lower else {
+        return idx.entries.len() as u32;
+    };
+
+    match trigram_candidates(&idx.trigram_idx, f) {
+        Some(candidates) => {
+            // Verify candidates: trigram intersection is a necessary but not
+            // sufficient condition, so re-check with contains().
+            candidates
+                .iter()
+                .filter(|&&i| {
+                    let e = &idx.entries[i as usize];
+                    e.code_lower.contains(f) || e.display_lower.contains(f)
+                })
+                .count() as u32
+        }
+        None => {
+            // Filter < 3 bytes: no trigrams — linear scan.
+            idx.entries
+                .iter()
+                .filter(|e| e.code_lower.contains(f) || e.display_lower.contains(f))
+                .count() as u32
+        }
     }
 }
 
 /// Return a paginated slice of in-memory entries matching an optional filter.
 ///
-/// Entries are pre-sorted by `(system_url, code)` from the DB load query, so
-/// unfiltered pagination is a simple skip/take.  Filtered results retain that
-/// order (equivalent to `ORDER BY system_url, code` in SQL).
+/// Unfiltered requests skip directly to `offset` without scanning all entries.
+/// Filtered requests use the trigram index for O(k) candidate lookup (≥ 3-char
+/// filters); shorter filters fall back to a linear scan.
+/// Candidates are returned in entry-index order, which preserves the original
+/// `ORDER BY system_url, code` ordering from the DB load.
 fn page_in_memory(
-    entries: &[ImplicitConceptEntry],
+    idx: &ImplicitConceptIndex,
     filter_lower: Option<&str>,
     offset: i64,
     limit: i64,
 ) -> Vec<ExpansionContains> {
-    let offset = offset as usize;
+    let offset_n = offset as usize;
     let take = if limit < 0 {
         usize::MAX
     } else {
         limit as usize
     };
 
-    entries
-        .iter()
-        .filter(|e| {
-            filter_lower.is_none_or(|f| e.code_lower.contains(f) || e.display_lower.contains(f))
-        })
-        .skip(offset)
-        .take(take)
-        .map(|e| ExpansionContains {
-            system: e.system_url.clone(),
-            code: e.code.clone(),
-            display: e.display.clone(),
-            inactive: None,
-            contains: vec![],
-        })
-        .collect()
+    let entry_to_contains = |e: &ImplicitConceptEntry| ExpansionContains {
+        system: e.system_url.clone(),
+        code: e.code.clone(),
+        display: e.display.clone(),
+        inactive: None,
+        contains: vec![],
+    };
+
+    let Some(f) = filter_lower else {
+        // No filter: O(count) direct slice — skip then take.
+        return idx
+            .entries
+            .iter()
+            .skip(offset_n)
+            .take(take)
+            .map(entry_to_contains)
+            .collect();
+    };
+
+    match trigram_candidates(&idx.trigram_idx, f) {
+        Some(candidates) => {
+            // Candidates are sorted by entry index → same order as entries.
+            candidates
+                .iter()
+                .filter_map(|&i| {
+                    let e = &idx.entries[i as usize];
+                    if e.code_lower.contains(f) || e.display_lower.contains(f) {
+                        Some(entry_to_contains(e))
+                    } else {
+                        None
+                    }
+                })
+                .skip(offset_n)
+                .take(take)
+                .collect()
+        }
+        None => {
+            // Filter < 3 bytes: linear scan.
+            idx.entries
+                .iter()
+                .filter(|e| e.code_lower.contains(f) || e.display_lower.contains(f))
+                .skip(offset_n)
+                .take(take)
+                .map(entry_to_contains)
+                .collect()
+        }
+    }
 }
 
 /// Wrap a search term as an FTS5 phrase literal.
