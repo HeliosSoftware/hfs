@@ -17,6 +17,18 @@ pub struct SubscriptionConfig {
     /// Backoff multiplier for exponential backoff.
     pub retry_backoff_factor: f64,
 
+    /// Delay before the first activation handshake attempt.
+    pub handshake_initial_delay: Duration,
+
+    /// Maximum number of activation handshake attempts.
+    pub handshake_max_attempts: u32,
+
+    /// Initial delay before retrying a failed activation handshake.
+    pub handshake_retry_initial_delay: Duration,
+
+    /// Maximum delay between activation handshake retries.
+    pub handshake_retry_max_delay: Duration,
+
     /// How often to check for heartbeats that are due.
     pub heartbeat_check_interval: Duration,
 
@@ -59,6 +71,10 @@ impl Default for SubscriptionConfig {
             retry_initial_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(60),
             retry_backoff_factor: 2.0,
+            handshake_initial_delay: Duration::ZERO,
+            handshake_max_attempts: 1,
+            handshake_retry_initial_delay: Duration::from_secs(1),
+            handshake_retry_max_delay: Duration::from_secs(60),
             heartbeat_check_interval: Duration::from_secs(30),
             error_threshold: 3,
             off_threshold: 10,

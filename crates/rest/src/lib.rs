@@ -322,11 +322,29 @@ where
                 supported.push("message".to_string());
                 info!("FHIR Messaging subscription channel ENABLED");
             }
+            let default_sub_config = helios_subscriptions::SubscriptionConfig::default();
             let sub_config = helios_subscriptions::SubscriptionConfig {
                 supported_channel_types: supported,
                 smtp,
                 messaging,
-                ..Default::default()
+                handshake_initial_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS",
+                    default_sub_config.handshake_initial_delay,
+                ),
+                handshake_max_attempts: subscription_u32_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS",
+                    default_sub_config.handshake_max_attempts,
+                )
+                .max(1),
+                handshake_retry_initial_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS",
+                    default_sub_config.handshake_retry_initial_delay,
+                ),
+                handshake_retry_max_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS",
+                    default_sub_config.handshake_retry_max_delay,
+                ),
+                ..default_sub_config
             };
             // Outbound auth provider was built above (static bearer when
             // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
@@ -397,6 +415,26 @@ where
 
     // Apply remaining middleware
     router.layer(service_builder)
+}
+
+#[cfg(feature = "subscriptions")]
+fn subscription_u32_from_env(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "subscriptions")]
+fn subscription_duration_ms_from_env(
+    name: &str,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(default)
 }
 
 /// Build SMTP settings for the email subscription channel from `HFS_SUBSCRIPTION_SMTP_*`

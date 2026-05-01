@@ -161,6 +161,10 @@ jobs:
       HFS_PORT: ${{ matrix.hfs_port }}
       INFERNO_PORT: ${{ needs.inferno-stack-up.outputs.port }}
       INFERNO_COMPOSE_PROJECT: ${{ needs.inferno-stack-up.outputs.project }}
+      HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS: 5000
+      HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS: 5
+      HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS: 1000
+      HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS: 10000
       RESULTS_DIR: inferno-subscription-results/${{ matrix.backend }}
       SUITE_ID: subscriptions_r5_backport_r4_server
       TEST_GROUP_ID: subscriptions_r5_backport_r4_server-subscriptions_r4_server_workflow

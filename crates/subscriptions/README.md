@@ -155,6 +155,10 @@ Comparators supported: `eq` (default), `in`. Native `filterBy.comparator` values
 | `HFS_SUBSCRIPTION_MAX_RETRIES` | `10` | Max delivery attempts before marking error |
 | `HFS_SUBSCRIPTION_RETRY_INITIAL_DELAY` | `1s` | Initial delay for exponential backoff |
 | `HFS_SUBSCRIPTION_RETRY_MAX_DELAY` | `60s` | Maximum delay cap for backoff |
+| `HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS` | `0` | Delay before the first activation handshake attempt |
+| `HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS` | `1` | Max activation handshake attempts before marking error |
+| `HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS` | `1000` | Initial delay before retrying a failed activation handshake |
+| `HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS` | `60000` | Maximum delay cap for activation handshake retries |
 | `HFS_SUBSCRIPTION_HEARTBEAT_INTERVAL` | `30s` | How often to check for due heartbeats |
 | `HFS_SUBSCRIPTION_ERROR_THRESHOLD` | `3` | Consecutive failures before `error` status |
 | `HFS_SUBSCRIPTION_OFF_THRESHOLD` | `10` | Consecutive failures before `off` status |
@@ -297,7 +301,7 @@ curl -X POST http://localhost:8080/Subscription \
   }'
 ```
 
-The server will immediately send a handshake notification to the endpoint. On a successful 2xx response the subscription transitions to `active`.
+The server schedules an activation handshake notification to the endpoint. On a successful 2xx response the subscription transitions to `active`; retryable handshake failures can be retried according to the `HFS_SUBSCRIPTION_HANDSHAKE_*` settings.
 
 ### Creating a WebSocket Subscription
 
