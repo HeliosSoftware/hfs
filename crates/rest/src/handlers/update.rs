@@ -198,8 +198,7 @@ where
             &stored,
             fhir_version,
             event_type,
-        )
-        .await;
+        );
     }
 
     build_update_response(

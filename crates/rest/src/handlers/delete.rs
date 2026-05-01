@@ -94,8 +94,7 @@ where
             &id,
             fhir_version,
             existing_resource.map(|stored| stored.content().clone()),
-        )
-        .await;
+        );
     }
 
     // Return 204 No Content (or 200 with OperationOutcome)
