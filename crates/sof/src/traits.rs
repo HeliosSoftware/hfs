@@ -245,13 +245,13 @@ pub trait ViewDefinitionWhereTrait {
 ///         let eval_result = constant.to_evaluation_result()?;
 ///         
 ///         match eval_result {
-///             EvaluationResult::String(s, _) => {
+///             EvaluationResult::String(s, _, _) => {
 ///                 println!("String constant '{}' = '{}'", name, s);
 ///             },
-///             EvaluationResult::Integer(i, _) => {
+///             EvaluationResult::Integer(i, _, _) => {
 ///                 println!("Integer constant '{}' = {}", name, i);
 ///             },
-///             EvaluationResult::Boolean(b, _) => {
+///             EvaluationResult::Boolean(b, _, _) => {
 ///                 println!("Boolean constant '{}' = {}", name, b);
 ///             },
 ///             _ => {

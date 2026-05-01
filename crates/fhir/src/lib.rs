@@ -2821,14 +2821,7 @@ where
                 EvaluationResult::Integer(i, _, _) => EvaluationResult::fhir_integer(i),
                 #[cfg(not(any(feature = "R4", feature = "R4B")))]
                 EvaluationResult::Integer64(i, _, _) => EvaluationResult::fhir_integer64(i),
-                EvaluationResult::String(s, _, _) => {
-                    let fhir_type_name = if TypeId::of::<V>() == TypeId::of::<String>() {
-                        "string"
-                    } else {
-                        "string"
-                    };
-                    EvaluationResult::fhir_string(s, fhir_type_name)
-                }
+                EvaluationResult::String(s, _, _) => EvaluationResult::fhir_string(s, "string"),
                 EvaluationResult::DateTime(dt, type_info, _) => {
                     if TypeId::of::<V>() == TypeId::of::<PrecisionInstant>() {
                         EvaluationResult::DateTime(
