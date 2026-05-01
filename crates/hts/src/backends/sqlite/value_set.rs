@@ -98,6 +98,57 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             ));
         }
 
+        // ── Async hot path: in-memory index already warm ──────────────────────
+        // For URL-based implicit ValueSet requests (no inline ValueSet body),
+        // check the in-memory index *before* entering spawn_blocking.  When the
+        // index is populated we serve the entire request from process memory —
+        // no pool connection acquired, no thread switch.  This eliminates pool
+        // contention for hot EX03-style repeated implicit-expansion queries.
+        if req.value_set.is_none() {
+            if let Some(url) = req.url.as_deref() {
+                if let Ok(guard) = self.implicit_index.read() {
+                    if let Some(concept_idx) = guard.get(url).cloned() {
+                        drop(guard); // release read lock before CPU work
+                        let filter_lower = req.filter.as_deref().map(|f| f.to_lowercase());
+                        let sql_offset = i64::from(req.offset.unwrap_or(0));
+                        let sql_limit = req.count.map(i64::from).unwrap_or(-1);
+                        let skip_count = req.count.is_some_and(|c| c > 0) && filter_lower.is_some();
+
+                        let total = if skip_count {
+                            None
+                        } else {
+                            let n = count_in_memory(&concept_idx, filter_lower.as_deref());
+                            if req.count.is_none() {
+                                if let Some(cap) = req.max_expansion_size {
+                                    if u64::from(n) > u64::from(cap) {
+                                        return Err(HtsError::TooCostly(format!(
+                                            "ValueSet expansion contains {} codes which exceeds \
+                                             the server limit of {} (set \
+                                             HTS_MAX_EXPANSION_SIZE to raise it)",
+                                            n, cap
+                                        )));
+                                    }
+                                }
+                            }
+                            Some(n)
+                        };
+                        let page = page_in_memory(
+                            &concept_idx,
+                            filter_lower.as_deref(),
+                            sql_offset,
+                            sql_limit,
+                        );
+                        return Ok(ExpandResponse {
+                            total,
+                            offset: req.offset,
+                            contains: page,
+                            warnings: vec![],
+                        });
+                    }
+                }
+            }
+        }
+
         let pool = self.pool().clone();
         let implicit_index = self.implicit_index.clone();
 
