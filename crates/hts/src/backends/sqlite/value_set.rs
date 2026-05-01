@@ -40,6 +40,7 @@ use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::ecl;
 use crate::error::HtsError;
@@ -50,6 +51,20 @@ use crate::types::{
 };
 
 use super::SqliteTerminologyBackend;
+
+/// A concept entry in the process-local in-memory implicit expansion index.
+///
+/// Pre-computed `code_lower` and `display_lower` avoid per-request
+/// `.to_lowercase()` allocations during filter matching at query time.
+/// Loaded from `implicit_expansion_cache` after the DB cache is built.
+#[derive(Clone)]
+pub(crate) struct ImplicitConceptEntry {
+    pub system_url: String,
+    pub code: String,
+    pub display: Option<String>,
+    pub code_lower: String,
+    pub display_lower: String,
+}
 
 #[async_trait]
 impl ValueSetOperations for SqliteTerminologyBackend {
@@ -70,6 +85,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         }
 
         let pool = self.pool().clone();
+        let implicit_index = self.implicit_index.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -336,6 +352,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
                         // ── Blocking path: cache is warm, or count is None ────────────
                         ensure_implicit_cache(&conn, url, req.date.as_deref())?;
+                        // Load DB cache into the in-memory index so subsequent
+                        // requests bypass SQLite entirely (EX03 optimisation).
+                        ensure_implicit_index(&conn, url, &implicit_index)?;
 
                         let filter_lower = req.filter.as_deref().map(|f| f.to_lowercase());
                         let sql_offset = i64::from(req.offset.unwrap_or(0));
@@ -348,6 +367,44 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // Always count for unbounded requests: needed for size-cap check.
                         let skip_count = req.count.is_some_and(|c| c > 0) && filter_lower.is_some();
 
+                        // Serve from the in-memory index — no DB connection needed for
+                        // filter/pagination once the index is warm.
+                        let in_mem = implicit_index.read().ok().and_then(|g| g.get(url).cloned());
+
+                        if let Some(entries) = in_mem {
+                            let total = if skip_count {
+                                None
+                            } else {
+                                let n = count_in_memory(&entries, filter_lower.as_deref());
+                                if req.count.is_none() {
+                                    if let Some(cap) = req.max_expansion_size {
+                                        if u64::from(n) > u64::from(cap) {
+                                            return Err(HtsError::TooCostly(format!(
+                                                "ValueSet expansion contains {} codes which \
+                                                 exceeds the server limit of {} (set \
+                                                 HTS_MAX_EXPANSION_SIZE to raise it)",
+                                                n, cap
+                                            )));
+                                        }
+                                    }
+                                }
+                                Some(n)
+                            };
+                            let page = page_in_memory(
+                                &entries,
+                                filter_lower.as_deref(),
+                                sql_offset,
+                                sql_limit,
+                            );
+                            return Ok(ExpandResponse {
+                                total,
+                                offset: req.offset,
+                                contains: page,
+                                warnings: vec![],
+                            });
+                        }
+
+                        // Fallback: SQL path (index lock poisoned — should not happen).
                         let total = if skip_count {
                             None
                         } else {
@@ -3016,6 +3073,122 @@ fn lookup_in_implicit_cache(
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(HtsError::StorageError(e.to_string())),
     }
+}
+
+/// Ensure the process-local in-memory concept index is populated for `url`.
+///
+/// Reads all rows for `url` from `implicit_expansion_cache` and stores them
+/// as an `Arc<[ImplicitConceptEntry]>` keyed by URL.  Subsequent calls for the
+/// same URL return immediately (O(1) read-lock check).  If two threads race on
+/// the first request, both load from DB but only the first writer's slice is
+/// kept (`or_insert` is a no-op for the second writer).
+fn ensure_implicit_index(
+    conn: &Connection,
+    url: &str,
+    index: &super::ImplicitIndex,
+) -> Result<(), HtsError> {
+    // Fast path: already loaded — only needs a shared read lock.
+    {
+        let guard = index
+            .read()
+            .map_err(|_| HtsError::Internal("implicit index lock poisoned".into()))?;
+        if guard.contains_key(url) {
+            return Ok(());
+        }
+    }
+
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT system_url, code, display \
+             FROM implicit_expansion_cache \
+             WHERE url = ?1 \
+             ORDER BY system_url, code",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let entries: Arc<[ImplicitConceptEntry]> = stmt
+        .query_map([url], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .into_iter()
+        .map(|(system_url, code, display)| {
+            let code_lower = code.to_lowercase();
+            let display_lower = display
+                .as_deref()
+                .map(str::to_lowercase)
+                .unwrap_or_default();
+            ImplicitConceptEntry {
+                system_url,
+                code,
+                display,
+                code_lower,
+                display_lower,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into();
+
+    {
+        let mut guard = index
+            .write()
+            .map_err(|_| HtsError::Internal("implicit index lock poisoned".into()))?;
+        guard.entry(url.to_string()).or_insert(entries);
+    }
+
+    Ok(())
+}
+
+/// Count entries in the in-memory index that match an optional filter.
+fn count_in_memory(entries: &[ImplicitConceptEntry], filter_lower: Option<&str>) -> u32 {
+    match filter_lower {
+        None => entries.len() as u32,
+        Some(f) => entries
+            .iter()
+            .filter(|e| e.code_lower.contains(f) || e.display_lower.contains(f))
+            .count() as u32,
+    }
+}
+
+/// Return a paginated slice of in-memory entries matching an optional filter.
+///
+/// Entries are pre-sorted by `(system_url, code)` from the DB load query, so
+/// unfiltered pagination is a simple skip/take.  Filtered results retain that
+/// order (equivalent to `ORDER BY system_url, code` in SQL).
+fn page_in_memory(
+    entries: &[ImplicitConceptEntry],
+    filter_lower: Option<&str>,
+    offset: i64,
+    limit: i64,
+) -> Vec<ExpansionContains> {
+    let offset = offset as usize;
+    let take = if limit < 0 {
+        usize::MAX
+    } else {
+        limit as usize
+    };
+
+    entries
+        .iter()
+        .filter(|e| {
+            filter_lower.is_none_or(|f| e.code_lower.contains(f) || e.display_lower.contains(f))
+        })
+        .skip(offset)
+        .take(take)
+        .map(|e| ExpansionContains {
+            system: e.system_url.clone(),
+            code: e.code.clone(),
+            display: e.display.clone(),
+            inactive: None,
+            contains: vec![],
+        })
+        .collect()
 }
 
 /// Wrap a search term as an FTS5 phrase literal.

@@ -17,6 +17,9 @@ mod code_system;
 mod concept_map;
 mod value_set;
 
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
 use async_trait::async_trait;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -26,6 +29,10 @@ use crate::error::HtsError;
 use crate::import::{BundleImportBackend, ImportStats};
 use crate::traits::TerminologyMetadata;
 use helios_persistence::tenant::TenantContext;
+
+/// Shared in-memory index for text-filtered implicit ValueSet expansions.
+pub(crate) type ImplicitIndex =
+    Arc<RwLock<HashMap<String, Arc<[value_set::ImplicitConceptEntry]>>>>;
 
 /// SQLite-backed terminology service backend.
 ///
@@ -39,9 +46,14 @@ use helios_persistence::tenant::TenantContext;
 /// [`AppState`]: crate::state::AppState
 #[derive(Clone)]
 pub struct SqliteTerminologyBackend {
-    // Shared across all operation impls and the metadata trait.
-    #[allow(dead_code)]
     pool: Pool<SqliteConnectionManager>,
+    /// In-process concept index for text-filtered implicit ValueSet expansions.
+    ///
+    /// Keyed by the implicit ValueSet URL; values are pre-sorted slices of
+    /// all concepts for that URL loaded from `implicit_expansion_cache`.
+    /// Filtering is done with pure-Rust `contains()` instead of SQLite FTS5,
+    /// eliminating pool contention at high concurrency (EX03 optimisation).
+    pub(crate) implicit_index: ImplicitIndex,
 }
 
 impl SqliteTerminologyBackend {
@@ -130,7 +142,10 @@ impl SqliteTerminologyBackend {
 
         info!(db_path, "SQLite terminology backend initialized");
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            implicit_index: Arc::new(RwLock::new(HashMap::new())),
+        })
     }
 
     /// Open an **in-memory** SQLite database (useful for tests).
@@ -168,7 +183,10 @@ impl SqliteTerminologyBackend {
             })?;
         }
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            implicit_index: Arc::new(RwLock::new(HashMap::new())),
+        })
     }
 
     /// Borrow the underlying r2d2 connection pool.
@@ -241,12 +259,22 @@ impl BundleImportBackend for SqliteTerminologyBackend {
     ) -> Result<ImportStats, HtsError> {
         let pool = self.pool.clone();
         let data_vec = data.to_vec();
+        let implicit_index = self.implicit_index.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             crate::import::fhir_bundle::import_bundle_sync(&pool, &data_vec)
         })
         .await
-        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?;
+
+        // Evict the in-memory index so the next expand re-reads fresh data.
+        if result.is_ok() {
+            if let Ok(mut guard) = implicit_index.write() {
+                guard.clear();
+            }
+        }
+
+        result
     }
 }
 
