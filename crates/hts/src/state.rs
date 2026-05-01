@@ -8,7 +8,7 @@
 //!
 //! [`TerminologyBackend`]: crate::traits::TerminologyBackend
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
@@ -56,6 +56,16 @@ pub struct ExpandCacheKey {
 pub type ExpandCache = Arc<RwLock<HashMap<ExpandCacheKey, Bytes>>>;
 
 pub const EXPAND_CACHE_MAX: usize = 2048;
+/// Maximum number of ValueSet URLs to remember as definitively absent.
+pub const NOT_FOUND_CACHE_MAX: usize = 10_000;
+
+/// Negative-result cache: ValueSet URLs that returned 404 on the last expand.
+///
+/// Keyed on the canonical ValueSet URL only (filter/count/offset are irrelevant
+/// — a missing URL is always missing).  Bounded to avoid unbounded growth when
+/// a client probes many non-existent URLs.  Cleared together with
+/// [`ExpandCache`] after every successful bundle import.
+pub type NotFoundCache = Arc<RwLock<HashSet<String>>>;
 
 /// Shared application state injected into every Axum handler.
 ///
@@ -109,6 +119,15 @@ pub struct AppState<B: TerminologyBackend> {
     /// cache is never invalidated during normal server operation; after a
     /// bundle import call [`Self::clear_expand_cache`].
     pub expand_cache: ExpandCache,
+
+    /// Negative cache for ValueSet URLs that are definitively absent.
+    ///
+    /// A URL in this set returned `HtsError::NotFound` on its last expand
+    /// attempt.  Subsequent requests skip all backend queries and return 404
+    /// immediately, eliminating the 5+ SQLite round-trips that a cold miss
+    /// costs for each uncached URL.  Cleared together with `expand_cache`
+    /// after every successful bundle import.
+    pub not_found_urls: NotFoundCache,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -125,16 +144,20 @@ impl<B: TerminologyBackend> AppState<B> {
             terminology_importer: None,
             max_expansion_size: 10_000,
             expand_cache: Arc::new(RwLock::new(HashMap::new())),
+            not_found_urls: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
-    /// Evict all cached `$expand` results.
+    /// Evict all cached `$expand` results and negative-cache entries.
     ///
     /// Call this after a successful bundle import so that expansions reflecting
     /// the new terminology data are recomputed on the next request.
     pub fn clear_expand_cache(&self) {
         if let Ok(mut cache) = self.expand_cache.write() {
             cache.clear();
+        }
+        if let Ok(mut neg) = self.not_found_urls.write() {
+            neg.clear();
         }
     }
 

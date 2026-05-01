@@ -41,7 +41,7 @@ use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
 use crate::error::HtsError;
-use crate::state::{AppState, EXPAND_CACHE_MAX, ExpandCacheKey};
+use crate::state::{AppState, EXPAND_CACHE_MAX, ExpandCacheKey, NOT_FOUND_CACHE_MAX};
 use crate::traits::{TerminologyBackend, ValueSetOperations};
 use crate::types::{ExpandRequest, ExpansionContains};
 
@@ -150,6 +150,22 @@ async fn process_expand<B: TerminologyBackend>(
         }
     }
 
+    // ── Negative-cache check (URL-based 404s) ─────────────────────────────────
+    // URLs that previously returned NotFound are remembered here so we can skip
+    // all backend queries on repeated requests (saves 5+ SQLite round-trips per
+    // hit).
+    if let Some(ref url_str) = url {
+        if let Ok(neg) = state.not_found_urls.read() {
+            if neg.contains(url_str.as_str()) {
+                return Err(HtsError::NotFound(url_str.clone()));
+            }
+        }
+    }
+
+    // Preserve the URL before it moves into ExpandRequest so we can record it
+    // in the negative cache if the backend returns NotFound.
+    let url_for_neg_cache = url.clone();
+
     // ── Cache miss: compute ───────────────────────────────────────────────────
     let req = ExpandRequest {
         url,
@@ -163,7 +179,22 @@ async fn process_expand<B: TerminologyBackend>(
     };
 
     let ctx = TenantContext::system();
-    let resp = ValueSetOperations::expand(state.backend(), &ctx, req).await?;
+    let resp = match ValueSetOperations::expand(state.backend(), &ctx, req).await {
+        Ok(r) => r,
+        Err(HtsError::NotFound(msg)) => {
+            // Populate the negative cache so future requests for this URL
+            // are resolved in O(1) without touching the database.
+            if let Some(url_str) = url_for_neg_cache {
+                if let Ok(mut neg) = state.not_found_urls.write() {
+                    if neg.len() < NOT_FOUND_CACHE_MAX {
+                        neg.insert(url_str);
+                    }
+                }
+            }
+            return Err(HtsError::NotFound(msg));
+        }
+        Err(e) => return Err(e),
+    };
 
     // ── Build FHIR ValueSet response with expansion ──────────────────────────
     let contains: Vec<Value> = resp
