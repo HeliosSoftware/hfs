@@ -160,6 +160,7 @@ jobs:
     env:
       HFS_PORT: ${{ matrix.hfs_port }}
       INFERNO_PORT: ${{ needs.inferno-stack-up.outputs.port }}
+      INFERNO_COMPOSE_PROJECT: ${{ needs.inferno-stack-up.outputs.project }}
       RESULTS_DIR: inferno-subscription-results/${{ matrix.backend }}
       SUITE_ID: subscriptions_r5_backport_r4_server
       TEST_GROUP_ID: subscriptions_r5_backport_r4_server-subscriptions_r4_server_workflow
@@ -521,6 +522,8 @@ jobs:
 
       - name: Start Inferno subscription workflow
         run: |
+          echo "INFERNO_LOG_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
           SUBSCRIPTION_INPUT="$(cat "$RESULTS_DIR/subscription-input.json")"
           RUN_PAYLOAD="$(jq -n \
             --arg session_id "$SESSION_ID" \
@@ -704,6 +707,38 @@ jobs:
           else
             echo "No results file found." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Capture Inferno container logs
+        if: always()
+        run: |
+          mkdir -p "$RESULTS_DIR/inferno-container-logs"
+
+          PROJECT="${INFERNO_COMPOSE_PROJECT:-inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}}"
+          echo "$PROJECT" > "$RESULTS_DIR/inferno-container-logs/project.txt"
+
+          IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
+          if [ -z "$IDS" ]; then
+            echo "No Inferno containers found for project $PROJECT" > "$RESULTS_DIR/inferno-container-logs/no-containers.txt"
+            exit 0
+          fi
+
+          for ID in $IDS; do
+            SERVICE=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$ID" 2>/dev/null || echo unknown)
+            NAME=$(docker inspect -f '{{ .Name }}' "$ID" 2>/dev/null | sed 's#^/##')
+
+            if [ -z "$NAME" ]; then
+              NAME="$ID"
+            fi
+
+            OUT="$RESULTS_DIR/inferno-container-logs/${SERVICE}-${NAME}.log"
+            docker inspect "$ID" > "$RESULTS_DIR/inferno-container-logs/${SERVICE}-${NAME}.inspect.json" 2>&1 || true
+
+            if [ -n "${INFERNO_LOG_SINCE:-}" ]; then
+              docker logs --timestamps --since "$INFERNO_LOG_SINCE" "$ID" > "$OUT" 2>&1 || true
+            else
+              docker logs --timestamps "$ID" > "$OUT" 2>&1 || true
+            fi
+          done
 
       - name: Upload test results
         if: always()
