@@ -405,11 +405,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             filter_lower.as_deref(),
                                         )?;
 
-                                        // Spawn one background thread per URL to build
-                                        // implicit_expansion_cache then the in-memory
-                                        // implicit_index.  Once complete, the async hot
-                                        // path at the top of expand() fires for all
-                                        // subsequent requests — no pool connection needed.
+                                        // Spawn one background thread per URL to populate
+                                        // implicit_expansion_cache (DB write only).  The
+                                        // in-memory trigram index is NOT built here to avoid
+                                        // peak memory pressure from concurrent large index
+                                        // builds on resource-constrained runners.  Instead,
+                                        // ensure_implicit_index is called lazily on the first
+                                        // spawn_blocking request after the cache is warm
+                                        // (the blocking path at line ~460 below).  From that
+                                        // point the async hot-path serves all requests without
+                                        // touching the pool.
                                         // bg_index_pending prevents duplicate threads when
                                         // many VUs hit the same uncached URL concurrently.
                                         let url_owned = url.to_string();
@@ -426,15 +431,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             .unwrap_or(false);
                                         if should_spawn {
                                             let bg_pool = pool.clone();
-                                            let bg_idx = implicit_index.clone();
                                             let bg_pending = bg_index_pending.clone();
                                             std::thread::spawn(move || {
                                                 if let Ok(bg_conn) = bg_pool.get() {
                                                     let _ = ensure_implicit_cache(
                                                         &bg_conn, &url_owned, None,
-                                                    );
-                                                    let _ = ensure_implicit_index(
-                                                        &bg_conn, &url_owned, &bg_idx,
                                                     );
                                                 }
                                                 if let Ok(mut p) = bg_pending.lock() {
