@@ -155,6 +155,14 @@ impl SubscriptionEngine {
 
         // Evaluate which subscriptions match this event.
         let matches = self.evaluator.evaluate(&event);
+        info!(
+            tenant_id = %event.tenant_id,
+            resource_type = %event.resource_type,
+            resource_id = %event.resource_id,
+            event_type = %event.event_type,
+            matched_subscriptions = matches.len(),
+            "Subscription event evaluated"
+        );
         if matches.is_empty() {
             return;
         }
@@ -178,10 +186,11 @@ impl SubscriptionEngine {
             // Ensure notification metadata reflects the event being emitted.
             subscription.events_since_start = event_number;
 
+            let focus_reference = format!("{}/{}", event.resource_type, event.resource_id);
             let event_data = NotificationEventData {
                 event_number,
                 timestamp: event.timestamp,
-                focus_reference: format!("{}/{}", event.resource_type, event.resource_id),
+                focus_reference: focus_reference.clone(),
             };
 
             // Build notification bundle.
@@ -202,8 +211,25 @@ impl SubscriptionEngine {
                 }
             };
 
+            info!(
+                tenant_id = %subscription.tenant_id,
+                subscription_id = %subscription.id,
+                topic_url = %subscription.topic_url,
+                channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                event_number,
+                focus_reference = %focus_reference,
+                "Dispatching subscription event notification"
+            );
+
             // Dispatch with retry.
-            self.dispatch_with_retry(&subscription, &bundle).await;
+            self.dispatch_with_retry(
+                &subscription,
+                &bundle,
+                "event-notification",
+                Some(event_number),
+            )
+            .await;
         }
     }
 
@@ -212,11 +238,23 @@ impl SubscriptionEngine {
         let tenant_id = event.tenant_id.to_string();
         let subscription_id = &event.resource_id;
 
+        info!(
+            tenant_id,
+            subscription_id,
+            event_type = %event.event_type,
+            fhir_version = %event.fhir_version,
+            "Handling Subscription resource event"
+        );
+
         match event.event_type {
             ResourceEventType::Delete => {
-                self.manager.deregister(&tenant_id, subscription_id);
+                let removed = self.manager.deregister(&tenant_id, subscription_id);
                 self.ws_manager
                     .remove_all_clients(&tenant_id, subscription_id);
+                info!(
+                    tenant_id,
+                    subscription_id, removed, "Subscription deregistered"
+                );
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
@@ -228,13 +266,31 @@ impl SubscriptionEngine {
                         event.fhir_version,
                     ) {
                         Ok(sub) => {
+                            info!(
+                                tenant_id = %sub.tenant_id,
+                                subscription_id = %sub.id,
+                                topic_url = %sub.topic_url,
+                                channel_type = %sub.channel.channel_type.as_fhir_str(),
+                                endpoint = sub.channel.endpoint.as_deref().unwrap_or(""),
+                                status = %sub.status,
+                                fhir_version = %sub.fhir_version,
+                                "Subscription registered"
+                            );
                             // If status is requested, perform handshake and activate.
                             if sub.status == SubscriptionStatusCode::Requested {
+                                info!(
+                                    tenant_id = %sub.tenant_id,
+                                    subscription_id = %sub.id,
+                                    channel_type = %sub.channel.channel_type.as_fhir_str(),
+                                    endpoint = sub.channel.endpoint.as_deref().unwrap_or(""),
+                                    "Subscription activation requested"
+                                );
                                 self.activate_subscription(&sub).await;
                             }
                         }
                         Err(e) => {
                             warn!(
+                                tenant_id,
                                 subscription_id,
                                 error = %e,
                                 "Failed to register subscription"
@@ -463,13 +519,28 @@ impl SubscriptionEngine {
         let handshake_bundle = match notification::build_handshake(subscription, &self.base_url) {
             Ok(b) => b,
             Err(e) => {
-                warn!(subscription_id = sub_id, error = %e, "Failed to build handshake");
+                warn!(
+                    tenant_id,
+                    subscription_id = sub_id,
+                    channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                    endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                    error = %e,
+                    "Failed to build handshake"
+                );
                 let _ =
                     self.manager
                         .update_status(tenant_id, sub_id, SubscriptionStatusCode::Error);
                 return;
             }
         };
+
+        info!(
+            tenant_id,
+            subscription_id = sub_id,
+            channel_type = %subscription.channel.channel_type.as_fhir_str(),
+            endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+            "Sending subscription handshake"
+        );
 
         // Perform handshake.
         let result = match subscription.channel.channel_type {
@@ -487,7 +558,9 @@ impl SubscriptionEngine {
                 Some(ch) => ch.handshake(subscription, &handshake_bundle).await,
                 None => {
                     warn!(
+                        tenant_id,
                         subscription_id = sub_id,
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                         "Email channel requested but no SMTP settings configured"
                     );
                     let _ = self.manager.update_status(
@@ -502,7 +575,9 @@ impl SubscriptionEngine {
                 Some(ch) => ch.handshake(subscription, &handshake_bundle).await,
                 None => {
                     warn!(
+                        tenant_id,
                         subscription_id = sub_id,
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                         "Messaging channel requested but messaging settings not configured"
                     );
                     let _ = self.manager.update_status(
@@ -515,8 +590,10 @@ impl SubscriptionEngine {
             },
             _ => {
                 warn!(
+                    tenant_id,
                     subscription_id = sub_id,
                     channel_type = subscription.channel.channel_type.as_fhir_str(),
+                    endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                     "Handshake not supported for channel type"
                 );
                 return;
@@ -526,7 +603,10 @@ impl SubscriptionEngine {
         match result {
             Ok(DispatchResult::Success) => {
                 info!(
+                    tenant_id,
                     subscription_id = sub_id,
+                    channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                    endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                     "Handshake successful, activating subscription"
                 );
                 let _ =
@@ -534,13 +614,27 @@ impl SubscriptionEngine {
                         .update_status(tenant_id, sub_id, SubscriptionStatusCode::Active);
             }
             Ok(DispatchResult::RetryableError(msg)) | Ok(DispatchResult::PermanentError(msg)) => {
-                warn!(subscription_id = sub_id, error = %msg, "Handshake failed");
+                warn!(
+                    tenant_id,
+                    subscription_id = sub_id,
+                    channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                    endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                    error = %msg,
+                    "Handshake failed"
+                );
                 let _ =
                     self.manager
                         .update_status(tenant_id, sub_id, SubscriptionStatusCode::Error);
             }
             Err(e) => {
-                warn!(subscription_id = sub_id, error = %e, "Handshake error");
+                warn!(
+                    tenant_id,
+                    subscription_id = sub_id,
+                    channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                    endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                    error = %e,
+                    "Handshake error"
+                );
                 let _ =
                     self.manager
                         .update_status(tenant_id, sub_id, SubscriptionStatusCode::Error);
@@ -553,6 +647,8 @@ impl SubscriptionEngine {
         &self,
         subscription: &ActiveSubscription,
         bundle: &serde_json::Value,
+        notification_type: &'static str,
+        event_number: Option<u64>,
     ) {
         let tenant_id = &subscription.tenant_id;
         let sub_id = &subscription.id;
@@ -564,7 +660,10 @@ impl SubscriptionEngine {
                 Some(ch) => ch,
                 None => {
                     warn!(
+                        tenant_id,
                         subscription_id = sub_id,
+                        notification_type,
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                         "Email dispatch requested but no SMTP settings configured"
                     );
                     return;
@@ -574,7 +673,10 @@ impl SubscriptionEngine {
                 Some(ch) => ch,
                 None => {
                     warn!(
+                        tenant_id,
                         subscription_id = sub_id,
+                        notification_type,
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                         "Messaging dispatch requested but messaging settings not configured"
                     );
                     return;
@@ -582,8 +684,11 @@ impl SubscriptionEngine {
             },
             _ => {
                 warn!(
+                    tenant_id,
                     subscription_id = sub_id,
+                    notification_type,
                     channel = subscription.channel.channel_type.as_fhir_str(),
+                    endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                     "No dispatcher for channel type"
                 );
                 return;
@@ -595,11 +700,25 @@ impl SubscriptionEngine {
             match dispatcher.dispatch(subscription, bundle).await {
                 Ok(DispatchResult::Success) => {
                     self.manager.reset_failures(tenant_id, sub_id);
+                    info!(
+                        tenant_id,
+                        subscription_id = sub_id,
+                        notification_type,
+                        event_number,
+                        channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                        "Subscription notification dispatched"
+                    );
                     return;
                 }
                 Ok(DispatchResult::PermanentError(msg)) => {
                     warn!(
+                        tenant_id,
                         subscription_id = sub_id,
+                        notification_type,
+                        event_number,
+                        channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                         error = %msg,
                         "Permanent delivery error"
                     );
@@ -610,7 +729,12 @@ impl SubscriptionEngine {
                     attempt += 1;
                     if !retry::should_retry(&self.config, attempt) {
                         warn!(
+                            tenant_id,
                             subscription_id = sub_id,
+                            notification_type,
+                            event_number,
+                            channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                            endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                             attempts = attempt,
                             error = %msg,
                             "Max retries exhausted"
@@ -621,7 +745,10 @@ impl SubscriptionEngine {
 
                     let delay = retry::calculate_delay(&self.config, attempt);
                     debug!(
+                        tenant_id,
                         subscription_id = sub_id,
+                        notification_type,
+                        event_number,
                         attempt,
                         delay_ms = delay.as_millis() as u64,
                         "Retrying delivery"
@@ -630,7 +757,12 @@ impl SubscriptionEngine {
                 }
                 Err(e) => {
                     error!(
+                        tenant_id,
                         subscription_id = sub_id,
+                        notification_type,
+                        event_number,
+                        channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                         error = %e,
                         "Dispatch error"
                     );

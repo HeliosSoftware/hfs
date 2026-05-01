@@ -120,7 +120,10 @@ mod tests {
 
     #[test]
     fn subscriptions_are_not_inline() {
-        assert!(!should_handle_inline("Subscription", FhirVersion::default()));
+        assert!(!should_handle_inline(
+            "Subscription",
+            FhirVersion::default()
+        ));
     }
 
     #[test]
