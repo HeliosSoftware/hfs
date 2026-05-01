@@ -3044,35 +3044,85 @@ fn fts5_word_prefix(term: &str) -> String {
 /// Reads rows from `implicit_expansion_cache` and bulk-inserts them into
 /// `implicit_expansion_fts` via a single `INSERT … SELECT` statement.
 fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
-    let populated: bool = conn
+    // Check both FTS tables in one query; either missing triggers a (re)build.
+    let (trigram_ok, word_ok): (bool, bool) = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM implicit_expansion_fts WHERE url = ?1 LIMIT 1)",
+            "SELECT
+               EXISTS(SELECT 1 FROM implicit_expansion_fts      WHERE url = ?1 LIMIT 1),
+               EXISTS(SELECT 1 FROM implicit_expansion_word_fts WHERE url = ?1 LIMIT 1)",
             [url],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    if populated {
+    if trigram_ok && word_ok {
         return Ok(());
     }
 
-    let tx = conn
-        .unchecked_transaction()
+    // BEGIN IMMEDIATE acquires the write lock upfront so concurrent VUs don't
+    // each rebuild the same 350K-row index independently (mirrors ensure_concepts_fts).
+    conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    tx.execute("DELETE FROM implicit_expansion_fts WHERE url = ?1", [url])
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    tx.execute(
-        "INSERT INTO implicit_expansion_fts (url, system_url, code, display)
-         SELECT url, system_url, code, display
-         FROM implicit_expansion_cache
-         WHERE url = ?1",
+    // Re-check inside the lock: another VU may have built the index while we waited.
+    let (still_no_trigram, still_no_word): (bool, bool) = match conn.query_row(
+        "SELECT
+           NOT EXISTS(SELECT 1 FROM implicit_expansion_fts      WHERE url = ?1 LIMIT 1),
+           NOT EXISTS(SELECT 1 FROM implicit_expansion_word_fts WHERE url = ?1 LIMIT 1)",
         [url],
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(HtsError::StorageError(e.to_string()));
+        }
+    };
 
-    tx.commit()
+    if !still_no_trigram && !still_no_word {
+        conn.execute_batch("COMMIT")
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        return Ok(());
+    }
+
+    if still_no_trigram {
+        if let Err(e) = conn.execute("DELETE FROM implicit_expansion_fts WHERE url = ?1", [url]) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(HtsError::StorageError(e.to_string()));
+        }
+        if let Err(e) = conn.execute(
+            "INSERT INTO implicit_expansion_fts (url, system_url, code, display)
+             SELECT url, system_url, code, display
+             FROM implicit_expansion_cache
+             WHERE url = ?1",
+            [url],
+        ) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(HtsError::StorageError(e.to_string()));
+        }
+    }
+
+    if still_no_word {
+        if let Err(e) = conn.execute(
+            "DELETE FROM implicit_expansion_word_fts WHERE url = ?1",
+            [url],
+        ) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(HtsError::StorageError(e.to_string()));
+        }
+        if let Err(e) = conn.execute(
+            "INSERT INTO implicit_expansion_word_fts (url, system_url, code, display)
+             SELECT url, system_url, code, display
+             FROM implicit_expansion_cache
+             WHERE url = ?1",
+            [url],
+        ) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(HtsError::StorageError(e.to_string()));
+        }
+    }
+
+    conn.execute_batch("COMMIT")
         .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
@@ -3183,12 +3233,13 @@ fn implicit_cache_count(
             )
         }
         Some(f) => {
-            let pattern = format!("%{f}%");
+            // Short filter (1–2 chars): word-prefix FTS count avoids O(N) LIKE scan.
+            ensure_implicit_fts(conn, url)?;
+            let prefix_expr = fts5_word_prefix(f);
             conn.query_row(
-                "SELECT COUNT(*) FROM implicit_expansion_cache
-                 WHERE url = ?1
-                   AND (LOWER(code) LIKE ?2 OR LOWER(COALESCE(display,'')) LIKE ?2)",
-                rusqlite::params![url, pattern],
+                "SELECT COUNT(*) FROM implicit_expansion_word_fts
+                 WHERE implicit_expansion_word_fts MATCH ?1 AND url = ?2",
+                rusqlite::params![prefix_expr, url],
                 |r| r.get(0),
             )
         }
@@ -3219,50 +3270,60 @@ fn implicit_cache_page(
             let match_expr = fts5_quote(f);
             let mut stmt = conn
                 .prepare_cached(
+                    // No ORDER BY: FTS5 short-circuits at LIMIT instead of
+                    // materialising all matching rows (potentially thousands for
+                    // common terms like "dia") before sorting. The tiny result
+                    // set is sorted in Rust below — O(N log N) on 20–100 rows.
                     "SELECT system_url, code, display
                      FROM implicit_expansion_fts
                      WHERE implicit_expansion_fts MATCH ?1 AND url = ?2
-                     ORDER BY code
                      LIMIT ?3 OFFSET ?4",
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            stmt.query_map(rusqlite::params![match_expr, url, limit, offset], |r| {
-                Ok(ExpansionContains {
-                    system: r.get(0)?,
-                    code: r.get(1)?,
-                    display: r.get(2)?,
-                    inactive: None,
-                    contains: vec![],
+            let mut rows = stmt
+                .query_map(rusqlite::params![match_expr, url, limit, offset], |r| {
+                    Ok(ExpansionContains {
+                        system: r.get(0)?,
+                        code: r.get(1)?,
+                        display: r.get(2)?,
+                        inactive: None,
+                        contains: vec![],
+                    })
                 })
-            })
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| HtsError::StorageError(e.to_string()))
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            rows.sort_unstable_by(|a, b| a.code.cmp(&b.code));
+            Ok(rows)
         }
         Some(f) => {
-            let pattern = format!("%{f}%");
+            // Short filter (1–2 chars): word-prefix FTS so `di*` matches any
+            // token starting with "di" — O(log N) vs O(N) LIKE scan on 350K rows.
+            ensure_implicit_fts(conn, url)?;
+            let prefix_expr = fts5_word_prefix(f);
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT system_url, code, display
-                     FROM implicit_expansion_cache
-                     WHERE url = ?1
-                       AND (LOWER(code) LIKE ?2 OR LOWER(COALESCE(display,'')) LIKE ?2)
-                     ORDER BY system_url, code
+                     FROM implicit_expansion_word_fts
+                     WHERE implicit_expansion_word_fts MATCH ?1 AND url = ?2
                      LIMIT ?3 OFFSET ?4",
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            stmt.query_map(rusqlite::params![url, pattern, limit, offset], |r| {
-                Ok(ExpansionContains {
-                    system: r.get(0)?,
-                    code: r.get(1)?,
-                    display: r.get(2)?,
-                    inactive: None,
-                    contains: vec![],
+            let mut rows = stmt
+                .query_map(rusqlite::params![prefix_expr, url, limit, offset], |r| {
+                    Ok(ExpansionContains {
+                        system: r.get(0)?,
+                        code: r.get(1)?,
+                        display: r.get(2)?,
+                        inactive: None,
+                        contains: vec![],
+                    })
                 })
-            })
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| HtsError::StorageError(e.to_string()))
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            rows.sort_unstable_by(|a, b| a.code.cmp(&b.code));
+            Ok(rows)
         }
         None => {
             let mut stmt = conn

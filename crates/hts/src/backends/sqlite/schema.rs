@@ -166,6 +166,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS implicit_expansion_fts
 USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
            tokenize='trigram case_sensitive 0');
 
+-- ── FTS5 word-prefix index for implicit expansion short-filter search ───────────
+-- Complements implicit_expansion_fts (trigram, >= 3-char terms) for 1-2 char
+-- filters. Uses unicode61 so prefix queries match tokens starting with the
+-- filter term rather than requiring a full trigram.
+-- Populated alongside implicit_expansion_fts in ensure_implicit_fts().
+CREATE VIRTUAL TABLE IF NOT EXISTS implicit_expansion_word_fts
+USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
+           tokenize='unicode61 remove_diacritics 1');
+
 -- ── FTS5 trigram index for direct concept text search ─────────────────────────
 -- Enables fast substring matching on concepts.code and concepts.display.
 -- Used by expand_inline_filtered for full-system includes with a text filter.
