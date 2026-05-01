@@ -151,6 +151,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
         let pool = self.pool().clone();
         let implicit_index = self.implicit_index.clone();
+        let bg_index_pending = self.bg_index_pending.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -403,6 +404,44 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             count as usize,
                                             filter_lower.as_deref(),
                                         )?;
+
+                                        // Spawn one background thread per URL to build
+                                        // implicit_expansion_cache then the in-memory
+                                        // implicit_index.  Once complete, the async hot
+                                        // path at the top of expand() fires for all
+                                        // subsequent requests — no pool connection needed.
+                                        // bg_index_pending prevents duplicate threads when
+                                        // many VUs hit the same uncached URL concurrently.
+                                        let url_owned = url.to_string();
+                                        let should_spawn = bg_index_pending
+                                            .lock()
+                                            .map(|mut p| {
+                                                if p.contains(&url_owned) {
+                                                    false
+                                                } else {
+                                                    p.insert(url_owned.clone());
+                                                    true
+                                                }
+                                            })
+                                            .unwrap_or(false);
+                                        if should_spawn {
+                                            let bg_pool = pool.clone();
+                                            let bg_idx = implicit_index.clone();
+                                            let bg_pending = bg_index_pending.clone();
+                                            std::thread::spawn(move || {
+                                                if let Ok(bg_conn) = bg_pool.get() {
+                                                    let _ = ensure_implicit_cache(
+                                                        &bg_conn, &url_owned, None,
+                                                    );
+                                                    let _ = ensure_implicit_index(
+                                                        &bg_conn, &url_owned, &bg_idx,
+                                                    );
+                                                }
+                                                if let Ok(mut p) = bg_pending.lock() {
+                                                    p.remove(&url_owned);
+                                                }
+                                            });
+                                        }
 
                                         return Ok(ExpandResponse {
                                             total: None,
@@ -3863,6 +3902,38 @@ pub(crate) fn prebuild_concepts_fts(conn: &Connection) {
         rows = n,
         "concepts_fts pre-populated (trigram + word-prefix)"
     );
+}
+
+/// Pre-warm the in-memory concept index from any implicit-expansion URLs
+/// already persisted in `implicit_expansion_cache`.
+///
+/// Called at server startup after `prebuild_concepts_fts`.  On a cold DB the
+/// cache is empty so this is a no-op.  On a warm restart (benchmark re-run,
+/// rolling deploy) the index is rebuilt in memory from the persisted rows,
+/// allowing the async hot path in [`expand`] to fire from the very first
+/// request without waiting for a background build thread.
+pub(crate) fn prebuild_implicit_index(conn: &Connection, index: &super::ImplicitIndex) {
+    let urls: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT url FROM implicit_expansion_cache \
+             WHERE url NOT LIKE 'inline-compose:%'",
+        )
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    for url in &urls {
+        let _ = ensure_implicit_index(conn, url, index);
+    }
+
+    if !urls.is_empty() {
+        tracing::info!(
+            count = urls.len(),
+            "implicit concept index pre-warmed from cache"
+        );
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

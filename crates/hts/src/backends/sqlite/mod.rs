@@ -17,8 +17,8 @@ mod code_system;
 mod concept_map;
 mod value_set;
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use r2d2::Pool;
@@ -56,6 +56,14 @@ pub struct SqliteTerminologyBackend {
     /// Filtering is done with pure-Rust `contains()` instead of SQLite FTS5,
     /// eliminating pool contention at high concurrency (EX03 optimisation).
     pub(crate) implicit_index: ImplicitIndex,
+
+    /// Deduplication guard for background index-population threads.
+    ///
+    /// When the BFS fast path serves an EX03 request it spawns exactly one
+    /// `std::thread` per URL to populate `implicit_expansion_cache` and then
+    /// build the in-memory `implicit_index`.  This set prevents multiple
+    /// concurrent VUs from each spawning their own thread for the same URL.
+    pub(crate) bg_index_pending: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SqliteTerminologyBackend {
@@ -91,6 +99,9 @@ impl SqliteTerminologyBackend {
             .max_size(20)
             .build(manager)
             .map_err(|e| HtsError::StorageError(format!("Failed to create SQLite pool: {e}")))?;
+
+        // Declare early so the init block can pre-warm the in-memory index.
+        let implicit_index: ImplicitIndex = Arc::new(RwLock::new(HashMap::new()));
 
         // Bootstrap: apply WAL + schema on a single connection.
         {
@@ -140,13 +151,21 @@ impl SqliteTerminologyBackend {
             // This runs synchronously before the server accepts requests; for large
             // systems (SNOMED 638K, LOINC 181K) it can take 10–25 s total.
             value_set::prebuild_concepts_fts(&conn);
+
+            // Pre-warm the in-memory concept index from any implicit-expansion
+            // entries that are already persisted in implicit_expansion_cache.
+            // On a warm restart (e.g. repeated benchmark runs) this lets the
+            // async hot path in expand() fire immediately without waiting for a
+            // background build thread.  No-op on first run (empty cache).
+            value_set::prebuild_implicit_index(&conn, &implicit_index);
         }
 
         info!(db_path, "SQLite terminology backend initialized");
 
         Ok(Self {
             pool,
-            implicit_index: Arc::new(RwLock::new(HashMap::new())),
+            implicit_index,
+            bg_index_pending: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -188,6 +207,7 @@ impl SqliteTerminologyBackend {
         Ok(Self {
             pool,
             implicit_index: Arc::new(RwLock::new(HashMap::new())),
+            bg_index_pending: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
