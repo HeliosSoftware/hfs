@@ -155,6 +155,10 @@ Comparators supported: `eq` (default), `in`. Native `filterBy.comparator` values
 | `HFS_SUBSCRIPTION_MAX_RETRIES` | `10` | Max delivery attempts before marking error |
 | `HFS_SUBSCRIPTION_RETRY_INITIAL_DELAY` | `1s` | Initial delay for exponential backoff |
 | `HFS_SUBSCRIPTION_RETRY_MAX_DELAY` | `60s` | Maximum delay cap for backoff |
+| `HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS` | `0` | Delay before the first activation handshake attempt |
+| `HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS` | `1` | Max activation handshake attempts before marking error |
+| `HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS` | `1000` | Initial delay before retrying a failed activation handshake |
+| `HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS` | `60000` | Maximum delay cap for activation handshake retries |
 | `HFS_SUBSCRIPTION_HEARTBEAT_INTERVAL` | `30s` | How often to check for due heartbeats |
 | `HFS_SUBSCRIPTION_ERROR_THRESHOLD` | `3` | Consecutive failures before `error` status |
 | `HFS_SUBSCRIPTION_OFF_THRESHOLD` | `10` | Consecutive failures before `off` status |
@@ -176,6 +180,16 @@ The email channel is enabled only when `HFS_SUBSCRIPTION_SMTP_HOST` and `HFS_SUB
 | `HFS_SUBSCRIPTION_SMTP_TIMEOUT_SECS` | `30` | Per-send timeout. |
 
 Subscription `header` entries (R4 backport `channel.header`, native `Subscription.parameter`) named `Subject`, `From`, `Reply-To`, and `Cc` override the server defaults on a per-subscription basis. Subscriptions requesting `content=full-resource` over an `HFS_SUBSCRIPTION_SMTP_ENCRYPTION=none` transport are rejected at dispatch time (analogous to the HTTPS requirement on the rest-hook channel).
+
+### FHIR Messaging channel
+
+The FHIR Messaging channel is disabled by default and is enabled only when `HFS_SUBSCRIPTION_MESSAGING_ENABLED=true`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel. |
+| `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers. |
+| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow delivery to private or loopback endpoint hosts; intended for local development and CI only. |
 
 ## Enabling in HFS
 
@@ -204,16 +218,16 @@ When enabled, the engine auto-initializes with default configuration and begins 
 
 ## Integration
 
-The engine integrates into `helios-rest` via the `AppState::with_subscription_engine()` builder. After each successful write, handlers call `emit_subscription_event()` which spawns an async task:
+The engine integrates into `helios-rest` via the `AppState::with_subscription_engine()` builder. After each successful write, handlers call `emit_subscription_event()`. Topic lifecycle writes are processed inline so the topic registry is up to date before the HTTP response returns; subscription activation and ordinary resource notifications are dispatched asynchronously:
 
 ```rust,ignore
 // In create handler (simplified)
 if let Some(engine) = state.subscription_engine() {
-    emit_subscription_event(engine, tenant.context(), &stored, fhir_version, ResourceEventType::Create);
+    emit_subscription_event(engine, tenant.context(), &stored, fhir_version, ResourceEventType::Create).await;
 }
 ```
 
-The spawned task calls `engine.on_resource_event(event).await`, which runs the full evaluation → notification → dispatch pipeline without blocking the HTTP response.
+For asynchronous events, the spawned task calls `engine.on_resource_event(event).await`, which runs the full evaluation -> notification -> dispatch pipeline without blocking the HTTP response.
 
 ### Registering a Topic
 
@@ -287,7 +301,7 @@ curl -X POST http://localhost:8080/Subscription \
   }'
 ```
 
-The server will immediately send a handshake notification to the endpoint. On a successful 2xx response the subscription transitions to `active`.
+The server schedules an activation handshake notification to the endpoint. On a successful 2xx response the subscription transitions to `active`; retryable handshake failures can be retried according to the `HFS_SUBSCRIPTION_HANDSHAKE_*` settings.
 
 ### Creating a WebSocket Subscription
 

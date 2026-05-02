@@ -289,6 +289,11 @@ where
         })
         .unwrap_or((None, "Device/hfs".to_string()));
 
+    // Build the outbound auth provider before moving auth_config into the
+    // app state — the subscription engine (constructed below) consumes it.
+    #[cfg(feature = "subscriptions")]
+    let outbound_auth_provider = auth_config.outbound_provider();
+
     // Create application state
     let state = AppState::with_auth_and_audit(
         Arc::new(storage),
@@ -307,18 +312,47 @@ where
             .unwrap_or(false);
         if subscriptions_enabled {
             let smtp = build_smtp_settings_from_env();
+            let messaging = build_messaging_settings_from_env(&config.base_url);
             let mut supported = vec!["rest-hook".to_string(), "websocket".to_string()];
             if smtp.is_some() {
                 supported.push("email".to_string());
                 info!("Email subscription channel ENABLED");
             }
+            if messaging.is_some() {
+                supported.push("message".to_string());
+                info!("FHIR Messaging subscription channel ENABLED");
+            }
+            let default_sub_config = helios_subscriptions::SubscriptionConfig::default();
             let sub_config = helios_subscriptions::SubscriptionConfig {
                 supported_channel_types: supported,
                 smtp,
-                ..Default::default()
+                messaging,
+                handshake_initial_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS",
+                    default_sub_config.handshake_initial_delay,
+                ),
+                handshake_max_attempts: subscription_u32_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS",
+                    default_sub_config.handshake_max_attempts,
+                )
+                .max(1),
+                handshake_retry_initial_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS",
+                    default_sub_config.handshake_retry_initial_delay,
+                ),
+                handshake_retry_max_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS",
+                    default_sub_config.handshake_retry_max_delay,
+                ),
+                ..default_sub_config
             };
-            let engine =
-                helios_subscriptions::SubscriptionEngine::new(sub_config, config.base_url.clone());
+            // Outbound auth provider was built above (static bearer when
+            // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
+            let engine = helios_subscriptions::SubscriptionEngine::with_outbound_auth(
+                sub_config,
+                config.base_url.clone(),
+                outbound_auth_provider,
+            );
             info!("Subscriptions engine ENABLED");
             state.with_subscription_engine(Arc::new(engine))
         } else {
@@ -383,6 +417,26 @@ where
     router.layer(service_builder)
 }
 
+#[cfg(feature = "subscriptions")]
+fn subscription_u32_from_env(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "subscriptions")]
+fn subscription_duration_ms_from_env(
+    name: &str,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(default)
+}
+
 /// Build SMTP settings for the email subscription channel from `HFS_SUBSCRIPTION_SMTP_*`
 /// environment variables. Returns `None` when `HOST` or `FROM` is unset — in that
 /// case the email channel is not advertised and any email Subscription is rejected.
@@ -436,6 +490,34 @@ fn build_smtp_settings_from_env() -> Option<helios_subscriptions::config::SmtpSe
         from_address,
         default_subject,
         timeout_secs,
+    })
+}
+
+#[cfg(feature = "subscriptions")]
+fn build_messaging_settings_from_env(
+    base_url: &str,
+) -> Option<helios_subscriptions::config::MessagingSettings> {
+    use helios_subscriptions::config::MessagingSettings;
+
+    let enabled = std::env::var("HFS_SUBSCRIPTION_MESSAGING_ENABLED")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    let source_endpoint = std::env::var("HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| base_url.to_string());
+
+    let allow_private_endpoints = std::env::var("HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false);
+
+    Some(MessagingSettings {
+        source_endpoint,
+        allow_private_endpoints,
     })
 }
 
@@ -494,8 +576,8 @@ pub fn init_logging(level: &str) {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(format!(
-            "helios_hfs={},helios_rest={},helios_persistence={},tower_http=debug",
-            level, level, level
+            "helios_hfs={},helios_rest={},helios_persistence={},helios_subscriptions={},tower_http=debug",
+            level, level, level, level
         ))
     });
 

@@ -1,8 +1,7 @@
 //! Subscription event emission helper.
 //!
-//! Constructs a `ResourceEvent` from handler context and spawns the
-//! subscription engine's event handler asynchronously, mirroring the
-//! fire-and-forget pattern used by the audit middleware.
+//! Constructs a `ResourceEvent` from handler context and dispatches it to the
+//! subscription engine.
 
 use std::sync::Arc;
 

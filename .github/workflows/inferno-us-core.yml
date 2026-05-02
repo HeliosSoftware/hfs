@@ -99,6 +99,8 @@ jobs:
               volumes: !override []
               ports: !override
                 - "0:80"
+            redis:
+              ports: !override []
           EOF
 
           docker compose -p "$PROJECT" up -d

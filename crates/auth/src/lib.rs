@@ -26,6 +26,7 @@ pub mod discovery;
 pub mod error;
 pub mod jti;
 pub mod jwks;
+pub mod outbound;
 pub mod policy;
 pub mod principal;
 pub mod provider;
@@ -37,6 +38,10 @@ pub use discovery::SmartConfiguration;
 pub use error::{AuthError, FhirOperation};
 pub use jti::{JtiCache, memory::InMemoryJtiCache};
 pub use jwks::JwksCache;
+pub use outbound::{
+    NoOpOutboundAuthProvider, OutboundAuthProvider, StaticBearerOutboundAuthProvider,
+    provider_from_token,
+};
 pub use policy::SmartScopePolicy;
 pub use principal::Principal;
 pub use provider::{AuthProvider, jwks_bearer::JwksBearerAuthProvider};

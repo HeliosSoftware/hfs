@@ -48,10 +48,8 @@ jobs:
     name: Start Shared Inferno Subscriptions Stack
     runs-on: [self-hosted, Linux]
     outputs:
-      host: ${{ steps.up.outputs.host }}
       port: ${{ steps.up.outputs.port }}
       project: ${{ steps.up.outputs.project }}
-      base-url: ${{ steps.up.outputs.base-url }}
     steps:
       - name: Checkout subscriptions-test-kit
         uses: actions/checkout@v5
@@ -100,6 +98,8 @@ jobs:
               volumes: !override []
               ports: !override
                 - "$INFERNO_PORT:80"
+            redis:
+              ports: !override []
           EOF
 
           for attempt in 1 2 3 4 5; do
@@ -126,10 +126,8 @@ jobs:
           for i in {1..60}; do
             if curl -sf "$INFERNO_BASE_URL/api/test_suites" > /dev/null 2>&1; then
               echo "Inferno is ready"
-              echo "host=$INFERNO_HOST" >> "$GITHUB_OUTPUT"
               echo "port=$INFERNO_PORT" >> "$GITHUB_OUTPUT"
               echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
-              echo "base-url=$INFERNO_BASE_URL" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             echo "Attempt $i/60: Inferno not ready yet..."
@@ -161,7 +159,12 @@ jobs:
           - { backend: s3-elasticsearch, hfs_port: 18092 }
     env:
       HFS_PORT: ${{ matrix.hfs_port }}
-      INFERNO_BASE_URL: ${{ needs.inferno-stack-up.outputs.base-url }}
+      INFERNO_PORT: ${{ needs.inferno-stack-up.outputs.port }}
+      INFERNO_COMPOSE_PROJECT: ${{ needs.inferno-stack-up.outputs.project }}
+      HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS: 5000
+      HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS: 5
+      HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS: 1000
+      HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS: 10000
       RESULTS_DIR: inferno-subscription-results/${{ matrix.backend }}
       SUITE_ID: subscriptions_r5_backport_r4_server
       TEST_GROUP_ID: subscriptions_r5_backport_r4_server-subscriptions_r4_server_workflow
@@ -188,6 +191,7 @@ jobs:
           fi
           echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
           echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "INFERNO_BASE_URL=http://$EFFECTIVE_DOCKER_HOST_IP:$INFERNO_PORT" >> "$GITHUB_ENV"
           echo "Runner IP: $RUNNER_IP"
           echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
 
@@ -413,7 +417,7 @@ jobs:
         run: |
           mkdir -p "$RESULTS_DIR"
           ACCESS_TOKEN="inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
-          TOPIC_URL="http://example.org/topic/inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
+          TOPIC_URL="https://github.com/HeliosSoftware/hfs/subscription-topic/inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
           ENCOUNTER_ID="inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
 
           echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> "$GITHUB_ENV"
@@ -522,6 +526,8 @@ jobs:
 
       - name: Start Inferno subscription workflow
         run: |
+          echo "INFERNO_LOG_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
           SUBSCRIPTION_INPUT="$(cat "$RESULTS_DIR/subscription-input.json")"
           RUN_PAYLOAD="$(jq -n \
             --arg session_id "$SESSION_ID" \
@@ -705,6 +711,38 @@ jobs:
           else
             echo "No results file found." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Capture Inferno container logs
+        if: always()
+        run: |
+          mkdir -p "$RESULTS_DIR/inferno-container-logs"
+
+          PROJECT="${INFERNO_COMPOSE_PROJECT:-inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}}"
+          echo "$PROJECT" > "$RESULTS_DIR/inferno-container-logs/project.txt"
+
+          IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
+          if [ -z "$IDS" ]; then
+            echo "No Inferno containers found for project $PROJECT" > "$RESULTS_DIR/inferno-container-logs/no-containers.txt"
+            exit 0
+          fi
+
+          for ID in $IDS; do
+            SERVICE=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$ID" 2>/dev/null || echo unknown)
+            NAME=$(docker inspect -f '{{ .Name }}' "$ID" 2>/dev/null | sed 's#^/##')
+
+            if [ -z "$NAME" ]; then
+              NAME="$ID"
+            fi
+
+            OUT="$RESULTS_DIR/inferno-container-logs/${SERVICE}-${NAME}.log"
+            docker inspect "$ID" > "$RESULTS_DIR/inferno-container-logs/${SERVICE}-${NAME}.inspect.json" 2>&1 || true
+
+            if [ -n "${INFERNO_LOG_SINCE:-}" ]; then
+              docker logs --timestamps --since "$INFERNO_LOG_SINCE" "$ID" > "$OUT" 2>&1 || true
+            else
+              docker logs --timestamps "$ID" > "$OUT" 2>&1 || true
+            fi
+          done
 
       - name: Upload test results
         if: always()

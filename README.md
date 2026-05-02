@@ -255,6 +255,10 @@ AWS_REGION=us-east-1 \
 | `HFS_AUDIT_CLOUDWATCH_LOG_GROUP` | *(none)* | Required when `HFS_AUDIT_BACKEND=cloudwatch`; CloudWatch Logs log group name |
 | `HFS_AUDIT_CLOUDWATCH_LOG_STREAM` | `hfs-audit` | CloudWatch Logs log stream name |
 | `HFS_AUDIT_CLOUDWATCH_REGION` | *(AWS chain)* | AWS region override for CloudWatch Logs |
+| `HFS_SUBSCRIPTIONS_ENABLED` | `false` | Enable the subscription engine when HFS is built with the `subscriptions` feature |
+| `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel |
+| `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers |
+| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow subscription deliveries to private or loopback endpoints; intended for local development and CI only |
 
 For detailed backend setup instructions (building from source, Docker commands, and search offloading architecture), see the [persistence crate documentation](crates/persistence/README.md#building--running-storage-backends).
 
