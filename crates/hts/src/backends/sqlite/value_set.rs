@@ -1117,12 +1117,24 @@ fn expand_inline_filtered(
                     || (prop == "concept" && matches!(op, "is-a" | "descendent-of" | "generalizes"))
             });
 
-        if filter_lower.len() >= 3 && all_batchable {
-            // FTS-first path: text filter ≥ 3 chars narrows to a small candidate
-            // set; apply_compose_filters_to_candidates then validates hierarchy
-            // (is-a / descendent-of) AND property= filters on that small set.
-            // This handles EX08-style combined filters without the 3-way JOIN
-            // over potentially thousands of property-matching descendants.
+        // `has_eq_filter` — true when any compose filter is a property= filter.
+        // When a text filter is also present (≥ 3 chars) we push it into SQL
+        // via instr() inside query_subtree_with_property, avoiding loading all
+        // property-matching descendants into Rust before text-filtering them.
+        let has_eq_filter = compose_filters.iter().any(|f| {
+            f["op"].as_str().unwrap_or("") == "="
+                && f["property"].as_str().unwrap_or("") != "constraint"
+        });
+        let sql_text = if has_eq_filter && filter_lower.len() >= 3 {
+            Some(filter_lower.as_str())
+        } else {
+            None
+        };
+
+        if filter_lower.len() >= 3 && all_batchable && !has_eq_filter {
+            // FTS-first path: hierarchy + text, no property= filter.
+            // FTS narrows to text-matching candidates; hierarchy walk runs on
+            // the already-small set via apply_compose_filters_to_candidates.
             ensure_concepts_fts(conn, &system_id)?;
             let candidates =
                 fts_candidates_for_system(conn, &system_id, system_url, &filter_lower)?;
@@ -1138,15 +1150,24 @@ fn expand_inline_filtered(
             continue;
         }
 
-        if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc)? {
-            // Compose filters (ECL/is-a) already bounded the result — apply text filter in Rust.
-            results.extend(filter_result.into_iter().filter(|c| {
-                c.code.to_lowercase().contains(&filter_lower)
-                    || c.display
-                        .as_deref()
-                        .map(|d| d.to_lowercase().contains(&filter_lower))
-                        .unwrap_or(false)
-            }));
+        if let Some(filter_result) =
+            apply_compose_filters(conn, system_url, &system_id, inc, sql_text)?
+        {
+            // When sql_text is Some, query_subtree_with_property already applied
+            // the text filter via instr() — extend directly.  Otherwise apply
+            // the Rust text filter here (ECL / generalizes / multi-property paths
+            // that don't push text into SQL).
+            if sql_text.is_some() {
+                results.extend(filter_result);
+            } else {
+                results.extend(filter_result.into_iter().filter(|c| {
+                    c.code.to_lowercase().contains(&filter_lower)
+                        || c.display
+                            .as_deref()
+                            .map(|d| d.to_lowercase().contains(&filter_lower))
+                            .unwrap_or(false)
+                }));
+            }
         } else if let Some(explicit_codes) = inc["concept"].as_array() {
             // Explicit code list — filter in Rust (bounded by the list length).
             let mut stmt = conn
@@ -1357,7 +1378,7 @@ fn compute_expansion_depth(
 
         // Check for ECL / is-a filters before falling through to the explicit
         // code list or "all concepts" paths.
-        if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc)? {
+        if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc, None)? {
             included.extend(filter_result);
         } else if let Some(explicit_codes) = inc["concept"].as_array() {
             // Explicit code list: single json_each batch join instead of N
@@ -1489,6 +1510,7 @@ fn apply_compose_filters(
     system_url: &str,
     system_id: &str,
     inc: &serde_json::Value,
+    text_filter: Option<&str>,
 ) -> Result<Option<Vec<ExpansionContains>>, HtsError> {
     let filters = match inc["filter"].as_array() {
         Some(f) if !f.is_empty() => f,
@@ -1538,6 +1560,7 @@ fn apply_compose_filters(
                 include_self,
                 property,
                 value,
+                text_filter,
             )?;
             match result.as_mut() {
                 Some(prev) => {
@@ -1680,6 +1703,7 @@ fn apply_compose_filters(
 /// disorder") and joining with `concept_properties` in one pass we avoid
 /// materialising the global property candidates (~10 000–24 000 rows) that
 /// the two-phase approach would produce.
+#[allow(clippy::too_many_arguments)]
 fn query_subtree_with_property(
     conn: &Connection,
     system_url: &str,
@@ -1688,46 +1712,81 @@ fn query_subtree_with_property(
     include_self: bool,
     property: &str,
     value: &str,
+    text_filter: Option<&str>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     // Property-first: idx_concept_properties_value narrows candidates to
     // O(K_property) rows before the closure PK checks ancestry.
     // For large SNOMED subtrees (e.g. "Disease" → 50 K descendants) with a
     // selective property (e.g. finding-site = Airway → 100 concepts) this is
     // several orders of magnitude faster than the closure-first approach.
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT c.code, c.display
-             FROM   concept_properties cp
-             JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?2
-             JOIN   concept_closure cc
-                    ON cc.system_id = ?2
-                    AND cc.ancestor_code = ?1
-                    AND cc.descendant_code = c.code
-             WHERE  cp.property = ?3
-               AND  cp.value = ?4
-               AND  (c.code != ?1 OR ?5)",
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
+    //
+    // When text_filter is set, the instr() clause pushes the text match into
+    // SQL so the DB returns only matching rows (EX08 optimisation — avoids
+    // loading all property-matching descendants into Rust before discarding them).
     let include_self_i = i64::from(include_self);
-    let rows = stmt
-        .query_map(
-            rusqlite::params![root_code, system_id, property, value, include_self_i],
-            |row| {
-                Ok(ExpansionContains {
-                    system: system_url.to_owned(),
-                    code: row.get(0)?,
-                    display: row.get(1)?,
-                    inactive: None,
-                    contains: vec![],
-                })
-            },
+
+    let row_fn = |row: &rusqlite::Row<'_>| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    };
+    let make = |(code, display): (String, Option<String>)| ExpansionContains {
+        system: system_url.to_owned(),
+        code,
+        display,
+        inactive: None,
+        contains: vec![],
+    };
+
+    let pairs: Vec<(String, Option<String>)> = if let Some(tf) =
+        text_filter.filter(|t| !t.is_empty())
+    {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code, c.display
+                 FROM   concept_properties cp
+                 JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?2
+                 JOIN   concept_closure cc
+                        ON cc.system_id = ?2
+                        AND cc.ancestor_code = ?1
+                        AND cc.descendant_code = c.code
+                 WHERE  cp.property = ?3
+                   AND  cp.value = ?4
+                   AND  (c.code != ?1 OR ?5)
+                   AND  (instr(lower(c.display), ?6) > 0
+                         OR instr(lower(c.code), ?6) > 0)",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        stmt.query_map(
+            rusqlite::params![root_code, system_id, property, value, include_self_i, tf],
+            row_fn,
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+    } else {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code, c.display
+                 FROM   concept_properties cp
+                 JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?2
+                 JOIN   concept_closure cc
+                        ON cc.system_id = ?2
+                        AND cc.ancestor_code = ?1
+                        AND cc.descendant_code = c.code
+                 WHERE  cp.property = ?3
+                   AND  cp.value = ?4
+                   AND  (c.code != ?1 OR ?5)",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        stmt.query_map(
+            rusqlite::params![root_code, system_id, property, value, include_self_i],
+            row_fn,
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+    };
 
-    Ok(rows)
+    Ok(pairs.into_iter().map(make).collect())
 }
 
 /// Look up all concepts in `system_id` that have a property matching
