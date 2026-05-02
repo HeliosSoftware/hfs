@@ -23,3 +23,7 @@ ignore = [
     # not invoke that path through aws-sdk-s3, and a fix requires upstream.
     "RUSTSEC-2026-0002",  # lru - unsound IterMut
 ]
+
+# Note: cargo-audit's `ignore` list above only suppresses warning-class
+# advisories (unmaintained, unsound). Vulnerability-class advisories must
+# be ignored via the `--ignore` CLI flag in CI (see .github/workflows/ci.yml).
