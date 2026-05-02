@@ -1305,144 +1305,161 @@ fn compute_expansion_depth(
     let includes = compose["include"].as_array().unwrap_or(&empty_arr);
     let mut included: Vec<ExpansionContains> = Vec::new();
 
-    for inc in includes {
-        // Handle include.valueSet references (FHIR R4 §4.8.5):
-        // one ValueSet includes all concepts from another ValueSet by URL.
-        // These includes have no `system` and would otherwise be silently skipped.
-        if let Some(vs_refs) = inc["valueSet"].as_array() {
-            if !vs_refs.is_empty() {
-                if depth >= 4 {
-                    warnings.push(
+    // Fast path: 2+ includes all using property-equality on the same system.
+    // Collapses N×M individual SQL round-trips into a single CTE query.
+    if let Some(result) = try_multi_include_property_only(conn, includes, warnings)? {
+        included = result;
+    } else {
+        let mut system_id_cache: HashMap<String, String> = HashMap::new();
+        for inc in includes {
+            // Handle include.valueSet references (FHIR R4 §4.8.5):
+            // one ValueSet includes all concepts from another ValueSet by URL.
+            // These includes have no `system` and would otherwise be silently skipped.
+            if let Some(vs_refs) = inc["valueSet"].as_array() {
+                if !vs_refs.is_empty() {
+                    if depth >= 4 {
+                        warnings.push(
                         "Max ValueSet include depth (4) reached; skipping nested valueSet references"
                             .to_owned(),
                     );
-                    continue;
-                }
-                for vs_ref in vs_refs {
-                    let ref_url = match vs_ref.as_str() {
-                        Some(u) => u,
-                        None => continue,
-                    };
-                    match resolve_value_set(conn, ref_url, None) {
-                        Ok((ref_vs_id, ref_compose)) => {
-                            let cached = fetch_cache(conn, &ref_vs_id)?;
-                            if cached.is_empty() {
-                                let nested = compute_expansion_depth(
-                                    conn,
-                                    ref_compose.as_deref(),
-                                    warnings,
-                                    depth + 1,
-                                )?;
-                                included.extend(nested);
-                            } else {
-                                included.extend(cached);
+                        continue;
+                    }
+                    for vs_ref in vs_refs {
+                        let ref_url = match vs_ref.as_str() {
+                            Some(u) => u,
+                            None => continue,
+                        };
+                        match resolve_value_set(conn, ref_url, None) {
+                            Ok((ref_vs_id, ref_compose)) => {
+                                let cached = fetch_cache(conn, &ref_vs_id)?;
+                                if cached.is_empty() {
+                                    let nested = compute_expansion_depth(
+                                        conn,
+                                        ref_compose.as_deref(),
+                                        warnings,
+                                        depth + 1,
+                                    )?;
+                                    included.extend(nested);
+                                } else {
+                                    included.extend(cached);
+                                }
                             }
-                        }
-                        Err(_) => {
-                            warnings.push(format!(
+                            Err(_) => {
+                                warnings.push(format!(
                                 "Referenced ValueSet {ref_url} not found; excluded from expansion"
                             ));
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            let system_url = match inc["system"].as_str() {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+
+            // Resolve code system id — cached so repeated includes for the same
+            // system URL don't round-trip to the database more than once.
+            let system_id = match system_id_cache.get(system_url) {
+                Some(id) => id.clone(),
+                None => {
+                    let raw_id: Option<String> = conn
+                        .query_row(
+                            "SELECT id FROM code_systems WHERE url = ?1",
+                            [system_url],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    match raw_id {
+                        Some(id) => {
+                            system_id_cache.insert(system_url.to_owned(), id.clone());
+                            id
+                        }
+                        None => {
+                            let msg = format!(
+                                "CodeSystem {system_url} was not found and has been excluded from the expansion"
+                            );
+                            tracing::warn!(%system_url, "{msg}");
+                            warnings.push(msg);
+                            continue;
                         }
                     }
                 }
-                continue;
-            }
-        }
+            };
 
-        let system_url = match inc["system"].as_str() {
-            Some(s) if !s.is_empty() => s,
-            _ => continue,
-        };
+            // Check for ECL / is-a filters before falling through to the explicit
+            // code list or "all concepts" paths.
+            if let Some(filter_result) =
+                apply_compose_filters(conn, system_url, &system_id, inc, None)?
+            {
+                included.extend(filter_result);
+            } else if let Some(explicit_codes) = inc["concept"].as_array() {
+                // Explicit code list: single json_each batch join instead of N
+                // individual point lookups.  For large VSAC ValueSets (6000+ codes)
+                // this reduces the round-trips from O(N) to O(1).
+                let codes_json: serde_json::Value = explicit_codes
+                    .iter()
+                    .filter_map(|e| e["code"].as_str())
+                    .collect::<Vec<_>>()
+                    .into();
+                let codes_str = codes_json.to_string();
 
-        // Resolve code system id from the `code_systems` table.
-        let system_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1",
-                [system_url],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-        let system_id = match system_id {
-            Some(id) => id,
-            None => {
-                let msg = format!(
-                    "CodeSystem {system_url} was not found and has been excluded from the expansion"
-                );
-                tracing::warn!(%system_url, "{msg}");
-                warnings.push(msg);
-                continue;
-            }
-        };
-
-        // Check for ECL / is-a filters before falling through to the explicit
-        // code list or "all concepts" paths.
-        if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc, None)? {
-            included.extend(filter_result);
-        } else if let Some(explicit_codes) = inc["concept"].as_array() {
-            // Explicit code list: single json_each batch join instead of N
-            // individual point lookups.  For large VSAC ValueSets (6000+ codes)
-            // this reduces the round-trips from O(N) to O(1).
-            let codes_json: serde_json::Value = explicit_codes
-                .iter()
-                .filter_map(|e| e["code"].as_str())
-                .collect::<Vec<_>>()
-                .into();
-            let codes_str = codes_json.to_string();
-
-            let mut stmt = conn
-                .prepare_cached(
-                    "SELECT je.value, c.display
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT je.value, c.display
                      FROM json_each(?1) je
                      LEFT JOIN concepts c
                          ON c.system_id = ?2 AND c.code = je.value",
-                )
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    )
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-            let rows = stmt
-                .query_map(rusqlite::params![codes_str, system_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                })
-                .map_err(|e| HtsError::StorageError(e.to_string()))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![codes_str, system_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-            for (code, display) in rows {
-                included.push(ExpansionContains {
-                    system: system_url.to_owned(),
-                    code,
-                    display,
-                    inactive: None,
-                    contains: vec![],
-                });
-            }
-        } else {
-            // No explicit codes and no filters: include ALL concepts from the
-            // referenced system.
-            let mut stmt = conn
-                .prepare_cached(
-                    "SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code",
-                )
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-            let rows = stmt
-                .query_map([&system_id], |row| {
-                    Ok(ExpansionContains {
+                for (code, display) in rows {
+                    included.push(ExpansionContains {
                         system: system_url.to_owned(),
-                        code: row.get(0)?,
-                        display: row.get(1)?,
+                        code,
+                        display,
                         inactive: None,
                         contains: vec![],
-                    })
-                })
-                .map_err(|e| HtsError::StorageError(e.to_string()))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    });
+                }
+            } else {
+                // No explicit codes and no filters: include ALL concepts from the
+                // referenced system.
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code",
+                    )
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-            included.extend(rows);
+                let rows = stmt
+                    .query_map([&system_id], |row| {
+                        Ok(ExpansionContains {
+                            system: system_url.to_owned(),
+                            code: row.get(0)?,
+                            display: row.get(1)?,
+                            inactive: None,
+                            contains: vec![],
+                        })
+                    })
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                included.extend(rows);
+            }
         }
-    }
+    } // end fast-path else
 
     // Apply excludes: build a (system, code) deny-set and filter.
     let excludes = compose["exclude"].as_array().unwrap_or(&empty_arr);
@@ -1693,6 +1710,174 @@ fn apply_compose_filters(
     Ok(result)
 }
 
+/// Returns `true` when a compose include entry uses only property-equality
+/// filters — no hierarchy operators, no ECL constraints, no explicit concept
+/// list, and no nested ValueSet references.
+fn is_property_only_include(inc: &serde_json::Value) -> bool {
+    if inc["system"].as_str().is_none_or(|s| s.is_empty()) {
+        return false;
+    }
+    if inc["concept"].as_array().is_some_and(|a| !a.is_empty()) {
+        return false;
+    }
+    if inc["valueSet"].as_array().is_some_and(|a| !a.is_empty()) {
+        return false;
+    }
+    let Some(filters) = inc["filter"].as_array() else {
+        return false;
+    };
+    !filters.is_empty()
+        && filters.iter().all(|f| {
+            f["op"].as_str().unwrap_or("") == "="
+                && f["property"].as_str().unwrap_or("") != "constraint"
+        })
+}
+
+/// Fast path for multi-include composes where every include uses the **same**
+/// CodeSystem and carries only property-equality (`op = "="`) filters.
+///
+/// Instead of N×M individual `query_property_eq` round-trips (one per
+/// property per include), this function builds a single CTE query of the form:
+///
+/// ```sql
+/// WITH
+///   inc0_p0 AS (SELECT concept_id FROM concept_properties WHERE property=? AND value=?),
+///   inc0_p1 AS (SELECT concept_id FROM concept_properties WHERE property=? AND value=?),
+///   inc0    AS (SELECT concept_id FROM inc0_p0 INTERSECT SELECT concept_id FROM inc0_p1),
+///   inc1_p0 AS (SELECT concept_id FROM concept_properties WHERE property=? AND value=?),
+///   inc1    AS (SELECT concept_id FROM inc1_p0),
+///   all_ids AS (SELECT concept_id FROM inc0 UNION SELECT concept_id FROM inc1)
+/// SELECT c.code, c.display
+/// FROM concepts c
+/// JOIN all_ids a ON a.concept_id = c.id
+/// WHERE c.system_id = ?
+/// ```
+///
+/// Returns `None` when the fast path does not apply (single include, mixed
+/// systems, non-property filters, explicit concept lists, etc.) so the caller
+/// can fall back to the generic per-include loop.
+fn try_multi_include_property_only(
+    conn: &Connection,
+    includes: &[serde_json::Value],
+    warnings: &mut Vec<String>,
+) -> Result<Option<Vec<ExpansionContains>>, HtsError> {
+    if includes.len() < 2 {
+        return Ok(None);
+    }
+
+    let first_system = match includes[0]["system"].as_str() {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(None),
+    };
+
+    if !includes
+        .iter()
+        .all(|inc| inc["system"].as_str() == Some(first_system) && is_property_only_include(inc))
+    {
+        return Ok(None);
+    }
+
+    let system_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM code_systems WHERE url = ?1",
+            [first_system],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let system_id = match system_id {
+        Some(id) => id,
+        None => {
+            let msg = format!(
+                "CodeSystem {first_system} was not found and has been excluded from the expansion"
+            );
+            tracing::warn!(%first_system, "{msg}");
+            warnings.push(msg);
+            return Ok(Some(vec![]));
+        }
+    };
+
+    let mut cte_parts: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    let mut inc_cte_names: Vec<String> = Vec::new();
+
+    for (inc_idx, inc) in includes.iter().enumerate() {
+        let filters = inc["filter"].as_array().unwrap();
+        let mut prop_cte_names: Vec<String> = Vec::new();
+
+        for (f_idx, f) in filters.iter().enumerate() {
+            let prop = f["property"].as_str().unwrap_or("");
+            let val = f["value"].as_str().unwrap_or("");
+            let cte_name = format!("inc{inc_idx}_p{f_idx}");
+            let p_idx = params.len() + 1;
+            let v_idx = params.len() + 2;
+            cte_parts.push(format!(
+                "{cte_name} AS (SELECT concept_id FROM concept_properties \
+                 WHERE property = ?{p_idx} AND value = ?{v_idx})"
+            ));
+            params.push(prop.to_string());
+            params.push(val.to_string());
+            prop_cte_names.push(cte_name);
+        }
+
+        let inc_cte_name = format!("inc{inc_idx}");
+        if prop_cte_names.len() == 1 {
+            cte_parts.push(format!(
+                "{inc_cte_name} AS (SELECT concept_id FROM {})",
+                prop_cte_names[0]
+            ));
+        } else {
+            let intersect = prop_cte_names
+                .iter()
+                .map(|n| format!("SELECT concept_id FROM {n}"))
+                .collect::<Vec<_>>()
+                .join(" INTERSECT ");
+            cte_parts.push(format!("{inc_cte_name} AS ({intersect})"));
+        }
+        inc_cte_names.push(inc_cte_name);
+    }
+
+    let union_expr = inc_cte_names
+        .iter()
+        .map(|n| format!("SELECT concept_id FROM {n}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ");
+    cte_parts.push(format!("all_ids AS ({union_expr})"));
+
+    let sid_idx = params.len() + 1;
+    params.push(system_id);
+
+    let sql = format!(
+        "WITH {ctes}\n\
+         SELECT c.code, c.display\n\
+         FROM concepts c\n\
+         JOIN all_ids a ON a.concept_id = c.id\n\
+         WHERE c.system_id = ?{sid_idx}",
+        ctes = cte_parts.join(",\n")
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let results = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(ExpansionContains {
+                system: first_system.to_owned(),
+                code: row.get(0)?,
+                display: row.get(1)?,
+                inactive: None,
+                contains: vec![],
+            })
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    Ok(Some(results))
+}
+
 /// Expand the subtree of `root_code` downward and immediately filter by
 /// a property equality constraint, all in a single recursive CTE query.
 ///
@@ -1725,9 +1910,8 @@ fn query_subtree_with_property(
     // loading all property-matching descendants into Rust before discarding them).
     let include_self_i = i64::from(include_self);
 
-    let row_fn = |row: &rusqlite::Row<'_>| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    };
+    let row_fn =
+        |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?));
     let make = |(code, display): (String, Option<String>)| ExpansionContains {
         system: system_url.to_owned(),
         code,
@@ -1736,12 +1920,11 @@ fn query_subtree_with_property(
         contains: vec![],
     };
 
-    let pairs: Vec<(String, Option<String>)> = if let Some(tf) =
-        text_filter.filter(|t| !t.is_empty())
-    {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT c.code, c.display
+    let pairs: Vec<(String, Option<String>)> =
+        if let Some(tf) = text_filter.filter(|t| !t.is_empty()) {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT c.code, c.display
                  FROM   concept_properties cp
                  JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?2
                  JOIN   concept_closure cc
@@ -1753,19 +1936,19 @@ fn query_subtree_with_property(
                    AND  (c.code != ?1 OR ?5)
                    AND  (instr(lower(c.display), ?6) > 0
                          OR instr(lower(c.code), ?6) > 0)",
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            stmt.query_map(
+                rusqlite::params![root_code, system_id, property, value, include_self_i, tf],
+                row_fn,
             )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        stmt.query_map(
-            rusqlite::params![root_code, system_id, property, value, include_self_i, tf],
-            row_fn,
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-    } else {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT c.code, c.display
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+        } else {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT c.code, c.display
                  FROM   concept_properties cp
                  JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?2
                  JOIN   concept_closure cc
@@ -1775,16 +1958,16 @@ fn query_subtree_with_property(
                  WHERE  cp.property = ?3
                    AND  cp.value = ?4
                    AND  (c.code != ?1 OR ?5)",
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            stmt.query_map(
+                rusqlite::params![root_code, system_id, property, value, include_self_i],
+                row_fn,
             )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        stmt.query_map(
-            rusqlite::params![root_code, system_id, property, value, include_self_i],
-            row_fn,
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-    };
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+        };
 
     Ok(pairs.into_iter().map(make).collect())
 }
