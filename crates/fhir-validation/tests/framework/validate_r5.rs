@@ -9,8 +9,8 @@ mod tests {
     use fhir_validation::profile::validate::validate_profile;
     use fhir_validation::validation_context::{ValidationContext, ValidationState};
     use fhir_validation::{
-        R5FhirPathEvaluator, StructureDefinitionKind, TypeDerivationRule, TypeProfileMatchMode,
-        Validator,
+        R5FhirPathEvaluator, Severity, StructureDefinitionKind, TypeDerivationRule,
+        TypeProfileMatchMode, Validator,
     };
     use helios_fhir::FhirVersion;
     use helios_fhir::r5::StructureDefinition;
@@ -2462,6 +2462,227 @@ mod tests {
                 i.fhir_path == "Bundle.entry.resource.subject" && i.code == "structure"
             }),
             "expected structure issue when subject reference does not match bundle entries, got {issues_fail:?}"
+        );
+    }
+
+    #[test]
+    fn recurses_into_non_core_base_definition_profile_from_registry() {
+        let mut base = empty_profile();
+        base.url = "http://example.org/fhir/StructureDefinition/base-patient".to_string();
+        base.resource_type = "Patient".to_string();
+        base.base_definition = Some("http://hl7.org/fhir/StructureDefinition/Patient".to_string());
+        base.element_rules.push(ExtractedElementRule {
+            id: "Patient.identifier".to_string(),
+            path: "Patient.identifier".to_string(),
+            min: Some(1),
+            ..Default::default()
+        });
+
+        let mut derived = empty_profile();
+        derived.url = "http://example.org/fhir/StructureDefinition/derived-patient".to_string();
+        derived.resource_type = "Patient".to_string();
+        derived.base_definition = Some(base.url.clone());
+
+        let mut registry = ProfileRegistry::default();
+        registry.insert(base);
+
+        let patient_json = r#"{ "resourceType": "Patient" }"#;
+        let patient: Patient =
+            serde_json::from_str(patient_json).expect("Patient JSON should deserialize");
+        let evaluator = R5FhirPathEvaluator::new(Resource::Patient(Box::new(patient.clone())));
+
+        let issues = run_validate_profile(
+            &validator(),
+            &patient,
+            "Patient",
+            &derived,
+            &evaluator,
+            Some(&registry),
+        );
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.fhir_path == "Patient.identifier" && i.code == "required"),
+            "expected required issue inherited from non-core base profile, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_recurse_into_core_hl7_base_definition_profile() {
+        let mut fake_core = empty_profile();
+        fake_core.url = "http://hl7.org/fhir/StructureDefinition/Patient".to_string();
+        fake_core.resource_type = "Patient".to_string();
+        fake_core.element_rules.push(ExtractedElementRule {
+            id: "Patient.identifier".to_string(),
+            path: "Patient.identifier".to_string(),
+            min: Some(1),
+            ..Default::default()
+        });
+
+        let mut derived = empty_profile();
+        derived.url = "http://example.org/fhir/StructureDefinition/derived-patient".to_string();
+        derived.resource_type = "Patient".to_string();
+        derived.base_definition =
+            Some("http://hl7.org/fhir/StructureDefinition/Patient".to_string());
+
+        let mut registry = ProfileRegistry::default();
+        registry.insert(fake_core);
+
+        let patient_json = r#"{ "resourceType": "Patient" }"#;
+        let patient: Patient =
+            serde_json::from_str(patient_json).expect("Patient JSON should deserialize");
+        let evaluator = R5FhirPathEvaluator::new(Resource::Patient(Box::new(patient.clone())));
+
+        let issues = run_validate_profile(
+            &validator(),
+            &patient,
+            "Patient",
+            &derived,
+            &evaluator,
+            Some(&registry),
+        );
+
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.fhir_path == "Patient.identifier" && i.code == "required"),
+            "did not expect recursion into core HL7 base profile, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn must_support_unpopulated_emits_warning() {
+        let mut profile = empty_profile();
+        profile.element_rules.push(ExtractedElementRule {
+            id: "Patient.active".to_string(),
+            path: "Patient.active".to_string(),
+            must_support: Some(true),
+            ..Default::default()
+        });
+
+        let patient = json!({ "resourceType": "Patient" });
+        let patient_typed: Patient =
+            serde_json::from_value(patient.clone()).expect("Patient JSON should deserialize");
+        let evaluator = R5FhirPathEvaluator::new(Resource::Patient(Box::new(patient_typed)));
+
+        let issues = run_validate_profile(
+            &validator(),
+            &patient,
+            "Patient",
+            &profile,
+            &evaluator,
+            None,
+        );
+
+        assert!(
+            issues.iter().any(|i| {
+                i.fhir_path == "Patient.active"
+                    && i.severity == Severity::Warning
+                    && i.code == "structure"
+            }),
+            "expected mustSupport warning on Patient.active, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn must_support_unpopulated_emits_error_when_configured() {
+        let mut profile = empty_profile();
+        profile.element_rules.push(ExtractedElementRule {
+            id: "Patient.active".to_string(),
+            path: "Patient.active".to_string(),
+            must_support: Some(true),
+            ..Default::default()
+        });
+
+        let patient = json!({ "resourceType": "Patient" });
+        let patient_typed: Patient =
+            serde_json::from_value(patient.clone()).expect("Patient JSON should deserialize");
+        let evaluator = R5FhirPathEvaluator::new(Resource::Patient(Box::new(patient_typed)));
+
+        let mut v = validator();
+        v.config.must_support_missing_severity = Severity::Error;
+
+        let issues = run_validate_profile(&v, &patient, "Patient", &profile, &evaluator, None);
+
+        assert!(
+            issues.iter().any(|i| {
+                i.fhir_path == "Patient.active"
+                    && i.severity == Severity::Error
+                    && i.code == "structure"
+            }),
+            "expected mustSupport error on Patient.active, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn type_profile_extension_declares_profile_via_url() {
+        let ext_url = "http://example.org/fhir/StructureDefinition/test-my-extension";
+        let ext_profile = ExtractedProfile {
+            url: ext_url.to_string(),
+            version: None,
+            name: None,
+            title: None,
+            resource_type: "Extension".to_string(),
+            base_definition: None,
+            kind: StructureDefinitionKind::ComplexType,
+            derivation: TypeDerivationRule::Constraint,
+            invariants: Vec::new(),
+            element_rules: vec![],
+        };
+
+        let mut patient_profile = empty_profile();
+        patient_profile.url =
+            "http://example.org/fhir/StructureDefinition/test-patient".to_string();
+        patient_profile.element_rules = vec![ExtractedElementRule {
+            id: "Patient.extension".to_string(),
+            path: "Patient.extension".to_string(),
+            min: None,
+            max: None,
+            binding: None,
+            constraints: Vec::new(),
+            value_constraint: None,
+            type_constraints: vec![ExtractedTypeConstraint {
+                code: "Extension".to_string(),
+                profiles: vec![ext_url.to_string()],
+                target_profiles: Vec::new(),
+                ..Default::default()
+            }],
+            slicing: None,
+            slice_name: None,
+            ..Default::default()
+        }];
+
+        let mut registry = ProfileRegistry::new();
+        registry.insert(ext_profile);
+
+        let patient = json!({
+            "resourceType": "Patient",
+            "extension": [
+                {
+                    "url": ext_url,
+                    "valueString": "x"
+                }
+            ]
+        });
+
+        let patient_typed: Patient =
+            serde_json::from_value(patient.clone()).expect("Patient JSON should deserialize");
+        let evaluator = R5FhirPathEvaluator::new(Resource::Patient(Box::new(patient_typed)));
+
+        let issues = run_validate_profile(
+            &validator(),
+            &patient,
+            "Patient",
+            &patient_profile,
+            &evaluator,
+            Some(&registry),
+        );
+
+        assert!(
+            !issues.iter().any(|i| i.summary.as_deref()
+                == Some("Declared profiles do not satisfy type.profile requirement")),
+            "extension url should satisfy type.profile like meta.profile, got {issues:?}"
         );
     }
 }

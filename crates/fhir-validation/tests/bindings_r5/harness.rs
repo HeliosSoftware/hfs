@@ -27,7 +27,7 @@ pub fn terminology_base_url_from_env() -> Option<String> {
 /// (typical Snowstorm FHIR API base).
 pub fn remote_terminology_for_tests() -> RemoteTerminologyService {
     let base =
-        terminology_base_url_from_env().unwrap_or_else(|| "http://localhost:8080/fhir".to_string());
+        terminology_base_url_from_env().unwrap_or_else(|| "http://localhost:8090".to_string());
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(8))

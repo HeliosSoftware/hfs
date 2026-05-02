@@ -108,19 +108,36 @@ pub fn extract_structure_definition_profile_from_json(
         return Err(ValidationError::from(SdMsg::DifferentialElementNonEmpty));
     }
 
-    let snapshot_map: HashMap<String, Value> = obj
-        .get("snapshot")
-        .and_then(|s| s.get("element"))
-        .and_then(|e| e.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| {
-                    let path = e.get("path")?.as_str()?;
-                    Some((path.to_string(), e.clone()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut differential_id_by_path: HashMap<String, String> = HashMap::new();
+    for diff_el in diff {
+        let diff_obj = diff_el
+            .as_object()
+            .ok_or_else(|| ValidationError::from(SdMsg::DifferentialElementEntryMustBeObject))?;
+        let path = diff_obj
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ValidationError::from(SdMsg::DifferentialElementMissingPath))?;
+        let id = diff_obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(path)
+            .to_string();
+        differential_id_by_path.insert(path.to_string(), id);
+    }
+
+    let snapshot_elements = if obj.get("snapshot").is_some() {
+        let arr = obj
+            .get("snapshot")
+            .and_then(|s| s.get("element"))
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| ValidationError::from(SdMsg::SnapshotElementMustBeArray))?;
+        if arr.is_empty() {
+            return Err(ValidationError::from(SdMsg::SnapshotElementNonEmpty));
+        }
+        Some(arr)
+    } else {
+        None
+    };
 
     let version = obj
         .get("version")
@@ -142,37 +159,67 @@ pub fn extract_structure_definition_profile_from_json(
     let mut profile_invariants = Vec::new();
     let mut element_rules = Vec::new();
 
-    for diff_el in diff {
-        let diff_obj = diff_el
-            .as_object()
-            .ok_or_else(|| ValidationError::from(SdMsg::DifferentialElementEntryMustBeObject))?;
-        let path = diff_obj
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ValidationError::from(SdMsg::DifferentialElementMissingPath))?;
-        let id = diff_obj
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(path)
-            .to_string();
+    if let Some(snapshot_elements) = snapshot_elements {
+        for snapshot_el in snapshot_elements {
+            let snapshot_obj = snapshot_el
+                .as_object()
+                .ok_or_else(|| ValidationError::from(SdMsg::SnapshotElementEntryMustBeObject))?;
+            let path = snapshot_obj
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ValidationError::from(SdMsg::SnapshotElementMissingPath))?;
+            let id = differential_id_by_path
+                .get(path)
+                .cloned()
+                .or_else(|| {
+                    snapshot_obj
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| path.to_string());
 
-        let resolved = snapshot_map
-            .get(path)
-            .cloned()
-            .unwrap_or_else(|| diff_el.clone());
-
-        if path == resource_type {
-            if let Some(arr) = resolved.get("constraint").and_then(|c| c.as_array()) {
-                for c in arr {
-                    if let Some(inv) = parse_invariant(c, path)? {
-                        profile_invariants.push(inv);
+            if path == resource_type {
+                if let Some(arr) = snapshot_el.get("constraint").and_then(|c| c.as_array()) {
+                    for c in arr {
+                        if let Some(inv) = parse_invariant(c, path)? {
+                            profile_invariants.push(inv);
+                        }
                     }
                 }
+                continue;
             }
-            continue;
-        }
 
-        element_rules.push(extract_element_rule(id, path.to_string(), &resolved)?);
+            element_rules.push(extract_element_rule(id, path.to_string(), snapshot_el)?);
+        }
+    } else {
+        for diff_el in diff {
+            let diff_obj = diff_el.as_object().ok_or_else(|| {
+                ValidationError::from(SdMsg::DifferentialElementEntryMustBeObject)
+            })?;
+            let path = diff_obj
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ValidationError::from(SdMsg::DifferentialElementMissingPath))?;
+            let id = diff_obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(path)
+                .to_string();
+
+            if path == resource_type {
+                if let Some(arr) = diff_el.get("constraint").and_then(|c| c.as_array()) {
+                    for c in arr {
+                        if let Some(inv) = parse_invariant(c, path)? {
+                            profile_invariants.push(inv);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            element_rules.push(extract_element_rule(id, path.to_string(), diff_el)?);
+        }
     }
 
     Ok(ExtractedProfile {

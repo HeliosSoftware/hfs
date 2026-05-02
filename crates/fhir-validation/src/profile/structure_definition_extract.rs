@@ -19,6 +19,10 @@ pub enum StructureDefinitionExtractMessage {
     DifferentialElementNonEmpty,
     DifferentialElementEntryMustBeObject,
     DifferentialElementMissingPath,
+    SnapshotElementMustBeArray,
+    SnapshotElementNonEmpty,
+    SnapshotElementEntryMustBeObject,
+    SnapshotElementMissingPath,
     ElementMustBeObject,
     BindingMissingValueSet,
     BindingMustBeObject,
@@ -60,6 +64,24 @@ impl fmt::Display for StructureDefinitionExtractMessage {
             ),
             Self::DifferentialElementMissingPath => {
                 f.write_str("StructureDefinition differential element missing path")
+            }
+            Self::SnapshotElementMustBeArray => {
+                write!(
+                    f,
+                    "StructureDefinition.snapshot.element must be a non-empty array"
+                )
+            }
+            Self::SnapshotElementNonEmpty => {
+                write!(f, "StructureDefinition.snapshot.element must be non-empty")
+            }
+            Self::SnapshotElementEntryMustBeObject => {
+                write!(
+                    f,
+                    "StructureDefinition.snapshot.element entry must be an object"
+                )
+            }
+            Self::SnapshotElementMissingPath => {
+                f.write_str("StructureDefinition snapshot element missing path")
             }
             Self::ElementMustBeObject => {
                 f.write_str("StructureDefinition element must be an object")

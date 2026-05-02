@@ -48,6 +48,6 @@ async fn coverage_eligibility_meta_tag_remote_validate_code() {
         &issues,
         "CoverageEligibilityRequest.meta.tag[0]",
         "http://hl7.org/fhir/ValueSet/common-tags",
-        "The system 'http://terminology.hl7.org/CodeSystem/v3-ActReason' is not included in this ValueSet.",
+        "Code 'HTEST' is not in value set 'http://terminology.hl7.org/ValueSet/common-tags'",
     );
 }

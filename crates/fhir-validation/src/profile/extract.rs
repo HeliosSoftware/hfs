@@ -9,31 +9,24 @@
 //! - **Snapshot** — the full merged element tree (base + profile), suitable for
 //!   operational use; each row is a complete [`ElementDefinition`] for that path.
 //!
-//! This module **only walks** the differential’s `element` list (`StructureDefinitionDifferential`).
-//! It does **not** iterate the snapshot’s `element` list by itself, so the set of
-//! paths and the scope of profile validation match the profile *delta* (what
-//! appears in the differential). Base resource validation is assumed to happen
-//! elsewhere.
+//! Extraction is **snapshot-first**:
+//! - When `snapshot.element` is present, extraction walks the snapshot rows.
+//! - When snapshot is absent, extraction falls back to differential rows.
 //!
-//! When a snapshot is present (typical in published Implementation Guides), each
-//! differential path is **resolved** to the snapshot row with the same
-//! `path`, and **that** row is used for extraction.
-//! Rationale: the snapshot row is the merged truth and carries inherited
-//! metadata (e.g. `type` for terminology binding target kind) that sparse
-//! differential rows may omit. If the snapshot is missing or has no row for a
-//! path, the differential row is used as-is.
+//! A present snapshot must be well-formed (`snapshot.element` non-empty array);
+//! malformed/empty snapshots are rejected as invalid `StructureDefinition`
+//! instead of silently falling back to differential.
 //!
-//! Resolution is **whole-row**: we pick either the snapshot or the differential
-//! [`ElementDefinition`], not a field-by-field merge. Published IGs are built so
-//! the snapshot matches the profile; we do **not** compute a snapshot from base
-//! + differential here (that is the IG Publisher / tooling layer).
+//! Snapshot-first keeps inherited metadata and constraints from the full merged
+//! profile view (base chain + local deltas), which is required for profile-on-
+//! profile validation scenarios.
 //!
-//! [`ExtractedElementRule`]'s `id` is always taken from the **differential** row for
-//! authoring alignment; all other extracted fields come from the resolved
-//! [`ElementDefinition`].
+//! [`ExtractedElementRule`]'s `id` prefers the **differential** row for authoring
+//! alignment when a matching path exists; otherwise snapshot `id` (or `path`) is
+//! used.
 //!
-//! Snapshot-only StructureDefinitions (no differential) are **not** supported;
-//! extraction requires a non-empty differential element list.
+//! Snapshot-only `StructureDefinition`s (no differential) are currently **not**
+//! supported; extraction still requires a non-empty differential element list.
 //!
 //! # `ElementDefinition.condition`
 //!

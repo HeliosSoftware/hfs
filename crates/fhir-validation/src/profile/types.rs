@@ -7,10 +7,9 @@ use fhir_validation_types::{
 /// Built from [`StructureDefinition`](https://hl7.org/fhir/structuredefinition.html) via
 /// [`crate::profile::extract`] (version-specific extractors and
 /// [`extract_structure_definition_profile_from_json`](crate::profile::extract::extract_structure_definition_profile_from_json)).
-/// Extraction walks **differential**
-/// elements only; when a **snapshot** is present, each path is resolved to the
-/// merged snapshot row where available. See the `extract` module documentation for
-/// the full differential vs snapshot strategy.
+/// Extraction is **snapshot-first** when `snapshot.element` is present, with
+/// differential fallback when snapshot is absent. See `extract` module docs for
+/// details.
 ///
 /// [`kind`] and [`derivation`] mirror `StructureDefinition.kind` and
 /// `StructureDefinition.derivation` (FHIR ValueSets, aligned with

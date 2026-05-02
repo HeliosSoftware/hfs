@@ -1,11 +1,14 @@
 //! **R4** integration tests: ValueSet binding units, `CodeableConcept` binding helpers, domain
-//! resource invariants (`dom-*`), reference / contained rules, and patient fixtures.
+//! resource invariants (`dom-*`), reference / contained rules, patient fixtures, and
+//! [`StructureDefinition-AtriusPatient.json`](fixtures/r4/profiles/StructureDefinition-AtriusPatient.json) profile validation.
 //!
 //! ```text
 //! cargo test -p fhir-validation --features R4 --test r4_suite
 //! ```
 
 #![cfg(feature = "R4")]
+#[path = "r4_suite/atrius_patient_profile.rs"]
+mod atrius_patient_profile;
 #[path = "r4_suite/bindings_code.rs"]
 mod bindings_code;
 #[path = "r4_suite/bindings_codeable_concept.rs"]

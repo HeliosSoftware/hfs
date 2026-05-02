@@ -37,9 +37,10 @@
 use crate::issue_code;
 use crate::profile::cardinality::{
     is_root_profile_element_path, relative_profile_path, validate_max_cardinality,
-    validate_min_cardinality,
+    validate_min_cardinality, validate_must_support,
 };
 use crate::profile::element_bounds::validate_element_bounds;
+use crate::profile::extract::extract_structure_definition_profile_from_json;
 use crate::profile::helpers::{
     get_values_at_relative_path, get_values_with_paths_at_relative_path,
 };
@@ -54,6 +55,12 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+static REMOTE_BASE_PROFILE_CACHE: OnceLock<
+    Mutex<std::collections::HashMap<String, Option<ExtractedProfile>>>,
+> = OnceLock::new();
 
 /// Validate a resource instance against a single extracted profile.
 ///
@@ -129,6 +136,7 @@ fn apply_profile_element_rule_invariants<T: Serialize>(
 /// - profile-level invariants ([`ExtractedProfile::invariants`], always root path — see module docs)
 /// - element-level invariants ([`apply_profile_element_rule_invariants`] per rule with constraints)
 /// - minimum cardinality
+/// - mustSupport (when enabled)
 /// - maximum cardinality
 /// - slicing validation
 /// - fixed/pattern value constraints
@@ -224,6 +232,13 @@ pub(crate) fn validate_profile_with_depth_async<'a, T: Serialize + 'a>(
             profile.element_rules.as_slice(),
         ));
 
+        issues.extend(validate_must_support(
+            resource,
+            resource_type,
+            profile.element_rules.as_slice(),
+            &ctx.validator.config,
+        ));
+
         issues.extend(validate_max_cardinality(
             resource,
             resource_type,
@@ -291,6 +306,11 @@ pub(crate) fn validate_profile_with_depth_async<'a, T: Serialize + 'a>(
                     .await,
             );
         }
+
+        issues.extend(
+            validate_base_definition_profile_async(ctx, state, resource, resource_type, profile)
+                .await,
+        );
 
         state.active_profiles.remove(&profile.url);
         issues
@@ -378,6 +398,13 @@ pub(crate) fn validate_profile_with_depth<T: Serialize>(
         profile.element_rules.as_slice(),
     ));
 
+    issues.extend(validate_must_support(
+        resource,
+        resource_type,
+        profile.element_rules.as_slice(),
+        &ctx.validator.config,
+    ));
+
     issues.extend(validate_max_cardinality(
         resource,
         resource_type,
@@ -439,8 +466,280 @@ pub(crate) fn validate_profile_with_depth<T: Serialize>(
         ));
     }
 
+    issues.extend(validate_base_definition_profile(
+        ctx,
+        state,
+        resource,
+        resource_type,
+        profile,
+    ));
+
     state.active_profiles.remove(&profile.url);
     issues
+}
+
+fn validate_base_definition_profile<T: Serialize>(
+    ctx: &ValidationContext<'_>,
+    state: &ValidationState,
+    resource: &T,
+    resource_type: &str,
+    profile: &ExtractedProfile,
+) -> Vec<ValidationIssue> {
+    if !ctx.validator.config.recurse_on_base_definition {
+        return Vec::new();
+    }
+
+    let Some(base_url_raw) = profile.base_definition.as_deref() else {
+        return Vec::new();
+    };
+    let base_url = canonical_profile_url(base_url_raw);
+    if base_url.is_empty() || is_core_type_base_definition(base_url, &profile.resource_type) {
+        return Vec::new();
+    }
+
+    let Some(base_profile) = resolve_base_profile_sync(ctx, base_url) else {
+        return Vec::new();
+    };
+
+    let mut child_state = ValidationState {
+        recursion_depth: state.recursion_depth + 1,
+        active_profiles: state.active_profiles.clone(),
+    };
+    validate_profile_with_depth(
+        ctx,
+        &mut child_state,
+        resource,
+        resource_type,
+        &base_profile,
+    )
+}
+
+fn resolve_base_profile_sync(
+    ctx: &ValidationContext<'_>,
+    base_url: &str,
+) -> Option<ExtractedProfile> {
+    if let Some(registry) = ctx.runtime_profile_registry {
+        if let Some(profile) = registry
+            .get(base_url)
+            .or_else(|| registry.get(canonical_profile_url(base_url)))
+        {
+            return Some(profile.clone());
+        }
+    }
+
+    if !ctx.validator.config.enable_base_definition_url_lookup {
+        return None;
+    }
+    fetch_remote_profile_sync(ctx, base_url)
+}
+
+async fn validate_base_definition_profile_async<'a, T: Serialize + 'a>(
+    ctx: &'a AsyncValidationContext<'a>,
+    state: &'a ValidationState,
+    resource: &'a T,
+    resource_type: &'a str,
+    profile: &'a ExtractedProfile,
+) -> Vec<ValidationIssue> {
+    if !ctx.validator.config.recurse_on_base_definition {
+        return Vec::new();
+    }
+
+    let Some(base_url_raw) = profile.base_definition.as_deref() else {
+        return Vec::new();
+    };
+    let base_url = canonical_profile_url(base_url_raw);
+    if base_url.is_empty() || is_core_type_base_definition(base_url, &profile.resource_type) {
+        return Vec::new();
+    }
+
+    let Some(base_profile) = resolve_base_profile_async(ctx, base_url).await else {
+        return Vec::new();
+    };
+
+    let mut child_state = ValidationState {
+        recursion_depth: state.recursion_depth + 1,
+        active_profiles: state.active_profiles.clone(),
+    };
+    validate_profile_with_depth_async(
+        ctx,
+        &mut child_state,
+        resource,
+        resource_type,
+        &base_profile,
+    )
+    .await
+}
+
+async fn resolve_base_profile_async(
+    ctx: &AsyncValidationContext<'_>,
+    base_url: &str,
+) -> Option<ExtractedProfile> {
+    if let Some(registry) = ctx.runtime_profile_registry {
+        if let Some(profile) = registry
+            .get(base_url)
+            .or_else(|| registry.get(canonical_profile_url(base_url)))
+        {
+            return Some(profile.clone());
+        }
+    }
+
+    if !ctx.validator.config.enable_base_definition_url_lookup {
+        return None;
+    }
+    fetch_remote_profile_async(ctx, base_url).await
+}
+
+fn fetch_remote_profile_sync(
+    ctx: &ValidationContext<'_>,
+    base_url: &str,
+) -> Option<ExtractedProfile> {
+    if !is_allowed_base_profile_url(base_url, &ctx.validator.config) {
+        return None;
+    }
+    let cache =
+        REMOTE_BASE_PROFILE_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.get(base_url) {
+            return cached.clone();
+        }
+    }
+
+    let timeout = Duration::from_millis(ctx.validator.config.base_definition_url_lookup_timeout_ms);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .ok()?;
+    let resp = client.get(base_url).send().ok()?;
+    if !resp.status().is_success() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(base_url.to_string(), None);
+        }
+        return None;
+    }
+    let body = resp.bytes().ok()?;
+    if body.len() > ctx.validator.config.base_definition_url_lookup_max_bytes {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(base_url.to_string(), None);
+        }
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&body).ok()?;
+    let extracted = extract_structure_definition_profile_from_json(&value).ok();
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(base_url.to_string(), extracted.clone());
+    }
+    extracted
+}
+
+async fn fetch_remote_profile_async(
+    ctx: &AsyncValidationContext<'_>,
+    base_url: &str,
+) -> Option<ExtractedProfile> {
+    if !is_allowed_base_profile_url(base_url, &ctx.validator.config) {
+        return None;
+    }
+    let cache =
+        REMOTE_BASE_PROFILE_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.get(base_url) {
+            return cached.clone();
+        }
+    }
+
+    let timeout = Duration::from_millis(ctx.validator.config.base_definition_url_lookup_timeout_ms);
+    let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
+    let resp = client.get(base_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(base_url.to_string(), None);
+        }
+        return None;
+    }
+    let body = resp.bytes().await.ok()?;
+    if body.len() > ctx.validator.config.base_definition_url_lookup_max_bytes {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(base_url.to_string(), None);
+        }
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&body).ok()?;
+    let extracted = extract_structure_definition_profile_from_json(&value).ok();
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(base_url.to_string(), extracted.clone());
+    }
+    extracted
+}
+
+fn canonical_profile_url(url: &str) -> &str {
+    url.split('|').next().unwrap_or(url)
+}
+
+fn is_core_type_base_definition(base_url: &str, resource_type: &str) -> bool {
+    base_url
+        .rsplit('/')
+        .next()
+        .is_some_and(|tail| tail == resource_type)
+        && (base_url.contains("hl7.org/fhir/StructureDefinition/")
+            || base_url.contains("hl7.org/fhir/4.0/StructureDefinition/")
+            || base_url.contains("hl7.org/fhir/5.0/StructureDefinition/"))
+}
+
+fn is_allowed_base_profile_url(url: &str, config: &crate::ValidationConfig) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return false;
+    }
+    if config.base_definition_url_lookup_allowed_hosts.is_empty() {
+        return true;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    config
+        .base_definition_url_lookup_allowed_hosts
+        .iter()
+        .any(|allowed| host == allowed || host.ends_with(&format!(".{allowed}")))
+}
+
+#[cfg(test)]
+mod base_profile_url_allowlist_tests {
+    use super::is_allowed_base_profile_url;
+    use crate::ValidationConfig;
+
+    #[test]
+    fn allowlist_empty_allows_https_hosts() {
+        let config = ValidationConfig::default();
+        assert!(is_allowed_base_profile_url(
+            "https://example.org/fhir/StructureDefinition/patient",
+            &config
+        ));
+    }
+
+    #[test]
+    fn allowlist_blocks_hosts_not_listed() {
+        let mut config = ValidationConfig::default();
+        config.base_definition_url_lookup_allowed_hosts = vec!["hl7.org".to_string()];
+        assert!(!is_allowed_base_profile_url(
+            "https://evil.example/StructureDefinition/patient",
+            &config
+        ));
+    }
+
+    #[test]
+    fn allowlist_accepts_exact_or_subdomain_match() {
+        let mut config = ValidationConfig::default();
+        config.base_definition_url_lookup_allowed_hosts = vec!["nrces.in".to_string()];
+        assert!(is_allowed_base_profile_url(
+            "https://nrces.in/ndhm/fhir/r4/StructureDefinition/Patient",
+            &config
+        ));
+        assert!(is_allowed_base_profile_url(
+            "https://api.nrces.in/ndhm/fhir/r4/StructureDefinition/Patient",
+            &config
+        ));
+    }
 }
 /// Prefix issue paths produced during recursive nested profile validation so
 /// they are reported relative to the parent element path in the outer resource.
@@ -1363,7 +1662,7 @@ fn validate_type_profile_constraints<T: Serialize>(
                 }
             }
 
-            let declared_profiles = declared_profiles_on_value(actual);
+            let declared_profiles = declared_profiles_for_type_profile_instance(actual);
             if !declared_profiles.is_empty() {
                 let matching_required_profiles: Vec<&str> = known_required_profiles
                     .iter()
@@ -1392,7 +1691,7 @@ fn validate_type_profile_constraints<T: Serialize>(
                         severity: crate::Severity::Error,
                         code: issue_code::STRUCTURE.to_string(),
                         summary: Some(
-                            "Nested resource meta.profile does not satisfy type.profile requirement"
+                            "Declared profiles do not satisfy type.profile requirement"
                                 .to_string(),
                         ),
                         expression_kind: None,
@@ -1707,7 +2006,7 @@ fn validate_type_profile_constraints_async<'a, T: Serialize + 'a>(
                     }
                 }
 
-                let declared_profiles = declared_profiles_on_value(actual);
+                let declared_profiles = declared_profiles_for_type_profile_instance(actual);
                 if !declared_profiles.is_empty() {
                     let matching_required_profiles: Vec<&str> = known_required_profiles
                         .iter()
@@ -1733,12 +2032,12 @@ fn validate_type_profile_constraints_async<'a, T: Serialize + 'a>(
 
                     if !declared_match_ok {
                         issues.push(ValidationIssue {
-                        severity: crate::Severity::Error,
-                        code: issue_code::STRUCTURE.to_string(),
-                        summary: Some(
-                            "Nested resource meta.profile does not satisfy type.profile requirement"
-                                .to_string(),
-                        ),
+                            severity: crate::Severity::Error,
+                            code: issue_code::STRUCTURE.to_string(),
+                            summary: Some(
+                                "Declared profiles do not satisfy type.profile requirement"
+                                    .to_string(),
+                            ),
                         expression_kind: None,
                         source_invariant_key: None,
                             detail_code: Some(ValidationIssueDetailCode::BusinessRuleViolation),
@@ -1965,6 +2264,22 @@ fn declared_profiles_on_value(value: &Value) -> Vec<String> {
         .iter()
         .filter_map(|item| item.as_str().map(str::to_owned))
         .collect()
+}
+
+/// Declared profiles from `meta.profile`, or — when absent — the Extension `url`,
+/// which identifies the extension definition the same way as a StructureDefinition URL.
+fn declared_profiles_for_type_profile_instance(actual: &Value) -> Vec<String> {
+    let from_meta = declared_profiles_on_value(actual);
+    if !from_meta.is_empty() {
+        return from_meta;
+    }
+    let Value::Object(map) = actual else {
+        return Vec::new();
+    };
+    map.get("url")
+        .and_then(|v| v.as_str())
+        .map(|url| vec![url.to_owned()])
+        .unwrap_or_default()
 }
 
 /// Extract `resourceType` from a JSON object value, if present.

@@ -137,6 +137,42 @@ mod tests {
     }
     "#;
 
+    /// Snapshot-first extraction should include constrained paths that are only
+    /// present in snapshot and omitted from differential.
+    const SNAPSHOT_ONLY_PATH_JSON: &str = r#"
+    {
+      "resourceType": "StructureDefinition",
+      "id": "snapshot-only-path-demo",
+      "url": "http://example.org/fhir/StructureDefinition/snapshot-only-path-demo",
+      "name": "SnapshotOnlyPathDemo",
+      "kind": "resource",
+      "type": "Patient",
+      "baseDefinition": "http://example.org/fhir/StructureDefinition/abdm-patient",
+      "derivation": "constraint",
+      "snapshot": {
+        "element": [
+          {
+            "id": "Patient",
+            "path": "Patient"
+          },
+          {
+            "id": "Patient.name",
+            "path": "Patient.name",
+            "min": 1
+          }
+        ]
+      },
+      "differential": {
+        "element": [
+          {
+            "id": "Patient",
+            "path": "Patient"
+          }
+        ]
+      }
+    }
+    "#;
+
     /// Minimal primitive specialization: `kind` + `derivation` + one differential row.
     const SPECIALIZATION_PRIMITIVE_STRING_JSON: &str = r#"
     {
@@ -321,6 +357,38 @@ mod tests {
             .expect("maritalStatus rule");
         let binding = marital.binding.as_ref().expect("maritalStatus binding");
         assert_eq!(binding.target_kind, BindingTargetKind::CodeableConcept);
+    }
+
+    #[test]
+    fn snapshot_first_extracts_paths_not_present_in_differential() {
+        let sd: StructureDefinition = serde_json::from_str(SNAPSHOT_ONLY_PATH_JSON)
+            .expect("snapshot-only-path StructureDefinition JSON should deserialize");
+
+        let profile = extract_r5_structure_definition_profile(&sd)
+            .expect("profile with snapshot-only constrained path should extract");
+
+        let name_rule = profile
+            .element_rules
+            .iter()
+            .find(|r| r.path == "Patient.name")
+            .expect("Patient.name rule should be extracted from snapshot");
+        assert_eq!(name_rule.min, Some(1));
+    }
+
+    #[test]
+    fn rejects_empty_snapshot_element_when_snapshot_is_present() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(ATRIUS_PATIENT_PROFILE_JSON).expect("parse");
+        json["snapshot"] = serde_json::json!({ "element": [] });
+
+        let sd: StructureDefinition = serde_json::from_value(json).expect("deserialize SD");
+        let err = extract_r5_structure_definition_profile(&sd).unwrap_err();
+        match err {
+            ValidationError::InvalidStructureDefinition(
+                StructureDefinitionExtractMessage::SnapshotElementNonEmpty,
+            ) => {}
+            other => panic!("expected SnapshotElementNonEmpty, got {other:?}"),
+        }
     }
 
     #[test]

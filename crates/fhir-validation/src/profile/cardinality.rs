@@ -1,6 +1,6 @@
 use crate::issue_code;
 use crate::profile::types::ExtractedElementRule;
-use crate::{Severity, ValidationIssue, ValidationIssueDetailCode};
+use crate::{Severity, ValidationConfig, ValidationIssue, ValidationIssueDetailCode};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -64,6 +64,89 @@ pub fn validate_max_cardinality<T: Serialize>(
     };
 
     validate_max_cardinality_from_json(&root, resource_type, rules)
+}
+
+/// Warn or error when `ElementDefinition.mustSupport` is true but the instance has
+/// no values at the rule path (same path resolution as cardinality).
+pub fn validate_must_support<T: Serialize>(
+    resource: &T,
+    resource_type: &str,
+    rules: &[ExtractedElementRule],
+    config: &ValidationConfig,
+) -> Vec<ValidationIssue> {
+    if !config.validate_must_support {
+        return Vec::new();
+    }
+
+    let root = match serde_json::to_value(resource) {
+        Ok(value) => value,
+        Err(err) => {
+            return vec![ValidationIssue {
+                severity: Severity::Error,
+                code: "processing".to_string(),
+                summary: Some(
+                    "Resource could not be serialized for mustSupport validation".to_string(),
+                ),
+                expression_kind: None,
+                source_invariant_key: None,
+                detail_code: Some(ValidationIssueDetailCode::ValidationException),
+                diagnostics: format!(
+                    "Failed to serialize resource while validating mustSupport: {}",
+                    err
+                ),
+                expression: None,
+                fhir_path: "".to_string(),
+                instance_path: None,
+            }];
+        }
+    };
+
+    validate_must_support_from_json(&root, resource_type, rules, config)
+}
+
+fn validate_must_support_from_json(
+    root: &Value,
+    resource_type: &str,
+    rules: &[ExtractedElementRule],
+    config: &ValidationConfig,
+) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+
+    for rule in rules {
+        if rule.must_support != Some(true) {
+            continue;
+        }
+
+        let Some(relative_path) = relative_profile_path(resource_type, &rule.path) else {
+            continue;
+        };
+
+        let count = count_relative_path(root, relative_path);
+        if count > 0 {
+            continue;
+        }
+
+        issues.push(ValidationIssue {
+            severity: config.must_support_missing_severity,
+            code: issue_code::STRUCTURE.to_string(),
+            summary: Some(
+                "Element is marked mustSupport in the profile but has no value in this instance"
+                    .to_string(),
+            ),
+            expression_kind: None,
+            source_invariant_key: None,
+            detail_code: Some(ValidationIssueDetailCode::BusinessRuleViolation),
+            diagnostics: format!(
+                "Element '{}' is mustSupport but is not populated in the instance.",
+                rule.path
+            ),
+            expression: None,
+            fhir_path: rule.path.clone(),
+            instance_path: Some(rule.path.clone()),
+        });
+    }
+
+    issues
 }
 
 fn validate_min_cardinality_from_json(
@@ -217,10 +300,12 @@ fn terminal_count(value: &Value) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_max_cardinality, validate_min_cardinality};
+    use super::{validate_max_cardinality, validate_min_cardinality, validate_must_support};
+    use crate::ValidationConfig;
     use crate::ValidationIssueDetailCode;
     use crate::profile::types::ExtractedElementRule;
     use fhir_validation_types::BindingDef;
+    use fhir_validation_types::Severity;
     use serde_json::json;
 
     fn rule(path: &str, min: Option<u32>, max: Option<&str>) -> ExtractedElementRule {
@@ -237,6 +322,59 @@ mod tests {
             slice_name: None,
             ..Default::default()
         }
+    }
+
+    fn must_support_rule(path: &str, ms: bool) -> ExtractedElementRule {
+        ExtractedElementRule {
+            id: path.to_string(),
+            path: path.to_string(),
+            must_support: Some(ms),
+            ..rule(path, None, None)
+        }
+    }
+
+    #[test]
+    fn must_support_missing_emits_warning_by_default() {
+        let patient = json!({ "resourceType": "Patient" });
+        let rules = vec![must_support_rule("Patient.active", true)];
+        let issues =
+            validate_must_support(&patient, "Patient", &rules, &ValidationConfig::default());
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Warning);
+        assert_eq!(issues[0].fhir_path, "Patient.active");
+    }
+
+    #[test]
+    fn must_support_present_produces_no_issue() {
+        let patient = json!({
+            "resourceType": "Patient",
+            "active": true
+        });
+        let rules = vec![must_support_rule("Patient.active", true)];
+        let issues =
+            validate_must_support(&patient, "Patient", &rules, &ValidationConfig::default());
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn must_support_disabled_emits_nothing() {
+        let patient = json!({ "resourceType": "Patient" });
+        let rules = vec![must_support_rule("Patient.active", true)];
+        let mut cfg = ValidationConfig::default();
+        cfg.validate_must_support = false;
+        let issues = validate_must_support(&patient, "Patient", &rules, &cfg);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn must_support_respects_configured_severity() {
+        let patient = json!({ "resourceType": "Patient" });
+        let rules = vec![must_support_rule("Patient.active", true)];
+        let mut cfg = ValidationConfig::default();
+        cfg.must_support_missing_severity = Severity::Error;
+        let issues = validate_must_support(&patient, "Patient", &rules, &cfg);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Error);
     }
 
     #[test]

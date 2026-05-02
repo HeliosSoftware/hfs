@@ -203,7 +203,7 @@ impl ValidationIssue {
     }
 }
 /// Configuration for validation behavior.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ValidationConfig {
     /// Treat extensible bindings as errors
     pub strict_extensible_bindings: bool,
@@ -241,8 +241,34 @@ pub struct ValidationConfig {
 
     pub warn_on_unknown_profile: bool,
     pub error_on_unknown_profile: bool,
+    /// Recursively validate against `StructureDefinition.baseDefinition` when it
+    /// points to a non-core profile.
+    pub recurse_on_base_definition: bool,
+    /// Allow HTTP(S) lookup of base profiles not present in the runtime
+    /// `ProfileRegistry`.
+    pub enable_base_definition_url_lookup: bool,
+    /// Network timeout used for base profile URL lookups.
+    pub base_definition_url_lookup_timeout_ms: u64,
+    /// Maximum accepted payload size (bytes) for fetched base profiles.
+    pub base_definition_url_lookup_max_bytes: usize,
+    /// Optional hostname allowlist for remote base profile lookups.
+    ///
+    /// - Empty list means "allow any host" (backward compatible).
+    /// - Non-empty list allows exact host match or subdomain match.
+    // cfg.base_definition_url_lookup_allowed_hosts = vec![
+    //     "hl7.org".to_string(),
+    //     "nrces.in".to_string(),
+    // ];
+    pub base_definition_url_lookup_allowed_hosts: Vec<String>,
 
     pub type_profile_match_mode: TypeProfileMatchMode,
+
+    /// When true, emit an issue for elements marked `mustSupport` in the profile
+    /// when the instance has no value at that path (see `must_support_missing_severity`).
+    pub validate_must_support: bool,
+
+    /// Severity when a `mustSupport` element has no instance values (`validate_must_support`).
+    pub must_support_missing_severity: Severity,
 }
 
 impl Default for ValidationConfig {
@@ -260,7 +286,14 @@ impl Default for ValidationConfig {
             recurse_on_type_profile_fallback: true,
             warn_on_unknown_profile: false,
             error_on_unknown_profile: true,
+            recurse_on_base_definition: true,
+            enable_base_definition_url_lookup: true,
+            base_definition_url_lookup_timeout_ms: 2_000,
+            base_definition_url_lookup_max_bytes: 1_000_000,
+            base_definition_url_lookup_allowed_hosts: Vec::new(),
             type_profile_match_mode: TypeProfileMatchMode::Any,
+            validate_must_support: true,
+            must_support_missing_severity: Severity::Warning,
         }
     }
 }

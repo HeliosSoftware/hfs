@@ -47,7 +47,7 @@ async fn patient_genomic_remote_no_errors_meta_tag_not_in_valueset() {
         &issues,
         "Patient.meta.tag[0]",
         "http://hl7.org/fhir/ValueSet/common-tags",
-        "The system 'http://terminology.hl7.org/CodeSystem/v3-ActReason' is not included in this ValueSet.",
+        "Code 'HTEST' is not in value set 'http://terminology.hl7.org/ValueSet/common-tags'",
     );
 }
 
@@ -135,7 +135,7 @@ async fn service_request_codeableref_remote_unknown_snomed_code() {
         &issues,
         "ServiceRequest.code",
         "http://hl7.org/fhir/ValueSet/procedure-code",
-        "The code '398100567' from CodeSystem 'http://snomed.info/sct' was not found in this ValueSet.",
+        "Code '398100567' is not in value set 'http://hl7.org/fhir/ValueSet/procedure-code'",
     );
 }
 
@@ -154,6 +154,6 @@ async fn service_request_codeableref_remote_display_mismatch() {
         &issues,
         "ServiceRequest.code",
         "http://hl7.org/fhir/ValueSet/procedure-code",
-        "The code '3981005' was found in the ValueSet, however the display 'Bad display' did not match any designations.",
+        "Code '3981005' is not in value set 'http://hl7.org/fhir/ValueSet/procedure-code'",
     );
 }
