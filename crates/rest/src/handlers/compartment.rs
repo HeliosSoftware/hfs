@@ -42,18 +42,33 @@ fn get_compartment_params_for_version(
     version: FhirVersion,
     compartment_type: &str,
     resource_type: &str,
-) -> &'static [&'static str] {
+) -> Result<&'static [&'static str], String> {
     match version {
         #[cfg(feature = "R4")]
-        FhirVersion::R4 => helios_fhir::r4::get_compartment_params(compartment_type, resource_type),
+        FhirVersion::R4 => Ok(helios_fhir::r4::get_compartment_params(
+            compartment_type,
+            resource_type,
+        )),
         #[cfg(feature = "R4B")]
-        FhirVersion::R4B => {
-            helios_fhir::r4b::get_compartment_params(compartment_type, resource_type)
-        }
+        FhirVersion::R4B => Ok(helios_fhir::r4b::get_compartment_params(
+            compartment_type,
+            resource_type,
+        )),
         #[cfg(feature = "R5")]
-        FhirVersion::R5 => helios_fhir::r5::get_compartment_params(compartment_type, resource_type),
+        FhirVersion::R5 => Ok(helios_fhir::r5::get_compartment_params(
+            compartment_type,
+            resource_type,
+        )),
         #[cfg(feature = "R6")]
-        FhirVersion::R6 => helios_fhir::r6::get_compartment_params(compartment_type, resource_type),
+        FhirVersion::R6 => Ok(helios_fhir::r6::get_compartment_params(
+            compartment_type,
+            resource_type,
+        )),
+        #[allow(unreachable_patterns)]
+        _ => Err(format!(
+            "FHIR version {:?} is not enabled in this build",
+            version
+        )),
     }
 }
 
@@ -96,7 +111,8 @@ where
     // Get the reference parameters for this compartment/target combination
     let fhir_version = version.storage_version();
     let ref_params =
-        get_compartment_params_for_version(fhir_version, &compartment_type, &target_type);
+        get_compartment_params_for_version(fhir_version, &compartment_type, &target_type)
+            .map_err(|message| RestError::InternalError { message })?;
 
     // Check if the resource type is a member of the compartment
     if ref_params.is_empty() {
@@ -122,8 +138,12 @@ where
         state.max_page_size(),
     );
 
-    // Convert REST params to persistence SearchQuery
-    let query = build_search_query_from_map(&target_type, &params)?;
+    // Convert REST params to persistence SearchQuery. Scope the registry read
+    // guard tightly so it doesn't span any await.
+    let query = {
+        let registry = state.storage().search_param_registry().read();
+        build_search_query_from_map(&target_type, &params, &registry)?
+    };
 
     // Execute the search
     let result = state
@@ -283,7 +303,8 @@ mod tests {
     fn test_get_compartment_params_patient_observation() {
         // Test that Patient compartment includes Observation with subject and performer params
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Patient", "Observation");
+            get_compartment_params_for_version(FhirVersion::default(), "Patient", "Observation")
+                .unwrap();
         assert!(!params.is_empty());
         assert!(params.contains(&"subject"));
     }
@@ -292,7 +313,8 @@ mod tests {
     fn test_get_compartment_params_patient_immunization() {
         // Test that Patient compartment includes Immunization with patient param
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Patient", "Immunization");
+            get_compartment_params_for_version(FhirVersion::default(), "Patient", "Immunization")
+                .unwrap();
         assert!(!params.is_empty());
         assert!(params.contains(&"patient"));
     }
@@ -301,7 +323,8 @@ mod tests {
     fn test_get_compartment_params_encounter_procedure() {
         // Test that Encounter compartment includes Procedure with encounter param
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Encounter", "Procedure");
+            get_compartment_params_for_version(FhirVersion::default(), "Encounter", "Procedure")
+                .unwrap();
         assert!(!params.is_empty());
         assert!(params.contains(&"encounter"));
     }
@@ -310,7 +333,8 @@ mod tests {
     fn test_get_compartment_params_unknown() {
         // Test that unknown resource types return an empty slice
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Patient", "UnknownType");
+            get_compartment_params_for_version(FhirVersion::default(), "Patient", "UnknownType")
+                .unwrap();
         assert!(params.is_empty());
     }
 
@@ -322,7 +346,8 @@ mod tests {
             FhirVersion::default(),
             "Patient",
             "AllergyIntolerance",
-        );
+        )
+        .unwrap();
         assert!(
             params.len() >= 2,
             "Expected multiple params for AllergyIntolerance"

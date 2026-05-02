@@ -82,7 +82,7 @@ pub fn is_of_type_with_context(
     let (target_namespace, target_type) =
         extract_namespace_and_type_with_context(type_spec, context)?;
     match value {
-        EvaluationResult::Boolean(_, type_info) => {
+        EvaluationResult::Boolean(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -100,7 +100,7 @@ pub fn is_of_type_with_context(
                 )
             }
         }
-        EvaluationResult::Integer(_, type_info) => {
+        EvaluationResult::Integer(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -118,7 +118,7 @@ pub fn is_of_type_with_context(
                 )
             }
         }
-        EvaluationResult::Decimal(_, type_info) => {
+        EvaluationResult::Decimal(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -136,7 +136,7 @@ pub fn is_of_type_with_context(
                 )
             }
         }
-        EvaluationResult::String(_, type_info) => {
+        EvaluationResult::String(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -154,7 +154,7 @@ pub fn is_of_type_with_context(
                 )
             }
         }
-        EvaluationResult::Date(_, type_info) => {
+        EvaluationResult::Date(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -172,7 +172,7 @@ pub fn is_of_type_with_context(
                 )
             }
         }
-        EvaluationResult::DateTime(_, type_info) => {
+        EvaluationResult::DateTime(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -190,7 +190,7 @@ pub fn is_of_type_with_context(
                 )
             }
         }
-        EvaluationResult::Time(_, type_info) => {
+        EvaluationResult::Time(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -208,7 +208,7 @@ pub fn is_of_type_with_context(
                 )
             }
         }
-        EvaluationResult::Quantity(_, _, type_info) => {
+        EvaluationResult::Quantity(_, _, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -237,7 +237,7 @@ pub fn is_of_type_with_context(
                 )
             } else if let Some(resource_type_value) = map.get("resourceType") {
                 // For FHIR resources, check the resourceType property
-                if let EvaluationResult::String(resource_type, _) = resource_type_value {
+                if let EvaluationResult::String(resource_type, _, _) = resource_type_value {
                     // Check if the resource type matches the target type
                     check_type_match(
                         &Some("FHIR".to_string()),
@@ -281,7 +281,7 @@ pub fn is_of_type_with_context(
             Ok(false)
         }
         #[cfg(not(any(feature = "R4", feature = "R4B")))]
-        EvaluationResult::Integer64(_, type_info) => {
+        EvaluationResult::Integer64(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -300,7 +300,7 @@ pub fn is_of_type_with_context(
             }
         }
         #[cfg(any(feature = "R4", feature = "R4B"))]
-        EvaluationResult::Integer64(_, _) => {
+        EvaluationResult::Integer64(_, _, _) => {
             // In R4 and R4B, Integer64 should be treated as Integer
             check_type_match(
                 &Some("System".to_string()),
@@ -330,7 +330,7 @@ pub fn is_of_type_for_of_type(
     let (target_namespace, target_type) = extract_namespace_and_type_without_context(type_spec)?;
 
     match value {
-        EvaluationResult::Boolean(_, type_info) => {
+        EvaluationResult::Boolean(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(
                     &Some(type_info.namespace.clone()),
@@ -350,7 +350,7 @@ pub fn is_of_type_for_of_type(
                 )
             }
         }
-        EvaluationResult::Integer(_, type_info) => {
+        EvaluationResult::Integer(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(
                     &Some(type_info.namespace.clone()),
@@ -370,7 +370,7 @@ pub fn is_of_type_for_of_type(
                 )
             }
         }
-        EvaluationResult::Decimal(_, type_info) => {
+        EvaluationResult::Decimal(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(
                     &Some(type_info.namespace.clone()),
@@ -390,7 +390,7 @@ pub fn is_of_type_for_of_type(
                 )
             }
         }
-        EvaluationResult::String(_, type_info) => {
+        EvaluationResult::String(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(
                     &Some(type_info.namespace.clone()),
@@ -410,7 +410,7 @@ pub fn is_of_type_for_of_type(
                 )
             }
         }
-        EvaluationResult::Date(_, type_info) => {
+        EvaluationResult::Date(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(
                     &Some(type_info.namespace.clone()),
@@ -430,7 +430,7 @@ pub fn is_of_type_for_of_type(
                 )
             }
         }
-        EvaluationResult::DateTime(_, type_info) => {
+        EvaluationResult::DateTime(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(
                     &Some(type_info.namespace.clone()),
@@ -450,7 +450,7 @@ pub fn is_of_type_for_of_type(
                 )
             }
         }
-        EvaluationResult::Time(_, type_info) => {
+        EvaluationResult::Time(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(
                     &Some(type_info.namespace.clone()),
@@ -470,7 +470,7 @@ pub fn is_of_type_for_of_type(
                 )
             }
         }
-        EvaluationResult::Quantity(_, _, type_info) => {
+        EvaluationResult::Quantity(_, _, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(
                     &Some(type_info.namespace.clone()),
@@ -499,7 +499,7 @@ pub fn is_of_type_for_of_type(
             Ok(false)
         }
         #[cfg(not(any(feature = "R4", feature = "R4B")))]
-        EvaluationResult::Integer64(_, type_info) => {
+        EvaluationResult::Integer64(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(
                     &Some(type_info.namespace.clone()),
@@ -520,7 +520,7 @@ pub fn is_of_type_for_of_type(
             }
         }
         #[cfg(any(feature = "R4", feature = "R4B"))]
-        EvaluationResult::Integer64(_, _) => {
+        EvaluationResult::Integer64(_, _, _) => {
             // In R4 and R4B, Integer64 should be treated as Integer
             check_type_match_with_cross_namespace(
                 &Some("System".to_string()),
@@ -542,7 +542,7 @@ pub fn is_of_type_for_of_type(
                 )
             } else if let Some(resource_type_value) = map.get("resourceType") {
                 // For FHIR resources, check the resourceType property
-                if let EvaluationResult::String(resource_type, _) = resource_type_value {
+                if let EvaluationResult::String(resource_type, _, _) = resource_type_value {
                     // Check if the resource type matches the target type
                     check_type_match_with_cross_namespace(
                         &Some("FHIR".to_string()),
@@ -580,7 +580,7 @@ pub fn is_of_type(
     let (target_namespace, target_type) = extract_namespace_and_type_without_context(type_spec)?;
 
     match value {
-        EvaluationResult::Boolean(_, type_info) => {
+        EvaluationResult::Boolean(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -598,7 +598,7 @@ pub fn is_of_type(
                 )
             }
         }
-        EvaluationResult::Integer(_, type_info) => {
+        EvaluationResult::Integer(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -616,7 +616,7 @@ pub fn is_of_type(
                 )
             }
         }
-        EvaluationResult::Decimal(_, type_info) => {
+        EvaluationResult::Decimal(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -634,7 +634,7 @@ pub fn is_of_type(
                 )
             }
         }
-        EvaluationResult::String(_, type_info) => {
+        EvaluationResult::String(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -652,7 +652,7 @@ pub fn is_of_type(
                 )
             }
         }
-        EvaluationResult::Date(_, type_info) => {
+        EvaluationResult::Date(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -670,7 +670,7 @@ pub fn is_of_type(
                 )
             }
         }
-        EvaluationResult::DateTime(_, type_info) => {
+        EvaluationResult::DateTime(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -688,7 +688,7 @@ pub fn is_of_type(
                 )
             }
         }
-        EvaluationResult::Time(_, type_info) => {
+        EvaluationResult::Time(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -706,7 +706,7 @@ pub fn is_of_type(
                 )
             }
         }
-        EvaluationResult::Quantity(_, _, type_info) => {
+        EvaluationResult::Quantity(_, _, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -733,7 +733,7 @@ pub fn is_of_type(
             Ok(false)
         }
         #[cfg(not(any(feature = "R4", feature = "R4B")))]
-        EvaluationResult::Integer64(_, type_info) => {
+        EvaluationResult::Integer64(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -752,7 +752,7 @@ pub fn is_of_type(
             }
         }
         #[cfg(any(feature = "R4", feature = "R4B"))]
-        EvaluationResult::Integer64(_, _) => {
+        EvaluationResult::Integer64(_, _, _) => {
             // In R4 and R4B, Integer64 should be treated as Integer
             check_type_match(
                 &Some("System".to_string()),
@@ -772,7 +772,7 @@ pub fn is_of_type(
                 )
             } else if let Some(resource_type_value) = map.get("resourceType") {
                 // For FHIR resources, check the resourceType property
-                if let EvaluationResult::String(resource_type, _) = resource_type_value {
+                if let EvaluationResult::String(resource_type, _, _) = resource_type_value {
                     // Check if the resource type matches the target type
                     check_type_match(
                         &Some("FHIR".to_string()),
@@ -1566,7 +1566,7 @@ fn try_convert_for_of_type(
     let (_target_namespace, target_type) = extract_namespace_and_type_without_context(type_spec)?;
 
     match value {
-        EvaluationResult::String(s, type_info) => {
+        EvaluationResult::String(s, type_info, _) => {
             // Check if this is a FHIR string that might represent a different type
             if let Some(type_info) = type_info {
                 if type_info.namespace == "FHIR" && type_info.name == "string" {

@@ -2,6 +2,10 @@ FROM debian:bookworm-slim
 
 ARG BINARY_NAME
 ARG EXPOSE_PORT=8080
+# Optional: directory inside the image that `hts run` will auto-import on
+# first boot when the target DB is empty. Empty string = no bootstrap. Used
+# by the hts image to point at the baked-in terminology-data/ directory.
+ARG BOOTSTRAP_DIR=""
 
 # Validate BINARY_NAME is set
 RUN test -n "$BINARY_NAME" || { echo "BINARY_NAME build arg is required"; exit 1; }
@@ -33,6 +37,8 @@ ENV HFS_SERVER_HOST=0.0.0.0
 ENV HFS_DATABASE_URL=:memory:
 ENV SOF_SERVER_HOST=0.0.0.0
 ENV FHIRPATH_SERVER_HOST=0.0.0.0
+ENV HTS_SERVER_HOST=0.0.0.0
+ENV HTS_BOOTSTRAP_DIR=${BOOTSTRAP_DIR}
 
 USER hfs
 

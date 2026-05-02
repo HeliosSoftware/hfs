@@ -166,15 +166,15 @@ pub fn to_string_with_format(
     format: &str,
 ) -> Result<EvaluationResult, EvaluationError> {
     match value {
-        EvaluationResult::Date(d, _) => format_date(d, format),
-        EvaluationResult::DateTime(dt, _) => format_datetime(dt, format),
-        EvaluationResult::Time(t, _) => format_time(t, format),
-        EvaluationResult::Integer(v, _) => {
+        EvaluationResult::Date(d, _, _) => format_date(d, format),
+        EvaluationResult::DateTime(dt, _, _) => format_datetime(dt, format),
+        EvaluationResult::Time(t, _, _) => format_time(t, format),
+        EvaluationResult::Integer(v, _, _) => {
             // For integers, format isn't really applicable; just convert to string
             Ok(EvaluationResult::string(v.to_string()))
         }
-        EvaluationResult::Decimal(v, _) => Ok(EvaluationResult::string(v.to_string())),
-        EvaluationResult::String(s, _) => {
+        EvaluationResult::Decimal(v, _, _) => Ok(EvaluationResult::string(v.to_string())),
+        EvaluationResult::String(s, _, _) => {
             // Strings pass through
             Ok(EvaluationResult::string(s.clone()))
         }

@@ -44,9 +44,12 @@ fn create_type_object(value: &EvaluationResult) -> EvaluationResult {
     let mut map = HashMap::new();
     map.insert(
         "namespace".to_string(),
-        EvaluationResult::String(namespace, None),
+        EvaluationResult::String(namespace, None, None),
     );
-    map.insert("name".to_string(), EvaluationResult::String(name, None));
+    map.insert(
+        "name".to_string(),
+        EvaluationResult::String(name, None, None),
+    );
 
     EvaluationResult::Object {
         map,
@@ -60,56 +63,56 @@ fn create_type_object(value: &EvaluationResult) -> EvaluationResult {
 /// Gets the type information (namespace, name) for an EvaluationResult
 fn get_type_info(value: &EvaluationResult) -> (String, String) {
     match value {
-        EvaluationResult::Boolean(_, type_info) => {
+        EvaluationResult::Boolean(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())
             } else {
                 ("System".to_string(), "Boolean".to_string())
             }
         }
-        EvaluationResult::Integer(_, type_info) => {
+        EvaluationResult::Integer(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())
             } else {
                 ("System".to_string(), "Integer".to_string())
             }
         }
-        EvaluationResult::Decimal(_, type_info) => {
+        EvaluationResult::Decimal(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())
             } else {
                 ("System".to_string(), "Decimal".to_string())
             }
         }
-        EvaluationResult::String(_, type_info) => {
+        EvaluationResult::String(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())
             } else {
                 ("System".to_string(), "String".to_string())
             }
         }
-        EvaluationResult::Date(_, type_info) => {
+        EvaluationResult::Date(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())
             } else {
                 ("System".to_string(), "Date".to_string())
             }
         }
-        EvaluationResult::DateTime(_, type_info) => {
+        EvaluationResult::DateTime(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())
             } else {
                 ("System".to_string(), "DateTime".to_string())
             }
         }
-        EvaluationResult::Time(_, type_info) => {
+        EvaluationResult::Time(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())
             } else {
                 ("System".to_string(), "Time".to_string())
             }
         }
-        EvaluationResult::Quantity(_, _, type_info) => {
+        EvaluationResult::Quantity(_, _, type_info, _) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())
             } else {
@@ -132,7 +135,7 @@ fn get_type_info(value: &EvaluationResult) -> (String, String) {
         }
         EvaluationResult::Empty => ("System".to_string(), "Empty".to_string()),
         #[cfg(not(any(feature = "R4", feature = "R4B")))]
-        EvaluationResult::Integer64(_, type_info) => {
+        EvaluationResult::Integer64(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())
             } else {
@@ -140,7 +143,7 @@ fn get_type_info(value: &EvaluationResult) -> (String, String) {
             }
         }
         #[cfg(any(feature = "R4", feature = "R4B"))]
-        EvaluationResult::Integer64(_, _) => {
+        EvaluationResult::Integer64(_, _, _) => {
             // In R4 and R4B, Integer64 should be treated as Integer
             ("System".to_string(), "Integer".to_string())
         }

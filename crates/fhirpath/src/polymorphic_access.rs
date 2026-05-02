@@ -221,7 +221,7 @@ fn get_polymorphic_fields(
 /// An `EvaluationResult` with the appropriate FHIRPath type
 fn convert_fhir_field_to_fhirpath_type(value: &EvaluationResult, suffix: &str) -> EvaluationResult {
     match value {
-        EvaluationResult::String(s, _) => {
+        EvaluationResult::String(s, _, _) => {
             match suffix {
                 "DateTime" => {
                     // Convert string to DateTime if it's a valid date/datetime format
@@ -243,6 +243,7 @@ fn convert_fhir_field_to_fhirpath_type(value: &EvaluationResult, suffix: &str) -
                         Some(helios_fhirpath_support::TypeInfoResult::new(
                             "FHIR", "instant",
                         )),
+                        None,
                     )
                 }
                 "Code" => {
@@ -476,7 +477,8 @@ pub fn apply_polymorphic_type_operation(
                 }
 
                 // Check if this resource is an Observation with a valueQuantity field
-                if let Some(EvaluationResult::String(resource_type, _)) = obj.get("resourceType") {
+                if let Some(EvaluationResult::String(resource_type, _, _)) = obj.get("resourceType")
+                {
                     if resource_type == "Observation" && obj.contains_key("valueQuantity") {
                         return if op == "is" {
                             Ok(EvaluationResult::boolean(true))
@@ -494,7 +496,7 @@ pub fn apply_polymorphic_type_operation(
             }
 
             // Check resource type - handle FHIR resource type checking generically
-            if let Some(EvaluationResult::String(resource_type, _)) = obj.get("resourceType") {
+            if let Some(EvaluationResult::String(resource_type, _, _)) = obj.get("resourceType") {
                 // For direct resource type checks (like Patient.is(Patient)), use case-insensitive comparison
                 if resource_type.to_lowercase() == type_name.to_lowercase() {
                     return if op == "is" {
@@ -565,7 +567,7 @@ pub fn apply_polymorphic_type_operation(
                         type_info: _,
                     } => {
                         // First check for FHIR resource type matching (for objects with type_info)
-                        if let Some(EvaluationResult::String(resource_type, _)) =
+                        if let Some(EvaluationResult::String(resource_type, _, _)) =
                             obj.get("resourceType")
                         {
                             // For direct resource type checks (like Patient.is(Patient) or Patient.is(FHIR.Patient))
@@ -610,7 +612,7 @@ pub fn apply_polymorphic_type_operation(
                             // If this object contains a boolean field (other than resourceType), it's likely a boolean property
                             for (key, value) in obj.iter() {
                                 if key != "resourceType"
-                                    && matches!(value, EvaluationResult::Boolean(_, _))
+                                    && matches!(value, EvaluationResult::Boolean(_, _, _))
                                 {
                                     return Ok(EvaluationResult::boolean(true));
                                 }
@@ -644,10 +646,10 @@ pub fn apply_polymorphic_type_operation(
 
                                 // Check value type - date values could be stored as strings or as Date type
                                 match val {
-                                    EvaluationResult::Date(_, None) => {
+                                    EvaluationResult::Date(_, None, None) => {
                                         return Ok(EvaluationResult::boolean(true));
                                     }
-                                    EvaluationResult::String(s, _) => {
+                                    EvaluationResult::String(s, _, _) => {
                                         // Check if string looks like a date (YYYY-MM-DD)
                                         if s.len() >= 10
                                             && s.chars().nth(4) == Some('-')
@@ -699,7 +701,7 @@ pub fn apply_polymorphic_type_operation(
 
                         // Try matching the value's type directly
                         // For native types mapped to FHIR primitive types
-                        if let Some(EvaluationResult::String(value_type, _)) = obj.get("type") {
+                        if let Some(EvaluationResult::String(value_type, _, _)) = obj.get("type") {
                             if value_type == type_name {
                                 return Ok(EvaluationResult::boolean(true));
                             }
@@ -709,7 +711,7 @@ pub fn apply_polymorphic_type_operation(
                         Ok(EvaluationResult::boolean(false))
                     }
                     // Match native types to FHIRPath types
-                    EvaluationResult::Boolean(_, _) => {
+                    EvaluationResult::Boolean(_, _, _) => {
                         // Check for qualifiers like "System.Boolean" and "FHIR.boolean"
                         let is_boolean_type = type_name == "Boolean"
                             || type_name == "boolean"
@@ -717,7 +719,7 @@ pub fn apply_polymorphic_type_operation(
                             || type_name.ends_with(".boolean");
                         Ok(EvaluationResult::boolean(is_boolean_type))
                     }
-                    EvaluationResult::Integer(_, _) => {
+                    EvaluationResult::Integer(_, _, _) => {
                         // Check for qualifiers like "System.Integer" and "FHIR.integer"
                         let is_integer_type = type_name == "Integer"
                             || type_name == "integer"
@@ -725,7 +727,7 @@ pub fn apply_polymorphic_type_operation(
                             || type_name.ends_with(".integer");
                         Ok(EvaluationResult::boolean(is_integer_type))
                     }
-                    EvaluationResult::Decimal(_, _) => {
+                    EvaluationResult::Decimal(_, _, _) => {
                         // Check for qualifiers like "System.Decimal" and "FHIR.decimal"
                         let is_decimal_type = type_name == "Decimal"
                             || type_name == "decimal"
@@ -733,7 +735,7 @@ pub fn apply_polymorphic_type_operation(
                             || type_name.ends_with(".decimal");
                         Ok(EvaluationResult::boolean(is_decimal_type))
                     }
-                    EvaluationResult::String(_, _) => {
+                    EvaluationResult::String(_, _, _) => {
                         // Check for qualifiers like "System.String" and "FHIR.string"
                         let is_string_type = type_name == "String"
                             || type_name == "string"
@@ -741,7 +743,7 @@ pub fn apply_polymorphic_type_operation(
                             || type_name.ends_with(".string");
                         Ok(EvaluationResult::boolean(is_string_type))
                     }
-                    EvaluationResult::Date(_, _) => {
+                    EvaluationResult::Date(_, _, _) => {
                         // Check for qualifiers like "System.Date" and "FHIR.date"
                         let is_date_type = type_name == "Date"
                             || type_name == "date"
@@ -749,7 +751,7 @@ pub fn apply_polymorphic_type_operation(
                             || type_name.ends_with(".date");
                         Ok(EvaluationResult::boolean(is_date_type))
                     }
-                    EvaluationResult::DateTime(_, _) => {
+                    EvaluationResult::DateTime(_, _, _) => {
                         // Check for qualifiers like "System.DateTime" and "FHIR.dateTime"
                         let is_datetime_type = type_name == "DateTime"
                             || type_name == "dateTime"
@@ -757,7 +759,7 @@ pub fn apply_polymorphic_type_operation(
                             || type_name.ends_with(".dateTime");
                         Ok(EvaluationResult::boolean(is_datetime_type))
                     }
-                    EvaluationResult::Time(_, _) => {
+                    EvaluationResult::Time(_, _, _) => {
                         // Check for qualifiers like "System.Time" and "FHIR.time"
                         let is_time_type = type_name == "Time"
                             || type_name == "time"
@@ -765,7 +767,7 @@ pub fn apply_polymorphic_type_operation(
                             || type_name.ends_with(".time");
                         Ok(EvaluationResult::boolean(is_time_type))
                     }
-                    EvaluationResult::Quantity(_, _, _) => {
+                    EvaluationResult::Quantity(_, _, _, _) => {
                         // Check for qualifiers like "System.Quantity" and "FHIR.Quantity"
                         let is_quantity_type =
                             type_name == "Quantity" || type_name.ends_with(".Quantity");
@@ -775,7 +777,7 @@ pub fn apply_polymorphic_type_operation(
                     EvaluationResult::Empty => Ok(EvaluationResult::boolean(false)),
                     EvaluationResult::Collection { .. } => Ok(EvaluationResult::boolean(false)),
                     #[cfg(not(any(feature = "R4", feature = "R4B")))]
-                    EvaluationResult::Integer64(_, _) => {
+                    EvaluationResult::Integer64(_, _, _) => {
                         // Check for qualifiers like "System.Integer64" and "FHIR.integer64"
                         let is_integer64_type = type_name == "Integer64"
                             || type_name == "integer64"
@@ -784,7 +786,7 @@ pub fn apply_polymorphic_type_operation(
                         Ok(EvaluationResult::boolean(is_integer64_type))
                     }
                     #[cfg(any(feature = "R4", feature = "R4B"))]
-                    EvaluationResult::Integer64(_, _) => {
+                    EvaluationResult::Integer64(_, _, _) => {
                         // In R4 and R4B, Integer64 should be treated as Integer
                         let is_integer_type = type_name == "Integer"
                             || type_name == "integer"
@@ -800,8 +802,8 @@ pub fn apply_polymorphic_type_operation(
                 let is_type_result =
                     apply_polymorphic_type_operation(value, "is", type_name, _namespace)?;
                 match is_type_result {
-                    EvaluationResult::Boolean(true, _) => Ok(value.clone()),
-                    EvaluationResult::Boolean(false, _) => Ok(EvaluationResult::Empty),
+                    EvaluationResult::Boolean(true, _, _) => Ok(value.clone()),
+                    EvaluationResult::Boolean(false, _, _) => Ok(EvaluationResult::Empty),
                     EvaluationResult::Empty => Ok(EvaluationResult::Empty), // 'is' on Empty can be Empty
                     _ => Err(EvaluationError::TypeError(format!(
                         "'is' operation returned non-Boolean: {:?}",

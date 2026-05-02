@@ -185,6 +185,12 @@ pub fn extract_parameters(params: FhirPathParameters) -> Result<ExtractedParamet
         FhirPathParameters::R6(parameters) => {
             extract_parameters_from_r6(parameters, &mut extracted)?;
         }
+        #[allow(unreachable_patterns)]
+        _ => {
+            return Err(
+                "FHIR version of Parameters resource is not enabled in this build".to_string(),
+            );
+        }
     }
 
     if extracted.expression.is_none() {

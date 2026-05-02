@@ -22,7 +22,7 @@ jobs:
         rust: [beta, nightly]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
       - name: Install Rust toolchain

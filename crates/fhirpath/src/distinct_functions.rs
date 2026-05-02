@@ -155,21 +155,23 @@ pub fn normalize_collection_result(
 fn simple_equality_check(a: &EvaluationResult, b: &EvaluationResult) -> bool {
     match (a, b) {
         // Direct equality for simple types
-        (EvaluationResult::Boolean(a_val, _), EvaluationResult::Boolean(b_val, _)) => {
+        (EvaluationResult::Boolean(a_val, _, _), EvaluationResult::Boolean(b_val, _, _)) => {
             a_val == b_val
         }
-        (EvaluationResult::Integer(a_val, _), EvaluationResult::Integer(b_val, _)) => {
+        (EvaluationResult::Integer(a_val, _, _), EvaluationResult::Integer(b_val, _, _)) => {
             a_val == b_val
         }
-        (EvaluationResult::Decimal(a_val, _), EvaluationResult::Decimal(b_val, _)) => {
+        (EvaluationResult::Decimal(a_val, _, _), EvaluationResult::Decimal(b_val, _, _)) => {
             a_val == b_val
         }
-        (EvaluationResult::String(a_val, _), EvaluationResult::String(b_val, _)) => a_val == b_val,
+        (EvaluationResult::String(a_val, _, _), EvaluationResult::String(b_val, _, _)) => {
+            a_val == b_val
+        }
 
         // Quantity comparison with same units
         (
-            EvaluationResult::Quantity(a_val, a_unit, _),
-            EvaluationResult::Quantity(b_val, b_unit, _),
+            EvaluationResult::Quantity(a_val, a_unit, _, _),
+            EvaluationResult::Quantity(b_val, b_unit, _, _),
         ) => a_val == b_val && a_unit == b_unit,
 
         // Object comparison by checking all keys/values are equal

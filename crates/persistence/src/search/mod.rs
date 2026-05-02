@@ -76,7 +76,7 @@ pub use extractor::{ExtractedValue, SearchParameterExtractor};
 pub use loader::SearchParameterLoader;
 pub use registry::{
     RegistryUpdate, SearchParameterDefinition, SearchParameterRegistry, SearchParameterSource,
-    SearchParameterStatus,
+    SearchParameterStatus, resolve_param_targets, resolve_param_type,
 };
 pub use reindex::{
     ReindexOperation, ReindexProgress, ReindexRequest, ReindexStatus, ReindexableStorage,

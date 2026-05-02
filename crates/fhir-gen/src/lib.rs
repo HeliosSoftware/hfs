@@ -379,7 +379,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     let cycles = detect_struct_cycles(&all_elements);
 
     // Generate code for each StructureDefinition in sorted order
-    for def in all_struct_defs {
+    for def in all_struct_defs.iter().copied() {
         let content = structure_definition_to_rust(def, &cycles);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -405,6 +405,9 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         &all_complex_types,
         &compartment_definitions,
     )?;
+
+    // Generate the per-version field-type lookup used by FHIRPath type inference.
+    generate_field_type_lookup(&version_path, &all_struct_defs)?;
 
     Ok(())
 }
@@ -782,6 +785,171 @@ fn generate_global_constructs(
 
     // Generate compartment params lookup
     generate_compartment_lookup(&mut file, compartment_definitions)?;
+
+    Ok(())
+}
+
+/// Generates a sorted static field-type lookup table for FHIRPath parse-debug type inference.
+///
+/// Walks every `StructureDefinition.snapshot.element`, derives `(parent_type_name,
+/// field_name, fhir_type, is_collection)` tuples, and emits them as a `FIELD_TYPES`
+/// static plus a `get_field_type` accessor. Choice elements (paths ending in `[x]`)
+/// produce one entry per concrete variant (`valueQuantity`, `valueString`, …) plus a
+/// bare entry mapping to the generated choice enum.
+fn generate_field_type_lookup(
+    output_path: impl AsRef<Path>,
+    all_struct_defs: &[&StructureDefinition],
+) -> io::Result<()> {
+    let mut entries: Vec<(String, String, String, bool)> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
+    for sd in all_struct_defs {
+        let Some(snapshot) = &sd.snapshot else {
+            continue;
+        };
+        let Some(elements) = &snapshot.element else {
+            continue;
+        };
+
+        for element in elements {
+            let parts: Vec<&str> = element.path.split('.').collect();
+            if parts.len() < 2 {
+                continue; // root element has no parent.field shape
+            }
+
+            let parent_path = parts[..parts.len() - 1].join(".");
+            let parent_type_name = generate_type_name(&parent_path);
+            let raw_field = parts[parts.len() - 1];
+
+            let is_choice = raw_field.ends_with("[x]");
+            let bare_field_name = raw_field.trim_end_matches("[x]").to_string();
+            let is_collection = element.max.as_deref() == Some("*");
+
+            let bare_fhir_type = if is_choice {
+                format!(
+                    "{}{}",
+                    capitalize_first_letter(&parent_type_name),
+                    capitalize_first_letter(&bare_field_name)
+                )
+            } else {
+                let type_code = element
+                    .r#type
+                    .as_ref()
+                    .and_then(|t| t.first())
+                    .map(|t| t.code.as_str());
+                match type_code {
+                    Some("Element") | Some("BackboneElement") => generate_type_name(&element.path),
+                    Some("Base") if element.path.contains("TestPlan") => {
+                        generate_type_name(&element.path)
+                    }
+                    Some(code) if code.starts_with("http://hl7.org/fhirpath/System.") => code
+                        .trim_start_matches("http://hl7.org/fhirpath/System.")
+                        .to_string(),
+                    Some(code) => code.to_string(),
+                    None => {
+                        if let Some(content_ref) = &element.content_reference {
+                            let ref_id = extract_content_reference_id(content_ref);
+                            if ref_id.is_empty() {
+                                continue;
+                            }
+                            generate_type_name(ref_id)
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            if seen.insert((parent_type_name.clone(), bare_field_name.clone())) {
+                entries.push((
+                    parent_type_name.clone(),
+                    bare_field_name.clone(),
+                    bare_fhir_type,
+                    is_collection,
+                ));
+            }
+
+            if is_choice {
+                if let Some(types) = &element.r#type {
+                    for ty in types {
+                        let variant_field =
+                            format!("{}{}", bare_field_name, capitalize_first_letter(&ty.code));
+                        let variant_type = if ty.code.starts_with("http://hl7.org/fhirpath/System.")
+                        {
+                            ty.code
+                                .trim_start_matches("http://hl7.org/fhirpath/System.")
+                                .to_string()
+                        } else {
+                            ty.code.clone()
+                        };
+                        if seen.insert((parent_type_name.clone(), variant_field.clone())) {
+                            entries.push((
+                                parent_type_name.clone(),
+                                variant_field,
+                                variant_type,
+                                false,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_path.as_ref())?;
+
+    writeln!(file, "\n// --- Field Type Lookup ---")?;
+    writeln!(
+        file,
+        "/// Static table of `(parent_type, field_name, fhir_type, is_collection)`"
+    )?;
+    writeln!(
+        file,
+        "/// generated from FHIR StructureDefinitions, sorted by `(parent_type, field_name)`"
+    )?;
+    writeln!(file, "/// for binary search via [`get_field_type`].")?;
+    writeln!(
+        file,
+        "pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &["
+    )?;
+    for (parent, field, ty, is_coll) in &entries {
+        writeln!(
+            file,
+            "    (\"{}\", \"{}\", \"{}\", {}),",
+            parent, field, ty, is_coll
+        )?;
+    }
+    writeln!(file, "];")?;
+    writeln!(file)?;
+    writeln!(
+        file,
+        "/// Returns the FHIR type code and collection flag for `parent_type.field_name`."
+    )?;
+    writeln!(file, "///")?;
+    writeln!(
+        file,
+        "/// Returns `None` if the parent type or field is unknown."
+    )?;
+    writeln!(
+        file,
+        "pub fn get_field_type(parent_type: &str, field_name: &str) -> Option<(&'static str, bool)> {{"
+    )?;
+    writeln!(file, "    FIELD_TYPES")?;
+    writeln!(
+        file,
+        "        .binary_search_by(|&(p, f, _, _)| (p, f).cmp(&(parent_type, field_name)))"
+    )?;
+    writeln!(file, "        .ok()")?;
+    writeln!(
+        file,
+        "        .map(|i| {{ let (_, _, ty, coll) = FIELD_TYPES[i]; (ty, coll) }})"
+    )?;
+    writeln!(file, "}}")?;
 
     Ok(())
 }

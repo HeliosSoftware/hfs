@@ -30,11 +30,11 @@ pub fn contains_function(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Check if we're dealing with a collection and a string argument
     if let EvaluationResult::Collection { items, .. } = invocation_base {
-        if matches!(arg, EvaluationResult::String(_, _)) {
+        if matches!(arg, EvaluationResult::String(_, _, _)) {
             // Check if the collection contains only strings
             let all_strings = items
                 .iter()
-                .all(|item| matches!(item, EvaluationResult::String(_, _)));
+                .all(|item| matches!(item, EvaluationResult::String(_, _, _)));
 
             if !all_strings && !items.is_empty() {
                 // Collection contains non-string items, and we have a string argument
@@ -55,7 +55,7 @@ pub fn contains_function(
     // Spec: {} contains X -> Empty for string argument, false for others
     if invocation_base == &EvaluationResult::Empty {
         // If the argument is a string, return Empty (string mode)
-        if matches!(arg, EvaluationResult::String(_, _)) {
+        if matches!(arg, EvaluationResult::String(_, _, _)) {
             return Ok(EvaluationResult::Empty);
         }
         // Otherwise return false (collection mode)
@@ -70,9 +70,9 @@ pub fn contains_function(
     }
 
     // Handle the string case specially
-    if let EvaluationResult::String(s, _) = invocation_base {
+    if let EvaluationResult::String(s, _, _) = invocation_base {
         // String contains substring: Check the type of arg here
-        if let EvaluationResult::String(substr, _) = arg {
+        if let EvaluationResult::String(substr, _, _) = arg {
             return Ok(EvaluationResult::boolean(s.contains(substr)));
         } else {
             // Argument is not String (and not Empty, checked earlier) -> Error
@@ -102,21 +102,23 @@ pub fn contains_function(
 fn simple_equality_check(a: &EvaluationResult, b: &EvaluationResult) -> bool {
     match (a, b) {
         // Direct equality for simple types
-        (EvaluationResult::Boolean(a_val, _), EvaluationResult::Boolean(b_val, _)) => {
+        (EvaluationResult::Boolean(a_val, _, _), EvaluationResult::Boolean(b_val, _, _)) => {
             a_val == b_val
         }
-        (EvaluationResult::Integer(a_val, _), EvaluationResult::Integer(b_val, _)) => {
+        (EvaluationResult::Integer(a_val, _, _), EvaluationResult::Integer(b_val, _, _)) => {
             a_val == b_val
         }
-        (EvaluationResult::Decimal(a_val, _), EvaluationResult::Decimal(b_val, _)) => {
+        (EvaluationResult::Decimal(a_val, _, _), EvaluationResult::Decimal(b_val, _, _)) => {
             a_val == b_val
         }
-        (EvaluationResult::String(a_val, _), EvaluationResult::String(b_val, _)) => a_val == b_val,
+        (EvaluationResult::String(a_val, _, _), EvaluationResult::String(b_val, _, _)) => {
+            a_val == b_val
+        }
 
         // Quantity comparison with same units
         (
-            EvaluationResult::Quantity(a_val, a_unit, _),
-            EvaluationResult::Quantity(b_val, b_unit, _),
+            EvaluationResult::Quantity(a_val, a_unit, _, _),
+            EvaluationResult::Quantity(b_val, b_unit, _, _),
         ) => a_val == b_val && a_unit == b_unit,
 
         // Object comparison by checking all keys/values are equal

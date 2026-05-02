@@ -3,12 +3,15 @@
 //! Implements the FHIR [batch/transaction interaction](https://hl7.org/fhir/http.html#transaction):
 //! `POST [base]` with a Bundle of type "batch" or "transaction"
 
+use std::sync::Arc;
+
 use axum::{
     Json,
     extract::{Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
 use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
@@ -20,6 +23,7 @@ use tracing::{debug, error, warn};
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::TenantExtractor;
+use crate::handlers::extract_patient_from_resource;
 use crate::middleware::prefer::PreferHeader;
 use crate::state::AppState;
 
@@ -118,6 +122,7 @@ where
         tenant = %tenant.tenant_id(),
         "Processing batch request"
     );
+    let correlation = AuditCorrelation::new("batch");
 
     let entries = bundle
         .get("entry")
@@ -130,6 +135,15 @@ where
 
     for (index, entry) in entries.iter().enumerate() {
         let result = process_batch_entry(state, &tenant, entry, index, principal).await;
+        let correlation_details = EntryAuditCorrelation::from_bundle(&correlation, index);
+        emit_batch_entry_audit(
+            state,
+            entry,
+            &result,
+            principal,
+            None,
+            Some(&correlation_details),
+        );
         response_entries.push(bundle_entry_result_to_json(&result, base_url, prefer));
     }
 
@@ -169,6 +183,7 @@ where
         tenant = %tenant.tenant_id(),
         "Processing transaction request"
     );
+    let correlation = AuditCorrelation::new("transaction");
 
     let json_entries = bundle
         .get("entry")
@@ -234,17 +249,31 @@ where
     match result {
         Ok(bundle_result) => {
             // Reorder results back to original entry order
-            let mut ordered_results: Vec<(usize, &BundleEntryResult)> = indexed_entries
-                .iter()
-                .zip(bundle_result.entries.iter())
-                .map(|((orig_idx, _, _), result)| (*orig_idx, result))
-                .collect();
-            ordered_results.sort_by_key(|(idx, _)| *idx);
+            let mut ordered_results: Vec<(usize, &BundleEntry, &BundleEntryResult)> =
+                indexed_entries
+                    .iter()
+                    .zip(bundle_result.entries.iter())
+                    .map(|((orig_idx, entry, _), result)| (*orig_idx, entry, result))
+                    .collect();
+            ordered_results.sort_by_key(|(idx, _, _)| *idx);
+
+            for (orig_idx, entry, result) in &ordered_results {
+                let correlation_details =
+                    EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
+                emit_transaction_entry_audit(
+                    state,
+                    entry,
+                    result,
+                    principal,
+                    None,
+                    Some(&correlation_details),
+                );
+            }
 
             let base_url = state.base_url();
             let response_entries: Vec<Value> = ordered_results
                 .into_iter()
-                .map(|(_, result)| bundle_entry_result_to_json(result, base_url, prefer))
+                .map(|(_, _, result)| bundle_entry_result_to_json(result, base_url, prefer))
                 .collect();
 
             let response_bundle = serde_json::json!({
@@ -261,6 +290,21 @@ where
             Ok((StatusCode::OK, Json(response_bundle)).into_response())
         }
         Err(e) => {
+            let rollback_reason = e.to_string();
+            let rollback_result =
+                create_error_result(500, &format!("Transaction rolled back: {rollback_reason}"));
+            for (orig_idx, entry, _) in &indexed_entries {
+                let correlation_details =
+                    EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
+                emit_transaction_entry_audit(
+                    state,
+                    entry,
+                    &rollback_result,
+                    principal,
+                    Some(&rollback_reason),
+                    Some(&correlation_details),
+                );
+            }
             error!(error = %e, "Transaction failed");
             transaction_error_to_response(e)
         }
@@ -403,6 +447,206 @@ where
             create_error_result(405, &format!("Unsupported method: {}", method))
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct EntryAuditCorrelation {
+    bundle_id: String,
+    bundle_type: String,
+    entry_index: usize,
+}
+
+impl EntryAuditCorrelation {
+    fn from_bundle(correlation: &AuditCorrelation, entry_index: usize) -> Self {
+        Self {
+            bundle_id: correlation.bundle_id.clone(),
+            bundle_type: correlation.bundle_type.clone(),
+            entry_index,
+        }
+    }
+}
+
+/// Emits an audit event for a processed batch entry.
+fn emit_batch_entry_audit<S>(
+    state: &AppState<S>,
+    entry: &Value,
+    result: &BundleEntryResult,
+    principal: Option<&Principal>,
+    rollback_reason: Option<&str>,
+    correlation: Option<&EntryAuditCorrelation>,
+) where
+    S: ResourceStorage + Send + Sync,
+{
+    let request = match entry.get("request") {
+        Some(request) => request,
+        None => return,
+    };
+    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let url = request.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let request_resource = entry.get("resource");
+    emit_entry_audit(
+        state,
+        method,
+        url,
+        request_resource,
+        result,
+        principal,
+        rollback_reason,
+        correlation,
+    );
+}
+
+/// Emits an audit event for a processed transaction entry.
+fn emit_transaction_entry_audit<S>(
+    state: &AppState<S>,
+    entry: &BundleEntry,
+    result: &BundleEntryResult,
+    principal: Option<&Principal>,
+    rollback_reason: Option<&str>,
+    correlation: Option<&EntryAuditCorrelation>,
+) where
+    S: ResourceStorage + Send + Sync,
+{
+    emit_entry_audit(
+        state,
+        bundle_method_to_http_method(&entry.method),
+        &entry.url,
+        entry.resource.as_ref(),
+        result,
+        principal,
+        rollback_reason,
+        correlation,
+    );
+}
+
+/// Builds and records an audit event for a bundle entry result.
+#[allow(clippy::too_many_arguments)]
+fn emit_entry_audit<S>(
+    state: &AppState<S>,
+    method: &str,
+    url: &str,
+    request_resource: Option<&Value>,
+    result: &BundleEntryResult,
+    principal: Option<&Principal>,
+    rollback_reason: Option<&str>,
+    correlation: Option<&EntryAuditCorrelation>,
+) where
+    S: ResourceStorage + Send + Sync,
+{
+    let Some(sink) = state.audit_sink() else {
+        return;
+    };
+
+    let action = method_to_audit_action(method);
+    let outcome = if rollback_reason.is_some() || result.status >= 400 {
+        "8"
+    } else {
+        "0"
+    };
+
+    let parsed = parse_request_url(url).ok();
+    let mut resource_type = parsed
+        .as_ref()
+        .map(|(rt, _)| rt.clone())
+        .unwrap_or_default();
+    let mut resource_id = parsed
+        .as_ref()
+        .and_then(|(_, id)| (!id.is_empty()).then_some(id.clone()));
+
+    if let Some(resource) = result.resource.as_ref().or(request_resource) {
+        if let Some(rt) = resource.get("resourceType").and_then(|v| v.as_str()) {
+            resource_type = rt.to_string();
+        }
+        if let Some(id) = resource.get("id").and_then(|v| v.as_str()) {
+            resource_id = Some(id.to_string());
+        }
+    }
+
+    let patient_ref = result
+        .resource
+        .as_ref()
+        .and_then(|resource| {
+            let rt = resource
+                .get("resourceType")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&resource_type);
+            extract_patient_from_resource(rt, resource)
+        })
+        .or_else(|| {
+            request_resource.and_then(|resource| {
+                let rt = resource
+                    .get("resourceType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&resource_type);
+                extract_patient_from_resource(rt, resource)
+            })
+        });
+
+    let mut builder = AuditEventBuilder::new(state.audit_source_observer())
+        .action(action)
+        .outcome(outcome);
+
+    if let Some(reason) = rollback_reason {
+        builder = builder.outcome_desc(format!("Transaction rolled back: {reason}"));
+    } else if let Some(desc) = extract_outcome_description(result.outcome.as_ref()) {
+        builder = builder.outcome_desc(desc);
+    }
+
+    if let Some(id) = resource_id.as_deref()
+        && !resource_type.is_empty()
+    {
+        builder = builder.resource(&resource_type, id);
+    }
+    if let Some(correlation) = correlation {
+        builder = builder
+            .detail("bundle-id", &correlation.bundle_id)
+            .detail("bundle-type", &correlation.bundle_type)
+            .detail("entry-index", correlation.entry_index.to_string());
+    }
+
+    if let Some(patient_ref) = patient_ref {
+        builder = builder.patient(patient_ref);
+    }
+    if let Some(principal) = principal {
+        builder = builder.agent(principal.subject(), None, true);
+    }
+
+    let sink = Arc::clone(sink);
+    let event = builder.build();
+    tokio::spawn(async move {
+        sink.record(event).await;
+    });
+}
+
+fn method_to_audit_action(method: &str) -> AuditAction {
+    match method {
+        "GET" => AuditAction::Read,
+        "POST" => AuditAction::Create,
+        "PUT" | "PATCH" => AuditAction::Update,
+        "DELETE" => AuditAction::Delete,
+        _ => AuditAction::Execute,
+    }
+}
+
+fn bundle_method_to_http_method(method: &BundleMethod) -> &'static str {
+    match method {
+        BundleMethod::Get => "GET",
+        BundleMethod::Post => "POST",
+        BundleMethod::Put => "PUT",
+        BundleMethod::Patch => "PATCH",
+        BundleMethod::Delete => "DELETE",
+    }
+}
+
+fn extract_outcome_description(outcome: Option<&Value>) -> Option<String> {
+    outcome
+        .and_then(|value| value.get("issue"))
+        .and_then(|issues| issues.as_array())
+        .and_then(|issues| issues.first())
+        .and_then(|issue| issue.get("details"))
+        .and_then(|details| details.get("text"))
+        .and_then(|text| text.as_str())
+        .map(ToString::to_string)
 }
 
 /// Parses a request URL to extract resource type and optional ID.
@@ -689,4 +933,223 @@ fn transaction_error_to_response(err: TransactionError) -> RestResult<Response> 
     });
 
     Ok((status_code, Json(outcome)).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    use async_trait::async_trait;
+    use helios_audit::AuditSink;
+    use helios_fhir::FhirVersion;
+    use helios_fhir::r4::{AuditEvent, AuditEventEntityDetailValue};
+    use helios_persistence::error::StorageResult;
+    use helios_persistence::tenant::TenantContext;
+    use helios_persistence::types::StoredResource;
+    use tokio::sync::Mutex;
+
+    struct MockStorage;
+
+    #[async_trait]
+    impl ResourceStorage for MockStorage {
+        fn backend_name(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!()
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            unimplemented!()
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            unimplemented!()
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            unimplemented!()
+        }
+    }
+
+    struct CollectorSink {
+        events: Mutex<Vec<AuditEvent>>,
+    }
+
+    #[async_trait]
+    impl AuditSink for CollectorSink {
+        async fn record(&self, event: AuditEvent) {
+            self.events.lock().await.push(event);
+        }
+
+        async fn flush(&self) {}
+
+        fn name(&self) -> &str {
+            "collector"
+        }
+    }
+
+    fn detail_map(event: &AuditEvent) -> HashMap<String, String> {
+        let mut details = HashMap::new();
+        for entity in event.entity.as_ref().into_iter().flatten() {
+            for detail in entity.detail.as_ref().into_iter().flatten() {
+                let Some(key) = detail.r#type.value.clone() else {
+                    continue;
+                };
+                let value = match &detail.value {
+                    Some(AuditEventEntityDetailValue::String(s)) => {
+                        s.value.clone().unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                details.insert(key, value);
+            }
+        }
+        details
+    }
+
+    #[tokio::test]
+    async fn test_emit_batch_entry_audit_records_per_entry() {
+        let sink = Arc::new(CollectorSink {
+            events: Mutex::new(Vec::new()),
+        });
+        let state = AppState::with_auth_and_audit(
+            Arc::new(MockStorage),
+            crate::config::ServerConfig::default(),
+            helios_auth::AuthConfig::default(),
+            None,
+            Some(Arc::clone(&sink) as Arc<dyn AuditSink>),
+            "Device/hfs",
+        );
+
+        let entry_1 = serde_json::json!({
+            "request": { "method": "GET", "url": "Patient/123" }
+        });
+        let entry_2 = serde_json::json!({
+            "request": { "method": "POST", "url": "Observation" },
+            "resource": {
+                "resourceType": "Observation",
+                "id": "obs-1",
+                "subject": { "reference": "Patient/123" }
+            }
+        });
+
+        let result_1 = BundleEntryResult {
+            status: 200,
+            location: None,
+            etag: None,
+            last_modified: None,
+            resource: Some(serde_json::json!({
+                "resourceType": "Patient",
+                "id": "123"
+            })),
+            outcome: None,
+        };
+        let result_2 = BundleEntryResult {
+            status: 201,
+            location: None,
+            etag: None,
+            last_modified: None,
+            resource: Some(serde_json::json!({
+                "resourceType": "Observation",
+                "id": "obs-1",
+                "subject": { "reference": "Patient/123" }
+            })),
+            outcome: None,
+        };
+        let correlation = AuditCorrelation::new("batch");
+        let correlation_0 = EntryAuditCorrelation::from_bundle(&correlation, 0);
+        let correlation_1 = EntryAuditCorrelation::from_bundle(&correlation, 1);
+
+        emit_batch_entry_audit(
+            &state,
+            &entry_1,
+            &result_1,
+            None,
+            None,
+            Some(&correlation_0),
+        );
+        emit_batch_entry_audit(
+            &state,
+            &entry_2,
+            &result_2,
+            None,
+            None,
+            Some(&correlation_1),
+        );
+
+        for _ in 0..20 {
+            if sink.events.lock().await.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = sink.events.lock().await;
+        assert_eq!(events.len(), 2);
+
+        let event_details: Vec<HashMap<String, String>> = events.iter().map(detail_map).collect();
+
+        let bundle_ids: HashSet<String> = event_details
+            .iter()
+            .filter_map(|d| d.get("bundle-id").cloned())
+            .collect();
+        assert_eq!(bundle_ids.len(), 1);
+
+        assert!(event_details.iter().all(|d| {
+            d.get("bundle-type")
+                .is_some_and(|bundle_type| bundle_type == "batch")
+        }));
+
+        let entry_indexes: HashSet<String> = event_details
+            .iter()
+            .filter_map(|d| d.get("entry-index").cloned())
+            .collect();
+        assert_eq!(
+            entry_indexes,
+            HashSet::from_iter(["0".to_string(), "1".to_string()])
+        );
+    }
 }

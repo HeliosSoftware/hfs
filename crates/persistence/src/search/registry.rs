@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::types::SearchParamType;
+use crate::types::{SearchParamType, SearchValue};
 
 use super::errors::RegistryError;
 use super::loader::SearchParameterLoader;
@@ -426,6 +426,89 @@ impl Default for SearchParameterRegistry {
     }
 }
 
+/// Deterministically resolves a search parameter to its `SearchParamType`.
+///
+/// Resolution order:
+/// 1. Registry lookup by `(resource_type, name)`.
+/// 2. Registry lookup by `("Resource", name)` for global params (`_id`, `_lastUpdated`, etc.).
+/// 3. Value-shape heuristic — only reached for params that aren't in the registry at all
+///    (e.g., user-defined custom params not yet registered).
+///
+/// This is the single source of truth for type resolution. REST extractors and
+/// storage backends both call this so they cannot disagree.
+pub fn resolve_param_type(
+    registry: &SearchParameterRegistry,
+    resource_type: &str,
+    name: &str,
+    values: &[SearchValue],
+) -> SearchParamType {
+    if let Some(def) = registry.get_param(resource_type, name) {
+        return def.param_type;
+    }
+    if let Some(def) = registry.get_param("Resource", name) {
+        return def.param_type;
+    }
+    infer_param_type_from_value(values)
+}
+
+/// Resolves the allowed target resource types for a reference search parameter.
+///
+/// Returns the registry-declared targets (e.g., `["Patient", "Group"]` for
+/// `Encounter.subject`). Returns an empty `Vec` when the parameter is unknown
+/// or has no declared targets — callers should treat that as "don't filter by
+/// target type."
+pub fn resolve_param_targets(
+    registry: &SearchParameterRegistry,
+    resource_type: &str,
+    name: &str,
+) -> Vec<String> {
+    let lookup = registry
+        .get_param(resource_type, name)
+        .or_else(|| registry.get_param("Resource", name));
+    lookup
+        .and_then(|def| def.target.clone())
+        .unwrap_or_default()
+}
+
+/// Last-resort value-shape heuristic for parameters not present in the registry.
+///
+/// Kept intentionally conservative — recognizes only the unambiguous shapes
+/// (FHIR date, quantity with unit, token with system, reference) and otherwise
+/// returns `String`.
+fn infer_param_type_from_value(values: &[SearchValue]) -> SearchParamType {
+    let Some(first) = values.first() else {
+        return SearchParamType::String;
+    };
+    let value = &first.value;
+
+    // FHIR date: YYYY or YYYY-MM-DD or full instant. Optional comparator prefix
+    // (gt/lt/ge/le/sa/eb/ap/eq/ne) is stripped by SearchValue::parse before
+    // we get here, so we only inspect the literal value.
+    if value.len() >= 4 && value.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
+        let rest = &value.as_bytes()[4..];
+        if rest.is_empty() || rest[0] == b'-' || rest[0] == b'T' {
+            return SearchParamType::Date;
+        }
+    }
+
+    // Quantity: number|system|code (FHIR token-style separator).
+    if value.contains('|') && value.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return SearchParamType::Quantity;
+    }
+
+    // Reference: ResourceType/id form.
+    if value.contains('/') && value.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return SearchParamType::Reference;
+    }
+
+    // Token: system|code.
+    if value.contains('|') {
+        return SearchParamType::Token;
+    }
+
+    SearchParamType::String
+}
+
 impl std::fmt::Debug for SearchParameterRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SearchParameterRegistry")
@@ -509,6 +592,100 @@ mod tests {
         // Unregister
         registry.unregister("http://example.org/sp/test").unwrap();
         assert_eq!(registry.len(), 0);
+    }
+
+    fn registry_with(defs: Vec<SearchParameterDefinition>) -> SearchParameterRegistry {
+        let mut r = SearchParameterRegistry::new();
+        for d in defs {
+            r.register(d).unwrap();
+        }
+        r
+    }
+
+    #[test]
+    fn resolve_param_type_hits_resource_specific_definition() {
+        let registry = registry_with(vec![
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Goal-target-date",
+                "target-date",
+                SearchParamType::Date,
+                "Goal.target.dueDate",
+            )
+            .with_base(vec!["Goal"]),
+        ]);
+
+        assert_eq!(
+            resolve_param_type(&registry, "Goal", "target-date", &[]),
+            SearchParamType::Date,
+        );
+    }
+
+    #[test]
+    fn resolve_param_type_falls_back_to_resource_base_for_global_params() {
+        let registry = registry_with(vec![
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Resource-lastUpdated",
+                "_lastUpdated",
+                SearchParamType::Date,
+                "Resource.meta.lastUpdated",
+            )
+            .with_base(vec!["Resource"]),
+        ]);
+
+        assert_eq!(
+            resolve_param_type(&registry, "Patient", "_lastUpdated", &[]),
+            SearchParamType::Date,
+        );
+    }
+
+    #[test]
+    fn resolve_param_type_uses_value_heuristic_when_unregistered() {
+        let registry = SearchParameterRegistry::new();
+        let date_value = vec![SearchValue::eq("2020-01-15")];
+        let ref_value = vec![SearchValue::eq("Patient/123")];
+        let token_value = vec![SearchValue::eq("http://loinc.org|1234-5")];
+        let plain = vec![SearchValue::eq("hello")];
+
+        assert_eq!(
+            resolve_param_type(&registry, "Custom", "x", &date_value),
+            SearchParamType::Date,
+        );
+        assert_eq!(
+            resolve_param_type(&registry, "Custom", "x", &ref_value),
+            SearchParamType::Reference,
+        );
+        assert_eq!(
+            resolve_param_type(&registry, "Custom", "x", &token_value),
+            SearchParamType::Token,
+        );
+        assert_eq!(
+            resolve_param_type(&registry, "Custom", "x", &plain),
+            SearchParamType::String,
+        );
+        assert_eq!(
+            resolve_param_type(&registry, "Custom", "x", &[]),
+            SearchParamType::String,
+        );
+    }
+
+    #[test]
+    fn resolve_param_targets_returns_declared_targets() {
+        let registry = registry_with(vec![
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Encounter-subject",
+                "subject",
+                SearchParamType::Reference,
+                "Encounter.subject",
+            )
+            .with_base(vec!["Encounter"])
+            .with_targets(vec!["Patient", "Group"]),
+        ]);
+
+        assert_eq!(
+            resolve_param_targets(&registry, "Encounter", "subject"),
+            vec!["Patient".to_string(), "Group".to_string()],
+        );
+        assert!(resolve_param_targets(&registry, "Encounter", "missing").is_empty());
     }
 
     #[test]

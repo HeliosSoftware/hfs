@@ -2604,4 +2604,225 @@ mod postgres_integration {
             .unwrap();
         assert!(page3.resources.is_empty() || page3.next_cursor.is_none());
     }
+
+    /// Inserts a row directly into the search_index table. Mirrors what the
+    /// SQLite chain tests do for the same purpose — exercises the chain SQL
+    /// without depending on the FHIRPath extractor's full coverage. Connects
+    /// to the shared testcontainer with its own tokio-postgres client because
+    /// `PostgresBackend::get_client` is crate-private.
+    async fn insert_search_index(
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        param_name: &str,
+        column: &str,
+        value: &str,
+    ) {
+        let pg = shared_pg().await;
+        let conn_str = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            pg.host, pg.port,
+        );
+        let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+            .await
+            .expect("connect to shared pg");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let sql = format!(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, {col}) \
+             VALUES ($1, $2, $3, $4, $5)",
+            col = column,
+        );
+        client
+            .execute(
+                &sql,
+                &[
+                    &tenant_id,
+                    &resource_type,
+                    &resource_id,
+                    &param_name,
+                    &value,
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_multi_level() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        // Mirror sqlite/search_impl.rs::test_resolve_chain_multi_level for
+        // Postgres. Three-level chain: Observation?subject.organization.name=Hospital.
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-multi");
+        let tenant_id = tenant.tenant_id().as_str();
+
+        backend
+            .create(
+                &tenant,
+                "Organization",
+                json!({"id": "org1", "name": "General Hospital"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"id": "p1", "managingOrganization": {"reference": "Organization/org1"}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        insert_search_index(
+            tenant_id,
+            "Organization",
+            "org1",
+            "name",
+            "value_string",
+            "General Hospital",
+        )
+        .await;
+        insert_search_index(
+            tenant_id,
+            "Patient",
+            "p1",
+            "organization",
+            "value_reference",
+            "Organization/org1",
+        )
+        .await;
+        insert_search_index(
+            tenant_id,
+            "Observation",
+            "o1",
+            "subject",
+            "value_reference",
+            "Patient/p1",
+        )
+        .await;
+
+        let ids = backend
+            .resolve_chain(
+                &tenant,
+                "Observation",
+                "subject.organization.name",
+                "Hospital",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec!["o1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_resolve_reverse_chain_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        // _has:Observation:subject:code=8867-4 — find patients referenced by
+        // Observations whose code matches.
+        let backend = create_backend().await;
+        let tenant = create_tenant("reverse-chain");
+        let tenant_id = tenant.tenant_id().as_str();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"id": "p1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"id": "p2"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"id": "o2", "subject": {"reference": "Patient/p2"}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        insert_search_index(
+            tenant_id,
+            "Observation",
+            "o1",
+            "subject",
+            "value_reference",
+            "Patient/p1",
+        )
+        .await;
+        insert_search_index(
+            tenant_id,
+            "Observation",
+            "o2",
+            "subject",
+            "value_reference",
+            "Patient/p2",
+        )
+        .await;
+        insert_search_index(
+            tenant_id,
+            "Observation",
+            "o1",
+            "code",
+            "value_token_code",
+            "8867-4",
+        )
+        .await;
+        insert_search_index(
+            tenant_id,
+            "Observation",
+            "o2",
+            "code",
+            "value_token_code",
+            "other",
+        )
+        .await;
+
+        let rc = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "code",
+            SearchValue::eq("8867-4"),
+        );
+        let ids = backend
+            .resolve_reverse_chain(&tenant, "Patient", &rc)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["p1".to_string()]);
+    }
 }

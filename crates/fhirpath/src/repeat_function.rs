@@ -178,7 +178,7 @@ mod tests {
                     type_info: None,
                 } = &item
                 {
-                    if let Some(EvaluationResult::String(name, _)) = map.get("name") {
+                    if let Some(EvaluationResult::String(name, _, _)) = map.get("name") {
                         if name == "level1" {
                             found_level1 = true;
                         } else if name == "level2" {

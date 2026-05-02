@@ -1,4 +1,7 @@
 use std::env;
+use std::sync::Arc;
+
+use crate::outbound::{OutboundAuthProvider, provider_from_token};
 
 /// Configuration for the authentication and authorization subsystem.
 #[derive(Debug, Clone)]
@@ -42,6 +45,12 @@ pub struct AuthConfig {
     pub smart_registration_endpoint: Option<String>,
     /// Revocation endpoint URL.
     pub smart_revocation_endpoint: Option<String>,
+
+    /// Static bearer token attached to outbound server-to-server requests
+    /// (e.g., subscription notification dispatch). When set, an
+    /// `Authorization: Bearer <token>` header is added to outbound calls.
+    /// Subscription-supplied headers take precedence.
+    pub outbound_bearer_token: Option<String>,
 }
 
 impl AuthConfig {
@@ -74,7 +83,17 @@ impl AuthConfig {
             smart_management_endpoint: env::var("HFS_SMART_MANAGEMENT_ENDPOINT").ok(),
             smart_registration_endpoint: env::var("HFS_SMART_REGISTRATION_ENDPOINT").ok(),
             smart_revocation_endpoint: env::var("HFS_SMART_REVOCATION_ENDPOINT").ok(),
+            outbound_bearer_token: env::var("HFS_OUTBOUND_BEARER_TOKEN").ok(),
         }
+    }
+
+    /// Build an outbound auth provider from this config.
+    ///
+    /// Returns a [`StaticBearerOutboundAuthProvider`](crate::StaticBearerOutboundAuthProvider)
+    /// when [`outbound_bearer_token`](Self::outbound_bearer_token) is set,
+    /// otherwise a [`NoOpOutboundAuthProvider`](crate::NoOpOutboundAuthProvider).
+    pub fn outbound_provider(&self) -> Arc<dyn OutboundAuthProvider> {
+        provider_from_token(self.outbound_bearer_token.as_deref())
     }
 }
 
@@ -102,6 +121,7 @@ impl Default for AuthConfig {
             smart_management_endpoint: None,
             smart_registration_endpoint: None,
             smart_revocation_endpoint: None,
+            outbound_bearer_token: None,
         }
     }
 }

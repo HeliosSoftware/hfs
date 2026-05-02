@@ -1,0 +1,68 @@
+[package]
+name = "helios-subscriptions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "FHIR topic-based Subscriptions engine for HFS"
+
+[features]
+default = ["R4"]
+R4 = ["helios-fhir/R4", "helios-persistence/R4"]
+R4B = ["helios-fhir/R4B", "helios-persistence/R4B"]
+R5 = ["helios-fhir/R5", "helios-persistence/R5"]
+R6 = ["helios-fhir/R6", "helios-persistence/R6"]
+
+[dependencies]
+# FHIR models
+helios-fhir = { path = "../fhir", default-features = false }
+
+# Persistence (for TenantContext, StoredResource, etc.)
+helios-persistence = { path = "../persistence", default-features = false }
+
+# Outbound auth (OutboundAuthProvider trait + static-bearer impl)
+helios-auth = { path = "../auth" }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+async-trait = "0.1"
+
+# Time
+chrono.workspace = true
+
+# Logging
+tracing = "0.1"
+
+# Error handling
+thiserror = "2"
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# HTTP client (rest-hook channel)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# SMTP client (email channel)
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1", "tokio1-rustls-tls", "builder", "hostname"] }
+
+# Concurrent data structures
+dashmap = "6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.
+# Windows test runs don't need SIGTERM cleanup, so drop the feature there.
+[target.'cfg(not(windows))'.dev-dependencies]
+testcontainers = { version = "0.27", features = ["watchdog"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+testcontainers = { version = "0.27" }

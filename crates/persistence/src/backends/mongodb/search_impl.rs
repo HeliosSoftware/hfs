@@ -14,13 +14,15 @@ use serde_json::Value;
 
 use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
-    ConditionalUpdateResult, PatchFormat, ResourceStorage, SearchProvider, SearchResult,
+    ConditionalUpdateResult, IncludeProvider, PatchFormat, ResourceStorage, RevincludeProvider,
+    SearchProvider, SearchResult,
 };
 use crate::error::{BackendError, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
-    CursorDirection, CursorValue, Page, PageCursor, PageInfo, SearchModifier, SearchParamType,
-    SearchParameter, SearchPrefix, SearchQuery, SearchValue, StoredResource,
+    CursorDirection, CursorValue, IncludeDirective, IncludeType, Page, PageCursor, PageInfo,
+    SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+    StoredResource,
 };
 
 use super::MongoBackend;
@@ -214,9 +216,38 @@ impl SearchProvider for MongoBackend {
             has_previous,
         };
 
+        let page = Page::new(resources, page_info);
+        let mut included: Vec<StoredResource> = Vec::new();
+
+        if !query.includes.is_empty() {
+            let forward: Vec<IncludeDirective> = query
+                .includes
+                .iter()
+                .filter(|i| i.include_type == IncludeType::Include)
+                .cloned()
+                .collect();
+            if !forward.is_empty() {
+                let resolved = self.resolve_includes(tenant, &page.items, &forward).await?;
+                Self::merge_unique(&mut included, resolved);
+            }
+
+            let reverse: Vec<IncludeDirective> = query
+                .includes
+                .iter()
+                .filter(|i| i.include_type == IncludeType::Revinclude)
+                .cloned()
+                .collect();
+            if !reverse.is_empty() {
+                let resolved = self
+                    .resolve_revincludes(tenant, &page.items, &reverse)
+                    .await?;
+                Self::merge_unique(&mut included, resolved);
+            }
+        }
+
         Ok(SearchResult {
-            resources: Page::new(resources, page_info),
-            included: Vec::new(),
+            resources: page,
+            included,
             total,
         })
     }
@@ -248,6 +279,12 @@ impl SearchProvider for MongoBackend {
             .count_documents(filter)
             .await
             .map_err(|e| internal_error(format!("Failed to count MongoDB search results: {}", e)))
+    }
+
+    fn search_param_registry(
+        &self,
+    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.search_registry()
     }
 }
 
@@ -360,12 +397,6 @@ impl MongoBackend {
 
         if !query.reverse_chains.is_empty() {
             return Err(StorageError::Search(SearchError::ReverseChainNotSupported));
-        }
-
-        if !query.includes.is_empty() {
-            return Err(StorageError::Search(SearchError::IncludeNotSupported {
-                operation: "_include/_revinclude".to_string(),
-            }));
         }
 
         for param in &query.parameters {
@@ -998,24 +1029,15 @@ impl MongoBackend {
         params
             .iter()
             .map(|(name, value)| {
-                let param_type = self
-                    .lookup_param_type(&registry, resource_type, name)
-                    .unwrap_or(match name.as_str() {
-                        "_id" => SearchParamType::Token,
-                        "_lastUpdated" => SearchParamType::Date,
-                        "_tag" | "_profile" | "_security" => SearchParamType::Token,
-                        "identifier" => SearchParamType::Token,
-                        "patient" | "subject" | "encounter" | "performer" | "author"
-                        | "requester" | "recorder" | "asserter" | "practitioner"
-                        | "organization" | "location" | "device" => SearchParamType::Reference,
-                        _ => SearchParamType::String,
-                    });
+                let values = vec![SearchValue::parse(value)];
+                let param_type =
+                    crate::search::resolve_param_type(&registry, resource_type, name, &values);
 
                 SearchParameter {
                     name: name.clone(),
                     param_type,
                     modifier: None,
-                    values: vec![SearchValue::parse(value)],
+                    values,
                     chain: vec![],
                     components: vec![],
                 }
@@ -1023,20 +1045,240 @@ impl MongoBackend {
             .collect()
     }
 
-    fn lookup_param_type(
+    fn merge_unique(target: &mut Vec<StoredResource>, additions: Vec<StoredResource>) {
+        let mut seen: HashSet<String> = target
+            .iter()
+            .map(|r| format!("{}/{}", r.resource_type(), r.id()))
+            .collect();
+        for resource in additions {
+            let key = format!("{}/{}", resource.resource_type(), resource.id());
+            if seen.insert(key) {
+                target.push(resource);
+            }
+        }
+    }
+
+    fn extract_references(content: &Value, search_param: &str) -> Vec<String> {
+        let mut refs = Vec::new();
+        if let Some(value) = content.get(search_param) {
+            Self::collect_references_from_value(value, &mut refs);
+        }
+        refs
+    }
+
+    fn collect_references_from_value(value: &Value, refs: &mut Vec<String>) {
+        match value {
+            Value::Object(obj) => {
+                if let Some(Value::String(reference)) = obj.get("reference") {
+                    refs.push(reference.clone());
+                }
+                for v in obj.values() {
+                    Self::collect_references_from_value(v, refs);
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    Self::collect_references_from_value(item, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn parse_reference(reference: &str) -> Option<(String, String)> {
+        let trimmed = reference
+            .strip_prefix("http://")
+            .or_else(|| reference.strip_prefix("https://"))
+            .unwrap_or(reference);
+
+        let mut segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.len() < 2 {
+            return None;
+        }
+
+        let id = segments.pop()?.to_string();
+        let resource_type = segments.pop()?.to_string();
+
+        if !resource_type
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+        {
+            return None;
+        }
+
+        Some((resource_type, id))
+    }
+
+    async fn fetch_resource_by_type_id(
         &self,
-        registry: &crate::search::SearchParameterRegistry,
+        tenant: &TenantContext,
         resource_type: &str,
-        param_name: &str,
-    ) -> Option<SearchParamType> {
-        if let Some(def) = registry.get_param(resource_type, param_name) {
-            return Some(def.param_type);
+        id: &str,
+    ) -> StorageResult<Option<StoredResource>> {
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let doc = resources
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "id": id,
+                "is_deleted": false,
+            })
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch included resource: {}", e)))?;
+
+        match doc {
+            Some(doc) => Ok(Some(self.document_to_stored_resource(
+                tenant,
+                resource_type,
+                doc,
+            )?)),
+            None => Ok(None),
+        }
+    }
+}
+
+#[async_trait]
+impl IncludeProvider for MongoBackend {
+    async fn resolve_includes(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        includes: &[IncludeDirective],
+    ) -> StorageResult<Vec<StoredResource>> {
+        if resources.is_empty() || includes.is_empty() {
+            return Ok(Vec::new());
         }
 
-        if let Some(def) = registry.get_param("Resource", param_name) {
-            return Some(def.param_type);
+        let mut included = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for include in includes {
+            for resource in resources {
+                if resource.resource_type() != include.source_type {
+                    continue;
+                }
+
+                let refs = Self::extract_references(resource.content(), &include.search_param);
+                for reference in refs {
+                    let Some((ref_type, ref_id)) = Self::parse_reference(&reference) else {
+                        continue;
+                    };
+
+                    if let Some(target) = include.target_type.as_ref() {
+                        if ref_type != *target {
+                            continue;
+                        }
+                    }
+
+                    let key = format!("{}/{}", ref_type, ref_id);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+
+                    if let Some(stored) = self
+                        .fetch_resource_by_type_id(tenant, &ref_type, &ref_id)
+                        .await?
+                    {
+                        included.push(stored);
+                    }
+                }
+            }
         }
 
-        None
+        Ok(included)
+    }
+}
+
+#[async_trait]
+impl RevincludeProvider for MongoBackend {
+    async fn resolve_revincludes(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        revincludes: &[IncludeDirective],
+    ) -> StorageResult<Vec<StoredResource>> {
+        if resources.is_empty() || revincludes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let db = self.get_database().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let resources_collection = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+
+        let mut included = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for revinclude in revincludes {
+            if revinclude.source_type.is_empty() {
+                continue;
+            }
+
+            let mut reference_values: Vec<String> = Vec::with_capacity(resources.len() * 2);
+            for resource in resources {
+                reference_values.push(format!("{}/{}", resource.resource_type(), resource.id()));
+                reference_values.push(resource.id().to_string());
+            }
+            reference_values.sort();
+            reference_values.dedup();
+
+            if reference_values.is_empty() {
+                continue;
+            }
+
+            let bson_values: Vec<Bson> = reference_values.into_iter().map(Bson::String).collect();
+            let index_filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": &revinclude.source_type,
+                "param_name": &revinclude.search_param,
+                "value_reference": { "$in": Bson::Array(bson_values) },
+            };
+
+            let matching_ids: Vec<String> = search_index
+                .distinct("resource_id", index_filter)
+                .await
+                .map_err(|e| {
+                    internal_error(format!(
+                        "Failed to query search_index for revinclude: {}",
+                        e
+                    ))
+                })?
+                .into_iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect();
+
+            if matching_ids.is_empty() {
+                continue;
+            }
+
+            let id_bson: Vec<Bson> = matching_ids.into_iter().map(Bson::String).collect();
+            let resource_filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": &revinclude.source_type,
+                "is_deleted": false,
+                "id": { "$in": Bson::Array(id_bson) },
+            };
+
+            let docs =
+                collect_documents(resources_collection.find(resource_filter).await.map_err(
+                    |e| internal_error(format!("Failed to fetch revinclude resources: {}", e)),
+                )?)
+                .await?;
+
+            for doc in docs {
+                let stored =
+                    self.document_to_stored_resource(tenant, &revinclude.source_type, doc)?;
+                let key = format!("{}/{}", stored.resource_type(), stored.id());
+                if seen.insert(key) {
+                    included.push(stored);
+                }
+            }
+        }
+
+        Ok(included)
     }
 }

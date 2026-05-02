@@ -21,6 +21,7 @@ use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::TenantExtractor;
+use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::prefer::PreferHeader;
 use crate::responses::headers::ResourceHeaders;
@@ -61,6 +62,14 @@ pub async fn patch_handler<S>(
 where
     S: ResourceStorage + Send + Sync,
 {
+    // AuditEvent resources are immutable — block write operations
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "PATCH".to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
+
     debug!(
         resource_type = %resource_type,
         id = %id,
@@ -123,7 +132,28 @@ where
         "Resource patched"
     );
 
-    build_patch_response(&stored, headers, &prefer)
+    // Emit subscription event
+    #[cfg(feature = "subscriptions")]
+    if let Some(engine) = state.subscription_engine() {
+        super::subscription_event::emit_subscription_event(
+            engine,
+            tenant.context(),
+            &stored,
+            stored.fhir_version(),
+            helios_subscriptions::ResourceEventType::Update,
+        );
+    }
+
+    build_patch_response(&stored, headers, &prefer).map(|mut response| {
+        response
+            .extensions_mut()
+            .insert(helios_audit::AuditResponseContext {
+                resource_type: Some(resource_type.clone()),
+                resource_id: Some(stored.id().to_string()),
+                patient_reference: extract_patient_from_resource(&resource_type, stored.content()),
+            });
+        response
+    })
 }
 
 /// Conditional patch handler.
@@ -179,7 +209,19 @@ where
     match result {
         ConditionalPatchResult::Patched(stored) => {
             let headers = ResourceHeaders::from_stored(&stored, &state);
-            build_patch_response(&stored, headers, &prefer)
+            build_patch_response(&stored, headers, &prefer).map(|mut response| {
+                response
+                    .extensions_mut()
+                    .insert(helios_audit::AuditResponseContext {
+                        resource_type: Some(resource_type.clone()),
+                        resource_id: Some(stored.id().to_string()),
+                        patient_reference: extract_patient_from_resource(
+                            &resource_type,
+                            stored.content(),
+                        ),
+                    });
+                response
+            })
         }
         ConditionalPatchResult::NoMatch => Err(RestError::NotFound {
             resource_type,

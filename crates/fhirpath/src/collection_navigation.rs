@@ -43,11 +43,11 @@ pub fn skip_function(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Determine the number of items to skip
     let num_to_skip = match num_arg {
-        EvaluationResult::Integer(i, _) => {
+        EvaluationResult::Integer(i, _, _) => {
             if *i < 0 { 0 } else { *i as usize } // Treat negative skip as 0
         }
         // Add conversion from Decimal if it's an integer value
-        EvaluationResult::Decimal(d, _) if d.is_integer() && d.is_sign_positive() => {
+        EvaluationResult::Decimal(d, _, _) if d.is_integer() && d.is_sign_positive() => {
             d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
         }
         _ => {
@@ -189,11 +189,11 @@ pub fn take_function(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Determine the number of items to take
     let num_to_take = match num_arg {
-        EvaluationResult::Integer(i, _) => {
+        EvaluationResult::Integer(i, _, _) => {
             if *i <= 0 { 0 } else { *i as usize } // Treat non-positive take as 0
         }
         // Add conversion from Decimal if it's an integer value
-        EvaluationResult::Decimal(d, _) if d.is_integer() && d.is_sign_positive() => {
+        EvaluationResult::Decimal(d, _, _) if d.is_integer() && d.is_sign_positive() => {
             d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
         }
         _ => {

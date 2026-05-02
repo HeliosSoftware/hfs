@@ -1035,6 +1035,24 @@ impl SearchProvider for S3Backend {
             capability: "search_count".to_string(),
         }))
     }
+
+    fn search_param_registry(
+        &self,
+    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        // S3 standalone does not implement search; an empty registry is
+        // required only to satisfy the trait. In real deployments S3 is
+        // composed with a search backend (e.g., Elasticsearch) and the
+        // composite forwards to that backend's registry.
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<
+            std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
+        > = OnceLock::new();
+        EMPTY.get_or_init(|| {
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::search::SearchParameterRegistry::new(),
+            ))
+        })
+    }
 }
 
 #[async_trait]

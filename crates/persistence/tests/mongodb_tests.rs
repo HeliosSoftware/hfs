@@ -13,8 +13,9 @@ use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
 use helios_persistence::core::{
     Backend, BackendCapability, BackendKind, BundleEntry, BundleMethod, BundleProvider,
     BundleResult, ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage,
-    ConditionalUpdateResult, HistoryParams, InstanceHistoryProvider, PatchFormat, ResourceStorage,
-    SearchProvider, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
+    ConditionalUpdateResult, HistoryParams, IncludeProvider, InstanceHistoryProvider, PatchFormat,
+    ResourceStorage, RevincludeProvider, SearchProvider, SystemHistoryProvider,
+    TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, TransactionError,
@@ -22,7 +23,8 @@ use helios_persistence::error::{
 use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
+    IncludeDirective, IncludeType, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    SortDirective,
 };
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
@@ -1846,5 +1848,123 @@ async fn mongodb_integration_search_parameter_registry_updates_when_offloaded() 
             .get_param("Patient", "mongo-offloaded-code")
             .is_none(),
         "Deleted SearchParameter should unregister when offloaded"
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_resolve_include_and_revinclude() {
+    let Some(connection_string) = test_mongo_url() else {
+        eprintln!(
+            "Skipping mongodb_integration_resolve_include_and_revinclude (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    // Point at the workspace-root spec file so that the registry knows about
+    // Observation.subject — without it, no reference index entries get written
+    // and revinclude resolution would have nothing to match.
+    let workspace_data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("data");
+    let config = MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name("includes"),
+        data_dir: Some(workspace_data_dir),
+        ..Default::default()
+    };
+    let backend = MongoBackend::new(config)
+        .expect("failed to create MongoBackend for include/revinclude test");
+    backend
+        .initialize()
+        .await
+        .expect("failed to initialize MongoDB schema for include/revinclude test");
+
+    let tenant = create_tenant("tenant-includes");
+
+    let patient = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "name": [{"family": "Includer"}],
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let observation = backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "subject": {"reference": format!("Patient/{}", patient.id())},
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let forward = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Observation".to_string(),
+        search_param: "subject".to_string(),
+        target_type: Some("Patient".to_string()),
+        iterate: false,
+    };
+    let included = backend
+        .resolve_includes(&tenant, std::slice::from_ref(&observation), &[forward])
+        .await
+        .expect("forward include resolution must succeed");
+    assert_eq!(included.len(), 1, "exactly one Patient should be included");
+    assert_eq!(included[0].resource_type(), "Patient");
+    assert_eq!(included[0].id(), patient.id());
+
+    let reverse = IncludeDirective {
+        include_type: IncludeType::Revinclude,
+        source_type: "Observation".to_string(),
+        search_param: "subject".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let revincluded = backend
+        .resolve_revincludes(
+            &tenant,
+            std::slice::from_ref(&patient),
+            std::slice::from_ref(&reverse),
+        )
+        .await
+        .expect("revinclude resolution must succeed");
+    assert_eq!(
+        revincluded.len(),
+        1,
+        "exactly one Observation should be revincluded"
+    );
+    assert_eq!(revincluded[0].resource_type(), "Observation");
+    assert_eq!(revincluded[0].id(), observation.id());
+
+    let query = SearchQuery::new("Patient").with_include(reverse);
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("search with _revinclude must not be rejected");
+    assert!(
+        result
+            .resources
+            .items
+            .iter()
+            .any(|r| r.resource_type() == "Patient" && r.id() == patient.id()),
+        "primary results should still contain the Patient"
+    );
+    assert!(
+        result
+            .included
+            .iter()
+            .any(|r| r.resource_type() == "Observation" && r.id() == observation.id()),
+        "search() should populate `included` from revinclude resolution"
     );
 }

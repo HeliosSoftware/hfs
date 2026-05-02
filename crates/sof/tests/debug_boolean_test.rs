@@ -40,6 +40,7 @@ mod tests {
             Some(helios_fhirpath_support::TypeInfoResult::new(
                 "FHIR", "boolean",
             )),
+            None,
         );
         context.set_variable_result("is_deceased", is_deceased_constant);
 

@@ -2,6 +2,8 @@
 
 A high-performance FHIR server built in Rust.
 
+An open test server is available at https://hfs.heliossoftware.com/ for experimentation and evaluation.
+
 ## Features
 
 - Full FHIR RESTful API support 
@@ -87,6 +89,7 @@ Options:
 | `HFS_CORS_METHODS` | GET,POST,PUT,DELETE,OPTIONS | Allowed HTTP methods |
 | `HFS_CORS_HEADERS` | Content-Type,Authorization,X-Requested-With | Allowed headers |
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
+| `HFS_TERMINOLOGY_SERVER` | (none) | Terminology server URL for `:in`/`:not-in` modifiers and FHIRPath `memberOf()`/`subsumes()` |
 
 ## FHIR Version Support
 
