@@ -668,13 +668,16 @@ impl ChainQueryBuilder {
         depth: usize,
         param_num: usize,
     ) -> StorageResult<(String, SqlParam)> {
-        // Determine the parameter type from the registry
+        // Determine the parameter type from the registry. Falls back to the
+        // shared value-shape heuristic for unregistered custom params.
         let param_type = {
             let registry = self.registry.read();
-            registry
-                .get_param(resource_type, param_name)
-                .map(|p| p.param_type)
-                .unwrap_or_else(|| self.infer_param_type(param_name))
+            crate::search::resolve_param_type(
+                &registry,
+                resource_type,
+                param_name,
+                std::slice::from_ref(value),
+            )
         };
 
         let alias = format!("si{}", depth);
@@ -744,25 +747,6 @@ impl ChainQueryBuilder {
         };
 
         Ok((condition, param))
-    }
-
-    /// Infers parameter type based on common parameter names.
-    fn infer_param_type(&self, param_name: &str) -> SearchParamType {
-        match param_name {
-            "name" | "family" | "given" | "text" | "display" | "description" | "address"
-            | "city" | "state" | "country" => SearchParamType::String,
-            "identifier" | "code" | "status" | "type" | "category" | "class" | "gender"
-            | "language" => SearchParamType::Token,
-            "date" | "birthdate" | "issued" | "effective" | "period" | "authored" => {
-                SearchParamType::Date
-            }
-            "patient" | "subject" | "performer" | "author" | "encounter" | "organization"
-            | "practitioner" | "location" => SearchParamType::Reference,
-            "value-quantity" | "dose" | "quantity" => SearchParamType::Quantity,
-            "length" | "count" | "value" => SearchParamType::Number,
-            "url" | "source" => SearchParamType::Uri,
-            _ => SearchParamType::String, // Default fallback
-        }
     }
 }
 

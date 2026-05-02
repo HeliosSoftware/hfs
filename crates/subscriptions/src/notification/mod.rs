@@ -8,6 +8,7 @@
 //! - **R5/R6**: Bundle(type=subscription-notification) with native SubscriptionStatus
 
 mod builder;
+pub mod messaging;
 
 use chrono::{DateTime, Utc};
 #[cfg(feature = "R4")]
@@ -17,6 +18,7 @@ use crate::error::SubscriptionError;
 use crate::manager::ActiveSubscription;
 
 pub use builder::NotificationBundleBuilder;
+pub use messaging::wrap_as_message_bundle;
 
 /// The type of notification being sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +39,63 @@ impl NotificationType {
             Self::EventNotification => "event-notification",
         }
     }
+
+    /// Parse a FHIR notification type code (`handshake`, `heartbeat`, or
+    /// `event-notification`).
+    pub fn from_fhir_str(s: &str) -> Option<Self> {
+        match s {
+            "handshake" => Some(Self::Handshake),
+            "heartbeat" => Some(Self::Heartbeat),
+            "event-notification" => Some(Self::EventNotification),
+            _ => None,
+        }
+    }
+}
+
+/// Inspect a notification bundle and return the [`NotificationType`] declared
+/// in its first status entry.
+///
+/// Supports both the R4 backport encoding (status as a `Parameters` resource
+/// with a `type` parameter) and the native R4B+ encoding (status as a
+/// `SubscriptionStatus` resource with a `type` field). Returns
+/// [`NotificationType::EventNotification`] when the bundle does not carry a
+/// recognizable type — the safest fallback because messaging dispatch then
+/// uses an event-shaped MessageHeader.
+pub fn notification_type_from_bundle(bundle: &serde_json::Value) -> NotificationType {
+    let status_resource = bundle
+        .get("entry")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.get("resource"));
+
+    let Some(resource) = status_resource else {
+        return NotificationType::EventNotification;
+    };
+
+    // Native (R4B+): SubscriptionStatus.type is a code.
+    if let Some(code) = resource.get("type").and_then(serde_json::Value::as_str) {
+        if let Some(nt) = NotificationType::from_fhir_str(code) {
+            return nt;
+        }
+    }
+
+    // R4 backport: Parameters with a parameter named "type" carrying valueCode.
+    if let Some(params) = resource
+        .get("parameter")
+        .and_then(serde_json::Value::as_array)
+    {
+        for p in params {
+            if p.get("name").and_then(serde_json::Value::as_str) == Some("type") {
+                if let Some(code) = p.get("valueCode").and_then(serde_json::Value::as_str) {
+                    if let Some(nt) = NotificationType::from_fhir_str(code) {
+                        return nt;
+                    }
+                }
+            }
+        }
+    }
+
+    NotificationType::EventNotification
 }
 
 /// Metadata about a notification event.

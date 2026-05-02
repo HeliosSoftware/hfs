@@ -39,8 +39,8 @@ pub fn all_true_function(
     // Check each item in the collection
     for item in items {
         match item {
-            EvaluationResult::Boolean(true, _) => continue,
-            EvaluationResult::Boolean(false, _) | EvaluationResult::Empty => {
+            EvaluationResult::Boolean(true, _, _) => continue,
+            EvaluationResult::Boolean(false, _, _) | EvaluationResult::Empty => {
                 return Ok(EvaluationResult::boolean(false));
             }
             // If any item is not boolean, it's an error according to spec
@@ -90,8 +90,8 @@ pub fn any_true_function(
     // Check each item in the collection
     for item in items {
         match item {
-            EvaluationResult::Boolean(true, _) => return Ok(EvaluationResult::boolean(true)),
-            EvaluationResult::Boolean(false, _) | EvaluationResult::Empty => continue,
+            EvaluationResult::Boolean(true, _, _) => return Ok(EvaluationResult::boolean(true)),
+            EvaluationResult::Boolean(false, _, _) | EvaluationResult::Empty => continue,
             // If any item is not boolean, it's an error according to spec
             _ => {
                 return Err(EvaluationError::TypeError(
@@ -139,8 +139,8 @@ pub fn all_false_function(
     // Check each item in the collection
     for item in items {
         match item {
-            EvaluationResult::Boolean(false, _) => continue,
-            EvaluationResult::Boolean(true, _) | EvaluationResult::Empty => {
+            EvaluationResult::Boolean(false, _, _) => continue,
+            EvaluationResult::Boolean(true, _, _) | EvaluationResult::Empty => {
                 return Ok(EvaluationResult::boolean(false));
             }
             // If any item is not boolean, it's an error according to spec
@@ -190,8 +190,8 @@ pub fn any_false_function(
     // Check each item in the collection
     for item in items {
         match item {
-            EvaluationResult::Boolean(false, _) => return Ok(EvaluationResult::boolean(true)),
-            EvaluationResult::Boolean(true, _) | EvaluationResult::Empty => continue,
+            EvaluationResult::Boolean(false, _, _) => return Ok(EvaluationResult::boolean(true)),
+            EvaluationResult::Boolean(true, _, _) | EvaluationResult::Empty => continue,
             // If any item is not boolean, it's an error according to spec
             _ => {
                 return Err(EvaluationError::TypeError(

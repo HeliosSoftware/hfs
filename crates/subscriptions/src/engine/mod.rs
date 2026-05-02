@@ -11,6 +11,8 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
+use crate::channels::email::EmailChannel;
+use crate::channels::messaging::MessagingChannel;
 use crate::channels::rest_hook::RestHookChannel;
 use crate::channels::websocket::WebSocketChannel;
 use crate::channels::ws_manager::WebSocketManager;
@@ -24,6 +26,7 @@ use crate::manager::{
 };
 use crate::notification::{self, NotificationEventData};
 use crate::topics::InMemoryTopicRegistry;
+use helios_auth::{NoOpOutboundAuthProvider, OutboundAuthProvider};
 
 /// The subscription engine orchestrates the entire subscription pipeline.
 ///
@@ -38,13 +41,41 @@ pub struct SubscriptionEngine {
     ws_manager: Arc<WebSocketManager>,
     ws_channel: Arc<WebSocketChannel>,
     ws_token_manager: Arc<WsBindingTokenManager>,
+    email_channel: Option<Arc<EmailChannel>>,
+    messaging_channel: Option<Arc<MessagingChannel>>,
     config: SubscriptionConfig,
     base_url: String,
 }
 
+fn calculate_handshake_retry_delay(
+    config: &SubscriptionConfig,
+    attempt: u32,
+) -> std::time::Duration {
+    let exponent = attempt.saturating_sub(1) as i32;
+    let delay_secs = config.handshake_retry_initial_delay.as_secs_f64()
+        * config.retry_backoff_factor.powi(exponent);
+    let capped = delay_secs.min(config.handshake_retry_max_delay.as_secs_f64());
+
+    std::time::Duration::from_secs_f64(capped)
+}
+
 impl SubscriptionEngine {
-    /// Creates a new subscription engine.
+    /// Creates a new subscription engine with a no-op outbound auth provider.
     pub fn new(config: SubscriptionConfig, base_url: String) -> Self {
+        Self::with_outbound_auth(config, base_url, Arc::new(NoOpOutboundAuthProvider))
+    }
+
+    /// Creates a new subscription engine with a custom outbound auth provider.
+    ///
+    /// The provider is used by channels that initiate outbound HTTP requests
+    /// (currently the FHIR Messaging channel) to attach server-side
+    /// credentials when the subscription does not supply its own
+    /// `Authorization` header.
+    pub fn with_outbound_auth(
+        config: SubscriptionConfig,
+        base_url: String,
+        outbound_auth: Arc<dyn OutboundAuthProvider>,
+    ) -> Self {
         let topic_registry = Arc::new(InMemoryTopicRegistry::new());
         let manager = Arc::new(SubscriptionManager::new(
             Arc::clone(&topic_registry),
@@ -55,6 +86,22 @@ impl SubscriptionEngine {
         let ws_manager = Arc::new(WebSocketManager::new());
         let ws_channel = Arc::new(WebSocketChannel::new(Arc::clone(&ws_manager)));
         let ws_token_manager = Arc::new(WsBindingTokenManager::new(config.ws_token_lifetime_secs));
+        let email_channel = match &config.smtp {
+            Some(settings) => match EmailChannel::new(settings.clone()) {
+                Ok(ch) => Some(Arc::new(ch)),
+                Err(e) => {
+                    warn!(error = %e, "Failed to initialize email channel; email dispatch disabled");
+                    None
+                }
+            },
+            None => None,
+        };
+        let messaging_channel = config.messaging.as_ref().map(|settings| {
+            Arc::new(
+                MessagingChannel::new(settings.source_endpoint.clone(), Arc::clone(&outbound_auth))
+                    .with_private_endpoints_allowed(settings.allow_private_endpoints),
+            )
+        });
 
         Self {
             topic_registry,
@@ -65,6 +112,8 @@ impl SubscriptionEngine {
             ws_manager,
             ws_channel,
             ws_token_manager,
+            email_channel,
+            messaging_channel,
             config,
             base_url,
         }
@@ -118,6 +167,14 @@ impl SubscriptionEngine {
 
         // Evaluate which subscriptions match this event.
         let matches = self.evaluator.evaluate(&event);
+        info!(
+            tenant_id = %event.tenant_id,
+            resource_type = %event.resource_type,
+            resource_id = %event.resource_id,
+            event_type = %event.event_type,
+            matched_subscriptions = matches.len(),
+            "Subscription event evaluated"
+        );
         if matches.is_empty() {
             return;
         }
@@ -141,10 +198,11 @@ impl SubscriptionEngine {
             // Ensure notification metadata reflects the event being emitted.
             subscription.events_since_start = event_number;
 
+            let focus_reference = format!("{}/{}", event.resource_type, event.resource_id);
             let event_data = NotificationEventData {
                 event_number,
                 timestamp: event.timestamp,
-                focus_reference: format!("{}/{}", event.resource_type, event.resource_id),
+                focus_reference: focus_reference.clone(),
             };
 
             // Build notification bundle.
@@ -165,8 +223,25 @@ impl SubscriptionEngine {
                 }
             };
 
+            info!(
+                tenant_id = %subscription.tenant_id,
+                subscription_id = %subscription.id,
+                topic_url = %subscription.topic_url,
+                channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                event_number,
+                focus_reference = %focus_reference,
+                "Dispatching subscription event notification"
+            );
+
             // Dispatch with retry.
-            self.dispatch_with_retry(&subscription, &bundle).await;
+            self.dispatch_with_retry(
+                &subscription,
+                &bundle,
+                "event-notification",
+                Some(event_number),
+            )
+            .await;
         }
     }
 
@@ -175,11 +250,23 @@ impl SubscriptionEngine {
         let tenant_id = event.tenant_id.to_string();
         let subscription_id = &event.resource_id;
 
+        info!(
+            tenant_id,
+            subscription_id,
+            event_type = %event.event_type,
+            fhir_version = %event.fhir_version,
+            "Handling Subscription resource event"
+        );
+
         match event.event_type {
             ResourceEventType::Delete => {
-                self.manager.deregister(&tenant_id, subscription_id);
+                let removed = self.manager.deregister(&tenant_id, subscription_id);
                 self.ws_manager
                     .remove_all_clients(&tenant_id, subscription_id);
+                info!(
+                    tenant_id,
+                    subscription_id, removed, "Subscription deregistered"
+                );
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
@@ -191,13 +278,31 @@ impl SubscriptionEngine {
                         event.fhir_version,
                     ) {
                         Ok(sub) => {
+                            info!(
+                                tenant_id = %sub.tenant_id,
+                                subscription_id = %sub.id,
+                                topic_url = %sub.topic_url,
+                                channel_type = %sub.channel.channel_type.as_fhir_str(),
+                                endpoint = sub.channel.endpoint.as_deref().unwrap_or(""),
+                                status = %sub.status,
+                                fhir_version = %sub.fhir_version,
+                                "Subscription registered"
+                            );
                             // If status is requested, perform handshake and activate.
                             if sub.status == SubscriptionStatusCode::Requested {
+                                info!(
+                                    tenant_id = %sub.tenant_id,
+                                    subscription_id = %sub.id,
+                                    channel_type = %sub.channel.channel_type.as_fhir_str(),
+                                    endpoint = sub.channel.endpoint.as_deref().unwrap_or(""),
+                                    "Subscription activation requested"
+                                );
                                 self.activate_subscription(&sub).await;
                             }
                         }
                         Err(e) => {
                             warn!(
+                                tenant_id,
                                 subscription_id,
                                 error = %e,
                                 "Failed to register subscription"
@@ -421,62 +526,194 @@ impl SubscriptionEngine {
     async fn activate_subscription(&self, subscription: &ActiveSubscription) {
         let tenant_id = &subscription.tenant_id;
         let sub_id = &subscription.id;
+        let handshake_max_attempts = self.config.handshake_max_attempts.max(1);
 
         // Build handshake notification.
         let handshake_bundle = match notification::build_handshake(subscription, &self.base_url) {
             Ok(b) => b,
             Err(e) => {
-                warn!(subscription_id = sub_id, error = %e, "Failed to build handshake");
-                let _ =
-                    self.manager
-                        .update_status(tenant_id, sub_id, SubscriptionStatusCode::Error);
-                return;
-            }
-        };
-
-        // Perform handshake.
-        let result = match subscription.channel.channel_type {
-            ChannelType::RestHook => {
-                self.rest_hook_channel
-                    .handshake(subscription, &handshake_bundle)
-                    .await
-            }
-            ChannelType::Websocket => {
-                self.ws_channel
-                    .handshake(subscription, &handshake_bundle)
-                    .await
-            }
-            _ => {
                 warn!(
+                    tenant_id,
                     subscription_id = sub_id,
-                    channel_type = subscription.channel.channel_type.as_fhir_str(),
-                    "Handshake not supported for channel type"
+                    channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                    endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                    error = %e,
+                    "Failed to build handshake"
                 );
+                let _ =
+                    self.manager
+                        .update_status(tenant_id, sub_id, SubscriptionStatusCode::Error);
                 return;
             }
         };
 
-        match result {
-            Ok(DispatchResult::Success) => {
-                info!(
-                    subscription_id = sub_id,
-                    "Handshake successful, activating subscription"
-                );
-                let _ =
-                    self.manager
-                        .update_status(tenant_id, sub_id, SubscriptionStatusCode::Active);
-            }
-            Ok(DispatchResult::RetryableError(msg)) | Ok(DispatchResult::PermanentError(msg)) => {
-                warn!(subscription_id = sub_id, error = %msg, "Handshake failed");
-                let _ =
-                    self.manager
-                        .update_status(tenant_id, sub_id, SubscriptionStatusCode::Error);
-            }
-            Err(e) => {
-                warn!(subscription_id = sub_id, error = %e, "Handshake error");
-                let _ =
-                    self.manager
-                        .update_status(tenant_id, sub_id, SubscriptionStatusCode::Error);
+        if !self.config.handshake_initial_delay.is_zero() {
+            info!(
+                tenant_id,
+                subscription_id = sub_id,
+                channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                delay_ms = self.config.handshake_initial_delay.as_millis() as u64,
+                "Delaying subscription handshake"
+            );
+            tokio::time::sleep(self.config.handshake_initial_delay).await;
+        }
+
+        let mut attempt = 1;
+        loop {
+            info!(
+                tenant_id,
+                subscription_id = sub_id,
+                channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                attempt,
+                max_attempts = handshake_max_attempts,
+                "Sending subscription handshake"
+            );
+
+            // Perform handshake.
+            let result = match subscription.channel.channel_type {
+                ChannelType::RestHook => {
+                    self.rest_hook_channel
+                        .handshake(subscription, &handshake_bundle)
+                        .await
+                }
+                ChannelType::Websocket => {
+                    self.ws_channel
+                        .handshake(subscription, &handshake_bundle)
+                        .await
+                }
+                ChannelType::Email => match self.email_channel.as_ref() {
+                    Some(ch) => ch.handshake(subscription, &handshake_bundle).await,
+                    None => {
+                        warn!(
+                            tenant_id,
+                            subscription_id = sub_id,
+                            endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                            "Email channel requested but no SMTP settings configured"
+                        );
+                        let _ = self.manager.update_status(
+                            tenant_id,
+                            sub_id,
+                            SubscriptionStatusCode::Error,
+                        );
+                        return;
+                    }
+                },
+                ChannelType::Message => match self.messaging_channel.as_ref() {
+                    Some(ch) => ch.handshake(subscription, &handshake_bundle).await,
+                    None => {
+                        warn!(
+                            tenant_id,
+                            subscription_id = sub_id,
+                            endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                            "Messaging channel requested but messaging settings not configured"
+                        );
+                        let _ = self.manager.update_status(
+                            tenant_id,
+                            sub_id,
+                            SubscriptionStatusCode::Error,
+                        );
+                        return;
+                    }
+                },
+                _ => {
+                    warn!(
+                        tenant_id,
+                        subscription_id = sub_id,
+                        channel_type = subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                        "Handshake not supported for channel type"
+                    );
+                    return;
+                }
+            };
+
+            match result {
+                Ok(DispatchResult::Success) => {
+                    info!(
+                        tenant_id,
+                        subscription_id = sub_id,
+                        channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                        attempt,
+                        "Handshake successful, activating subscription"
+                    );
+                    let _ = self.manager.update_status(
+                        tenant_id,
+                        sub_id,
+                        SubscriptionStatusCode::Active,
+                    );
+                    return;
+                }
+                Ok(DispatchResult::PermanentError(msg)) => {
+                    warn!(
+                        tenant_id,
+                        subscription_id = sub_id,
+                        channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                        attempt,
+                        error = %msg,
+                        "Handshake failed with permanent error"
+                    );
+                    let _ = self.manager.update_status(
+                        tenant_id,
+                        sub_id,
+                        SubscriptionStatusCode::Error,
+                    );
+                    return;
+                }
+                Ok(DispatchResult::RetryableError(msg)) => {
+                    if attempt >= handshake_max_attempts {
+                        warn!(
+                            tenant_id,
+                            subscription_id = sub_id,
+                            channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                            endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                            attempts = attempt,
+                            error = %msg,
+                            "Handshake retries exhausted"
+                        );
+                        let _ = self.manager.update_status(
+                            tenant_id,
+                            sub_id,
+                            SubscriptionStatusCode::Error,
+                        );
+                        return;
+                    }
+
+                    let delay = calculate_handshake_retry_delay(&self.config, attempt);
+                    warn!(
+                        tenant_id,
+                        subscription_id = sub_id,
+                        channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                        attempt,
+                        next_attempt = attempt + 1,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %msg,
+                        "Retrying subscription handshake"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        tenant_id,
+                        subscription_id = sub_id,
+                        channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                        attempt,
+                        error = %e,
+                        "Handshake error"
+                    );
+                    let _ = self.manager.update_status(
+                        tenant_id,
+                        sub_id,
+                        SubscriptionStatusCode::Error,
+                    );
+                    return;
+                }
             }
         }
     }
@@ -486,6 +723,8 @@ impl SubscriptionEngine {
         &self,
         subscription: &ActiveSubscription,
         bundle: &serde_json::Value,
+        notification_type: &'static str,
+        event_number: Option<u64>,
     ) {
         let tenant_id = &subscription.tenant_id;
         let sub_id = &subscription.id;
@@ -493,10 +732,39 @@ impl SubscriptionEngine {
         let dispatcher: &dyn ChannelDispatcher = match subscription.channel.channel_type {
             ChannelType::RestHook => self.rest_hook_channel.as_ref(),
             ChannelType::Websocket => self.ws_channel.as_ref(),
+            ChannelType::Email => match self.email_channel.as_deref() {
+                Some(ch) => ch,
+                None => {
+                    warn!(
+                        tenant_id,
+                        subscription_id = sub_id,
+                        notification_type,
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                        "Email dispatch requested but no SMTP settings configured"
+                    );
+                    return;
+                }
+            },
+            ChannelType::Message => match self.messaging_channel.as_deref() {
+                Some(ch) => ch,
+                None => {
+                    warn!(
+                        tenant_id,
+                        subscription_id = sub_id,
+                        notification_type,
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                        "Messaging dispatch requested but messaging settings not configured"
+                    );
+                    return;
+                }
+            },
             _ => {
                 warn!(
+                    tenant_id,
                     subscription_id = sub_id,
+                    notification_type,
                     channel = subscription.channel.channel_type.as_fhir_str(),
+                    endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                     "No dispatcher for channel type"
                 );
                 return;
@@ -508,11 +776,25 @@ impl SubscriptionEngine {
             match dispatcher.dispatch(subscription, bundle).await {
                 Ok(DispatchResult::Success) => {
                     self.manager.reset_failures(tenant_id, sub_id);
+                    info!(
+                        tenant_id,
+                        subscription_id = sub_id,
+                        notification_type,
+                        event_number,
+                        channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
+                        "Subscription notification dispatched"
+                    );
                     return;
                 }
                 Ok(DispatchResult::PermanentError(msg)) => {
                     warn!(
+                        tenant_id,
                         subscription_id = sub_id,
+                        notification_type,
+                        event_number,
+                        channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                         error = %msg,
                         "Permanent delivery error"
                     );
@@ -523,7 +805,12 @@ impl SubscriptionEngine {
                     attempt += 1;
                     if !retry::should_retry(&self.config, attempt) {
                         warn!(
+                            tenant_id,
                             subscription_id = sub_id,
+                            notification_type,
+                            event_number,
+                            channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                            endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                             attempts = attempt,
                             error = %msg,
                             "Max retries exhausted"
@@ -534,7 +821,10 @@ impl SubscriptionEngine {
 
                     let delay = retry::calculate_delay(&self.config, attempt);
                     debug!(
+                        tenant_id,
                         subscription_id = sub_id,
+                        notification_type,
+                        event_number,
                         attempt,
                         delay_ms = delay.as_millis() as u64,
                         "Retrying delivery"
@@ -543,7 +833,12 @@ impl SubscriptionEngine {
                 }
                 Err(e) => {
                     error!(
+                        tenant_id,
                         subscription_id = sub_id,
+                        notification_type,
+                        event_number,
+                        channel_type = %subscription.channel.channel_type.as_fhir_str(),
+                        endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                         error = %e,
                         "Dispatch error"
                     );
@@ -589,8 +884,12 @@ mod tests {
     use helios_fhir::FhirVersion;
     use helios_persistence::tenant::TenantId;
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use wiremock::matchers::method;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     fn make_engine(base_url: &str) -> SubscriptionEngine {
         let config = SubscriptionConfig {
@@ -631,6 +930,21 @@ mod tests {
             })),
             previous_resource: None,
             timestamp: Utc::now(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailFirstHandshake {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl Respond for FailFirstHandshake {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200)
+            }
         }
     }
 
@@ -775,6 +1089,52 @@ mod tests {
         // Subscription should be registered.
         let sub = engine.manager().get_subscription("t1", "sub-1");
         assert!(sub.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_subscription_activation_retries_retryable_handshake_failure() {
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .respond_with(FailFirstHandshake {
+                attempts: Arc::clone(&attempts),
+            })
+            .mount(&server)
+            .await;
+
+        let config = SubscriptionConfig {
+            handshake_max_attempts: 2,
+            handshake_retry_initial_delay: std::time::Duration::from_millis(1),
+            handshake_retry_max_delay: std::time::Duration::from_millis(1),
+            ..Default::default()
+        };
+        let engine = SubscriptionEngine::new(config, "http://localhost:8080".to_string());
+        engine.topic_registry().add_topic(encounter_topic());
+
+        let sub_resource = crate::manager::tests::build_subscription_json(
+            "http://example.org/topic/encounter-start",
+            "rest-hook",
+            Some(&format!("{}/webhook", server.uri())),
+        );
+
+        let event = ResourceEvent {
+            tenant_id: TenantId::new("t1"),
+            fhir_version: FhirVersion::default(),
+            resource_type: "Subscription".to_string(),
+            resource_id: "sub-1".to_string(),
+            version_id: "1".to_string(),
+            event_type: ResourceEventType::Create,
+            resource: Some(sub_resource),
+            previous_resource: None,
+            timestamp: Utc::now(),
+        };
+
+        engine.on_resource_event(event).await;
+
+        let sub = engine.manager().get_subscription("t1", "sub-1").unwrap();
+        assert_eq!(sub.status, SubscriptionStatusCode::Active);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

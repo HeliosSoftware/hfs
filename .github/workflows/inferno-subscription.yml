@@ -1,0 +1,807 @@
+name: Inferno Subscription Test Suite
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
+
+jobs:
+  build:
+    name: Build HFS with subscriptions
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Build HFS
+        run: |
+          cargo build -p helios-hfs --no-default-features \
+            --features R4,subscriptions,sqlite,elasticsearch,postgres,mongodb,s3
+
+      - name: Upload HFS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-subscriptions-inferno-binary
+          path: target/debug/hfs
+          retention-days: 1
+
+  inferno-stack-up:
+    name: Start Shared Inferno Subscriptions Stack
+    runs-on: [self-hosted, Linux]
+    outputs:
+      port: ${{ steps.up.outputs.port }}
+      project: ${{ steps.up.outputs.project }}
+    steps:
+      - name: Checkout subscriptions-test-kit
+        uses: actions/checkout@v5
+        with:
+          repository: HeliosSoftware/subscriptions-test-kit
+          path: subscriptions-test-kit
+
+      - name: Run setup.sh under shared compose project
+        working-directory: subscriptions-test-kit
+        env:
+          COMPOSE_PROJECT_NAME: inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          if [ -x ./setup.sh ]; then
+            ./setup.sh
+          else
+            echo "No setup.sh found in test-kit checkout, skipping"
+          fi
+
+      - name: Bring up shared Inferno stack
+        id: up
+        working-directory: subscriptions-test-kit
+        run: |
+          PROJECT="inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
+          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          INFERNO_PORT=$((22000 + (${{ github.run_id }} % 20000) + ${{ github.run_attempt }}))
+          INFERNO_BASE_URL="http://$INFERNO_HOST:$INFERNO_PORT"
+
+          mkdir -p ci-images/nginx
+          cat > ci-images/nginx/Dockerfile <<'EOF'
+          FROM nginx
+          COPY config/nginx.conf /etc/nginx/nginx.conf
+          EOF
+          cat > docker-compose.override.yml <<EOF
+          services:
+            inferno:
+              environment:
+                INFERNO_HOST: "$INFERNO_BASE_URL"
+            worker:
+              environment:
+                INFERNO_HOST: "$INFERNO_BASE_URL"
+            nginx:
+              image: !reset null
+              build:
+                context: .
+                dockerfile: ci-images/nginx/Dockerfile
+              volumes: !override []
+              ports: !override
+                - "$INFERNO_PORT:80"
+            redis:
+              ports: !override []
+          EOF
+
+          for attempt in 1 2 3 4 5; do
+            if docker compose -p "$PROJECT" up -d; then
+              break
+            fi
+
+            if [ "$attempt" -eq 5 ]; then
+              echo "Failed to start Inferno stack after $attempt attempts"
+              docker compose -p "$PROJECT" ps || true
+              docker compose -p "$PROJECT" logs --tail 200 || true
+              exit 1
+            fi
+
+            echo "Inferno port $INFERNO_PORT was not usable; retrying with another port"
+            docker compose -p "$PROJECT" down -v --remove-orphans || true
+            INFERNO_PORT=$((INFERNO_PORT + attempt))
+            INFERNO_BASE_URL="http://$INFERNO_HOST:$INFERNO_PORT"
+            sed -i "s#INFERNO_HOST: .*#INFERNO_HOST: \"$INFERNO_BASE_URL\"#" docker-compose.override.yml
+            sed -i "s#- \".*:80\"#- \"$INFERNO_PORT:80\"#" docker-compose.override.yml
+          done
+
+          echo "Waiting for Inferno test kit to respond on $INFERNO_BASE_URL..."
+          for i in {1..60}; do
+            if curl -sf "$INFERNO_BASE_URL/api/test_suites" > /dev/null 2>&1; then
+              echo "Inferno is ready"
+              echo "port=$INFERNO_PORT" >> "$GITHUB_OUTPUT"
+              echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Attempt $i/60: Inferno not ready yet..."
+            sleep 2
+          done
+
+          echo "Inferno is not reachable at $INFERNO_BASE_URL"
+          docker compose -p "$PROJECT" ps
+          docker compose -p "$PROJECT" logs --tail 200
+          exit 1
+
+  inferno-subscription-test:
+    name: Inferno Subscriptions R4 Server Workflow (${{ matrix.backend }})
+    needs: [build, inferno-stack-up]
+    runs-on: [self-hosted, Linux]
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
+        include:
+          - { backend: sqlite, hfs_port: 18088 }
+          - { backend: sqlite-elasticsearch, hfs_port: 18089 }
+          - { backend: postgres, hfs_port: 18090 }
+          - { backend: mongodb, hfs_port: 18091 }
+          - { backend: s3-elasticsearch, hfs_port: 18092 }
+    env:
+      HFS_PORT: ${{ matrix.hfs_port }}
+      INFERNO_PORT: ${{ needs.inferno-stack-up.outputs.port }}
+      INFERNO_COMPOSE_PROJECT: ${{ needs.inferno-stack-up.outputs.project }}
+      HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS: 5000
+      HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS: 5
+      HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS: 1000
+      HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS: 10000
+      RESULTS_DIR: inferno-subscription-results/${{ matrix.backend }}
+      SUITE_ID: subscriptions_r5_backport_r4_server
+      TEST_GROUP_ID: subscriptions_r5_backport_r4_server-subscriptions_r4_server_workflow
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-subscriptions-inferno-binary
+          path: target/debug
+
+      - name: Make HFS binary executable
+        run: chmod +x target/debug/hfs
+
+      - name: Determine runner and Docker host IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "INFERNO_BASE_URL=http://$EFFECTIVE_DOCKER_HOST_IP:$INFERNO_PORT" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      - name: Validate backend configuration
+        run: |
+          if [ "${{ matrix.backend }}" = "s3-elasticsearch" ] && [ -z "$HFS_S3_BUCKET" ]; then
+            echo "::error::s3-elasticsearch backend requires HFS_S3_BUCKET to be configured"
+            exit 1
+          fi
+
+      - name: Start Elasticsearch
+        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        run: |
+          ES_CONTAINER="es-inferno-subscriptions-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$ES_CONTAINER" -p 0:9200 \
+            -e "discovery.type=single-node" \
+            -e "xpack.security.enabled=false" \
+            -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+            elasticsearch:8.15.0
+
+          echo "ES_CONTAINER=$ES_CONTAINER" >> "$GITHUB_ENV"
+
+          echo "Waiting for Elasticsearch to be ready..."
+          for i in {1..30}; do
+            ES_PORT=$(docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$ES_PORT" ]; then
+              if curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" > /dev/null 2>&1; then
+                echo "Elasticsearch is ready on port $ES_PORT"
+                echo "ES_PORT=$ES_PORT" >> "$GITHUB_ENV"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: Elasticsearch not ready yet..."
+            sleep 2
+          done
+
+          echo "Elasticsearch failed to start"
+          docker logs "$ES_CONTAINER"
+          exit 1
+
+      - name: Start PostgreSQL
+        if: matrix.backend == 'postgres'
+        run: |
+          PG_CONTAINER="pg-inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PG_CONTAINER" -p 0:5432 \
+            -e POSTGRES_USER=helios \
+            -e POSTGRES_PASSWORD=helios \
+            -e POSTGRES_DB=helios \
+            postgres:16
+
+          echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..30}; do
+            if docker exec "$PG_CONTAINER" pg_isready -U helios > /dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PostgreSQL is ready on port $PG_PORT"
+                echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: PostgreSQL not ready yet..."
+            sleep 2
+          done
+
+          echo "PostgreSQL failed to start"
+          docker logs "$PG_CONTAINER"
+          exit 1
+
+      - name: Start MongoDB replica set
+        if: matrix.backend == 'mongodb'
+        run: |
+          MONGO_CONTAINER="mongo-inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+
+          echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
+
+          READY=0
+          for i in {1..30}; do
+            if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' > /dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            echo "Attempt $i/30: MongoDB not ready yet..."
+            sleep 2
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "MongoDB failed to start"
+            docker logs "$MONGO_CONTAINER"
+            exit 1
+          fi
+
+          docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status(); } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] }); }' > /dev/null 2>&1
+
+          echo "Waiting for MongoDB replica set primary..."
+          for i in {1..60}; do
+            PRIMARY_STATE=$(docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status().myState } catch (e) { 0 }' | tr -d '\r\n ')
+            if [ "$PRIMARY_STATE" = "1" ]; then
+              MONGO_PORT=$(docker port "$MONGO_CONTAINER" 27017 | head -1 | sed 's/.*://')
+              echo "MongoDB replica set is ready on port $MONGO_PORT"
+              echo "MONGO_PORT=$MONGO_PORT" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "Attempt $i/60: MongoDB replica set not primary yet..."
+            sleep 2
+          done
+
+          echo "MongoDB replica set failed to become primary"
+          docker logs "$MONGO_CONTAINER"
+          exit 1
+
+      - name: Configure AWS credentials
+        if: matrix.backend == 's3-elasticsearch'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install AWS CLI
+        if: matrix.backend == 's3-elasticsearch'
+        run: |
+          if ! command -v aws &>/dev/null; then
+            if ! /tmp/aws-bin/aws --version &>/dev/null; then
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -qo /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
+              rm -rf /tmp/awscliv2.zip /tmp/aws
+            fi
+            echo "/tmp/aws-bin" >> "$GITHUB_PATH"
+          fi
+          aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
+      - name: Empty S3 prefix
+        if: matrix.backend == 's3-elasticsearch'
+        run: |
+          BUCKET="${{ secrets.HFS_S3_BUCKET }}"
+          PREFIX="ci/inferno-subscriptions/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.backend }}/"
+          echo "Emptying s3://$BUCKET/$PREFIX"
+          aws s3 rm "s3://$BUCKET/$PREFIX" --recursive
+          echo "Prefix emptied"
+
+      - name: Start HFS server
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          HFS_LOG="$RESULTS_DIR/hfs.log"
+          HFS_BASE_URL="http://$RUNNER_IP:$HFS_PORT"
+          echo "HFS_LOG=$HFS_LOG" >> "$GITHUB_ENV"
+          echo "HFS_BASE_URL=$HFS_BASE_URL" >> "$GITHUB_ENV"
+
+          if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_DEFAULT_FHIR_VERSION=R4 \
+            HFS_STORAGE_BACKEND=sqlite-elasticsearch \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_DEFAULT_FHIR_VERSION=R4 \
+            HFS_STORAGE_BACKEND=postgres \
+            HFS_PG_HOST="$DOCKER_HOST_IP" \
+            HFS_PG_PORT="$PG_PORT" \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_DEFAULT_FHIR_VERSION=R4 \
+            HFS_STORAGE_BACKEND=mongodb \
+            HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_inferno_subscriptions_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.backend }}" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_DEFAULT_FHIR_VERSION=R4 \
+            HFS_STORAGE_BACKEND=s3-elasticsearch \
+            HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET }}" \
+            HFS_S3_PREFIX="ci/inferno-subscriptions/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.backend }}/" \
+            HFS_S3_VALIDATE_BUCKETS=false \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          else
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_DEFAULT_FHIR_VERSION=R4 \
+            ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          fi
+
+          echo $! > /tmp/hfs-inferno-subscriptions-${{ matrix.backend }}.pid
+          echo "HFS_PID=$(cat /tmp/hfs-inferno-subscriptions-${{ matrix.backend }}.pid)" >> "$GITHUB_ENV"
+
+      - name: Wait for HFS to be ready
+        run: |
+          echo "Waiting for HFS to start..."
+          for i in {1..30}; do
+            if ! kill -0 "$HFS_PID" 2>/dev/null; then
+              echo "HFS process ($HFS_PID) exited"
+              cat "$HFS_LOG"
+              exit 1
+            fi
+            if curl -sf "http://localhost:$HFS_PORT/health" > /dev/null 2>&1; then
+              echo "HFS is ready"
+              exit 0
+            fi
+            echo "Attempt $i/30: HFS not ready yet..."
+            sleep 2
+          done
+
+          echo "HFS failed to start"
+          tail -50 "$HFS_LOG"
+          exit 1
+
+      - name: Prepare Inferno subscription inputs
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          ACCESS_TOKEN="inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
+          TOPIC_URL="https://github.com/HeliosSoftware/hfs/subscription-topic/inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
+          ENCOUNTER_ID="inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.backend }}"
+
+          echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> "$GITHUB_ENV"
+          echo "TOPIC_URL=$TOPIC_URL" >> "$GITHUB_ENV"
+          echo "ENCOUNTER_ID=$ENCOUNTER_ID" >> "$GITHUB_ENV"
+
+          cat > "$RESULTS_DIR/topic.json" <<EOF
+          {
+            "resourceType": "Basic",
+            "id": "topic-$ENCOUNTER_ID",
+            "code": {
+              "coding": [{
+                "system": "http://hl7.org/fhir/fhir-types",
+                "code": "SubscriptionTopic"
+              }]
+            },
+            "extension": [{
+              "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url",
+              "valueUri": "$TOPIC_URL"
+            }, {
+              "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.title",
+              "valueString": "Inferno Subscriptions Encounter Topic"
+            }, {
+              "url": "http://hl7.org/fhir/4.3/StructureDefinition/extension-SubscriptionTopic.resourceTrigger",
+              "extension": [{
+                "url": "resource",
+                "valueUri": "http://hl7.org/fhir/StructureDefinition/Encounter"
+              }, {
+                "url": "supportedInteraction",
+                "valueCode": "create"
+              }]
+            }]
+          }
+          EOF
+
+          cat > "$RESULTS_DIR/subscription.json" <<EOF
+          {
+            "resourceType": "Subscription",
+            "status": "requested",
+            "reason": "Inferno R4 backport rest-hook subscription workflow",
+            "meta": {
+              "profile": [
+                "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-subscription"
+              ]
+            },
+            "criteria": "$TOPIC_URL",
+            "channel": {
+              "type": "rest-hook",
+              "endpoint": "$INFERNO_BASE_URL/custom/$SUITE_ID/subscription/channel/notification_listener",
+              "payload": "application/fhir+json",
+              "header": ["Authorization: Bearer $ACCESS_TOKEN"],
+              "_payload": {
+                "extension": [{
+                  "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+                  "valueCode": "id-only"
+                }]
+              }
+            }
+          }
+          EOF
+
+          jq -Rs '{name: "subscription_resource", value: .}' "$RESULTS_DIR/subscription.json" > "$RESULTS_DIR/subscription-input.json"
+
+      - name: Seed subscription topic in HFS
+        run: |
+          TOPIC_STATUS="$(curl -sS -o "$RESULTS_DIR/topic-response.json" -w "%{http_code}" \
+            -X POST "$HFS_BASE_URL/Basic" \
+            -H "Content-Type: application/fhir+json; fhirVersion=4.0" \
+            -H "Accept: application/fhir+json; fhirVersion=4.0" \
+            --data-binary @"$RESULTS_DIR/topic.json")"
+
+          if [ "$TOPIC_STATUS" != "200" ] && [ "$TOPIC_STATUS" != "201" ]; then
+            echo "::error::create SubscriptionTopic returned HTTP $TOPIC_STATUS"
+            cat "$RESULTS_DIR/topic-response.json"
+            exit 1
+          fi
+
+      - name: Sanity-check shared Inferno stack
+        run: |
+          if ! curl -sf "$INFERNO_BASE_URL/api/test_suites" > /dev/null; then
+            echo "Shared Inferno stack not reachable at $INFERNO_BASE_URL"
+            exit 1
+          fi
+
+      - name: Create Inferno test session
+        run: |
+          for attempt in $(seq 1 5); do
+            SESSION_RESPONSE=$(curl -s -X POST "$INFERNO_BASE_URL/api/test_sessions?test_suite_id=$SUITE_ID")
+            SESSION_ID=$(echo "$SESSION_RESPONSE" | jq -r '.id' 2>/dev/null) || true
+
+            if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ]; then
+              break
+            fi
+            echo "Attempt $attempt/5: Failed to create test session: $SESSION_RESPONSE"
+            sleep $((attempt * 3))
+          done
+
+          if [ -z "${SESSION_ID:-}" ] || [ "$SESSION_ID" = "null" ]; then
+            echo "Failed to create test session after 5 attempts"
+            echo "$SESSION_RESPONSE"
+            exit 1
+          fi
+
+          echo "SESSION_ID=$SESSION_ID" >> "$GITHUB_ENV"
+          echo "$SESSION_RESPONSE" > "$RESULTS_DIR/session.json"
+
+      - name: Start Inferno subscription workflow
+        run: |
+          echo "INFERNO_LOG_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+          SUBSCRIPTION_INPUT="$(cat "$RESULTS_DIR/subscription-input.json")"
+          RUN_PAYLOAD="$(jq -n \
+            --arg session_id "$SESSION_ID" \
+            --arg group_id "$TEST_GROUP_ID" \
+            --arg url "$HFS_BASE_URL" \
+            --arg access_token "$ACCESS_TOKEN" \
+            --argjson subscription_input "$SUBSCRIPTION_INPUT" \
+            '{
+              test_session_id: $session_id,
+              test_group_id: $group_id,
+              inputs: [
+                {name: "url", value: $url},
+                {name: "smart_auth_info", value: "{\"auth_type\":\"public\"}"},
+                {name: "access_token", value: $access_token},
+                $subscription_input
+              ]
+            }')"
+
+          for attempt in $(seq 1 5); do
+            RUN_RESPONSE=$(curl -s -X POST "$INFERNO_BASE_URL/api/test_runs" \
+              -H "Content-Type: application/json" \
+              -d "$RUN_PAYLOAD")
+            RUN_ID=$(echo "$RUN_RESPONSE" | jq -r '.id' 2>/dev/null) || true
+
+            if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+              break
+            fi
+            echo "Attempt $attempt/5: Failed to start test run: $RUN_RESPONSE"
+            sleep $((attempt * 3))
+          done
+
+          if [ -z "${RUN_ID:-}" ] || [ "$RUN_ID" = "null" ]; then
+            echo "Failed to start test run after 5 attempts"
+            echo "$RUN_RESPONSE"
+            exit 1
+          fi
+
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          echo "$RUN_RESPONSE" > "$RESULTS_DIR/run.json"
+
+      - name: Trigger subscription event and finish Inferno wait
+        run: |
+          WAITING=0
+          for i in {1..60}; do
+            STATUS_RESPONSE=$(curl -s "$INFERNO_BASE_URL/api/test_runs/$RUN_ID")
+            RUN_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status' 2>/dev/null) || true
+            RESULTS=$(curl -s "$INFERNO_BASE_URL/api/test_runs/$RUN_ID/results")
+            echo "$RESULTS" > "$RESULTS_DIR/results.json"
+
+            if [ "$RUN_STATUS" = "waiting" ]; then
+              WAITING=1
+              break
+            fi
+            if [ "$RUN_STATUS" = "done" ]; then
+              echo "Inferno run completed before event trigger"
+              break
+            fi
+            echo "Poll $i/60: Status=$RUN_STATUS; waiting for notification-delivery wait state"
+            sleep 5
+          done
+
+          if [ "$WAITING" -ne 1 ]; then
+            echo "::error::Inferno run did not reach waiting state"
+            cat "$RESULTS_DIR/results.json"
+            exit 1
+          fi
+
+          cat > "$RESULTS_DIR/encounter.json" <<EOF
+          {
+            "resourceType": "Encounter",
+            "id": "$ENCOUNTER_ID",
+            "status": "in-progress"
+          }
+          EOF
+
+          ENCOUNTER_STATUS="$(curl -sS -o "$RESULTS_DIR/encounter-response.json" -w "%{http_code}" \
+            -X POST "$HFS_BASE_URL/Encounter" \
+            -H "Content-Type: application/fhir+json; fhirVersion=4.0" \
+            -H "Accept: application/fhir+json; fhirVersion=4.0" \
+            --data-binary @"$RESULTS_DIR/encounter.json")"
+
+          if [ "$ENCOUNTER_STATUS" != "200" ] && [ "$ENCOUNTER_STATUS" != "201" ]; then
+            echo "::error::create Encounter returned HTTP $ENCOUNTER_STATUS"
+            cat "$RESULTS_DIR/encounter-response.json"
+            exit 1
+          fi
+
+          sleep 15
+          CONFIRMATION_URL="$INFERNO_BASE_URL/custom/$SUITE_ID/resume_pass?token=notification%20$ACCESS_TOKEN"
+          curl -sf "$CONFIRMATION_URL" > "$RESULTS_DIR/resume-response.txt"
+
+      - name: Poll Inferno results
+        run: |
+          MAX_POLLS=120
+          POLL_INTERVAL=10
+          API_ERRORS=0
+
+          for i in $(seq 1 $MAX_POLLS); do
+            STATUS_RESPONSE=$(curl -s "$INFERNO_BASE_URL/api/test_runs/$RUN_ID")
+            RUN_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status' 2>/dev/null) || true
+
+            if [ -z "$RUN_STATUS" ] || [ "$RUN_STATUS" = "null" ]; then
+              API_ERRORS=$((API_ERRORS + 1))
+              echo "Poll $i/$MAX_POLLS: WARNING - Inferno API returned non-JSON (error $API_ERRORS)"
+              echo "  Response (first 200 chars): ${STATUS_RESPONSE:0:200}"
+              if [ "$API_ERRORS" -ge 5 ]; then
+                echo "::error::Inferno API failed $API_ERRORS consecutive times"
+                tail -50 "$HFS_LOG"
+                exit 1
+              fi
+              sleep "$POLL_INTERVAL"
+              continue
+            fi
+            API_ERRORS=0
+
+            RESULTS=$(curl -s "$INFERNO_BASE_URL/api/test_runs/$RUN_ID/results")
+            echo "$RESULTS" > "$RESULTS_DIR/results.json"
+            TOTAL=$(echo "$RESULTS" | jq '[.[] | select(.test_id)] | length' 2>/dev/null) || TOTAL="?"
+            PASS=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "pass")] | length' 2>/dev/null) || PASS="?"
+            FAIL=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "fail")] | length' 2>/dev/null) || FAIL="?"
+            ERROR=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "error")] | length' 2>/dev/null) || ERROR="?"
+
+            echo "Poll $i/$MAX_POLLS: Status=$RUN_STATUS Total=$TOTAL Pass=$PASS Fail=$FAIL Error=$ERROR"
+
+            if [ "$RUN_STATUS" = "done" ]; then
+              exit 0
+            fi
+
+            sleep "$POLL_INTERVAL"
+          done
+
+          echo "::error::Inferno subscription workflow timed out"
+          exit 1
+
+      - name: Check test results
+        run: |
+          if [ ! -f "$RESULTS_DIR/results.json" ]; then
+            echo "::error::No results file found"
+            exit 1
+          fi
+
+          RESULTS=$(cat "$RESULTS_DIR/results.json")
+          FAILURES=$(echo "$RESULTS" | jq '[.[] | select(.test_id and (.result == "fail" or .result == "error"))] | length')
+          echo "Failures: $FAILURES"
+
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "::error::$FAILURES Inferno subscription test(s) failed"
+            echo "$RESULTS" | jq -r '.[] | select(.test_id and (.result == "fail" or .result == "error")) | "  \(.test_id): \(.result) - \(.result_message // "No message" | .[0:200])"'
+            exit 1
+          fi
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          echo "## Inferno Subscriptions R4 Server Workflow (${{ matrix.backend }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RESULTS_DIR/results.json" ]; then
+            RESULTS=$(cat "$RESULTS_DIR/results.json")
+            TOTAL=$(echo "$RESULTS" | jq '[.[] | select(.test_id)] | length')
+            PASS=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "pass")] | length')
+            FAIL=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "fail")] | length')
+            ERROR=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "error")] | length')
+            SKIP=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "skip")] | length')
+            OMIT=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "omit")] | length')
+
+            echo "| Status | Count |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Pass | $PASS |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Fail | $FAIL |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Error | $ERROR |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Skip | $SKIP |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Omit | $OMIT |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Total | $TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+
+            if [ "$FAIL" -gt 0 ] || [ "$ERROR" -gt 0 ]; then
+              echo "### Failed/Error Tests" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "$RESULTS" | jq -r '.[] | select((.result == "fail" or .result == "error") and .test_id) | "- **\(.test_id)**: \(.result) - \(.result_message // "No message" | .[0:200])"' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "No results file found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Capture Inferno container logs
+        if: always()
+        run: |
+          mkdir -p "$RESULTS_DIR/inferno-container-logs"
+
+          PROJECT="${INFERNO_COMPOSE_PROJECT:-inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}}"
+          echo "$PROJECT" > "$RESULTS_DIR/inferno-container-logs/project.txt"
+
+          IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
+          if [ -z "$IDS" ]; then
+            echo "No Inferno containers found for project $PROJECT" > "$RESULTS_DIR/inferno-container-logs/no-containers.txt"
+            exit 0
+          fi
+
+          for ID in $IDS; do
+            SERVICE=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$ID" 2>/dev/null || echo unknown)
+            NAME=$(docker inspect -f '{{ .Name }}' "$ID" 2>/dev/null | sed 's#^/##')
+
+            if [ -z "$NAME" ]; then
+              NAME="$ID"
+            fi
+
+            OUT="$RESULTS_DIR/inferno-container-logs/${SERVICE}-${NAME}.log"
+            docker inspect "$ID" > "$RESULTS_DIR/inferno-container-logs/${SERVICE}-${NAME}.inspect.json" 2>&1 || true
+
+            if [ -n "${INFERNO_LOG_SINCE:-}" ]; then
+              docker logs --timestamps --since "$INFERNO_LOG_SINCE" "$ID" > "$OUT" 2>&1 || true
+            else
+              docker logs --timestamps "$ID" > "$OUT" 2>&1 || true
+            fi
+          done
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: inferno-subscription-results-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: inferno-subscription-results/${{ matrix.backend }}/
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Stopping HFS..."
+          if [ -f /tmp/hfs-inferno-subscriptions-${{ matrix.backend }}.pid ]; then
+            HFS_PID=$(cat /tmp/hfs-inferno-subscriptions-${{ matrix.backend }}.pid)
+            kill -INT "$HFS_PID" 2>/dev/null || true
+            for _ in {1..50}; do
+              if kill -0 "$HFS_PID" 2>/dev/null; then
+                sleep 0.2
+              else
+                break
+              fi
+            done
+            kill -9 "$HFS_PID" 2>/dev/null || true
+            rm -f /tmp/hfs-inferno-subscriptions-${{ matrix.backend }}.pid
+          fi
+
+          echo "Stopping backend containers..."
+          docker rm -f "${ES_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
+
+  inferno-stack-down:
+    name: Stop Shared Inferno Subscriptions Stack
+    needs: [inferno-stack-up, inferno-subscription-test]
+    if: always() && needs.inferno-stack-up.result != 'skipped'
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Tear down Inferno stack by compose project label
+        run: |
+          PROJECT="${{ needs.inferno-stack-up.outputs.project }}"
+          if [ -z "$PROJECT" ]; then
+            PROJECT="inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
+          fi
+          echo "Tearing down compose project: $PROJECT"
+
+          IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
+          if [ -n "$IDS" ]; then
+            docker rm -f $IDS
+          fi
+
+          NETS=$(docker network ls --filter "label=com.docker.compose.project=$PROJECT" -q)
+          if [ -n "$NETS" ]; then
+            docker network rm $NETS || true
+          fi
+
+          VOLS=$(docker volume ls --filter "label=com.docker.compose.project=$PROJECT" -q)
+          if [ -n "$VOLS" ]; then
+            docker volume rm $VOLS || true
+          fi
+
+          echo "Inferno subscriptions stack teardown complete"

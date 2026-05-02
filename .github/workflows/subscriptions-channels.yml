@@ -5,6 +5,7 @@ name: Subscriptions Channel Integration
 #                            Catches Class 1 (broken single-version builds).
 #   32 rest-hook jobs      — one per enabled runtime version per subset.
 #   32 websocket jobs      — same shape. Drives HFS_TEST_FHIR_VERSION.
+#   32 messaging jobs      — same shape. FHIR Messaging channel (Bundle.type=message).
 
 on:
   workflow_dispatch:
@@ -83,8 +84,12 @@ jobs:
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
 
       - name: Run unit tests
+        # Keep default features (R4 + sqlite + audit) and add the matrix's
+        # extra FHIR versions on top. helios-audit is structurally R4-only,
+        # so dropping defaults breaks builds; this matrix exercises adding
+        # additional versions to the R4 baseline.
         run: |
-          cargo test --no-default-features \
+          cargo test \
             --features "${{ matrix.features }}" \
             -p helios-subscriptions -p helios-rest -p helios-persistence -p helios-fhirpath
 
@@ -120,7 +125,7 @@ jobs:
         env:
           HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
         run: |
-          cargo test -p helios-subscriptions --no-default-features \
+          cargo test -p helios-subscriptions \
             --features "${{ matrix.features }}" --test rest_hook_integration
 
   websocket-integration:
@@ -155,5 +160,75 @@ jobs:
         env:
           HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
         run: |
-          cargo test -p helios-subscriptions --no-default-features \
+          cargo test -p helios-subscriptions \
             --features "${{ matrix.features }}" --test websocket_integration
+
+  email-integration:
+    name: Email (${{ matrix.build_key }} / ${{ matrix.fhir_version }})
+    needs: matrix-setup
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.matrix-setup.outputs.integration-matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust linker (Linux)
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Run subscriptions email integration test
+        env:
+          HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
+        run: |
+          cargo test -p helios-subscriptions \
+            --features "${{ matrix.features }}" --test email_integration
+
+  messaging-integration:
+    name: Messaging (${{ matrix.build_key }} / ${{ matrix.fhir_version }})
+    needs: matrix-setup
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.matrix-setup.outputs.integration-matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust linker (Linux)
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Run subscriptions messaging integration test
+        env:
+          HFS_TEST_FHIR_VERSION: ${{ matrix.fhir_version }}
+        run: |
+          cargo test -p helios-subscriptions \
+            --features "${{ matrix.features }}" --test messaging_integration

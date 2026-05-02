@@ -1415,6 +1415,7 @@ impl IntoEvaluationResult for PrecisionInstant {
         EvaluationResult::DateTime(
             self.inner.original_string.to_string(),
             Some(TypeInfoResult::new("FHIR", "instant")),
+            None,
         )
     }
 }
@@ -2794,49 +2795,49 @@ where
     E: IntoEvaluationResult + Clone,
 {
     fn to_evaluation_result(&self) -> EvaluationResult {
+        use helios_fhirpath_support::PrimitiveElement;
         use std::any::TypeId;
+
+        // Build PrimitiveElement metadata from id/extension (used when value is also present)
+        let primitive_meta = if self.id.is_some() || self.extension.is_some() {
+            let mut meta = PrimitiveElement::default();
+            if let Some(id) = &self.id {
+                meta.id = Some(id.clone());
+            }
+            if let Some(ext) = &self.extension {
+                meta.extension = ext.iter().map(|e| e.to_evaluation_result()).collect();
+            }
+            if !meta.is_empty() { Some(meta) } else { None }
+        } else {
+            None
+        };
 
         // Prioritize returning the primitive value if it exists
         if let Some(v) = &self.value {
             let result = v.to_evaluation_result();
             // For primitive values, we need to preserve FHIR type information
-            return match result {
-                EvaluationResult::Boolean(b, _) => {
-                    // Return FHIR boolean
-                    EvaluationResult::fhir_boolean(b)
-                }
-                EvaluationResult::Integer(i, _) => {
-                    // Return FHIR integer
-                    EvaluationResult::fhir_integer(i)
-                }
+            let typed = match result {
+                EvaluationResult::Boolean(b, _, _) => EvaluationResult::fhir_boolean(b),
+                EvaluationResult::Integer(i, _, _) => EvaluationResult::fhir_integer(i),
                 #[cfg(not(any(feature = "R4", feature = "R4B")))]
-                EvaluationResult::Integer64(i, _) => {
-                    // Return FHIR integer64 (R5 and above)
-                    EvaluationResult::fhir_integer64(i)
-                }
-                EvaluationResult::String(s, _) => {
-                    // Determine the FHIR type name based on V's type
-                    let fhir_type_name = if TypeId::of::<V>() == TypeId::of::<String>() {
-                        // For strings, we need more context to determine the exact FHIR type
-                        // Default to "string" but this could be date, dateTime, etc.
-                        "string"
-                    } else {
-                        // Default fallback
-                        "string"
-                    };
-                    EvaluationResult::fhir_string(s, fhir_type_name)
-                }
-                EvaluationResult::DateTime(dt, type_info) => {
-                    // Check if V is PrecisionInstant - if so, this is an instant
+                EvaluationResult::Integer64(i, _, _) => EvaluationResult::fhir_integer64(i),
+                EvaluationResult::String(s, _, _) => EvaluationResult::fhir_string(s, "string"),
+                EvaluationResult::DateTime(dt, type_info, _) => {
                     if TypeId::of::<V>() == TypeId::of::<PrecisionInstant>() {
-                        // Return as FHIR instant
-                        EvaluationResult::DateTime(dt, Some(TypeInfoResult::new("FHIR", "instant")))
+                        EvaluationResult::DateTime(
+                            dt,
+                            Some(TypeInfoResult::new("FHIR", "instant")),
+                            None,
+                        )
                     } else {
-                        // Preserve original type info for PrecisionDateTime
-                        EvaluationResult::DateTime(dt, type_info)
+                        EvaluationResult::DateTime(dt, type_info, None)
                     }
                 }
-                _ => result, // For other types, return as-is
+                other => other,
+            };
+            return match primitive_meta {
+                Some(meta) => typed.with_primitive_element(meta),
+                None => typed,
             };
         } else if self.id.is_some() || self.extension.is_some() {
             // If value is None, but id or extension exist, return an Object with those
@@ -2871,11 +2872,30 @@ where
     E: IntoEvaluationResult + Clone,
 {
     fn to_evaluation_result(&self) -> EvaluationResult {
+        use helios_fhirpath_support::PrimitiveElement;
+
+        // Build PrimitiveElement metadata from id/extension
+        let primitive_meta = if self.id.is_some() || self.extension.is_some() {
+            let mut meta = PrimitiveElement::default();
+            if let Some(id) = &self.id {
+                meta.id = Some(id.clone());
+            }
+            if let Some(ext) = &self.extension {
+                meta.extension = ext.iter().map(|e| e.to_evaluation_result()).collect();
+            }
+            if !meta.is_empty() { Some(meta) } else { None }
+        } else {
+            None
+        };
+
         // Prioritize returning the primitive decimal value if it exists
         if let Some(precise_decimal) = &self.value {
             if let Some(decimal_val) = precise_decimal.value() {
-                // Return FHIR decimal
-                return EvaluationResult::fhir_decimal(decimal_val);
+                let result = EvaluationResult::fhir_decimal(decimal_val);
+                return match primitive_meta {
+                    Some(meta) => result.with_primitive_element(meta),
+                    None => result,
+                };
             }
             // If PreciseDecimal holds None for value, fall through to check id/extension
         }

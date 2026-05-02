@@ -104,9 +104,16 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
 tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
-testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "elastic_search", "minio"] }
 paste = "1.0"
+
+# `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.
+# Windows test runs don't need SIGTERM cleanup, so drop the feature there.
+[target.'cfg(not(windows))'.dev-dependencies]
+testcontainers = { version = "0.27", features = ["watchdog"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+testcontainers = { version = "0.27" }
 
 # Configuration advisor binary
 [[bin]]

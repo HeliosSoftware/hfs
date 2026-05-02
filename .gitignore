@@ -8,6 +8,7 @@ crates/sof/output.csv
 package-lock.json
 .prettierrc
 off
+.claude
 AGENTS.md
 .claude/
 

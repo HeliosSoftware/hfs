@@ -512,6 +512,290 @@ if [ "${WS_INPUT_OPEN:-0}" -eq 1 ]; then
 fi
 rm -f "$WS_INPUT_FIFO"
 
+# --- Email channel smoke (optional) ---------------------------------------
+# Requires HFS to be built with subscriptions, started with
+# HFS_SUBSCRIPTION_SMTP_* env vars, and a reachable mailpit HTTP API.
+EMAIL_SMOKE_TOTAL=0
+if [ -n "${MAILPIT_HTTP_URL:-}" ]; then
+  EMAIL_SUB_ID="sub-email-$ID_SUFFIX"
+  EMAIL_ENCOUNTER_ID="enc-email-$ID_SUFFIX"
+  EMAIL_RECIPIENT="smoke-$ID_SUFFIX@example.test"
+  EMAIL_DIR="$RESULTS_DIR/email"
+  mkdir -p "$EMAIL_DIR"
+
+  # Make sure mailpit is reachable before pushing a subscription through HFS.
+  if ! wait_for_health "$MAILPIT_HTTP_URL/api/v1/info" 15; then
+    log "MAILPIT_HTTP_URL set but /api/v1/info unreachable; skipping email smoke"
+  else
+    if [ "$USE_BACKPORT" -eq 1 ]; then
+      cat > "$HTTP_DIR/email-subscription.request.json" <<EOF
+{
+  "resourceType": "Subscription",
+  "id": "$EMAIL_SUB_ID",
+  "status": "requested",
+  "reason": "R4 backport email subscriptions smoke test",
+  "meta": {
+    "profile": [
+      "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-subscription"
+    ]
+  },
+  "criteria": "$TOPIC_URL",
+  "channel": {
+    "type": "email",
+    "endpoint": "mailto:$EMAIL_RECIPIENT",
+    "payload": "application/fhir+json",
+    "_payload": {
+      "extension": [{
+        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+        "valueCode": "id-only"
+      }]
+    }
+  }
+}
+EOF
+    else
+      cat > "$HTTP_DIR/email-subscription.request.json" <<EOF
+{
+  "resourceType": "Subscription",
+  "id": "$EMAIL_SUB_ID",
+  "status": "requested",
+  "reason": "Native email subscriptions smoke test",
+  "topic": "$TOPIC_URL",
+  "channelType": {
+    "system": "http://terminology.hl7.org/CodeSystem/subscription-channel-type",
+    "code": "email"
+  },
+  "endpoint": "mailto:$EMAIL_RECIPIENT",
+  "contentType": "application/fhir+json",
+  "content": "id-only"
+}
+EOF
+    fi
+
+    EMAIL_SUB_STATUS="$(curl -sS -o "$HTTP_DIR/email-subscription.response.json" -w "%{http_code}" \
+      -X POST "$BASE_URL/Subscription" \
+      -H "Content-Type: $FHIR_CT" \
+      -H "Accept: $FHIR_ACCEPT" \
+      --data-binary @"$HTTP_DIR/email-subscription.request.json")"
+
+    if [ "$EMAIL_SUB_STATUS" != "200" ] && [ "$EMAIL_SUB_STATUS" != "201" ]; then
+      log "email Subscription creation returned $EMAIL_SUB_STATUS — email channel likely unsupported by this HFS; skipping email smoke"
+    else
+      # Poll mailpit for the handshake email addressed to our recipient.
+      wait_for_mailpit_email() {
+        local subject_match="$1"
+        local timeout_secs="$2"
+        local label="$3"
+        local match_file="$EMAIL_DIR/${label}-messages.json"
+        for _ in $(seq 1 "$timeout_secs"); do
+          curl -sf "$MAILPIT_HTTP_URL/api/v1/search?query=$(printf '%s' "to:$EMAIL_RECIPIENT subject:\"$subject_match\"" | jq -sRr @uri)" \
+            -o "$match_file" 2>/dev/null || true
+          if [ -s "$match_file" ]; then
+            local count
+            count="$(jq -r '.messages | length' "$match_file" 2>/dev/null || echo 0)"
+            if [ "${count:-0}" -ge 1 ]; then
+              return 0
+            fi
+          fi
+          sleep 1
+        done
+        fail "timed out waiting for mailpit email labelled '$label' (subject ~ $subject_match)"
+      }
+
+      wait_for_mailpit_email "handshake" 30 "handshake"
+
+      cat > "$HTTP_DIR/email-encounter.request.json" <<EOF
+{
+  "resourceType": "Encounter",
+  "id": "$EMAIL_ENCOUNTER_ID",
+  "status": "in-progress"
+}
+EOF
+
+      EMAIL_ENCOUNTER_STATUS="$(curl -sS -o "$HTTP_DIR/email-encounter.response.json" -w "%{http_code}" \
+        -X POST "$BASE_URL/Encounter" \
+        -H "Content-Type: $FHIR_CT" \
+        -H "Accept: $FHIR_ACCEPT" \
+        --data-binary @"$HTTP_DIR/email-encounter.request.json")"
+      expect_created "$EMAIL_ENCOUNTER_STATUS" "create Encounter for email smoke" "$HTTP_DIR/email-encounter.response.json"
+
+      wait_for_mailpit_email "event-notification" 30 "event-notification"
+
+      # Pull the handshake + event-notification emails and fetch the notification.json
+      # attachment for bundle-shape assertions.
+      fetch_mailpit_attachment() {
+        local label="$1"
+        local out_file="$2"
+        local msg_list_file="$EMAIL_DIR/${label}-messages.json"
+        local message_id part_id
+        message_id="$(jq -r '.messages[0].ID' "$msg_list_file" 2>/dev/null || echo "")"
+        if [ -z "$message_id" ] || [ "$message_id" = "null" ]; then
+          fail "mailpit did not record a message id for '$label'"
+        fi
+        curl -sf "$MAILPIT_HTTP_URL/api/v1/message/$message_id" \
+          -o "$EMAIL_DIR/${label}.detail.json" || fail "failed to fetch mailpit message $message_id"
+        part_id="$(jq -r '.Attachments[] | select(.FileName=="notification.json") | .PartID' \
+          "$EMAIL_DIR/${label}.detail.json" | head -n 1)"
+        if [ -z "$part_id" ] || [ "$part_id" = "null" ]; then
+          fail "mailpit message $message_id has no notification.json attachment"
+        fi
+        curl -sf "$MAILPIT_HTTP_URL/api/v1/message/$message_id/part/$part_id" \
+          -o "$out_file" || fail "failed to fetch mailpit attachment for '$label'"
+      }
+
+      fetch_mailpit_attachment "handshake" "$EMAIL_DIR/handshake.json"
+      fetch_mailpit_attachment "event-notification" "$EMAIL_DIR/event-notification.json"
+
+      jq -e --arg expected "$EXPECTED_BUNDLE_TYPE" \
+        '.resourceType=="Bundle" and .type==$expected' "$EMAIL_DIR/handshake.json" >/dev/null \
+        || fail "email handshake bundle shape mismatch"
+      jq -e --arg expected_type "handshake" \
+        "($NOTIFICATION_TYPE_JQ)==\$expected_type" \
+        "$EMAIL_DIR/handshake.json" >/dev/null || fail "email handshake type missing"
+      jq -e --arg expected "$EXPECTED_BUNDLE_TYPE" \
+             --arg expected_type "event-notification" \
+             --arg focus "Encounter/$EMAIL_ENCOUNTER_ID" \
+        ".resourceType==\"Bundle\"
+         and .type==\$expected
+         and (($NOTIFICATION_TYPE_JQ)==\$expected_type)
+         and any(.entry[]?; (.request.url // \"\") == \$focus)" \
+        "$EMAIL_DIR/event-notification.json" >/dev/null \
+        || fail "email event bundle missing expected focus"
+
+      EMAIL_SMOKE_TOTAL=2
+      pass "email smoke assertions passed (handshake + event-notification)"
+    fi
+  fi
+else
+  log "MAILPIT_HTTP_URL not set; skipping email channel smoke"
+fi
+
+# --- FHIR Messaging channel smoke ----------------------------------------
+# Reuses the existing webhook capture but posts to /process-message so the
+# captured bundles can be filtered by .type == "message".
+MSG_SMOKE_TOTAL=0
+MSG_SUB_ID="sub-msg-$ID_SUFFIX"
+MSG_ENCOUNTER_ID="enc-msg-$ID_SUFFIX"
+MSG_DIR="$RESULTS_DIR/messaging"
+mkdir -p "$MSG_DIR"
+
+if [ "$USE_BACKPORT" -eq 1 ]; then
+  cat > "$HTTP_DIR/msg-subscription.request.json" <<EOF
+{
+  "resourceType": "Subscription",
+  "id": "$MSG_SUB_ID",
+  "status": "requested",
+  "reason": "R4 backport messaging subscriptions smoke test",
+  "meta": {
+    "profile": [
+      "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-subscription"
+    ]
+  },
+  "criteria": "$TOPIC_URL",
+  "channel": {
+    "type": "message",
+    "endpoint": "http://127.0.0.1:$WEBHOOK_PORT/process-message",
+    "payload": "application/fhir+json",
+    "_payload": {
+      "extension": [{
+        "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
+        "valueCode": "id-only"
+      }]
+    }
+  }
+}
+EOF
+else
+  cat > "$HTTP_DIR/msg-subscription.request.json" <<EOF
+{
+  "resourceType": "Subscription",
+  "id": "$MSG_SUB_ID",
+  "status": "requested",
+  "reason": "Native messaging subscriptions smoke test",
+  "topic": "$TOPIC_URL",
+  "channelType": {
+    "system": "http://terminology.hl7.org/CodeSystem/subscription-channel-type",
+    "code": "message"
+  },
+  "endpoint": "http://127.0.0.1:$WEBHOOK_PORT/process-message",
+  "contentType": "application/fhir+json",
+  "content": "id-only"
+}
+EOF
+fi
+
+MSG_SUB_STATUS="$(curl -sS -o "$HTTP_DIR/msg-subscription.response.json" -w "%{http_code}" \
+  -X POST "$BASE_URL/Subscription" \
+  -H "Content-Type: $FHIR_CT" \
+  -H "Accept: $FHIR_ACCEPT" \
+  --data-binary @"$HTTP_DIR/msg-subscription.request.json")"
+
+if [ "$MSG_SUB_STATUS" != "200" ] && [ "$MSG_SUB_STATUS" != "201" ]; then
+  log "messaging Subscription creation returned $MSG_SUB_STATUS — messaging channel likely not enabled on this HFS; skipping messaging smoke"
+else
+  MSG_HEADER_EVENT_JQ='
+    if (.entry[0].resource.eventCoding.code // "") != "" then
+      .entry[0].resource.eventCoding.code
+    elif (.entry[0].resource.eventUri // "") != "" then
+      "topic"
+    else
+      ""
+    end
+  '
+
+  wait_for_value_count "$REST_CAPTURE_FILE" \
+    "select(.type==\"message\") | $MSG_HEADER_EVENT_JQ | select(. == \"handshake\" or . == \"topic\")" \
+    1 30 "messaging handshake notification"
+
+  cat > "$HTTP_DIR/msg-encounter.request.json" <<EOF
+{
+  "resourceType": "Encounter",
+  "id": "$MSG_ENCOUNTER_ID",
+  "status": "in-progress"
+}
+EOF
+
+  MSG_ENC_STATUS="$(curl -sS -o "$HTTP_DIR/msg-encounter.response.json" -w "%{http_code}" \
+    -X POST "$BASE_URL/Encounter" \
+    -H "Content-Type: $FHIR_CT" \
+    -H "Accept: $FHIR_ACCEPT" \
+    --data-binary @"$HTTP_DIR/msg-encounter.request.json")"
+  expect_created "$MSG_ENC_STATUS" "create Encounter for messaging smoke" "$HTTP_DIR/msg-encounter.response.json"
+
+  # Wait for the messaging event-notification: a Bundle(type=message) whose
+  # MessageHeader points at our subscription's id.
+  wait_for_value_count "$REST_CAPTURE_FILE" \
+    "select(.type==\"message\") | select((.entry[0].resource.focus[0].reference // \"\") == \"Subscription/$MSG_SUB_ID\") | select(any(.entry[]?; (.request.url // \"\") == \"Encounter/$MSG_ENCOUNTER_ID\"))" \
+    1 30 "messaging event-notification"
+
+  # Capture the first messaging handshake + event bundles for shape assertions.
+  jq -c "select(.type==\"message\") | select((.entry[0].resource.focus[0].reference // \"\") == \"Subscription/$MSG_SUB_ID\") | select(all(.entry[]?; (.request.url // \"\") != \"Encounter/$MSG_ENCOUNTER_ID\"))" \
+    "$REST_CAPTURE_FILE" | head -n 1 > "$MSG_DIR/handshake.json"
+  jq -c "select(.type==\"message\") | select((.entry[0].resource.focus[0].reference // \"\") == \"Subscription/$MSG_SUB_ID\") | select(any(.entry[]?; (.request.url // \"\") == \"Encounter/$MSG_ENCOUNTER_ID\"))" \
+    "$REST_CAPTURE_FILE" | head -n 1 > "$MSG_DIR/event-notification.json"
+
+  [ -s "$MSG_DIR/handshake.json" ] || fail "missing captured messaging handshake bundle"
+  [ -s "$MSG_DIR/event-notification.json" ] || fail "missing captured messaging event bundle"
+
+  jq -e '
+    .resourceType=="Bundle" and .type=="message"
+    and .entry[0].resource.resourceType=="MessageHeader"
+    and ((.entry[0].resource.destination[0].endpoint // "") | endswith("/process-message"))
+    and ((.entry[0].resource.focus[0].reference // "") | startswith("Subscription/"))
+  ' "$MSG_DIR/handshake.json" >/dev/null \
+    || fail "messaging handshake bundle shape mismatch"
+
+  jq -e --arg focus "Encounter/$MSG_ENCOUNTER_ID" '
+    .resourceType=="Bundle" and .type=="message"
+    and .entry[0].resource.resourceType=="MessageHeader"
+    and any(.entry[]?; (.request.url // "") == $focus)
+  ' "$MSG_DIR/event-notification.json" >/dev/null \
+    || fail "messaging event bundle missing expected focus"
+
+  MSG_SMOKE_TOTAL=2
+  pass "messaging smoke assertions passed (handshake + event-notification)"
+fi
+
 REST_TOTAL="$(wc -l < "$REST_CAPTURE_FILE" 2>/dev/null | tr -d ' ')"
 WS_TOTAL="$(wc -l < "$WS_FRAMES" 2>/dev/null | tr -d ' ')"
 
@@ -519,6 +803,8 @@ cat >> "$SUMMARY_FILE" <<EOF
 
 - Rest-hook notifications captured: $REST_TOTAL
 - WebSocket frames captured: $WS_TOTAL
+- Email notifications captured: $EMAIL_SMOKE_TOTAL
+- Messaging notifications captured: $MSG_SMOKE_TOTAL
 
 All subscriptions smoke checks completed successfully.
 EOF

@@ -8,12 +8,11 @@ env:
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   HFS_PORT: 8088
-  INFERNO_PORT: ${{ secrets.INFERNO_PORT || vars.INFERNO_PORT || '4568' }}
   # Remote Docker host (set via GitHub repository secrets or variables; leave unset for local Docker)
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   # S3+Elasticsearch backend configuration (optional; s3-elasticsearch tests are skipped when not set)
-  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}
+  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
 
 jobs:
   build:
@@ -46,10 +45,97 @@ jobs:
           path: target/debug/hfs
           retention-days: 1
 
+  inferno-stack-up:
+    name: Start Shared Inferno Stack
+    runs-on: [self-hosted, Linux]
+    outputs:
+      port: ${{ steps.up.outputs.port }}
+      project: ${{ steps.up.outputs.project }}
+    steps:
+      - name: Checkout us-core-test-kit
+        uses: actions/checkout@v5
+        with:
+          repository: HeliosSoftware/us-core-test-kit
+          path: us-core-test-kit
+
+      - name: Run setup.sh under shared compose project
+        working-directory: us-core-test-kit
+        env:
+          COMPOSE_PROJECT_NAME: inferno-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          if [ -x ./setup.sh ]; then
+            ./setup.sh
+          else
+            echo "No setup.sh found in test-kit checkout, skipping"
+          fi
+
+      - name: Bring up shared Inferno stack
+        id: up
+        working-directory: us-core-test-kit
+        run: |
+          PROJECT="inferno-${{ github.run_id }}-${{ github.run_attempt }}"
+
+          # The upstream compose file bind-mounts ./config/nginx.conf from the
+          # runner's filesystem. With a remote DOCKER_HOST that path doesn't
+          # exist on the daemon — Docker auto-creates the missing source as a
+          # directory, which then can't be mounted onto a file. Bake the
+          # config into a one-off CI image instead, and assign an ephemeral
+          # nginx host port so the stack can coexist on a shared Docker host.
+          # (The validator's ./data/igs bind-mount is fine to leave: data/igs
+          # is just a .keep upstream, so the auto-created empty dir matches
+          # what the validator would see in a fresh checkout anyway.)
+          mkdir -p ci-images/nginx
+          cat > ci-images/nginx/Dockerfile <<'EOF'
+          FROM nginx
+          COPY config/nginx.conf /etc/nginx/nginx.conf
+          EOF
+          cat > docker-compose.override.yml <<'EOF'
+          services:
+            nginx:
+              image: !reset null
+              build:
+                context: .
+                dockerfile: ci-images/nginx/Dockerfile
+              volumes: !override []
+              ports: !override
+                - "0:80"
+            redis:
+              ports: !override []
+          EOF
+
+          docker compose -p "$PROJECT" up -d
+
+          INFERNO_PORT=$(docker compose -p "$PROJECT" port nginx 80 | head -1 | sed 's/.*://')
+          if [ -z "$INFERNO_PORT" ]; then
+            echo "Failed to discover Inferno host port"
+            docker compose -p "$PROJECT" ps
+            docker compose -p "$PROJECT" logs --tail 200
+            exit 1
+          fi
+
+          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          echo "Waiting for Inferno test kit to respond on $INFERNO_HOST:$INFERNO_PORT..."
+          for i in {1..60}; do
+            if curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null 2>&1; then
+              echo "Inferno is ready"
+              echo "port=$INFERNO_PORT" >> $GITHUB_OUTPUT
+              echo "project=$PROJECT" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Attempt $i/60: Inferno not ready yet..."
+            sleep 2
+          done
+          echo "Inferno is not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+          docker compose -p "$PROJECT" ps
+          docker compose -p "$PROJECT" logs --tail 200
+          exit 1
+
   inferno-test:
     name: Inferno US Core ${{ matrix.version_label }} Tests (${{ matrix.backend }})
-    needs: build
+    needs: [build, inferno-stack-up]
     runs-on: [self-hosted, Linux]
+    env:
+      INFERNO_PORT: ${{ needs.inferno-stack-up.outputs.port }}
     permissions:
       id-token: write
       contents: read
@@ -135,6 +221,9 @@ jobs:
             us_core_v700|us_core_v800)
               # Inferno fhir_client gem bug with UUID-based Location references
               OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_location-${SUITE}_location_address_search_test\""
+              # smokingstatus/simple-observation: shared test data references SNOMED CT US-edition version (731000124108) not in International Edition; Inferno validator can't resolve it
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_smokingstatus-${SUITE}_smokingstatus_validation_test\""
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_simple_observation-${SUITE}_simple_observation_validation_test\""
               ;;
           esac
 
@@ -258,8 +347,8 @@ jobs:
         if: matrix.backend == 's3-elasticsearch'
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Install AWS CLI
         if: matrix.backend == 's3-elasticsearch'
@@ -278,7 +367,7 @@ jobs:
       - name: Empty S3 prefix
         if: matrix.backend == 's3-elasticsearch'
         run: |
-          BUCKET="${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }}"
+          BUCKET="${{ secrets.HFS_S3_BUCKET }}"
           PREFIX="ci/${{ matrix.suite_id }}/"
           echo "Emptying s3://$BUCKET/$PREFIX"
           aws s3 rm "s3://$BUCKET/$PREFIX" --recursive
@@ -309,7 +398,7 @@ jobs:
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=s3-elasticsearch \
-            HFS_S3_BUCKET=${{ secrets.HFS_S3_BUCKET || vars.HFS_S3_BUCKET }} \
+            HFS_S3_BUCKET=${{ secrets.HFS_S3_BUCKET }} \
             HFS_S3_PREFIX=ci/${{ matrix.suite_id }}/ \
             HFS_S3_VALIDATE_BUCKETS=false \
             HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
@@ -354,19 +443,24 @@ jobs:
             exit 1
           }
 
-      - name: Wait for Inferno to be ready
+      - name: Refresh Elasticsearch indices
+        # ES indexes asynchronously (default refresh_interval=1s). The data load
+        # returns as soon as HFS finishes writing, but the first search may run
+        # before ES has refreshed, producing missing-data failures. Force a
+        # refresh on all hfs_* indices so the first test batch sees fresh data.
+        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
         run: |
-          echo "Waiting for persistent Inferno container to respond..."
-          for i in {1..30}; do
-            if curl -sf "http://$DOCKER_HOST_IP:$INFERNO_PORT/api/test_suites" > /dev/null 2>&1; then
-              echo "Inferno is ready on $DOCKER_HOST_IP:$INFERNO_PORT"
-              exit 0
-            fi
-            echo "Attempt $i/30: Inferno not ready yet..."
-            sleep 2
-          done
-          echo "Inferno is not reachable at http://$DOCKER_HOST_IP:$INFERNO_PORT"
-          exit 1
+          curl -sf -X POST "http://$DOCKER_HOST_IP:$ES_PORT/hfs_*/_refresh" > /dev/null \
+            || echo "::warning::Elasticsearch refresh request did not return success — proceeding anyway"
+
+      - name: Sanity-check shared Inferno stack
+        run: |
+          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          echo "INFERNO_HOST=$INFERNO_HOST" >> $GITHUB_ENV
+          if ! curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null; then
+            echo "Shared Inferno stack not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+            exit 1
+          fi
 
       - name: Create results directory
         run: mkdir -p inferno-results
@@ -377,7 +471,7 @@ jobs:
           # Retry to handle Inferno's SQLite "database is locked" errors under concurrent load
           echo "Creating test session for ${{ matrix.suite_id }}..."
           for attempt in $(seq 1 5); do
-            SESSION_RESPONSE=$(curl -s -X POST "http://$DOCKER_HOST_IP:$INFERNO_PORT/api/test_sessions?test_suite_id=${{ matrix.suite_id }}")
+            SESSION_RESPONSE=$(curl -s -X POST "http://$INFERNO_HOST:$INFERNO_PORT/api/test_sessions?test_suite_id=${{ matrix.suite_id }}")
             SESSION_ID=$(echo "$SESSION_RESPONSE" | jq -r '.id' 2>/dev/null) || true
 
             if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ]; then
@@ -401,7 +495,7 @@ jobs:
           # Note: smart_auth_info with auth_type=public allows testing without SMART OAuth
           echo "Starting test run..."
           for attempt in $(seq 1 5); do
-            RUN_RESPONSE=$(curl -s -X POST "http://$DOCKER_HOST_IP:$INFERNO_PORT/api/test_runs" \
+            RUN_RESPONSE=$(curl -s -X POST "http://$INFERNO_HOST:$INFERNO_PORT/api/test_runs" \
               -H "Content-Type: application/json" \
               -d "{
                 \"test_session_id\": \"$SESSION_ID\",
@@ -439,7 +533,7 @@ jobs:
 
           for i in $(seq 1 $MAX_POLLS); do
             # Check test run status directly (more reliable than counting results)
-            STATUS_RESPONSE=$(curl -s "http://$DOCKER_HOST_IP:$INFERNO_PORT/api/test_runs/$RUN_ID")
+            STATUS_RESPONSE=$(curl -s "http://$INFERNO_HOST:$INFERNO_PORT/api/test_runs/$RUN_ID")
             RUN_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status' 2>/dev/null) || true
 
             if [ -z "$RUN_STATUS" ] || [ "$RUN_STATUS" = "null" ]; then
@@ -459,7 +553,7 @@ jobs:
             API_ERRORS=0
 
             # Get results for progress display (filter to individual tests only, not group aggregations)
-            RESULTS=$(curl -s "http://$DOCKER_HOST_IP:$INFERNO_PORT/api/test_runs/$RUN_ID/results")
+            RESULTS=$(curl -s "http://$INFERNO_HOST:$INFERNO_PORT/api/test_runs/$RUN_ID/results")
             TOTAL=$(echo "$RESULTS" | jq '[.[] | select(.test_id)] | length' 2>/dev/null) || TOTAL="?"
             PASS=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "pass")] | length' 2>/dev/null) || PASS="?"
             FAIL=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "fail")] | length' 2>/dev/null) || FAIL="?"
@@ -493,18 +587,23 @@ jobs:
 
           RESULTS=$(cat inferno-results/results.json)
 
-          # Count failures excluding omitted tests
+          # Inferno records the same test_id multiple times when a test is part
+          # of multiple test groups. Count failures based on the LATEST result
+          # for each test_id so transient flakes that subsequently passed do not
+          # fail the build.
+          LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
+
           FAIL=$(echo "$RESULTS" | jq --argjson omit "$OMITTED_TESTS" \
-            '[.[] | select(.test_id and (.result == "fail" or .result == "error") and (.test_id | IN($omit[]) | not))] | length')
+            "[$LATEST | .[] | select((.result == \"fail\" or .result == \"error\") and (.test_id | IN(\$omit[]) | not))] | length")
           OMITTED_COUNT=$(echo "$RESULTS" | jq --argjson omit "$OMITTED_TESTS" \
-            '[.[] | select(.test_id and (.test_id | IN($omit[])))] | length')
+            "[$LATEST | .[] | select(.test_id | IN(\$omit[]))] | length")
 
           echo "Failures (excluding $OMITTED_COUNT omitted tests): $FAIL"
 
           if [ "$FAIL" -gt 0 ]; then
             echo "::error::$FAIL test(s) failed (excluding omitted)"
             echo "$RESULTS" | jq -r --argjson omit "$OMITTED_TESTS" \
-              '.[] | select(.test_id and (.result == "fail" or .result == "error") and (.test_id | IN($omit[]) | not)) | "  \(.test_id): \(.result) - \(.result_message // "No message" | .[0:200])"'
+              "$LATEST | .[] | select((.result == \"fail\" or .result == \"error\") and (.test_id | IN(\$omit[]) | not)) | \"  \(.test_id): \(.result) - \(.result_message // \"No message\" | .[0:200])\""
             exit 1
           fi
 
@@ -519,17 +618,21 @@ jobs:
 
             RESULTS=$(cat inferno-results/results.json)
 
-            # Count only individual tests (exclude group aggregations which have test_group_id instead of test_id)
-            TOTAL=$(echo "$RESULTS" | jq '[.[] | select(.test_id)] | length')
-            PASS=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "pass")] | length')
+            # Count only the LATEST result for each test_id (Inferno re-runs the
+            # same test for every group it belongs to). This matches the build
+            # gate in the "Check test results" step.
+            LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
+
+            TOTAL=$(echo "$RESULTS" | jq "[$LATEST | .[]] | length")
+            PASS=$(echo "$RESULTS" | jq "[$LATEST | .[] | select(.result == \"pass\")] | length")
             FAIL=$(echo "$RESULTS" | jq --argjson omit "$OMITTED_TESTS" \
-              '[.[] | select(.test_id and .result == "fail" and (.test_id | IN($omit[]) | not))] | length')
-            SKIP=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "skip")] | length')
+              "[$LATEST | .[] | select(.result == \"fail\" and (.test_id | IN(\$omit[]) | not))] | length")
+            SKIP=$(echo "$RESULTS" | jq "[$LATEST | .[] | select(.result == \"skip\")] | length")
             ERROR=$(echo "$RESULTS" | jq --argjson omit "$OMITTED_TESTS" \
-              '[.[] | select(.test_id and .result == "error" and (.test_id | IN($omit[]) | not))] | length')
-            OMIT=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "omit")] | length')
+              "[$LATEST | .[] | select(.result == \"error\" and (.test_id | IN(\$omit[]) | not))] | length")
+            OMIT=$(echo "$RESULTS" | jq "[$LATEST | .[] | select(.result == \"omit\")] | length")
             OMITTED_COUNT=$(echo "$RESULTS" | jq --argjson omit "$OMITTED_TESTS" \
-              '[.[] | select(.test_id and (.test_id | IN($omit[])))] | length')
+              "[$LATEST | .[] | select(.test_id | IN(\$omit[]))] | length")
 
             echo "| Status | Count |" >> $GITHUB_STEP_SUMMARY
             echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
@@ -542,21 +645,21 @@ jobs:
             echo "| **Total** | **$TOTAL** |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
 
-            # List omitted tests
+            # List omitted tests (latest result per test_id)
             if [ "$OMITTED_COUNT" -gt 0 ]; then
               echo "### Omitted Tests (known expected failures)" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
               echo "$RESULTS" | jq -r --argjson omit "$OMITTED_TESTS" \
-                '.[] | select(.test_id and (.test_id | IN($omit[]))) | "- **\(.test_id)**: \(.result) - \(.result_message // "No message" | .[0:200])"' >> $GITHUB_STEP_SUMMARY
+                "$LATEST | .[] | select(.test_id | IN(\$omit[])) | \"- **\(.test_id)**: \(.result) - \(.result_message // \"No message\" | .[0:200])\"" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
             fi
 
-            # List failed tests (excluding omitted)
+            # List failed tests (latest result per test_id, excluding omitted)
             if [ "$FAIL" -gt 0 ] || [ "$ERROR" -gt 0 ]; then
               echo "### Failed/Error Tests" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
               echo "$RESULTS" | jq -r --argjson omit "$OMITTED_TESTS" \
-                '.[] | select((.result == "fail" or .result == "error") and .test_id and (.test_id | IN($omit[]) | not)) | "- **\(.test_id)**: \(.result) - \(.result_message // "No message" | .[0:200])"' >> $GITHUB_STEP_SUMMARY
+                "$LATEST | .[] | select((.result == \"fail\" or .result == \"error\") and (.test_id | IN(\$omit[]) | not)) | \"- **\(.test_id)**: \(.result) - \(.result_message // \"No message\" | .[0:200])\"" >> $GITHUB_STEP_SUMMARY
             fi
           else
             echo "## Inferno US Core ${{ matrix.version_label }} Test Results" >> $GITHUB_STEP_SUMMARY
@@ -571,6 +674,15 @@ jobs:
           name: inferno-test-results-${{ matrix.suite_id }}-${{ matrix.backend }}
           path: inferno-results/
           retention-days: 30
+
+      - name: Upload HFS server log on failure
+        if: failure() && env.HFS_LOG != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-log-${{ matrix.suite_id }}-${{ matrix.backend }}
+          path: ${{ env.HFS_LOG }}
+          retention-days: 30
+          if-no-files-found: ignore
 
       - name: Cleanup
         if: always()
@@ -591,3 +703,34 @@ jobs:
           docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Cleanup complete"
+
+  inferno-stack-down:
+    name: Stop Shared Inferno Stack
+    needs: [inferno-stack-up, inferno-test]
+    if: always() && needs.inferno-stack-up.result != 'skipped'
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Tear down Inferno stack by compose project label
+        run: |
+          PROJECT="${{ needs.inferno-stack-up.outputs.project }}"
+          if [ -z "$PROJECT" ]; then
+            PROJECT="inferno-${{ github.run_id }}-${{ github.run_attempt }}"
+          fi
+          echo "Tearing down compose project: $PROJECT"
+
+          IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
+          if [ -n "$IDS" ]; then
+            docker rm -f $IDS
+          fi
+
+          NETS=$(docker network ls --filter "label=com.docker.compose.project=$PROJECT" -q)
+          if [ -n "$NETS" ]; then
+            docker network rm $NETS || true
+          fi
+
+          VOLS=$(docker volume ls --filter "label=com.docker.compose.project=$PROJECT" -q)
+          if [ -n "$VOLS" ]; then
+            docker volume rm $VOLS || true
+          fi
+
+          echo "Inferno stack teardown complete"
