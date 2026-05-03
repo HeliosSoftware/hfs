@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ClinicalUseDefinition"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-04-22T02:59:29.647+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -1181,11 +1181,11 @@
     <valueCode value="anonymous"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/ClinicalUseDefinition"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="ClinicalUseDefinition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-04-22T02:59:29+00:00"/>
   <publisher value="HL7 International / Biomedical Research and Regulation"/>
   <contact>
     <telecom>
@@ -1207,7 +1207,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -1457,7 +1457,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1662,7 +1662,7 @@
         </extension>
         <strength value="required"/>
         <description value="Overall defining type of this clinical use definition."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/clinical-use-definition-type|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/clinical-use-definition-type|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="idmp"/>
@@ -3850,7 +3850,7 @@
         </extension>
         <strength value="required"/>
         <description value="Overall defining type of this clinical use definition."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/clinical-use-definition-type|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/clinical-use-definition-type|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="idmp"/>

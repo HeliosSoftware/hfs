@@ -260,13 +260,13 @@
     <valueCode value="cqi"/>
   </extension>
   <url value="http://hl7.org/fhir/OperationDefinition/Measure-evaluate-measure"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="EvaluateMeasure"/>
   <title value="Evaluate Measure"/>
   <status value="draft"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-04-22T02:59:29+00:00"/>
   <publisher value="HL7 International / Clinical Quality Information"/>
   <contact>
     <telecom>
@@ -361,7 +361,7 @@
     <type value="code"/>
     <binding>
       <strength value="required"/>
-      <valueSet value="http://hl7.org/fhir/ValueSet/measure-report-evaluation-type|6.0.0-ballot3"/>
+      <valueSet value="http://hl7.org/fhir/ValueSet/measure-report-evaluation-type|6.0.0-ballot4"/>
     </binding>
   </parameter>
   <parameter>

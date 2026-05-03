@@ -16,12 +16,12 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Product",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "Product",
   "title": "product",
   "status": "draft",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-04-22T02:59:29+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -53,7 +53,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "rim",
@@ -150,7 +150,7 @@
           ],
           "strength": "required",
           "description": "Codes identifying the lifecycle stage of a product.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/product-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/product-status|6.0.0-ballot4"
         },
         "mapping": [
           {

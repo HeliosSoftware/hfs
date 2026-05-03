@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "OperationOutcome",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-04-22T02:59:29.647+00:00"
   },
   "text": {
     "status": "generated",
@@ -31,11 +31,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/OperationOutcome",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "OperationOutcome",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-04-22T02:59:29+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -59,7 +59,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "w5",
@@ -291,7 +291,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -669,7 +669,7 @@
           ],
           "strength": "required",
           "description": "How the issue affects the success of the action.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/issue-severity|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/issue-severity|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -722,7 +722,7 @@
           ],
           "strength": "required",
           "description": "A code that describes the type of issue.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/issue-type|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/issue-type|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -988,7 +988,7 @@
           ],
           "strength": "required",
           "description": "How the issue affects the success of the action.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/issue-severity|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/issue-severity|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1027,7 +1027,7 @@
           ],
           "strength": "required",
           "description": "A code that describes the type of issue.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/issue-type|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/issue-type|6.0.0-ballot4"
         },
         "mapping": [
           {

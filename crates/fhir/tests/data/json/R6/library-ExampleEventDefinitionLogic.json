@@ -12,7 +12,7 @@
     }
   ],
   "url": "http://hl7.org/fhir/EventDefinition/ExampleEventDefinitionLogic",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "ExampleEventDefinitionLogic",
   "title": "Example EventDefinition Logic",
   "status": "active",

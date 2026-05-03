@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "Goal",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-04-22T02:59:29.647+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Goal",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "Goal",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-04-22T02:59:29+00:00",
   "publisher": "HL7 International / Patient Care",
   "contact": [
     {
@@ -63,7 +63,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "w5",
@@ -299,7 +299,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -560,7 +560,7 @@
           ],
           "strength": "required",
           "description": "Codes that reflect the current state of a goal and whether the goal is still being targeted.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/goal-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/goal-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1144,7 +1144,7 @@
           ],
           "strength": "required",
           "description": "Codes that identify whether the goal has been accepted or not.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/goal-accept-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/goal-accept-status|6.0.0-ballot4"
         }
       },
       {
@@ -1834,7 +1834,7 @@
           ],
           "strength": "required",
           "description": "Codes that reflect the current state of a goal and whether the goal is still being targeted.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/goal-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/goal-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -2157,7 +2157,7 @@
           ],
           "strength": "required",
           "description": "Codes that identify whether the goal has been accepted or not.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/goal-accept-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/goal-accept-status|6.0.0-ballot4"
         }
       },
       {

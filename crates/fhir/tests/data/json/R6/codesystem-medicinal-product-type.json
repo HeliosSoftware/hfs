@@ -2,11 +2,11 @@
   "resourceType": "CodeSystem",
   "id": "medicinal-product-type",
   "meta": {
-    "lastUpdated": "2025-12-17T20:50:17.012+11:00"
+    "lastUpdated": "2026-04-22T13:59:29.647+11:00"
   },
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem medicinal-product-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"medicinal-product-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcmedicinal-product-type\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eLast updated: 2021-01-05T10:01:24.148+11:00\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/medicinal-product-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eMedicinalProduct\u003ca name\u003d\"medicinal-product-type-MedicinalProduct\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMedicinal Product\u003c/td\u003e\u003ctd\u003eA standard medicinal product.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eInvestigationalProduct\u003ca name\u003d\"medicinal-product-type-InvestigationalProduct\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eInvestigational Medicinal Product\u003c/td\u003e\u003ctd\u003eAn investigational medicinal product.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem medicinal-product-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"medicinal-product-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcmedicinal-product-type\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eLast updated: 2021-01-05T10:01:24.148+11:00\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/medicinal-product-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eMedicinalProduct\u003ca name\u003d\"medicinal-product-type-MedicinalProduct\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMedicinal Product\u003c/td\u003e\u003ctd\u003eAny substance or combination of substances that may be administered to human beings (or animals) for treating or preventing disease, or with the intent to make a medical diagnosis or to restore, correct or modify physiological functions. Its regulatory status is authorized/marketed for commercial use.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eInvestigationalProduct\u003ca name\u003d\"medicinal-product-type-InvestigationalProduct\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eInvestigational Medicinal Product\u003c/td\u003e\u003ctd\u003eA medicinal product which is being tested or used as a reference, including as a placebo, in a clinical trial. Its regulatory status is under evaluation in a clinical trial; might or might not have marketing authorization.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -29,7 +29,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.4.1916"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "MedicinalProductType",
   "title": "Medicinal Product Type",
   "status": "active",
@@ -69,12 +69,12 @@
     {
       "code": "MedicinalProduct",
       "display": "Medicinal Product",
-      "definition": "A standard medicinal product."
+      "definition": "Any substance or combination of substances that may be administered to human beings (or animals) for treating or preventing disease, or with the intent to make a medical diagnosis or to restore, correct or modify physiological functions. Its regulatory status is authorized/marketed for commercial use."
     },
     {
       "code": "InvestigationalProduct",
       "display": "Investigational Medicinal Product",
-      "definition": "An investigational medicinal product."
+      "definition": "A medicinal product which is being tested or used as a reference, including as a placebo, in a clinical trial. Its regulatory status is under evaluation in a clinical trial; might or might not have marketing authorization."
     }
   ]
 }

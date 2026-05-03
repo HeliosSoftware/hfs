@@ -17,13 +17,13 @@
       <a name="hc101"> </a>
       <p>Mapping from 
         <a href="valueset-address-use.html">AddressUse</a> to 
-        <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+        <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-AddressUse.html">AddressUse</a>
       </p>
       <br/>
       <p>
         <b>Group 1 </b>Mapping from 
         <a href="codesystem-address-use.html">AddressUse</a> to 
-        <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+        <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
       </p>
       <table class="grid">
         <tr>
@@ -87,7 +87,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:uuid:53cd62ee-033e-414c-9f58-3ca97b5ffc3b"/>
   </identifier>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="FHIRv3AddressUse"/>
   <title value="FHIR/v3 Address Use Mapping"/>
   <status value="draft"/>

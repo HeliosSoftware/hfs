@@ -142,44 +142,6 @@
         </tr>
         <tr>
           <td>IN</td>
-          <td>organization</td>
-          <td/>
-          <td>0..1</td>
-          <td>
-            <a href="datatypes.html#string">string</a>
-            <br/>(
-            <a href="search.html#reference">reference</a>)
-          </td>
-          <td/>
-          <td>
-            <div>
-              <p>Reference to an 
-                <a href="organization.html">Organization</a> for which the gaps in care report will be created. Either 'organization' or 'organizationResource' SHALL be provided, but not both.
-              </p>
-
-            </div>
-          </td>
-        </tr>
-        <tr>
-          <td>IN</td>
-          <td>organizationResource</td>
-          <td/>
-          <td>0..1</td>
-          <td>
-            <a href="organization.html">Organization</a>
-          </td>
-          <td/>
-          <td>
-            <div>
-              <p>Organization for which the gaps in care report will be created is provided as an Organization resource. This is intended to support the use case in which the organization information is not on the server performing the evaluation, for example an 
-                <a href="clinicalreasoning-quality-reporting.html#ad-hoc-organizations">ad-hoc group of practitioners</a> that are part of a provider group. Either 'organization' or 'organizationResource' SHALL be provided, but not both.
-              </p>
-
-            </div>
-          </td>
-        </tr>
-        <tr>
-          <td>IN</td>
           <td>location</td>
           <td/>
           <td>0..*</td>
@@ -192,6 +154,46 @@
           <td>
             <div>
               <p>The location(s) for which the gaps in care report will be run. This parameter is reflected in the location element of the resulting MeasureReport(s).</p>
+
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <td>IN</td>
+          <td>reporter</td>
+          <td/>
+          <td>0..1</td>
+          <td>
+            <a href="datatypes.html#string">string</a>
+            <br/>(
+            <a href="search.html#reference">reference</a>)
+          </td>
+          <td/>
+          <td>
+            <div>
+              <p>The provider for which the report will be run. This may be a reference to a Practitioner, PractitionerRole, or Organization. If specified, systems MAY use this information to determine subjects for which the measure will be calculated, but how subjects are determined is implementation-specific. This parameter is reflected in the reporter element of the resulting MeasureReport(s). This parameter cannot be used with the reporterResource parameter.</p>
+
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <td>IN</td>
+          <td>reporterResource</td>
+          <td/>
+          <td>0..1</td>
+          <td>
+            <a href="practitioner.html">Practitioner</a> | 
+            <a href="practitionerrole.html">PractitionerRole</a> | 
+            <a href="organization.html">Organization</a>
+            <br/>(
+            <a href="search.html#reference">reference</a>)
+          </td>
+          <td/>
+          <td>
+            <div>
+              <p>The provider for which the report will be run, provided as a Practitioner, PractitionerRole, or Organization resource. This is intended to support the use case in which the organization information is not on the server performing the evaluation, for example an 
+                <a href="clinicalreasoning-quality-reporting.html#ad-hoc-organizations">ad-hoc group of practitioners</a> that are part of a provider group. This parameter is reflected in the reporter element of the resulting MeasureReport(s). This parameter cannot be used with the reporter parameter.
+              </p>
 
             </div>
           </td>
@@ -301,13 +303,13 @@
     <valueCode value="cqi"/>
   </extension>
   <url value="http://hl7.org/fhir/OperationDefinition/Measure-care-gaps"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="CareGaps"/>
   <title value="Care Gaps"/>
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-04-22T02:59:29+00:00"/>
   <publisher value="HL7 International / Clinical Quality Information"/>
   <contact>
     <telecom>
@@ -391,29 +393,39 @@
     <searchType value="reference"/>
   </parameter>
   <parameter>
-    <name value="organization"/>
-    <use value="in"/>
-    <min value="0"/>
-    <max value="1"/>
-    <documentation value="Reference to an [Organization](organization.html) for which the gaps in care report will be created. Either 'organization' or 'organizationResource' SHALL be provided, but not both."/>
-    <type value="string"/>
-    <searchType value="reference"/>
-  </parameter>
-  <parameter>
-    <name value="organizationResource"/>
-    <use value="in"/>
-    <min value="0"/>
-    <max value="1"/>
-    <documentation value="Organization for which the gaps in care report will be created is provided as an Organization resource. This is intended to support the use case in which the organization information is not on the server performing the evaluation, for example an [ad-hoc group of practitioners](clinicalreasoning-quality-reporting.html#ad-hoc-organizations) that are part of a provider group. Either 'organization' or 'organizationResource' SHALL be provided, but not both."/>
-    <type value="Organization"/>
-  </parameter>
-  <parameter>
     <name value="location"/>
     <use value="in"/>
     <min value="0"/>
     <max value="*"/>
     <documentation value="The location(s) for which the gaps in care report will be run. This parameter is reflected in the location element of the resulting MeasureReport(s)."/>
     <type value="string"/>
+    <searchType value="reference"/>
+  </parameter>
+  <parameter>
+    <name value="reporter"/>
+    <use value="in"/>
+    <min value="0"/>
+    <max value="1"/>
+    <documentation value="The provider for which the report will be run. This may be a reference to a Practitioner, PractitionerRole, or Organization. If specified, systems MAY use this information to determine subjects for which the measure will be calculated, but how subjects are determined is implementation-specific. This parameter is reflected in the reporter element of the resulting MeasureReport(s). This parameter cannot be used with the reporterResource parameter."/>
+    <type value="string"/>
+    <searchType value="reference"/>
+  </parameter>
+  <parameter>
+    <extension url="http://hl7.org/fhir/StructureDefinition/operationdefinition-allowed-type">
+      <valueUri value="Practitioner"/>
+    </extension>
+    <extension url="http://hl7.org/fhir/StructureDefinition/operationdefinition-allowed-type">
+      <valueUri value="PractitionerRole"/>
+    </extension>
+    <extension url="http://hl7.org/fhir/StructureDefinition/operationdefinition-allowed-type">
+      <valueUri value="Organization"/>
+    </extension>
+    <name value="reporterResource"/>
+    <use value="in"/>
+    <min value="0"/>
+    <max value="1"/>
+    <documentation value="The provider for which the report will be run, provided as a Practitioner, PractitionerRole, or Organization resource. This is intended to support the use case in which the organization information is not on the server performing the evaluation, for example an [ad-hoc group of practitioners](clinicalreasoning-quality-reporting.html#ad-hoc-organizations) that are part of a provider group. This parameter is reflected in the reporter element of the resulting MeasureReport(s). This parameter cannot be used with the reporter parameter."/>
+    <type value="Element"/>
     <searchType value="reference"/>
   </parameter>
   <parameter>

@@ -34,7 +34,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.5.1463"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "Observationbodyheight",
   "title": "Observation Body Height Profile",
   "status": "draft",
@@ -52,7 +52,7 @@
     }
   ],
   "description": "FHIR Body Height Profile",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "workflow",
@@ -94,7 +94,7 @@
     "extension": [
       {
         "url": "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-        "valueString": "6.0.0-ballot3"
+        "valueString": "6.0.0-ballot4"
       }
     ],
     "element": [
@@ -378,7 +378,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -898,7 +898,7 @@
           ],
           "strength": "required",
           "description": "The type of TriggeredBy Observation.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1046,7 +1046,7 @@
           ],
           "strength": "required",
           "description": "Codes providing the status of an observation.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -2043,17 +2043,6 @@
         "mustSupport": false,
         "isModifier": false,
         "isSummary": false,
-        "binding": {
-          "extension": [
-            {
-              "url": "http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName",
-              "valueString": "BodySite"
-            }
-          ],
-          "strength": "example",
-          "description": "SNOMED CT Body site concepts",
-          "valueSet": "http://hl7.org/fhir/ValueSet/body-site"
-        },
         "mapping": [
           {
             "identity": "v2",

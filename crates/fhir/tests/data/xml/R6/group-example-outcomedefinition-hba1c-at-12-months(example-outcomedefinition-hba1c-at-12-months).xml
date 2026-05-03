@@ -46,7 +46,7 @@
     </valueCodeableConcept>
     <exclude value="false"/>
     <description value="HbA1c at 12 months"/>
-    <timing>
+    <relativeTime>
       <contextCode>
         <coding>
           <system value="http://snomed.info/sct"/>
@@ -61,6 +61,6 @@
         <code value="mo"/>
       </offsetDuration>
       <text value="at 12 months"/>
-    </timing>
+    </relativeTime>
   </characteristic>
 </Group>

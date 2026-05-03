@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "action-applicability-behavior",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-04-22T02:59:29.647+00:00"
   },
   "text": {
     "status": "generated",
@@ -23,7 +23,7 @@
     }
   ],
   "url": "http://hl7.org/fhir/action-applicability-behavior",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "ActionApplicabilityBehavior",
   "title": "Action Applicability Behavior",
   "status": "active",

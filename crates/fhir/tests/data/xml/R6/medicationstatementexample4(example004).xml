@@ -31,6 +31,7 @@
     <text value="Patient indicates they miss the occasional dose"/>
   </note>
   <dosage>
+    <renderedInstruction value="One capsule three times daily by mouth."/>
     <safety>
       <doseLimit>
         <valueQuantity>
