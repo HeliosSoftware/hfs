@@ -1736,22 +1736,30 @@ fn is_property_only_include(inc: &serde_json::Value) -> bool {
 /// Fast path for multi-include composes where every include uses the **same**
 /// CodeSystem and carries only property-equality (`op = "="`) filters.
 ///
-/// Instead of N×M individual `query_property_eq` round-trips (one per
-/// property per include), this function builds a single CTE query of the form:
+/// Collapses all includes into a single query using a UNION of driver-+EXISTS
+/// sub-selects instead of N×M individual round-trips or an INTERSECT CTE
+/// (which would materialise and sort large intermediate sets).  For a
+/// 2-include × 2-filter case the generated SQL looks like:
 ///
 /// ```sql
-/// WITH
-///   inc0_p0 AS (SELECT concept_id FROM concept_properties WHERE property=? AND value=?),
-///   inc0_p1 AS (SELECT concept_id FROM concept_properties WHERE property=? AND value=?),
-///   inc0    AS (SELECT concept_id FROM inc0_p0 INTERSECT SELECT concept_id FROM inc0_p1),
-///   inc1_p0 AS (SELECT concept_id FROM concept_properties WHERE property=? AND value=?),
-///   inc1    AS (SELECT concept_id FROM inc1_p0),
-///   all_ids AS (SELECT concept_id FROM inc0 UNION SELECT concept_id FROM inc1)
-/// SELECT c.code, c.display
-/// FROM concepts c
-/// JOIN all_ids a ON a.concept_id = c.id
-/// WHERE c.system_id = ?
+/// SELECT c.code, c.display FROM concepts c
+/// WHERE c.system_id = ?5
+/// AND c.id IN (
+///     SELECT cp0.concept_id FROM concept_properties cp0
+///     WHERE cp0.property = ?1 AND cp0.value = ?2
+///       AND EXISTS (SELECT 1 FROM concept_properties
+///                   WHERE concept_id = cp0.concept_id AND property = ?3 AND value = ?4)
+///     UNION
+///     SELECT cp0.concept_id FROM concept_properties cp0
+///     WHERE cp0.property = ?5 AND cp0.value = ?6
+///       AND EXISTS (SELECT 1 FROM concept_properties
+///                   WHERE concept_id = cp0.concept_id AND property = ?7 AND value = ?8)
+/// )
 /// ```
+///
+/// The driver scan uses `idx_concept_properties_value(property, value, concept_id)`;
+/// each EXISTS check uses `idx_concept_properties_lookup(concept_id, property, value)`.
+/// No large temp sets are sorted — SQLite short-circuits EXISTS on the first hit.
 ///
 /// Returns `None` when the fast path does not apply (single include, mixed
 /// systems, non-property filters, explicit concept lists, etc.) so the caller
@@ -1798,67 +1806,56 @@ fn try_multi_include_property_only(
         }
     };
 
-    let mut cte_parts: Vec<String> = Vec::new();
+    // Build one sub-select per include clause, joined with UNION.
+    // Each sub-select drives from the FIRST filter (uses idx_concept_properties_value),
+    // then ANDs every subsequent filter as a correlated EXISTS (uses
+    // idx_concept_properties_lookup).  This avoids materialising and sorting
+    // the large intermediate sets that INTERSECT requires.
+    let mut union_parts: Vec<String> = Vec::new();
     let mut params: Vec<String> = Vec::new();
-    let mut inc_cte_names: Vec<String> = Vec::new();
 
-    for (inc_idx, inc) in includes.iter().enumerate() {
+    for inc in includes {
         let filters = inc["filter"].as_array().unwrap();
-        let mut prop_cte_names: Vec<String> = Vec::new();
 
-        for (f_idx, f) in filters.iter().enumerate() {
-            let prop = f["property"].as_str().unwrap_or("");
-            let val = f["value"].as_str().unwrap_or("");
-            let cte_name = format!("inc{inc_idx}_p{f_idx}");
-            let p_idx = params.len() + 1;
-            let v_idx = params.len() + 2;
-            cte_parts.push(format!(
-                "{cte_name} AS (SELECT concept_id FROM concept_properties \
-                 WHERE property = ?{p_idx} AND value = ?{v_idx})"
+        // Driver: first filter
+        let f0 = &filters[0];
+        let p0_idx = params.len() + 1;
+        let v0_idx = params.len() + 2;
+        params.push(f0["property"].as_str().unwrap_or("").to_string());
+        params.push(f0["value"].as_str().unwrap_or("").to_string());
+
+        // EXISTS clauses for additional filters (idx_concept_properties_lookup)
+        let mut exists_clauses = String::new();
+        for f in &filters[1..] {
+            let ep_idx = params.len() + 1;
+            let ev_idx = params.len() + 2;
+            params.push(f["property"].as_str().unwrap_or("").to_string());
+            params.push(f["value"].as_str().unwrap_or("").to_string());
+            exists_clauses.push_str(&format!(
+                "\n      AND EXISTS (SELECT 1 FROM concept_properties \
+                 WHERE concept_id = cp0.concept_id AND property = ?{ep_idx} AND value = ?{ev_idx})"
             ));
-            params.push(prop.to_string());
-            params.push(val.to_string());
-            prop_cte_names.push(cte_name);
         }
 
-        let inc_cte_name = format!("inc{inc_idx}");
-        if prop_cte_names.len() == 1 {
-            cte_parts.push(format!(
-                "{inc_cte_name} AS (SELECT concept_id FROM {})",
-                prop_cte_names[0]
-            ));
-        } else {
-            let intersect = prop_cte_names
-                .iter()
-                .map(|n| format!("SELECT concept_id FROM {n}"))
-                .collect::<Vec<_>>()
-                .join(" INTERSECT ");
-            cte_parts.push(format!("{inc_cte_name} AS ({intersect})"));
-        }
-        inc_cte_names.push(inc_cte_name);
+        union_parts.push(format!(
+            "SELECT cp0.concept_id FROM concept_properties cp0 \
+             WHERE cp0.property = ?{p0_idx} AND cp0.value = ?{v0_idx}{exists_clauses}"
+        ));
     }
-
-    let union_expr = inc_cte_names
-        .iter()
-        .map(|n| format!("SELECT concept_id FROM {n}"))
-        .collect::<Vec<_>>()
-        .join(" UNION ");
-    cte_parts.push(format!("all_ids AS ({union_expr})"));
 
     let sid_idx = params.len() + 1;
     params.push(system_id);
 
+    let union_sql = union_parts.join("\n    UNION\n    ");
     let sql = format!(
-        "WITH {ctes}\n\
-         SELECT c.code, c.display\n\
+        "SELECT c.code, c.display\n\
          FROM concepts c\n\
-         JOIN all_ids a ON a.concept_id = c.id\n\
-         WHERE c.system_id = ?{sid_idx}",
-        ctes = cte_parts.join(",\n")
+         WHERE c.system_id = ?{sid_idx}\n\
+         AND c.id IN (\n    {union_sql}\n)"
     );
 
     let mut stmt = conn
-        .prepare(&sql)
+        .prepare_cached(&sql)
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     let results = stmt
