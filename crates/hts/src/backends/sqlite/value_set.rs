@@ -827,12 +827,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 &req.code,
                                 req.system.as_deref(),
                             )?;
+                            let abstract_for_msg = found
+                                .as_ref()
+                                .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
+                                .unwrap_or(false);
                             return finish_validate_code_response(
                                 found,
                                 &req.code,
                                 &url,
                                 req.display.as_deref(),
                                 req.system.as_deref(),
+                                abstract_for_msg,
                             );
                         }
 
@@ -847,12 +852,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             req.system.as_deref(),
                         )?;
 
+                        let abstract_for_msg = found
+                            .as_ref()
+                            .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
+                            .unwrap_or(false);
                         return finish_validate_code_response(
                             found,
                             &req.code,
                             &url,
                             req.display.as_deref(),
                             req.system.as_deref(),
+                            abstract_for_msg,
                         );
                     }
                     Err(e) => return Err(e),
@@ -876,12 +886,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .system
                 .clone()
                 .or_else(|| found.as_ref().map(|c| c.system.clone()));
+            let abstract_for_msg = found
+                .as_ref()
+                .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
+                .unwrap_or(false);
             finish_validate_code_response(
                 found,
                 &req.code,
                 &url,
                 req.display.as_deref(),
                 system_for_msg.as_deref(),
+                abstract_for_msg,
             )
         })
         .await
@@ -3453,22 +3468,46 @@ fn populate_cache(
 ///
 /// Shared by all validate-code paths (explicit ValueSet, implicit cache, and
 /// direct `?fhir_vs` lookups) so display-mismatch logic is applied consistently.
+/// Returns true when the concept (system_url, code) is marked notSelectable=true.
+///
+/// Used to reject abstract concepts from $validate-code: per the IG fixtures,
+/// validating an abstract code against a VS that contains it must still
+/// produce result=false with an "abstract, and not allowed in this context"
+/// message.
+fn is_concept_abstract(conn: &Connection, system_url: &str, code: &str) -> bool {
+    conn.query_row(
+        "SELECT 1
+         FROM concept_properties cp
+         JOIN concepts c ON c.id = cp.concept_id
+         JOIN code_systems s ON s.id = c.system_id
+         WHERE s.url = ?1
+           AND c.code = ?2
+           AND cp.property = 'notSelectable'
+           AND cp.value = 'true'
+         LIMIT 1",
+        rusqlite::params![system_url, code],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
 fn finish_validate_code_response(
     found: Option<ExpansionContains>,
     code: &str,
     url: &str,
     expected_display: Option<&str>,
     system_for_msg: Option<&str>,
+    is_abstract: bool,
 ) -> Result<ValidateCodeResponse, HtsError> {
+    let qualified = match system_for_msg {
+        Some(s) => format!("{s}#{code}"),
+        None => code.to_string(),
+    };
     match found {
         None => {
             // The IG validator compares this text with the format
             //   "The provided code 'system#code' was not found in the value set 'url'"
             // (see notSelectable/* and validation/* response fixtures).
-            let qualified = match system_for_msg {
-                Some(s) => format!("{s}#{code}"),
-                None => code.to_string(),
-            };
             Ok(ValidateCodeResponse {
                 result: false,
                 message: Some(format!(
@@ -3478,6 +3517,17 @@ fn finish_validate_code_response(
             })
         }
         Some(concept) => {
+            // Abstract / notSelectable concepts are present in the VS but
+            // cannot be selected by users — reject with the IG wording.
+            if is_abstract {
+                return Ok(ValidateCodeResponse {
+                    result: false,
+                    message: Some(format!(
+                        "The code '{qualified}' is abstract, and not allowed in this context"
+                    )),
+                    display: concept.display,
+                });
+            }
             let mut message = None;
             if let Some(expected) = expected_display {
                 if let Some(actual) = concept.display.as_deref() {
