@@ -192,16 +192,13 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     }
 
     // ── Path 2: `coding` parameter (valueCoding — system+code bundled together) ──
-    if let Some((system, code, coding_display)) = extract_coding(&params, "coding") {
+    if let Some((system, code, _display)) = extract_coding(&params, "coding") {
         let req = ValidateCodeRequest {
             url: None,
             system: Some(system.clone()),
             code: code.clone(),
             version: find_str_param(&params, "version"),
-            // Coding.display takes precedence over a top-level `display` param —
-            // the IG fixtures pin display via the Coding so the server can
-            // report a mismatch.
-            display: coding_display.or_else(|| find_str_param(&params, "display")),
+            display: find_str_param(&params, "display"),
             date: find_str_param(&params, "date"),
             include_abstract: params
                 .iter()
@@ -370,13 +367,13 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     }
 
     // ── Path 2: `coding` parameter (valueCoding) ──────────────────────────────
-    if let Some((system, code, coding_display)) = extract_coding(&params, "coding") {
+    if let Some((system, code, _display)) = extract_coding(&params, "coding") {
         let req = ValidateCodeRequest {
             url: Some(url),
             system: Some(system.clone()),
             code: code.clone(),
             version: find_str_param(&params, "version"),
-            display: coding_display.or_else(|| find_str_param(&params, "display")),
+            display: find_str_param(&params, "display"),
             date: find_str_param(&params, "date"),
             include_abstract: params
                 .iter()
