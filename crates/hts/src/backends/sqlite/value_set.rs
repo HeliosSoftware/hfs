@@ -1041,9 +1041,9 @@ fn resolve_value_set(
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
     )
     .map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => {
-            HtsError::NotFound(format!("ValueSet not found: {url}"))
-        }
+        rusqlite::Error::QueryReturnedNoRows => HtsError::NotFound(format!(
+            "A definition for the value Set \'{url}\' could not be found"
+        )),
         other => HtsError::StorageError(other.to_string()),
     })
 }
@@ -3223,9 +3223,9 @@ fn find_cs_for_implicit_vs(
         |row| row.get::<_, String>(0),
     )
     .map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => {
-            HtsError::NotFound(format!("ValueSet not found: {vs_url}"))
-        }
+        rusqlite::Error::QueryReturnedNoRows => HtsError::NotFound(format!(
+            "A definition for the value Set \'{vs_url}\' could not be found"
+        )),
         other => HtsError::StorageError(other.to_string()),
     })
 }
@@ -3598,7 +3598,9 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
     } else if let Some((cs_url, pat)) = parse_fhir_vs_url(url) {
         (cs_url, pat)
     } else {
-        return Err(HtsError::NotFound(format!("ValueSet not found: {url}")));
+        return Err(HtsError::NotFound(format!(
+            "A definition for the value Set \'{url}\' could not be found"
+        )));
     };
 
     let system_id: Option<String> = conn

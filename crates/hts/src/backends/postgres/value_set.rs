@@ -282,10 +282,11 @@ async fn resolve_value_set(
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| HtsError::NotFound(format!("ValueSet not found: {url}")))?;
+    let row = rows.into_iter().next().ok_or_else(|| {
+        HtsError::NotFound(format!(
+            "A definition for the value Set \'{url}\' could not be found"
+        ))
+    })?;
 
     Ok((row.get(0), row.get(1)))
 }
@@ -455,7 +456,11 @@ async fn find_cs_for_implicit_vs(
     rows.into_iter()
         .next()
         .map(|r| r.get::<_, String>(0))
-        .ok_or_else(|| HtsError::NotFound(format!("ValueSet not found: {vs_url}")))
+        .ok_or_else(|| {
+            HtsError::NotFound(format!(
+                "A definition for the value Set \'{vs_url}\' could not be found"
+            ))
+        })
 }
 
 /// Build a tree-structured expansion from a flat list of concepts.
