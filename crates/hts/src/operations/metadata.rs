@@ -231,17 +231,36 @@ pub fn build_terminology_capabilities(_backend: &impl TerminologyMetadata) -> Va
 /// Includes a `capabilitystatement-supported-system` extension for each
 /// code system URL currently registered in the backend.
 pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
-    // ── capabilitystatement-supported-system extensions ───────────────────────
-    let supported_system_extensions: Vec<Value> = backend
-        .supported_systems()
-        .into_iter()
-        .map(|url| {
-            json!({
-                "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-supported-system",
-                "valueUri": url
-            })
+    // ── application-feature extensions (test-bench advertisements) ────────────
+    // The IG metadata test expects the CapabilityStatement to advertise the
+    // tx-ecosystem features it implements via the
+    // http://hl7.org/fhir/uv/application-feature/StructureDefinition/feature
+    // extension. Each entry is a sub-extension of {definition: <FeatureDefinition canonical>,
+    // value: <code or boolean>}.
+    let mut supported_system_extensions: Vec<Value> = vec![
+        json!({
+            "url": "http://hl7.org/fhir/uv/application-feature/StructureDefinition/feature",
+            "extension": [
+                {"url": "definition", "valueCanonical": "http://hl7.org/fhir/uv/tx-tests/FeatureDefinition/test-version"},
+                {"url": "value", "valueCode": "1.7.0"}
+            ]
+        }),
+        json!({
+            "url": "http://hl7.org/fhir/uv/application-feature/StructureDefinition/feature",
+            "extension": [
+                {"url": "definition", "valueCanonical": "http://hl7.org/fhir/uv/tx-ecosystem/FeatureDefinition/CodeSystemAsParameter"},
+                {"url": "value", "valueBoolean": true}
+            ]
+        }),
+    ];
+
+    // Then the per-CodeSystem `capabilitystatement-supported-system` entries.
+    supported_system_extensions.extend(backend.supported_systems().into_iter().map(|url| {
+        json!({
+            "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-supported-system",
+            "valueUri": url
         })
-        .collect();
+    }));
 
     // ── Shared search params for all three resource types ─────────────────────
     let search_params = json!([
@@ -510,8 +529,15 @@ mod tests {
     fn capability_statement_supported_system_extensions_empty_on_fresh_backend() {
         let cs = build_capability_statement(&backend());
         let exts = cs["extension"].as_array().unwrap();
+        // The two static application-feature extensions are always present;
+        // verify none of the per-supported-system entries appear on an empty
+        // backend.
         assert!(
-            exts.is_empty(),
+            !exts.iter().any(|e| e
+                .get("url")
+                .and_then(|u| u.as_str())
+                .map(|u| u.ends_with("capabilitystatement-supported-system"))
+                .unwrap_or(false)),
             "fresh backend should have no supported-system extensions"
         );
     }
@@ -530,12 +556,16 @@ mod tests {
 
         let cs = build_capability_statement(&b);
         let exts = cs["extension"].as_array().unwrap();
-        assert_eq!(exts.len(), 1);
-        assert_eq!(
-            exts[0]["url"],
-            "http://hl7.org/fhir/StructureDefinition/capabilitystatement-supported-system"
-        );
-        assert_eq!(exts[0]["valueUri"], "http://example.org/cs");
+        let supported = exts
+            .iter()
+            .find(|e| {
+                e.get("url")
+                    .and_then(|u| u.as_str())
+                    .map(|u| u.ends_with("capabilitystatement-supported-system"))
+                    .unwrap_or(false)
+            })
+            .expect("supported-system extension present");
+        assert_eq!(supported["valueUri"], "http://example.org/cs");
     }
 
     // ── Integration tests: HTTP GET /metadata mode dispatch ───────────────────
