@@ -95,7 +95,13 @@ impl IntoResponse for HtsError {
                 "issue": [{
                     "severity": "error",
                     "code": "too-costly",
-                    "details": { "text": msg },
+                    "details": {
+                        "coding": [{
+                            "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                            "code": "too-costly",
+                        }],
+                        "text": msg,
+                    },
                     "diagnostics": msg,
                 }]
             });
@@ -122,15 +128,20 @@ impl IntoResponse for HtsError {
 
         // The HL7 IG validator's TxTesterScrubbers strips OperationOutcome.issue
         // entries that have `diagnostics` but no `details` — every such issue
-        // disappears from comparison, leaving an empty OperationOutcome and
-        // failing the test with "missing property issue" (27 such failures in
-        // run #93). Always emit details.text so issues survive the scrubber.
+        // disappears from comparison. The IG fixtures additionally expect a
+        // tx-issue-type coding inside details.
         let body = json!({
             "resourceType": "OperationOutcome",
             "issue": [{
                 "severity": "error",
                 "code": code,
-                "details": { "text": diagnostics },
+                "details": {
+                    "coding": [{
+                        "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                        "code": code,
+                    }],
+                    "text": diagnostics,
+                },
                 "diagnostics": diagnostics,
             }]
         });
