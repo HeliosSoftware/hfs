@@ -47,6 +47,7 @@ fn build_validate_response(
     system: Option<&str>,
     version: Option<&str>,
     codeable_concept: Option<&Value>,
+    unknown_system: Option<&str>,
 ) -> Value {
     let mut parameter: Vec<Value> = Vec::new();
     if let Some(c) = code {
@@ -105,6 +106,9 @@ fn build_validate_response(
     if let Some(v) = version {
         parameter.push(json!({"name": "version", "valueString": v}));
     }
+    if let Some(u) = unknown_system {
+        parameter.push(json!({"name": "x-unknown-system", "valueCanonical": u}));
+    }
     json!({
         "resourceType": "Parameters",
         "parameter": parameter
@@ -130,7 +134,22 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     } else {
         None
     };
-    build_validate_response(resp, code, system, version.as_deref(), codeable_concept)
+    // If the input system isn't stored, the IG expects an `x-unknown-system`
+    // parameter pointing at the unknown URL (only when validate-code reported
+    // result=false).
+    let unknown_system = if !resp.result && version.is_none() {
+        system
+    } else {
+        None
+    };
+    build_validate_response(
+        resp,
+        code,
+        system,
+        version.as_deref(),
+        codeable_concept,
+        unknown_system,
+    )
 }
 
 /// Core validate-code logic for `CodeSystem/$validate-code`.
@@ -272,6 +291,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             None,
             None,
             cc_value.as_ref(),
+            None,
         ));
     }
 
@@ -464,6 +484,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             None,
             None,
             cc_value.as_ref(),
+            None,
         ));
     }
 
