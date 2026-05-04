@@ -283,6 +283,24 @@ async fn process_expand<B: TerminologyBackend>(
     // them here in a per-system batch so the per-concept SQL stays cold-path.
     populate_concept_flags(state.backend(), &ctx, &mut resp.contains).await;
 
+    // ── Look up source ValueSet (used for both parameter extension and metadata copy) ──
+    let source_vs: Option<Value> = if let Some(ref u) = url_for_neg_cache {
+        ValueSetOperations::search(
+            state.backend(),
+            &ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some(u.clone()),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()
+        .and_then(|mut v| v.pop())
+    } else {
+        value_set_for_response.clone()
+    };
+
     // ── Build FHIR ValueSet response with expansion ──────────────────────────
     let contains: Vec<Value> = resp
         .contains
@@ -349,6 +367,52 @@ async fn process_expand<B: TerminologyBackend>(
         .cloned()
         .collect();
 
+    // Pull additional default expansion parameters from the source ValueSet's
+    // `compose.extension[].valueset-expansion-parameter` entries. The IG fixtures
+    // use this to pin defaults like displayLanguage="en" without forcing every
+    // caller to pass it explicitly. Each extension nests two sub-extensions
+    // (`name` and `value`); convert each into a {name, value[x]} parameter.
+    if let Some(vs) = source_vs.as_ref() {
+        let exts = vs
+            .get("compose")
+            .and_then(|c| c.get("extension"))
+            .and_then(|e| e.as_array());
+        if let Some(exts) = exts {
+            for ext in exts {
+                if ext.get("url").and_then(|u| u.as_str())
+                    != Some("http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter")
+                {
+                    continue;
+                }
+                let inner = match ext.get("extension").and_then(|i| i.as_array()) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let mut name: Option<&str> = None;
+                let mut value_entry: Option<(String, Value)> = None;
+                for sub in inner {
+                    let sub_url = sub.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                    if sub_url == "name" {
+                        name = sub.get("valueCode").and_then(|v| v.as_str());
+                    } else if let Some(obj) = sub.as_object() {
+                        if let Some((k, v)) = obj.iter().find(|(k, _)| k.starts_with("value")) {
+                            value_entry = Some((k.clone(), v.clone()));
+                        }
+                    }
+                }
+                if let (Some(n), Some((k, v))) = (name, value_entry) {
+                    // Don't double-emit if the caller already provided this knob.
+                    let already = emitted_params
+                        .iter()
+                        .any(|p| p.get("name").and_then(|x| x.as_str()) == Some(n));
+                    if !already {
+                        emitted_params.push(json!({ "name": n, k: v }));
+                    }
+                }
+            }
+        }
+    }
+
     // Emit one `used-codesystem` entry per distinct CodeSystem that contributed
     // concepts. The IG validator compares these as `<url>|<version>` strings,
     // so omitting the version (or omitting the entry entirely) is a hard fail.
@@ -398,23 +462,7 @@ async fn process_expand<B: TerminologyBackend>(
     // the canonical-resource fields. For inline ValueSet requests, the
     // caller supplied the body — copy from there.
     let mut response = json!({ "resourceType": "ValueSet" });
-    let source_vs: Option<Value> = if let Some(ref u) = url_for_neg_cache {
-        ValueSetOperations::search(
-            state.backend(),
-            &ctx,
-            crate::types::ResourceSearchQuery {
-                url: Some(u.clone()),
-                count: Some(1),
-                ..Default::default()
-            },
-        )
-        .await
-        .ok()
-        .and_then(|mut v| v.pop())
-    } else {
-        value_set_for_response.clone()
-    };
-    if let Some(vs) = source_vs {
+    if let Some(ref vs) = source_vs {
         if let Some(obj) = vs.as_object() {
             // Required-by-fixtures fields plus a few common optionals. Skip
             // `compose` deliberately: it is never required by any IG fixture
