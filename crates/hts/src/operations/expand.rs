@@ -206,6 +206,48 @@ fn populate_designations<'a, B: TerminologyBackend>(
     })
 }
 
+/// Replace each contains[] entry's `display` with a designation matching the
+/// requested displayLanguage (when one exists). Mirrors the `lookup()`
+/// language-aware behavior. Walks nested `contains[]` recursively.
+fn apply_display_language<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+    language: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use std::collections::HashMap;
+        let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.as_str())
+                .or_default()
+                .push(c.code.clone());
+        }
+        let mut map: HashMap<(String, String), String> = HashMap::new();
+        for (system, codes) in &by_system {
+            if let Ok(ds) = backend.concept_designations(ctx, system, codes).await {
+                for (code, list) in ds {
+                    if let Some(d) = list
+                        .into_iter()
+                        .find(|d| d.language.as_deref() == Some(language))
+                    {
+                        map.insert(((*system).to_string(), code), d.value);
+                    }
+                }
+            }
+        }
+        for c in contains.iter_mut() {
+            if let Some(v) = map.remove(&(c.system.clone(), c.code.clone())) {
+                c.display = Some(v);
+            }
+            if !c.contains.is_empty() {
+                apply_display_language(backend, ctx, &mut c.contains, language).await;
+            }
+        }
+    })
+}
+
 /// Expand a ValueSet and return the result as pre-serialized JSON bytes.
 ///
 /// Bytes are cached keyed on request parameters.  On a cache hit the stored
@@ -374,6 +416,20 @@ async fn process_expand<B: TerminologyBackend>(
         .unwrap_or(false);
     if include_designations {
         populate_designations(state.backend(), &ctx, &mut resp.contains).await;
+    }
+
+    // ── displayLanguage: swap display from matching designation ──────────────
+    let display_language = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("displayLanguage"))
+        .and_then(|p| {
+            p.get("valueCode")
+                .or_else(|| p.get("valueString"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    if let Some(lang) = display_language.as_deref() {
+        apply_display_language(state.backend(), &ctx, &mut resp.contains, lang).await;
     }
 
     // ── Look up source ValueSet (used for both parameter extension and metadata copy) ──
