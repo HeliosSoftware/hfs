@@ -152,6 +152,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             result: message.is_none(),
             message,
             display,
+            inactive: None,
         })
     }
 
