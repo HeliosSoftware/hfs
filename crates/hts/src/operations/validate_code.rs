@@ -216,7 +216,11 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
             .and_then(|p| p.get("valueCodeableConcept"))
             .cloned();
-        for (system, code) in codings {
+        // The IG fixtures expect the LAST matching coding to win (when several
+        // codings in a CodeableConcept all validate, the response echoes the
+        // last one). Iterate in reverse so the earliest "yes" we find is the
+        // last entry in the input.
+        for (system, code) in codings.into_iter().rev() {
             let req = ValidateCodeRequest {
                 url: None,
                 system: Some(system.clone()),
@@ -373,7 +377,11 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
             .and_then(|p| p.get("valueCodeableConcept"))
             .cloned();
-        for (system, code) in codings {
+        // The IG fixtures expect the LAST matching coding to win (when several
+        // codings in a CodeableConcept all validate, the response echoes the
+        // last one). Iterate in reverse so the earliest "yes" we find is the
+        // last entry in the input.
+        for (system, code) in codings.into_iter().rev() {
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),
                 system: Some(system.clone()),
