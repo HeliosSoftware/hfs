@@ -836,6 +836,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 .as_ref()
                                 .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
                                 .unwrap_or(false);
+                            let vs_version_owned = lookup_value_set_version(&conn, &url);
                             return finish_validate_code_response(
                                 found,
                                 &req.code,
@@ -844,6 +845,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 req.system.as_deref(),
                                 abstract_for_msg,
                                 inactive_for_msg,
+                                vs_version_owned.as_deref(),
                             );
                         }
 
@@ -866,6 +868,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             .as_ref()
                             .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
                             .unwrap_or(false);
+                        let vs_version_owned = lookup_value_set_version(&conn, &url);
                         return finish_validate_code_response(
                             found,
                             &req.code,
@@ -874,6 +877,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             req.system.as_deref(),
                             abstract_for_msg,
                             inactive_for_msg,
+                            vs_version_owned.as_deref(),
                         );
                     }
                     Err(e) => return Err(e),
@@ -906,6 +910,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .as_ref()
                 .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
                 .unwrap_or(false);
+            let vs_version_owned = lookup_value_set_version(&conn, &url);
             finish_validate_code_response(
                 found,
                 &req.code,
@@ -914,6 +919,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 system_for_msg.as_deref(),
                 abstract_for_msg,
                 inactive_for_msg,
+                vs_version_owned.as_deref(),
             )
         })
         .await
@@ -3508,6 +3514,19 @@ fn is_concept_abstract(conn: &Connection, system_url: &str, code: &str) -> bool 
     .is_ok()
 }
 
+/// Returns the stored version for a ValueSet URL (None if unknown). Used to
+/// format `url|version` in $validate-code "code not found" messages, which
+/// is what the IG fixtures expect.
+fn lookup_value_set_version(conn: &Connection, url: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT version FROM value_sets WHERE url = ?1 LIMIT 1",
+        rusqlite::params![url],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
 /// Returns true when the concept has a status property in the inactive set
 /// (retired/deprecated/withdrawn/inactive). Used by $validate-code so the
 /// response can surface a top-level `inactive` parameter per the IG fixtures.
@@ -3536,10 +3555,15 @@ fn finish_validate_code_response(
     system_for_msg: Option<&str>,
     is_abstract: bool,
     is_inactive: bool,
+    vs_version: Option<&str>,
 ) -> Result<ValidateCodeResponse, HtsError> {
     let qualified = match system_for_msg {
         Some(s) => format!("{s}#{code}"),
         None => code.to_string(),
+    };
+    let url_with_version = match vs_version {
+        Some(v) => format!("{url}|{v}"),
+        None => url.to_string(),
     };
     match found {
         None => {
@@ -3549,7 +3573,7 @@ fn finish_validate_code_response(
             Ok(ValidateCodeResponse {
                 result: false,
                 message: Some(format!(
-                    "The provided code '{qualified}' was not found in the value set '{url}'"
+                    "The provided code '{qualified}' was not found in the value set '{url_with_version}'"
                 )),
                 display: None,
                 inactive: None,
