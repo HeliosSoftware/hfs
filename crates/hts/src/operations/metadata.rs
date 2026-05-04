@@ -107,7 +107,7 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
             ..Default::default()
         },
         kind: Element {
-            value: Some("terminology".to_string()),
+            value: Some("instance".to_string()),
             ..Default::default()
         },
         // Use a fixed publication date; this value identifies the capability document itself.
@@ -185,7 +185,7 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
 
 #[cfg(not(feature = "R4"))]
 pub fn build_terminology_capabilities(_backend: &impl TerminologyMetadata) -> Value {
-    json!({ "resourceType": "TerminologyCapabilities", "status": "active", "kind": "terminology" })
+    json!({ "resourceType": "TerminologyCapabilities", "status": "active", "kind": "instance" })
 }
 
 /// Build a FHIR R4 CapabilityStatement for the HTS server.
@@ -323,9 +323,9 @@ mod tests {
     }
 
     #[test]
-    fn kind_is_terminology() {
+    fn kind_is_instance() {
         let caps = build_terminology_capabilities(&backend());
-        assert_eq!(caps["kind"], "terminology");
+        assert_eq!(caps["kind"], "instance");
     }
 
     #[test]
@@ -543,6 +543,6 @@ mod tests {
     async fn get_metadata_mode_terminology_returns_terminology_capabilities() {
         let body = get_metadata(make_metadata_app(), "/metadata?mode=terminology").await;
         assert_eq!(body["resourceType"], "TerminologyCapabilities");
-        assert_eq!(body["kind"], "terminology");
+        assert_eq!(body["kind"], "instance");
     }
 }
