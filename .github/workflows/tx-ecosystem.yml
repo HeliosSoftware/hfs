@@ -241,13 +241,21 @@ jobs:
           python3 - <<'PY'
           import json, glob, os
           base = 'tx-ecosystem-ig/tests'
-          entries = []
+          paths = []
           for pattern in ('valueset-*.json', 'codesystem-*.json', 'conceptmap-*.json'):
-              for path in glob.glob(f'{base}/**/{pattern}', recursive=True):
-                  with open(path) as f:
-                      r = json.load(f)
-                  if r.get('resourceType') in ('CodeSystem', 'ValueSet', 'ConceptMap'):
-                      entries.append({'resource': r})
+              paths.extend(glob.glob(f'{base}/**/{pattern}', recursive=True))
+          # Sort for deterministic import order. Without this, glob iteration
+          # order varies across runners, and same-URL-different-version pairs
+          # (e.g. codesystem-version-1.json + -2.json) silently flip which one
+          # "wins" the import — leading to non-reproducible 404 churn in the
+          # version test suite.
+          paths.sort()
+          entries = []
+          for path in paths:
+              with open(path) as f:
+                  r = json.load(f)
+              if r.get('resourceType') in ('CodeSystem', 'ValueSet', 'ConceptMap'):
+                  entries.append({'resource': r})
           bundle = {'resourceType': 'Bundle', 'type': 'collection', 'entry': entries}
           with open('tx-fixtures.json', 'w') as f:
               json.dump(bundle, f)
