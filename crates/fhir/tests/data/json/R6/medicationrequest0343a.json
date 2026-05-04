@@ -45,6 +45,48 @@
     "reference": "Practitioner/f007",
     "display": "Patrick Pump"
   },
+  "dosageInstruction": {
+    "simple": {
+      "text": "One tablet (4mg) orally twice daily as needed for nausea",
+      "timing": {
+        "repeat": {
+          "frequency": 2,
+          "period": 1,
+          "periodUnit": "d"
+        }
+      },
+      "asNeededFor": [
+        {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "16932000",
+              "display": "Nausea and Vomiting"
+            }
+          ]
+        }
+      ],
+      "route": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "78421000",
+            "display": "Intramuscular Route"
+          }
+        ]
+      },
+      "doseAndRate": [
+        {
+          "doseQuantity": {
+            "value": 4,
+            "unit": "mg",
+            "system": "http://unitsofmeasure.org",
+            "code": "mg"
+          }
+        }
+      ]
+    }
+  },
   "meta": {
     "tag": [
       {

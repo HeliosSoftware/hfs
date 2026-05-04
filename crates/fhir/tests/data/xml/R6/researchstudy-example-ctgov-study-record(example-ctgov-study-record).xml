@@ -389,13 +389,13 @@
     </targetAttachment>
   </relatesTo>
   <status value="active"/>
-  <purposeType>
+  <primaryPurposeType>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/research-study-prim-purp-type"/>
       <code value="treatment"/>
       <display value="Treatment"/>
     </coding>
-  </purposeType>
+  </primaryPurposeType>
   <phase>
     <coding>
       <system value="https://fevir.net/sevco"/>
@@ -518,7 +518,7 @@
     <name value="Alebund Pharmaceuticals"/>
     <role>
       <coding>
-        <system value="http://terminology.hl7.org/CodeSystem/research-study-party-role"/>
+        <system value="http://hl7.org/fhir/research-study-party-role"/>
         <code value="sponsor"/>
         <display value="Sponsor"/>
       </coding>
@@ -535,7 +535,7 @@
     <name value="Alebund Pty Ltd"/>
     <role>
       <coding>
-        <system value="http://terminology.hl7.org/CodeSystem/research-study-party-role"/>
+        <system value="http://hl7.org/fhir/research-study-party-role"/>
         <code value="lead-sponsor"/>
         <display value="Lead sponsor"/>
       </coding>
@@ -552,7 +552,7 @@
     <name value="Sam Francis, Doctor"/>
     <role>
       <coding>
-        <system value="http://terminology.hl7.org/CodeSystem/research-study-party-role"/>
+        <system value="http://hl7.org/fhir/research-study-party-role"/>
         <code value="primary-investigator"/>
         <display value="Principal investigator"/>
       </coding>
@@ -564,7 +564,7 @@
   <progressStatus>
     <state>
       <coding>
-        <system value="http://terminology.hl7.org/CodeSystem/research-study-status"/>
+        <system value="http://hl7.org/fhir/research-study-status"/>
         <code value="completed"/>
         <display value="Completed"/>
       </coding>
@@ -573,7 +573,7 @@
   <progressStatus>
     <state>
       <coding>
-        <system value="http://terminology.hl7.org/CodeSystem/research-study-status"/>
+        <system value="http://hl7.org/fhir/research-study-status"/>
         <code value="overall-study"/>
         <display value="Overall study"/>
       </coding>

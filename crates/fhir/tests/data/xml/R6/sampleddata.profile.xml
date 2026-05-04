@@ -260,11 +260,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/SampledData"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="SampledData"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-04-22T02:59:29+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -287,7 +287,7 @@
     </coding>
   </jurisdiction>
   <purpose value="There is a need for a concise way to handle the data produced by devices that sample a physical state at a high frequency."/>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="v2"/>
     <uri value="http://hl7.org/v2"/>
@@ -497,7 +497,7 @@
         </extension>
         <strength value="required"/>
         <description value="Units of measure allowed for an element."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/ucum-units|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/ucum-units|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="SampledData.factor">
@@ -780,7 +780,7 @@
         </extension>
         <strength value="required"/>
         <description value="Units of measure allowed for an element."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/ucum-units|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/ucum-units|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="SampledData.factor">

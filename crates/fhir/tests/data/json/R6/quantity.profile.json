@@ -32,11 +32,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Quantity",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "Quantity",
   "status": "active",
   "experimental": false,
-  "date": "2026-04-22T02:59:29+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -69,7 +69,7 @@
     }
   ],
   "purpose": "Need to able to capture all sorts of measured values, even if the measured value are not precisely quantified. Values include exact measures such as 3.51g, customary units such as 3 tablets, and currencies such as $100.32USD.",
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "v2",
@@ -320,7 +320,7 @@
           ],
           "strength": "required",
           "description": "How the Quantity should be understood and represented.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -577,7 +577,7 @@
           ],
           "strength": "required",
           "description": "How the Quantity should be understood and represented.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot3"
         },
         "mapping": [
           {

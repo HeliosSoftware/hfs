@@ -57,7 +57,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-location-status"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="LocationStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Location Status&quot;"/>
   <status value="draft"/>

@@ -37,7 +37,7 @@
             <code>http://terminology.hl7.org/CodeSystem/v2-0532</code>
           </td>
           <td style="white-space:nowrap">  
-            <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0532.html#v2-0532-Y">Y</a>
+            <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0532.html#v2-0532-Y">Y</a>
           </td>
           <td>Yes</td>
           <td>Yes</td>
@@ -48,7 +48,7 @@
             <code>http://terminology.hl7.org/CodeSystem/v2-0532</code>
           </td>
           <td style="white-space:nowrap">  
-            <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0532.html#v2-0532-N">N</a>
+            <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0532.html#v2-0532-N">N</a>
           </td>
           <td>No</td>
           <td>No</td>
@@ -59,7 +59,7 @@
             <code>http://terminology.hl7.org/CodeSystem/data-absent-reason</code>
           </td>
           <td style="white-space:nowrap">  
-            <a href="http://terminology.hl7.org/7.1.0/CodeSystem-data-absent-reason.html#data-absent-reason-asked-unknown">asked-unknown</a>
+            <a href="http://terminology.hl7.org/7.0.0/CodeSystem-data-absent-reason.html#data-absent-reason-asked-unknown">asked-unknown</a>
           </td>
           <td>Don't know</td>
           <td>The source was asked but does not know the value.</td>
@@ -75,7 +75,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.3.3149"/>
   </identifier>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="YesNoDontKnow"/>
   <title value="Yes/No/Don't Know"/>
   <status value="draft"/>

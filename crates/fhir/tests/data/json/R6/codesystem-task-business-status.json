@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "task-business-status",
   "meta": {
-    "lastUpdated": "2026-04-22T02:59:29.647+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
     "status": "generated",
@@ -23,7 +23,7 @@
     }
   ],
   "url": "http://hl7.org/fhir/task-business-status",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "TaskBusinessStatus",
   "title": "Task Business Status",
   "status": "active",

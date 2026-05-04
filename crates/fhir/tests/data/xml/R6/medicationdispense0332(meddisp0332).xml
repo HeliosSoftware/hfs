@@ -83,5 +83,57 @@
     <system value="http://unitsofmeasure.org"/>
     <code value="d"/>
   </daysSupply>
-  <dosageInstruction/>
+  <dosageInstruction>
+    <simple>
+      <text value="1000mL infused at 50ml/hour for 4 hours - hang at 2200 hours"/>
+      <timing>
+        <event value="2020-01-15T22:00:00+11:00"/>
+        <repeat>
+          <boundsPeriod>
+            <start value="2020-01-15"/>
+            <end value="2020-01-20"/>
+          </boundsPeriod>
+          <frequency value="1"/>
+          <period value="24"/>
+          <periodUnit value="h"/>
+        </repeat>
+      </timing>
+      <route>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="255560000"/>
+          <display value="Intravenous"/>
+        </coding>
+      </route>
+      <doseAndRate>
+        <type>
+          <coding>
+            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+            <code value="ordered"/>
+            <display value="Ordered"/>
+          </coding>
+        </type>
+        <doseQuantity>
+          <value value="1000"/>
+          <unit value="mL"/>
+          <system value="http://unitsofmeasure.org"/>
+          <code value="mL"/>
+        </doseQuantity>
+        <rateRatio>
+          <numerator>
+            <value value="50"/>
+            <unit value="mL"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="mL"/>
+          </numerator>
+          <denominator>
+            <value value="1"/>
+            <unit value="h"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="h"/>
+          </denominator>
+        </rateRatio>
+      </doseAndRate>
+    </simple>
+  </dosageInstruction>
 </MedicationDispense>

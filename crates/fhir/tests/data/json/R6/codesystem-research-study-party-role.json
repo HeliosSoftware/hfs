@@ -1,0 +1,130 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "research-study-party-role",
+  "meta": {
+    "lastUpdated": "2025-12-17T09:50:17+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem research-study-party-role\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"research-study-party-role\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcresearch-study-party-role\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eLast updated: 2022-05-12T12:40:00Z\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/research-study-party-role\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esponsor\u003ca name\u003d\"research-study-party-role-sponsor\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSponsor\u003c/td\u003e\u003ctd\u003ePerson, company, agency or institution that initiates a clinical investigation and takes responsibility for that investigation but does not conduct the investigation.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003elead-sponsor\u003ca name\u003d\"research-study-party-role-lead-sponsor\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eLead sponsor\u003c/td\u003e\u003ctd\u003ePrimary person, company, agency or institution that initiates a clinical investigation and takes responsibility for that investigation but does not conduct the investigation if there is more than one sponsor.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esponsor-investigator\u003ca name\u003d\"research-study-party-role-sponsor-investigator\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSponsor-investigator\u003c/td\u003e\u003ctd\u003eEntity who both initiates and conducts an investigation.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eprimary-investigator\u003ca name\u003d\"research-study-party-role-primary-investigator\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePrincipal investigator\u003c/td\u003e\u003ctd\u003eAn investigator who is responsible for all aspects of the conduct of a study.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecollaborator\u003ca name\u003d\"research-study-party-role-collaborator\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCollaborator\u003c/td\u003e\u003ctd\u003eAn organization or individual, who contributes to a study by providing support to the primary investigator to conduct research.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003efunding-source\u003ca name\u003d\"research-study-party-role-funding-source\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFunding source\u003c/td\u003e\u003ctd\u003eAn organization that underwrites financial support for the research study.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003egeneral-contact\u003ca name\u003d\"research-study-party-role-general-contact\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGeneral contact\u003c/td\u003e\u003ctd\u003eInformation for the person who can answer general questions for a study.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003erecruitment-contact\u003ca name\u003d\"research-study-party-role-recruitment-contact\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRecruitment contact\u003c/td\u003e\u003ctd\u003eInformation for the person who can answer recruitment questions for a study.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esub-investigator\u003ca name\u003d\"research-study-party-role-sub-investigator\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSub-investigator\u003c/td\u003e\u003ctd\u003eAny individual member of the clinical trial team designated and supervised by the investigator at a trial site to perform critical trial-related procedures and/or to make important trial-related decisions (e.g., associates, residents, research fellows).\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003estudy-chair\u003ca name\u003d\"research-study-party-role-study-chair\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStudy chair\u003c/td\u003e\u003ctd\u003eAn individual person who both initiates and conducts, alone or with others, a clinical trial and under whose immediate direction the investigational product is administered to, dispensed to, or used by a subject. (Also called study director or study chairperson)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eirb\u003ca name\u003d\"research-study-party-role-irb\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eInstitutional Review Board\u003c/td\u003e\u003ctd\u003eA group of individuals that reviews and monitors research involving human subjects.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003edata-monitoring\u003ca name\u003d\"research-study-party-role-data-monitoring\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eData Monitoring\u003c/td\u003e\u003ctd\u003eAn organization or individual who monitors the validity and integrity of collected data while prioritizing participant safety and study integrity. The organization may be called a Data Monitoring Committee (DMC) or Data and Safety Monitoring Board (DSMB).\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 0
+    }
+  ],
+  "url": "http://hl7.org/fhir/research-study-party-role",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.4.1968"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "ResearchStudyPartyRole",
+  "title": "Research Study Party Role",
+  "status": "active",
+  "experimental": false,
+  "date": "2022-05-12T12:40:00+00:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "This is a ResearchStudy\u0027s party role.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/research-study-party-role",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "sponsor",
+      "display": "Sponsor",
+      "definition": "Person, company, agency or institution that initiates a clinical investigation and takes responsibility for that investigation but does not conduct the investigation."
+    },
+    {
+      "code": "lead-sponsor",
+      "display": "Lead sponsor",
+      "definition": "Primary person, company, agency or institution that initiates a clinical investigation and takes responsibility for that investigation but does not conduct the investigation if there is more than one sponsor."
+    },
+    {
+      "code": "sponsor-investigator",
+      "display": "Sponsor-investigator",
+      "definition": "Entity who both initiates and conducts an investigation."
+    },
+    {
+      "code": "primary-investigator",
+      "display": "Principal investigator",
+      "definition": "An investigator who is responsible for all aspects of the conduct of a study."
+    },
+    {
+      "code": "collaborator",
+      "display": "Collaborator",
+      "definition": "An organization or individual, who contributes to a study by providing support to the primary investigator to conduct research."
+    },
+    {
+      "code": "funding-source",
+      "display": "Funding source",
+      "definition": "An organization that underwrites financial support for the research study."
+    },
+    {
+      "code": "general-contact",
+      "display": "General contact",
+      "definition": "Information for the person who can answer general questions for a study."
+    },
+    {
+      "code": "recruitment-contact",
+      "display": "Recruitment contact",
+      "definition": "Information for the person who can answer recruitment questions for a study."
+    },
+    {
+      "code": "sub-investigator",
+      "display": "Sub-investigator",
+      "definition": "Any individual member of the clinical trial team designated and supervised by the investigator at a trial site to perform critical trial-related procedures and/or to make important trial-related decisions (e.g., associates, residents, research fellows)."
+    },
+    {
+      "code": "study-chair",
+      "display": "Study chair",
+      "definition": "An individual person who both initiates and conducts, alone or with others, a clinical trial and under whose immediate direction the investigational product is administered to, dispensed to, or used by a subject. (Also called study director or study chairperson)"
+    },
+    {
+      "code": "irb",
+      "display": "Institutional Review Board",
+      "definition": "A group of individuals that reviews and monitors research involving human subjects."
+    },
+    {
+      "code": "data-monitoring",
+      "display": "Data Monitoring",
+      "definition": "An organization or individual who monitors the validity and integrity of collected data while prioritizing participant safety and study integrity. The organization may be called a Data Monitoring Committee (DMC) or Data and Safety Monitoring Board (DSMB)."
+    }
+  ]
+}

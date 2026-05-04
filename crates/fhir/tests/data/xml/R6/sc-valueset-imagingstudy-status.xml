@@ -78,7 +78,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-imagingstudy-status"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="ImagingStudyStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Imaging Study Status&quot;"/>
   <status value="draft"/>

@@ -262,6 +262,17 @@
     "start": "2018-01-01",
     "end": "2018-12-31"
   },
+  "topic": [
+    {
+      "coding": [
+        {
+          "system": "http://loinc.org",
+          "code": "57024-2",
+          "display": "Health Quality Measure Document"
+        }
+      ]
+    }
+  ],
   "library": [
     "#EXM55"
   ],

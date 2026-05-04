@@ -71,7 +71,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-biologicallyderived-product-status"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="BiologicallyDerivedProductStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Biologically Derived Product Status&quot;"/>
   <status value="draft"/>

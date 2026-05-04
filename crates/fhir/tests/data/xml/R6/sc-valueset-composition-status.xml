@@ -113,7 +113,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-composition-status"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="CompositionStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Composition Status&quot;"/>
   <status value="draft"/>

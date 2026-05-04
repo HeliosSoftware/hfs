@@ -111,7 +111,50 @@
     <reference value="Practitioner/f007"/>
     <display value="Patrick Pump"/>
   </requester>
-  <dosageInstruction/>
+  <dosageInstruction>
+    <simple>
+      <text value="Apply twice daily to affected area on left arm"/>
+      <additionalInstruction>
+        <text value="Apply sparingly"/>
+      </additionalInstruction>
+      <timing>
+        <repeat>
+          <frequency value="2"/>
+          <period value="1"/>
+          <periodUnit value="d"/>
+        </repeat>
+      </timing>
+      <site>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="72098002"/>
+          <display value="Entire left upper arm (body structure)"/>
+        </coding>
+      </site>
+      <route>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="359540000"/>
+          <display value="Topical (qualifier value)"/>
+        </coding>
+      </route>
+      <doseAndRate>
+        <type>
+          <coding>
+            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+            <code value="ordered"/>
+            <display value="Ordered"/>
+          </coding>
+        </type>
+        <doseQuantity>
+          <value value="1"/>
+          <unit value="ea"/>
+          <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
+          <code value="OINT"/>
+        </doseQuantity>
+      </doseAndRate>
+    </simple>
+  </dosageInstruction>
   <dispenseRequest>
     <validityPeriod>
       <start value="2015-01-15"/>

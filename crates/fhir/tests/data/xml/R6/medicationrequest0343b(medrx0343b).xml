@@ -48,5 +48,38 @@
     <reference value="Practitioner/f007"/>
     <display value="Patrick Pump"/>
   </requester>
-  <dosageInstruction/>
+  <dosageInstruction>
+    <simple>
+      <text value="4mg IM twice daily as needed for nausea"/>
+      <timing>
+        <repeat>
+          <frequency value="2"/>
+          <period value="1"/>
+          <periodUnit value="d"/>
+        </repeat>
+      </timing>
+      <asNeededFor>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="16932000"/>
+          <display value="Nausea and Vomiting"/>
+        </coding>
+      </asNeededFor>
+      <route>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="78421000"/>
+          <display value="Intramuscular Route"/>
+        </coding>
+      </route>
+      <doseAndRate>
+        <doseQuantity>
+          <value value="4"/>
+          <unit value="mg"/>
+          <system value="http://unitsofmeasure.org"/>
+          <code value="mg"/>
+        </doseQuantity>
+      </doseAndRate>
+    </simple>
+  </dosageInstruction>
 </MedicationRequest>

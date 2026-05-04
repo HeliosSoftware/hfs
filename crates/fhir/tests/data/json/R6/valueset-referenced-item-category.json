@@ -2,11 +2,11 @@
   "resourceType": "ValueSet",
   "id": "referenced-item-category",
   "meta": {
-    "lastUpdated": "2026-04-22T02:59:29.647+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet referenced-item-category\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"referenced-item-category\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcreferenced-item-category\"\u003e \u003c/a\u003e\u003cp\u003eThis value set includes codes based on the following rules:\u003c/p\u003e\u003cul\u003e\u003cli\u003eInclude all codes defined in \u003ca href\u003d\"http://terminology.hl7.org/7.1.0/CodeSystem-media-category.html\"\u003e\u003ccode\u003ehttp://terminology.hl7.org/CodeSystem/media-category\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated, which means it is fixed to 5.0.0, the version found through the package references\"\u003e version \u0026#x1F4E6;5.0.0\u003c/span\u003e\u003c/li\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e where SCALE_TYP  \u003d LP32888-7 (Doc)\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet referenced-item-category\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"referenced-item-category\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcreferenced-item-category\"\u003e \u003c/a\u003e\u003cp\u003eThis value set includes codes based on the following rules:\u003c/p\u003e\u003cul\u003e\u003cli\u003eInclude all codes defined in \u003ca href\u003d\"http://terminology.hl7.org/7.0.1/CodeSystem-media-category.html\"\u003e\u003ccode\u003ehttp://terminology.hl7.org/CodeSystem/media-category\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated, which means it is fixed to 4.0.0, the version found through the package references\"\u003e version \u0026#x1F4E6;4.0.0\u003c/span\u003e\u003c/li\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e where SCALE_TYP  \u003d LP32888-7 (Doc)\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -29,7 +29,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.3.3275"
     }
   ],
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "ReferencedItemCategoryValueSet",
   "title": "Referenced Item Category Value Set",
   "status": "active",

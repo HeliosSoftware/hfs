@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "AdministrableProductDefinition",
   "meta": {
-    "lastUpdated": "2026-04-22T02:59:29.647+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/AdministrableProductDefinition",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "AdministrableProductDefinition",
   "status": "active",
   "experimental": false,
-  "date": "2026-04-22T02:59:29+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / Biomedical Research and Regulation",
   "contact": [
     {
@@ -63,7 +63,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "w5",
@@ -308,7 +308,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
           "additional": [
             {
               "purpose": "starter",
@@ -570,7 +570,7 @@
           ],
           "strength": "required",
           "description": "The lifecycle status of an artifact.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -1229,7 +1229,7 @@
           ],
           "strength": "required",
           "description": "The lifecycle status of an artifact.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -2194,7 +2194,7 @@
           ],
           "strength": "required",
           "description": "The lifecycle status of an artifact.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -2564,7 +2564,7 @@
           ],
           "strength": "required",
           "description": "The lifecycle status of an artifact.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"
         },
         "mapping": [
           {

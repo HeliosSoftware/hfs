@@ -22,7 +22,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.5.1318"/>
   </identifier>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="ProvenanceRelevantHistory"/>
   <title value="Provenance  Relevant  History"/>
   <status value="active"/>
@@ -36,7 +36,7 @@
     </telecom>
   </contact>
   <description value="This profile is provided for guidance purposes only.  There is no expectation that implementers must adhere to this profile.  It is included in the specification to help implementers understand how they might use Provenance to satisfy the typical needs envisioned by the 'relevantHistory' elements found in various Event and Request resources.&#xD;&#xA;&#xD;&#xA;This profile identifies the data elements most likely to be relevant to implementers who are using Provenance to convey the `relevant history` of a resource, as discussed in the [request pattern](request.html#history).  For the purposes of this profile, mustSupport should be interpreted as 'SHOULD be considered for population and SHOULD be understood by consumers.'  Implementers are not obligated to handle all of these element and are not prohibited from also making use of additional data elements"/>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -69,7 +69,7 @@
   <derivation value="constraint"/>
   <snapshot>
     <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-      <valueString value="6.0.0-ballot4"/>
+      <valueString value="6.0.0-ballot3"/>
     </extension>
     <element id="Provenance">
       <path value="Provenance"/>
@@ -252,7 +252,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1745,7 +1745,7 @@
         </extension>
         <strength value="required"/>
         <description value="How an entity was used in an activity."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/provenance-entity-role|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/provenance-entity-role|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="rim"/>

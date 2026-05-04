@@ -16,11 +16,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/RelatedArtifact",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "RelatedArtifact",
   "status": "active",
   "experimental": false,
-  "date": "2026-04-22T02:59:29+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -53,7 +53,7 @@
     }
   ],
   "purpose": "Knowledge resources must be able to provide enough information for consumers of the content (and/or interventions or results produced by the content) to be able to determine and understand the justification for and evidence in support of the content.",
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "rim",
@@ -249,7 +249,7 @@
           ],
           "strength": "required",
           "description": "The type of relationship to the related artifact.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/related-artifact-type|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/related-artifact-type|6.0.0-ballot3"
         }
       },
       {
@@ -543,7 +543,7 @@
           ],
           "strength": "required",
           "description": "The type of relationship to the related artifact.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/related-artifact-type|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/related-artifact-type|6.0.0-ballot3"
         }
       },
       {

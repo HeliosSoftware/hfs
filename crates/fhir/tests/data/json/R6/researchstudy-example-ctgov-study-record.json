@@ -418,17 +418,15 @@
     }
   ],
   "status": "active",
-  "purposeType": [
-    {
-      "coding": [
-        {
-          "system": "http://terminology.hl7.org/CodeSystem/research-study-prim-purp-type",
-          "code": "treatment",
-          "display": "Treatment"
-        }
-      ]
-    }
-  ],
+  "primaryPurposeType": {
+    "coding": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/research-study-prim-purp-type",
+        "code": "treatment",
+        "display": "Treatment"
+      }
+    ]
+  },
   "phase": {
     "coding": [
       {
@@ -579,7 +577,7 @@
       "role": {
         "coding": [
           {
-            "system": "http://terminology.hl7.org/CodeSystem/research-study-party-role",
+            "system": "http://hl7.org/fhir/research-study-party-role",
             "code": "sponsor",
             "display": "Sponsor"
           }
@@ -602,7 +600,7 @@
       "role": {
         "coding": [
           {
-            "system": "http://terminology.hl7.org/CodeSystem/research-study-party-role",
+            "system": "http://hl7.org/fhir/research-study-party-role",
             "code": "lead-sponsor",
             "display": "Lead sponsor"
           }
@@ -625,7 +623,7 @@
       "role": {
         "coding": [
           {
-            "system": "http://terminology.hl7.org/CodeSystem/research-study-party-role",
+            "system": "http://hl7.org/fhir/research-study-party-role",
             "code": "primary-investigator",
             "display": "Principal investigator"
           }
@@ -641,7 +639,7 @@
       "state": {
         "coding": [
           {
-            "system": "http://terminology.hl7.org/CodeSystem/research-study-status",
+            "system": "http://hl7.org/fhir/research-study-status",
             "code": "completed",
             "display": "Completed"
           }
@@ -652,7 +650,7 @@
       "state": {
         "coding": [
           {
-            "system": "http://terminology.hl7.org/CodeSystem/research-study-status",
+            "system": "http://hl7.org/fhir/research-study-status",
             "code": "overall-study",
             "display": "Overall study"
           }

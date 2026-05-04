@@ -16,11 +16,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/ElementDefinition",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "ElementDefinition",
   "status": "active",
   "experimental": false,
-  "date": "2026-04-22T02:59:29+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -52,7 +52,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "v2",
@@ -486,7 +486,7 @@
           ],
           "strength": "required",
           "description": "How a property is represented when serialized.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/property-representation|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/property-representation|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -1007,7 +1007,7 @@
           ],
           "strength": "required",
           "description": "How an element value is interpreted when discrimination is evaluated.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/discriminator-type|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/discriminator-type|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -1186,7 +1186,7 @@
           ],
           "strength": "required",
           "description": "How slices are interpreted when evaluating an instance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/resource-slicing-rules|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/resource-slicing-rules|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -2211,7 +2211,7 @@
           ],
           "strength": "required",
           "description": "How resource references can be aggregated.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/resource-aggregation-mode|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/resource-aggregation-mode|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -2266,7 +2266,7 @@
           ],
           "strength": "required",
           "description": "Whether a reference needs to be version specific or version independent, or whether either can be used.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/reference-version-rules|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/reference-version-rules|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -3819,7 +3819,7 @@
           ],
           "strength": "required",
           "description": "SHALL applications comply with this constraint?",
-          "valueSet": "http://hl7.org/fhir/ValueSet/constraint-severity|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/constraint-severity|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -4455,7 +4455,7 @@
           ],
           "strength": "required",
           "description": "Indication of the degree of conformance expectations associated with a binding.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -4774,7 +4774,7 @@
           ],
           "strength": "required",
           "description": "The use of an additional binding.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/additional-binding-purpose|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/additional-binding-purpose|6.0.0-ballot3"
         }
       },
       {
@@ -5147,7 +5147,7 @@
           ],
           "strength": "required",
           "description": "BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)",
-          "valueSet": "http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -5465,7 +5465,7 @@
           ],
           "strength": "required",
           "description": "How a property is represented when serialized.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/property-representation|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/property-representation|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -5705,7 +5705,7 @@
           ],
           "strength": "required",
           "description": "How an element value is interpreted when discrimination is evaluated.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/discriminator-type|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/discriminator-type|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -5824,7 +5824,7 @@
           ],
           "strength": "required",
           "description": "How slices are interpreted when evaluating an instance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/resource-slicing-rules|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/resource-slicing-rules|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -6422,7 +6422,7 @@
           ],
           "strength": "required",
           "description": "How resource references can be aggregated.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/resource-aggregation-mode|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/resource-aggregation-mode|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -6462,7 +6462,7 @@
           ],
           "strength": "required",
           "description": "Whether a reference needs to be version specific or version independent, or whether either can be used.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/reference-version-rules|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/reference-version-rules|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -7601,7 +7601,7 @@
           ],
           "strength": "required",
           "description": "SHALL applications comply with this constraint?",
-          "valueSet": "http://hl7.org/fhir/ValueSet/constraint-severity|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/constraint-severity|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -7971,7 +7971,7 @@
           ],
           "strength": "required",
           "description": "Indication of the degree of conformance expectations associated with a binding.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-ballot3"
         },
         "mapping": [
           {
@@ -8129,7 +8129,7 @@
           ],
           "strength": "required",
           "description": "The use of an additional binding.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/additional-binding-purpose|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/additional-binding-purpose|6.0.0-ballot3"
         }
       },
       {
@@ -8294,7 +8294,7 @@
           ],
           "strength": "required",
           "description": "BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)",
-          "valueSet": "http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot3"
         },
         "mapping": [
           {

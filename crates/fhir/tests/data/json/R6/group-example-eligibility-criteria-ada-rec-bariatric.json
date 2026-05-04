@@ -420,7 +420,7 @@
           },
           "exclude": true,
           "description": "unless documented to be disease-free for five years",
-          "relativeTime": [
+          "timing": [
             {
               "offsetRange": {
                 "low": {
@@ -555,7 +555,7 @@
       },
       "exclude": true,
       "description": "Cardiovascular event (myocardial infarction, acute coronary syndrome, coronary artery angioplasty or bypass, stroke) in the past six months.",
-      "relativeTime": [
+      "timing": [
         {
           "offsetRange": {
             "low": {
@@ -628,7 +628,7 @@
       },
       "exclude": true,
       "description": "Pulmonary embolus in the past six months. Placeholder for now to represent \u0027screened surgical candidate\u0027.",
-      "relativeTime": [
+      "timing": [
         {
           "offsetRange": {
             "low": {
@@ -669,7 +669,7 @@
       },
       "exclude": true,
       "description": "Thrombophlebitis in the past six months. Placeholder for now to represent \u0027screened surgical candidate\u0027.",
-      "relativeTime": [
+      "timing": [
         {
           "offsetRange": {
             "low": {

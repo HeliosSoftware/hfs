@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "research-study-party-organization-type",
   "meta": {
-    "lastUpdated": "2026-04-22T13:59:29.647+11:00"
+    "lastUpdated": "2025-12-17T20:50:17.012+11:00"
   },
   "text": {
     "status": "generated",
@@ -23,7 +23,7 @@
     }
   ],
   "url": "http://hl7.org/fhir/research-study-party-organization-type",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "ResearchStudyPartyOrganizationType",
   "title": "ResearchStudy Party Organization Type Code System",
   "status": "active",

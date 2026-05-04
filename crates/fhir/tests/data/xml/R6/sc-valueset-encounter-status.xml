@@ -99,7 +99,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-encounter-status"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="EncounterStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Encounter Status&quot;"/>
   <status value="draft"/>

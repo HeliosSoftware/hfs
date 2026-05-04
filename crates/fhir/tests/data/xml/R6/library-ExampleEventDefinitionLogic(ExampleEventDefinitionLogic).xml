@@ -69,7 +69,7 @@ define fluent function consecutivelyAfter(observations List&lt;Observation&gt;, 
     <valueCode value="cds"/>
   </extension>
   <url value="http://hl7.org/fhir/EventDefinition/ExampleEventDefinitionLogic"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="ExampleEventDefinitionLogic"/>
   <title value="Example EventDefinition Logic"/>
   <status value="active"/>

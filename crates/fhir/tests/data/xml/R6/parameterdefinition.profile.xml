@@ -208,11 +208,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/ParameterDefinition"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="ParameterDefinition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-04-22T02:59:29+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -234,7 +234,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="rim"/>
     <uri value="http://hl7.org/v3"/>
@@ -395,7 +395,7 @@
         </extension>
         <strength value="required"/>
         <description value="Whether the parameter is input or output."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/operation-parameter-use|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/operation-parameter-use|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="ParameterDefinition.min">
@@ -505,7 +505,7 @@
         </extension>
         <strength value="required"/>
         <description value="List of FHIR types (resources, data types)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="ParameterDefinition.profile">
@@ -575,7 +575,7 @@
         </extension>
         <strength value="required"/>
         <description value="Whether the parameter is input or output."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/operation-parameter-use|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/operation-parameter-use|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="ParameterDefinition.min">
@@ -633,7 +633,7 @@
         </extension>
         <strength value="required"/>
         <description value="List of FHIR types (resources, data types)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="ParameterDefinition.profile">

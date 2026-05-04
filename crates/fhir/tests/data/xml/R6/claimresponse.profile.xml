@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ClaimResponse"/>
   <meta>
-    <lastUpdated value="2026-04-22T02:59:29.647+00:00"/>
+    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -3316,11 +3316,11 @@
     <valueCode value="patient"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/ClaimResponse"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="ClaimResponse"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-04-22T02:59:29+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / Financial Management"/>
   <contact>
     <telecom>
@@ -3342,7 +3342,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -3542,7 +3542,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -3773,7 +3773,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code specifying the state of the resource instance."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -3920,7 +3920,7 @@
         </extension>
         <strength value="required"/>
         <description value="Claim, preauthorization, predetermination."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/claim-use|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/claim-use|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -4124,7 +4124,7 @@
         </extension>
         <strength value="required"/>
         <description value="The result of the claim processing."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/claim-outcome|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/claim-outcome|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="ClaimResponse.decision">
@@ -9155,7 +9155,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -9794,7 +9794,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code specifying the state of the resource instance."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -9893,7 +9893,7 @@
         </extension>
         <strength value="required"/>
         <description value="Claim, preauthorization, predetermination."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/claim-use|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/claim-use|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -10025,7 +10025,7 @@
         </extension>
         <strength value="required"/>
         <description value="The result of the claim processing."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/claim-outcome|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/claim-outcome|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="ClaimResponse.decision">
@@ -12316,7 +12316,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>

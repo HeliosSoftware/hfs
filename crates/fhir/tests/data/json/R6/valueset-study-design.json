@@ -1,0 +1,2066 @@
+{
+  "resourceType": "ValueSet",
+  "id": "study-design",
+  "meta": {
+    "lastUpdated": "2025-12-17T09:50:17+00:00"
+  },
+  "text": {
+    "status": "extensions",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet study-design\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"study-design\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcstudy-design\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eLast updated: 2022-05-12T12:40:00Z\u003c/p\u003e\u003c/div\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://tx.fhir.org/r5\"\u003e\u003ccode\u003ehttps://fevir.net/sevco\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is explicitly stated to be 2.0\"\u003e version \u0026#x1F4CD;2.0\u003c/span\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition (core metadata concept)\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eSynonym (core metadata concept)\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801001\"\u003eSEVCO:01001\u003c/a\u003e\u003c/td\u003e\u003ctd\u003einterventional research\u003c/td\u003e\u003ctd\u003eA study design in which an independent variable (an exposure or intervention) is prospectively assigned or modified by the investigator to evaluate a response in the dependent variable (an effect or outcome).\u003c/td\u003e\u003ctd\u003eA study design in which an independent variable (an exposure or intervention) is prospectively assigned or modified by the investigator to evaluate a response in the dependent variable (an effect or outcome).\u003c/td\u003e\u003ctd\u003eexperimental study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801003\"\u003eSEVCO:01003\u003c/a\u003e\u003c/td\u003e\u003ctd\u003erandomized assignment\u003c/td\u003e\u003ctd\u003eAn interventional study design in which an independent variable (an exposure or intervention) is prospectively assigned or modified by random chance to separate groups.\u003c/td\u003e\u003ctd\u003eAn interventional study design in which an independent variable (an exposure or intervention) is prospectively assigned or modified by random chance to separate groups.\u003c/td\u003e\u003ctd\u003eRCT\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801006\"\u003eSEVCO:01006\u003c/a\u003e\u003c/td\u003e\u003ctd\u003esimple randomization\u003c/td\u003e\u003ctd\u003eA randomized assignment in which each participant has the same prespecified likelihood of being assigned to a group as all other participants, independent of the assignment of any other participant.\u003c/td\u003e\u003ctd\u003eA randomized assignment in which each participant has the same prespecified likelihood of being assigned to a group as all other participants, independent of the assignment of any other participant.\u003c/td\u003e\u003ctd\u003eunrestricted randomization\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801007\"\u003eSEVCO:01007\u003c/a\u003e\u003c/td\u003e\u003ctd\u003estratified randomization\u003c/td\u003e\u003ctd\u003eA randomized assignment in which participants are stratified into groups based on prognostic variables and then randomized into balanced treatment groups\u003c/td\u003e\u003ctd\u003eA randomized assignment in which participants are stratified into groups based on prognostic variables and then randomized into balanced treatment groups\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801008\"\u003eSEVCO:01008\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eblock randomization\u003c/td\u003e\u003ctd\u003eA randomized assignment in which a pre-specified number of subjects is assigned to a block containing the same pre-specified ratio of group assignments in random order.\u003c/td\u003e\u003ctd\u003eA randomized assignment in which a pre-specified number of subjects is assigned to a block containing the same pre-specified ratio of group assignments in random order.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801009\"\u003eSEVCO:01009\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eadaptive randomization\u003c/td\u003e\u003ctd\u003eA randomized assignment in which a participant’s group assignment probability is adjusted based on any factor such that the likelihood of assignment is not the same for all participants.\u003c/td\u003e\u003ctd\u003eA randomized assignment in which a participant’s group assignment probability is adjusted based on any factor such that the likelihood of assignment is not the same for all participants.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801005\"\u003eSEVCO:01005\u003c/a\u003e\u003c/td\u003e\u003ctd\u003enon-randomized assignment\u003c/td\u003e\u003ctd\u003eAn interventional study design in which an independent variable (an exposure or intervention) is prospectively assigned or modified by methods other than random chance to separate groups.\u003c/td\u003e\u003ctd\u003eAn interventional study design in which an independent variable (an exposure or intervention) is prospectively assigned or modified by methods other than random chance to separate groups.\u003c/td\u003e\u003ctd\u003einterventional research with non-randomized assignment\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801004\"\u003eSEVCO:01004\u003c/a\u003e\u003c/td\u003e\u003ctd\u003equasi-randomized assignment\u003c/td\u003e\u003ctd\u003eAn interventional study design with a method of allocation that is not limited to random chance but is intended to produce similar baseline groups for experimentation.\u003c/td\u003e\u003ctd\u003eAn interventional study design with a method of allocation that is not limited to random chance but is intended to produce similar baseline groups for experimentation.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801029\"\u003eSEVCO:01029\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eclinical trial\u003c/td\u003e\u003ctd\u003eInterventional research in which one or more healthcare-related actions (i.e., a diagnostic, prognostic, therapeutic, preventive or screening method or intervention) is evaluated for effects on health-related biomedical or behavioral processes and/or outcomes.\u003c/td\u003e\u003ctd\u003eInterventional research in which one or more healthcare-related actions (i.e., a diagnostic, prognostic, therapeutic, preventive or screening method or intervention) is evaluated for effects on health-related biomedical or behavioral processes and/or outcomes.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801041\"\u003eSEVCO:01041\u003c/a\u003e\u003c/td\u003e\u003ctd\u003epragmatic clinical trial\u003c/td\u003e\u003ctd\u003eA clinical trial conducted under conditions of routine clinical practice.\u003c/td\u003e\u003ctd\u003eA clinical trial conducted under conditions of routine clinical practice.\u003c/td\u003e\u003ctd\u003epragmatic trial\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801038\"\u003eSEVCO:01038\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eexpanded access study\u003c/td\u003e\u003ctd\u003eA clinical trial that provides a means for obtaining an experimental drug or device for patients who are not adequately treated by existing therapy, who do not meet the eligibility criteria for enrollment, or who are otherwise unable to participate in another clinical study.\u003c/td\u003e\u003ctd\u003eA clinical trial that provides a means for obtaining an experimental drug or device for patients who are not adequately treated by existing therapy, who do not meet the eligibility criteria for enrollment, or who are otherwise unable to participate in another clinical study. \u003c/td\u003e\u003ctd\u003eexpanded access trial\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801030\"\u003eSEVCO:01030\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ephase 1 trial\u003c/td\u003e\u003ctd\u003eA clinical trial to gather initial evidence in humans to support further investigation of an intervention.\u003c/td\u003e\u003ctd\u003eA clinical trial to gather initial evidence in humans to support further investigation of an intervention.\u003c/td\u003e\u003ctd\u003ephase I clinical trial\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801031\"\u003eSEVCO:01031\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eexploratory investigational new drug study\u003c/td\u003e\u003ctd\u003eA clinical trial that is conducted early in phase 1, involves very limited human exposure, and has no therapeutic or diagnostic intent (e.g., screening studies, microdose studies).\u003c/td\u003e\u003ctd\u003eA clinical trial that is conducted early in phase 1, involves very limited human exposure, and has no therapeutic or diagnostic intent (e.g., screening studies, microdose studies). \u003c/td\u003e\u003ctd\u003eexploratory ind study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801032\"\u003eSEVCO:01032\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ephase 1/phase 2 trial\u003c/td\u003e\u003ctd\u003eA clinical trial with a component meeting the definition of phase 1 trial and a component meeting the definition of phase 2 trial.\u003c/td\u003e\u003ctd\u003e A clinical trial with a component meeting the definition of phase 1 trial and a component meeting the definition of phase 2 trial.\u003c/td\u003e\u003ctd\u003etrial phase 1/2\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801033\"\u003eSEVCO:01033\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ephase 2 trial\u003c/td\u003e\u003ctd\u003eA clinical trial to gather evidence of effectiveness and safety for an intervention in patients with the disease or condition under study, but not intended to provide an adequate basis for regulatory approval for clinical use.\u003c/td\u003e\u003ctd\u003eA clinical trial to gather evidence of effectiveness and safety for an intervention in patients with the disease or condition under study, but not intended to provide an adequate basis for regulatory approval for clinical use.\u003c/td\u003e\u003ctd\u003ephase II clinical trial\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801034\"\u003eSEVCO:01034\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ephase 2/phase 3 trial\u003c/td\u003e\u003ctd\u003eA clinical trial with a component meeting the definition of phase 2 trial and a component meeting the definition of phase 3 trial.\u003c/td\u003e\u003ctd\u003eA clinical trial with a component meeting the definition of phase 2 trial and a component meeting the definition of phase 3 trial.\u003c/td\u003e\u003ctd\u003etrial phase 2/3\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801035\"\u003eSEVCO:01035\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ephase 3 trial\u003c/td\u003e\u003ctd\u003eA clinical trial to gather the evidence of effectiveness and safety of an intervention, intended to provide an adequate basis for regulatory approval for clinical use.\u003c/td\u003e\u003ctd\u003eA clinical trial to gather the evidence of effectiveness and safety of an intervention, intended to provide an adequate basis for regulatory approval for clinical use.\u003c/td\u003e\u003ctd\u003ephase III clinical trial\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801036\"\u003eSEVCO:01036\u003c/a\u003e\u003c/td\u003e\u003ctd\u003epost-marketing study\u003c/td\u003e\u003ctd\u003eA clinical trial to gather additional evidence of effectiveness and safety of an intervention for an already approved clinical use.\u003c/td\u003e\u003ctd\u003eA clinical trial to gather additional evidence of effectiveness and safety of an intervention for an already approved clinical use.\u003c/td\u003e\u003ctd\u003epost-approval study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801002\"\u003eSEVCO:01002\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eobservational research\u003c/td\u003e\u003ctd\u003eA study design in which the independent variables (exposures or interventions) are not prospectively assigned or modified by the investigator.\u003c/td\u003e\u003ctd\u003eA study design in which the independent variables (exposures or interventions) are not prospectively assigned or modified by the investigator. \u003c/td\u003e\u003ctd\u003enon-interventional research\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801037\"\u003eSEVCO:01037\u003c/a\u003e\u003c/td\u003e\u003ctd\u003epost-marketing surveillance study\u003c/td\u003e\u003ctd\u003eAn observational study to identify adverse events related to the use of an approved clinical intervention.\u003c/td\u003e\u003ctd\u003eAn observational study to identify adverse events related to the use of an approved clinical intervention.\u003c/td\u003e\u003ctd\u003epostmarketing evaluation study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801010\"\u003eSEVCO:01010\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ecomparative study design\u003c/td\u003e\u003ctd\u003eA study design in which two or more groups are compared.\u003c/td\u003e\u003ctd\u003eA study design in which two or more groups are compared.\u003c/td\u003e\u003ctd\u003ecomparative research\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801011\"\u003eSEVCO:01011\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eparallel cohort design\u003c/td\u003e\u003ctd\u003eA comparative study design in which the groups are compared concurrently and participants are expected to remain in the groups being compared for the entire duration of participation in the study.\u003c/td\u003e\u003ctd\u003eA comparative study design in which the groups are compared concurrently and participants are expected to remain in the groups being compared for the entire duration of participation in the study.\u003c/td\u003e\u003ctd\u003econcurrent cohort study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801012\"\u003eSEVCO:01012\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ecrossover cohort design\u003c/td\u003e\u003ctd\u003eA comparative study design in which participants receive two or more alternative exposures during separate periods of time.\u003c/td\u003e\u003ctd\u003eA comparative study design in which participants receive two or more alternative exposures during separate periods of time.\u003c/td\u003e\u003ctd\u003ecrossover trial\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801024\"\u003eSEVCO:01024\u003c/a\u003e\u003c/td\u003e\u003ctd\u003econtrolled crossover cohort design\u003c/td\u003e\u003ctd\u003eA crossover cohort design in which two or more cohorts have different orders of exposures.\u003c/td\u003e\u003ctd\u003eA crossover cohort design in which two or more cohorts have different orders of exposures.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801025\"\u003eSEVCO:01025\u003c/a\u003e\u003c/td\u003e\u003ctd\u003esingle-arm crossover design\u003c/td\u003e\u003ctd\u003eA crossover cohort design in which all participants are in a single cohort with the same order of exposures.\u003c/td\u003e\u003ctd\u003eA crossover cohort design in which all participants are in a single cohort with the same order of exposures.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801013\"\u003eSEVCO:01013\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ecase control design\u003c/td\u003e\u003ctd\u003eA comparative study design in which the groups being compared are defined by outcome presence (case) or absence (control).\u003c/td\u003e\u003ctd\u003eA comparative study design in which the groups being compared are defined by outcome presence (case) or absence (control).\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801014\"\u003eSEVCO:01014\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ematching for comparison\u003c/td\u003e\u003ctd\u003eA comparative study design in which individual participants in different groups being compared are paired or matched into sets based on selected attributes for within-set analysis.\u003c/td\u003e\u003ctd\u003eA comparative study design in which individual participants in different groups being compared are paired or matched into sets based on selected attributes for within-set analysis.\u003c/td\u003e\u003ctd\u003ematched study design\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801020\"\u003eSEVCO:01020\u003c/a\u003e\u003c/td\u003e\u003ctd\u003efamily study design\u003c/td\u003e\u003ctd\u003eA matched study design in which related or non-related family members are compared.\u003c/td\u003e\u003ctd\u003eA matched study design in which related or non-related family members are compared.\u003c/td\u003e\u003ctd\u003efamily based study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801021\"\u003eSEVCO:01021\u003c/a\u003e\u003c/td\u003e\u003ctd\u003etwin study design\u003c/td\u003e\u003ctd\u003eA family study design in which twin siblings are compared.\u003c/td\u003e\u003ctd\u003eA family study design in which twin siblings are compared.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801015\"\u003eSEVCO:01015\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ecluster as unit of allocation\u003c/td\u003e\u003ctd\u003eA comparative study design in which participants are allocated to exposures (interventions) by their membership in groups (called clusters) rather than by individualized assignments.\u003c/td\u003e\u003ctd\u003eA comparative study design in which participants are allocated to exposures (interventions) by their membership in groups (called clusters) rather than by individualized assignments.\u003c/td\u003e\u003ctd\u003eclustering for comparison\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801023\"\u003eSEVCO:01023\u003c/a\u003e\u003c/td\u003e\u003ctd\u003enon-comparative study design\u003c/td\u003e\u003ctd\u003eA study design with no comparisons between groups with different exposures and no comparisons between groups with different outcomes.\u003c/td\u003e\u003ctd\u003eA study design with no comparisons between groups with different exposures and no comparisons between groups with different outcomes.\u003c/td\u003e\u003ctd\u003edescriptive study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801016\"\u003eSEVCO:01016\u003c/a\u003e\u003c/td\u003e\u003ctd\u003euncontrolled cohort design\u003c/td\u003e\u003ctd\u003eA non-comparative study design in which two or more participants are evaluated in a single group (or cohort).\u003c/td\u003e\u003ctd\u003eA non-comparative study design in which two or more participants are evaluated in a single group (or cohort).\u003c/td\u003e\u003ctd\u003enon-controlled cohort design\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801017\"\u003eSEVCO:01017\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ecase report\u003c/td\u003e\u003ctd\u003eA non-comparative study design in which a single participant is evaluated.\u003c/td\u003e\u003ctd\u003eA non-comparative study design in which a single participant is evaluated.\u003c/td\u003e\u003ctd\u003ecase study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801022\"\u003eSEVCO:01022\u003c/a\u003e\u003c/td\u003e\u003ctd\u003epopulation-based design\u003c/td\u003e\u003ctd\u003eA study design in which the unit of observation is a population or community.\u003c/td\u003e\u003ctd\u003eA study design in which the unit of observation is a population or community. \u003c/td\u003e\u003ctd\u003epopulation study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801044\"\u003eSEVCO:01044\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eecological design\u003c/td\u003e\u003ctd\u003eA study design in which the unit of observation is a population or community defined by social relationships or physical surroundings.\u003c/td\u003e\u003ctd\u003eA study design in which the unit of observation is a population or community defined by social relationships or physical surroundings. \u003c/td\u003e\u003ctd\u003eecologic study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801027\"\u003eSEVCO:01027\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ecross sectional data collection \u003c/td\u003e\u003ctd\u003eA study design process in which data is collected at a single point in time.\u003c/td\u003e\u003ctd\u003eA study design process in which data is collected at a single point in time.\u003c/td\u003e\u003ctd\u003ecross-sectional study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801028\"\u003eSEVCO:01028\u003c/a\u003e\u003c/td\u003e\u003ctd\u003elongitudinal data collection\u003c/td\u003e\u003ctd\u003eA study design process in which data is collected at two or more points in time.\u003c/td\u003e\u003ctd\u003eA study design process in which data is collected at two or more points in time.\u003c/td\u003e\u003ctd\u003elongitudinal study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801018\"\u003eSEVCO:01018\u003c/a\u003e\u003c/td\u003e\u003ctd\u003etime series design\u003c/td\u003e\u003ctd\u003eA longitudinal data collection which includes a set of time-ordered observations.\u003c/td\u003e\u003ctd\u003eA longitudinal data collection which includes a set of time-ordered observations.\u003c/td\u003e\u003ctd\u003emultiple time point comparison\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801019\"\u003eSEVCO:01019\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ebefore and after comparison\u003c/td\u003e\u003ctd\u003eA time series design which includes comparisons of observations before and after an event or exposure.\u003c/td\u003e\u003ctd\u003eA time series design which includes comparisons of observations before and after an event or exposure.\u003c/td\u003e\u003ctd\u003ebefore-after comparison\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801045\"\u003eSEVCO:01045\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eprimary data collection\u003c/td\u003e\u003ctd\u003eA study design process in which the data are recorded and collected during the study for the purpose of the same study.\u003c/td\u003e\u003ctd\u003eA study design process in which the data are recorded and collected during the study for the purpose of the same study.\u003c/td\u003e\u003ctd\u003estudy-generated data collection\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801026\"\u003eSEVCO:01026\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ereal world data collection\u003c/td\u003e\u003ctd\u003eA study design process in which the study data are obtained from a source of data collected during a routine process in the natural environment rather than using a process designed or controlled by the researcher.\u003c/td\u003e\u003ctd\u003eA study design process in which the study data are obtained from a source of data collected during a routine process in the natural environment rather than using a process designed or controlled by the researcher.\u003c/td\u003e\u003ctd\u003eRWD collection\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801039\"\u003eSEVCO:01039\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ereal world data collection from healthcare records\u003c/td\u003e\u003ctd\u003eReal world data collection from data obtained routinely for a purpose of recording healthcare delivery in a record controlled by a healthcare professional.\u003c/td\u003e\u003ctd\u003eReal world data collection from data obtained routinely for a purpose of recording healthcare delivery in a record controlled by a healthcare professional.\u003c/td\u003e\u003ctd\u003ereal world data collection from medical records\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801050\"\u003eSEVCO:01050\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ereal world data collection from personal health records\u003c/td\u003e\u003ctd\u003eReal world data collection from data obtained routinely for a purpose of recording data related to personal health in a record controlled by the person, guardian, or caretaker.\u003c/td\u003e\u003ctd\u003eReal world data collection from data obtained routinely for a purpose of recording data related to personal health in a record controlled by the person, guardian, or caretaker.\u003c/td\u003e\u003ctd\u003eRWD collection from personal medical records\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801040\"\u003eSEVCO:01040\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ereal world data collection from healthcare financing records\u003c/td\u003e\u003ctd\u003eReal world data collection from data obtained routinely for a purpose of recording healthcare financing.\u003c/td\u003e\u003ctd\u003eReal world data collection from data obtained routinely for a purpose of recording healthcare financing.\u003c/td\u003e\u003ctd\u003eRWD collection from healthcare financing records\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801048\"\u003eSEVCO:01048\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ereal world data collection from testing procedures\u003c/td\u003e\u003ctd\u003eReal world data collection from data obtained routinely for a purpose of testing, such as diagnostic testing or screening examination.\u003c/td\u003e\u003ctd\u003eReal world data collection from data obtained routinely for a purpose of testing, such as diagnostic testing or screening examination.\u003c/td\u003e\u003ctd\u003eRWD collection from testing procedures\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801046\"\u003eSEVCO:01046\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ereal world data collection from monitoring procedures\u003c/td\u003e\u003ctd\u003eReal world data collection from data obtained routinely for a purpose of repeated testing.\u003c/td\u003e\u003ctd\u003eReal world data collection from data obtained routinely for a purpose of repeated testing.\u003c/td\u003e\u003ctd\u003eRWD collection from monitoring procedures\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801049\"\u003eSEVCO:01049\u003c/a\u003e\u003c/td\u003e\u003ctd\u003esecondary data collection from prior research\u003c/td\u003e\u003ctd\u003eA study design process in which the data are collected from data obtained during a different study than the current study.\u003c/td\u003e\u003ctd\u003eA study design process in which the data are collected from data obtained during a different study than the current study.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801042\"\u003eSEVCO:01042\u003c/a\u003e\u003c/td\u003e\u003ctd\u003esecondary data collection from a registry\u003c/td\u003e\u003ctd\u003eA study design process in which the data are collected from a system organized to obtain and maintain uniform data for discovery and analysis, and this system is organized prior to the current study.\u003c/td\u003e\u003ctd\u003eA study design process in which the data are collected from a system organized to obtain and maintain uniform data for discovery and analysis, and this system is organized prior to the current study.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801051\"\u003eSEVCO:01051\u003c/a\u003e\u003c/td\u003e\u003ctd\u003emultisite data collection\u003c/td\u003e\u003ctd\u003eA study design process in which data are collected from two or more geographic locations.\u003c/td\u003e\u003ctd\u003eA study design process in which data are collected from two or more geographic locations.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801086\"\u003eSEVCO:01086\u003c/a\u003e\u003c/td\u003e\u003ctd\u003equantitative analysis\u003c/td\u003e\u003ctd\u003eA study design process in which data are analyzed with mathematical or statistical methods and formulas.\u003c/td\u003e\u003ctd\u003eA study design process in which data are analyzed with mathematical or statistical methods and formulas.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801087\"\u003eSEVCO:01087\u003c/a\u003e\u003c/td\u003e\u003ctd\u003equalitative analysis\u003c/td\u003e\u003ctd\u003eA study design process in which data are analyzed, without primary reliance on mathematical or statistical techniques, by coding and organizing data to provide interpretation or understanding of experiences or hypotheses.\u003c/td\u003e\u003ctd\u003eA study design process in which data are analyzed, without primary reliance on mathematical or statistical techniques, by coding and organizing data to provide interpretation or understanding of experiences or hypotheses.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801060\"\u003eSEVCO:01060\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eblinding of study participants\u003c/td\u003e\u003ctd\u003eA study design process in which study participants are not informed of their intervention assignment.\u003c/td\u003e\u003ctd\u003eA study design process in which study participants are not informed of their intervention assignment.\u003c/td\u003e\u003ctd\u003emasking of study participants\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801061\"\u003eSEVCO:01061\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eblinding of intervention providers\u003c/td\u003e\u003ctd\u003eA study design process in which the people administering the intervention are not informed of the intervention assignment.\u003c/td\u003e\u003ctd\u003eA study design process in which the people administering the intervention are not informed of the intervention assignment.\u003c/td\u003e\u003ctd\u003emasking of intervention deliverers\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801062\"\u003eSEVCO:01062\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eblinding of outcome assessors\u003c/td\u003e\u003ctd\u003eA study design process in which the people determining the outcome are not informed of the intervention assignment.\u003c/td\u003e\u003ctd\u003eA study design process in which the people determining the outcome are not informed of the intervention assignment.\u003c/td\u003e\u003ctd\u003emasking of outcome assessors\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801063\"\u003eSEVCO:01063\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eblinding of data analysts\u003c/td\u003e\u003ctd\u003eA study design process in which the people managing or processing the data and statistical analysis are not informed of the intervention assignment.\u003c/td\u003e\u003ctd\u003eA study design process in which the people managing or processing the data and statistical analysis are not informed of the intervention assignment.\u003c/td\u003e\u003ctd\u003emasking of data analysts\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801064\"\u003eSEVCO:01064\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eallocation concealment\u003c/td\u003e\u003ctd\u003eA study design process in which all parties influencing study enrollment and allocation to study groups are unaware of the group assignment for the study participant at the time of enrollment and allocation.\u003c/td\u003e\u003ctd\u003eA study design process in which all parties influencing study enrollment and allocation to study groups are unaware of the group assignment for the study participant at the time of enrollment and allocation.\u003c/td\u003e\u003ctd\u003emasking of randomization assignment\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801043\"\u003eSEVCO:01043\u003c/a\u003e\u003c/td\u003e\u003ctd\u003emulticentric\u003c/td\u003e\u003ctd\u003eA study design feature in which two or more institutions are responsible for the conduct of the study.\u003c/td\u003e\u003ctd\u003eA study design feature in which two or more institutions are responsible for the conduct of the study.\u003c/td\u003e\u003ctd\u003emulticenter study\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801052\"\u003eSEVCO:01052\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eincludes patient-reported outcome\u003c/td\u003e\u003ctd\u003eA study design feature in which one or more outcomes are reported directly from the patient without interpretation by a clinician or researcher.\u003c/td\u003e\u003ctd\u003eA study design feature in which one or more outcomes are reported directly from the patient without interpretation by a clinician or researcher.\u003c/td\u003e\u003ctd\u003ePRO\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801053\"\u003eSEVCO:01053\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eincludes patient-centered outcome\u003c/td\u003e\u003ctd\u003eA study design feature in which one or more measures are outcomes that patients directly care about, i.e. outcomes that are directly related to patients\u0027 experience of their life.\u003c/td\u003e\u003ctd\u003eA study design feature in which one or more measures are outcomes that patients directly care about, i.e. outcomes that are directly related to patients\u0027 experience of their life.\u003c/td\u003e\u003ctd\u003eincludes clinical outcome measure\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801054\"\u003eSEVCO:01054\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eincludes disease-oriented outcome\u003c/td\u003e\u003ctd\u003eA study design feature in which one or more measures are outcomes that relate to a health or illness condition but are not outcomes which patients directly care about.\u003c/td\u003e\u003ctd\u003eA study design feature in which one or more measures are outcomes that relate to a health or illness condition but are not outcomes which patients directly care about.\u003c/td\u003e\u003ctd\u003eincludes surrogate outcome measure\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801085\"\u003eSEVCO:01085\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eincludes process measure\u003c/td\u003e\u003ctd\u003eA study design feature in which one or more outcomes are actions or behaviors of a healthcare professional or care team.\u003c/td\u003e\u003ctd\u003eA study design feature in which one or more outcomes are actions or behaviors of a healthcare professional or care team.\u003c/td\u003e\u003ctd\u003eincludes process outcome measure\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801089\"\u003eSEVCO:01089\u003c/a\u003e\u003c/td\u003e\u003ctd\u003estudy goal\u003c/td\u003e\u003ctd\u003eA study design feature specifying the intent of the study.\u003c/td\u003e\u003ctd\u003eA study design feature specifying the intent of the study.\u003c/td\u003e\u003ctd\u003estudy aim\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801096\"\u003eSEVCO:01096\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eevaluation goal\u003c/td\u003e\u003ctd\u003eA study goal to assess the efficiency, effectiveness, and impact of a given program, process, person or piece of equipment.\u003c/td\u003e\u003ctd\u003eA study goal to assess the efficiency, effectiveness, and impact of a given program, process, person or piece of equipment.\u003c/td\u003e\u003ctd\u003eevaluation aim\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801097\"\u003eSEVCO:01097\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ederivation goal\u003c/td\u003e\u003ctd\u003eA study goal with the intent to generate a predictive algorithm.\u003c/td\u003e\u003ctd\u003eA study goal with the intent to generate a predictive algorithm.\u003c/td\u003e\u003ctd\u003ederivation study goal\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801098\"\u003eSEVCO:01098\u003c/a\u003e\u003c/td\u003e\u003ctd\u003evalidation goal\u003c/td\u003e\u003ctd\u003eA study goal with the intent to determine the reliability and/or performance of a procedure for a specific predictive, classification, measurement, or communication purpose.\u003c/td\u003e\u003ctd\u003eA study goal with the intent to determine the reliability and/or performance of a procedure for a specific predictive, classification, measurement, or communication purpose.\u003c/td\u003e\u003ctd\u003evalidation study goal\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801088\"\u003eSEVCO:01088\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ecomparison goal\u003c/td\u003e\u003ctd\u003eA study design feature in which the study intent is to compare two or more interventions or exposures.\u003c/td\u003e\u003ctd\u003eA study design feature in which the study intent is to compare two or more interventions or exposures.\u003c/td\u003e\u003ctd\u003ecomparative analysis goal\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801091\"\u003eSEVCO:01091\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ecomparative effectiveness goal\u003c/td\u003e\u003ctd\u003eA study design feature in which the study intent is to compare two or more interventions with respect to benefits and/or harms.\u003c/td\u003e\u003ctd\u003eA study design feature in which the study intent is to compare two or more interventions with respect to benefits and/or harms.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801090\"\u003eSEVCO:01090\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ecomparative efficacy goal\u003c/td\u003e\u003ctd\u003eA study design feature in which the study intent is to compare two or more interventions with respect to effectiveness in ideal conditions.\u003c/td\u003e\u003ctd\u003eA study design feature in which the study intent is to compare two or more interventions with respect to effectiveness in ideal conditions.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801092\"\u003eSEVCO:01092\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ecomparative safety goal\u003c/td\u003e\u003ctd\u003eA study design feature in which the study intent is to compare two or more interventions with respect to harms.\u003c/td\u003e\u003ctd\u003eA study design feature in which the study intent is to compare two or more interventions with respect to harms.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801093\"\u003eSEVCO:01093\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eequivalence goal\u003c/td\u003e\u003ctd\u003eA study goal with the intent to compare two or more interventions or exposures and determine that any difference in effects is within a prespecified range representing absence of a meaningful difference.\u003c/td\u003e\u003ctd\u003eA study goal with the intent to compare two or more interventions or exposures and determine that any difference in effects is within a prespecified range representing absence of a meaningful difference.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801094\"\u003eSEVCO:01094\u003c/a\u003e\u003c/td\u003e\u003ctd\u003enon-inferiority goal\u003c/td\u003e\u003ctd\u003eA study goal with the intent to compare two or more interventions or exposures and determine that any difference in effects is below a prespecified value representing a threshold between a meaningful difference and absence of a meaningful difference.\u003c/td\u003e\u003ctd\u003eA study goal with the intent to compare two or more interventions or exposures and determine that any difference in effects is below a prespecified value representing a threshold between a meaningful difference and absence of a meaningful difference.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801095\"\u003eSEVCO:01095\u003c/a\u003e\u003c/td\u003e\u003ctd\u003esuperiority goal\u003c/td\u003e\u003ctd\u003eA study goal with the intent to compare two or more interventions or exposures and detect a difference in effects.\u003c/td\u003e\u003ctd\u003eA study goal with the intent to compare two or more interventions or exposures and detect a difference in effects.\u003c/td\u003e\u003ctd\u003esuperiority study goal\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/SEVCO#SEVCO-SEVCO.5801100\"\u003eSEVCO:01100\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eallocation ratio\u003c/td\u003e\u003ctd\u003eA study design feature describing the intended relative proportion of assignment across groups.\u003c/td\u003e\u003ctd\u003eA study design feature describing the intended relative proportion of assignment across groups.\u003c/td\u003e\u003ctd\u003e\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "cds"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "normative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 2
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/study-design",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.3.3045"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "StudyDesign",
+  "title": "Study Design",
+  "status": "active",
+  "experimental": false,
+  "date": "2022-08-24T12:40:00+00:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "This is a set of terms for study design characteristics.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "immutable": true,
+  "compose": {
+    "include": [
+      {
+        "system": "https://fevir.net/sevco",
+        "version": "2.0",
+        "concept": [
+          {
+            "code": "SEVCO:01001",
+            "display": "interventional research",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design in which an independent variable (an exposure or intervention) is prospectively assigned or modified by the investigator to evaluate a response in the dependent variable (an effect or outcome)."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "interventional study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "interventional study design"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "interventional primary research"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "international method of research"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "experimental research"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "experimental study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01003",
+            "display": "randomized assignment",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "An interventional study design in which an independent variable (an exposure or intervention) is prospectively assigned or modified by random chance to separate groups."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "interventional research with randomized assignment"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "randomized trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "randomized controlled trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "RCT"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01006",
+            "display": "simple randomization",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A randomized assignment in which each participant has the same prespecified likelihood of being assigned to a group as all other participants, independent of the assignment of any other participant."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "unrestricted randomization"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01007",
+            "display": "stratified randomization",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A randomized assignment in which participants are stratified into groups based on prognostic variables and then randomized into balanced treatment groups"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01008",
+            "display": "block randomization",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A randomized assignment in which a pre-specified number of subjects is assigned to a block containing the same pre-specified ratio of group assignments in random order."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01009",
+            "display": "adaptive randomization",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A randomized assignment in which a participant’s group assignment probability is adjusted based on any factor such that the likelihood of assignment is not the same for all participants."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01005",
+            "display": "non-randomized assignment",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "An interventional study design in which an independent variable (an exposure or intervention) is prospectively assigned or modified by methods other than random chance to separate groups."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "interventional research with non-randomized assignment"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01004",
+            "display": "quasi-randomized assignment",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "An interventional study design with a method of allocation that is not limited to random chance but is intended to produce similar baseline groups for experimentation."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01029",
+            "display": "clinical trial",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "Interventional research in which one or more healthcare-related actions (i.e., a diagnostic, prognostic, therapeutic, preventive or screening method or intervention) is evaluated for effects on health-related biomedical or behavioral processes and/or outcomes."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01041",
+            "display": "pragmatic clinical trial",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A clinical trial conducted under conditions of routine clinical practice."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "pragmatic trial"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01038",
+            "display": "expanded access study",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A clinical trial that provides a means for obtaining an experimental drug or device for patients who are not adequately treated by existing therapy, who do not meet the eligibility criteria for enrollment, or who are otherwise unable to participate in another clinical study. "
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "compassionate use trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "compassionate use study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "expanded access trial"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01030",
+            "display": "phase 1 trial",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A clinical trial to gather initial evidence in humans to support further investigation of an intervention."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase I trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase 1 study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase I clinical trial"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01031",
+            "display": "exploratory investigational new drug study",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A clinical trial that is conducted early in phase 1, involves very limited human exposure, and has no therapeutic or diagnostic intent (e.g., screening studies, microdose studies). "
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase 0 study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "pre-clinical trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "exploratory ind study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01032",
+            "display": "phase 1/phase 2 trial",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": " A clinical trial with a component meeting the definition of phase 1 trial and a component meeting the definition of phase 2 trial."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase I/II trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase 1-2 trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase 1/2 trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "trial phase 1-2"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "trial phase 1/2"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01033",
+            "display": "phase 2 trial",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A clinical trial to gather evidence of effectiveness and safety for an intervention in patients with the disease or condition under study, but not intended to provide an adequate basis for regulatory approval for clinical use."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase II trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase 2 study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "exploratory clinical study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase II clinical trial"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01034",
+            "display": "phase 2/phase 3 trial",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A clinical trial with a component meeting the definition of phase 2 trial and a component meeting the definition of phase 3 trial."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase II/III trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase 2-3 trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase 2/3 trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "trial phase 2-3"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "trial phase 2/3"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01035",
+            "display": "phase 3 trial",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A clinical trial to gather the evidence of effectiveness and safety of an intervention, intended to provide an adequate basis for regulatory approval for clinical use."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase III trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase 3 study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "confirmatory clinical study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase III clinical trial"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01036",
+            "display": "post-marketing study",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A clinical trial to gather additional evidence of effectiveness and safety of an intervention for an already approved clinical use."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase IV trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase 4 trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "phase 4 study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "trial phase 4"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "post-approval study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01002",
+            "display": "observational research",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design in which the independent variables (exposures or interventions) are not prospectively assigned or modified by the investigator. "
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "observational study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "observational study design"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "observational primary research"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "observational method of research"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "non-interventional research"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "observational study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "observational study design"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "observational primary research"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "non-interventional research"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01037",
+            "display": "post-marketing surveillance study",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "An observational study to identify adverse events related to the use of an approved clinical intervention."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "postmarketing evaluation study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "postmarketing evaluation study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01010",
+            "display": "comparative study design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design in which two or more groups are compared."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "comparative research"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01011",
+            "display": "parallel cohort design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A comparative study design in which the groups are compared concurrently and participants are expected to remain in the groups being compared for the entire duration of participation in the study."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "concurrent cohort study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01012",
+            "display": "crossover cohort design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A comparative study design in which participants receive two or more alternative exposures during separate periods of time."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "crossover study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "crossover trial"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01024",
+            "display": "controlled crossover cohort design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A crossover cohort design in which two or more cohorts have different orders of exposures."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01025",
+            "display": "single-arm crossover design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A crossover cohort design in which all participants are in a single cohort with the same order of exposures."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01013",
+            "display": "case control design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A comparative study design in which the groups being compared are defined by outcome presence (case) or absence (control)."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01014",
+            "display": "matching for comparison",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A comparative study design in which individual participants in different groups being compared are paired or matched into sets based on selected attributes for within-set analysis."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "matched study design"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01020",
+            "display": "family study design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A matched study design in which related or non-related family members are compared."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "familial study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "family study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "family based study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01021",
+            "display": "twin study design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A family study design in which twin siblings are compared."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01015",
+            "display": "cluster as unit of allocation",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A comparative study design in which participants are allocated to exposures (interventions) by their membership in groups (called clusters) rather than by individualized assignments."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "clustering for comparison"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01023",
+            "display": "non-comparative study design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design with no comparisons between groups with different exposures and no comparisons between groups with different outcomes."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "non-comparative research"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "descriptive study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01016",
+            "display": "uncontrolled cohort design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A non-comparative study design in which two or more participants are evaluated in a single group (or cohort)."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "single cohort design"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "case series design"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "non-controlled cohort design"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01017",
+            "display": "case report",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A non-comparative study design in which a single participant is evaluated."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "case study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01022",
+            "display": "population-based design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design in which the unit of observation is a population or community. "
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "population study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01044",
+            "display": "ecological design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design in which the unit of observation is a population or community defined by social relationships or physical surroundings. "
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "ecologic study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01027",
+            "display": "cross sectional data collection ",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which data is collected at a single point in time."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "cross-sectional study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01028",
+            "display": "longitudinal data collection",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which data is collected at two or more points in time."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "longitudinal study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01018",
+            "display": "time series design",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A longitudinal data collection which includes a set of time-ordered observations."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "multiple time point comparison"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01019",
+            "display": "before and after comparison",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A time series design which includes comparisons of observations before and after an event or exposure."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "before and after design"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "pre-post design"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "before-after comparison"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01045",
+            "display": "primary data collection",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which the data are recorded and collected during the study for the purpose of the same study."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "study-generated data collection"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01026",
+            "display": "real world data collection",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which the study data are obtained from a source of data collected during a routine process in the natural environment rather than using a process designed or controlled by the researcher."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "RWD collection"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01039",
+            "display": "real world data collection from healthcare records",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "Real world data collection from data obtained routinely for a purpose of recording healthcare delivery in a record controlled by a healthcare professional."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "RWD collection from clinical care records"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "RWD from health care records"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "RWD from healthcare delivery records"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "real world data collection from medical records"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01050",
+            "display": "real world data collection from personal health records",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "Real world data collection from data obtained routinely for a purpose of recording data related to personal health in a record controlled by the person, guardian, or caretaker."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "real world data collection from personal care records"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "RWD collection from personal medical records"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01040",
+            "display": "real world data collection from healthcare financing records",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "Real world data collection from data obtained routinely for a purpose of recording healthcare financing."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "RWD collection from healthcare financing records"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01048",
+            "display": "real world data collection from testing procedures",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "Real world data collection from data obtained routinely for a purpose of testing, such as diagnostic testing or screening examination."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "RWD collection from testing procedures"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01046",
+            "display": "real world data collection from monitoring procedures",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "Real world data collection from data obtained routinely for a purpose of repeated testing."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "RWD collection from monitoring procedures"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01049",
+            "display": "secondary data collection from prior research",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which the data are collected from data obtained during a different study than the current study."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01042",
+            "display": "secondary data collection from a registry",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which the data are collected from a system organized to obtain and maintain uniform data for discovery and analysis, and this system is organized prior to the current study."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01051",
+            "display": "multisite data collection",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which data are collected from two or more geographic locations."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01086",
+            "display": "quantitative analysis",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which data are analyzed with mathematical or statistical methods and formulas."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01087",
+            "display": "qualitative analysis",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which data are analyzed, without primary reliance on mathematical or statistical techniques, by coding and organizing data to provide interpretation or understanding of experiences or hypotheses."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01060",
+            "display": "blinding of study participants",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which study participants are not informed of their intervention assignment."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "masking of study participants"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01061",
+            "display": "blinding of intervention providers",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which the people administering the intervention are not informed of the intervention assignment."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "masking of intervention providers"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "blinding of intervention deliverers"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "masking of intervention deliverers"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01062",
+            "display": "blinding of outcome assessors",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which the people determining the outcome are not informed of the intervention assignment."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "masking of outcome assessors"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01063",
+            "display": "blinding of data analysts",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which the people managing or processing the data and statistical analysis are not informed of the intervention assignment."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "masking of data analysts"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01064",
+            "display": "allocation concealment",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design process in which all parties influencing study enrollment and allocation to study groups are unaware of the group assignment for the study participant at the time of enrollment and allocation."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "blinding of randomization assignment"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "masking of randomization assignment"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01043",
+            "display": "multicentric",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature in which two or more institutions are responsible for the conduct of the study."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "multi-institutional study"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "multicenter trial"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "multicenter study"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01052",
+            "display": "includes patient-reported outcome",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature in which one or more outcomes are reported directly from the patient without interpretation by a clinician or researcher."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes patient-reported outcomes"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "PRO"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01053",
+            "display": "includes patient-centered outcome",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature in which one or more measures are outcomes that patients directly care about, i.e. outcomes that are directly related to patients\u0027 experience of their life."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes patient-oriented outcome"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes patient-important outcome"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes patient-relevant outcome"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes clinical outcome"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes patient-centered outcome measure"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes clinical outcome measure"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01054",
+            "display": "includes disease-oriented outcome",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature in which one or more measures are outcomes that relate to a health or illness condition but are not outcomes which patients directly care about."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes disease-oriented outcome measure"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes surrogate outcome"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes surrogate outcome measure"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01085",
+            "display": "includes process measure",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature in which one or more outcomes are actions or behaviors of a healthcare professional or care team."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes process outcome"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "includes process outcome measure"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01089",
+            "display": "study goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature specifying the intent of the study."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "study aim"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01096",
+            "display": "evaluation goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study goal to assess the efficiency, effectiveness, and impact of a given program, process, person or piece of equipment."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "evaluation study goal"
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "evaluation aim"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01097",
+            "display": "derivation goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study goal with the intent to generate a predictive algorithm."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "derivation study goal"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01098",
+            "display": "validation goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study goal with the intent to determine the reliability and/or performance of a procedure for a specific predictive, classification, measurement, or communication purpose."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "validation study goal"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01088",
+            "display": "comparison goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature in which the study intent is to compare two or more interventions or exposures."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "comparative analysis goal"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01091",
+            "display": "comparative effectiveness goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature in which the study intent is to compare two or more interventions with respect to benefits and/or harms."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01090",
+            "display": "comparative efficacy goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature in which the study intent is to compare two or more interventions with respect to effectiveness in ideal conditions."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01092",
+            "display": "comparative safety goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature in which the study intent is to compare two or more interventions with respect to harms."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01093",
+            "display": "equivalence goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study goal with the intent to compare two or more interventions or exposures and determine that any difference in effects is within a prespecified range representing absence of a meaningful difference."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01094",
+            "display": "non-inferiority goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study goal with the intent to compare two or more interventions or exposures and determine that any difference in effects is below a prespecified value representing a threshold between a meaningful difference and absence of a meaningful difference."
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01095",
+            "display": "superiority goal",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study goal with the intent to compare two or more interventions or exposures and detect a difference in effects."
+              },
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000013009",
+                  "display": "Synonym (core metadata concept)"
+                },
+                "value": "superiority study goal"
+              }
+            ]
+          },
+          {
+            "code": "SEVCO:01100",
+            "display": "allocation ratio",
+            "designation": [
+              {
+                "use": {
+                  "system": "http://snomed.info/sct",
+                  "code": "900000000000550004",
+                  "display": "Definition (core metadata concept)"
+                },
+                "value": "A study design feature describing the intended relative proportion of assignment across groups."
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

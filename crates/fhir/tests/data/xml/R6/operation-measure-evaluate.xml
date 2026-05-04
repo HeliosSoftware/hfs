@@ -173,16 +173,14 @@
           <td/>
           <td>0..1</td>
           <td>
-            <a href="practitioner.html">Practitioner</a> | 
-            <a href="practitionerrole.html">PractitionerRole</a> | 
-            <a href="organization.html">Organization</a>
+            <a href="datatypes.html#string">string</a>
             <br/>(
             <a href="search.html#reference">reference</a>)
           </td>
           <td/>
           <td>
             <div>
-              <p>The provider for which the report will be run, provided as a Practitioner, PractitionerRole, or Organization resource. This is intended to support the use case in which the organization information is not on the server performing the evaluation, for example an 
+              <p>The provider for which the report will be run, provided as an Organization resource. This is intended to support the use case in which the organization information is not on the server performing the evaluation, for example an 
                 <a href="clinicalreasoning-quality-reporting.html#ad-hoc-organizations">ad-hoc group of practitioners</a> that are part of a provider group. This parameter is reflected in the reporter element of the resulting MeasureReport(s). This parameter cannot be used with the reporter parameter.
               </p>
 
@@ -329,7 +327,7 @@
             <a href="datatypes.html#code">code</a>
           </td>
           <td>
-            <a href="valueset-measure-stratifier-type-example.html">Measure Stratifier Type Example</a> (Example)
+            <a href="valueset-measure-stratifier-example.html">Measure Stratifier Example</a> (Example)
           </td>
           <td>
             <div>
@@ -460,7 +458,7 @@
             <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
           <td>
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-measure-data-usage.html">MeasureDataUsage</a> (Extensible)
+            <a href="http://terminology.hl7.org/7.0.0/ValueSet-measure-data-usage.html">MeasureDataUsage</a> (Extensible)
           </td>
           <td>
             <div>
@@ -541,13 +539,13 @@
     <valueCode value="cqi"/>
   </extension>
   <url value="http://hl7.org/fhir/OperationDefinition/Measure-evaluate"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="Evaluate"/>
   <title value="Evaluate"/>
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2026-04-22T02:59:29+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / Clinical Quality Information"/>
   <contact>
     <telecom>
@@ -630,7 +628,7 @@
     <type value="code"/>
     <binding>
       <strength value="required"/>
-      <valueSet value="http://hl7.org/fhir/ValueSet/measure-report-evaluation-type|6.0.0-ballot4"/>
+      <valueSet value="http://hl7.org/fhir/ValueSet/measure-report-evaluation-type|6.0.0-ballot3"/>
     </binding>
   </parameter>
   <parameter>
@@ -643,21 +641,12 @@
     <searchType value="reference"/>
   </parameter>
   <parameter>
-    <extension url="http://hl7.org/fhir/StructureDefinition/operationdefinition-allowed-type">
-      <valueUri value="Practitioner"/>
-    </extension>
-    <extension url="http://hl7.org/fhir/StructureDefinition/operationdefinition-allowed-type">
-      <valueUri value="PractitionerRole"/>
-    </extension>
-    <extension url="http://hl7.org/fhir/StructureDefinition/operationdefinition-allowed-type">
-      <valueUri value="Organization"/>
-    </extension>
     <name value="reporterResource"/>
     <use value="in"/>
     <min value="0"/>
     <max value="1"/>
-    <documentation value="The provider for which the report will be run, provided as a Practitioner, PractitionerRole, or Organization resource. This is intended to support the use case in which the organization information is not on the server performing the evaluation, for example an [ad-hoc group of practitioners](clinicalreasoning-quality-reporting.html#ad-hoc-organizations) that are part of a provider group. This parameter is reflected in the reporter element of the resulting MeasureReport(s). This parameter cannot be used with the reporter parameter."/>
-    <type value="Element"/>
+    <documentation value="The provider for which the report will be run, provided as an Organization resource. This is intended to support the use case in which the organization information is not on the server performing the evaluation, for example an [ad-hoc group of practitioners](clinicalreasoning-quality-reporting.html#ad-hoc-organizations) that are part of a provider group. This parameter is reflected in the reporter element of the resulting MeasureReport(s). This parameter cannot be used with the reporter parameter."/>
+    <type value="string"/>
     <searchType value="reference"/>
   </parameter>
   <parameter>
@@ -731,7 +720,7 @@
         <type value="code"/>
         <binding>
           <strength value="example"/>
-          <valueSet value="http://hl7.org/fhir/ValueSet/measure-stratifier-type-example"/>
+          <valueSet value="http://hl7.org/fhir/ValueSet/measure-stratifier-example"/>
         </binding>
       </part>
       <part>

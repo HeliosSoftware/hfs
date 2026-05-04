@@ -211,6 +211,13 @@
     <start value="2018-01-01"/>
     <end value="2018-12-31"/>
   </effectivePeriod>
+  <topic>
+    <coding>
+      <system value="http://loinc.org"/>
+      <code value="57024-2"/>
+      <display value="Health Quality Measure Document"/>
+    </coding>
+  </topic>
   <library value="#EXM55"/>
   <group id="group-1">
     <linkId/>

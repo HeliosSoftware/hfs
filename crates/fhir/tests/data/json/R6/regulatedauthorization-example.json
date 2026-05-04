@@ -37,12 +37,10 @@
     "reference": "Organization/example"
   },
   "case": {
-    "identifier": [
-      {
-        "system": "http://ema.europa.eu/example/procedureidentifier-number",
-        "value": "EMEA/H/C/009999/IA/0099/G"
-      }
-    ],
+    "identifier": {
+      "system": "http://ema.europa.eu/example/procedureidentifier-number",
+      "value": "EMEA/H/C/009999/IA/0099/G"
+    },
     "type": {
       "coding": [
         {
@@ -57,12 +55,10 @@
     },
     "application": [
       {
-        "identifier": [
-          {
-            "system": "http://ema.europa.eu/example/applicationidentifier-number",
-            "value": "IA38G"
-          }
-        ],
+        "identifier": {
+          "system": "http://ema.europa.eu/example/applicationidentifier-number",
+          "value": "IA38G"
+        },
         "type": {
           "coding": [
             {
@@ -74,12 +70,10 @@
         "dateDateTime": "2015-08-01"
       },
       {
-        "identifier": [
-          {
-            "system": "http://ema.europa.eu/example/applicationidentifier-number",
-            "value": "IA38F"
-          }
-        ],
+        "identifier": {
+          "system": "http://ema.europa.eu/example/applicationidentifier-number",
+          "value": "IA38F"
+        },
         "type": {
           "coding": [
             {

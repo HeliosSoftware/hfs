@@ -20,7 +20,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.5.1229"/>
   </identifier>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="FamilyMemberHistoryForGeneticsAnalysis"/>
   <title value="Family member history for genetics analysis"/>
   <status value="draft"/>
@@ -34,7 +34,7 @@
     </telecom>
   </contact>
   <description value="Adds additional information to a family member history supporting both the capture of mother/father relationships as well as additional observations necessary to enable genetics-based risk analysis for patients"/>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -62,7 +62,7 @@
   <derivation value="constraint"/>
   <snapshot>
     <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-      <valueString value="6.0.0-ballot4"/>
+      <valueString value="6.0.0-ballot3"/>
     </extension>
     <element id="FamilyMemberHistory">
       <path value="FamilyMemberHistory"/>
@@ -262,7 +262,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -585,7 +585,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code that identifies the status of the family history record."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>

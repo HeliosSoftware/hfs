@@ -29,7 +29,26 @@
             "expression": "[\"Observation\": code in \"75859-9|LOINC\"] mRS where mRS.value between 3 and 6"
           },
           "exclude": false,
-          "description": "mRS 3-6 at 90 days"
+          "description": "mRS 3-6 at 90 days",
+          "timing": [
+            {
+              "contextCode": {
+                "coding": [
+                  {
+                    "system": "http://hl7.org/fhir/evidence-variable-event",
+                    "code": "study-start",
+                    "display": "Study Start"
+                  }
+                ]
+              },
+              "offsetDuration": {
+                "value": 90,
+                "unit": "days",
+                "system": "http://unitsofmeasure.org",
+                "code": "d"
+              }
+            }
+          ]
         }
       ]
     }

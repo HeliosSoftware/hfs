@@ -44,7 +44,7 @@
   ],
   "entity": [
     {
-      "role": "removal",
+      "role": "source",
       "what": {
         "reference": "http://terminology.hl7.org/CodeSystem/location-physical-type/_history/3"
       }

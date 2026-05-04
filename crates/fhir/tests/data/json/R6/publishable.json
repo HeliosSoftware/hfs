@@ -16,12 +16,12 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Publishable",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "Publishable",
   "title": "publishable",
   "status": "draft",
   "experimental": false,
-  "date": "2026-04-22T02:59:29+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -54,7 +54,7 @@
     }
   ],
   "purpose": "The Publishable pattern is defined to ensure that artifacts have enough metadata to understand when, where, and why a particular artifact would be used, as well as who contributed to it, who reviewed or endorsed it, and what evidence supports its use. The pattern is about ensuring artifacts can establish trust and credibility, as well as carry enough metadata to be discoverable in a public repository or artifact catalog.",
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "kind": "logical",
   "abstract": false,
   "type": "Publishable",

@@ -17,10 +17,8 @@
       <a name="hcexample-cpt-all"> </a>
       <ul>
         <li>Include all codes defined in 
-          <a href="http://tx.fhir.org/r5">
-            <code>http://www.ama-assn.org/go/cpt</code>
-          </a>
-          <span title="Version is not explicitly stated. No matching Code System found"> version Not Stated (use latest from terminology server)</span>
+          <code>http://www.ama-assn.org/go/cpt</code>
+          <span title="Version is not explicity stated. No matching Code System found"> version Not Stated (use latest from terminology server)</span>
         </li>
       </ul>
     </div>
@@ -33,7 +31,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.3.3138"/>
   </identifier>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="AllCPTCodes"/>
   <title value="All CPT codes"/>
   <status value="active"/>

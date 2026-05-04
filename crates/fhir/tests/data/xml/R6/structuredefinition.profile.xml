@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="StructureDefinition"/>
   <meta>
-    <lastUpdated value="2026-04-22T02:59:29.647+00:00"/>
+    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -425,7 +425,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Jurisdiction of the authority that maintains the structure definition (if applicable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
+            <a href="http://terminology.hl7.org/7.0.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -497,7 +497,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <span title="StructureDefinition.keyword : (DEPRECATED) A set of key words or terms from external terminologies that may be used to assist with indexing and searching of templates by describing the use of this structure definition, or the content it describes.">keyword</span>
+            <span title="StructureDefinition.keyword : (DEPRECATED) A set of key words or terms from external terminologies that may be used to assist with indexing and searching of templates nby describing the use of this structure definition, or the content it describes.">keyword</span>
             <a name="StructureDefinition.keyword"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -980,11 +980,11 @@
     <valueCode value="anonymous"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/StructureDefinition"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="StructureDefinition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-04-22T02:59:29+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -1000,7 +1000,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="w5"/>
     <uri value="http://hl7.org/fhir/fivews"/>
@@ -1314,7 +1314,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1693,7 +1693,7 @@
         </extension>
         <strength value="required"/>
         <description value="The lifecycle status of an artifact."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -2034,7 +2034,7 @@
     <element id="StructureDefinition.keyword">
       <path value="StructureDefinition.keyword"/>
       <short value="Assist with indexing and finding"/>
-      <definition value="(DEPRECATED) A set of key words or terms from external terminologies that may be used to assist with indexing and searching of templates by describing the use of this structure definition, or the content it describes."/>
+      <definition value="(DEPRECATED) A set of key words or terms from external terminologies that may be used to assist with indexing and searching of templates nby describing the use of this structure definition, or the content it describes."/>
       <comment value="Note that this element is deprecated. Use the [http://hl7.org/fhir/StructureDefinition/artifact-topic](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-artifact-topic.html) extension instead."/>
       <requirements value="Assist in searching for appropriate StructureDefinitions."/>
       <min value="0"/>
@@ -2104,7 +2104,7 @@
         </extension>
         <strength value="required"/>
         <description value="All published FHIR Versions."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="StructureDefinition.mapping">
@@ -2372,7 +2372,7 @@
         </extension>
         <strength value="required"/>
         <description value="Defines the type of structure that a definition is describing."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/structure-definition-kind|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/structure-definition-kind|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="StructureDefinition.abstract">
@@ -2550,7 +2550,7 @@
         </extension>
         <strength value="required"/>
         <description value="How an extension context is interpreted."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/extension-context-type|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/extension-context-type|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="StructureDefinition.context.expression">
@@ -2715,7 +2715,7 @@
         </extension>
         <strength value="required"/>
         <description value="How a type relates to its baseDefinition."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/type-derivation-rule|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/type-derivation-rule|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="StructureDefinition.snapshot">
@@ -3449,7 +3449,7 @@
         </extension>
         <strength value="required"/>
         <description value="The lifecycle status of an artifact."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -3670,7 +3670,7 @@
     <element id="StructureDefinition.keyword">
       <path value="StructureDefinition.keyword"/>
       <short value="Assist with indexing and finding"/>
-      <definition value="(DEPRECATED) A set of key words or terms from external terminologies that may be used to assist with indexing and searching of templates by describing the use of this structure definition, or the content it describes."/>
+      <definition value="(DEPRECATED) A set of key words or terms from external terminologies that may be used to assist with indexing and searching of templates nby describing the use of this structure definition, or the content it describes."/>
       <comment value="Note that this element is deprecated. Use the [http://hl7.org/fhir/StructureDefinition/artifact-topic](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-artifact-topic.html) extension instead."/>
       <requirements value="Assist in searching for appropriate StructureDefinitions."/>
       <min value="0"/>
@@ -3716,7 +3716,7 @@
         </extension>
         <strength value="required"/>
         <description value="All published FHIR Versions."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="StructureDefinition.mapping">
@@ -3820,7 +3820,7 @@
         </extension>
         <strength value="required"/>
         <description value="Defines the type of structure that a definition is describing."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/structure-definition-kind|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/structure-definition-kind|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="StructureDefinition.abstract">
@@ -3870,7 +3870,7 @@
         </extension>
         <strength value="required"/>
         <description value="How an extension context is interpreted."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/extension-context-type|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/extension-context-type|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="StructureDefinition.context.expression">
@@ -3975,7 +3975,7 @@
         </extension>
         <strength value="required"/>
         <description value="How a type relates to its baseDefinition."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/type-derivation-rule|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/type-derivation-rule|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="StructureDefinition.snapshot">

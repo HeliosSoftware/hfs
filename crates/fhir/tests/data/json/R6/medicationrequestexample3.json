@@ -30,6 +30,47 @@
     "reference": "Practitioner/f007",
     "display": "Patrick Pump"
   },
+  "dosageInstruction": {
+    "simple": {
+      "text": "1800 mg (1000 mg/m2) orally twice daily from days 1-14 of cycle",
+      "doseAndRate": [
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
+                "code": "calculated",
+                "display": "Calculated"
+              }
+            ]
+          },
+          "doseQuantity": {
+            "value": 1800,
+            "unit": "mg/m2",
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/m2"
+          }
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
+                "code": "ordered",
+                "display": "ordered"
+              }
+            ]
+          },
+          "doseQuantity": {
+            "value": 1000,
+            "unit": "mg",
+            "system": "http://unitsofmeasure.org",
+            "code": "mg"
+          }
+        }
+      ]
+    }
+  },
   "meta": {
     "tag": [
       {

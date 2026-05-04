@@ -91,5 +91,36 @@
     <reference value="Practitioner/f007"/>
     <display value="Patrick Pump"/>
   </requester>
-  <dosageInstruction/>
+  <dosageInstruction>
+    <simple>
+      <text value="Dopamine 4mcg/kg/min"/>
+      <timing>
+        <repeat>
+          <duration value="33.33"/>
+          <durationUnit value="h"/>
+        </repeat>
+      </timing>
+      <route>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="47625008"/>
+          <display value="Intravenous route"/>
+        </coding>
+      </route>
+      <doseAndRate>
+        <type>
+          <coding>
+            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+            <code value="ordered"/>
+            <display value="Ordered"/>
+          </coding>
+        </type>
+        <rateQuantity>
+          <value value="200"/>
+          <unit value="ug/min"/>
+          <system value="http://unitsofmeasure.org"/>
+        </rateQuantity>
+      </doseAndRate>
+    </simple>
+  </dosageInstruction>
 </MedicationRequest>

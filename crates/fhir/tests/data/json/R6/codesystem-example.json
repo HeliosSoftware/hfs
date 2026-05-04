@@ -22,7 +22,7 @@
       "value": "internal-cholesterol-inl"
     }
   ],
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "ACMECholCodesBlood",
   "title": "ACME Codes for Cholesterol in Serum/Plasma",
   "status": "draft",

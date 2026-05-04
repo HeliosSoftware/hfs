@@ -16,11 +16,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/TriggerDefinition",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "TriggerDefinition",
   "status": "active",
   "experimental": false,
-  "date": "2026-04-22T02:59:29+00:00",
+  "date": "2025-12-17T09:50:17+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -52,7 +52,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-ballot3",
   "mapping": [
     {
       "identity": "rim",
@@ -243,7 +243,7 @@
           ],
           "strength": "required",
           "description": "The type of trigger.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/trigger-type|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/trigger-type|6.0.0-ballot3"
         }
       },
       {
@@ -508,7 +508,7 @@
           ],
           "strength": "required",
           "description": "The type of trigger.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/trigger-type|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/trigger-type|6.0.0-ballot3"
         }
       },
       {

@@ -136,7 +136,7 @@
       },
       "exclude": true,
       "description": "unless documented to be disease-free for five years",
-      "relativeTime": [
+      "timing": [
         {
           "contextCode": {
             "coding": [

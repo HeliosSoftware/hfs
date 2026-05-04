@@ -378,7 +378,7 @@
         </valueCodeableConcept>
         <exclude value="true"/>
         <description value="unless documented to be disease-free for five years"/>
-        <relativeTime>
+        <timing>
           <offsetRange>
             <low>
               <value value="-5"/>
@@ -394,7 +394,7 @@
             </high>
           </offsetRange>
           <text value="for five years"/>
-        </relativeTime>
+        </timing>
       </characteristic>
     </Group>
   </contained>
@@ -492,7 +492,7 @@
     </valueReference>
     <exclude value="true"/>
     <description value="Cardiovascular event (myocardial infarction, acute coronary syndrome, coronary artery angioplasty or bypass, stroke) in the past six months."/>
-    <relativeTime>
+    <timing>
       <offsetRange>
         <low>
           <value value="-6"/>
@@ -508,7 +508,7 @@
         </high>
       </offsetRange>
       <text value="in the past six months"/>
-    </relativeTime>
+    </timing>
   </characteristic>
   <characteristic>
     <code>
@@ -555,7 +555,7 @@
     </valueCodeableConcept>
     <exclude value="true"/>
     <description value="Pulmonary embolus in the past six months. Placeholder for now to represent 'screened surgical candidate'."/>
-    <relativeTime>
+    <timing>
       <offsetRange>
         <low>
           <value value="-6"/>
@@ -571,7 +571,7 @@
         </high>
       </offsetRange>
       <text value="in the past six months"/>
-    </relativeTime>
+    </timing>
   </characteristic>
   <characteristic>
     <code>
@@ -590,7 +590,7 @@
     </valueCodeableConcept>
     <exclude value="true"/>
     <description value="Thrombophlebitis in the past six months. Placeholder for now to represent 'screened surgical candidate'."/>
-    <relativeTime>
+    <timing>
       <offsetRange>
         <low>
           <value value="-6"/>
@@ -606,7 +606,7 @@
         </high>
       </offsetRange>
       <text value="in the past six months"/>
-    </relativeTime>
+    </timing>
   </characteristic>
   <characteristic>
     <code>
