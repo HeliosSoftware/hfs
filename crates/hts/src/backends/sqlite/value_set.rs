@@ -260,21 +260,26 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             if let Ok(guard) = self.plain_fts_cache.read() {
                                 if let Some(concept_idx) = guard.get(&plain_key).cloned() {
                                     drop(guard);
-                                    let sql_offset = i64::from(req.offset.unwrap_or(0));
-                                    let sql_limit = req.count.map(i64::from).unwrap_or(-1);
-                                    let total = count_in_memory(&concept_idx, Some(&filter_lower));
-                                    let page = page_in_memory(
-                                        &concept_idx,
-                                        Some(&filter_lower),
-                                        sql_offset,
-                                        sql_limit,
-                                    );
-                                    return Ok(ExpandResponse {
-                                        total: Some(total),
-                                        offset: req.offset,
-                                        contains: page,
-                                        warnings: vec![],
-                                    });
+                                    // Zero-entry sentinel = corpus too large to cache;
+                                    // fall through to spawn_blocking / FTS path.
+                                    if !concept_idx.entries.is_empty() {
+                                        let sql_offset = i64::from(req.offset.unwrap_or(0));
+                                        let sql_limit = req.count.map(i64::from).unwrap_or(-1);
+                                        let total =
+                                            count_in_memory(&concept_idx, Some(&filter_lower));
+                                        let page = page_in_memory(
+                                            &concept_idx,
+                                            Some(&filter_lower),
+                                            sql_offset,
+                                            sql_limit,
+                                        );
+                                        return Ok(ExpandResponse {
+                                            total: Some(total),
+                                            offset: req.offset,
+                                            contains: page,
+                                            warnings: vec![],
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -4668,9 +4673,15 @@ fn load_plain_corpus_and_cache(
     warnings: &mut Vec<String>,
 ) -> Option<Arc<ImplicitConceptIndex>> {
     // Fast path: another request already populated the cache.
+    // A zero-entry index is a "too-large" sentinel — return None so the
+    // caller falls back to the FTS query without re-counting the corpus.
     if let Ok(guard) = cache.read() {
         if let Some(idx) = guard.get(cache_key).cloned() {
-            return Some(idx);
+            return if idx.entries.is_empty() {
+                None
+            } else {
+                Some(idx)
+            };
         }
     }
 
@@ -4712,6 +4723,37 @@ fn load_plain_corpus_and_cache(
     let id_to_url: std::collections::HashMap<String, String> =
         pairs.into_iter().map(|(url, id)| (id, url)).collect();
 
+    // COUNT before loading to avoid pulling millions of rows for large systems.
+    // On too-large: store a zero-entry sentinel so all subsequent requests
+    // skip this check entirely (no repeated COUNT queries).
+    let corpus_count: i64 = match conn.query_row(
+        "SELECT COUNT(*) FROM concepts \
+         WHERE system_id IN (SELECT value FROM json_each(?1))",
+        rusqlite::params![ids_json],
+        |r| r.get(0),
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("Failed to count plain corpus: {e}");
+            return None;
+        }
+    };
+
+    if corpus_count as usize > PLAIN_FTS_CACHE_MAX_CONCEPTS {
+        // Store a zero-entry sentinel so subsequent requests (both the async
+        // hot path and this function's own fast path) skip the COUNT query.
+        let sentinel = Arc::new(build_concept_index_from_entries(vec![]));
+        if let Ok(mut guard) = cache.write() {
+            guard.entry(cache_key.to_string()).or_insert(sentinel);
+        }
+        tracing::debug!(
+            count = corpus_count,
+            cache_key,
+            "Plain corpus exceeds cache limit; using FTS fallback"
+        );
+        return None;
+    }
+
     let mut stmt = match conn.prepare_cached(
         "SELECT system_id, code, display FROM concepts \
          WHERE system_id IN (SELECT value FROM json_each(?1)) \
@@ -4740,15 +4782,6 @@ fn load_plain_corpus_and_cache(
             return None;
         }
     };
-
-    if rows.len() > PLAIN_FTS_CACHE_MAX_CONCEPTS {
-        tracing::debug!(
-            count = rows.len(),
-            cache_key,
-            "Plain corpus exceeds cache limit; falling back to FTS query"
-        );
-        return None;
-    }
 
     let entries: Vec<ImplicitConceptEntry> = rows
         .into_iter()
