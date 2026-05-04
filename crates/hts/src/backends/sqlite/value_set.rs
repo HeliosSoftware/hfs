@@ -232,11 +232,63 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             }
         }
 
+        // ── Async hot path: plain-fts corpus cache warm (EX07 optimisation) ──────
+        // For inline ValueSet requests with a text filter where every include is a
+        // plain full-system include (no compose filters, no concept list, no nested
+        // valueSets), if the full corpus for those systems is already cached in
+        // memory, apply the text filter in Rust without entering spawn_blocking.
+        // This eliminates pool contention for repeated EX07-style multi-system text
+        // filter queries where concurrent VUs use different filter terms.
+        if let Some(ref vs) = req.value_set {
+            if req.hierarchical != Some(true) {
+                if let Some(ref filter_str) = req.filter {
+                    let filter_lower = filter_str.to_lowercase();
+                    if filter_lower.len() >= 3 {
+                        let compose = &vs["compose"];
+                        let empty_arr: Vec<serde_json::Value> = vec![];
+                        let includes = compose["include"].as_array().unwrap_or(&empty_arr);
+                        let all_plain = !includes.is_empty()
+                            && includes.iter().all(|inc| {
+                                inc["system"].as_str().is_some_and(|s| !s.is_empty())
+                                    && inc["filter"].as_array().is_none_or(|a| a.is_empty())
+                                    && inc["concept"].as_array().is_none_or(|a| a.is_empty())
+                                    && inc["valueSet"].as_array().is_none_or(|a| a.is_empty())
+                            });
+                        if all_plain {
+                            let plain_key =
+                                format!("plain-fts:{:016x}", fnv64(compose.to_string().as_bytes()));
+                            if let Ok(guard) = self.plain_fts_cache.read() {
+                                if let Some(concept_idx) = guard.get(&plain_key).cloned() {
+                                    drop(guard);
+                                    let sql_offset = i64::from(req.offset.unwrap_or(0));
+                                    let sql_limit = req.count.map(i64::from).unwrap_or(-1);
+                                    let total = count_in_memory(&concept_idx, Some(&filter_lower));
+                                    let page = page_in_memory(
+                                        &concept_idx,
+                                        Some(&filter_lower),
+                                        sql_offset,
+                                        sql_limit,
+                                    );
+                                    return Ok(ExpandResponse {
+                                        total: Some(total),
+                                        offset: req.offset,
+                                        contains: page,
+                                        warnings: vec![],
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let pool = self.pool().clone();
         let implicit_index = self.implicit_index.clone();
         let bg_index_pending = self.bg_index_pending.clone();
         let inline_compose_index = self.inline_compose_index.clone();
         let property_result_cache = self.property_result_cache.clone();
+        let plain_fts_cache = self.plain_fts_cache.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -256,6 +308,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     let limit_hint = req.count.map(|c| ((c as usize) * 3).max(100));
                     let compose_str = compose.to_string();
                     let prop_key = format!("prop-result:{:016x}", fnv64(compose_str.as_bytes()));
+                    let plain_key = format!("plain-fts:{:016x}", fnv64(compose_str.as_bytes()));
                     expand_inline_filtered(
                         &conn,
                         compose,
@@ -263,6 +316,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         limit_hint,
                         &mut warnings,
                         Some((&prop_key, &property_result_cache)),
+                        Some((&plain_key, &plain_fts_cache)),
                     )?
                 } else {
                     let compose_str = compose.to_string();
@@ -1134,6 +1188,7 @@ fn expand_inline_filtered(
     limit_hint: Option<usize>,
     warnings: &mut Vec<String>,
     prop_cache: Option<(&str, &super::PropertyResultCache)>,
+    plain_fts_cache: Option<(&str, &super::PlainFtsCache)>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let empty_arr = vec![];
     let includes = compose["include"].as_array().unwrap_or(&empty_arr);
@@ -1154,6 +1209,16 @@ fn expand_inline_filtered(
                 && inc["valueSet"].as_array().is_none_or(|a| a.is_empty())
         });
         if all_plain {
+            if let Some((plain_key, cache)) = plain_fts_cache {
+                if let Some(concept_idx) =
+                    load_plain_corpus_and_cache(conn, includes, plain_key, cache, warnings)
+                {
+                    // Apply text filter via trigram index in Rust.
+                    // Return all matches (no pagination) — the caller in expand()
+                    // handles pagination via the filtered.skip().take() path.
+                    return Ok(page_in_memory(&concept_idx, Some(&filter_lower), 0, -1));
+                }
+            }
             return expand_inline_plain_fts(conn, includes, &filter_lower, limit_hint, warnings);
         }
     }
@@ -4517,6 +4582,146 @@ fn populate_property_cache(
     if let Ok(mut guard) = cache.write() {
         guard.entry(cache_key.to_string()).or_insert(concept_idx);
     }
+}
+
+/// Maximum number of concepts to load into the PlainFtsCache per compose body.
+///
+/// Compose bodies that reference more total concepts than this threshold are
+/// not cached; requests for them fall back to the existing FTS query path.
+/// 500 000 covers the largest realistic multi-system benchmarks (e.g. LOINC +
+/// SNOMED combined) while bounding per-entry memory to roughly 150–200 MB.
+const PLAIN_FTS_CACHE_MAX_CONCEPTS: usize = 500_000;
+
+/// Load ALL concepts from plain system includes and populate the PlainFtsCache.
+///
+/// Called by `expand_inline_filtered` on the first filtered request for a
+/// compose body where every include is a plain full-system include (EX07
+/// pattern).  Loads all concepts without any text filter, builds an
+/// `ImplicitConceptIndex`, stores it under `cache_key`, and returns the Arc.
+///
+/// Returns `None` when:
+/// - All systems are missing from the DB (warning emitted for each).
+/// - The total concept count exceeds [`PLAIN_FTS_CACHE_MAX_CONCEPTS`].
+/// - Any SQLite error occurs (logged at WARN level).
+///
+/// A concurrent request that already populated the same key returns the
+/// existing Arc without rebuilding the index.
+fn load_plain_corpus_and_cache(
+    conn: &Connection,
+    includes: &[serde_json::Value],
+    cache_key: &str,
+    cache: &super::PlainFtsCache,
+    warnings: &mut Vec<String>,
+) -> Option<Arc<ImplicitConceptIndex>> {
+    // Fast path: another request already populated the cache.
+    if let Ok(guard) = cache.read() {
+        if let Some(idx) = guard.get(cache_key).cloned() {
+            return Some(idx);
+        }
+    }
+
+    // Resolve (system_url, system_id) pairs.
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(includes.len());
+    for inc in includes {
+        let system_url = inc["system"].as_str().unwrap_or("");
+        match conn
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = ?1",
+                [system_url],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        {
+            Ok(Some(id)) => pairs.push((system_url.to_owned(), id)),
+            Ok(None) => {
+                let msg = format!(
+                    "CodeSystem {system_url} was not found and has been excluded from the expansion"
+                );
+                tracing::warn!(%system_url, "{msg}");
+                warnings.push(msg);
+            }
+            Err(e) => {
+                tracing::warn!(%system_url, "Error resolving system for plain-fts cache: {e}");
+                return None;
+            }
+        }
+    }
+
+    if pairs.is_empty() {
+        return None;
+    }
+
+    let ids_json =
+        serde_json::to_string(&pairs.iter().map(|(_, id)| id.as_str()).collect::<Vec<_>>())
+            .unwrap_or_else(|_| "[]".to_owned());
+
+    let id_to_url: std::collections::HashMap<String, String> =
+        pairs.into_iter().map(|(url, id)| (id, url)).collect();
+
+    let mut stmt = match conn.prepare_cached(
+        "SELECT system_id, code, display FROM concepts \
+         WHERE system_id IN (SELECT value FROM json_each(?1)) \
+         ORDER BY system_id, code",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("Failed to prepare plain corpus query: {e}");
+            return None;
+        }
+    };
+
+    let rows = match stmt
+        .query_map(rusqlite::params![ids_json], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .and_then(|iter| iter.collect::<rusqlite::Result<Vec<_>>>())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Failed to load plain corpus concepts: {e}");
+            return None;
+        }
+    };
+
+    if rows.len() > PLAIN_FTS_CACHE_MAX_CONCEPTS {
+        tracing::debug!(
+            count = rows.len(),
+            cache_key,
+            "Plain corpus exceeds cache limit; falling back to FTS query"
+        );
+        return None;
+    }
+
+    let entries: Vec<ImplicitConceptEntry> = rows
+        .into_iter()
+        .filter_map(|(system_id, code, display)| {
+            let system_url = id_to_url.get(&system_id)?.clone();
+            let code_lower = code.to_lowercase();
+            let display_lower = display
+                .as_deref()
+                .map(str::to_lowercase)
+                .unwrap_or_default();
+            Some(ImplicitConceptEntry {
+                system_url,
+                code,
+                display,
+                code_lower,
+                display_lower,
+            })
+        })
+        .collect();
+
+    let concept_idx = Arc::new(build_concept_index_from_entries(entries));
+    if let Ok(mut guard) = cache.write() {
+        guard
+            .entry(cache_key.to_string())
+            .or_insert_with(|| concept_idx.clone());
+    }
+    Some(concept_idx)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

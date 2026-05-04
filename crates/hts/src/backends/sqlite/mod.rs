@@ -55,6 +55,17 @@ pub(crate) type InlineComposeIndex =
 pub(crate) type PropertyResultCache =
     Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
 
+/// Shared in-memory corpus index for plain multi-system text-filter expansions.
+///
+/// Keyed by `"plain-fts:{fnv64-hex}"` of the compose body.  Populated on the
+/// first filtered expansion where every include is a plain full-system include
+/// (no compose filters, no explicit concept list, no nested valueSets) — the
+/// EX07 pattern.  Stores ALL concepts from the included systems (no text
+/// filter); subsequent requests for the same compose (any filter term) apply
+/// the text filter in Rust via the trigram index, eliminating `spawn_blocking`
+/// and r2d2 pool contention under high concurrency.
+pub(crate) type PlainFtsCache = Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
+
 /// SQLite-backed terminology service backend.
 ///
 /// Wraps an r2d2 connection pool. Schema migrations are applied automatically
@@ -102,6 +113,17 @@ pub struct SqliteTerminologyBackend {
     /// same compose but a different text filter apply the filter in Rust,
     /// bypassing `spawn_blocking` and r2d2 pool contention entirely.
     pub(crate) property_result_cache: PropertyResultCache,
+
+    /// In-process corpus index for plain multi-system text-filter expansions.
+    ///
+    /// Keyed by `"plain-fts:{fnv64-hex}"` of the compose body.  Populated on
+    /// the first filtered expansion where every include is a plain full-system
+    /// include (EX07 pattern: multi-system text filter, no compose filters).
+    /// The cached set contains ALL concepts from the included systems; any
+    /// subsequent request for the same compose body (regardless of text filter)
+    /// is served entirely from process memory via the trigram index, bypassing
+    /// `spawn_blocking` and r2d2 pool contention.
+    pub(crate) plain_fts_cache: PlainFtsCache,
 }
 
 impl SqliteTerminologyBackend {
@@ -142,6 +164,7 @@ impl SqliteTerminologyBackend {
         let implicit_index: ImplicitIndex = Arc::new(RwLock::new(HashMap::new()));
         let inline_compose_index: InlineComposeIndex = Arc::new(RwLock::new(HashMap::new()));
         let property_result_cache: PropertyResultCache = Arc::new(RwLock::new(HashMap::new()));
+        let plain_fts_cache: PlainFtsCache = Arc::new(RwLock::new(HashMap::new()));
 
         // Bootstrap: apply WAL + schema on a single connection.
         {
@@ -213,6 +236,7 @@ impl SqliteTerminologyBackend {
             bg_index_pending: Arc::new(Mutex::new(HashSet::new())),
             inline_compose_index,
             property_result_cache,
+            plain_fts_cache,
         })
     }
 
@@ -257,6 +281,7 @@ impl SqliteTerminologyBackend {
             bg_index_pending: Arc::new(Mutex::new(HashSet::new())),
             inline_compose_index: Arc::new(RwLock::new(HashMap::new())),
             property_result_cache: Arc::new(RwLock::new(HashMap::new())),
+            plain_fts_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -333,6 +358,7 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         let implicit_index = self.implicit_index.clone();
         let inline_compose_index = self.inline_compose_index.clone();
         let property_result_cache = self.property_result_cache.clone();
+        let plain_fts_cache = self.plain_fts_cache.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             crate::import::fhir_bundle::import_bundle_sync(&pool, &data_vec)
@@ -349,6 +375,9 @@ impl BundleImportBackend for SqliteTerminologyBackend {
                 guard.clear();
             }
             if let Ok(mut guard) = property_result_cache.write() {
+                guard.clear();
+            }
+            if let Ok(mut guard) = plain_fts_cache.write() {
                 guard.clear();
             }
         }
