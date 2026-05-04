@@ -832,6 +832,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 &req.code,
                                 &url,
                                 req.display.as_deref(),
+                                req.system.as_deref(),
                             );
                         }
 
@@ -851,6 +852,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             &req.code,
                             &url,
                             req.display.as_deref(),
+                            req.system.as_deref(),
                         );
                     }
                     Err(e) => return Err(e),
@@ -868,7 +870,19 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 all_codes.iter().find(|c| c.code == req.code).cloned()
             };
 
-            finish_validate_code_response(found, &req.code, &url, req.display.as_deref())
+            // Prefer the matched concept's system if present (in case the
+            // request didn't pass a system).
+            let system_for_msg: Option<String> = req
+                .system
+                .clone()
+                .or_else(|| found.as_ref().map(|c| c.system.clone()));
+            finish_validate_code_response(
+                found,
+                &req.code,
+                &url,
+                req.display.as_deref(),
+                system_for_msg.as_deref(),
+            )
         })
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
@@ -3444,13 +3458,25 @@ fn finish_validate_code_response(
     code: &str,
     url: &str,
     expected_display: Option<&str>,
+    system_for_msg: Option<&str>,
 ) -> Result<ValidateCodeResponse, HtsError> {
     match found {
-        None => Ok(ValidateCodeResponse {
-            result: false,
-            message: Some(format!("Code '{code}' is not in value set '{url}'")),
-            display: None,
-        }),
+        None => {
+            // The IG validator compares this text with the format
+            //   "The provided code 'system#code' was not found in the value set 'url'"
+            // (see notSelectable/* and validation/* response fixtures).
+            let qualified = match system_for_msg {
+                Some(s) => format!("{s}#{code}"),
+                None => code.to_string(),
+            };
+            Ok(ValidateCodeResponse {
+                result: false,
+                message: Some(format!(
+                    "The provided code '{qualified}' was not found in the value set '{url}'"
+                )),
+                display: None,
+            })
+        }
         Some(concept) => {
             let mut message = None;
             if let Some(expected) = expected_display {

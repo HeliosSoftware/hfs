@@ -167,11 +167,19 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         };
 
         match found {
-            None => Ok(ValidateCodeResponse {
-                result: false,
-                message: Some(format!("Code '{}' is not in value set '{url}'", req.code)),
-                display: None,
-            }),
+            None => {
+                let qualified = match req.system.as_deref() {
+                    Some(s) => format!("{s}#{}", req.code),
+                    None => req.code.clone(),
+                };
+                Ok(ValidateCodeResponse {
+                    result: false,
+                    message: Some(format!(
+                        "The provided code '{qualified}' was not found in the value set '{url}'"
+                    )),
+                    display: None,
+                })
+            }
             Some(concept) => {
                 let mut message = None;
                 if let Some(expected) = req.display.as_deref() {
