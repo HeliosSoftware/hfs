@@ -203,7 +203,15 @@ async fn process_expand<B: TerminologyBackend>(
         .map(serialize_expansion_contains)
         .collect();
 
-    let mut expansion = json!({ "contains": contains });
+    // The IG validator (txTests) treats `expansion.identifier` and
+    // `expansion.timestamp` as required (they appear in every fixture without
+    // an `$optional$` marker). The values are matched as `$uuid$` / `$instant$`
+    // wildcards, so any well-formed value satisfies the comparison.
+    let mut expansion = json!({
+        "identifier": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "contains": contains,
+    });
 
     if let Some(total) = resp.total {
         expansion["total"] = json!(total);
