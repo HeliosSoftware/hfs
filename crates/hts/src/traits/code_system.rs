@@ -60,4 +60,15 @@ pub trait CodeSystemOperations: Send + Sync {
         ctx: &TenantContext,
         req: SubsumesRequest,
     ) -> Result<SubsumesResponse, HtsError>;
+
+    /// Return the stored `version` value for the CodeSystem with the given URL.
+    ///
+    /// Used by `$expand` to populate `expansion.parameter[].used-codesystem`
+    /// entries with the canonical `<url>|<version>` form. Returns `Ok(None)`
+    /// when the system is unknown or carries no version.
+    async fn code_system_version_for_url(
+        &self,
+        ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError>;
 }

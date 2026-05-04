@@ -259,6 +259,37 @@ async fn process_expand<B: TerminologyBackend>(
         .cloned()
         .collect();
 
+    // Emit one `used-codesystem` entry per distinct CodeSystem that contributed
+    // concepts. The IG validator compares these as `<url>|<version>` strings,
+    // so omitting the version (or omitting the entry entirely) is a hard fail.
+    let mut used_systems: Vec<&String> =
+        resp.contains
+            .iter()
+            .map(|c| &c.system)
+            .fold(Vec::<&String>::new(), |mut acc, s| {
+                if !acc.contains(&s) {
+                    acc.push(s);
+                }
+                acc
+            });
+    used_systems.sort();
+    for system_url in used_systems {
+        let version = state
+            .backend()
+            .code_system_version_for_url(&ctx, system_url)
+            .await
+            .ok()
+            .flatten();
+        let value_uri = match version {
+            Some(v) => format!("{system_url}|{v}"),
+            None => system_url.clone(),
+        };
+        emitted_params.push(json!({
+            "name": "used-codesystem",
+            "valueUri": value_uri,
+        }));
+    }
+
     // Append any expansion warnings as parameter entries with name=warning.
     for w in &resp.warnings {
         emitted_params.push(json!({ "name": "warning", "valueString": w }));

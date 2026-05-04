@@ -193,6 +193,26 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         })
     }
 
+    async fn code_system_version_for_url(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let row = client
+            .query_opt(
+                "SELECT version FROM code_systems WHERE url = $1 LIMIT 1",
+                &[&url],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+    }
+
     async fn search(
         &self,
         _ctx: &TenantContext,

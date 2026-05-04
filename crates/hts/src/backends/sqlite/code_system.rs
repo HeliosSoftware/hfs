@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
+use rusqlite::OptionalExtension;
 
 use crate::error::HtsError;
 use crate::traits::CodeSystemOperations;
@@ -236,6 +237,33 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             Ok(SubsumesResponse {
                 outcome: SubsumptionOutcome::NotSubsumed,
             })
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn code_system_version_for_url(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        let pool = self.pool().clone();
+        let url = url.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            let version: Option<String> = conn
+                .query_row(
+                    "SELECT version FROM code_systems WHERE url = ?1 LIMIT 1",
+                    rusqlite::params![url],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .flatten();
+            Ok(version)
         })
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
