@@ -338,12 +338,25 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     })?;
 
     let ctx = TenantContext::system();
+    // Used to rewrite "...'url'..." → "...'url|version'..." in NotFound
+    // messages so the IG-expected text format is met.
+    let vs_version = find_str_param(&params, "valueSetVersion");
+    let rewrite = |e: HtsError| -> HtsError {
+        match (e, vs_version.as_deref()) {
+            (HtsError::NotFound(msg), Some(v)) => {
+                let needle = format!("'{url}'");
+                let replacement = format!("'{url}|{v}'");
+                HtsError::NotFound(msg.replace(&needle, &replacement))
+            }
+            (e, _) => e,
+        }
+    };
 
     // ── Path 1: bare `code` parameter ────────────────────────────────────────────
     if let Some(code) = find_str_param(&params, "code") {
         let system = find_str_param(&params, "system");
         let req = ValidateCodeRequest {
-            url: Some(url),
+            url: Some(url.clone()),
             system: system.clone(),
             code: code.clone(),
             version: find_str_param(&params, "version"),
@@ -354,7 +367,9 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
-        let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
+        let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
+            .await
+            .map_err(&rewrite)?;
         return Ok(build_validate_response_async(
             state.backend(),
             &ctx,
@@ -369,7 +384,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // ── Path 2: `coding` parameter (valueCoding) ──────────────────────────────
     if let Some((system, code, _display)) = extract_coding(&params, "coding") {
         let req = ValidateCodeRequest {
-            url: Some(url),
+            url: Some(url.clone()),
             system: Some(system.clone()),
             code: code.clone(),
             version: find_str_param(&params, "version"),
@@ -380,7 +395,9 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
-        let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
+        let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
+            .await
+            .map_err(&rewrite)?;
         return Ok(build_validate_response_async(
             state.backend(),
             &ctx,
@@ -421,7 +438,9 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                     .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
             };
-            let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
+            let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
+                .await
+                .map_err(&rewrite)?;
             if resp.result {
                 return Ok(build_validate_response_async(
                     state.backend(),

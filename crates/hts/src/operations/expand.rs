@@ -336,13 +336,26 @@ async fn process_expand<B: TerminologyBackend>(
         Err(HtsError::NotFound(msg)) => {
             // Populate the negative cache so future requests for this URL
             // are resolved in O(1) without touching the database.
-            if let Some(url_str) = url_for_neg_cache {
+            if let Some(ref url_str) = url_for_neg_cache {
                 if let Ok(mut neg) = state.not_found_urls.write() {
                     if neg.len() < NOT_FOUND_CACHE_MAX {
-                        neg.insert(url_str);
+                        neg.insert(url_str.clone());
                     }
                 }
             }
+            // The IG fixtures format VS-not-found errors as
+            //   "A definition for the value Set 'url|version' could not be found"
+            // when a `valueSetVersion` was supplied. Rewrite the backend's
+            // version-less message in-place when we have one.
+            let vs_version = find_str_param(&params, "valueSetVersion");
+            let msg =
+                if let (Some(url), Some(v)) = (url_for_neg_cache.as_ref(), vs_version.as_ref()) {
+                    let needle = format!("'{url}'");
+                    let replacement = format!("'{url}|{v}'");
+                    msg.replace(&needle, &replacement)
+                } else {
+                    msg
+                };
             return Err(HtsError::NotFound(msg));
         }
         Err(e) => return Err(e),
