@@ -17,7 +17,7 @@ mod concept_map;
 mod metadata;
 mod value_set;
 
-pub use code_system::{CodeSystemOperations, ConceptExpansionFlags};
+pub use code_system::{CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags};
 pub use concept_map::ConceptMapOperations;
 pub use metadata::TerminologyMetadata;
 pub use value_set::ValueSetOperations;

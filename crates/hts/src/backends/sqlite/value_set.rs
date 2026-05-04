@@ -381,6 +381,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     is_abstract: None,
 
                                     inactive: None,
+
+                                    designations: vec![],
                                     contains: vec![],
                                 })
                             })
@@ -1067,6 +1069,8 @@ fn fetch_cache(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionContains>,
             is_abstract: None,
 
             inactive: None,
+
+            designations: vec![],
             contains: vec![],
         })
     })
@@ -1173,6 +1177,8 @@ fn expand_inline_plain_fts(
                 is_abstract: None,
 
                 inactive: None,
+
+                designations: vec![],
                 contains: vec![],
             });
         }
@@ -1411,6 +1417,8 @@ fn expand_inline_filtered(
                         is_abstract: None,
 
                         inactive: None,
+
+                        designations: vec![],
                         contains: vec![],
                     });
                 }
@@ -1448,6 +1456,8 @@ fn expand_inline_filtered(
                                 is_abstract: None,
 
                                 inactive: None,
+
+                                designations: vec![],
                                 contains: vec![],
                             })
                         },
@@ -1478,6 +1488,8 @@ fn expand_inline_filtered(
                                 is_abstract: None,
 
                                 inactive: None,
+
+                                designations: vec![],
                                 contains: vec![],
                             })
                         },
@@ -1668,6 +1680,8 @@ fn compute_expansion_depth(
                         is_abstract: None,
 
                         inactive: None,
+
+                        designations: vec![],
                         contains: vec![],
                     });
                 }
@@ -1689,6 +1703,8 @@ fn compute_expansion_depth(
                             is_abstract: None,
 
                             inactive: None,
+
+                            designations: vec![],
                             contains: vec![],
                         })
                     })
@@ -1932,6 +1948,8 @@ fn apply_compose_filters(
                 is_abstract: None,
 
                 inactive: None,
+
+                designations: vec![],
                 contains: vec![],
             })
             .collect();
@@ -2110,6 +2128,8 @@ fn try_multi_include_property_only(
                 is_abstract: None,
 
                 inactive: None,
+
+                designations: vec![],
                 contains: vec![],
             })
         })
@@ -2161,6 +2181,8 @@ fn query_subtree_with_property(
         is_abstract: None,
 
         inactive: None,
+
+        designations: vec![],
         contains: vec![],
     };
 
@@ -2254,6 +2276,8 @@ fn query_property_eq(
             is_abstract: None,
 
             inactive: None,
+
+            designations: vec![],
             contains: vec![],
         })
         .collect())
@@ -2377,6 +2401,8 @@ fn query_ancestors_full(
                 is_abstract: None,
 
                 inactive: None,
+
+                designations: vec![],
                 contains: vec![],
             })
         })
@@ -2414,6 +2440,8 @@ fn fts_candidates_for_system(
                 is_abstract: None,
 
                 inactive: None,
+
+                designations: vec![],
                 contains: vec![],
             })
         })
@@ -2844,6 +2872,8 @@ fn compose_page_fast(
             is_abstract: None,
 
             inactive: None,
+
+            designations: vec![],
             contains: vec![],
         });
     }
@@ -2964,6 +2994,8 @@ fn bfs_expand_page(
                                     is_abstract: None,
 
                                     inactive: None,
+
+                                    designations: vec![],
                                     contains: vec![],
                                 })
                             },
@@ -2993,6 +3025,8 @@ fn bfs_expand_page(
                             is_abstract: None,
 
                             inactive: None,
+
+                            designations: vec![],
                             contains: vec![],
                         })
                     },
@@ -3015,6 +3049,8 @@ fn bfs_expand_page(
                         is_abstract: None,
 
                         inactive: None,
+
+                        designations: vec![],
                         contains: vec![],
                     })
                 })
@@ -3071,6 +3107,8 @@ fn bfs_isa_page(
             is_abstract: None,
 
             inactive: None,
+
+            designations: vec![],
             contains: vec![],
         })
     };
@@ -3486,6 +3524,8 @@ fn validate_fhir_vs(
                 is_abstract: None,
 
                 inactive: None,
+
+                designations: vec![],
                 contains: vec![],
             }))
         }
@@ -3523,6 +3563,8 @@ fn validate_fhir_vs(
                 is_abstract: None,
 
                 inactive: None,
+
+                designations: vec![],
                 contains: vec![],
             }))
         }
@@ -3653,6 +3695,8 @@ fn lookup_in_implicit_cache(
                     is_abstract: None,
 
                     inactive: None,
+
+                    designations: vec![],
                     contains: vec![],
                 })
             },
@@ -3672,6 +3716,8 @@ fn lookup_in_implicit_cache(
                     is_abstract: None,
 
                     inactive: None,
+
+                    designations: vec![],
                     contains: vec![],
                 })
             },
@@ -3908,6 +3954,8 @@ fn page_in_memory(
         is_abstract: None,
 
         inactive: None,
+
+        designations: vec![],
         contains: vec![],
     };
 
@@ -4223,6 +4271,8 @@ fn implicit_cache_page(
                         is_abstract: None,
 
                         inactive: None,
+
+                        designations: vec![],
                         contains: vec![],
                     })
                 })
@@ -4254,6 +4304,8 @@ fn implicit_cache_page(
                         is_abstract: None,
 
                         inactive: None,
+
+                        designations: vec![],
                         contains: vec![],
                     })
                 })
@@ -4281,6 +4333,8 @@ fn implicit_cache_page(
                     is_abstract: None,
 
                     inactive: None,
+
+                    designations: vec![],
                     contains: vec![],
                 })
             })

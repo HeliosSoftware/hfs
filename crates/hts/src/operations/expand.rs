@@ -77,6 +77,30 @@ fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
     if c.inactive == Some(true) {
         item["inactive"] = json!(true);
     }
+    if !c.designations.is_empty() {
+        let designations: Vec<Value> = c
+            .designations
+            .iter()
+            .map(|d| {
+                let mut entry = json!({ "value": d.value });
+                if let Some(lang) = &d.language {
+                    entry["language"] = json!(lang);
+                }
+                if d.use_system.is_some() || d.use_code.is_some() {
+                    let mut us = serde_json::Map::new();
+                    if let Some(s) = &d.use_system {
+                        us.insert("system".into(), json!(s));
+                    }
+                    if let Some(c) = &d.use_code {
+                        us.insert("code".into(), json!(c));
+                    }
+                    entry["use"] = Value::Object(us);
+                }
+                entry
+            })
+            .collect();
+        item["designation"] = json!(designations);
+    }
     if !c.contains.is_empty() {
         let nested: Vec<Value> = c
             .contains
@@ -131,6 +155,52 @@ fn populate_concept_flags<'a, B: TerminologyBackend>(
             }
             if !c.contains.is_empty() {
                 populate_concept_flags(backend, ctx, &mut c.contains).await;
+            }
+        }
+    })
+}
+
+/// Populate `designations` on each expansion entry in-place via a per-system
+/// batched lookup. Mirrors `populate_concept_flags` and is only invoked when
+/// the caller passes `includeDesignations=true`.
+fn populate_designations<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::ExpansionContainsDesignation;
+        use std::collections::HashMap;
+        let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.as_str())
+                .or_default()
+                .push(c.code.clone());
+        }
+        let mut map: HashMap<(String, String), Vec<ExpansionContainsDesignation>> = HashMap::new();
+        for (system, codes) in &by_system {
+            if let Ok(ds) = backend.concept_designations(ctx, system, codes).await {
+                for (code, list) in ds {
+                    let entries = list
+                        .into_iter()
+                        .map(|d| ExpansionContainsDesignation {
+                            language: d.language,
+                            use_system: d.use_system,
+                            use_code: d.use_code,
+                            value: d.value,
+                        })
+                        .collect();
+                    map.insert(((*system).to_string(), code), entries);
+                }
+            }
+        }
+        for c in contains.iter_mut() {
+            if let Some(ds) = map.remove(&(c.system.clone(), c.code.clone())) {
+                c.designations = ds;
+            }
+            if !c.contains.is_empty() {
+                populate_designations(backend, ctx, &mut c.contains).await;
             }
         }
     })
@@ -282,6 +352,16 @@ async fn process_expand<B: TerminologyBackend>(
     // Backends construct ExpansionContains with both flags as None; resolve
     // them here in a per-system batch so the per-concept SQL stays cold-path.
     populate_concept_flags(state.backend(), &ctx, &mut resp.contains).await;
+
+    // ── Populate designations (only if explicitly requested) ─────────────────
+    let include_designations = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("includeDesignations"))
+        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    if include_designations {
+        populate_designations(state.backend(), &ctx, &mut resp.contains).await;
+    }
 
     // ── activeOnly filter ────────────────────────────────────────────────────
     // The IG fixtures pass `activeOnly=true` to drop inactive concepts from

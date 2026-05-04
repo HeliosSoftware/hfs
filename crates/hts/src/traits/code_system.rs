@@ -72,6 +72,18 @@ pub trait CodeSystemOperations: Send + Sync {
         url: &str,
     ) -> Result<Option<String>, HtsError>;
 
+    /// Batch-fetch designations for a list of concept codes in the given
+    /// CodeSystem URL. Returns a map from code → list of designations. Codes
+    /// with no designations may be omitted from the result. Used by `$expand`
+    /// to populate `expansion.contains[].designation` when the caller asks
+    /// for `includeDesignations=true`.
+    async fn concept_designations(
+        &self,
+        ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<ConceptDesignation>>, HtsError>;
+
     /// Look up the `(is_abstract, inactive)` flags for a batch of concept codes
     /// in the given CodeSystem URL.
     ///
@@ -97,4 +109,13 @@ pub trait CodeSystemOperations: Send + Sync {
 pub struct ConceptExpansionFlags {
     pub is_abstract: bool,
     pub inactive: bool,
+}
+
+/// A single designation row for a concept (translation or alternate label).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConceptDesignation {
+    pub language: Option<String>,
+    pub use_system: Option<String>,
+    pub use_code: Option<String>,
+    pub value: String,
 }

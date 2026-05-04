@@ -159,9 +159,24 @@ pub struct ExpansionContains {
     #[serde(default, rename = "abstract")]
     pub is_abstract: Option<bool>,
     pub inactive: Option<bool>,
+    /// Designations attached to this concept (translations, alternate
+    /// labels). Populated post-expansion when the caller asked for
+    /// `includeDesignations=true`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub designations: Vec<ExpansionContainsDesignation>,
     /// Nested contains for hierarchical expansions.
     #[serde(default)]
     pub contains: Vec<ExpansionContains>,
+}
+
+/// One designation entry on an `ExpansionContains`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpansionContainsDesignation {
+    pub language: Option<String>,
+    /// `{system, code}` of the designation use; both optional.
+    pub use_system: Option<String>,
+    pub use_code: Option<String>,
+    pub value: String,
 }
 
 /// Request for `ValueSet/$expand`.
@@ -407,6 +422,7 @@ mod tests {
             display: Some("Child Concept".into()),
             is_abstract: None,
             inactive: None,
+            designations: vec![],
             contains: vec![],
         };
         let parent = ExpansionContains {
@@ -415,6 +431,7 @@ mod tests {
             display: Some("Parent Concept".into()),
             is_abstract: None,
             inactive: None,
+            designations: vec![],
             contains: vec![child.clone()],
         };
         let json = serde_json::to_string(&parent).unwrap();

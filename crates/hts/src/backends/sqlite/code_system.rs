@@ -14,7 +14,7 @@ use helios_persistence::tenant::TenantContext;
 use rusqlite::OptionalExtension;
 
 use crate::error::HtsError;
-use crate::traits::{CodeSystemOperations, ConceptExpansionFlags};
+use crate::traits::{CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags};
 use crate::types::{
     DesignationValue, LookupRequest, LookupResponse, PropertyValue, ResourceSearchQuery,
     SubsumesRequest, SubsumesResponse, SubsumptionOutcome, ValidateCodeRequest,
@@ -264,6 +264,76 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(e.to_string()))?
                 .flatten();
             Ok(version)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn concept_designations(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<ConceptDesignation>>, HtsError> {
+        if codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let pool = self.pool().clone();
+        let system_url = system_url.to_string();
+        let codes = codes.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+            let placeholders = (2..=codes.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT c.code, cd.language, cd.use_system, cd.use_code, cd.value
+                 FROM concept_designations cd
+                 JOIN concepts c ON c.id = cd.concept_id
+                 JOIN code_systems s ON s.id = c.system_id
+                 WHERE s.url = ?1
+                   AND c.code IN ({placeholders})",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(codes.len() + 1);
+            params.push(&system_url);
+            for c in &codes {
+                params.push(c as &dyn rusqlite::ToSql);
+            }
+
+            let mut out: std::collections::HashMap<String, Vec<ConceptDesignation>> =
+                std::collections::HashMap::new();
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            for r in rows {
+                let (code, language, use_system, use_code, value) =
+                    r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                out.entry(code).or_default().push(ConceptDesignation {
+                    language,
+                    use_system,
+                    use_code,
+                    value,
+                });
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?

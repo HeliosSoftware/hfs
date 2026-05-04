@@ -315,6 +315,8 @@ async fn fetch_cache(
             is_abstract: None,
 
             inactive: None,
+
+            designations: vec![],
             contains: vec![],
         })
         .collect())
@@ -382,6 +384,8 @@ async fn compute_expansion(
                     is_abstract: None,
 
                     inactive: None,
+
+                    designations: vec![],
                     contains: vec![],
                 });
             }
@@ -402,6 +406,8 @@ async fn compute_expansion(
                     is_abstract: None,
 
                     inactive: None,
+
+                    designations: vec![],
                     contains: vec![],
                 });
             }

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 
 use crate::error::HtsError;
-use crate::traits::{CodeSystemOperations, ConceptExpansionFlags};
+use crate::traits::{CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags};
 use crate::types::{
     DesignationValue, LookupRequest, LookupResponse, PropertyValue, ResourceSearchQuery,
     SubsumesRequest, SubsumesResponse, SubsumptionOutcome, ValidateCodeRequest,
@@ -211,6 +211,46 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+    }
+
+    async fn concept_designations(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<ConceptDesignation>>, HtsError> {
+        if codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT c.code, cd.language, cd.use_system, cd.use_code, cd.value
+                 FROM concept_designations cd
+                 JOIN concepts c ON c.id = cd.concept_id
+                 JOIN code_systems s ON s.id = c.system_id
+                 WHERE s.url = $1
+                   AND c.code = ANY($2)",
+                &[&system_url, &codes],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let mut out: std::collections::HashMap<String, Vec<ConceptDesignation>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let code: String = row.get(0);
+            out.entry(code).or_default().push(ConceptDesignation {
+                language: row.get(1),
+                use_system: row.get(2),
+                use_code: row.get(3),
+                value: row.get(4),
+            });
+        }
+        Ok(out)
     }
 
     async fn concept_expansion_flags(
