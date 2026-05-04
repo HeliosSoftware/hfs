@@ -156,30 +156,23 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
                 value: Some(false),
                 ..Default::default()
             }),
-            // The IG fixtures expect an `expansion.parameter` array listing
-            // every $expand parameter we honor; the entries are alphabetised
-            // by the validator so insertion order doesn't matter.
+            // The IG fixtures expect a specific 12-entry expansion.parameter
+            // list (per tests/capterms.json). The validator sorts before
+            // comparing, so insertion order doesn't matter.
             parameter: Some(
                 [
                     "activeOnly",
                     "check-system-version",
                     "count",
-                    "date",
-                    "default-valueset-version",
                     "displayLanguage",
                     "excludeNested",
-                    "excludeSystem",
-                    "filter",
                     "force-system-version",
-                    "hierarchical",
                     "includeDefinition",
                     "includeDesignations",
-                    "limitedExpansion",
                     "offset",
+                    "property",
                     "system-version",
-                    "url",
-                    "valueSet",
-                    "valueSetVersion",
+                    "tx-resource",
                 ]
                 .iter()
                 .map(|name| TerminologyCapabilitiesExpansionParameter {
@@ -306,7 +299,8 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
         "extension": supported_system_extensions,
         "software": {
             "name": HTS_NAME,
-            "version": HTS_VERSION
+            "version": HTS_VERSION,
+            "releaseDate": "2026-04-01",
         },
         "implementation": {
             "description": "Helios Terminology Server SQLite backend"
