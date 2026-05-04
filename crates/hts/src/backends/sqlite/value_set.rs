@@ -149,9 +149,57 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             }
         }
 
+        // ── Async hot path: inline compose in-memory index already warm ──────────
+        // For unfiltered inline ValueSet requests, check the per-compose-body
+        // index *before* entering spawn_blocking.  Once an expansion has been
+        // computed (or loaded from the DB cache at startup) every subsequent
+        // request for the same compose body is served entirely from process
+        // memory — no pool connection acquired, no thread switch.  This
+        // eliminates spawn_blocking / r2d2 pool contention for hot EX06-style
+        // repeated inline-compose queries.
+        if let Some(ref vs) = req.value_set {
+            if req.filter.is_none() && req.hierarchical != Some(true) {
+                let compose_cache_key = {
+                    let compose = &vs["compose"];
+                    format!(
+                        "inline-compose:{:016x}",
+                        fnv64(compose.to_string().as_bytes())
+                    )
+                };
+                if let Ok(guard) = self.inline_compose_index.read() {
+                    if let Some(concept_idx) = guard.get(&compose_cache_key).cloned() {
+                        drop(guard);
+                        let sql_offset = i64::from(req.offset.unwrap_or(0));
+                        let sql_limit = req.count.map(i64::from).unwrap_or(-1);
+                        let n = count_in_memory(&concept_idx, None);
+                        if req.count.is_none() {
+                            if let Some(cap) = req.max_expansion_size {
+                                if u64::from(n) > u64::from(cap) {
+                                    return Err(HtsError::TooCostly(format!(
+                                        "ValueSet expansion contains {} codes which exceeds \
+                                         the server limit of {} (set \
+                                         HTS_MAX_EXPANSION_SIZE to raise it)",
+                                        n, cap
+                                    )));
+                                }
+                            }
+                        }
+                        let page = page_in_memory(&concept_idx, None, sql_offset, sql_limit);
+                        return Ok(ExpandResponse {
+                            total: Some(n),
+                            offset: req.offset,
+                            contains: page,
+                            warnings: vec![],
+                        });
+                    }
+                }
+            }
+        }
+
         let pool = self.pool().clone();
         let implicit_index = self.implicit_index.clone();
         let bg_index_pending = self.bg_index_pending.clone();
+        let inline_compose_index = self.inline_compose_index.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -298,6 +346,14 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // the expansion is complete and safe to reuse).
                         if warnings.is_empty() {
                             let _ = populate_implicit_cache(&conn, &cache_key, &codes);
+                            // Populate the in-memory inline compose index so that
+                            // subsequent requests for the same compose body are served
+                            // from process memory without entering spawn_blocking.
+                            populate_inline_compose_index(
+                                &codes,
+                                &cache_key,
+                                &inline_compose_index,
+                            );
                         }
                         codes
                     }
@@ -1739,11 +1795,12 @@ fn is_property_only_include(inc: &serde_json::Value) -> bool {
 /// Collapses all includes into a single query using a UNION of driver-+EXISTS
 /// sub-selects instead of N×M individual round-trips or an INTERSECT CTE
 /// (which would materialise and sort large intermediate sets).  For a
-/// 2-include × 2-filter case the generated SQL looks like:
+/// 2-include × 2-filter case the generated SQL looks like (parameters are
+/// numbered sequentially: ?1..?8 for the 4×2 filter params, ?9 for system_id):
 ///
 /// ```sql
 /// SELECT c.code, c.display FROM concepts c
-/// WHERE c.system_id = ?5
+/// WHERE c.system_id = ?9
 /// AND c.id IN (
 ///     SELECT cp0.concept_id FROM concept_properties cp0
 ///     WHERE cp0.property = ?1 AND cp0.value = ?2
@@ -4171,6 +4228,154 @@ pub(crate) fn prebuild_implicit_index(conn: &Connection, index: &super::Implicit
     }
 }
 
+/// Build an [`ImplicitConceptIndex`] from a flat list of expansion entries.
+///
+/// Entries are assumed to be already sorted by `(system_url, code)`.
+/// Constructs the trigram inverted index for O(k) filtered queries.
+fn build_concept_index_from_entries(entries: Vec<ImplicitConceptEntry>) -> ImplicitConceptIndex {
+    let mut trigram_idx: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
+    let mut seen: Vec<[u8; 3]> = Vec::with_capacity(64);
+    for (i, entry) in entries.iter().enumerate() {
+        seen.clear();
+        let idx = i as u32;
+        for text in [entry.code_lower.as_str(), entry.display_lower.as_str()] {
+            let bytes = text.as_bytes();
+            for w in bytes.windows(3) {
+                let tri = [w[0], w[1], w[2]];
+                if !seen.contains(&tri) {
+                    seen.push(tri);
+                    trigram_idx.entry(tri).or_default().push(idx);
+                }
+            }
+        }
+    }
+    let trigram_idx: HashMap<[u8; 3], Box<[u32]>> = trigram_idx
+        .into_iter()
+        .map(|(k, v)| (k, v.into_boxed_slice()))
+        .collect();
+    ImplicitConceptIndex {
+        entries: entries.into_boxed_slice(),
+        trigram_idx,
+    }
+}
+
+/// Populate the inline-compose in-memory index from a computed expansion.
+///
+/// Called immediately after a successful `compute_expansion` + DB cache write
+/// so that all subsequent requests for the same compose body skip `spawn_blocking`
+/// entirely.  No-op if the index already contains an entry for `cache_key` (a
+/// concurrent request already populated it).
+fn populate_inline_compose_index(
+    codes: &[ExpansionContains],
+    cache_key: &str,
+    index: &super::InlineComposeIndex,
+) {
+    {
+        // Fast read-path: already populated by a concurrent request.
+        if let Ok(guard) = index.read() {
+            if guard.contains_key(cache_key) {
+                return;
+            }
+        }
+    }
+
+    let entries: Vec<ImplicitConceptEntry> = codes
+        .iter()
+        .map(|c| {
+            let code_lower = c.code.to_lowercase();
+            let display_lower = c
+                .display
+                .as_deref()
+                .map(str::to_lowercase)
+                .unwrap_or_default();
+            ImplicitConceptEntry {
+                system_url: c.system.clone(),
+                code: c.code.clone(),
+                display: c.display.clone(),
+                code_lower,
+                display_lower,
+            }
+        })
+        .collect();
+
+    let concept_idx = Arc::new(build_concept_index_from_entries(entries));
+    if let Ok(mut guard) = index.write() {
+        guard.entry(cache_key.to_string()).or_insert(concept_idx);
+    }
+}
+
+/// Pre-warm the inline-compose in-memory index from any `inline-compose:*`
+/// entries already persisted in `implicit_expansion_cache`.
+///
+/// Called at server startup after `prebuild_implicit_index`.  On a cold DB
+/// this is a no-op.  On a warm restart (benchmark re-run) the index is rebuilt
+/// from persisted rows, letting the async hot path in [`expand`] serve all
+/// inline-compose requests without ever entering `spawn_blocking`.
+pub(crate) fn prebuild_inline_compose_index(conn: &Connection, index: &super::InlineComposeIndex) {
+    let keys: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT url FROM implicit_expansion_cache \
+             WHERE url LIKE 'inline-compose:%'",
+        )
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    if keys.is_empty() {
+        return;
+    }
+
+    let mut loaded = 0usize;
+    for key in &keys {
+        let entries_result = conn.prepare_cached(
+            "SELECT system_url, code, display \
+             FROM implicit_expansion_cache \
+             WHERE url = ?1 \
+             ORDER BY system_url, code",
+        );
+        let mut stmt = match entries_result {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let rows: Vec<(String, String, Option<String>)> =
+            match stmt.query_map([key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(_) => continue,
+            };
+
+        let entries: Vec<ImplicitConceptEntry> = rows
+            .into_iter()
+            .map(|(system_url, code, display)| {
+                let code_lower = code.to_lowercase();
+                let display_lower = display
+                    .as_deref()
+                    .map(str::to_lowercase)
+                    .unwrap_or_default();
+                ImplicitConceptEntry {
+                    system_url,
+                    code,
+                    display,
+                    code_lower,
+                    display_lower,
+                }
+            })
+            .collect();
+
+        let concept_idx = Arc::new(build_concept_index_from_entries(entries));
+        if let Ok(mut guard) = index.write() {
+            guard.insert(key.clone(), concept_idx);
+        }
+        loaded += 1;
+    }
+
+    tracing::info!(
+        count = loaded,
+        "inline compose concept index pre-warmed from cache"
+    );
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -5658,6 +5863,345 @@ mod tests {
             resp.contains.len(),
             1,
             "only child1 should be in the result"
+        );
+    }
+
+    /// Multi-include property filter uses OR semantics across includes (EX06 pattern).
+    ///
+    /// Two includes each with a single property= filter: the result should be the
+    /// union of concepts matching either filter, exercising `try_multi_include_property_only`.
+    #[tokio::test]
+    async fn expand_multi_include_property_or_semantics() {
+        let b = backend();
+
+        // CodeSystem: concepts with property "tty" set to various values.
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-rx-multi",
+              "url": "http://example.org/cs-rx-multi",
+              "status": "active", "content": "complete",
+              "property": [
+                { "code": "tty",      "type": "code"   },
+                { "code": "relatedTo","type": "code"   }
+              ],
+              "concept": [
+                { "code": "BN1", "display": "Brand One",
+                  "property": [
+                    { "code": "tty",       "valueCode": "BN"      },
+                    { "code": "relatedTo", "valueCode": "ING:A"   }
+                  ]
+                },
+                { "code": "BN2", "display": "Brand Two",
+                  "property": [
+                    { "code": "tty",       "valueCode": "BN"      },
+                    { "code": "relatedTo", "valueCode": "ING:B"   }
+                  ]
+                },
+                { "code": "IN1", "display": "Ingredient One",
+                  "property": [{ "code": "tty", "valueCode": "IN" }]
+                },
+                { "code": "SCD1", "display": "Clinical Drug One",
+                  "property": [{ "code": "tty", "valueCode": "SCD" }]
+                }
+              ]
+            }
+          }]
+        }"#;
+
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        // Two includes: tty=BN OR tty=SCD (OR across includes).
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [
+                    {
+                        "system": "http://example.org/cs-rx-multi",
+                        "filter": [{ "property": "tty", "op": "=", "value": "BN" }]
+                    },
+                    {
+                        "system": "http://example.org/cs-rx-multi",
+                        "filter": [{ "property": "tty", "op": "=", "value": "SCD" }]
+                    }
+                ]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        codes.sort_unstable();
+        assert!(codes.contains(&"BN1"), "BN1 matches tty=BN");
+        assert!(codes.contains(&"BN2"), "BN2 matches tty=BN");
+        assert!(codes.contains(&"SCD1"), "SCD1 matches tty=SCD");
+        assert!(!codes.contains(&"IN1"), "IN1 has tty=IN, not included");
+        assert_eq!(codes.len(), 3, "exactly 3 concepts across both includes");
+    }
+
+    /// Multi-include with AND semantics within each include (EX06 AND pattern).
+    ///
+    /// Single include with two property= filters: only concepts matching BOTH
+    /// filters are returned.
+    #[tokio::test]
+    async fn expand_single_include_two_property_filters_and_semantics() {
+        let b = backend();
+
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-rx-and",
+              "url": "http://example.org/cs-rx-and",
+              "status": "active", "content": "complete",
+              "property": [
+                { "code": "tty",       "type": "code" },
+                { "code": "relatedTo", "type": "code" }
+              ],
+              "concept": [
+                { "code": "BN_ING_A", "display": "Brand of A",
+                  "property": [
+                    { "code": "tty",       "valueCode": "BN"    },
+                    { "code": "relatedTo", "valueCode": "ING:A" }
+                  ]
+                },
+                { "code": "BN_ING_B", "display": "Brand of B",
+                  "property": [
+                    { "code": "tty",       "valueCode": "BN"    },
+                    { "code": "relatedTo", "valueCode": "ING:B" }
+                  ]
+                },
+                { "code": "IN_A", "display": "Ingredient A",
+                  "property": [
+                    { "code": "tty",       "valueCode": "IN"    },
+                    { "code": "relatedTo", "valueCode": "ING:A" }
+                  ]
+                }
+              ]
+            }
+          }]
+        }"#;
+
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        // Single include: tty=BN AND relatedTo=ING:A (AND within one include).
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-rx-and",
+                    "filter": [
+                        { "property": "tty",       "op": "=", "value": "BN"    },
+                        { "property": "relatedTo", "op": "=", "value": "ING:A" }
+                    ]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(
+            codes.contains(&"BN_ING_A"),
+            "BN_ING_A matches tty=BN AND relatedTo=ING:A"
+        );
+        assert!(
+            !codes.contains(&"BN_ING_B"),
+            "BN_ING_B has relatedTo=ING:B, excluded"
+        );
+        assert!(!codes.contains(&"IN_A"), "IN_A has tty=IN, excluded");
+        assert_eq!(codes.len(), 1, "only BN_ING_A matches both filters");
+    }
+
+    /// is-a + property= + text filter (EX08 combined pattern).
+    ///
+    /// Requests descendants of a root, filtered by a property value AND a text
+    /// filter — exercises the sql_text push-down path in expand_inline_filtered
+    /// that calls query_subtree_with_property with a text_filter argument.
+    #[tokio::test]
+    async fn expand_inline_isa_property_and_text_filter_combined() {
+        let b = backend();
+
+        // Hierarchy: root → finding_A (morphology=erosion, display "Erosion finding"),
+        //                  → finding_B (morphology=fracture, display "Fracture finding"),
+        //                  → finding_C (morphology=erosion, display "Chronic erosion")
+        // orphan: morphology=erosion but NOT under root.
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-snomed-sim",
+              "url": "http://example.org/cs-snomed-sim",
+              "status": "active", "content": "complete",
+              "property": [
+                { "code": "morph", "type": "code" }
+              ],
+              "concept": [
+                {
+                  "code": "root", "display": "Clinical finding",
+                  "concept": [
+                    {
+                      "code": "find_A", "display": "Erosion finding",
+                      "property": [{ "code": "morph", "valueCode": "erosion" }]
+                    },
+                    {
+                      "code": "find_B", "display": "Fracture finding",
+                      "property": [{ "code": "morph", "valueCode": "fracture" }]
+                    },
+                    {
+                      "code": "find_C", "display": "Chronic erosion disorder",
+                      "property": [{ "code": "morph", "valueCode": "erosion" }]
+                    }
+                  ]
+                },
+                {
+                  "code": "orphan", "display": "Orphan erosion",
+                  "property": [{ "code": "morph", "valueCode": "erosion" }]
+                }
+              ]
+            }
+          }]
+        }"#;
+
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        // $expand with filter="erosion" + compose filter: is-a root + morph=erosion.
+        // Should return find_A and find_C (both under root, have morph=erosion, display has "erosion").
+        // Should NOT return find_B (morph=fracture), orphan (not under root).
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-snomed-sim",
+                    "filter": [
+                        { "property": "concept", "op": "is-a",  "value": "root"   },
+                        { "property": "morph",   "op": "=",     "value": "erosion" }
+                    ]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    filter: Some("erosion".into()),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        codes.sort_unstable();
+        assert!(
+            codes.contains(&"find_A"),
+            "find_A: erosion morphology, under root, display matches"
+        );
+        assert!(
+            codes.contains(&"find_C"),
+            "find_C: erosion morphology, under root, display matches"
+        );
+        assert!(
+            !codes.contains(&"find_B"),
+            "find_B: fracture morphology, excluded"
+        );
+        assert!(
+            !codes.contains(&"orphan"),
+            "orphan: not under root, excluded"
+        );
+        assert_eq!(codes.len(), 2, "exactly find_A and find_C");
+
+        // Also check: with text filter 'chronic' only find_C should match.
+        let inline_vs2 = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-snomed-sim",
+                    "filter": [
+                        { "property": "concept", "op": "is-a",  "value": "root"   },
+                        { "property": "morph",   "op": "=",     "value": "erosion" }
+                    ]
+                }]
+            }
+        });
+
+        let resp2 = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs2),
+                    filter: Some("chronic".into()),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes2: Vec<&str> = resp2.contains.iter().map(|c| c.code.as_str()).collect();
+        assert_eq!(
+            codes2,
+            vec!["find_C"],
+            "only find_C has 'chronic' in display"
+        );
+
+        // And: text filter that matches nothing → empty expansion (not an error).
+        let inline_vs3 = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-snomed-sim",
+                    "filter": [
+                        { "property": "concept", "op": "is-a",  "value": "root"    },
+                        { "property": "morph",   "op": "=",     "value": "erosion"  }
+                    ]
+                }]
+            }
+        });
+
+        let resp3 = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs3),
+                    filter: Some("injection".into()),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            resp3.contains.is_empty(),
+            "no erosion-morphology concepts under root have 'injection' in display"
         );
     }
 

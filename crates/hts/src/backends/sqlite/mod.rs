@@ -36,6 +36,15 @@ use helios_persistence::tenant::TenantContext;
 /// plus a trigram inverted index that enables O(k) filtered queries.
 pub(crate) type ImplicitIndex = Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
 
+/// Shared in-memory index for inline-compose ValueSet expansions.
+///
+/// Keyed by the DB-level cache key (`"inline-compose:{fnv64-hex}"`).  After
+/// the first expansion for a given compose body the full result set is loaded
+/// into this map so that subsequent requests bypass `spawn_blocking` entirely,
+/// eliminating r2d2 pool contention under high concurrency (EX06 optimisation).
+pub(crate) type InlineComposeIndex =
+    Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
+
 /// SQLite-backed terminology service backend.
 ///
 /// Wraps an r2d2 connection pool. Schema migrations are applied automatically
@@ -64,6 +73,15 @@ pub struct SqliteTerminologyBackend {
     /// build the in-memory `implicit_index`.  This set prevents multiple
     /// concurrent VUs from each spawning their own thread for the same URL.
     pub(crate) bg_index_pending: Arc<Mutex<HashSet<String>>>,
+
+    /// In-process concept index for inline-compose ValueSet expansions.
+    ///
+    /// Keyed by `"inline-compose:{fnv64-hex}"` — the same key used by the
+    /// DB-level `implicit_expansion_cache` table.  Populated during the first
+    /// expansion for each unique compose body and pre-warmed at startup from any
+    /// existing cache rows, so that repeated requests (e.g. k6 benchmark VUs)
+    /// bypass `spawn_blocking` entirely once the index is warm.
+    pub(crate) inline_compose_index: InlineComposeIndex,
 }
 
 impl SqliteTerminologyBackend {
@@ -100,8 +118,9 @@ impl SqliteTerminologyBackend {
             .build(manager)
             .map_err(|e| HtsError::StorageError(format!("Failed to create SQLite pool: {e}")))?;
 
-        // Declare early so the init block can pre-warm the in-memory index.
+        // Declare early so the init block can pre-warm the in-memory indexes.
         let implicit_index: ImplicitIndex = Arc::new(RwLock::new(HashMap::new()));
+        let inline_compose_index: InlineComposeIndex = Arc::new(RwLock::new(HashMap::new()));
 
         // Bootstrap: apply WAL + schema on a single connection.
         {
@@ -158,6 +177,11 @@ impl SqliteTerminologyBackend {
             // async hot path in expand() fire immediately without waiting for a
             // background build thread.  No-op on first run (empty cache).
             value_set::prebuild_implicit_index(&conn, &implicit_index);
+
+            // Pre-warm the inline-compose in-memory index from any persisted
+            // "inline-compose:*" entries.  Eliminates spawn_blocking contention
+            // for repeated inline ValueSet $expand calls (e.g. EX06 benchmark).
+            value_set::prebuild_inline_compose_index(&conn, &inline_compose_index);
         }
 
         info!(db_path, "SQLite terminology backend initialized");
@@ -166,6 +190,7 @@ impl SqliteTerminologyBackend {
             pool,
             implicit_index,
             bg_index_pending: Arc::new(Mutex::new(HashSet::new())),
+            inline_compose_index,
         })
     }
 
@@ -208,6 +233,7 @@ impl SqliteTerminologyBackend {
             pool,
             implicit_index: Arc::new(RwLock::new(HashMap::new())),
             bg_index_pending: Arc::new(Mutex::new(HashSet::new())),
+            inline_compose_index: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -282,6 +308,7 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         let pool = self.pool.clone();
         let data_vec = data.to_vec();
         let implicit_index = self.implicit_index.clone();
+        let inline_compose_index = self.inline_compose_index.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             crate::import::fhir_bundle::import_bundle_sync(&pool, &data_vec)
@@ -289,9 +316,12 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?;
 
-        // Evict the in-memory index so the next expand re-reads fresh data.
+        // Evict both in-memory indexes so the next expand re-reads fresh data.
         if result.is_ok() {
             if let Ok(mut guard) = implicit_index.write() {
+                guard.clear();
+            }
+            if let Ok(mut guard) = inline_compose_index.write() {
                 guard.clear();
             }
         }
