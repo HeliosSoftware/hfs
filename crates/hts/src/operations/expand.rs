@@ -646,7 +646,8 @@ pub async fn expand_handler<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let params = extract_parameter_array(&body)?;
+    let mut params = extract_parameter_array(&body)?;
+    inject_accept_language(&headers, &mut params);
     Ok(expand_bytes_respond(
         process_expand(&state, params).await?,
         format,
@@ -666,11 +667,35 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
-    let params = query_params_to_fhir_params(pairs);
+    let mut params = query_params_to_fhir_params(pairs);
+    inject_accept_language(&headers, &mut params);
     Ok(expand_bytes_respond(
         process_expand(&state, params).await?,
         format,
     ))
+}
+
+/// If the request carried an `Accept-Language` header and the params don't
+/// already pin a `displayLanguage`, inject one synthesised from the header.
+/// This is what the IG validator uses to express the language it wants
+/// (`client().setAcceptLanguage(lang)`), and the expected fixtures echo
+/// `displayLanguage` in `expansion.parameter` even when the request body
+/// didn't carry it explicitly.
+fn inject_accept_language(headers: &HeaderMap, params: &mut Vec<Value>) {
+    let lang = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        // Take just the primary tag (strip q-values, secondary tags).
+        .map(|s| s.split([',', ';']).next().unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty() && s != "*");
+    let already = params
+        .iter()
+        .any(|p| p.get("name").and_then(|v| v.as_str()) == Some("displayLanguage"));
+    if let Some(l) = lang {
+        if !already {
+            params.push(json!({"name": "displayLanguage", "valueCode": l}));
+        }
+    }
 }
 
 /// Inject (or replace) the `url` parameter in a params list.
@@ -706,8 +731,10 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
     let raw_params = body
         .and_then(|Json(v)| extract_parameter_array(&v).ok())
         .unwrap_or_default();
+    let mut params = inject_url(raw_params, url);
+    inject_accept_language(&headers, &mut params);
     Ok(expand_bytes_respond(
-        process_expand(&state, inject_url(raw_params, url)).await?,
+        process_expand(&state, params).await?,
         format,
     ))
 }
@@ -734,8 +761,10 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
 
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
+    let mut params = inject_url(params, url);
+    inject_accept_language(&headers, &mut params);
     Ok(expand_bytes_respond(
-        process_expand(&state, inject_url(params, url)).await?,
+        process_expand(&state, params).await?,
         format,
     ))
 }
