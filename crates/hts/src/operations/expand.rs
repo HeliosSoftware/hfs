@@ -326,7 +326,16 @@ async fn process_expand<B: TerminologyBackend>(
         .iter()
         .filter(|p| {
             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            // Discriminator inputs (identify the ValueSet) — not knobs to echo.
             if matches!(name, "url" | "valueSet" | "filter") {
+                return false;
+            }
+            // Configuration inputs that the IG validator passes via the
+            // `profile` parameter set — they steer test execution rather than
+            // request semantics, and the validator does NOT expect them back
+            // in expansion.parameter[]. Echoing produces "Unexpected Node
+            // found in array" diffs against every fixture.
+            if matches!(name, "uuid" | "binding-style") {
                 return false;
             }
             // Must carry a primitive value[x] to be valid in expansion.parameter.
