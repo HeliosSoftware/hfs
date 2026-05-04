@@ -291,7 +291,12 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             let flags = out.entry(code).or_default();
             match property.as_str() {
                 "notSelectable" if value == "true" => flags.is_abstract = true,
-                "status" if matches!(value.as_str(), "retired" | "deprecated" | "withdrawn") => {
+                "status"
+                    if matches!(
+                        value.as_str(),
+                        "retired" | "deprecated" | "withdrawn" | "inactive"
+                    ) =>
+                {
                     flags.inactive = true;
                 }
                 _ => {}

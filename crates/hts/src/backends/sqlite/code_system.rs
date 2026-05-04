@@ -401,7 +401,10 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 match property.as_str() {
                     "notSelectable" if value == "true" => flags.is_abstract = true,
                     "status"
-                        if matches!(value.as_str(), "retired" | "deprecated" | "withdrawn") =>
+                        if matches!(
+                            value.as_str(),
+                            "retired" | "deprecated" | "withdrawn" | "inactive"
+                        ) =>
                     {
                         flags.inactive = true;
                     }
