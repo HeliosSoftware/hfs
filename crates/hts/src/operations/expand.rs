@@ -130,6 +130,26 @@ async fn process_expand<B: TerminologyBackend>(
     // Build a stable key from the request parameters. For inline ValueSets
     // (ad-hoc POST) we serialise the body to compact JSON; k6 sends identical
     // bytes each iteration so the string is a reliable cache discriminator.
+    // Build a canonical (name-sorted) form of the input parameters minus the
+    // ones already captured in `url_or_body`. This makes cache entries unique
+    // per combination of "extra" inputs that the response will echo back in
+    // `expansion.parameter`.
+    let extra_params = {
+        let mut sorted: Vec<&Value> = params
+            .iter()
+            .filter(|p| {
+                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                !matches!(name, "url" | "valueSet")
+            })
+            .collect();
+        sorted.sort_by(|a, b| {
+            let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            an.cmp(bn)
+        });
+        serde_json::to_string(&sorted).unwrap_or_default()
+    };
+
     let cache_key = ExpandCacheKey {
         url_or_body: url.clone().unwrap_or_else(|| {
             value_set
@@ -141,6 +161,7 @@ async fn process_expand<B: TerminologyBackend>(
         count: count.unwrap_or(u32::MAX),
         offset: offset.unwrap_or(0),
         hierarchical: hierarchical.unwrap_or(false),
+        extra_params,
     };
 
     if let Ok(cache) = state.expand_cache.read() {
@@ -219,13 +240,32 @@ async fn process_expand<B: TerminologyBackend>(
     if let Some(off) = resp.offset {
         expansion["offset"] = json!(off);
     }
-    if !resp.warnings.is_empty() {
-        let params: Vec<Value> = resp
-            .warnings
-            .iter()
-            .map(|w| json!({ "name": "warning", "valueString": w }))
-            .collect();
-        expansion["parameter"] = json!(params);
+
+    // ── expansion.parameter ──────────────────────────────────────────────────
+    // Echo back the input parameters that influenced the result (e.g.
+    // `excludeNested`, `displayLanguage`, `includeDesignations`, `count`,
+    // `offset`, `activeOnly`). The validator's tests check that we report
+    // every honored input here.
+    //
+    // Skip the `url` / `valueSet` discriminators (they identify the
+    // ValueSet, not a knob), and skip `filter` (already reflected in the
+    // contains[] result).
+    let mut emitted_params: Vec<Value> = params
+        .iter()
+        .filter(|p| {
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            !matches!(name, "url" | "valueSet" | "filter")
+        })
+        .cloned()
+        .collect();
+
+    // Append any expansion warnings as parameter entries with name=warning.
+    for w in &resp.warnings {
+        emitted_params.push(json!({ "name": "warning", "valueString": w }));
+    }
+
+    if !emitted_params.is_empty() {
+        expansion["parameter"] = json!(emitted_params);
     }
 
     let response = json!({

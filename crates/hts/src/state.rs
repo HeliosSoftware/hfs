@@ -44,6 +44,13 @@ pub struct ExpandCacheKey {
     pub offset: u32,
     /// Whether a hierarchical (tree) expansion was requested.
     pub hierarchical: bool,
+    /// Serialised, name-sorted form of the input parameters (excluding the
+    /// `url` / `valueSet` discriminators already captured in `url_or_body`).
+    /// Two requests with the same target ValueSet but different "extra" inputs
+    /// (e.g. `excludeNested`, `displayLanguage`, `includeDesignations`) must
+    /// yield distinct cache entries because the response echoes those inputs
+    /// in `expansion.parameter`.
+    pub extra_params: String,
 }
 
 /// Thread-safe in-process cache for `$expand` responses.
