@@ -107,6 +107,14 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
             value: Some(HTS_VERSION.to_string()),
             ..Default::default()
         }),
+        name: Some(Element {
+            value: Some("HeliosTerminologyServer".to_string()),
+            ..Default::default()
+        }),
+        title: Some(Element {
+            value: Some(HTS_NAME.to_string()),
+            ..Default::default()
+        }),
         status: Element {
             value: Some("active".to_string()),
             ..Default::default()
@@ -340,6 +348,14 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                         {"name": "closure", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-closure"}
                     ]
                 }
+            ],
+            "operation": [
+                {"name": "lookup", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"},
+                {"name": "validate-code", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"},
+                {"name": "subsumes", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-subsumes"},
+                {"name": "expand", "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"},
+                {"name": "translate", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"},
+                {"name": "closure", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-closure"}
             ]
         }]
     })
