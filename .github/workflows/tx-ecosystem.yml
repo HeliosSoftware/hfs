@@ -340,7 +340,10 @@ jobs:
             TC=$(jq -r '(.test // []) | length' "$REPORT_JSON" 2>/dev/null)
             if [ -n "$TC" ] && [ "$TC" -gt 0 ] 2>/dev/null; then
               TOTAL="$TC"
-              JFAIL=$(jq -r '[.test[]? | select(.result != "pass")] | length' "$REPORT_JSON" 2>/dev/null)
+              # The actual per-test result lives at .test[].action[].operation.result,
+              # not on .test[] itself. A test is a failure when any of its actions
+              # has a non-"pass" operation result (fail / error / skip).
+              JFAIL=$(jq -r '[.test[]? | select(any(.action[]?; .operation.result != "pass"))] | length' "$REPORT_JSON" 2>/dev/null)
               # Prefer the report's own pass/fail count; fall back to the file count.
               if [ -n "$JFAIL" ] && [ "$JFAIL" -ge "$FAILED" ] 2>/dev/null; then
                 FAILED="$JFAIL"
