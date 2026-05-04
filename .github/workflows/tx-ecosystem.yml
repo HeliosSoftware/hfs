@@ -276,34 +276,128 @@ jobs:
           set +e
           LABEL="${{ matrix.label }}"
           LOG="/tmp/txtests-${LABEL}.log"
+          OUTPUT_DIR="tx-test-output"
+          REPORT_JSON="${OUTPUT_DIR}/report.json"
 
-          # The validator writes one JSON file per failing test to -output.
-          FAILED=$(find tx-test-output -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+          # The validator writes per-failing-test JSON diffs to OUTPUT_DIR/actual/.
+          # `$versions.json` is metadata (always written) — exclude it from the
+          # failure count.
+          if [ -d "${OUTPUT_DIR}/actual" ]; then
+            FAILED=$(find "${OUTPUT_DIR}/actual" -maxdepth 1 -type f -name '*.json' \
+                       -not -name '$versions.json' -size +0c 2>/dev/null | wc -l | tr -d ' ')
+          else
+            FAILED=0
+          fi
 
-          # Total tests: grep the validator's own summary line from its log
-          # (format varies across validator releases — we tolerate missing).
-          TOTAL_LINE=$(grep -E '(tests? (run|executed)|txtests?.+complete)' "$LOG" 2>/dev/null | tail -1 || true)
-          TOTAL=$(printf '%s' "$TOTAL_LINE" | grep -oE '[0-9]+' | head -1)
-          if [ -z "$TOTAL" ]; then TOTAL="unknown"; fi
-
+          # Pull totals from the validator's own TestReport when available;
+          # fall back to log parsing for older validator releases.
+          TOTAL="unknown"
           PASSED="unknown"
           PASS_RATE="unknown"
+          SERVER_VERSION="unknown"
+          if [ -s "$REPORT_JSON" ] && command -v jq >/dev/null 2>&1; then
+            SV=$(jq -r '(.participant[]? | select(.type=="server") | .display) // empty' "$REPORT_JSON" 2>/dev/null | head -1)
+            [ -n "$SV" ] && SERVER_VERSION="$SV"
+            TC=$(jq -r '(.test // []) | length' "$REPORT_JSON" 2>/dev/null)
+            if [ -n "$TC" ] && [ "$TC" -gt 0 ] 2>/dev/null; then
+              TOTAL="$TC"
+              JFAIL=$(jq -r '[.test[]? | select(.result != "pass")] | length' "$REPORT_JSON" 2>/dev/null)
+              # Prefer the report's own pass/fail count; fall back to the file count.
+              if [ -n "$JFAIL" ] && [ "$JFAIL" -ge "$FAILED" ] 2>/dev/null; then
+                FAILED="$JFAIL"
+              fi
+            fi
+          fi
+          if [ "$TOTAL" = "unknown" ]; then
+            TOTAL_LINE=$(grep -E '(tests? (run|executed)|txtests?.+complete)' "$LOG" 2>/dev/null | tail -1 || true)
+            TOTAL_GUESS=$(printf '%s' "$TOTAL_LINE" | grep -oE '[0-9]+' | head -1)
+            [ -n "$TOTAL_GUESS" ] && TOTAL="$TOTAL_GUESS"
+          fi
           if [ "$TOTAL" != "unknown" ] && [ "$TOTAL" -gt 0 ] 2>/dev/null; then
             PASSED=$((TOTAL - FAILED))
             PASS_RATE=$(awk -v p="$PASSED" -v t="$TOTAL" 'BEGIN{ printf "%.1f%%", (p*100)/t }')
           fi
 
+          # Validator + Java versions for the metadata table.
+          VALIDATOR_VERSION=$(grep -m1 -oE 'FHIR Validation tool Version [^ ]+' "$LOG" 2>/dev/null \
+                              | sed 's/FHIR Validation tool Version //')
+          [ -z "$VALIDATOR_VERSION" ] && VALIDATOR_VERSION="unknown"
+          JAVA_VERSION=$(grep -m1 -E '^[[:space:]]+Java:' "$LOG" 2>/dev/null \
+                         | sed -E 's/^[[:space:]]+Java:[[:space:]]+([^[:space:]]+).*/\1/')
+          [ -z "$JAVA_VERSION" ] && JAVA_VERSION="unknown"
+
+          # Surface early validator failures (e.g. server returned unparseable
+          # CapabilityStatement) — otherwise users see "Total=unknown" with no
+          # explanation.
+          VALIDATOR_ERROR=""
+          if [ "$TOTAL" = "unknown" ] || [ "$TOTAL" = "0" ]; then
+            VALIDATOR_ERROR=$(grep -m1 -E '^Exception running' "$LOG" 2>/dev/null)
+            if [ -z "$VALIDATOR_ERROR" ]; then
+              VALIDATOR_ERROR=$(grep -m1 -E 'Terminology tests completed with failures' "$LOG" 2>/dev/null)
+            fi
+          fi
+
+          # Status badge
+          if [ "${TXTESTS_EXIT:-1}" = "0" ] && [ "$FAILED" = "0" ]; then
+            STATUS=":white_check_mark: passed"
+          elif [ "$TOTAL" = "unknown" ] || [ "$TOTAL" = "0" ]; then
+            STATUS=":x: validator did not run"
+          else
+            STATUS=":x: ${FAILED} failing"
+          fi
+
           {
-            echo "## Tx Ecosystem IG — FHIR ${LABEL}"
+            echo "## Tx Ecosystem IG — FHIR ${LABEL} — ${STATUS}"
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| Total tests | ${TOTAL} |"
-            echo "| Failed      | ${FAILED} |"
-            echo "| Passed      | ${PASSED} |"
-            echo "| Pass rate   | ${PASS_RATE} |"
-            echo "| Validator exit | ${TXTESTS_EXIT:-?} |"
+            echo "| **Branch**       | \`${{ github.ref_name }}\` |"
+            echo "| **Commit**       | \`$(echo '${{ github.sha }}' | cut -c1-7)\` |"
+            echo "| **Server**       | ${SERVER_VERSION} |"
+            echo "| **Validator**    | ${VALIDATOR_VERSION} |"
+            echo "| **Java**         | ${JAVA_VERSION} |"
+            echo "| **Test source**  | hl7.fhir.uv.tx-ecosystem#current |"
             echo ""
+            echo "### Results"
+            echo ""
+            echo "| Total | Passed | Failed | Pass rate | Validator exit |"
+            echo "|------:|-------:|-------:|----------:|---------------:|"
+            echo "| ${TOTAL} | ${PASSED} | ${FAILED} | ${PASS_RATE} | ${TXTESTS_EXIT:-?} |"
+            echo ""
+
+            if [ -n "$VALIDATOR_ERROR" ]; then
+              echo "### :warning: Validator did not run the tx-ecosystem suite"
+              echo ""
+              echo '```'
+              echo "$VALIDATOR_ERROR"
+              echo '```'
+              echo ""
+              echo "> See the \`txtests-log-${LABEL}\` artifact for the full validator output and stack trace."
+              echo ""
+            fi
+
+            if [ "$FAILED" -gt 0 ] 2>/dev/null && [ -d "${OUTPUT_DIR}/actual" ]; then
+              echo "### Failing tests"
+              echo ""
+              echo "| # | Test |"
+              echo "|--:|------|"
+              i=0
+              for f in "${OUTPUT_DIR}/actual"/*.json; do
+                [ -f "$f" ] || continue
+                NAME=$(basename "$f" .json)
+                [ "$NAME" = "\$versions" ] && continue
+                [ ! -s "$f" ] && continue
+                i=$((i + 1))
+                if [ "$i" -le 50 ]; then
+                  echo "| ${i} | \`${NAME}\` |"
+                fi
+              done
+              if [ "$i" -gt 50 ]; then
+                echo "| … | _and $((i - 50)) more (see \`tx-test-output-${LABEL}\` artifact)_ |"
+              fi
+              echo ""
+            fi
+
             echo "### Import status"
             echo ""
             echo "| Corpus | Exit code |"
@@ -315,7 +409,7 @@ jobs:
             echo "| NDC    | ${NDC_IMPORT_EXIT:-?} |"
             echo ""
             echo "> Import exit codes: 0 = success, 2 = success-with-warnings, 1 = fatal, skip = not attempted."
-            echo "> Failing-test JSON diffs are published as the \`tx-test-output-${LABEL}\` artifact."
+            echo "> Per-test JSON diffs and the full validator log are published as artifacts \`tx-test-output-${LABEL}\` and \`txtests-log-${LABEL}\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "=== Tx Ecosystem IG — FHIR ${LABEL} ==="
