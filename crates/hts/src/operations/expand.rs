@@ -363,24 +363,6 @@ async fn process_expand<B: TerminologyBackend>(
         populate_designations(state.backend(), &ctx, &mut resp.contains).await;
     }
 
-    // ── activeOnly filter ────────────────────────────────────────────────────
-    // The IG fixtures pass `activeOnly=true` to drop inactive concepts from
-    // the expansion. Backends don't honor it during expansion, so post-filter
-    // using the freshly-populated inactive flag and adjust `total` to match.
-    let active_only = params
-        .iter()
-        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
-        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
-    if active_only {
-        let before = resp.contains.len();
-        resp.contains.retain(|c| c.inactive != Some(true));
-        let removed = before - resp.contains.len();
-        if let Some(t) = resp.total.as_mut() {
-            *t = t.saturating_sub(removed as u32);
-        }
-    }
-
     // ── Look up source ValueSet (used for both parameter extension and metadata copy) ──
     let source_vs: Option<Value> = if let Some(ref u) = url_for_neg_cache {
         ValueSetOperations::search(
@@ -398,6 +380,32 @@ async fn process_expand<B: TerminologyBackend>(
     } else {
         value_set_for_response.clone()
     };
+
+    // ── activeOnly / compose.inactive=false filter ──────────────────────────
+    // The IG fixtures drop inactive concepts when EITHER:
+    //   - the request passes `activeOnly=true`, OR
+    //   - the source VS has `compose.inactive: false` (FHIR R5)
+    // Post-filter using the freshly-populated inactive flag and adjust
+    // `total` to match.
+    let active_only_request = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
+        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let compose_inactive_false = source_vs
+        .as_ref()
+        .and_then(|vs| vs.get("compose"))
+        .and_then(|c| c.get("inactive"))
+        .and_then(|i| i.as_bool())
+        == Some(false);
+    if active_only_request || compose_inactive_false {
+        let before = resp.contains.len();
+        resp.contains.retain(|c| c.inactive != Some(true));
+        let removed = before - resp.contains.len();
+        if let Some(t) = resp.total.as_mut() {
+            *t = t.saturating_sub(removed as u32);
+        }
+    }
 
     // ── Build FHIR ValueSet response with expansion ──────────────────────────
     let contains: Vec<Value> = resp
