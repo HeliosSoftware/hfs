@@ -283,6 +283,24 @@ async fn process_expand<B: TerminologyBackend>(
     // them here in a per-system batch so the per-concept SQL stays cold-path.
     populate_concept_flags(state.backend(), &ctx, &mut resp.contains).await;
 
+    // ── activeOnly filter ────────────────────────────────────────────────────
+    // The IG fixtures pass `activeOnly=true` to drop inactive concepts from
+    // the expansion. Backends don't honor it during expansion, so post-filter
+    // using the freshly-populated inactive flag and adjust `total` to match.
+    let active_only = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
+        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    if active_only {
+        let before = resp.contains.len();
+        resp.contains.retain(|c| c.inactive != Some(true));
+        let removed = before - resp.contains.len();
+        if let Some(t) = resp.total.as_mut() {
+            *t = t.saturating_sub(removed as u32);
+        }
+    }
+
     // ── Look up source ValueSet (used for both parameter extension and metadata copy) ──
     let source_vs: Option<Value> = if let Some(ref u) = url_for_neg_cache {
         ValueSetOperations::search(
