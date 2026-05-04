@@ -71,4 +71,30 @@ pub trait CodeSystemOperations: Send + Sync {
         ctx: &TenantContext,
         url: &str,
     ) -> Result<Option<String>, HtsError>;
+
+    /// Look up the `(is_abstract, inactive)` flags for a batch of concept codes
+    /// in the given CodeSystem URL.
+    ///
+    /// Used by `$expand` to populate `expansion.contains[].abstract` (driven
+    /// by the FHIR `notSelectable` concept-property) and
+    /// `expansion.contains[].inactive` (driven by the `status` property having
+    /// a non-active value: `retired`, `deprecated`, `withdrawn`).
+    ///
+    /// Returns a map from code → flags. Codes with neither flag set may be
+    /// omitted from the result.
+    async fn concept_expansion_flags(
+        &self,
+        ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, ConceptExpansionFlags>, HtsError>;
+}
+
+/// Per-concept flags surfaced in `expansion.contains[]`.
+///
+/// Both fields default to `false`; `Some(true)` means the flag should appear.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ConceptExpansionFlags {
+    pub is_abstract: bool,
+    pub inactive: bool,
 }

@@ -67,6 +67,16 @@ fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
     if let Some(display) = &c.display {
         item["display"] = json!(display);
     }
+    // FHIR expansion.contains.abstract / .inactive — only emit when true.
+    // Both flags signal that the concept exists in the system but should not
+    // be selected by users (abstract = grouper / placeholder; inactive = the
+    // concept's status is no longer current).
+    if c.is_abstract == Some(true) {
+        item["abstract"] = json!(true);
+    }
+    if c.inactive == Some(true) {
+        item["inactive"] = json!(true);
+    }
     if !c.contains.is_empty() {
         let nested: Vec<Value> = c
             .contains
@@ -76,6 +86,54 @@ fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
         item["contains"] = json!(nested);
     }
     item
+}
+
+/// Populate `is_abstract` / `inactive` on the given expansion entries in-place.
+///
+/// Groups entries by system URL, runs a single batched lookup against the
+/// backend per system, then walks both the entry list and any nested
+/// `contains[]` (hierarchical expansions) to set the flags.
+///
+/// Failures are silently ignored — the flags are best-effort and a backend
+/// error here should never fail the expansion itself.
+fn populate_concept_flags<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use std::collections::HashMap;
+        // Bucket codes per system so we issue one query per system.
+        let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.as_str())
+                .or_default()
+                .push(c.code.clone());
+        }
+        let mut flag_map: HashMap<(String, String), crate::traits::ConceptExpansionFlags> =
+            HashMap::new();
+        for (system, codes) in &by_system {
+            if let Ok(flags) = backend.concept_expansion_flags(ctx, system, codes).await {
+                for (code, f) in flags {
+                    flag_map.insert(((*system).to_string(), code), f);
+                }
+            }
+        }
+        for c in contains.iter_mut() {
+            if let Some(f) = flag_map.get(&(c.system.clone(), c.code.clone())) {
+                if f.is_abstract {
+                    c.is_abstract = Some(true);
+                }
+                if f.inactive {
+                    c.inactive = Some(true);
+                }
+            }
+            if !c.contains.is_empty() {
+                populate_concept_flags(backend, ctx, &mut c.contains).await;
+            }
+        }
+    })
 }
 
 /// Expand a ValueSet and return the result as pre-serialized JSON bytes.
@@ -200,7 +258,7 @@ async fn process_expand<B: TerminologyBackend>(
     };
 
     let ctx = TenantContext::system();
-    let resp = match ValueSetOperations::expand(state.backend(), &ctx, req).await {
+    let mut resp = match ValueSetOperations::expand(state.backend(), &ctx, req).await {
         Ok(r) => r,
         Err(HtsError::NotFound(msg)) => {
             // Populate the negative cache so future requests for this URL
@@ -216,6 +274,11 @@ async fn process_expand<B: TerminologyBackend>(
         }
         Err(e) => return Err(e),
     };
+
+    // ── Populate abstract / inactive flags ───────────────────────────────────
+    // Backends construct ExpansionContains with both flags as None; resolve
+    // them here in a per-system batch so the per-concept SQL stays cold-path.
+    populate_concept_flags(state.backend(), &ctx, &mut resp.contains).await;
 
     // ── Build FHIR ValueSet response with expansion ──────────────────────────
     let contains: Vec<Value> = resp

@@ -312,6 +312,8 @@ async fn fetch_cache(
             system: row.get(0),
             code: row.get(1),
             display: row.get(2),
+            is_abstract: None,
+
             inactive: None,
             contains: vec![],
         })
@@ -377,6 +379,8 @@ async fn compute_expansion(
                     system: system_url.to_owned(),
                     code,
                     display,
+                    is_abstract: None,
+
                     inactive: None,
                     contains: vec![],
                 });
@@ -395,6 +399,8 @@ async fn compute_expansion(
                     system: system_url.to_owned(),
                     code: row.get(0),
                     display: row.get(1),
+                    is_abstract: None,
+
                     inactive: None,
                     contains: vec![],
                 });

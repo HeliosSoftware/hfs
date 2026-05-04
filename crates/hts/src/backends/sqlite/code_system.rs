@@ -14,7 +14,7 @@ use helios_persistence::tenant::TenantContext;
 use rusqlite::OptionalExtension;
 
 use crate::error::HtsError;
-use crate::traits::CodeSystemOperations;
+use crate::traits::{CodeSystemOperations, ConceptExpansionFlags};
 use crate::types::{
     DesignationValue, LookupRequest, LookupResponse, PropertyValue, ResourceSearchQuery,
     SubsumesRequest, SubsumesResponse, SubsumptionOutcome, ValidateCodeRequest,
@@ -264,6 +264,81 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(e.to_string()))?
                 .flatten();
             Ok(version)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn concept_expansion_flags(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, ConceptExpansionFlags>, HtsError> {
+        if codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let pool = self.pool().clone();
+        let system_url = system_url.to_string();
+        let codes = codes.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+            // Build a parameterised IN-list: (?2, ?3, ...). The first param is
+            // the system URL.
+            let placeholders = (2..=codes.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT c.code, cp.property, cp.value
+                 FROM concept_properties cp
+                 JOIN concepts c ON c.id = cp.concept_id
+                 JOIN code_systems s ON s.id = c.system_id
+                 WHERE s.url = ?1
+                   AND c.code IN ({placeholders})
+                   AND cp.property IN ('notSelectable', 'status')",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(codes.len() + 1);
+            params.push(&system_url);
+            for c in &codes {
+                params.push(c as &dyn rusqlite::ToSql);
+            }
+
+            let mut out: std::collections::HashMap<String, ConceptExpansionFlags> =
+                std::collections::HashMap::new();
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            for r in rows {
+                let (code, property, value) =
+                    r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let flags = out.entry(code).or_default();
+                match property.as_str() {
+                    "notSelectable" if value == "true" => flags.is_abstract = true,
+                    "status"
+                        if matches!(value.as_str(), "retired" | "deprecated" | "withdrawn") =>
+                    {
+                        flags.inactive = true;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?

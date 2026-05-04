@@ -154,6 +154,10 @@ pub struct ExpansionContains {
     pub system: String,
     pub code: String,
     pub display: Option<String>,
+    /// FHIR `abstract` flag — mirrors the concept's `notSelectable` property.
+    /// Populated by the operations layer post-expansion via a batch lookup.
+    #[serde(default, rename = "abstract")]
+    pub is_abstract: Option<bool>,
     pub inactive: Option<bool>,
     /// Nested contains for hierarchical expansions.
     #[serde(default)]
@@ -401,6 +405,7 @@ mod tests {
             system: "http://example.org/cs".into(),
             code: "CHILD".into(),
             display: Some("Child Concept".into()),
+            is_abstract: None,
             inactive: None,
             contains: vec![],
         };
@@ -408,6 +413,7 @@ mod tests {
             system: "http://example.org/cs".into(),
             code: "PARENT".into(),
             display: Some("Parent Concept".into()),
+            is_abstract: None,
             inactive: None,
             contains: vec![child.clone()],
         };

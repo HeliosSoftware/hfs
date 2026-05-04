@@ -373,6 +373,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     system: r.get(0)?,
                                     code: r.get(1)?,
                                     display: r.get(2)?,
+                                    is_abstract: None,
+
                                     inactive: None,
                                     contains: vec![],
                                 })
@@ -1057,6 +1059,8 @@ fn fetch_cache(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionContains>,
             system: row.get(0)?,
             code: row.get(1)?,
             display: row.get(2)?,
+            is_abstract: None,
+
             inactive: None,
             contains: vec![],
         })
@@ -1161,6 +1165,8 @@ fn expand_inline_plain_fts(
                 system: system_url.to_owned(),
                 code,
                 display,
+                is_abstract: None,
+
                 inactive: None,
                 contains: vec![],
             });
@@ -1397,6 +1403,8 @@ fn expand_inline_filtered(
                         system: system_url.to_owned(),
                         code: code.to_owned(),
                         display,
+                        is_abstract: None,
+
                         inactive: None,
                         contains: vec![],
                     });
@@ -1432,6 +1440,8 @@ fn expand_inline_filtered(
                                 system: system_url.to_owned(),
                                 code: row.get(0)?,
                                 display: row.get(1)?,
+                                is_abstract: None,
+
                                 inactive: None,
                                 contains: vec![],
                             })
@@ -1460,6 +1470,8 @@ fn expand_inline_filtered(
                                 system: system_url.to_owned(),
                                 code: row.get(0)?,
                                 display: row.get(1)?,
+                                is_abstract: None,
+
                                 inactive: None,
                                 contains: vec![],
                             })
@@ -1648,6 +1660,8 @@ fn compute_expansion_depth(
                         system: system_url.to_owned(),
                         code,
                         display,
+                        is_abstract: None,
+
                         inactive: None,
                         contains: vec![],
                     });
@@ -1667,6 +1681,8 @@ fn compute_expansion_depth(
                             system: system_url.to_owned(),
                             code: row.get(0)?,
                             display: row.get(1)?,
+                            is_abstract: None,
+
                             inactive: None,
                             contains: vec![],
                         })
@@ -1908,6 +1924,8 @@ fn apply_compose_filters(
                 system: system_url.to_owned(),
                 code: c.code,
                 display: c.display,
+                is_abstract: None,
+
                 inactive: None,
                 contains: vec![],
             })
@@ -2084,6 +2102,8 @@ fn try_multi_include_property_only(
                 system: first_system.to_owned(),
                 code: row.get(0)?,
                 display: row.get(1)?,
+                is_abstract: None,
+
                 inactive: None,
                 contains: vec![],
             })
@@ -2133,6 +2153,8 @@ fn query_subtree_with_property(
         system: system_url.to_owned(),
         code,
         display,
+        is_abstract: None,
+
         inactive: None,
         contains: vec![],
     };
@@ -2224,6 +2246,8 @@ fn query_property_eq(
             system: system_url.to_owned(),
             code,
             display,
+            is_abstract: None,
+
             inactive: None,
             contains: vec![],
         })
@@ -2345,6 +2369,8 @@ fn query_ancestors_full(
                 system: system_url.to_owned(),
                 code: r.get(0)?,
                 display: r.get(1)?,
+                is_abstract: None,
+
                 inactive: None,
                 contains: vec![],
             })
@@ -2380,6 +2406,8 @@ fn fts_candidates_for_system(
                 system: system_url.to_owned(),
                 code: row.get(0)?,
                 display: row.get(1)?,
+                is_abstract: None,
+
                 inactive: None,
                 contains: vec![],
             })
@@ -2808,6 +2836,8 @@ fn compose_page_fast(
             system: system_url.clone(),
             code: code.clone(),
             display,
+            is_abstract: None,
+
             inactive: None,
             contains: vec![],
         });
@@ -2926,6 +2956,8 @@ fn bfs_expand_page(
                                     system: cs_url.to_owned(),
                                     code: r.get(0)?,
                                     display: r.get(1)?,
+                                    is_abstract: None,
+
                                     inactive: None,
                                     contains: vec![],
                                 })
@@ -2953,6 +2985,8 @@ fn bfs_expand_page(
                             system: cs_url.to_owned(),
                             code: r.get(0)?,
                             display: r.get(1)?,
+                            is_abstract: None,
+
                             inactive: None,
                             contains: vec![],
                         })
@@ -2973,6 +3007,8 @@ fn bfs_expand_page(
                         system: cs_url.to_owned(),
                         code: r.get(0)?,
                         display: r.get(1)?,
+                        is_abstract: None,
+
                         inactive: None,
                         contains: vec![],
                     })
@@ -3027,6 +3063,8 @@ fn bfs_isa_page(
             system: cs_url.to_owned(),
             code: r.get(0)?,
             display: r.get(1)?,
+            is_abstract: None,
+
             inactive: None,
             contains: vec![],
         })
@@ -3440,6 +3478,8 @@ fn validate_fhir_vs(
                 system: cs_url.to_owned(),
                 code,
                 display,
+                is_abstract: None,
+
                 inactive: None,
                 contains: vec![],
             }))
@@ -3475,6 +3515,8 @@ fn validate_fhir_vs(
                 system: cs_url.to_owned(),
                 code: code.to_owned(),
                 display,
+                is_abstract: None,
+
                 inactive: None,
                 contains: vec![],
             }))
@@ -3603,6 +3645,8 @@ fn lookup_in_implicit_cache(
                     system: r.get(0)?,
                     code: r.get(1)?,
                     display: r.get(2)?,
+                    is_abstract: None,
+
                     inactive: None,
                     contains: vec![],
                 })
@@ -3620,6 +3664,8 @@ fn lookup_in_implicit_cache(
                     system: r.get(0)?,
                     code: r.get(1)?,
                     display: r.get(2)?,
+                    is_abstract: None,
+
                     inactive: None,
                     contains: vec![],
                 })
@@ -3854,6 +3900,8 @@ fn page_in_memory(
         system: e.system_url.clone(),
         code: e.code.clone(),
         display: e.display.clone(),
+        is_abstract: None,
+
         inactive: None,
         contains: vec![],
     };
@@ -4167,6 +4215,8 @@ fn implicit_cache_page(
                         system: r.get(0)?,
                         code: r.get(1)?,
                         display: r.get(2)?,
+                        is_abstract: None,
+
                         inactive: None,
                         contains: vec![],
                     })
@@ -4196,6 +4246,8 @@ fn implicit_cache_page(
                         system: r.get(0)?,
                         code: r.get(1)?,
                         display: r.get(2)?,
+                        is_abstract: None,
+
                         inactive: None,
                         contains: vec![],
                     })
@@ -4221,6 +4273,8 @@ fn implicit_cache_page(
                     system: r.get(0)?,
                     code: r.get(1)?,
                     display: r.get(2)?,
+                    is_abstract: None,
+
                     inactive: None,
                     contains: vec![],
                 })
