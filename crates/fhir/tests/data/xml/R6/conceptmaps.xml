@@ -3,9 +3,468 @@
 <Bundle xmlns="http://hl7.org/fhir">
   <id value="conceptmaps"/>
   <meta>
-    <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
   </meta>
   <type value="collection"/>
+  <entry>
+    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-administrative-gender-v2"/>
+    <resource>
+      <ConceptMap>
+        <id value="cm-administrative-gender-v2"/>
+        <text>
+          <status value="generated"/>
+          <div xmlns="http://www.w3.org/1999/xhtml">
+            <p class="res-header-id">
+              <b>Generated Narrative: ConceptMap cm-administrative-gender-v2</b>
+            </p>
+            <a name="cm-administrative-gender-v2"> </a>
+            <a name="hccm-administrative-gender-v2"> </a>
+            <p>Mapping from 
+              <a href="valueset-administrative-gender.html">AdministrativeGender</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0001.html">hl7VS-administrativeSex</a>
+            </p>
+            <br/>
+            <p>
+              <b>Group 1 </b>Mapping from 
+              <a href="codesystem-administrative-gender.html">AdministrativeGender</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0001.html">administrativeSex</a>
+            </p>
+
+            <table class="grid">
+              <tr>
+                <td colspan="2">
+                  <b>Source Concept Details</b>
+                </td>
+                <td>
+                  <b>Relationship</b>
+                </td>
+                <td colspan="2">
+                  <b>Target Concept Details</b>
+                </td>
+                <td>
+                  <b>Comment</b>
+                </td>
+              </tr>
+
+              <tr>
+                <td colspan="2">
+                  <b>Codes</b> from 
+                  <a href="codesystem-administrative-gender.html" title="http://hl7.org/fhir/administrative-gender">AdministrativeGender</a>
+                </td>
+
+                <td/>
+
+                <td colspan="2">
+                  <b>Codes</b> from 
+                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0001.html" title="http://terminology.hl7.org/CodeSystem/v2-0001">administrativeSex</a>
+                </td>
+
+                <td/>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px">male</td>
+
+                <td style="border-left-width: 0px">Male</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td style="border-right-width: 0px">M</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td/>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px">female</td>
+
+                <td style="border-left-width: 0px">Female</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td style="border-right-width: 0px">F</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td/>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px; border-bottom-style: none">other</td>
+
+                <td style="border-left-width: 0px; border-bottom-style: none">Other</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
+                </td>
+
+                <td style="border-right-width: 0px">A</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td>Source concept 'other' is broader than target concept 'Ambiguous' because target concept does not include 'Other'</td>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px; border-top-style: none"/>
+
+                <td style="border-top-style: none; border-left-width: 0px"/>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
+                </td>
+
+                <td style="border-right-width: 0px">O</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td>Source concept 'other' is broader than target concept 'Other' because target concept does not include 'Ambiguous'</td>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px">unknown</td>
+
+                <td style="border-left-width: 0px">Unknown</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td style="border-right-width: 0px">U</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td/>
+              </tr>
+            </table>
+          </div>
+        </text>
+        <url value="http://hl7.org/fhir/ConceptMap/cm-administrative-gender-v2"/>
+        <version value="6.0.0-ballot3"/>
+        <name value="v2.AdministrativeGender"/>
+        <title value="v2 map for AdministrativeGender"/>
+        <status value="draft"/>
+        <experimental value="false"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
+        <publisher value="HL7 (FHIR Project)"/>
+        <contact>
+          <telecom>
+            <system value="url"/>
+            <value value="http://www.hl7.org/Special/committees/pafm"/>
+          </telecom>
+        </contact>
+        <jurisdiction>
+          <coding>
+            <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
+            <code value="001"/>
+            <display value="World"/>
+          </coding>
+        </jurisdiction>
+        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/administrative-gender"/>
+        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v2-0001"/>
+        <group>
+          <source value="http://hl7.org/fhir/administrative-gender"/>
+          <target value="http://terminology.hl7.org/CodeSystem/v2-0001"/>
+          <element>
+            <code value="male"/>
+            <target>
+              <code value="M"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="female"/>
+            <target>
+              <code value="F"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="other"/>
+            <target>
+              <code value="A"/>
+              <relationship value="source-is-broader-than-target"/>
+              <comment value="Source concept 'other' is broader than target concept 'Ambiguous' because target concept does not include 'Other'"/>
+            </target>
+            <target>
+              <code value="O"/>
+              <relationship value="source-is-broader-than-target"/>
+              <comment value="Source concept 'other' is broader than target concept 'Other' because target concept does not include 'Ambiguous'"/>
+            </target>
+          </element>
+          <element>
+            <code value="unknown"/>
+            <target>
+              <code value="U"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+        </group>
+      </ConceptMap>
+    </resource>
+  </entry>
+  <entry>
+    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-administrative-gender-v3"/>
+    <resource>
+      <ConceptMap>
+        <id value="cm-administrative-gender-v3"/>
+        <text>
+          <status value="generated"/>
+          <div xmlns="http://www.w3.org/1999/xhtml">
+            <p class="res-header-id">
+              <b>Generated Narrative: ConceptMap cm-administrative-gender-v3</b>
+            </p>
+            <a name="cm-administrative-gender-v3"> </a>
+            <a name="hccm-administrative-gender-v3"> </a>
+            <p>Mapping from 
+              <a href="valueset-administrative-gender.html">AdministrativeGender</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AdministrativeGender.html">AdministrativeGender</a>
+            </p>
+            <br/>
+            <p>
+              <b>Group 1 </b>Mapping from 
+              <a href="codesystem-administrative-gender.html">AdministrativeGender</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AdministrativeGender.html">AdministrativeGender</a>
+            </p>
+
+            <table class="grid">
+              <tr>
+                <td>
+                  <b>Source Code</b>
+                </td>
+                <td>
+                  <b>Relationship</b>
+                </td>
+                <td>
+                  <b>Target Code</b>
+                </td>
+              </tr>
+
+              <tr>
+                <td>male</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td>M (Male)</td>
+              </tr>
+
+              <tr>
+                <td>female</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td>F (Female)</td>
+              </tr>
+
+              <tr>
+                <td>other</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#source-is-narrower-than-target" title="source-is-narrower-than-target">is narrower than</a>
+                </td>
+
+                <td>UN (Undifferentiated)</td>
+              </tr>
+
+              <tr>
+                <td>unknown</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td>UNK</td>
+              </tr>
+            </table>
+          </div>
+        </text>
+        <url value="http://hl7.org/fhir/ConceptMap/cm-administrative-gender-v3"/>
+        <version value="6.0.0-ballot3"/>
+        <name value="v3.AdministrativeGender"/>
+        <title value="v3 map for AdministrativeGender"/>
+        <status value="draft"/>
+        <experimental value="false"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
+        <publisher value="HL7 (FHIR Project)"/>
+        <contact>
+          <telecom>
+            <system value="url"/>
+            <value value="http://www.hl7.org/Special/committees/pafm"/>
+          </telecom>
+        </contact>
+        <jurisdiction>
+          <coding>
+            <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
+            <code value="001"/>
+            <display value="World"/>
+          </coding>
+        </jurisdiction>
+        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/administrative-gender"/>
+        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v3-AdministrativeGender"/>
+        <group>
+          <source value="http://hl7.org/fhir/administrative-gender"/>
+          <target value="http://terminology.hl7.org/CodeSystem/v3-AdministrativeGender"/>
+          <element>
+            <code value="male"/>
+            <target>
+              <code value="M"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="female"/>
+            <target>
+              <code value="F"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="other"/>
+            <target>
+              <code value="UN"/>
+              <relationship value="source-is-narrower-than-target"/>
+            </target>
+          </element>
+          <element>
+            <code value="unknown"/>
+            <target>
+              <code value="UNK"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+        </group>
+      </ConceptMap>
+    </resource>
+  </entry>
+  <entry>
+    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-document-reference-status-v3"/>
+    <resource>
+      <ConceptMap>
+        <id value="cm-document-reference-status-v3"/>
+        <text>
+          <status value="generated"/>
+          <div xmlns="http://www.w3.org/1999/xhtml">
+            <p class="res-header-id">
+              <b>Generated Narrative: ConceptMap cm-document-reference-status-v3</b>
+            </p>
+            <a name="cm-document-reference-status-v3"> </a>
+            <a name="hccm-document-reference-status-v3"> </a>
+            <p>Mapping from 
+              <a href="valueset-document-reference-status.html">DocumentReferenceStatus</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-ActStatus.html">ActStatus</a>
+            </p>
+            <br/>
+            <p>
+              <b>Group 1 </b>Mapping from 
+              <a href="codesystem-document-reference-status.html">DocumentReferenceStatus</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ActStatus.html">ActStatus</a>
+            </p>
+
+            <table class="grid">
+              <tr>
+                <td>
+                  <b>Source Code</b>
+                </td>
+                <td>
+                  <b>Relationship</b>
+                </td>
+                <td>
+                  <b>Target Code</b>
+                </td>
+              </tr>
+
+              <tr>
+                <td>current</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td>active</td>
+              </tr>
+
+              <tr>
+                <td>superseded</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td>obsolete</td>
+              </tr>
+
+              <tr>
+                <td>entered-in-error</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td>nullified</td>
+              </tr>
+            </table>
+          </div>
+        </text>
+        <url value="http://hl7.org/fhir/ConceptMap/cm-document-reference-status-v3"/>
+        <version value="6.0.0-ballot3"/>
+        <name value="v3.DocumentReferenceStatus"/>
+        <title value="v3 map for DocumentReferenceStatus"/>
+        <status value="draft"/>
+        <experimental value="false"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
+        <publisher value="HL7 (FHIR Project)"/>
+        <contact>
+          <telecom>
+            <system value="url"/>
+            <value value="http://www.hl7.org/Special/committees/orders"/>
+          </telecom>
+        </contact>
+        <jurisdiction>
+          <coding>
+            <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
+            <code value="001"/>
+            <display value="World"/>
+          </coding>
+        </jurisdiction>
+        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/document-reference-status"/>
+        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v3-ActStatus"/>
+        <group>
+          <source value="http://hl7.org/fhir/document-reference-status"/>
+          <target value="http://terminology.hl7.org/CodeSystem/v3-ActStatus"/>
+          <element>
+            <code value="current"/>
+            <target>
+              <code value="active"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="superseded"/>
+            <target>
+              <code value="obsolete"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="entered-in-error"/>
+            <target>
+              <code value="nullified"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+        </group>
+      </ConceptMap>
+    </resource>
+  </entry>
   <entry>
     <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-name-use-v2"/>
     <resource>
@@ -21,13 +480,13 @@
             <a name="hccm-name-use-v2"> </a>
             <p>Mapping from 
               <a href="valueset-name-use.html">NameUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v2-0200.html">hl7VS-nameType</a>
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0200.html">hl7VS-nameType</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-name-use.html">NameUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0200.html">nameType2</a>
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0200.html">nameType2</a>
             </p>
 
             <table class="grid">
@@ -56,7 +515,7 @@
 
                 <td colspan="2">
                   <b>Codes</b> from 
-                  <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0200.html" title="http://terminology.hl7.org/CodeSystem/v2-0200">nameType2</a>
+                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0200.html" title="http://terminology.hl7.org/CodeSystem/v2-0200">nameType2</a>
                 </td>
 
                 <td/>
@@ -193,12 +652,12 @@
           </div>
         </text>
         <url value="http://hl7.org/fhir/ConceptMap/cm-name-use-v2"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="v2.NameUse"/>
         <title value="v2 map for NameUse"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -288,514 +747,6 @@
     </resource>
   </entry>
   <entry>
-    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-address-use-v2"/>
-    <resource>
-      <ConceptMap>
-        <id value="cm-address-use-v2"/>
-        <text>
-          <status value="generated"/>
-          <div xmlns="http://www.w3.org/1999/xhtml">
-            <p class="res-header-id">
-              <b>Generated Narrative: ConceptMap cm-address-use-v2</b>
-            </p>
-            <a name="cm-address-use-v2"> </a>
-            <a name="hccm-address-use-v2"> </a>
-            <p>Mapping from 
-              <a href="valueset-address-use.html">AddressUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v2-0190.html">hl7VS-addressType</a>
-            </p>
-            <br/>
-            <p>
-              <b>Group 1 </b>Mapping from 
-              <a href="codesystem-address-use.html">AddressUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0190.html">addressType</a>
-            </p>
-
-            <table class="grid">
-              <tr>
-                <td>
-                  <b>Source Code</b>
-                </td>
-                <td>
-                  <b>Relationship</b>
-                </td>
-                <td>
-                  <b>Target Code</b>
-                </td>
-                <td>
-                  <b>Comment</b>
-                </td>
-              </tr>
-
-              <tr>
-                <td>home</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td>H (Home)</td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td>work</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td>O (Office/Business)</td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td>temp (Temporary)</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td>C (Current Or Temporary)</td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td>old (Old / Incorrect)</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
-                </td>
-
-                <td>BA (Bad address)</td>
-
-                <td>unclear about old addresses</td>
-              </tr>
-
-              <tr>
-                <td>billing</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td>BI (Billing Address)</td>
-
-                <td/>
-              </tr>
-            </table>
-          </div>
-        </text>
-        <url value="http://hl7.org/fhir/ConceptMap/cm-address-use-v2"/>
-        <version value="6.0.0-ballot4"/>
-        <name value="v2.AddressUse"/>
-        <title value="v2 map for AddressUse"/>
-        <status value="draft"/>
-        <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
-        <publisher value="HL7 (FHIR Project)"/>
-        <contact>
-          <telecom>
-            <system value="url"/>
-            <value value="http://hl7.org/fhir"/>
-          </telecom>
-          <telecom>
-            <system value="email"/>
-            <value value="fhir@lists.hl7.org"/>
-          </telecom>
-        </contact>
-        <contact>
-          <telecom>
-            <system value="url"/>
-            <value value="http://www.hl7.org/Special/committees/fiwg"/>
-          </telecom>
-        </contact>
-        <jurisdiction>
-          <coding>
-            <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
-            <code value="001"/>
-            <display value="World"/>
-          </coding>
-        </jurisdiction>
-        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/address-use"/>
-        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v2-0190"/>
-        <group>
-          <source value="http://hl7.org/fhir/address-use"/>
-          <target value="http://terminology.hl7.org/CodeSystem/v2-0190"/>
-          <element>
-            <code value="home"/>
-            <target>
-              <code value="H"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="work"/>
-            <target>
-              <code value="O"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="temp"/>
-            <target>
-              <code value="C"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="old"/>
-            <target>
-              <code value="BA"/>
-              <relationship value="source-is-broader-than-target"/>
-              <comment value="unclear about old addresses"/>
-            </target>
-          </element>
-          <element>
-            <code value="billing"/>
-            <target>
-              <code value="BI"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-        </group>
-      </ConceptMap>
-    </resource>
-  </entry>
-  <entry>
-    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-document-reference-status-v3"/>
-    <resource>
-      <ConceptMap>
-        <id value="cm-document-reference-status-v3"/>
-        <text>
-          <status value="generated"/>
-          <div xmlns="http://www.w3.org/1999/xhtml">
-            <p class="res-header-id">
-              <b>Generated Narrative: ConceptMap cm-document-reference-status-v3</b>
-            </p>
-            <a name="cm-document-reference-status-v3"> </a>
-            <a name="hccm-document-reference-status-v3"> </a>
-            <p>Mapping from 
-              <a href="valueset-document-reference-status.html">DocumentReferenceStatus</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-ActStatus.html">ActStatus</a>
-            </p>
-            <br/>
-            <p>
-              <b>Group 1 </b>Mapping from 
-              <a href="codesystem-document-reference-status.html">DocumentReferenceStatus</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-ActStatus.html">ActStatus</a>
-            </p>
-
-            <table class="grid">
-              <tr>
-                <td>
-                  <b>Source Code</b>
-                </td>
-                <td>
-                  <b>Relationship</b>
-                </td>
-                <td>
-                  <b>Target Code</b>
-                </td>
-              </tr>
-
-              <tr>
-                <td>current</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td>active</td>
-              </tr>
-
-              <tr>
-                <td>superseded</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td>obsolete</td>
-              </tr>
-
-              <tr>
-                <td>entered-in-error</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td>nullified</td>
-              </tr>
-            </table>
-          </div>
-        </text>
-        <url value="http://hl7.org/fhir/ConceptMap/cm-document-reference-status-v3"/>
-        <version value="6.0.0-ballot4"/>
-        <name value="v3.DocumentReferenceStatus"/>
-        <title value="v3 map for DocumentReferenceStatus"/>
-        <status value="draft"/>
-        <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
-        <publisher value="HL7 (FHIR Project)"/>
-        <contact>
-          <telecom>
-            <system value="url"/>
-            <value value="http://www.hl7.org/Special/committees/orders"/>
-          </telecom>
-        </contact>
-        <jurisdiction>
-          <coding>
-            <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
-            <code value="001"/>
-            <display value="World"/>
-          </coding>
-        </jurisdiction>
-        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/document-reference-status"/>
-        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v3-ActStatus"/>
-        <group>
-          <source value="http://hl7.org/fhir/document-reference-status"/>
-          <target value="http://terminology.hl7.org/CodeSystem/v3-ActStatus"/>
-          <element>
-            <code value="current"/>
-            <target>
-              <code value="active"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="superseded"/>
-            <target>
-              <code value="obsolete"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="entered-in-error"/>
-            <target>
-              <code value="nullified"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-        </group>
-      </ConceptMap>
-    </resource>
-  </entry>
-  <entry>
-    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-contact-point-use-v2"/>
-    <resource>
-      <ConceptMap>
-        <id value="cm-contact-point-use-v2"/>
-        <text>
-          <status value="generated"/>
-          <div xmlns="http://www.w3.org/1999/xhtml">
-            <p class="res-header-id">
-              <b>Generated Narrative: ConceptMap cm-contact-point-use-v2</b>
-            </p>
-            <a name="cm-contact-point-use-v2"> </a>
-            <a name="hccm-contact-point-use-v2"> </a>
-            <p>Mapping from 
-              <a href="valueset-contact-point-use.html">ContactPointUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v2-0201.html">hl7VS-telecommunicationUseCode</a>
-            </p>
-            <br/>
-            <p>
-              <b>Group 1 </b>Mapping from 
-              <a href="codesystem-contact-point-use.html">ContactPointUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0201.html">telecommunicationUse</a>
-            </p>
-
-            <table class="grid">
-              <tr>
-                <td colspan="2">
-                  <b>Source Concept Details</b>
-                </td>
-                <td>
-                  <b>Relationship</b>
-                </td>
-                <td colspan="2">
-                  <b>Target Concept Details</b>
-                </td>
-                <td>
-                  <b>Comment</b>
-                </td>
-              </tr>
-
-              <tr>
-                <td colspan="2">
-                  <b>Codes</b> from 
-                  <a href="codesystem-contact-point-use.html" title="http://hl7.org/fhir/contact-point-use">ContactPointUse</a>
-                </td>
-
-                <td/>
-
-                <td colspan="2">
-                  <b>Codes</b> from 
-                  <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0201.html" title="http://terminology.hl7.org/CodeSystem/v2-0201">telecommunicationUse</a>
-                </td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px; border-bottom-style: none">home</td>
-
-                <td style="border-left-width: 0px; border-bottom-style: none">Home</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
-                </td>
-
-                <td style="border-right-width: 0px">PRN</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td>FHIR doesn't distinguish types of homes for contacts</td>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px; border-top-style: none; border-bottom-style: none"/>
-
-                <td style="border-left-width: 0px; border-top-style: none; border-bottom-style: none"/>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
-                </td>
-
-                <td style="border-right-width: 0px">ORN</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td>FHIR doesn't distinguish types of homes for contacts</td>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px; border-top-style: none"/>
-
-                <td style="border-top-style: none; border-left-width: 0px"/>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
-                </td>
-
-                <td style="border-right-width: 0px">VHN</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td>FHIR doesn't distinguish types of homes for contacts</td>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px">work</td>
-
-                <td style="border-left-width: 0px">Work</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td style="border-right-width: 0px">WPN</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px">mobile</td>
-
-                <td style="border-left-width: 0px">Mobile</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td style="border-right-width: 0px">PRS</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td/>
-              </tr>
-            </table>
-          </div>
-        </text>
-        <url value="http://hl7.org/fhir/ConceptMap/cm-contact-point-use-v2"/>
-        <version value="6.0.0-ballot4"/>
-        <name value="v2.ContactPointUse"/>
-        <title value="v2 map for ContactPointUse"/>
-        <status value="draft"/>
-        <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
-        <publisher value="HL7 (FHIR Project)"/>
-        <contact>
-          <telecom>
-            <system value="url"/>
-            <value value="http://hl7.org/fhir"/>
-          </telecom>
-          <telecom>
-            <system value="email"/>
-            <value value="fhir@lists.hl7.org"/>
-          </telecom>
-        </contact>
-        <contact>
-          <telecom>
-            <system value="url"/>
-            <value value="http://www.hl7.org/Special/committees/fiwg"/>
-          </telecom>
-        </contact>
-        <jurisdiction>
-          <coding>
-            <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
-            <code value="001"/>
-            <display value="World"/>
-          </coding>
-        </jurisdiction>
-        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/contact-point-use"/>
-        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v2-0201"/>
-        <group>
-          <source value="http://hl7.org/fhir/contact-point-use"/>
-          <target value="http://terminology.hl7.org/CodeSystem/v2-0201"/>
-          <element>
-            <code value="home"/>
-            <target>
-              <code value="PRN"/>
-              <relationship value="source-is-broader-than-target"/>
-              <comment value="FHIR doesn't distinguish types of homes for contacts"/>
-            </target>
-            <target>
-              <code value="ORN"/>
-              <relationship value="source-is-broader-than-target"/>
-              <comment value="FHIR doesn't distinguish types of homes for contacts"/>
-            </target>
-            <target>
-              <code value="VHN"/>
-              <relationship value="source-is-broader-than-target"/>
-              <comment value="FHIR doesn't distinguish types of homes for contacts"/>
-            </target>
-          </element>
-          <element>
-            <code value="work"/>
-            <target>
-              <code value="WPN"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="mobile"/>
-            <target>
-              <code value="PRS"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-        </group>
-      </ConceptMap>
-    </resource>
-  </entry>
-  <entry>
     <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-name-use-v3"/>
     <resource>
       <ConceptMap>
@@ -810,13 +761,13 @@
             <a name="hccm-name-use-v3"> </a>
             <p>Mapping from 
               <a href="valueset-name-use.html">NameUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-EntityNameUseR2.html">EntityNameUseR2</a>
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-EntityNameUseR2.html">EntityNameUseR2</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-name-use.html">NameUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-EntityNameUseR2.html">EntityNameUseR2</a>
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-EntityNameUseR2.html">EntityNameUseR2</a>
             </p>
 
             <table class="grid">
@@ -905,12 +856,12 @@
           </div>
         </text>
         <url value="http://hl7.org/fhir/ConceptMap/cm-name-use-v3"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="v3.NameUse"/>
         <title value="v3 map for NameUse"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -994,24 +945,27 @@
     </resource>
   </entry>
   <entry>
-    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-detectedissue-severity-v3"/>
+    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-address-use-v2"/>
     <resource>
       <ConceptMap>
-        <id value="cm-detectedissue-severity-v3"/>
+        <id value="cm-address-use-v2"/>
         <text>
           <status value="generated"/>
           <div xmlns="http://www.w3.org/1999/xhtml">
             <p class="res-header-id">
-              <b>Generated Narrative: ConceptMap cm-detectedissue-severity-v3</b>
+              <b>Generated Narrative: ConceptMap cm-address-use-v2</b>
             </p>
-            <a name="cm-detectedissue-severity-v3"> </a>
-            <a name="hccm-detectedissue-severity-v3"> </a>
-            <p>Mapping from (not specified) to (not specified)</p>
+            <a name="cm-address-use-v2"> </a>
+            <a name="hccm-address-use-v2"> </a>
+            <p>Mapping from 
+              <a href="valueset-address-use.html">AddressUse</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0190.html">hl7VS-addressType</a>
+            </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
-              <a href="codesystem-detectedissue-severity.html">Detected Issue Severity</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-ObservationValue.html">ObservationValue</a>
+              <a href="codesystem-address-use.html">AddressUse</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0190.html">addressType</a>
             </p>
 
             <table class="grid">
@@ -1025,53 +979,97 @@
                 <td>
                   <b>Target Code</b>
                 </td>
+                <td>
+                  <b>Comment</b>
+                </td>
               </tr>
 
               <tr>
-                <td>high</td>
+                <td>home</td>
 
                 <td>
                   <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
                 </td>
 
-                <td>H (High)</td>
+                <td>H (Home)</td>
+
+                <td/>
               </tr>
 
               <tr>
-                <td>moderate</td>
+                <td>work</td>
 
                 <td>
                   <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
                 </td>
 
-                <td>M (Moderate)</td>
+                <td>O (Office/Business)</td>
+
+                <td/>
               </tr>
 
               <tr>
-                <td>low</td>
+                <td>temp (Temporary)</td>
 
                 <td>
                   <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
                 </td>
 
-                <td>L (Low)</td>
+                <td>C (Current Or Temporary)</td>
+
+                <td/>
+              </tr>
+
+              <tr>
+                <td>old (Old / Incorrect)</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
+                </td>
+
+                <td>BA (Bad address)</td>
+
+                <td>unclear about old addresses</td>
+              </tr>
+
+              <tr>
+                <td>billing</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td>BI (Billing Address)</td>
+
+                <td/>
               </tr>
             </table>
           </div>
         </text>
-        <url value="http://hl7.org/fhir/ConceptMap/cm-detectedissue-severity-v3"/>
-        <identifier>
-          <system value="urn:ietf:rfc:3986"/>
-          <value value="urn:oid:2.16.840.1.113883.4.642.14.10"/>
-        </identifier>
-        <version value="6.0.0-ballot4"/>
-        <name value="V3DetectedIssueSeverity"/>
-        <title value="v3 map for DetectedIssueSeverity"/>
+        <url value="http://hl7.org/fhir/ConceptMap/cm-address-use-v2"/>
+        <version value="6.0.0-ballot3"/>
+        <name value="v2.AddressUse"/>
+        <title value="v2 map for AddressUse"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2020-12-24T21:13:15+00:00"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
-        <description value="v3 map for DetectedIssueSeverity"/>
+        <contact>
+          <telecom>
+            <system value="url"/>
+            <value value="http://hl7.org/fhir"/>
+          </telecom>
+          <telecom>
+            <system value="email"/>
+            <value value="fhir@lists.hl7.org"/>
+          </telecom>
+        </contact>
+        <contact>
+          <telecom>
+            <system value="url"/>
+            <value value="http://www.hl7.org/Special/committees/fiwg"/>
+          </telecom>
+        </contact>
         <jurisdiction>
           <coding>
             <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
@@ -1079,28 +1077,257 @@
             <display value="World"/>
           </coding>
         </jurisdiction>
+        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/address-use"/>
+        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v2-0190"/>
         <group>
-          <source value="http://hl7.org/fhir/detectedissue-severity"/>
-          <target value="http://terminology.hl7.org/CodeSystem/v3-ObservationValue"/>
+          <source value="http://hl7.org/fhir/address-use"/>
+          <target value="http://terminology.hl7.org/CodeSystem/v2-0190"/>
           <element>
-            <code value="high"/>
+            <code value="home"/>
             <target>
               <code value="H"/>
               <relationship value="equivalent"/>
             </target>
           </element>
           <element>
-            <code value="moderate"/>
+            <code value="work"/>
             <target>
-              <code value="M"/>
+              <code value="O"/>
               <relationship value="equivalent"/>
             </target>
           </element>
           <element>
-            <code value="low"/>
+            <code value="temp"/>
             <target>
-              <code value="L"/>
+              <code value="C"/>
               <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="old"/>
+            <target>
+              <code value="BA"/>
+              <relationship value="source-is-broader-than-target"/>
+              <comment value="unclear about old addresses"/>
+            </target>
+          </element>
+          <element>
+            <code value="billing"/>
+            <target>
+              <code value="BI"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+        </group>
+      </ConceptMap>
+    </resource>
+  </entry>
+  <entry>
+    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-address-use-v3"/>
+    <resource>
+      <ConceptMap>
+        <id value="cm-address-use-v3"/>
+        <text>
+          <status value="generated"/>
+          <div xmlns="http://www.w3.org/1999/xhtml">
+            <p class="res-header-id">
+              <b>Generated Narrative: ConceptMap cm-address-use-v3</b>
+            </p>
+            <a name="cm-address-use-v3"> </a>
+            <a name="hccm-address-use-v3"> </a>
+            <p>Mapping from 
+              <a href="valueset-address-use.html">AddressUse</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+            </p>
+            <br/>
+            <p>
+              <b>Group 1 </b>Mapping from 
+              <a href="codesystem-address-use.html">AddressUse</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+            </p>
+
+            <table class="grid">
+              <tr>
+                <td colspan="2">
+                  <b>Source Concept Details</b>
+                </td>
+                <td>
+                  <b>Relationship</b>
+                </td>
+                <td colspan="2">
+                  <b>Target Concept Details</b>
+                </td>
+                <td>
+                  <b>Comment</b>
+                </td>
+              </tr>
+
+              <tr>
+                <td colspan="2">
+                  <b>Codes</b> from 
+                  <a href="codesystem-address-use.html" title="http://hl7.org/fhir/address-use">AddressUse</a>
+                </td>
+
+                <td/>
+
+                <td colspan="2">
+                  <b>Codes</b> from 
+                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html" title="http://terminology.hl7.org/CodeSystem/v3-AddressUse">AddressUse</a>
+                </td>
+
+                <td/>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px">home</td>
+
+                <td style="border-left-width: 0px">Home</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td style="border-right-width: 0px">H</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td/>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px">work</td>
+
+                <td style="border-left-width: 0px">Work</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td style="border-right-width: 0px">WP</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td/>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px">temp</td>
+
+                <td style="border-left-width: 0px">Temporary</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td style="border-right-width: 0px">TMP</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td/>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px; border-bottom-style: none">old</td>
+
+                <td style="border-left-width: 0px; border-bottom-style: none">Old / Incorrect</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
+                </td>
+
+                <td style="border-right-width: 0px">OLD</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td>Bad or Old</td>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px; border-top-style: none"/>
+
+                <td style="border-top-style: none; border-left-width: 0px"/>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
+                </td>
+
+                <td style="border-right-width: 0px">BAD</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td>Bad or Old</td>
+              </tr>
+            </table>
+          </div>
+        </text>
+        <url value="http://hl7.org/fhir/ConceptMap/cm-address-use-v3"/>
+        <version value="6.0.0-ballot3"/>
+        <name value="v3.AddressUse"/>
+        <title value="v3 map for AddressUse"/>
+        <status value="draft"/>
+        <experimental value="false"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
+        <publisher value="HL7 (FHIR Project)"/>
+        <contact>
+          <telecom>
+            <system value="url"/>
+            <value value="http://hl7.org/fhir"/>
+          </telecom>
+          <telecom>
+            <system value="email"/>
+            <value value="fhir@lists.hl7.org"/>
+          </telecom>
+        </contact>
+        <contact>
+          <telecom>
+            <system value="url"/>
+            <value value="http://www.hl7.org/Special/committees/fiwg"/>
+          </telecom>
+        </contact>
+        <jurisdiction>
+          <coding>
+            <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
+            <code value="001"/>
+            <display value="World"/>
+          </coding>
+        </jurisdiction>
+        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/address-use"/>
+        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v3-AddressUse"/>
+        <group>
+          <source value="http://hl7.org/fhir/address-use"/>
+          <target value="http://terminology.hl7.org/CodeSystem/v3-AddressUse"/>
+          <element>
+            <code value="home"/>
+            <target>
+              <code value="H"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="work"/>
+            <target>
+              <code value="WP"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="temp"/>
+            <target>
+              <code value="TMP"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="old"/>
+            <target>
+              <code value="OLD"/>
+              <relationship value="source-is-broader-than-target"/>
+              <comment value="Bad or Old"/>
+            </target>
+            <target>
+              <code value="BAD"/>
+              <relationship value="source-is-broader-than-target"/>
+              <comment value="Bad or Old"/>
             </target>
           </element>
         </group>
@@ -1122,13 +1349,13 @@
             <a name="hccm-address-type-v3"> </a>
             <p>Mapping from 
               <a href="valueset-address-type.html">AddressType</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-address-type.html">AddressType</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
             </p>
 
             <table class="grid">
@@ -1167,12 +1394,12 @@
           </div>
         </text>
         <url value="http://hl7.org/fhir/ConceptMap/cm-address-type-v3"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="v3.AddressType"/>
         <title value="v3 map for AddressType"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -1235,13 +1462,13 @@
             <a name="hccm-contact-point-system-v2"> </a>
             <p>Mapping from 
               <a href="valueset-contact-point-system.html">ContactPointSystem</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v2-0202.html">hl7VS-telecommunicationEquipmentType</a>
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0202.html">hl7VS-telecommunicationEquipmentType</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-contact-point-system.html">ContactPointSystem</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0202.html">telecommunicationEquipmentType</a>
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0202.html">telecommunicationEquipmentType</a>
             </p>
 
             <table class="grid">
@@ -1323,12 +1550,12 @@
           </div>
         </text>
         <url value="http://hl7.org/fhir/ConceptMap/cm-contact-point-system-v2"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="v2.ContactPointSystem"/>
         <title value="v2 map for ContactPointSystem"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -1400,27 +1627,27 @@
     </resource>
   </entry>
   <entry>
-    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-contact-point-use-v3"/>
+    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-contact-point-use-v2"/>
     <resource>
       <ConceptMap>
-        <id value="cm-contact-point-use-v3"/>
+        <id value="cm-contact-point-use-v2"/>
         <text>
           <status value="generated"/>
           <div xmlns="http://www.w3.org/1999/xhtml">
             <p class="res-header-id">
-              <b>Generated Narrative: ConceptMap cm-contact-point-use-v3</b>
+              <b>Generated Narrative: ConceptMap cm-contact-point-use-v2</b>
             </p>
-            <a name="cm-contact-point-use-v3"> </a>
-            <a name="hccm-contact-point-use-v3"> </a>
+            <a name="cm-contact-point-use-v2"> </a>
+            <a name="hccm-contact-point-use-v2"> </a>
             <p>Mapping from 
               <a href="valueset-contact-point-use.html">ContactPointUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0201.html">hl7VS-telecommunicationUseCode</a>
             </p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-contact-point-use.html">ContactPointUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0201.html">telecommunicationUse</a>
             </p>
 
             <table class="grid">
@@ -1449,7 +1676,217 @@
 
                 <td colspan="2">
                   <b>Codes</b> from 
-                  <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-AddressUse.html" title="http://terminology.hl7.org/CodeSystem/v3-AddressUse">AddressUse</a>
+                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0201.html" title="http://terminology.hl7.org/CodeSystem/v2-0201">telecommunicationUse</a>
+                </td>
+
+                <td/>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px; border-bottom-style: none">home</td>
+
+                <td style="border-left-width: 0px; border-bottom-style: none">Home</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
+                </td>
+
+                <td style="border-right-width: 0px">PRN</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td>FHIR doesn't distinguish types of homes for contacts</td>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px; border-top-style: none; border-bottom-style: none"/>
+
+                <td style="border-left-width: 0px; border-top-style: none; border-bottom-style: none"/>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
+                </td>
+
+                <td style="border-right-width: 0px">ORN</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td>FHIR doesn't distinguish types of homes for contacts</td>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px; border-top-style: none"/>
+
+                <td style="border-top-style: none; border-left-width: 0px"/>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
+                </td>
+
+                <td style="border-right-width: 0px">VHN</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td>FHIR doesn't distinguish types of homes for contacts</td>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px">work</td>
+
+                <td style="border-left-width: 0px">Work</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td style="border-right-width: 0px">WPN</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td/>
+              </tr>
+
+              <tr>
+                <td style="border-right-width: 0px">mobile</td>
+
+                <td style="border-left-width: 0px">Mobile</td>
+
+                <td>
+                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+                </td>
+
+                <td style="border-right-width: 0px">PRS</td>
+
+                <td style="border-left-width: 0px"></td>
+
+                <td/>
+              </tr>
+            </table>
+          </div>
+        </text>
+        <url value="http://hl7.org/fhir/ConceptMap/cm-contact-point-use-v2"/>
+        <version value="6.0.0-ballot3"/>
+        <name value="v2.ContactPointUse"/>
+        <title value="v2 map for ContactPointUse"/>
+        <status value="draft"/>
+        <experimental value="false"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
+        <publisher value="HL7 (FHIR Project)"/>
+        <contact>
+          <telecom>
+            <system value="url"/>
+            <value value="http://hl7.org/fhir"/>
+          </telecom>
+          <telecom>
+            <system value="email"/>
+            <value value="fhir@lists.hl7.org"/>
+          </telecom>
+        </contact>
+        <contact>
+          <telecom>
+            <system value="url"/>
+            <value value="http://www.hl7.org/Special/committees/fiwg"/>
+          </telecom>
+        </contact>
+        <jurisdiction>
+          <coding>
+            <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
+            <code value="001"/>
+            <display value="World"/>
+          </coding>
+        </jurisdiction>
+        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/contact-point-use"/>
+        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v2-0201"/>
+        <group>
+          <source value="http://hl7.org/fhir/contact-point-use"/>
+          <target value="http://terminology.hl7.org/CodeSystem/v2-0201"/>
+          <element>
+            <code value="home"/>
+            <target>
+              <code value="PRN"/>
+              <relationship value="source-is-broader-than-target"/>
+              <comment value="FHIR doesn't distinguish types of homes for contacts"/>
+            </target>
+            <target>
+              <code value="ORN"/>
+              <relationship value="source-is-broader-than-target"/>
+              <comment value="FHIR doesn't distinguish types of homes for contacts"/>
+            </target>
+            <target>
+              <code value="VHN"/>
+              <relationship value="source-is-broader-than-target"/>
+              <comment value="FHIR doesn't distinguish types of homes for contacts"/>
+            </target>
+          </element>
+          <element>
+            <code value="work"/>
+            <target>
+              <code value="WPN"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+          <element>
+            <code value="mobile"/>
+            <target>
+              <code value="PRS"/>
+              <relationship value="equivalent"/>
+            </target>
+          </element>
+        </group>
+      </ConceptMap>
+    </resource>
+  </entry>
+  <entry>
+    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-contact-point-use-v3"/>
+    <resource>
+      <ConceptMap>
+        <id value="cm-contact-point-use-v3"/>
+        <text>
+          <status value="generated"/>
+          <div xmlns="http://www.w3.org/1999/xhtml">
+            <p class="res-header-id">
+              <b>Generated Narrative: ConceptMap cm-contact-point-use-v3</b>
+            </p>
+            <a name="cm-contact-point-use-v3"> </a>
+            <a name="hccm-contact-point-use-v3"> </a>
+            <p>Mapping from 
+              <a href="valueset-contact-point-use.html">ContactPointUse</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+            </p>
+            <br/>
+            <p>
+              <b>Group 1 </b>Mapping from 
+              <a href="codesystem-contact-point-use.html">ContactPointUse</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+            </p>
+
+            <table class="grid">
+              <tr>
+                <td colspan="2">
+                  <b>Source Concept Details</b>
+                </td>
+                <td>
+                  <b>Relationship</b>
+                </td>
+                <td colspan="2">
+                  <b>Target Concept Details</b>
+                </td>
+                <td>
+                  <b>Comment</b>
+                </td>
+              </tr>
+
+              <tr>
+                <td colspan="2">
+                  <b>Codes</b> from 
+                  <a href="codesystem-contact-point-use.html" title="http://hl7.org/fhir/contact-point-use">ContactPointUse</a>
+                </td>
+
+                <td/>
+
+                <td colspan="2">
+                  <b>Codes</b> from 
+                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html" title="http://terminology.hl7.org/CodeSystem/v3-AddressUse">AddressUse</a>
                 </td>
 
                 <td/>
@@ -1554,12 +1991,12 @@
           </div>
         </text>
         <url value="http://hl7.org/fhir/ConceptMap/cm-contact-point-use-v3"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="v3.ContactPointUse"/>
         <title value="v3 map for ContactPointUse"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
+        <date value="2025-11-27T16:48:47+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
         <contact>
           <telecom>
@@ -1635,27 +2072,24 @@
     </resource>
   </entry>
   <entry>
-    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-administrative-gender-v3"/>
+    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-detectedissue-severity-v3"/>
     <resource>
       <ConceptMap>
-        <id value="cm-administrative-gender-v3"/>
+        <id value="cm-detectedissue-severity-v3"/>
         <text>
           <status value="generated"/>
           <div xmlns="http://www.w3.org/1999/xhtml">
             <p class="res-header-id">
-              <b>Generated Narrative: ConceptMap cm-administrative-gender-v3</b>
+              <b>Generated Narrative: ConceptMap cm-detectedissue-severity-v3</b>
             </p>
-            <a name="cm-administrative-gender-v3"> </a>
-            <a name="hccm-administrative-gender-v3"> </a>
-            <p>Mapping from 
-              <a href="valueset-administrative-gender.html">AdministrativeGender</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-AdministrativeGender.html">AdministrativeGender</a>
-            </p>
+            <a name="cm-detectedissue-severity-v3"> </a>
+            <a name="hccm-detectedissue-severity-v3"> </a>
+            <p>Mapping from (not specified) to (not specified)</p>
             <br/>
             <p>
               <b>Group 1 </b>Mapping from 
-              <a href="codesystem-administrative-gender.html">AdministrativeGender</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-AdministrativeGender.html">AdministrativeGender</a>
+              <a href="codesystem-detectedissue-severity.html">Detected Issue Severity</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ObservationValue.html">ObservationValue</a>
             </p>
 
             <table class="grid">
@@ -1672,61 +2106,50 @@
               </tr>
 
               <tr>
-                <td>male</td>
+                <td>high</td>
 
                 <td>
                   <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
                 </td>
 
-                <td>M (Male)</td>
+                <td>H (High)</td>
               </tr>
 
               <tr>
-                <td>female</td>
+                <td>moderate</td>
 
                 <td>
                   <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
                 </td>
 
-                <td>F (Female)</td>
+                <td>M (Moderate)</td>
               </tr>
 
               <tr>
-                <td>other</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#source-is-narrower-than-target" title="source-is-narrower-than-target">is narrower than</a>
-                </td>
-
-                <td>UN (Undifferentiated)</td>
-              </tr>
-
-              <tr>
-                <td>unknown</td>
+                <td>low</td>
 
                 <td>
                   <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
                 </td>
 
-                <td>UNK</td>
+                <td>L (Low)</td>
               </tr>
             </table>
           </div>
         </text>
-        <url value="http://hl7.org/fhir/ConceptMap/cm-administrative-gender-v3"/>
-        <version value="6.0.0-ballot4"/>
-        <name value="v3.AdministrativeGender"/>
-        <title value="v3 map for AdministrativeGender"/>
+        <url value="http://hl7.org/fhir/ConceptMap/cm-detectedissue-severity-v3"/>
+        <identifier>
+          <system value="urn:ietf:rfc:3986"/>
+          <value value="urn:oid:2.16.840.1.113883.4.642.14.10"/>
+        </identifier>
+        <version value="6.0.0-ballot3"/>
+        <name value="V3DetectedIssueSeverity"/>
+        <title value="v3 map for DetectedIssueSeverity"/>
         <status value="draft"/>
         <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
+        <date value="2020-12-24T21:13:15+00:00"/>
         <publisher value="HL7 (FHIR Project)"/>
-        <contact>
-          <telecom>
-            <system value="url"/>
-            <value value="http://www.hl7.org/Special/committees/pafm"/>
-          </telecom>
-        </contact>
+        <description value="v3 map for DetectedIssueSeverity"/>
         <jurisdiction>
           <coding>
             <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
@@ -1734,450 +2157,27 @@
             <display value="World"/>
           </coding>
         </jurisdiction>
-        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/administrative-gender"/>
-        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v3-AdministrativeGender"/>
         <group>
-          <source value="http://hl7.org/fhir/administrative-gender"/>
-          <target value="http://terminology.hl7.org/CodeSystem/v3-AdministrativeGender"/>
+          <source value="http://hl7.org/fhir/detectedissue-severity"/>
+          <target value="http://terminology.hl7.org/CodeSystem/v3-ObservationValue"/>
           <element>
-            <code value="male"/>
-            <target>
-              <code value="M"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="female"/>
-            <target>
-              <code value="F"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="other"/>
-            <target>
-              <code value="UN"/>
-              <relationship value="source-is-narrower-than-target"/>
-            </target>
-          </element>
-          <element>
-            <code value="unknown"/>
-            <target>
-              <code value="UNK"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-        </group>
-      </ConceptMap>
-    </resource>
-  </entry>
-  <entry>
-    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-address-use-v3"/>
-    <resource>
-      <ConceptMap>
-        <id value="cm-address-use-v3"/>
-        <text>
-          <status value="generated"/>
-          <div xmlns="http://www.w3.org/1999/xhtml">
-            <p class="res-header-id">
-              <b>Generated Narrative: ConceptMap cm-address-use-v3</b>
-            </p>
-            <a name="cm-address-use-v3"> </a>
-            <a name="hccm-address-use-v3"> </a>
-            <p>Mapping from 
-              <a href="valueset-address-use.html">AddressUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-AddressUse.html">AddressUse</a>
-            </p>
-            <br/>
-            <p>
-              <b>Group 1 </b>Mapping from 
-              <a href="codesystem-address-use.html">AddressUse</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
-            </p>
-
-            <table class="grid">
-              <tr>
-                <td colspan="2">
-                  <b>Source Concept Details</b>
-                </td>
-                <td>
-                  <b>Relationship</b>
-                </td>
-                <td colspan="2">
-                  <b>Target Concept Details</b>
-                </td>
-                <td>
-                  <b>Comment</b>
-                </td>
-              </tr>
-
-              <tr>
-                <td colspan="2">
-                  <b>Codes</b> from 
-                  <a href="codesystem-address-use.html" title="http://hl7.org/fhir/address-use">AddressUse</a>
-                </td>
-
-                <td/>
-
-                <td colspan="2">
-                  <b>Codes</b> from 
-                  <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-AddressUse.html" title="http://terminology.hl7.org/CodeSystem/v3-AddressUse">AddressUse</a>
-                </td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px">home</td>
-
-                <td style="border-left-width: 0px">Home</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td style="border-right-width: 0px">H</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px">work</td>
-
-                <td style="border-left-width: 0px">Work</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td style="border-right-width: 0px">WP</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px">temp</td>
-
-                <td style="border-left-width: 0px">Temporary</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td style="border-right-width: 0px">TMP</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px; border-bottom-style: none">old</td>
-
-                <td style="border-left-width: 0px; border-bottom-style: none">Old / Incorrect</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
-                </td>
-
-                <td style="border-right-width: 0px">OLD</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td>Bad or Old</td>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px; border-top-style: none"/>
-
-                <td style="border-top-style: none; border-left-width: 0px"/>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
-                </td>
-
-                <td style="border-right-width: 0px">BAD</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td>Bad or Old</td>
-              </tr>
-            </table>
-          </div>
-        </text>
-        <url value="http://hl7.org/fhir/ConceptMap/cm-address-use-v3"/>
-        <version value="6.0.0-ballot4"/>
-        <name value="v3.AddressUse"/>
-        <title value="v3 map for AddressUse"/>
-        <status value="draft"/>
-        <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
-        <publisher value="HL7 (FHIR Project)"/>
-        <contact>
-          <telecom>
-            <system value="url"/>
-            <value value="http://hl7.org/fhir"/>
-          </telecom>
-          <telecom>
-            <system value="email"/>
-            <value value="fhir@lists.hl7.org"/>
-          </telecom>
-        </contact>
-        <contact>
-          <telecom>
-            <system value="url"/>
-            <value value="http://www.hl7.org/Special/committees/fiwg"/>
-          </telecom>
-        </contact>
-        <jurisdiction>
-          <coding>
-            <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
-            <code value="001"/>
-            <display value="World"/>
-          </coding>
-        </jurisdiction>
-        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/address-use"/>
-        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v3-AddressUse"/>
-        <group>
-          <source value="http://hl7.org/fhir/address-use"/>
-          <target value="http://terminology.hl7.org/CodeSystem/v3-AddressUse"/>
-          <element>
-            <code value="home"/>
+            <code value="high"/>
             <target>
               <code value="H"/>
               <relationship value="equivalent"/>
             </target>
           </element>
           <element>
-            <code value="work"/>
-            <target>
-              <code value="WP"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="temp"/>
-            <target>
-              <code value="TMP"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="old"/>
-            <target>
-              <code value="OLD"/>
-              <relationship value="source-is-broader-than-target"/>
-              <comment value="Bad or Old"/>
-            </target>
-            <target>
-              <code value="BAD"/>
-              <relationship value="source-is-broader-than-target"/>
-              <comment value="Bad or Old"/>
-            </target>
-          </element>
-        </group>
-      </ConceptMap>
-    </resource>
-  </entry>
-  <entry>
-    <fullUrl value="http://hl7.org/fhir/ConceptMap/cm-administrative-gender-v2"/>
-    <resource>
-      <ConceptMap>
-        <id value="cm-administrative-gender-v2"/>
-        <text>
-          <status value="generated"/>
-          <div xmlns="http://www.w3.org/1999/xhtml">
-            <p class="res-header-id">
-              <b>Generated Narrative: ConceptMap cm-administrative-gender-v2</b>
-            </p>
-            <a name="cm-administrative-gender-v2"> </a>
-            <a name="hccm-administrative-gender-v2"> </a>
-            <p>Mapping from 
-              <a href="valueset-administrative-gender.html">AdministrativeGender</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v2-0001.html">hl7VS-administrativeSex</a>
-            </p>
-            <br/>
-            <p>
-              <b>Group 1 </b>Mapping from 
-              <a href="codesystem-administrative-gender.html">AdministrativeGender</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0001.html">administrativeSex</a>
-            </p>
-
-            <table class="grid">
-              <tr>
-                <td colspan="2">
-                  <b>Source Concept Details</b>
-                </td>
-                <td>
-                  <b>Relationship</b>
-                </td>
-                <td colspan="2">
-                  <b>Target Concept Details</b>
-                </td>
-                <td>
-                  <b>Comment</b>
-                </td>
-              </tr>
-
-              <tr>
-                <td colspan="2">
-                  <b>Codes</b> from 
-                  <a href="codesystem-administrative-gender.html" title="http://hl7.org/fhir/administrative-gender">AdministrativeGender</a>
-                </td>
-
-                <td/>
-
-                <td colspan="2">
-                  <b>Codes</b> from 
-                  <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0001.html" title="http://terminology.hl7.org/CodeSystem/v2-0001">administrativeSex</a>
-                </td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px">male</td>
-
-                <td style="border-left-width: 0px">Male</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td style="border-right-width: 0px">M</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px">female</td>
-
-                <td style="border-left-width: 0px">Female</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td style="border-right-width: 0px">F</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td/>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px; border-bottom-style: none">other</td>
-
-                <td style="border-left-width: 0px; border-bottom-style: none">Other</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
-                </td>
-
-                <td style="border-right-width: 0px">A</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td>Source concept 'other' is broader than target concept 'Ambiguous' because target concept does not include 'Other'</td>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px; border-top-style: none"/>
-
-                <td style="border-top-style: none; border-left-width: 0px"/>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
-                </td>
-
-                <td style="border-right-width: 0px">O</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td>Source concept 'other' is broader than target concept 'Other' because target concept does not include 'Ambiguous'</td>
-              </tr>
-
-              <tr>
-                <td style="border-right-width: 0px">unknown</td>
-
-                <td style="border-left-width: 0px">Unknown</td>
-
-                <td>
-                  <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
-                </td>
-
-                <td style="border-right-width: 0px">U</td>
-
-                <td style="border-left-width: 0px"></td>
-
-                <td/>
-              </tr>
-            </table>
-          </div>
-        </text>
-        <url value="http://hl7.org/fhir/ConceptMap/cm-administrative-gender-v2"/>
-        <version value="6.0.0-ballot4"/>
-        <name value="v2.AdministrativeGender"/>
-        <title value="v2 map for AdministrativeGender"/>
-        <status value="draft"/>
-        <experimental value="false"/>
-        <date value="2026-05-01T16:46:36+00:00"/>
-        <publisher value="HL7 (FHIR Project)"/>
-        <contact>
-          <telecom>
-            <system value="url"/>
-            <value value="http://www.hl7.org/Special/committees/pafm"/>
-          </telecom>
-        </contact>
-        <jurisdiction>
-          <coding>
-            <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
-            <code value="001"/>
-            <display value="World"/>
-          </coding>
-        </jurisdiction>
-        <sourceScopeCanonical value="http://hl7.org/fhir/ValueSet/administrative-gender"/>
-        <targetScopeCanonical value="http://terminology.hl7.org/ValueSet/v2-0001"/>
-        <group>
-          <source value="http://hl7.org/fhir/administrative-gender"/>
-          <target value="http://terminology.hl7.org/CodeSystem/v2-0001"/>
-          <element>
-            <code value="male"/>
+            <code value="moderate"/>
             <target>
               <code value="M"/>
               <relationship value="equivalent"/>
             </target>
           </element>
           <element>
-            <code value="female"/>
+            <code value="low"/>
             <target>
-              <code value="F"/>
-              <relationship value="equivalent"/>
-            </target>
-          </element>
-          <element>
-            <code value="other"/>
-            <target>
-              <code value="A"/>
-              <relationship value="source-is-broader-than-target"/>
-              <comment value="Source concept 'other' is broader than target concept 'Ambiguous' because target concept does not include 'Other'"/>
-            </target>
-            <target>
-              <code value="O"/>
-              <relationship value="source-is-broader-than-target"/>
-              <comment value="Source concept 'other' is broader than target concept 'Other' because target concept does not include 'Ambiguous'"/>
-            </target>
-          </element>
-          <element>
-            <code value="unknown"/>
-            <target>
-              <code value="U"/>
+              <code value="L"/>
               <relationship value="equivalent"/>
             </target>
           </element>
@@ -2203,7 +2203,7 @@
             <p>
               <b>Group 1 </b>Mapping from 
               <a href="codesystem-composition-status.html">Composition Status</a> to 
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-ActStatus.html">ActStatus</a>
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ActStatus.html">ActStatus</a>
             </p>
 
             <table class="grid">
@@ -2266,7 +2266,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.14.9"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="V3CompositionStatus"/>
         <title value="v3 map for CompositionStatus"/>
         <status value="draft"/>
@@ -2322,7 +2322,7 @@
       <ConceptMap>
         <id value="101"/>
         <meta>
-          <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -2342,7 +2342,7 @@
         
               <a href="valueset-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -2354,7 +2354,7 @@
         
               <a href="codesystem-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -2468,7 +2468,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:uuid:53cd62ee-033e-414c-9f58-3ca97b5ffc3b"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="FHIRv3AddressUse"/>
         <title value="FHIR/v3 Address Use Mapping"/>
         <status value="draft"/>
@@ -2557,7 +2557,7 @@
       <ConceptMap>
         <id value="103"/>
         <meta>
-          <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -2585,9 +2585,9 @@
         
               <b>Group 1 </b>Mapping from 
         
-              <code>http://snomed.info/sct</code> (SNOMED CT International Edition) to 
+              <code>http://snomed.info/sct</code> to 
         
-              <code>http://hl7.org/fhir/sid/icd-10-cm</code> (International Classification of Diseases, 10th Revision, Clinical Modification (ICD-10-CM))
+              <code>http://hl7.org/fhir/sid/icd-10-cm</code>
       
             </p>
       
@@ -2669,7 +2669,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:uuid:53cd62ee-033e-414c-9f58-3ca97b5ffc3b"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="SNOMEDCTToICD10CMMappingsForFractureOfUlna"/>
         <title value="SNOMED CT to ICD-10-CM mappings for fracture of ulna"/>
         <status value="draft"/>
@@ -2722,7 +2722,7 @@
       <ConceptMap>
         <id value="102"/>
         <meta>
-          <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -2740,7 +2740,7 @@
       
             <p>Mapping from 
         
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v2-0487.html">hl7VS-specimenType</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0487.html">hl7VS-specimenType</a> to 
         
               <a href="https://browser.ihtsdotools.org/">All Codes SCT ValueSet</a>
       
@@ -2752,9 +2752,9 @@
         
               <b>Group 1 </b>Mapping from 
         
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0487.html">specimenType</a> to 
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0487.html">specimenType</a> to 
         
-              <code>http://snomed.info/sct</code> (SNOMED CT International Edition)
+              <code>http://snomed.info/sct</code>
       
             </p>
       
@@ -2794,7 +2794,7 @@
             
                   <b>Codes</b> from 
             
-                  <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v2-0487.html" title="http://terminology.hl7.org/CodeSystem/v2-0487">specimenType</a>
+                  <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v2-0487.html" title="http://terminology.hl7.org/CodeSystem/v2-0487">specimenType</a>
           
                 </td>
           
@@ -9042,7 +9042,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.14.3"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="SpecimenMappingFromV2Table0487ToSNOMEDCT"/>
         <title value="Specimen mapping from v2 table 0487 to SNOMED CT"/>
         <status value="draft"/>
@@ -11325,7 +11325,7 @@
       <ConceptMap>
         <id value="example2"/>
         <meta>
-          <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -11435,7 +11435,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.14.8"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="FHIRexanple2"/>
         <title value="FHIR Example 2"/>
         <status value="draft"/>
@@ -11491,7 +11491,7 @@
       <ConceptMap>
         <id value="example-metadata"/>
         <meta>
-          <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -11511,7 +11511,7 @@
         
               <a href="valueset-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -11523,7 +11523,7 @@
         
               <a href="codesystem-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -11633,7 +11633,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.14.5"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="ExampleMetadata"/>
         <title value="Metadata Example"/>
         <status value="draft"/>
@@ -11750,7 +11750,7 @@
       <ConceptMap>
         <id value="example-metadata-2"/>
         <meta>
-          <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -11770,7 +11770,7 @@
         
               <a href="valueset-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -11782,7 +11782,7 @@
         
               <a href="codesystem-address-use.html">AddressUse</a> to 
         
-              <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+              <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
       
             </p>
       
@@ -11892,7 +11892,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.14.4"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="ExampleMetadata"/>
         <title value="Metadata Example"/>
         <status value="draft"/>
@@ -12013,7 +12013,7 @@
       <ConceptMap>
         <id value="example-priority"/>
         <meta>
-          <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -12183,7 +12183,7 @@
           <valueCode value="vocab"/>
         </extension>
         <url value="http://hl7.org/fhir/ConceptMap/example-priority"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <title value="Example map with priorities"/>
         <status value="draft"/>
         <experimental value="true"/>
@@ -12259,7 +12259,7 @@
       <ConceptMap>
         <id value="message-adt-a04-to-bundle"/>
         <meta>
-          <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+          <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
         </meta>
         <text>
           <status value="generated"/>
@@ -12310,36 +12310,6 @@
                   <b>Target Code</b>
           
                 </td>
-          
-                <td>
-            
-                  <b>segment-map</b>
-          
-                </td>
-          
-                <td>
-            
-                  <b>references</b>
-          
-                </td>
-          
-                <td>
-            
-                  <b>antlr</b>
-          
-                </td>
-          
-                <td>
-            
-                  <b>fhirpath</b>
-          
-                </td>
-          
-                <td>
-            
-                  <b>narrative</b>
-          
-                </td>
         
               </tr>
         
@@ -12354,16 +12324,6 @@
                 </td>
           
                 <td>Bundle</td>
-          
-                <td>MSH[Bundle]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12378,16 +12338,6 @@
                 </td>
           
                 <td>MessageHeader[1]</td>
-          
-                <td>MSH[MessageHeader]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12402,16 +12352,6 @@
                 </td>
           
                 <td>Provenance[1]</td>
-          
-                <td>MSH[Provenance]</td>
-          
-                <td>Provenance.target=Bundle; Provenance.target=MessageHeader[MSH]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12426,16 +12366,6 @@
                 </td>
           
                 <td>MessageHeader[1]</td>
-          
-                <td>SFT[MessageHeader]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12450,16 +12380,6 @@
                 </td>
           
                 <td>Provenance[3]</td>
-          
-                <td>EVN[Provenance]</td>
-          
-                <td>Provenance.target=Bundle; Provenance.target=MessageHeader[MSH]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12474,16 +12394,6 @@
                 </td>
           
                 <td>Patient[1]</td>
-          
-                <td>PID[Patient]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12498,16 +12408,6 @@
                 </td>
           
                 <td>Patient[1]</td>
-          
-                <td>PD1[Patient]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12522,16 +12422,6 @@
                 </td>
           
                 <td>Patient[1]</td>
-          
-                <td>ARV[Patient]</td>
-          
-                <td>Resource=Patient[1]</td>
-          
-                <td>IF ARV-1 IN (&quot;PID&quot;, &quot;PD1&quot;) AND ARV-3 NOT VALUED</td>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12546,16 +12436,6 @@
                 </td>
           
                 <td>Patient[1]</td>
-          
-                <td>ROL[Patient-PractitionerRole]</td>
-          
-                <td/>
-          
-                <td>IF ROL-3.1 EQUALS &quot;PP&quot; AND ROL-3.3 EQUALS &quot;HL70443&quot;</td>
-          
-                <td>(element(&quot;3.1&quot;)=&quot;PP&quot;)and(element(&quot;3.3&quot;)=&quot;HL70443&quot;)</td>
-          
-                <td/>
         
               </tr>
         
@@ -12570,16 +12450,6 @@
                 </td>
           
                 <td>RelatedPerson[1]</td>
-          
-                <td>ROL[RelatedPerson]</td>
-          
-                <td>RelatedPerson[1].patient.reference=Patient[1].id</td>
-          
-                <td>IF ROL-3.1 NOT EQUALS  &quot;PP&quot; OR ROL-3.3 NOT EQUALS &quot;HL70443&quot;</td>
-          
-                <td>(element(&quot;3.1&quot;)!=&quot;PP&quot;)or(element(&quot;3.3&quot;)!=&quot;HL70443&quot;)</td>
-          
-                <td>While most likely all other HL70443 values go to RelatedPerson, the implementation needs to determine whether that is fully accurate.</td>
         
               </tr>
         
@@ -12594,16 +12464,6 @@
                 </td>
           
                 <td>RelatedPerson[2]</td>
-          
-                <td>NK1[RelatedPerson]</td>
-          
-                <td>RelatedPerson[2].patient.reference=Patient[1].id</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td>The FHIR location will depend on the nature of the data being exchanged and how the systems use next of kin data</td>
         
               </tr>
         
@@ -12618,16 +12478,6 @@
                 </td>
           
                 <td>Patient[1]</td>
-          
-                <td>NK1[Patient]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td>The FHIR location will depend on the nature of the data being exchanged and how the systems use next of kin data</td>
         
               </tr>
         
@@ -12642,16 +12492,6 @@
                 </td>
           
                 <td>Encounter[1]</td>
-          
-                <td>PV1[Encounter]</td>
-          
-                <td>Encounter[1].subject.reference=Patient[1].id</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12666,16 +12506,6 @@
                 </td>
           
                 <td>Patient[1]</td>
-          
-                <td>PV1[Patient]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12690,16 +12520,6 @@
                 </td>
           
                 <td>Encounter[1]</td>
-          
-                <td>PV2[Encounter]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12714,16 +12534,6 @@
                 </td>
           
                 <td>Encounter[1]</td>
-          
-                <td>ARV[Encounter]</td>
-          
-                <td>Resource=Encounter[1]</td>
-          
-                <td>IF ARV-1 IN (&quot;PV1&quot;, &quot;PV2&quot;) AND ARV-3 NOT VALUED</td>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12738,16 +12548,6 @@
                 </td>
           
                 <td>Encounter[1]</td>
-          
-                <td>ROL[Encounter-PractitionerRole]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12762,16 +12562,6 @@
                 </td>
           
                 <td>Observation</td>
-          
-                <td>OBX[Observation]</td>
-          
-                <td>Observation.subject.reference=Patient[1].id</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12786,16 +12576,6 @@
                 </td>
           
                 <td>Observation</td>
-          
-                <td>OBX[Observation-Component]</td>
-          
-                <td>Observation.subject.reference=Patient[1].id</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12810,16 +12590,6 @@
                 </td>
           
                 <td>AllergyIntolerance</td>
-          
-                <td>AL1[AllergyIntolerance]</td>
-          
-                <td>AllergyIntolerance.patient.reference=Patient[1].id</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12834,16 +12604,6 @@
                 </td>
           
                 <td>Condition</td>
-          
-                <td>DG1[Condition]</td>
-          
-                <td>Condition.subject.reference=Patient[1].id</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td>If in context of the patient</td>
         
               </tr>
         
@@ -12858,16 +12618,6 @@
                 </td>
           
                 <td>Encounter[1]</td>
-          
-                <td>DG1[Encounter]</td>
-          
-                <td>Encounter[1].diagnosis.reference=Condition[1].id</td>
-          
-                <td>IF DG1-6 EQUALS &quot;admitting&quot;</td>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12882,16 +12632,6 @@
                 </td>
           
                 <td>Encounter[1]</td>
-          
-                <td>DG1[Encounter]</td>
-          
-                <td>Encounter[1].diagnosis.reference=Condition[1].id</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td>If in context of an encounter</td>
         
               </tr>
         
@@ -12906,16 +12646,6 @@
                 </td>
           
                 <td>EpisodeOfCare[1]</td>
-          
-                <td>DG1[EpisodeOfCare]</td>
-          
-                <td>EpisodeOfCare.diagnosis.reference=Condition[1].id</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td>If in context of an episode of care</td>
         
               </tr>
         
@@ -12930,16 +12660,6 @@
                 </td>
           
                 <td>Procedure</td>
-          
-                <td>PR1[Procedure]</td>
-          
-                <td>Procedure.subject.reference=Patient[1].id</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12954,16 +12674,6 @@
                 </td>
           
                 <td>Coverage[1]</td>
-          
-                <td>IN1[Coverage]</td>
-          
-                <td>Coverage.subscriber.reference=Patient[1].id</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -12978,16 +12688,6 @@
                 </td>
           
                 <td>Coverage[1]</td>
-          
-                <td>IN2[Coverage]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
         
@@ -13002,16 +12702,6 @@
                 </td>
           
                 <td>Coverage[1]</td>
-          
-                <td>IN3[Coverage]</td>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
-          
-                <td/>
         
               </tr>
       
@@ -13027,7 +12717,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.14.2"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-ballot3"/>
         <name value="MessageADT_A04toBundle"/>
         <title value="MessageADT_ A04to Bundle"/>
         <status value="active"/>

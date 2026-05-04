@@ -30,13 +30,7 @@
   </device>
   <status value="active"/>
   <operationalStatus value="on"/>
-  <color>
-    <coding>
-      <system value="http://hl7.org/fhir/color-names"/>
-      <code value="blue"/>
-      <display value="Blue"/>
-    </coding>
-  </color>
+  <color value="blue"/>
   <category>
     <coding>
       <system value="http://hl7.org/fhir/metric-category"/>
@@ -52,13 +46,7 @@
   </measurementFrequency>
   <calibration>
     <type/>
-    <state>
-      <coding>
-        <system value="http://hl7.org/fhir/metric-calibration-state"/>
-        <code value="calibrated"/>
-        <display value="Calibrated"/>
-      </coding>
-    </state>
+    <state value="calibrated"/>
     <time value="2016-12-28T09:03:04-05:00"/>
   </calibration>
 </DeviceMetric>

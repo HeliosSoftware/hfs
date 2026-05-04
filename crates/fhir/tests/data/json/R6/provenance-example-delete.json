@@ -8,7 +8,16 @@
   ],
   "recorded": "2015-06-27T08:39:24+10:00",
   "authorization": [
-    null
+    {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+            "code": "METAMGT"
+          }
+        ]
+      }
+    }
   ],
   "activity": {
     "coding": [

@@ -2,11 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "devicealert-category",
   "meta": {
-<<<<<<< Updated upstream
     "lastUpdated": "2025-12-17T09:50:17.012+00:00"
-=======
-    "lastUpdated": "2026-05-01T16:46:36.632+00:00"
->>>>>>> Stashed changes
   },
   "text": {
     "status": "generated",
@@ -19,11 +15,11 @@
     },
     {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
-      "valueCode": "normative"
+      "valueCode": "informative"
     },
     {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
-      "valueInteger": 2
+      "valueInteger": 1
     }
   ],
   "url": "http://hl7.org/fhir/devicealert-category",

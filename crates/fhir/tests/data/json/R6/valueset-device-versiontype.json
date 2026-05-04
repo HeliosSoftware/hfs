@@ -2,11 +2,11 @@
   "resourceType": "ValueSet",
   "id": "device-versiontype",
   "meta": {
-    "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
   },
   "text": {
-    "status": "extensions",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet device-versiontype\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"device-versiontype\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdevice-versiontype\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://tx.fhir.org/r5\"\u003e\u003ccode\u003eurn:iso:std:iso:11073:10101\u003c/code\u003e\u003c/a\u003e\u003cspan style\u003d\"opacity: 0.5\" title\u003d\"Version is not explicitly stated. When building this specification, the most recent version 2024-12-05 has been used\"\u003e version ⏿2024-12-05\u003c/span\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/MDC#MDC-531974\"\u003e531974\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHardware revision\u003c/td\u003e\u003ctd\u003eThe hardware-revision component id group of the MDC_ATTR_ID_PROD_SPECN attribute.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/MDC#MDC-531975\"\u003e531975\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSoftware revision\u003c/td\u003e\u003ctd\u003eThe software-revision component id group of the MDC_ATTR_ID_PROD_SPECN attribute.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/MDC#MDC-531976\"\u003e531976\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFirmware revision\u003c/td\u003e\u003ctd\u003eThe firmware-revision component id group of the MDC_ATTR_ID_PROD_SPECN attribute.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/MDC#MDC-531977\"\u003e531977\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProtocol revision\u003c/td\u003e\u003ctd\u003eThe protocol-revision component id group of the MDC_ATTR_ID_PROD_SPECN attribute.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://tx.fhir.org/r5/ValueSet/MDC#MDC-532352\"\u003e532352\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eContinua version\u003c/td\u003e\u003ctd\u003eRegulation-Certification-Continua-Version (hypothetical decomposition of MDC_ATTR_REG-CERT-DATALIST Continua Body Certified Device Version sub element)\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet device-versiontype\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"device-versiontype\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdevice-versiontype\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ccode\u003eurn:iso:std:iso:11073:10101\u003c/code\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e531974\u003c/td\u003e\u003ctd\u003eHardware revision\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e531975\u003c/td\u003e\u003ctd\u003eSoftware revision\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e531976\u003c/td\u003e\u003ctd\u003eFirmware revision\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e531977\u003c/td\u003e\u003ctd\u003eProtocol revision\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e532352\u003c/td\u003e\u003ctd\u003eContinua version\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -29,7 +29,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.3.3202"
     }
   ],
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-ballot3",
   "name": "DeviceVersionType",
   "title": "Device Version Type",
   "status": "active",

@@ -110,11 +110,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Ratio"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="Ratio"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-05-01T16:46:36+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -137,7 +137,7 @@
     </coding>
   </jurisdiction>
   <purpose value="Need to able to capture ratios for some measurements (titers) and some rates (costs)."/>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="v2"/>
     <uri value="http://hl7.org/v2"/>

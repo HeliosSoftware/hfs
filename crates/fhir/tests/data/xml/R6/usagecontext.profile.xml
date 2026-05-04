@@ -66,7 +66,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Type of context being specified
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-usage-context-type.html" title="A code that specifies a type of context being specified by a usage context.">UsageContextType</a> (
+            <a href="http://terminology.hl7.org/7.0.0/ValueSet-usage-context-type.html" title="A code that specifies a type of context being specified by a usage context.">UsageContextType</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -180,11 +180,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/UsageContext"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="UsageContext"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-05-01T16:46:36+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -207,7 +207,7 @@
     </coding>
   </jurisdiction>
   <purpose value="Consumers of the resource must be able to determine the intended applicability for the resource. Ideally, this information would be used programmatically to determine when and how it should be incorporated or exposed."/>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="rim"/>
     <uri value="http://hl7.org/v3"/>

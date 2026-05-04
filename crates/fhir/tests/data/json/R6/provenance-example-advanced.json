@@ -15,7 +15,16 @@
     "reference": "Location/1/_history/1"
   },
   "authorization": [
-    null
+    {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+            "code": "TREAT"
+          }
+        ]
+      }
+    }
   ],
   "activity": {
     "coding": [

@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Group"/>
   <meta>
-    <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -541,7 +541,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="Group.combinationMethod : Used to specify how two or more characteristics are combined.&#xA;&#xA;* 'all-of': Each of the characteristics must be met. This is functionally equivalent to combining all characteristics with an AND operator.&#xA;* 'any-of': At least one of the characteristics must be met. This is functionally equivalent to combining all characteristics with an OR operator.&#xA;* 'at-least': At least n of the characteristics must be met. Use Group.combinationThreshold to specify the value of n.&#xA;* 'at-most': At most n of the characteristics must be met. Use Group.combinationThreshold to specify the value of n.&#xA;*  'except-subset': The characteristics expressed as exclusion criteria are used as exceptions to meeting the characteristics expressed as inclusion criteria.">combinationMethod</span>
+            <span title="Group.combinationMethod : Used to specify how two or more characteristics are combined.">combinationMethod</span>
             <a name="Group.combinationMethod"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -806,7 +806,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <span title="Group.characteristic.method : The method modifies the Group.characteristic.code and indicates how the value is to be determined.">method</span>
+            <span title="Group.characteristic.method : Method for how the characteristic value was determined.">method</span>
             <a name="Group.characteristic.method"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -905,7 +905,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"></td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Number of occurrences
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Number of occurrences meeting the characteristic
             <br/>
             <span style="font-style: italic" title="grp-1">+ Rule: Ranges have to be positive</span>
             <br/>
@@ -958,7 +958,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"></td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">How long
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Length of time in which the characteristic is met
             <br/>
           </td>
         </tr>
@@ -1011,7 +1011,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#Period">Period</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">When (in calendar time)
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Period over which characteristic is tested
             <br/>
           </td>
         </tr>
@@ -1022,15 +1022,15 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzME+lXFigAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+3OsRUAIAjEUOL+O8cJABttJM11/x1qZAGqRBEVcNIqdWj1efDqQbb3HwwwwEfABmQUHSPM9dtDAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <span title="Group.characteristic.relativeTime : The relative time in which the characteristic is determined.">relativeTime</span>
-            <a name="Group.characteristic.relativeTime"> </a>
+            <span title="Group.characteristic.timing : Timing in which the characteristic is determined.">timing</span>
+            <a name="Group.characteristic.timing"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..*</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#RelativeTime">RelativeTime</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">When (with respect to an event)
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Timing in which the characteristic is determined
             <br/>
             <br/>
           </td>
@@ -1179,11 +1179,11 @@
     <valueCode value="business"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Group"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="Group"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-05-01T16:46:36+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -1191,7 +1191,7 @@
       <value value="http://www.hl7.org/Special/committees/fiwg"/>
     </telecom>
   </contact>
-  <description value="Represents a defined collection of entities that may be discussed or acted upon collectively but which are not typically expected to act collectively*. These collections are also not typically formally or legally recognized.\r\n\r\n*NOTE: Group may be used to define families or households, which in some circumstances may act collectively or have a degree of legal or formal recognition. This should be considered an exception. When Group is used for types of entities other than Patient or RelatedPerson, the expectation remains that the Group will not act collectively or have formal recognition - use Organization if these behaviors are needed. See more discussion [below](group.html#group-usage)"/>
+  <description value="Represents a defined collection of entities that may be discussed or acted upon collectively but which are not typically expected to act collectively.  These collections are also not typically formally or legally recognized.&#xA;&#xA;NOTE: Group may be used to define families or households, which in some circumstances may act collectively or have a degree of legal or formal recognition.  This should be considered an exception.  When Group is used for types of entities other than Patient or RelatedPerson, the expectation remains that the Group will not act collectively or have formal recognition - use Organization if these behaviors are needed.&#xA;&#xA;For example, it is possible for a 'family' Group to be a performer of an Observation or owner of a Task.  However, this is not permitted for a Group made up of Practitioners, PractitionerRoles or Organizations.  Organization or CareTeam would need to be used instead.  A Group of Practitioners could, however, be a subject of an Observation."/>
   <jurisdiction>
     <coding>
       <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
@@ -1199,7 +1199,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="w5"/>
     <uri value="http://hl7.org/fhir/fivews"/>
@@ -1370,7 +1370,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1747,7 +1747,7 @@
         </extension>
         <strength value="required"/>
         <description value="The lifecycle status of an artifact."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -2056,7 +2056,7 @@
         </extension>
         <strength value="required"/>
         <description value="Types of resources that are part of group."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/group-type|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/group-type|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -2099,7 +2099,7 @@
         </extension>
         <strength value="required"/>
         <description value="The basis for membership in a group"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/group-membership-basis|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/group-membership-basis|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="Group.code">
@@ -2212,7 +2212,7 @@
     <element id="Group.combinationMethod">
       <path value="Group.combinationMethod"/>
       <short value="all-of | any-of | at-least | at-most | except-subset"/>
-      <definition value="Used to specify how two or more characteristics are combined.&#xA;&#xA;* 'all-of': Each of the characteristics must be met. This is functionally equivalent to combining all characteristics with an AND operator.&#xA;* 'any-of': At least one of the characteristics must be met. This is functionally equivalent to combining all characteristics with an OR operator.&#xA;* 'at-least': At least n of the characteristics must be met. Use Group.combinationThreshold to specify the value of n.&#xA;* 'at-most': At most n of the characteristics must be met. Use Group.combinationThreshold to specify the value of n.&#xA;*  'except-subset': The characteristics expressed as exclusion criteria are used as exceptions to meeting the characteristics expressed as inclusion criteria."/>
+      <definition value="Used to specify how two or more characteristics are combined."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2240,7 +2240,7 @@
           <valueString value="CharacteristicCombination"/>
         </extension>
         <strength value="required"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/group-characteristic-combination|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/group-characteristic-combination|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="Group.combinationThreshold">
@@ -2538,7 +2538,7 @@
     <element id="Group.characteristic.method">
       <path value="Group.characteristic.method"/>
       <short value="Method for how the characteristic value was determined"/>
-      <definition value="The method modifies the Group.characteristic.code and indicates how the value is to be determined."/>
+      <definition value="Method for how the characteristic value was determined."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2627,7 +2627,6 @@
       <path value="Group.characteristic.offset"/>
       <short value="Reference point for comparison"/>
       <definition value="Defines the reference point for comparison when other than 0."/>
-      <comment value="As an example, to express a characteristic of a calcium level greater than the normal limit or a hemoglobin level less than 1 g/dL below the reference range, the offset concept would represent &quot;normal limit&quot; [upper limit] or &quot;reference range&quot; [lower limit]."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2659,7 +2658,7 @@
     </element>
     <element id="Group.characteristic.instances[x]">
       <path value="Group.characteristic.instances[x]"/>
-      <short value="Number of occurrences"/>
+      <short value="Number of occurrences meeting the characteristic"/>
       <definition value="Number of occurrences meeting the characteristic."/>
       <min value="0"/>
       <max value="1"/>
@@ -2694,7 +2693,7 @@
     </element>
     <element id="Group.characteristic.duration[x]">
       <path value="Group.characteristic.duration[x]"/>
-      <short value="How long"/>
+      <short value="Length of time in which the characteristic is met"/>
       <definition value="Length of time in which the characteristic is met."/>
       <min value="0"/>
       <max value="1"/>
@@ -2722,7 +2721,7 @@
     </element>
     <element id="Group.characteristic.period">
       <path value="Group.characteristic.period"/>
-      <short value="When (in calendar time)"/>
+      <short value="Period over which characteristic is tested"/>
       <definition value="The period over which the characteristic is tested; e.g. the patient had an operation during the month of June."/>
       <min value="0"/>
       <max value="1"/>
@@ -2745,14 +2744,14 @@
       <isModifier value="false"/>
       <isSummary value="false"/>
     </element>
-    <element id="Group.characteristic.relativeTime">
-      <path value="Group.characteristic.relativeTime"/>
-      <short value="When (with respect to an event)"/>
-      <definition value="The relative time in which the characteristic is determined."/>
+    <element id="Group.characteristic.timing">
+      <path value="Group.characteristic.timing"/>
+      <short value="Timing in which the characteristic is determined"/>
+      <definition value="Timing in which the characteristic is determined."/>
       <min value="0"/>
       <max value="*"/>
       <base>
-        <path value="Group.characteristic.relativeTime"/>
+        <path value="Group.characteristic.timing"/>
         <min value="0"/>
         <max value="*"/>
       </base>
@@ -3212,7 +3211,7 @@
         </extension>
         <strength value="required"/>
         <description value="The lifecycle status of an artifact."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -3401,7 +3400,7 @@
         </extension>
         <strength value="required"/>
         <description value="Types of resources that are part of group."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/group-type|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/group-type|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -3432,7 +3431,7 @@
         </extension>
         <strength value="required"/>
         <description value="The basis for membership in a group"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/group-membership-basis|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/group-membership-basis|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="Group.code">
@@ -3509,7 +3508,7 @@
     <element id="Group.combinationMethod">
       <path value="Group.combinationMethod"/>
       <short value="all-of | any-of | at-least | at-most | except-subset"/>
-      <definition value="Used to specify how two or more characteristics are combined.&#xA;&#xA;* 'all-of': Each of the characteristics must be met. This is functionally equivalent to combining all characteristics with an AND operator.&#xA;* 'any-of': At least one of the characteristics must be met. This is functionally equivalent to combining all characteristics with an OR operator.&#xA;* 'at-least': At least n of the characteristics must be met. Use Group.combinationThreshold to specify the value of n.&#xA;* 'at-most': At most n of the characteristics must be met. Use Group.combinationThreshold to specify the value of n.&#xA;*  'except-subset': The characteristics expressed as exclusion criteria are used as exceptions to meeting the characteristics expressed as inclusion criteria."/>
+      <definition value="Used to specify how two or more characteristics are combined."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -3525,7 +3524,7 @@
           <valueString value="CharacteristicCombination"/>
         </extension>
         <strength value="required"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/group-characteristic-combination|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/group-characteristic-combination|6.0.0-ballot3"/>
       </binding>
     </element>
     <element id="Group.combinationThreshold">
@@ -3659,7 +3658,7 @@
     <element id="Group.characteristic.method">
       <path value="Group.characteristic.method"/>
       <short value="Method for how the characteristic value was determined"/>
-      <definition value="The method modifies the Group.characteristic.code and indicates how the value is to be determined."/>
+      <definition value="Method for how the characteristic value was determined."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -3712,7 +3711,6 @@
       <path value="Group.characteristic.offset"/>
       <short value="Reference point for comparison"/>
       <definition value="Defines the reference point for comparison when other than 0."/>
-      <comment value="As an example, to express a characteristic of a calcium level greater than the normal limit or a hemoglobin level less than 1 g/dL below the reference range, the offset concept would represent &quot;normal limit&quot; [upper limit] or &quot;reference range&quot; [lower limit]."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -3732,7 +3730,7 @@
     </element>
     <element id="Group.characteristic.instances[x]">
       <path value="Group.characteristic.instances[x]"/>
-      <short value="Number of occurrences"/>
+      <short value="Number of occurrences meeting the characteristic"/>
       <definition value="Number of occurrences meeting the characteristic."/>
       <min value="0"/>
       <max value="1"/>
@@ -3755,7 +3753,7 @@
     </element>
     <element id="Group.characteristic.duration[x]">
       <path value="Group.characteristic.duration[x]"/>
-      <short value="How long"/>
+      <short value="Length of time in which the characteristic is met"/>
       <definition value="Length of time in which the characteristic is met."/>
       <min value="0"/>
       <max value="1"/>
@@ -3771,7 +3769,7 @@
     </element>
     <element id="Group.characteristic.period">
       <path value="Group.characteristic.period"/>
-      <short value="When (in calendar time)"/>
+      <short value="Period over which characteristic is tested"/>
       <definition value="The period over which the characteristic is tested; e.g. the patient had an operation during the month of June."/>
       <min value="0"/>
       <max value="1"/>
@@ -3782,10 +3780,10 @@
       <isModifier value="false"/>
       <isSummary value="false"/>
     </element>
-    <element id="Group.characteristic.relativeTime">
-      <path value="Group.characteristic.relativeTime"/>
-      <short value="When (with respect to an event)"/>
-      <definition value="The relative time in which the characteristic is determined."/>
+    <element id="Group.characteristic.timing">
+      <path value="Group.characteristic.timing"/>
+      <short value="Timing in which the characteristic is determined"/>
+      <definition value="Timing in which the characteristic is determined."/>
       <min value="0"/>
       <max value="*"/>
       <type>

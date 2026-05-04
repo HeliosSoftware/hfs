@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Encounter"/>
   <meta>
-    <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
+    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -234,7 +234,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Classification of patient encounter context - e.g. Inpatient, outpatient
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-encounter-class.html">Encounter class</a> (
+            <a href="http://terminology.hl7.org/7.0.0/ValueSet-encounter-class.html">Encounter class</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -256,7 +256,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Indicates the urgency of the encounter
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-ActPriority.html">ActPriority</a> (
+            <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-ActPriority.html">ActPriority</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1000,7 +1000,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Indicates that the patient is being re-admitted
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-v2-0092.html">hl7VS-re-admissionIndicator</a> (
+            <a href="http://terminology.hl7.org/7.0.0/ValueSet-v2-0092.html">hl7VS-re-admissionIndicator</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1175,11 +1175,11 @@
     <valueCode value="patient"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Encounter"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-ballot3"/>
   <name value="Encounter"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-05-01T16:46:36+00:00"/>
+  <date value="2025-11-27T16:48:47+00:00"/>
   <publisher value="HL7 International / Patient Administration"/>
   <contact>
     <telecom>
@@ -1201,7 +1201,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-ballot3"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -1406,7 +1406,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1617,7 +1617,7 @@
         </extension>
         <strength value="required"/>
         <description value="Current state of the encounter."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/encounter-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/encounter-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -3920,7 +3920,7 @@
         </extension>
         <strength value="required"/>
         <description value="The status of the location."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/encounter-location-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/encounter-location-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -4063,7 +4063,7 @@
         </extension>
         <strength value="required"/>
         <description value="Current state of the encounter."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/encounter-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/encounter-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -5274,7 +5274,7 @@
         </extension>
         <strength value="required"/>
         <description value="The status of the location."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/encounter-location-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/encounter-location-status|6.0.0-ballot3"/>
       </binding>
       <mapping>
         <identity value="rim"/>

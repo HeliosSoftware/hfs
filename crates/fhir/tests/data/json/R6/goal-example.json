@@ -11,12 +11,6 @@
     }
   ],
   "lifecycleStatus": "on-hold",
-  "lifecycleStatusReason": [
-    {
-      "text": "Patient wants to defer weight loss until after honeymoon."
-    }
-  ],
-  "achievementStatusDate": "2016-02-14",
   "category": [
     {
       "coding": [
@@ -72,6 +66,12 @@
         }
       },
       "dueDate": "2016-04-05"
+    }
+  ],
+  "statusDate": "2016-02-14",
+  "statusReason": [
+    {
+      "text": "Patient wants to defer weight loss until after honeymoon."
     }
   ],
   "source": {
