@@ -28,6 +28,7 @@ use helios_fhir::r4::{
     TerminologyCapabilitiesSoftware, TerminologyCapabilitiesTranslation,
     TerminologyCapabilitiesValidateCode,
 };
+#[cfg(feature = "R4")]
 use helios_fhir::{Element, PrecisionDateTime};
 
 use crate::import::BundleImportBackend;
@@ -225,12 +226,28 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
         {"code": "search-type"}
     ]);
 
+    // Report the FHIR version that matches the build's enabled feature.
+    // The HL7 validator picks an R4 vs R5 client (and by extension, an R4 vs
+    // R5 JSON parser) based on this string. If we always claim "4.0.1" the
+    // R5 client never runs, and our R5 responses are downgraded by the R4
+    // parser — losing typed values on non-standard parameter names like
+    // `excludeNested`, which then fails the validator's sort with NPEs.
+    let fhir_version = if cfg!(feature = "R6") {
+        "6.0.0"
+    } else if cfg!(feature = "R5") {
+        "5.0.0"
+    } else if cfg!(feature = "R4B") {
+        "4.3.0"
+    } else {
+        "4.0.1"
+    };
+
     json!({
         "resourceType": "CapabilityStatement",
         "status": "active",
         "kind": "instance",
         "date": "2026-04-01",
-        "fhirVersion": "4.0.1",
+        "fhirVersion": fhir_version,
         "format": ["application/fhir+json", "application/fhir+xml"],
         "extension": supported_system_extensions,
         "software": {
