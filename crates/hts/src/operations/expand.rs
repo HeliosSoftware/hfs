@@ -313,11 +313,26 @@ async fn process_expand<B: TerminologyBackend>(
     // Skip the `url` / `valueSet` discriminators (they identify the
     // ValueSet, not a knob), and skip `filter` (already reflected in the
     // contains[] result).
+    //
+    // Critically: the FHIR R5 ValueSet model requires every
+    // `expansion.parameter[].value[x]` to be a primitive (boolean | string |
+    // integer | decimal | uri | code | dateTime). The HL7 IG validator
+    // augments our request with `tx-resource` parameters whose payload is a
+    // Resource (no value[x] at all) plus `profile.parameter` entries. If we
+    // echo any of those, the R5 parser produces a ValueSetExpansionParameterComponent
+    // with `getValue() == null`, and TxTesterSorters.ExpParameterSorter NPEs
+    // on the sort. Drop anything without a primitive value[x] field.
     let mut emitted_params: Vec<Value> = params
         .iter()
         .filter(|p| {
             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            !matches!(name, "url" | "valueSet" | "filter")
+            if matches!(name, "url" | "valueSet" | "filter") {
+                return false;
+            }
+            // Must carry a primitive value[x] to be valid in expansion.parameter.
+            p.as_object()
+                .map(|obj| obj.keys().any(|k| k.starts_with("value")))
+                .unwrap_or(false)
         })
         .cloned()
         .collect();
