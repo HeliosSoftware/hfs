@@ -39,18 +39,56 @@ use super::params::{
 ///
 /// Always includes `result` (boolean).  Includes `message` when set (e.g.,
 /// when a display mismatch is detected).  Includes `display` on success.
-fn build_validate_response(resp: ValidateCodeResponse) -> Value {
-    let mut parameter: Vec<Value> = vec![json!({"name": "result", "valueBoolean": resp.result})];
-    if let Some(msg) = resp.message {
-        parameter.push(json!({"name": "message", "valueString": msg}));
+/// Echoes `code`, `system`, and `version` (when known) so the IG fixtures
+/// can confirm what we validated.
+fn build_validate_response(
+    resp: ValidateCodeResponse,
+    code: Option<&str>,
+    system: Option<&str>,
+    version: Option<&str>,
+) -> Value {
+    let mut parameter: Vec<Value> = Vec::new();
+    if let Some(c) = code {
+        parameter.push(json!({"name": "code", "valueCode": c}));
     }
     if let Some(display) = resp.display {
         parameter.push(json!({"name": "display", "valueString": display}));
+    }
+    if let Some(msg) = resp.message {
+        parameter.push(json!({"name": "message", "valueString": msg}));
+    }
+    parameter.push(json!({"name": "result", "valueBoolean": resp.result}));
+    if let Some(s) = system {
+        parameter.push(json!({"name": "system", "valueUri": s}));
+    }
+    if let Some(v) = version {
+        parameter.push(json!({"name": "version", "valueString": v}));
     }
     json!({
         "resourceType": "Parameters",
         "parameter": parameter
     })
+}
+
+/// Build a validate-code response and resolve the system's version via a
+/// backend lookup (so the response can echo `version` per the IG fixtures).
+async fn build_validate_response_async<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    resp: ValidateCodeResponse,
+    code: Option<&str>,
+    system: Option<&str>,
+) -> Value {
+    let version = if let Some(s) = system {
+        backend
+            .code_system_version_for_url(ctx, s)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    build_validate_response(resp, code, system, version.as_deref())
 }
 
 /// Core validate-code logic for `CodeSystem/$validate-code`.
@@ -89,28 +127,42 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
         })?;
         let req = ValidateCodeRequest {
             url: None,
-            system: Some(system),
-            code,
+            system: Some(system.clone()),
+            code: code.clone(),
             version: find_str_param(&params, "version"),
             display: find_str_param(&params, "display"),
             date: find_str_param(&params, "date"),
         };
         let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
-        return Ok(build_validate_response(resp));
+        return Ok(build_validate_response_async(
+            state.backend(),
+            &ctx,
+            resp,
+            Some(&code),
+            Some(&system),
+        )
+        .await);
     }
 
     // ── Path 2: `coding` parameter (valueCoding — system+code bundled together) ──
     if let Some((system, code, _display)) = extract_coding(&params, "coding") {
         let req = ValidateCodeRequest {
             url: None,
-            system: Some(system),
-            code,
+            system: Some(system.clone()),
+            code: code.clone(),
             version: find_str_param(&params, "version"),
             display: find_str_param(&params, "display"),
             date: find_str_param(&params, "date"),
         };
         let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
-        return Ok(build_validate_response(resp));
+        return Ok(build_validate_response_async(
+            state.backend(),
+            &ctx,
+            resp,
+            Some(&code),
+            Some(&system),
+        )
+        .await);
     }
 
     // ── Path 3: `codeableConcept` parameter (multiple codings — true if any matches) ──
@@ -123,23 +175,35 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
         for (system, code) in codings {
             let req = ValidateCodeRequest {
                 url: None,
-                system: Some(system),
-                code,
+                system: Some(system.clone()),
+                code: code.clone(),
                 version: find_str_param(&params, "version"),
                 display: None,
                 date: find_str_param(&params, "date"),
             };
             let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
             if resp.result {
-                return Ok(build_validate_response(resp));
+                return Ok(build_validate_response_async(
+                    state.backend(),
+                    &ctx,
+                    resp,
+                    Some(&code),
+                    Some(&system),
+                )
+                .await);
             }
         }
         // No coding matched
-        return Ok(build_validate_response(ValidateCodeResponse {
-            result: false,
-            message: Some("None of the provided codings were found in any CodeSystem".into()),
-            display: None,
-        }));
+        return Ok(build_validate_response(
+            ValidateCodeResponse {
+                result: false,
+                message: Some("None of the provided codings were found in any CodeSystem".into()),
+                display: None,
+            },
+            None,
+            None,
+            None,
+        ));
     }
 
     Err(HtsError::InvalidRequest(
@@ -208,30 +272,45 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
 
     // ── Path 1: bare `code` parameter ────────────────────────────────────────────
     if let Some(code) = find_str_param(&params, "code") {
+        let system = find_str_param(&params, "system");
         let req = ValidateCodeRequest {
             url: Some(url),
-            system: find_str_param(&params, "system"),
-            code,
+            system: system.clone(),
+            code: code.clone(),
             version: find_str_param(&params, "version"),
             display: find_str_param(&params, "display"),
             date: find_str_param(&params, "date"),
         };
         let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
-        return Ok(build_validate_response(resp));
+        return Ok(build_validate_response_async(
+            state.backend(),
+            &ctx,
+            resp,
+            Some(&code),
+            system.as_deref(),
+        )
+        .await);
     }
 
     // ── Path 2: `coding` parameter (valueCoding) ──────────────────────────────
     if let Some((system, code, _display)) = extract_coding(&params, "coding") {
         let req = ValidateCodeRequest {
             url: Some(url),
-            system: Some(system),
-            code,
+            system: Some(system.clone()),
+            code: code.clone(),
             version: find_str_param(&params, "version"),
             display: find_str_param(&params, "display"),
             date: find_str_param(&params, "date"),
         };
         let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
-        return Ok(build_validate_response(resp));
+        return Ok(build_validate_response_async(
+            state.backend(),
+            &ctx,
+            resp,
+            Some(&code),
+            Some(&system),
+        )
+        .await);
     }
 
     // ── Path 3: `codeableConcept` parameter (true if any coding is in the ValueSet) ──
@@ -244,22 +323,34 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         for (system, code) in codings {
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),
-                system: Some(system),
-                code,
+                system: Some(system.clone()),
+                code: code.clone(),
                 version: find_str_param(&params, "version"),
                 display: None,
                 date: find_str_param(&params, "date"),
             };
             let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
             if resp.result {
-                return Ok(build_validate_response(resp));
+                return Ok(build_validate_response_async(
+                    state.backend(),
+                    &ctx,
+                    resp,
+                    Some(&code),
+                    Some(&system),
+                )
+                .await);
             }
         }
-        return Ok(build_validate_response(ValidateCodeResponse {
-            result: false,
-            message: Some("None of the provided codings were found in the ValueSet".into()),
-            display: None,
-        }));
+        return Ok(build_validate_response(
+            ValidateCodeResponse {
+                result: false,
+                message: Some("None of the provided codings were found in the ValueSet".into()),
+                display: None,
+            },
+            None,
+            None,
+            None,
+        ));
     }
 
     Err(HtsError::InvalidRequest(
