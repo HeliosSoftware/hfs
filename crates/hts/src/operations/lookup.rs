@@ -69,8 +69,8 @@ async fn process_lookup<B: TerminologyBackend>(
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: code".into()))?;
 
     let req = LookupRequest {
-        system,
-        code,
+        system: system.clone(),
+        code: code.clone(),
         version: find_str_param(&params, "version"),
         display_language: find_str_param(&params, "displayLanguage"),
         expression: find_str_param(&params, "expression"),
@@ -90,6 +90,19 @@ async fn process_lookup<B: TerminologyBackend>(
 
     if let Some(display) = resp.display {
         parameter.push(json!({"name": "display", "valueString": display}));
+    }
+
+    // Echo back the system + code so the IG fixtures can confirm what we
+    // looked up; also surface `abstract` from the notSelectable property
+    // when set.
+    parameter.push(json!({"name": "system", "valueUri": system}));
+    parameter.push(json!({"name": "code", "valueCode": code}));
+    if resp
+        .properties
+        .iter()
+        .any(|p| p.code == "notSelectable" && p.value == "true")
+    {
+        parameter.push(json!({"name": "abstract", "valueBoolean": true}));
     }
 
     for prop in resp.properties {

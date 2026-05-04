@@ -60,7 +60,11 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let (concept_id, display, _definition) = find_concept(&conn, &system_id, &req.code)?;
 
             let all_props = fetch_properties(&conn, concept_id)?;
-            let properties = if req.properties.is_empty() {
+            // Per FHIR spec, property="*" is the wildcard meaning "include
+            // every property the concept has". Treat any "*" entry as
+            // equivalent to omitting the filter.
+            let want_all = req.properties.is_empty() || req.properties.iter().any(|p| p == "*");
+            let properties = if want_all {
                 all_props
             } else {
                 all_props
