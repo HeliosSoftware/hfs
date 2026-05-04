@@ -236,9 +236,12 @@ fn find_loinc_paths(path: &Path) -> Result<(String, String), HtsError> {
         let filename = lower.rsplit('/').next().unwrap_or(&lower);
 
         if filename.ends_with(".csv") {
-            if (filename.starts_with("loinc") && !filename.contains("panel"))
-                || filename.ends_with("loinctable.csv")
-            {
+            // The main table is always exactly `Loinc.csv` or `LoincTable.csv`
+            // (flat or under `Loinc_<ver>/` or `LoincTable/`). Accessory files
+            // like `LoincPartLink_Primary.csv`, `LoincParts.csv`, or
+            // `LoincUniversalLabOrdersValueSet.csv` would be false positives
+            // for a looser prefix match.
+            if filename == "loinc.csv" || filename == "loinctable.csv" {
                 loinc_path = Some(name);
             } else if filename.contains("multiaxial") || filename.contains("componenthierarchy") {
                 hierarchy_path = Some(name);
@@ -580,6 +583,45 @@ LP7786-3.LP10156-0.718-7,3,LP10156-0,718-7,Hemoglobin\r\n";
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn import_loinc_ignores_accessory_loinc_files() {
+        // Reproduces tx-ecosystem subset layout: real table at
+        // `LoincTable/Loinc.csv`, with `AccessoryFiles/PartFile/LoincPartLink_Primary.csv`
+        // alongside. The accessory file's name starts with "loinc" but isn't
+        // the main table — picking it would fail with "LOINC_NUM not found".
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+
+        let tmp = NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+
+            zip.start_file("AccessoryFiles/PartFile/LoincPartLink_Primary.csv", opts)
+                .unwrap();
+            zip.write_all(b"LinkTypeName,LoincNumber,PartNumber\r\n")
+                .unwrap();
+
+            zip.start_file("LoincTable/Loinc.csv", opts).unwrap();
+            zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();
+
+            zip.start_file(
+                "AccessoryFiles/ComponentHierarchyBySystem/ComponentHierarchyBySystem.csv",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(HIERARCHY_CSV.as_bytes()).unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let stats = import_loinc_csv(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .expect("should pick LoincTable/Loinc.csv, not the accessory file");
+        assert_eq!(stats.concepts, 6);
+        assert_eq!(count_rows(&backend, "concepts"), 6);
     }
 
     #[tokio::test]
