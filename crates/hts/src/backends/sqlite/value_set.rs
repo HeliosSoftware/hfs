@@ -827,10 +827,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 &req.code,
                                 req.system.as_deref(),
                             )?;
-                            let abstract_for_msg = found
-                                .as_ref()
-                                .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
-                                .unwrap_or(false);
+                            let abstract_for_msg = req.include_abstract == Some(false)
+                                && found
+                                    .as_ref()
+                                    .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
+                                    .unwrap_or(false);
                             return finish_validate_code_response(
                                 found,
                                 &req.code,
@@ -886,10 +887,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .system
                 .clone()
                 .or_else(|| found.as_ref().map(|c| c.system.clone()));
-            let abstract_for_msg = found
-                .as_ref()
-                .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
-                .unwrap_or(false);
+            let abstract_for_msg = req.include_abstract == Some(false)
+                && found
+                    .as_ref()
+                    .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
+                    .unwrap_or(false);
             finish_validate_code_response(
                 found,
                 &req.code,

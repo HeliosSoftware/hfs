@@ -82,6 +82,12 @@ pub struct ValidateCodeRequest {
     pub version: Option<String>,
     /// Expected display; if provided the response includes whether it matches.
     pub display: Option<String>,
+    /// FHIR `abstract` parameter — when explicitly false, abstract concepts
+    /// (those with `notSelectable=true`) are rejected with a "code is
+    /// abstract, and not allowed in this context" message. None / true mean
+    /// abstract concepts pass when the VS otherwise contains them.
+    #[serde(default)]
+    pub include_abstract: Option<bool>,
     /// Point-in-time date for evaluation (ISO-8601).
     #[serde(default)]
     pub date: Option<String>,

@@ -168,6 +168,10 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             version: find_str_param(&params, "version"),
             display: find_str_param(&params, "display"),
             date: find_str_param(&params, "date"),
+            include_abstract: params
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
+                .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
         let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
         return Ok(build_validate_response_async(
@@ -190,6 +194,10 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             version: find_str_param(&params, "version"),
             display: find_str_param(&params, "display"),
             date: find_str_param(&params, "date"),
+            include_abstract: params
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
+                .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
         let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
         return Ok(build_validate_response_async(
@@ -228,6 +236,10 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 version: find_str_param(&params, "version"),
                 display: None,
                 date: find_str_param(&params, "date"),
+                include_abstract: params
+                    .iter()
+                    .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
+                    .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
             };
             let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
             if resp.result {
@@ -330,6 +342,10 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             version: find_str_param(&params, "version"),
             display: find_str_param(&params, "display"),
             date: find_str_param(&params, "date"),
+            include_abstract: params
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
+                .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
         let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
         return Ok(build_validate_response_async(
@@ -352,6 +368,10 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             version: find_str_param(&params, "version"),
             display: find_str_param(&params, "display"),
             date: find_str_param(&params, "date"),
+            include_abstract: params
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
+                .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
         let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
         return Ok(build_validate_response_async(
@@ -389,6 +409,10 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 version: find_str_param(&params, "version"),
                 display: None,
                 date: find_str_param(&params, "date"),
+                include_abstract: params
+                    .iter()
+                    .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
+                    .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
             };
             let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req).await?;
             if resp.result {
