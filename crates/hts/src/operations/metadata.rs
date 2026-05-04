@@ -103,6 +103,10 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
         .collect();
 
     let caps = TerminologyCapabilities {
+        version: Some(Element {
+            value: Some(HTS_VERSION.to_string()),
+            ..Default::default()
+        }),
         status: Element {
             value: Some("active".to_string()),
             ..Default::default()
@@ -311,47 +315,30 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "CodeSystem",
                     "interaction": interactions,
-                    "searchParam": search_params
+                    "searchParam": search_params,
+                    "operation": [
+                        {"name": "lookup", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"},
+                        {"name": "validate-code", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"},
+                        {"name": "subsumes", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-subsumes"}
+                    ]
                 },
                 {
                     "type": "ValueSet",
                     "interaction": interactions,
-                    "searchParam": search_params
+                    "searchParam": search_params,
+                    "operation": [
+                        {"name": "expand", "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"},
+                        {"name": "validate-code", "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-validate-code"}
+                    ]
                 },
                 {
                     "type": "ConceptMap",
                     "interaction": interactions,
-                    "searchParam": search_params
-                }
-            ],
-            "operation": [
-                {
-                    "name": "lookup",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"
-                },
-                {
-                    "name": "validate-code",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"
-                },
-                {
-                    "name": "subsumes",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-subsumes"
-                },
-                {
-                    "name": "expand",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"
-                },
-                {
-                    "name": "validate-code",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-validate-code"
-                },
-                {
-                    "name": "translate",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"
-                },
-                {
-                    "name": "closure",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-closure"
+                    "searchParam": search_params,
+                    "operation": [
+                        {"name": "translate", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"},
+                        {"name": "closure", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-closure"}
+                    ]
                 }
             ]
         }]
@@ -505,8 +492,19 @@ mod tests {
     #[test]
     fn capability_statement_lists_all_operations() {
         let cs = build_capability_statement(&backend());
-        let ops = cs["rest"][0]["operation"].as_array().unwrap();
-        let names: Vec<&str> = ops.iter().filter_map(|o| o["name"].as_str()).collect();
+        // Operations are now declared per-resource (FHIR-conformant) instead
+        // of at the rest level; flatten across resources to verify they're
+        // all advertised somewhere.
+        let mut names: Vec<String> = Vec::new();
+        for r in cs["rest"][0]["resource"].as_array().unwrap() {
+            if let Some(ops) = r.get("operation").and_then(|v| v.as_array()) {
+                for op in ops {
+                    if let Some(n) = op.get("name").and_then(|v| v.as_str()) {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+        }
         for expected in [
             "lookup",
             "validate-code",
@@ -515,7 +513,10 @@ mod tests {
             "translate",
             "closure",
         ] {
-            assert!(names.contains(&expected), "missing operation '{expected}'");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing operation '{expected}'"
+            );
         }
     }
 
