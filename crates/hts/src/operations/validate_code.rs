@@ -46,10 +46,14 @@ fn build_validate_response(
     code: Option<&str>,
     system: Option<&str>,
     version: Option<&str>,
+    codeable_concept: Option<&Value>,
 ) -> Value {
     let mut parameter: Vec<Value> = Vec::new();
     if let Some(c) = code {
         parameter.push(json!({"name": "code", "valueCode": c}));
+    }
+    if let Some(cc) = codeable_concept {
+        parameter.push(json!({"name": "codeableConcept", "valueCodeableConcept": cc}));
     }
     if let Some(display) = resp.display {
         parameter.push(json!({"name": "display", "valueString": display}));
@@ -78,6 +82,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     resp: ValidateCodeResponse,
     code: Option<&str>,
     system: Option<&str>,
+    codeable_concept: Option<&Value>,
 ) -> Value {
     let version = if let Some(s) = system {
         backend
@@ -88,7 +93,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     } else {
         None
     };
-    build_validate_response(resp, code, system, version.as_deref())
+    build_validate_response(resp, code, system, version.as_deref(), codeable_concept)
 }
 
 /// Core validate-code logic for `CodeSystem/$validate-code`.
@@ -140,6 +145,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             Some(&system),
+            None,
         )
         .await);
     }
@@ -161,6 +167,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             Some(&system),
+            None,
         )
         .await);
     }
@@ -172,6 +179,12 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 "codeableConcept parameter has no valid coding entries".into(),
             ));
         }
+        // Capture the original valueCodeableConcept so we can echo it in the response.
+        let cc_value = params
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
+            .and_then(|p| p.get("valueCodeableConcept"))
+            .cloned();
         for (system, code) in codings {
             let req = ValidateCodeRequest {
                 url: None,
@@ -189,6 +202,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                     resp,
                     Some(&code),
                     Some(&system),
+                    cc_value.as_ref(),
                 )
                 .await);
             }
@@ -203,6 +217,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             None,
             None,
             None,
+            cc_value.as_ref(),
         ));
     }
 
@@ -288,6 +303,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             system.as_deref(),
+            None,
         )
         .await);
     }
@@ -309,6 +325,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             Some(&system),
+            None,
         )
         .await);
     }
@@ -320,6 +337,11 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 "codeableConcept parameter has no valid coding entries".into(),
             ));
         }
+        let cc_value = params
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
+            .and_then(|p| p.get("valueCodeableConcept"))
+            .cloned();
         for (system, code) in codings {
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),
@@ -337,6 +359,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     resp,
                     Some(&code),
                     Some(&system),
+                    cc_value.as_ref(),
                 )
                 .await);
             }
@@ -350,6 +373,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             None,
             None,
             None,
+            cc_value.as_ref(),
         ));
     }
 
