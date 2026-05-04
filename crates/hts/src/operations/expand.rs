@@ -591,6 +591,7 @@ async fn process_expand<B: TerminologyBackend>(
             // verbatim produces "unexpected property" diffs.
             for field in [
                 "id",
+                "language",
                 "url",
                 "version",
                 "name",
