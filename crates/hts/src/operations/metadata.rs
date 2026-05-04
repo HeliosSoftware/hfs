@@ -24,9 +24,9 @@ use serde_json::{Value, json};
 #[cfg(feature = "R4")]
 use helios_fhir::r4::{
     TerminologyCapabilities, TerminologyCapabilitiesClosure, TerminologyCapabilitiesCodeSystem,
-    TerminologyCapabilitiesExpansion, TerminologyCapabilitiesImplementation,
-    TerminologyCapabilitiesSoftware, TerminologyCapabilitiesTranslation,
-    TerminologyCapabilitiesValidateCode,
+    TerminologyCapabilitiesExpansion, TerminologyCapabilitiesExpansionParameter,
+    TerminologyCapabilitiesImplementation, TerminologyCapabilitiesSoftware,
+    TerminologyCapabilitiesTranslation, TerminologyCapabilitiesValidateCode,
 };
 #[cfg(feature = "R4")]
 use helios_fhir::{Element, PrecisionDateTime};
@@ -156,6 +156,41 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
                 value: Some(false),
                 ..Default::default()
             }),
+            // The IG fixtures expect an `expansion.parameter` array listing
+            // every $expand parameter we honor; the entries are alphabetised
+            // by the validator so insertion order doesn't matter.
+            parameter: Some(
+                [
+                    "activeOnly",
+                    "check-system-version",
+                    "count",
+                    "date",
+                    "default-valueset-version",
+                    "displayLanguage",
+                    "excludeNested",
+                    "excludeSystem",
+                    "filter",
+                    "force-system-version",
+                    "hierarchical",
+                    "includeDefinition",
+                    "includeDesignations",
+                    "limitedExpansion",
+                    "offset",
+                    "system-version",
+                    "url",
+                    "valueSet",
+                    "valueSetVersion",
+                ]
+                .iter()
+                .map(|name| TerminologyCapabilitiesExpansionParameter {
+                    name: Element {
+                        value: Some((*name).to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            ),
             ..Default::default()
         }),
         validate_code: Some(TerminologyCapabilitiesValidateCode {
