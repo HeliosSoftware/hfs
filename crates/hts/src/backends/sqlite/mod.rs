@@ -45,6 +45,16 @@ pub(crate) type ImplicitIndex = Arc<RwLock<HashMap<String, Arc<value_set::Implic
 pub(crate) type InlineComposeIndex =
     Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
 
+/// Shared in-memory index for property-filtered inline ValueSet expansions.
+///
+/// Keyed by `"prop-result:{fnv64-hex}"` of the compose body.  Populated on
+/// the first expansion of a compose that uses property= + hierarchy filters
+/// (EX08 pattern).  Stores the FULL property-matched concept set (no text
+/// filter); subsequent requests apply the text filter in Rust, eliminating
+/// `spawn_blocking` and r2d2 pool contention under high concurrency.
+pub(crate) type PropertyResultCache =
+    Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
+
 /// SQLite-backed terminology service backend.
 ///
 /// Wraps an r2d2 connection pool. Schema migrations are applied automatically
@@ -82,6 +92,16 @@ pub struct SqliteTerminologyBackend {
     /// existing cache rows, so that repeated requests (e.g. k6 benchmark VUs)
     /// bypass `spawn_blocking` entirely once the index is warm.
     pub(crate) inline_compose_index: InlineComposeIndex,
+
+    /// In-process concept index for property-filtered inline ValueSet expansions.
+    ///
+    /// Keyed by `"prop-result:{fnv64-hex}"` of the compose body.  Populated on
+    /// the first expansion that has property= + hierarchy compose filters (e.g.
+    /// EX08: SNOMED finding-site + is-a + text).  The cached set contains ALL
+    /// property-matched concepts (no text filter); subsequent requests with the
+    /// same compose but a different text filter apply the filter in Rust,
+    /// bypassing `spawn_blocking` and r2d2 pool contention entirely.
+    pub(crate) property_result_cache: PropertyResultCache,
 }
 
 impl SqliteTerminologyBackend {
@@ -121,6 +141,7 @@ impl SqliteTerminologyBackend {
         // Declare early so the init block can pre-warm the in-memory indexes.
         let implicit_index: ImplicitIndex = Arc::new(RwLock::new(HashMap::new()));
         let inline_compose_index: InlineComposeIndex = Arc::new(RwLock::new(HashMap::new()));
+        let property_result_cache: PropertyResultCache = Arc::new(RwLock::new(HashMap::new()));
 
         // Bootstrap: apply WAL + schema on a single connection.
         {
@@ -191,6 +212,7 @@ impl SqliteTerminologyBackend {
             implicit_index,
             bg_index_pending: Arc::new(Mutex::new(HashSet::new())),
             inline_compose_index,
+            property_result_cache,
         })
     }
 
@@ -234,6 +256,7 @@ impl SqliteTerminologyBackend {
             implicit_index: Arc::new(RwLock::new(HashMap::new())),
             bg_index_pending: Arc::new(Mutex::new(HashSet::new())),
             inline_compose_index: Arc::new(RwLock::new(HashMap::new())),
+            property_result_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -309,6 +332,7 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         let data_vec = data.to_vec();
         let implicit_index = self.implicit_index.clone();
         let inline_compose_index = self.inline_compose_index.clone();
+        let property_result_cache = self.property_result_cache.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             crate::import::fhir_bundle::import_bundle_sync(&pool, &data_vec)
@@ -316,12 +340,15 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?;
 
-        // Evict both in-memory indexes so the next expand re-reads fresh data.
+        // Evict all in-memory indexes so the next expand re-reads fresh data.
         if result.is_ok() {
             if let Ok(mut guard) = implicit_index.write() {
                 guard.clear();
             }
             if let Ok(mut guard) = inline_compose_index.write() {
+                guard.clear();
+            }
+            if let Ok(mut guard) = property_result_cache.write() {
                 guard.clear();
             }
         }

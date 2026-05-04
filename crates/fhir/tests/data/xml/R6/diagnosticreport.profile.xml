@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="DiagnosticReport"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -550,9 +550,7 @@
             <span title="DiagnosticReport.media : A list of key images or data associated with this report. The images or data are generally created during the diagnostic process, and may be directly of the patient, or of treated specimens (i.e. slides of interest).">media</span>
             <a name="DiagnosticReport.media"> </a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
-          </td>
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..*</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="types.html#BackBoneElement">BackboneElement</a>
@@ -591,9 +589,7 @@
             <span title="DiagnosticReport.media.link : Reference to the image or data source.">link</span>
             <a name="DiagnosticReport.media.link"> </a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
-          </td>
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">1..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="references.html#Reference">Reference</a>(
@@ -633,7 +629,9 @@
             <span title="DiagnosticReport.conclusion : Concise and clinically contextualized summary conclusion (interpretation/impression) of the diagnostic report.">conclusion</span>
             <a name="DiagnosticReport.conclusion"> </a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
+            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
+          </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#markdown">markdown</a>
@@ -651,7 +649,9 @@
             <span title="DiagnosticReport.conclusionCode : One or more codes and/or references that represent the summary conclusion (interpretation/impression) of the diagnostic report.">conclusionCode</span>
             <a name="DiagnosticReport.conclusionCode"> </a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
+            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
+          </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..*</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="references.html#CodeableReference">CodeableReference</a>(
@@ -672,8 +672,8 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="DiagnosticReport.recomendation : Proposed follow-up actions based on the findings and interpretations of the diagnostic test for which this report is the subject.">recomendation</span>
-            <a name="DiagnosticReport.recomendation"> </a>
+            <span title="DiagnosticReport.recommendation : Proposed follow-up actions based on the findings and interpretations of the diagnostic test for which this report is the subject.">recommendation</span>
+            <a name="DiagnosticReport.recommendation"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -778,11 +778,11 @@
     <valueCode value="patient"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/DiagnosticReport"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="DiagnosticReport"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-05-01T16:46:36+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -805,7 +805,7 @@
     </coding>
   </jurisdiction>
   <purpose value="To support reporting for any diagnostic report into a clinical data repository."/>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -1028,7 +1028,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1288,7 +1288,7 @@
         </extension>
         <strength value="required"/>
         <description value="The status of the diagnostic report."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/diagnostic-report-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/diagnostic-report-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -2125,7 +2125,7 @@
       </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
-      <isSummary value="true"/>
+      <isSummary value="false"/>
       <mapping>
         <identity value="v2"/>
         <map value="OBX?"/>
@@ -2282,7 +2282,7 @@
       </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
-      <isSummary value="true"/>
+      <isSummary value="false"/>
       <mapping>
         <identity value="rim"/>
         <map value=".value.reference"/>
@@ -2345,7 +2345,7 @@
       </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
-      <isSummary value="false"/>
+      <isSummary value="true"/>
       <mapping>
         <identity value="v2"/>
         <map value="OBX"/>
@@ -2380,7 +2380,7 @@
       </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
-      <isSummary value="false"/>
+      <isSummary value="true"/>
       <binding>
         <extension url="http://hl7.org/fhir/tools/StructureDefinition/binding-definition">
           <valueMarkdown value="Diagnosis codes provided as adjuncts to the report."/>
@@ -2401,15 +2401,15 @@
         <map value="inboundRelationship[typeCode=SPRT].source[classCode=OBS, moodCode=EVN, code=LOINC:54531-9].value (type=CD)"/>
       </mapping>
     </element>
-    <element id="DiagnosticReport.recomendation">
-      <path value="DiagnosticReport.recomendation"/>
+    <element id="DiagnosticReport.recommendation">
+      <path value="DiagnosticReport.recommendation"/>
       <short value="Recommendations based on findings and interpretations"/>
       <definition value="Proposed follow-up actions based on the findings and interpretations of the diagnostic test for which this report is the subject."/>
       <comment value="The resources that should be referenced include CarePlan, ServiceRequest, CommunicationRequest, etc. that allow for proposed actions and next steps."/>
       <min value="0"/>
       <max value="*"/>
       <base>
-        <path value="DiagnosticReport.recomendation"/>
+        <path value="DiagnosticReport.recommendation"/>
         <min value="0"/>
         <max value="*"/>
       </base>
@@ -2653,7 +2653,7 @@
         </extension>
         <strength value="required"/>
         <description value="The status of the diagnostic report."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/diagnostic-report-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/diagnostic-report-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -3182,7 +3182,7 @@
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
-      <isSummary value="true"/>
+      <isSummary value="false"/>
       <mapping>
         <identity value="v2"/>
         <map value="OBX?"/>
@@ -3223,7 +3223,7 @@
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
-      <isSummary value="true"/>
+      <isSummary value="false"/>
       <mapping>
         <identity value="rim"/>
         <map value=".value.reference"/>
@@ -3262,7 +3262,7 @@
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
-      <isSummary value="false"/>
+      <isSummary value="true"/>
       <mapping>
         <identity value="v2"/>
         <map value="OBX"/>
@@ -3285,7 +3285,7 @@
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
-      <isSummary value="false"/>
+      <isSummary value="true"/>
       <binding>
         <extension url="http://hl7.org/fhir/tools/StructureDefinition/binding-definition">
           <valueMarkdown value="Diagnosis codes provided as adjuncts to the report."/>
@@ -3306,8 +3306,8 @@
         <map value="inboundRelationship[typeCode=SPRT].source[classCode=OBS, moodCode=EVN, code=LOINC:54531-9].value (type=CD)"/>
       </mapping>
     </element>
-    <element id="DiagnosticReport.recomendation">
-      <path value="DiagnosticReport.recomendation"/>
+    <element id="DiagnosticReport.recommendation">
+      <path value="DiagnosticReport.recommendation"/>
       <short value="Recommendations based on findings and interpretations"/>
       <definition value="Proposed follow-up actions based on the findings and interpretations of the diagnostic test for which this report is the subject."/>
       <comment value="The resources that should be referenced include CarePlan, ServiceRequest, CommunicationRequest, etc. that allow for proposed actions and next steps."/>

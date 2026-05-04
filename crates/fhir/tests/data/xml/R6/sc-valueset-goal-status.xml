@@ -95,6 +95,13 @@
           </td>
           <td>abandoned</td>
         </tr>
+        <tr>
+          <td>unknown</td>
+          <td>
+            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+          </td>
+          <td>unknown</td>
+        </tr>
       </table>
     </div>
   </text>
@@ -189,6 +196,13 @@
       <code value="cancelled"/>
       <target>
         <code value="abandoned"/>
+        <relationship value="equivalent"/>
+      </target>
+    </element>
+    <element>
+      <code value="unknown"/>
+      <target>
+        <code value="unknown"/>
         <relationship value="equivalent"/>
       </target>
     </element>

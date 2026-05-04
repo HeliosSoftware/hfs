@@ -597,7 +597,6 @@
       <path value="Provenance.authorization"/>
       <short value="Authorization (purposeOfUse) related to the event"/>
       <definition value="The authorization (e.g., PurposeOfUse) that was used during the event being recorded."/>
-      <comment value="Plain text reasons can be sent in the &quot;text&quot; component with no codings.  Domains MAY wish to define a constrained terminology.  The authorization for the resource's existence of the resource itself will be maintained on the resource, not here."/>
       <requirements value="Record of any relevant security context, not restricted to purposeOfUse valueSet. May include security compartments, refrain, obligation, or other security tags."/>
       <alias value="PurposeOfEvent"/>
       <min value="0"/>
@@ -608,7 +607,7 @@
         <max value="*"/>
       </base>
       <type>
-        <code value="CodeableReference"/>
+        <code value="CodeableConcept"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -617,7 +616,7 @@
         <expression value="hasValue() or (children().count() &gt; id.count())"/>
         <source value="http://hl7.org/fhir/StructureDefinition/Element"/>
       </constraint>
-      <mustSupport value="true"/>
+      <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
       <binding>
@@ -649,6 +648,7 @@
       <path value="Provenance.why"/>
       <short value="Why was the event performed?"/>
       <definition value="Describes why the event recorded in this provenenace occurred in textual form."/>
+      <comment value="Plain/Markdown text reasons the action occurred."/>
       <alias value="reason"/>
       <min value="0"/>
       <max value="1"/>
@@ -667,7 +667,7 @@
         <expression value="hasValue() or (children().count() &gt; id.count())"/>
         <source value="http://hl7.org/fhir/StructureDefinition/Element"/>
       </constraint>
-      <mustSupport value="false"/>
+      <mustSupport value="true"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
       <mapping>
@@ -1716,7 +1716,7 @@
     </element>
     <element id="Provenance.entity.role">
       <path value="Provenance.entity.role"/>
-      <short value="revision | quotation | source | instantiates | removal"/>
+      <short value="revision | quotation | source | instantiates | removal | other"/>
       <definition value="How the entity was used during the activity."/>
       <min value="1"/>
       <max value="1"/>
@@ -1885,9 +1885,9 @@
       </type>
       <mustSupport value="true"/>
     </element>
-    <element id="Provenance.authorization">
-      <path value="Provenance.authorization"/>
-      <comment value="Plain text reasons can be sent in the &quot;text&quot; component with no codings.  Domains MAY wish to define a constrained terminology.  The authorization for the resource's existence of the resource itself will be maintained on the resource, not here."/>
+    <element id="Provenance.why">
+      <path value="Provenance.why"/>
+      <comment value="Plain/Markdown text reasons the action occurred."/>
       <mustSupport value="true"/>
     </element>
     <element id="Provenance.activity">

@@ -2,7 +2,11 @@
   "resourceType": "Bundle",
   "id": "profiles-others",
   "meta": {
+<<<<<<< Updated upstream
     "lastUpdated": "2025-12-17T09:50:17.012+00:00",
+=======
+    "lastUpdated": "2026-05-01T16:46:36.632+00:00",
+>>>>>>> Stashed changes
     "tag": [
       {
         "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
@@ -160,13 +164,6 @@
                   "severity": "error",
                   "human": "Can have age[x] or born[x], but not both",
                   "expression": "age.empty() or born.empty()",
-                  "source": "http://hl7.org/fhir/StructureDefinition/FamilyMemberHistory"
-                },
-                {
-                  "key": "fhs-2",
-                  "severity": "error",
-                  "human": "Can only have estimatedAge if age[x] is present",
-                  "expression": "age.exists() or estimatedAge.empty()",
                   "source": "http://hl7.org/fhir/StructureDefinition/FamilyMemberHistory"
                 },
                 {
@@ -1164,7 +1161,6 @@
               "path": "FamilyMemberHistory.age[x]",
               "short": "(approximate) age",
               "definition": "The age of the relative at the time the family member history is recorded.",
-              "comment": "use estimatedAge to indicate whether the age is actual or not.",
               "requirements": "While age can be calculated from date of birth, sometimes recording age directly is more natural for clinicians.",
               "min": 0,
               "max": "1",
@@ -1185,7 +1181,6 @@
                 }
               ],
               "condition": [
-                "fhs-2",
                 "fhs-1",
                 "fhs-3"
               ],
@@ -1207,42 +1202,6 @@
                   "map": "participation[typeCode\u003dSBJ].act[classCode\u003dOBS,moodCode\u003dEVN, code\u003d\"age\"].value"
                 }
               ]
-            },
-            {
-              "id": "FamilyMemberHistory.estimatedAge",
-              "path": "FamilyMemberHistory.estimatedAge",
-              "short": "Age is estimated?",
-              "definition": "If true, indicates that the age value specified is an estimated value.",
-              "comment": "This element is labeled as a modifier because the fact that age is estimated can/should change the results of any algorithm that calculates based on the specified age.",
-              "requirements": "Clinicians often prefer to specify an estimaged age rather than an age range.",
-              "min": 0,
-              "max": "1",
-              "base": {
-                "path": "FamilyMemberHistory.estimatedAge",
-                "min": 0,
-                "max": "1"
-              },
-              "type": [
-                {
-                  "code": "boolean"
-                }
-              ],
-              "meaningWhenMissing": "It is unknown whether the age is an estimate or not",
-              "condition": [
-                "fhs-2"
-              ],
-              "constraint": [
-                {
-                  "key": "ele-1",
-                  "severity": "error",
-                  "human": "All FHIR elements must have a @value or children",
-                  "expression": "hasValue() or (children().count() \u003e id.count())",
-                  "source": "http://hl7.org/fhir/StructureDefinition/Element"
-                }
-              ],
-              "mustSupport": false,
-              "isModifier": false,
-              "isSummary": true
             },
             {
               "id": "FamilyMemberHistory.deceased[x]",
@@ -2928,7 +2887,6 @@
               "path": "Provenance.authorization",
               "short": "Authorization (purposeOfUse) related to the event",
               "definition": "The authorization (e.g., PurposeOfUse) that was used during the event being recorded.",
-              "comment": "Plain text reasons can be sent in the \"text\" component with no codings.  Domains MAY wish to define a constrained terminology.  The authorization for the resource\u0027s existence of the resource itself will be maintained on the resource, not here.",
               "requirements": "Record of any relevant security context, not restricted to purposeOfUse valueSet. May include security compartments, refrain, obligation, or other security tags.",
               "alias": [
                 "PurposeOfEvent"
@@ -2942,7 +2900,7 @@
               },
               "type": [
                 {
-                  "code": "CodeableReference"
+                  "code": "CodeableConcept"
                 }
               ],
               "constraint": [
@@ -2954,7 +2912,7 @@
                   "source": "http://hl7.org/fhir/StructureDefinition/Element"
                 }
               ],
-              "mustSupport": true,
+              "mustSupport": false,
               "isModifier": false,
               "isSummary": false,
               "binding": {
@@ -2992,6 +2950,7 @@
               "path": "Provenance.why",
               "short": "Why was the event performed?",
               "definition": "Describes why the event recorded in this provenenace occurred in textual form.",
+              "comment": "Plain/Markdown text reasons the action occurred.",
               "alias": [
                 "reason"
               ],
@@ -3016,7 +2975,7 @@
                   "source": "http://hl7.org/fhir/StructureDefinition/Element"
                 }
               ],
-              "mustSupport": false,
+              "mustSupport": true,
               "isModifier": false,
               "isSummary": false,
               "mapping": [
@@ -4304,7 +4263,7 @@
             {
               "id": "Provenance.entity.role",
               "path": "Provenance.entity.role",
-              "short": "revision | quotation | source | instantiates | removal",
+              "short": "revision | quotation | source | instantiates | removal | other",
               "definition": "How the entity was used during the activity.",
               "min": 1,
               "max": "1",
@@ -4511,9 +4470,9 @@
               "mustSupport": true
             },
             {
-              "id": "Provenance.authorization",
-              "path": "Provenance.authorization",
-              "comment": "Plain text reasons can be sent in the \"text\" component with no codings.  Domains MAY wish to define a constrained terminology.  The authorization for the resource\u0027s existence of the resource itself will be maintained on the resource, not here.",
+              "id": "Provenance.why",
+              "path": "Provenance.why",
+              "comment": "Plain/Markdown text reasons the action occurred.",
               "mustSupport": true
             },
             {
@@ -50860,7 +50819,11 @@
         "title": "History bundle",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "description": "This profile holds all the requirements and constraints related to a FHIR history bundle.",
         "fhirVersion": "6.0.0-ballot3",
         "mapping": [
@@ -58807,7 +58770,11 @@
         "title": "Search Set Bundle",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -63215,7 +63182,11 @@
         "title": "Subscription Notification bundle",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -67614,7 +67585,11 @@
         "title": "Batch bundle",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -76791,7 +76766,11 @@
         "title": "Batch response bundle",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -78822,7 +78801,11 @@
         "title": "Transaction bundle",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -87999,7 +87982,11 @@
         "title": "Transaction response bundle",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -90030,7 +90017,11 @@
         "title": "Document bundle",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {

@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Invoice"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -639,11 +639,11 @@
     <valueCode value="patient"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Invoice"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="Invoice"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-05-01T16:46:36+00:00"/>
   <publisher value="HL7 International / Financial Management"/>
   <contact>
     <telecom>
@@ -665,7 +665,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -873,7 +873,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1080,7 +1080,7 @@
         </extension>
         <strength value="required"/>
         <description value="Codes identifying the lifecycle stage of an Invoice."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/invoice-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/invoice-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -2038,7 +2038,7 @@
         </extension>
         <strength value="required"/>
         <description value="Codes identifying the lifecycle stage of an Invoice."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/invoice-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/invoice-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="w5"/>

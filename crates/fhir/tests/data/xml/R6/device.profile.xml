@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Device"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -314,7 +314,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <span title="Device.biologicalSourceEvent : A production identifier of the donation, collection, or pooling event from which biological material in this device was derived.">biologicalSourceEvent</span>
+            <span title="Device.biologicalSourceEvent : A production identifier of the donor, donation, or pooling event associated with the biological material incorporated into the device.">biologicalSourceEvent</span>
             <a name="Device.biologicalSourceEvent"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -322,7 +322,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#Identifier">Identifier</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">A production identifier of the donation, collection, or pooling event from which biological material in this device was derived
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">A production identifier of the donor, donation, or pooling event associated with the biological material incorporated into the device
             <br/>
           </td>
         </tr>
@@ -493,7 +493,6 @@
             <a name="Device.name.display"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="conformance-rules.html#isModifier" title="This element is a modifier element">?!</a>
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
             <a style="padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;; padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;" href="conformance-rules.html#constraints" title="This element has or is affected by some invariants">C</a>
           </td>
@@ -1128,11 +1127,11 @@
     <valueCode value="business"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Device"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="Device"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-05-01T16:46:36+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -1155,7 +1154,7 @@
     </coding>
   </jurisdiction>
   <purpose value="Allows institutions to track their devices."/>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="w5"/>
     <uri value="http://hl7.org/fhir/fivews"/>
@@ -1386,7 +1385,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -2030,7 +2029,7 @@
         </extension>
         <strength value="required"/>
         <description value="Codes to identify how UDI data was entered."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/udi-entry-type|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/udi-entry-type|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="btle"/>
@@ -2072,7 +2071,7 @@
         </extension>
         <strength value="required"/>
         <description value="The record status of the device."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/device-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/device-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -2126,8 +2125,8 @@
     </element>
     <element id="Device.biologicalSourceEvent">
       <path value="Device.biologicalSourceEvent"/>
-      <short value="A production identifier of the donation, collection, or pooling event from which biological material in this device was derived"/>
-      <definition value="A production identifier of the donation, collection, or pooling event from which biological material in this device was derived."/>
+      <short value="A production identifier of the donor, donation, or pooling event associated with the biological material incorporated into the device"/>
+      <definition value="A production identifier of the donor, donation, or pooling event associated with the biological material incorporated into the device."/>
       <comment value="Necessary to support mandatory requirements for traceability from donor/source to recipient and vice versa, while also satisfying donor anonymity requirements. The element is defined consistently across BiologicallyDerivedProduct, NutritionProduct, and Device.  The identifier references an event that links to a single biological entity such as a blood donor, or to multiple biological entities (e.g. when the product is an embryo or a pooled platelet product).  A single biologicalSourceEvent identifier may appear on multiple products of many types derived from a single donation event or source extraction.  As an example, a single donation event may provide 2 kidneys and a liver for organ transplantation, 2 corneas for eye surgery, heart valves and arterial tissue for cardiovascular surgery, multiple skin grafts, tendons, multiple shaped bone grafts and a large number of bone putty/paste products; and each of them may be assigned to the same biological source event identifier."/>
       <alias value="Distinct Identification Code (DIC)"/>
       <min value="0"/>
@@ -2610,8 +2609,7 @@
         <source value="http://hl7.org/fhir/StructureDefinition/Element"/>
       </constraint>
       <mustSupport value="false"/>
-      <isModifier value="true"/>
-      <isModifierReason value="This element is labelled as a modifier because it is a status element that can indicate that that a name is preferred."/>
+      <isModifier value="false"/>
       <isSummary value="true"/>
       <mapping>
         <identity value="w5"/>
@@ -4185,7 +4183,7 @@
         </extension>
         <strength value="required"/>
         <description value="Codes to identify how UDI data was entered."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/udi-entry-type|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/udi-entry-type|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="btle"/>
@@ -4215,7 +4213,7 @@
         </extension>
         <strength value="required"/>
         <description value="The record status of the device."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/device-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/device-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -4257,8 +4255,8 @@
     </element>
     <element id="Device.biologicalSourceEvent">
       <path value="Device.biologicalSourceEvent"/>
-      <short value="A production identifier of the donation, collection, or pooling event from which biological material in this device was derived"/>
-      <definition value="A production identifier of the donation, collection, or pooling event from which biological material in this device was derived."/>
+      <short value="A production identifier of the donor, donation, or pooling event associated with the biological material incorporated into the device"/>
+      <definition value="A production identifier of the donor, donation, or pooling event associated with the biological material incorporated into the device."/>
       <comment value="Necessary to support mandatory requirements for traceability from donor/source to recipient and vice versa, while also satisfying donor anonymity requirements. The element is defined consistently across BiologicallyDerivedProduct, NutritionProduct, and Device.  The identifier references an event that links to a single biological entity such as a blood donor, or to multiple biological entities (e.g. when the product is an embryo or a pooled platelet product).  A single biologicalSourceEvent identifier may appear on multiple products of many types derived from a single donation event or source extraction.  As an example, a single donation event may provide 2 kidneys and a liver for organ transplantation, 2 corneas for eye surgery, heart valves and arterial tissue for cardiovascular surgery, multiple skin grafts, tendons, multiple shaped bone grafts and a large number of bone putty/paste products; and each of them may be assigned to the same biological source event identifier."/>
       <alias value="Distinct Identification Code (DIC)"/>
       <min value="0"/>
@@ -4529,8 +4527,7 @@
       </type>
       <condition value="dev-1"/>
       <mustSupport value="false"/>
-      <isModifier value="true"/>
-      <isModifierReason value="This element is labelled as a modifier because it is a status element that can indicate that that a name is preferred."/>
+      <isModifier value="false"/>
       <isSummary value="true"/>
       <mapping>
         <identity value="w5"/>

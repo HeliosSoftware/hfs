@@ -730,7 +730,6 @@
         "path": "Provenance.authorization",
         "short": "Authorization (purposeOfUse) related to the event",
         "definition": "The authorization (e.g., PurposeOfUse) that was used during the event being recorded.",
-        "comment": "Plain text reasons can be sent in the \"text\" component with no codings.  Domains MAY wish to define a constrained terminology.  The authorization for the resource\u0027s existence of the resource itself will be maintained on the resource, not here.",
         "requirements": "Record of any relevant security context, not restricted to purposeOfUse valueSet. May include security compartments, refrain, obligation, or other security tags.",
         "alias": [
           "PurposeOfEvent"
@@ -744,7 +743,7 @@
         },
         "type": [
           {
-            "code": "CodeableReference"
+            "code": "CodeableConcept"
           }
         ],
         "constraint": [
@@ -756,7 +755,7 @@
             "source": "http://hl7.org/fhir/StructureDefinition/Element"
           }
         ],
-        "mustSupport": true,
+        "mustSupport": false,
         "isModifier": false,
         "isSummary": false,
         "binding": {
@@ -794,6 +793,7 @@
         "path": "Provenance.why",
         "short": "Why was the event performed?",
         "definition": "Describes why the event recorded in this provenenace occurred in textual form.",
+        "comment": "Plain/Markdown text reasons the action occurred.",
         "alias": [
           "reason"
         ],
@@ -818,7 +818,7 @@
             "source": "http://hl7.org/fhir/StructureDefinition/Element"
           }
         ],
-        "mustSupport": false,
+        "mustSupport": true,
         "isModifier": false,
         "isSummary": false,
         "mapping": [
@@ -2106,7 +2106,7 @@
       {
         "id": "Provenance.entity.role",
         "path": "Provenance.entity.role",
-        "short": "revision | quotation | source | instantiates | removal",
+        "short": "revision | quotation | source | instantiates | removal | other",
         "definition": "How the entity was used during the activity.",
         "min": 1,
         "max": "1",
@@ -2313,9 +2313,9 @@
         "mustSupport": true
       },
       {
-        "id": "Provenance.authorization",
-        "path": "Provenance.authorization",
-        "comment": "Plain text reasons can be sent in the \"text\" component with no codings.  Domains MAY wish to define a constrained terminology.  The authorization for the resource\u0027s existence of the resource itself will be maintained on the resource, not here.",
+        "id": "Provenance.why",
+        "path": "Provenance.why",
+        "comment": "Plain/Markdown text reasons the action occurred.",
         "mustSupport": true
       },
       {

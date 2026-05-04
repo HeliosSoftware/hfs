@@ -2,7 +2,11 @@
   "resourceType": "Bundle",
   "id": "types",
   "meta": {
+<<<<<<< Updated upstream
     "lastUpdated": "2025-12-17T09:50:17.012+00:00",
+=======
+    "lastUpdated": "2026-05-01T16:46:36.632+00:00",
+>>>>>>> Stashed changes
     "tag": [
       {
         "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
@@ -19,7 +23,11 @@
         "resourceType": "StructureDefinition",
         "id": "Element",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -44,7 +52,11 @@
         "name": "Element",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -310,7 +322,11 @@
         "resourceType": "StructureDefinition",
         "id": "BackboneElement",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -335,7 +351,11 @@
         "name": "BackboneElement",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -599,7 +619,11 @@
         "resourceType": "StructureDefinition",
         "id": "base64Binary",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -628,7 +652,11 @@
         "name": "base64Binary",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -845,7 +873,11 @@
         "resourceType": "StructureDefinition",
         "id": "boolean",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -870,7 +902,11 @@
         "name": "boolean",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -1085,7 +1121,11 @@
         "resourceType": "StructureDefinition",
         "id": "canonical",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -1118,7 +1158,11 @@
         "name": "canonical",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -1335,7 +1379,11 @@
         "resourceType": "StructureDefinition",
         "id": "code",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -1368,7 +1416,11 @@
         "name": "code",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -1583,7 +1635,11 @@
         "resourceType": "StructureDefinition",
         "id": "date",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -1616,7 +1672,11 @@
         "name": "date",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -1831,7 +1891,11 @@
         "resourceType": "StructureDefinition",
         "id": "dateTime",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -1868,7 +1932,11 @@
         "name": "dateTime",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -2085,7 +2153,11 @@
         "resourceType": "StructureDefinition",
         "id": "decimal",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -2122,7 +2194,11 @@
         "name": "decimal",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -2339,7 +2415,11 @@
         "resourceType": "StructureDefinition",
         "id": "id",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -2368,7 +2448,11 @@
         "name": "id",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -2585,7 +2669,11 @@
         "resourceType": "StructureDefinition",
         "id": "instant",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -2622,7 +2710,11 @@
         "name": "instant",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -2839,7 +2931,11 @@
         "resourceType": "StructureDefinition",
         "id": "integer",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -2872,7 +2968,11 @@
         "name": "integer",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -3093,7 +3193,11 @@
         "resourceType": "StructureDefinition",
         "id": "integer64",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -3126,7 +3230,11 @@
         "name": "integer64",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -3347,7 +3455,11 @@
         "resourceType": "StructureDefinition",
         "id": "markdown",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -3380,7 +3492,11 @@
         "name": "markdown",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -3597,7 +3713,11 @@
         "resourceType": "StructureDefinition",
         "id": "oid",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -3626,7 +3746,11 @@
         "name": "oid",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -3843,7 +3967,11 @@
         "resourceType": "StructureDefinition",
         "id": "positiveInt",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -3876,7 +4004,11 @@
         "name": "positiveInt",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -4093,7 +4225,11 @@
         "resourceType": "StructureDefinition",
         "id": "string",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -4130,7 +4266,11 @@
         "name": "string",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -4349,7 +4489,11 @@
         "resourceType": "StructureDefinition",
         "id": "time",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -4386,7 +4530,11 @@
         "name": "time",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -4601,7 +4749,11 @@
         "resourceType": "StructureDefinition",
         "id": "unsignedInt",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -4634,7 +4786,11 @@
         "name": "unsignedInt",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -4851,7 +5007,11 @@
         "resourceType": "StructureDefinition",
         "id": "uri",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -4884,7 +5044,11 @@
         "name": "uri",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -5101,7 +5265,11 @@
         "resourceType": "StructureDefinition",
         "id": "url",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -5134,7 +5302,11 @@
         "name": "url",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -5349,7 +5521,11 @@
         "resourceType": "StructureDefinition",
         "id": "uuid",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -5378,7 +5554,11 @@
         "name": "uuid",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -5595,7 +5775,11 @@
         "resourceType": "StructureDefinition",
         "id": "xhtml",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -5624,7 +5808,11 @@
         "name": "xhtml",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 FHIR Standard",
         "contact": [
           {
@@ -5836,7 +6024,11 @@
         "resourceType": "StructureDefinition",
         "id": "Address",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -5857,7 +6049,11 @@
         "name": "Address",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -7034,7 +7230,11 @@
         "resourceType": "StructureDefinition",
         "id": "Age",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -7067,7 +7267,11 @@
         "name": "Age",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -7588,7 +7792,11 @@
         "resourceType": "StructureDefinition",
         "id": "Annotation",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -7613,7 +7821,11 @@
         "name": "Annotation",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -8031,7 +8243,11 @@
         "resourceType": "StructureDefinition",
         "id": "Attachment",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -8056,7 +8272,11 @@
         "name": "Attachment",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -9191,7 +9411,11 @@
         "resourceType": "StructureDefinition",
         "id": "Availability",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -9212,7 +9436,11 @@
         "name": "Availability",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -10033,7 +10261,11 @@
         "resourceType": "StructureDefinition",
         "id": "BackboneType",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -10058,7 +10290,11 @@
         "name": "BackboneType",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -10322,7 +10558,11 @@
         "resourceType": "StructureDefinition",
         "id": "Base",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -10347,7 +10587,11 @@
         "name": "Base",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -10440,7 +10684,11 @@
         "resourceType": "StructureDefinition",
         "id": "CodeableConcept",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -10469,7 +10717,11 @@
         "name": "CodeableConcept",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -10852,7 +11104,11 @@
         "resourceType": "StructureDefinition",
         "id": "CodeableReference",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -10885,7 +11141,11 @@
         "name": "CodeableReference",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -11182,7 +11442,11 @@
         "resourceType": "StructureDefinition",
         "id": "Coding",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -11211,7 +11475,11 @@
         "name": "Coding",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -11853,7 +12121,11 @@
         "resourceType": "StructureDefinition",
         "id": "ContactDetail",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -11874,7 +12146,11 @@
         "name": "ContactDetail",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -12149,7 +12425,11 @@
         "resourceType": "StructureDefinition",
         "id": "ContactPoint",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -12170,7 +12450,11 @@
         "name": "ContactPoint",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -12837,7 +13121,11 @@
         "resourceType": "StructureDefinition",
         "id": "Count",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -12862,7 +13150,11 @@
         "name": "Count",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -13347,7 +13639,11 @@
         "resourceType": "StructureDefinition",
         "id": "DataRequirement",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -13368,7 +13664,11 @@
         "name": "DataRequirement",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -15110,7 +15410,11 @@
         "resourceType": "StructureDefinition",
         "id": "DataType",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -15135,7 +15439,11 @@
         "name": "DataType",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -15327,7 +15635,11 @@
         "resourceType": "StructureDefinition",
         "id": "Distance",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -15360,7 +15672,11 @@
         "name": "Distance",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -15881,7 +16197,11 @@
         "resourceType": "StructureDefinition",
         "id": "Dosage",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -15902,7 +16222,11 @@
         "name": "Dosage",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -17403,7 +17727,11 @@
         "resourceType": "StructureDefinition",
         "id": "DosageCondition",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -17424,7 +17752,11 @@
         "name": "DosageCondition",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -18282,7 +18614,11 @@
         "resourceType": "StructureDefinition",
         "id": "DosageDetails",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -18303,7 +18639,11 @@
         "name": "DosageDetails",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -19025,7 +19365,11 @@
         "resourceType": "StructureDefinition",
         "id": "DosageSafety",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -19046,7 +19390,11 @@
         "name": "DosageSafety",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -19663,7 +20011,11 @@
         "resourceType": "StructureDefinition",
         "id": "Duration",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -19696,7 +20048,11 @@
         "name": "Duration",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -20217,7 +20573,11 @@
         "resourceType": "StructureDefinition",
         "id": "ElementDefinition",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -20238,7 +20598,11 @@
         "name": "ElementDefinition",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -28576,7 +28940,11 @@
         "resourceType": "StructureDefinition",
         "id": "Expression",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -28597,7 +28965,11 @@
         "name": "Expression",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -29106,7 +29478,11 @@
         "resourceType": "StructureDefinition",
         "id": "ExtendedContactDetail",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -29127,7 +29503,11 @@
         "name": "ExtendedContactDetail",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -29620,7 +30000,11 @@
         "resourceType": "StructureDefinition",
         "id": "Extension",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -29649,7 +30033,11 @@
         "name": "Extension",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -30309,7 +30697,11 @@
         "resourceType": "StructureDefinition",
         "id": "HumanName",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -30330,7 +30722,11 @@
         "name": "HumanName",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -31099,7 +31495,11 @@
         "resourceType": "StructureDefinition",
         "id": "Identifier",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -31120,7 +31520,11 @@
         "name": "Identifier",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -31890,7 +32294,11 @@
         "resourceType": "StructureDefinition",
         "id": "MarketingStatus",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -31911,7 +32319,11 @@
         "name": "MarketingStatus",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -32370,7 +32782,11 @@
         "resourceType": "StructureDefinition",
         "id": "Meta",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -32391,7 +32807,11 @@
         "name": "Meta",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -32927,7 +33347,11 @@
         "resourceType": "StructureDefinition",
         "id": "MonetaryComponent",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -32960,7 +33384,11 @@
         "name": "MonetaryComponent",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -33378,7 +33806,11 @@
         "resourceType": "StructureDefinition",
         "id": "Money",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -33411,7 +33843,11 @@
         "name": "Money",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -33762,7 +34198,11 @@
         "resourceType": "StructureDefinition",
         "id": "Narrative",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -33787,7 +34227,11 @@
         "name": "Narrative",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -34135,7 +34579,11 @@
         "resourceType": "StructureDefinition",
         "id": "ParameterDefinition",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -34156,7 +34604,11 @@
         "name": "ParameterDefinition",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -34729,7 +35181,11 @@
         "resourceType": "StructureDefinition",
         "id": "Period",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -34750,7 +35206,11 @@
         "name": "Period",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -35117,7 +35577,11 @@
         "resourceType": "StructureDefinition",
         "id": "PrimitiveType",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -35142,7 +35606,11 @@
         "name": "PrimitiveType",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -35334,7 +35802,11 @@
         "resourceType": "StructureDefinition",
         "id": "ProductShelfLife",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -35355,7 +35827,11 @@
         "name": "ProductShelfLife",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -35734,7 +36210,11 @@
         "resourceType": "StructureDefinition",
         "id": "Quantity",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -35771,7 +36251,11 @@
         "name": "Quantity",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -36429,7 +36913,11 @@
         "resourceType": "StructureDefinition",
         "id": "Range",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -36454,7 +36942,11 @@
         "name": "Range",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -36832,7 +37324,11 @@
         "resourceType": "StructureDefinition",
         "id": "Ratio",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -36853,7 +37349,11 @@
         "name": "Ratio",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -37205,7 +37705,11 @@
         "resourceType": "StructureDefinition",
         "id": "RatioRange",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -37230,7 +37734,11 @@
         "name": "RatioRange",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -37681,7 +38189,11 @@
         "resourceType": "StructureDefinition",
         "id": "Reference",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -37706,7 +38218,11 @@
         "name": "Reference",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -38228,7 +38744,11 @@
         "resourceType": "StructureDefinition",
         "id": "RelatedArtifact",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -38249,7 +38769,11 @@
         "name": "RelatedArtifact",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -38908,7 +39432,11 @@
         "resourceType": "StructureDefinition",
         "id": "RelativeTime",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -38929,7 +39457,11 @@
         "name": "RelativeTime",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -39518,7 +40050,11 @@
         "resourceType": "StructureDefinition",
         "id": "SampledData",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -39539,7 +40075,11 @@
         "name": "SampledData",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -40364,7 +40904,11 @@
         "resourceType": "StructureDefinition",
         "id": "Signature",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -40385,7 +40929,11 @@
         "name": "Signature",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -41030,7 +41578,11 @@
         "resourceType": "StructureDefinition",
         "id": "Timing",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -41051,7 +41603,11 @@
         "name": "Timing",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -42918,7 +43474,11 @@
         "resourceType": "StructureDefinition",
         "id": "TriggerDefinition",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -42939,7 +43499,11 @@
         "name": "TriggerDefinition",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -43554,7 +44118,11 @@
         "resourceType": "StructureDefinition",
         "id": "UsageContext",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -43575,7 +44143,11 @@
         "name": "UsageContext",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -43952,7 +44524,11 @@
         "resourceType": "StructureDefinition",
         "id": "VirtualServiceDetail",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -43973,7 +44549,11 @@
         "name": "VirtualServiceDetail",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -44428,7 +45008,11 @@
         "resourceType": "StructureDefinition",
         "id": "MoneyQuantity",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -44469,7 +45053,11 @@
         "name": "MoneyQuantity",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -44937,7 +45525,11 @@
         "resourceType": "StructureDefinition",
         "id": "SimpleQuantity",
         "meta": {
+<<<<<<< Updated upstream
           "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+=======
+          "lastUpdated": "2026-05-01T16:46:36.632+00:00"
+>>>>>>> Stashed changes
         },
         "text": {
           "status": "generated",
@@ -44978,7 +45570,11 @@
         "name": "SimpleQuantity",
         "status": "active",
         "experimental": false,
+<<<<<<< Updated upstream
         "date": "2025-12-17T09:50:17+00:00",
+=======
+        "date": "2026-05-01T16:46:36+00:00",
+>>>>>>> Stashed changes
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {

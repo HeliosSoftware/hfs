@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="MessageHeader"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-05-01T16:46:36.632+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -611,11 +611,11 @@
     <valueCode value="not-classified"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/MessageHeader"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="MessageHeader"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-05-01T16:46:36+00:00"/>
   <publisher value="HL7 International / Infrastructure And Messaging"/>
   <contact>
     <telecom>
@@ -638,7 +638,7 @@
     </coding>
   </jurisdiction>
   <purpose value="Many implementations are not prepared to use REST and need a messaging based infrastructure."/>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -846,7 +846,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1854,7 +1854,7 @@
         </extension>
         <strength value="required"/>
         <description value="The kind of response to a message."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/response-code|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/response-code|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -2393,7 +2393,7 @@
         </extension>
         <strength value="required"/>
         <description value="The kind of response to a message."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/response-code|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/response-code|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="v2"/>

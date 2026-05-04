@@ -12,13 +12,13 @@
       <a name="hcbase2"> </a>
       <h2 id="title"/>
       <ul>
-        <li>Implementation Guide Version: 6.0.0-ballot3 </li>
-        <li>FHIR Version: 6.0.0-ballot3 </li>
+        <li>Implementation Guide Version: 6.0.0-ballot4 </li>
+        <li>FHIR Version: 6.0.0-ballot4 </li>
         <li>Supported Formats: 
           <code>xml</code>, 
           <code>json</code>
         </li>
-        <li>Published on: 2025-11-27T16:48:47Z </li>
+        <li>Published on: 2026-05-01T16:46:36Z </li>
         <li>Published by: HL7 International / FHIR Infrastructure </li>
       </ul>
       <blockquote class="impl-note">
@@ -62,11 +62,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/CapabilityStatement/base2"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="Base FHIR Capability Statement (Empty)"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-05-01T16:46:36+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -79,7 +79,7 @@
   <software>
     <name value="Insert your software name here..."/>
   </software>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <format value="xml"/>
   <format value="json"/>
   <rest>

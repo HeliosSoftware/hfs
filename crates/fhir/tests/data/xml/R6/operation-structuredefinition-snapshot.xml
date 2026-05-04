@@ -102,13 +102,13 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/OperationDefinition/StructureDefinition-snapshot"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="Snapshot"/>
   <title value="Generate Snapshot"/>
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-05-01T16:46:36+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -126,7 +126,7 @@
       <value value="http://www.hl7.org/Special/committees/fiwg"/>
     </telecom>
   </contact>
-  <description value="Generates a [StructureDefinition](structuredefinition.html) instance  with  a snapshot, based on a differential in a specified [StructureDefinition](structuredefinition.html).   &#xA;&#xA;If the operation is not called at the instance level, either *definition* or *url* 'in' parameters must be provided. If more than one is specified, servers may raise an error or may resolve with the parameter of their choice. If called at the instance level, these parameters will be ignored."/>
+  <description value="Generates a [StructureDefinition](structuredefinition.html) instance  with  a snapshot, based on a differential in a specified [StructureDefinition](structuredefinition.html).   &#xA;&#xA;If the operation is not called at the instance level, either *definition* or *url* 'in' parameters must be provided. If more than one is specified, servers may raise an error or may resolve with the parameter of their choice. If called at the instance level, these parameters will be ignored. Snapshot generation is dependent on profiles that are referenced - if those profiles change, the snapshot can change. For a frozen package, $snapshot is idempotent."/>
   <jurisdiction>
     <coding>
       <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
@@ -134,7 +134,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <affectsState value="true"/>
+  <affectsState value="false"/>
   <code value="snapshot"/>
   <resource value="StructureDefinition"/>
   <system value="false"/>

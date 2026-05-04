@@ -196,10 +196,47 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             }
         }
 
+        // ── Async hot path: property result cache warm (EX08 optimisation) ──────
+        // For inline ValueSet requests with a text filter AND property= compose
+        // filters, if the property-matched concept set is already cached in
+        // memory, apply the text filter in Rust without entering spawn_blocking.
+        // This eliminates pool contention for repeated EX08-style combined
+        // property+text queries where only the text term changes between VUs.
+        if let Some(ref vs) = req.value_set {
+            if req.filter.is_some() && req.hierarchical != Some(true) {
+                let prop_key = format!(
+                    "prop-result:{:016x}",
+                    fnv64(vs["compose"].to_string().as_bytes())
+                );
+                if let Ok(guard) = self.property_result_cache.read() {
+                    if let Some(concept_idx) = guard.get(&prop_key).cloned() {
+                        drop(guard);
+                        let filter_lower = req.filter.as_deref().map(|f| f.to_lowercase());
+                        let sql_offset = i64::from(req.offset.unwrap_or(0));
+                        let sql_limit = req.count.map(i64::from).unwrap_or(-1);
+                        let total = count_in_memory(&concept_idx, filter_lower.as_deref());
+                        let page = page_in_memory(
+                            &concept_idx,
+                            filter_lower.as_deref(),
+                            sql_offset,
+                            sql_limit,
+                        );
+                        return Ok(ExpandResponse {
+                            total: Some(total),
+                            offset: req.offset,
+                            contains: page,
+                            warnings: vec![],
+                        });
+                    }
+                }
+            }
+        }
+
         let pool = self.pool().clone();
         let implicit_index = self.implicit_index.clone();
         let bg_index_pending = self.bg_index_pending.clone();
         let inline_compose_index = self.inline_compose_index.clone();
+        let property_result_cache = self.property_result_cache.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -217,7 +254,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 let compose = &vs_resource["compose"];
                 let codes = if let Some(filter) = req.filter.as_deref() {
                     let limit_hint = req.count.map(|c| ((c as usize) * 3).max(100));
-                    expand_inline_filtered(&conn, compose, filter, limit_hint, &mut warnings)?
+                    let compose_str = compose.to_string();
+                    let prop_key = format!("prop-result:{:016x}", fnv64(compose_str.as_bytes()));
+                    expand_inline_filtered(
+                        &conn,
+                        compose,
+                        filter,
+                        limit_hint,
+                        &mut warnings,
+                        Some((&prop_key, &property_result_cache)),
+                    )?
                 } else {
                     let compose_str = compose.to_string();
                     // Cache inline compose expansions so that repeated requests for
@@ -1087,6 +1133,7 @@ fn expand_inline_filtered(
     text_filter: &str,
     limit_hint: Option<usize>,
     warnings: &mut Vec<String>,
+    prop_cache: Option<(&str, &super::PropertyResultCache)>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let empty_arr = vec![];
     let includes = compose["include"].as_array().unwrap_or(&empty_arr);
@@ -1110,6 +1157,39 @@ fn expand_inline_filtered(
             return expand_inline_plain_fts(conn, includes, &filter_lower, limit_hint, warnings);
         }
     }
+
+    // ── Property result cache (EX08 optimisation) ─────────────────────────────
+    // When every include has at least one property= filter and all filters are
+    // batchable (property= or is-a/descendent-of/generalizes), accumulate the
+    // FULL property-matched concept set without applying the text filter in SQL.
+    // After the loop the set is stored in the in-process property_result_cache
+    // keyed by the compose body hash, then the text filter is applied in Rust.
+    //
+    // On subsequent requests for the same compose (different text term) the
+    // async hot path in expand() serves the response entirely from memory
+    // without entering spawn_blocking.
+    let all_prop_cacheable = prop_cache.is_some()
+        && !includes.is_empty()
+        && includes.iter().all(|inc| {
+            let filters = inc["filter"]
+                .as_array()
+                .map(|a| a.as_slice())
+                .unwrap_or(&[]);
+            !filters.is_empty()
+                && filters.iter().any(|f| {
+                    f["op"].as_str().unwrap_or("") == "="
+                        && f["property"].as_str().unwrap_or("") != "constraint"
+                })
+                && filters.iter().all(|f| {
+                    let op = f["op"].as_str().unwrap_or("");
+                    let prop = f["property"].as_str().unwrap_or("");
+                    (op == "=" && prop != "constraint")
+                        || (prop == "concept"
+                            && matches!(op, "is-a" | "descendent-of" | "generalizes"))
+                })
+                && inc["concept"].as_array().is_none_or(|a| a.is_empty())
+                && inc["valueSet"].as_array().is_none_or(|a| a.is_empty())
+        });
 
     for inc in includes {
         let system_url = match inc["system"].as_str() {
@@ -1174,14 +1254,16 @@ fn expand_inline_filtered(
             });
 
         // `has_eq_filter` — true when any compose filter is a property= filter.
-        // When a text filter is also present (≥ 3 chars) we push it into SQL
-        // via instr() inside query_subtree_with_property, avoiding loading all
-        // property-matching descendants into Rust before text-filtering them.
+        // Normally we push the text filter into SQL via instr() to avoid loading
+        // all property-matching descendants before discarding them.  When the
+        // property result cache is active (all_prop_cacheable), we skip the SQL
+        // text push so that the FULL property-matched set is returned and cached;
+        // the text filter is applied in Rust after the loop.
         let has_eq_filter = compose_filters.iter().any(|f| {
             f["op"].as_str().unwrap_or("") == "="
                 && f["property"].as_str().unwrap_or("") != "constraint"
         });
-        let sql_text = if has_eq_filter && filter_lower.len() >= 3 {
+        let sql_text = if has_eq_filter && filter_lower.len() >= 3 && !all_prop_cacheable {
             Some(filter_lower.as_str())
         } else {
             None
@@ -1209,11 +1291,12 @@ fn expand_inline_filtered(
         if let Some(filter_result) =
             apply_compose_filters(conn, system_url, &system_id, inc, sql_text)?
         {
-            // When sql_text is Some, query_subtree_with_property already applied
-            // the text filter via instr() — extend directly.  Otherwise apply
-            // the Rust text filter here (ECL / generalizes / multi-property paths
-            // that don't push text into SQL).
-            if sql_text.is_some() {
+            // sql_text.is_some(): SQL already applied the text filter via instr().
+            // all_prop_cacheable: accumulate the full unfiltered set; text filter
+            //   is applied after the loop (and the set is stored in the cache).
+            // Otherwise: apply the Rust text filter here (ECL / generalizes /
+            //   multi-property paths that don't push text into SQL).
+            if sql_text.is_some() || all_prop_cacheable {
                 results.extend(filter_result);
             } else {
                 results.extend(filter_result.into_iter().filter(|c| {
@@ -1323,6 +1406,21 @@ fn expand_inline_filtered(
                 results.extend(rows);
             }
         }
+    }
+
+    // When all includes were prop-cacheable, populate the property result cache
+    // with the full (unfiltered) concept set, then apply the text filter in Rust.
+    if all_prop_cacheable {
+        if let Some((prop_key, cache)) = prop_cache {
+            populate_property_cache(&results, prop_key, cache);
+        }
+        results.retain(|c| {
+            c.code.to_lowercase().contains(&filter_lower)
+                || c.display
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(&filter_lower))
+                    .unwrap_or(false)
+        });
     }
 
     Ok(results)
@@ -4374,6 +4472,51 @@ pub(crate) fn prebuild_inline_compose_index(conn: &Connection, index: &super::In
         count = loaded,
         "inline compose concept index pre-warmed from cache"
     );
+}
+
+/// Populate the property-result in-memory cache from a computed expansion.
+///
+/// Called by `expand_inline_filtered` after accumulating the full
+/// property-matched (but text-unfiltered) concept set.  Subsequent requests
+/// for the same compose body with a different text filter are served from this
+/// cache by the async hot path in `expand()`, bypassing `spawn_blocking`.
+///
+/// No-op when the cache already has an entry for `cache_key` (a concurrent
+/// request raced and won).
+fn populate_property_cache(
+    codes: &[ExpansionContains],
+    cache_key: &str,
+    cache: &super::PropertyResultCache,
+) {
+    {
+        if let Ok(guard) = cache.read() {
+            if guard.contains_key(cache_key) {
+                return;
+            }
+        }
+    }
+    let entries: Vec<ImplicitConceptEntry> = codes
+        .iter()
+        .map(|c| {
+            let code_lower = c.code.to_lowercase();
+            let display_lower = c
+                .display
+                .as_deref()
+                .map(str::to_lowercase)
+                .unwrap_or_default();
+            ImplicitConceptEntry {
+                system_url: c.system.clone(),
+                code: c.code.clone(),
+                display: c.display.clone(),
+                code_lower,
+                display_lower,
+            }
+        })
+        .collect();
+    let concept_idx = Arc::new(build_concept_index_from_entries(entries));
+    if let Ok(mut guard) = cache.write() {
+        guard.entry(cache_key.to_string()).or_insert(concept_idx);
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
