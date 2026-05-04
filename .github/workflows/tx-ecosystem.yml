@@ -230,6 +230,37 @@ jobs:
           echo "NDC_IMPORT_EXIT=$CODE" >> "$GITHUB_ENV"
           echo "NDC import exit code: $CODE"
 
+      # The IG ships per-group CodeSystem/ValueSet fixtures under tests/<group>/.
+      # The validator's txTests command sends Parameters bodies that reference
+      # these by canonical URL — the server must already know them, otherwise
+      # every $expand / $validate-code returns 404. Bundle them all into one
+      # collection Bundle and import.
+      - name: Import IG test fixtures
+        run: |
+          set +e
+          python3 - <<'PY'
+          import json, glob, os
+          base = 'tx-ecosystem-ig/tests'
+          entries = []
+          for pattern in ('valueset-*.json', 'codesystem-*.json', 'conceptmap-*.json'):
+              for path in glob.glob(f'{base}/**/{pattern}', recursive=True):
+                  with open(path) as f:
+                      r = json.load(f)
+                  if r.get('resourceType') in ('CodeSystem', 'ValueSet', 'ConceptMap'):
+                      entries.append({'resource': r})
+          bundle = {'resourceType': 'Bundle', 'type': 'collection', 'entry': entries}
+          with open('tx-fixtures.json', 'w') as f:
+              json.dump(bundle, f)
+          print(f'Wrote tx-fixtures.json: {len(entries)} entries, {os.path.getsize("tx-fixtures.json")} bytes')
+          PY
+          ./hts import tx-fixtures.json \
+            --database-url "./data/hts-${{ matrix.label }}.db" \
+            --batch-size 500 \
+            --verbose
+          CODE=$?
+          echo "FIXTURES_IMPORT_EXIT=$CODE" >> "$GITHUB_ENV"
+          echo "IG fixtures import exit code: $CODE"
+
       # ── Run the server ─────────────────────────────────────────────────────
       - name: Kill any leftover process on port ${{ env.HTS_PORT }}
         run: fuser -k "${{ env.HTS_PORT }}/tcp" 2>/dev/null || true
@@ -402,11 +433,12 @@ jobs:
             echo ""
             echo "| Corpus | Exit code |"
             echo "|---|---|"
-            echo "| UTG    | ${UTG_IMPORT_EXIT:-?} |"
-            echo "| SNOMED | ${SNOMED_IMPORT_EXIT:-?} |"
-            echo "| LOINC  | ${LOINC_IMPORT_EXIT:-?} |"
-            echo "| RxNorm | ${RXNORM_IMPORT_EXIT:-?} |"
-            echo "| NDC    | ${NDC_IMPORT_EXIT:-?} |"
+            echo "| UTG          | ${UTG_IMPORT_EXIT:-?} |"
+            echo "| SNOMED       | ${SNOMED_IMPORT_EXIT:-?} |"
+            echo "| LOINC        | ${LOINC_IMPORT_EXIT:-?} |"
+            echo "| RxNorm       | ${RXNORM_IMPORT_EXIT:-?} |"
+            echo "| NDC          | ${NDC_IMPORT_EXIT:-?} |"
+            echo "| IG fixtures  | ${FIXTURES_IMPORT_EXIT:-?} |"
             echo ""
             echo "> Import exit codes: 0 = success, 2 = success-with-warnings, 1 = fatal, skip = not attempted."
             echo "> Per-test JSON diffs and the full validator log are published as artifacts \`tx-test-output-${LABEL}\` and \`txtests-log-${LABEL}\`."
