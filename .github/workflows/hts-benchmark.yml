@@ -180,6 +180,17 @@ jobs:
               --database-url "$DB_PATH" --batch-size 500 || true
           done
 
+          # ── Supplement: VSAC ValueSets not covered by us.nlm.vsac@0.17.0
+          # (EX04 pool entries for OIDs 2.16.840.1.113762.1.4.1267.17,
+          #  2.16.840.1.114222.24.7.14, 2.16.840.1.113762.1.4.1260.230,
+          #  2.16.840.1.113762.1.4.1078.781)
+          SUPPLEMENT="$GITHUB_WORKSPACE/crates/hts/terminology-data/vsac-supplement.bundle.json"
+          if [ -f "$SUPPLEMENT" ]; then
+            echo "Importing VSAC supplement..."
+            ./hts import "$SUPPLEMENT" \
+              --database-url "$DB_PATH" --batch-size 500 || true
+          fi
+
           # ── Source 2: licensed distributions from S3 (SNOMED, LOINC, ...)
           LICENSED_DIR="$GITHUB_WORKSPACE/licensed-terminology"
           rm -rf "$LICENSED_DIR"

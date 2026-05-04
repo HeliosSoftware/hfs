@@ -412,8 +412,8 @@ async fn run_import_for_path(
                 "Cannot auto-detect format from '{}'. \
                  Use --format to specify one of: hl7-npm, snomed-rf2, loinc, \
                  icd10-cm, icd9-cm, rxnorm, ucum, nci-thesaurus, mesh, dicom, \
-                 hl7-v2-tables, nucc, ndc. Note: .zip files may require \
-                 --format if auto-detection is ambiguous.",
+                 hl7-v2-tables, nucc, ndc, fhir-bundle. Note: .zip files may \
+                 require --format if auto-detection is ambiguous.",
                 args.path.display()
             ))
         })?,
@@ -582,7 +582,37 @@ async fn dispatch_import(
         }
         ImportFormat::Nucc => import_nucc(backend, ctx, path, batch_size, dry_run).await,
         ImportFormat::Ndc => import_ndc(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::FhirBundle => import_fhir_bundle_file(backend, ctx, path, dry_run).await,
     }
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn import_fhir_bundle_file(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
+    path: &std::path::Path,
+    dry_run: bool,
+) -> Result<helios_hts::import::ImportStats, helios_hts::error::HtsError> {
+    use helios_hts::error::HtsError;
+
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|e| HtsError::InvalidRequest(format!("Cannot read '{}': {e}", path.display())))?;
+
+    if dry_run {
+        let parsed = helios_hts::import::bundle_parser::parse_bundle(&data)?;
+        let concepts: usize = parsed.code_systems.iter().map(|cs| cs.concepts.len()).sum();
+        let stats = helios_hts::import::ImportStats {
+            code_systems: parsed.code_systems.len() as u32,
+            value_sets: parsed.value_sets.len() as u32,
+            concept_maps: parsed.concept_maps.len() as u32,
+            concepts: concepts as u32,
+            ..Default::default()
+        };
+        return Ok(stats);
+    }
+
+    backend.import_bundle(ctx, &data).await
 }
 
 #[cfg(not(any(feature = "sqlite", feature = "postgres")))]

@@ -155,6 +155,9 @@ pub enum ImportFormat {
     /// FDA National Drug Code Directory (`product.txt` or `ndctext.zip`) — public domain
     #[value(name = "ndc")]
     Ndc,
+    /// Plain FHIR Bundle JSON file (.json) containing CodeSystem/ValueSet/ConceptMap resources
+    #[value(name = "fhir-bundle")]
+    FhirBundle,
 }
 
 impl fmt::Display for ImportFormat {
@@ -173,6 +176,7 @@ impl fmt::Display for ImportFormat {
             ImportFormat::Hl7V2Tables => write!(f, "hl7-v2-tables"),
             ImportFormat::Nucc => write!(f, "nucc"),
             ImportFormat::Ndc => write!(f, "ndc"),
+            ImportFormat::FhirBundle => write!(f, "fhir-bundle"),
         }
     }
 }
@@ -185,6 +189,7 @@ impl fmt::Display for ImportFormat {
 /// - `.rrf` (case-insensitive) → [`ImportFormat::Rxnorm`]
 /// - directory → [`ImportFormat::Rxnorm`]
 /// - `.zip` → peeks into the archive to distinguish formats
+/// - `.json` → peeks to check for `"resourceType":"Bundle"` → [`ImportFormat::FhirBundle`]
 /// - anything else → `None` (user must pass `--format`)
 pub fn detect_format(path: &Path) -> Option<ImportFormat> {
     let name = path
@@ -229,6 +234,9 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
     }
     if name.ends_with(".zip") {
         return detect_zip_format(path);
+    }
+    if name.ends_with(".json") {
+        return detect_json_format(path);
     }
     None
 }
@@ -307,6 +315,22 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
         if entry_name == "product.txt" || entry_name.ends_with("/product.txt") {
             return Some(ImportFormat::Ndc);
         }
+    }
+    None
+}
+
+/// Peek into a JSON file to detect whether it is a FHIR Bundle.
+///
+/// Reads the first 256 bytes and looks for `"resourceType"` + `"Bundle"`.
+/// Returns `None` when the file is not a FHIR Bundle or cannot be read.
+fn detect_json_format(path: &Path) -> Option<ImportFormat> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 256];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let preview = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    if preview.contains("\"resourceType\"") && preview.contains("\"Bundle\"") {
+        return Some(ImportFormat::FhirBundle);
     }
     None
 }
