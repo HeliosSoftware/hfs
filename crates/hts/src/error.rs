@@ -95,7 +95,8 @@ impl IntoResponse for HtsError {
                 "issue": [{
                     "severity": "error",
                     "code": "too-costly",
-                    "diagnostics": msg
+                    "details": { "text": msg },
+                    "diagnostics": msg,
                 }]
             });
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
@@ -119,12 +120,18 @@ impl IntoResponse for HtsError {
             HtsError::TooCostly(_) => unreachable!("handled above"),
         };
 
+        // The HL7 IG validator's TxTesterScrubbers strips OperationOutcome.issue
+        // entries that have `diagnostics` but no `details` — every such issue
+        // disappears from comparison, leaving an empty OperationOutcome and
+        // failing the test with "missing property issue" (27 such failures in
+        // run #93). Always emit details.text so issues survive the scrubber.
         let body = json!({
             "resourceType": "OperationOutcome",
             "issue": [{
                 "severity": "error",
                 "code": code,
-                "diagnostics": diagnostics
+                "details": { "text": diagnostics },
+                "diagnostics": diagnostics,
             }]
         });
 
