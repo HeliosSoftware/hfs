@@ -141,6 +141,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         result: false,
                         message: Some(format!("Unknown code system: {system}")),
                         display: None,
+                        inactive: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -154,6 +155,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         result: false,
                         message: Some(format!("Unknown code: {}", req.code)),
                         display: None,
+                        inactive: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -177,6 +179,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 result: message.is_none(),
                 message,
                 display,
+                inactive: None,
             })
         })
         .await

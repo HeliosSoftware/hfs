@@ -144,6 +144,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         result: false,
                         message: Some(format!("Unknown value set: {url}")),
                         display: None,
+                        inactive: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -178,6 +179,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         "The provided code '{qualified}' was not found in the value set '{url}'"
                     )),
                     display: None,
+                    inactive: None,
                 })
             }
             Some(concept) => {
@@ -195,6 +197,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     result: message.is_none(),
                     message,
                     display: concept.display.clone(),
+                    inactive: None,
                 })
             }
         }

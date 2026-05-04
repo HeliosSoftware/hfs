@@ -58,6 +58,12 @@ fn build_validate_response(
     if let Some(display) = resp.display {
         parameter.push(json!({"name": "display", "valueString": display}));
     }
+    // The IG fixtures expect a top-level `inactive` parameter when the
+    // validated concept is inactive (status retired/deprecated/withdrawn/
+    // inactive); kept alphabetical between display and issues.
+    if resp.inactive == Some(true) {
+        parameter.push(json!({"name": "inactive", "valueBoolean": true}));
+    }
     // When validation has anything to report (negative result or display
     // mismatch), wrap the message in an OperationOutcome and surface it via
     // the `issues` parameter — every IG fixture for failed validation
@@ -260,6 +266,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 result: false,
                 message: Some("None of the provided codings were found in any CodeSystem".into()),
                 display: None,
+                inactive: None,
             },
             None,
             None,
@@ -432,6 +439,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 result: false,
                 message: Some("None of the provided codings were found in the ValueSet".into()),
                 display: None,
+                inactive: None,
             },
             None,
             None,

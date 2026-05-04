@@ -102,6 +102,11 @@ pub struct ValidateCodeResponse {
     pub message: Option<String>,
     /// The preferred display for the code (present on success).
     pub display: Option<String>,
+    /// `Some(true)` when the matched concept is inactive (status in
+    /// retired/deprecated/withdrawn/inactive). The IG fixtures expect this
+    /// to surface as a top-level `inactive` parameter on the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive: Option<bool>,
 }
 
 // ─── $subsumes ────────────────────────────────────────────────────────────────

@@ -832,6 +832,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     .as_ref()
                                     .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
                                     .unwrap_or(false);
+                            let inactive_for_msg = found
+                                .as_ref()
+                                .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
+                                .unwrap_or(false);
                             return finish_validate_code_response(
                                 found,
                                 &req.code,
@@ -839,6 +843,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 req.display.as_deref(),
                                 req.system.as_deref(),
                                 abstract_for_msg,
+                                inactive_for_msg,
                             );
                         }
 
@@ -857,6 +862,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             .as_ref()
                             .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
                             .unwrap_or(false);
+                        let inactive_for_msg = found
+                            .as_ref()
+                            .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
+                            .unwrap_or(false);
                         return finish_validate_code_response(
                             found,
                             &req.code,
@@ -864,6 +873,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             req.display.as_deref(),
                             req.system.as_deref(),
                             abstract_for_msg,
+                            inactive_for_msg,
                         );
                     }
                     Err(e) => return Err(e),
@@ -892,6 +902,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .as_ref()
                     .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
                     .unwrap_or(false);
+            let inactive_for_msg = found
+                .as_ref()
+                .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
+                .unwrap_or(false);
             finish_validate_code_response(
                 found,
                 &req.code,
@@ -899,6 +913,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 req.display.as_deref(),
                 system_for_msg.as_deref(),
                 abstract_for_msg,
+                inactive_for_msg,
             )
         })
         .await
@@ -3493,6 +3508,26 @@ fn is_concept_abstract(conn: &Connection, system_url: &str, code: &str) -> bool 
     .is_ok()
 }
 
+/// Returns true when the concept has a status property in the inactive set
+/// (retired/deprecated/withdrawn/inactive). Used by $validate-code so the
+/// response can surface a top-level `inactive` parameter per the IG fixtures.
+fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool {
+    conn.query_row(
+        "SELECT 1
+         FROM concept_properties cp
+         JOIN concepts c ON c.id = cp.concept_id
+         JOIN code_systems s ON s.id = c.system_id
+         WHERE s.url = ?1
+           AND c.code = ?2
+           AND cp.property = 'status'
+           AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
+         LIMIT 1",
+        rusqlite::params![system_url, code],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
 fn finish_validate_code_response(
     found: Option<ExpansionContains>,
     code: &str,
@@ -3500,6 +3535,7 @@ fn finish_validate_code_response(
     expected_display: Option<&str>,
     system_for_msg: Option<&str>,
     is_abstract: bool,
+    is_inactive: bool,
 ) -> Result<ValidateCodeResponse, HtsError> {
     let qualified = match system_for_msg {
         Some(s) => format!("{s}#{code}"),
@@ -3516,6 +3552,7 @@ fn finish_validate_code_response(
                     "The provided code '{qualified}' was not found in the value set '{url}'"
                 )),
                 display: None,
+                inactive: None,
             })
         }
         Some(concept) => {
@@ -3528,6 +3565,7 @@ fn finish_validate_code_response(
                         "The code '{qualified}' is abstract, and not allowed in this context"
                     )),
                     display: concept.display,
+                    inactive: None,
                 });
             }
             let mut message = None;
@@ -3544,6 +3582,7 @@ fn finish_validate_code_response(
                 result: message.is_none(),
                 message,
                 display: concept.display,
+                inactive: if is_inactive { Some(true) } else { None },
             })
         }
     }
