@@ -272,6 +272,14 @@ fn lookup_field_type(
         FhirVersion::R5 => helios_fhir::r5::get_field_type(parent_type, field_name),
         #[cfg(feature = "R6")]
         FhirVersion::R6 => helios_fhir::r6::get_field_type(parent_type, field_name),
+        // The `FhirVersion` enum's variants are gated on `helios-fhir`'s own
+        // feature flags, which can disagree with this crate's feature flags
+        // when an upstream consumer enables a version on `helios-fhir`
+        // directly without enabling the same version on `helios-fhirpath`.
+        // In that case we have no field-type table for the variant — fall back
+        // to "no info" rather than failing to compile.
+        #[allow(unreachable_patterns)]
+        _ => None,
     }
 }
 
