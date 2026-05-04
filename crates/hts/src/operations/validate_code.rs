@@ -58,7 +58,38 @@ fn build_validate_response(
     if let Some(display) = resp.display {
         parameter.push(json!({"name": "display", "valueString": display}));
     }
-    if let Some(msg) = resp.message {
+    // When validation has anything to report (negative result or display
+    // mismatch), wrap the message in an OperationOutcome and surface it via
+    // the `issues` parameter — every IG fixture for failed validation
+    // expects it.
+    if let Some(msg) = resp.message.as_deref() {
+        let (issue_code, tx_code) = if resp.result {
+            // result=true with a message means a soft warning (e.g. display mismatch).
+            ("invalid", "invalid-display")
+        } else {
+            // result=false → hard failure; "code-invalid" + "not-in-vs" is
+            // the catch-all the IG uses when the code isn't part of the VS.
+            ("code-invalid", "not-in-vs")
+        };
+        let severity = if resp.result { "warning" } else { "error" };
+        parameter.push(json!({
+            "name": "issues",
+            "resource": {
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": severity,
+                    "code": issue_code,
+                    "details": {
+                        "coding": [{
+                            "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                            "code": tx_code,
+                        }],
+                        "text": msg,
+                    },
+                    "expression": ["Coding.code"],
+                }]
+            }
+        }));
         parameter.push(json!({"name": "message", "valueString": msg}));
     }
     parameter.push(json!({"name": "result", "valueBoolean": resp.result}));
