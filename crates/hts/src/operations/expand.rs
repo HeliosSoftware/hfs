@@ -242,8 +242,11 @@ async fn process_expand<B: TerminologyBackend>(
     }
 
     // Preserve the URL before it moves into ExpandRequest so we can record it
-    // in the negative cache if the backend returns NotFound.
+    // in the negative cache if the backend returns NotFound. Also clone the
+    // inline ValueSet body (when present) so we can echo its top-level
+    // metadata back in the response after expansion completes.
     let url_for_neg_cache = url.clone();
+    let value_set_for_response = value_set.clone();
 
     // ── Cache miss: compute ───────────────────────────────────────────────────
     let req = ExpandRequest {
@@ -386,10 +389,56 @@ async fn process_expand<B: TerminologyBackend>(
         expansion["parameter"] = json!(emitted_params);
     }
 
-    let response = json!({
-        "resourceType": "ValueSet",
-        "expansion": expansion,
-    });
+    // ── Copy metadata from the source ValueSet ───────────────────────────────
+    // The IG fixtures expect the response to mirror the original ValueSet's
+    // top-level fields (url, version, name, title, status, ...) — without
+    // them tests fail with "missing property url" / etc.
+    //
+    // For URL-based requests, look up the stored ValueSet and copy across
+    // the canonical-resource fields. For inline ValueSet requests, the
+    // caller supplied the body — copy from there.
+    let mut response = json!({ "resourceType": "ValueSet" });
+    let source_vs: Option<Value> = if let Some(ref u) = url_for_neg_cache {
+        ValueSetOperations::search(
+            state.backend(),
+            &ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some(u.clone()),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()
+        .and_then(|mut v| v.pop())
+    } else {
+        value_set_for_response.clone()
+    };
+    if let Some(vs) = source_vs {
+        if let Some(obj) = vs.as_object() {
+            for field in [
+                "id",
+                "url",
+                "identifier",
+                "version",
+                "name",
+                "title",
+                "status",
+                "experimental",
+                "date",
+                "publisher",
+                "contact",
+                "description",
+                "copyright",
+                "compose",
+            ] {
+                if let Some(v) = obj.get(field) {
+                    response[field] = v.clone();
+                }
+            }
+        }
+    }
+    response["expansion"] = expansion;
 
     // ── Serialize once, cache, return ─────────────────────────────────────────
     // `serde_json::to_vec` writes directly into a Vec<u8>; wrapping in
