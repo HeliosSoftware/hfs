@@ -359,6 +359,75 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
     }
 
+    async fn concept_property_values(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+        properties: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+        if codes.is_empty() || properties.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let pool = self.pool().clone();
+        let system_url = system_url.to_string();
+        let codes = codes.to_vec();
+        let properties = properties.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            let code_ph = (2..=codes.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let prop_ph = (codes.len() + 2..=codes.len() + properties.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT c.code, cp.property, cp.value
+                 FROM concept_properties cp
+                 JOIN concepts c ON c.id = cp.concept_id
+                 JOIN code_systems s ON s.id = c.system_id
+                 WHERE s.url = ?1
+                   AND c.code IN ({code_ph})
+                   AND cp.property IN ({prop_ph})",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let mut params: Vec<&dyn rusqlite::ToSql> =
+                Vec::with_capacity(1 + codes.len() + properties.len());
+            params.push(&system_url);
+            for c in &codes {
+                params.push(c as &dyn rusqlite::ToSql);
+            }
+            for p in &properties {
+                params.push(p as &dyn rusqlite::ToSql);
+            }
+            let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+                std::collections::HashMap::new();
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            for r in rows {
+                let (code, prop, value) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                out.entry(code).or_default().push((prop, value));
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
     async fn concept_expansion_flags(
         &self,
         _ctx: &TenantContext,

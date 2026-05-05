@@ -329,6 +329,8 @@ async fn fetch_cache(
             inactive: None,
 
             designations: vec![],
+
+            properties: vec![],
             contains: vec![],
         })
         .collect())
@@ -398,6 +400,8 @@ async fn compute_expansion(
                     inactive: None,
 
                     designations: vec![],
+
+                    properties: vec![],
                     contains: vec![],
                 });
             }
@@ -420,6 +424,8 @@ async fn compute_expansion(
                     inactive: None,
 
                     designations: vec![],
+
+                    properties: vec![],
                     contains: vec![],
                 });
             }

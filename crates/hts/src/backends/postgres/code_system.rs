@@ -256,6 +256,45 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         Ok(out)
     }
 
+    async fn concept_property_values(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+        properties: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+        if codes.is_empty() || properties.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT c.code, cp.property, cp.value
+                 FROM concept_properties cp
+                 JOIN concepts c ON c.id = cp.concept_id
+                 JOIN code_systems s ON s.id = c.system_id
+                 WHERE s.url = $1
+                   AND c.code = ANY($2)
+                   AND cp.property = ANY($3)",
+                &[&system_url, &codes, &properties],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let code: String = row.get(0);
+            let prop: String = row.get(1);
+            let value: String = row.get(2);
+            out.entry(code).or_default().push((prop, value));
+        }
+        Ok(out)
+    }
+
     async fn concept_expansion_flags(
         &self,
         _ctx: &TenantContext,

@@ -175,9 +175,26 @@ pub struct ExpansionContains {
     /// `includeDesignations=true`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub designations: Vec<ExpansionContainsDesignation>,
+    /// Properties attached to this concept (FHIR concept properties).
+    /// Populated post-expansion when the caller passed a `property`
+    /// parameter naming one or more property codes to surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<ExpansionContainsProperty>,
     /// Nested contains for hierarchical expansions.
     #[serde(default)]
     pub contains: Vec<ExpansionContains>,
+}
+
+/// One property entry on an `ExpansionContains` — mirrors the FHIR
+/// `expansion.contains[].property[]` shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpansionContainsProperty {
+    pub code: String,
+    /// FHIR `value[x]` type label (e.g. "Code", "String", "Boolean").
+    pub value_type: String,
+    /// Serialised value (always a string; the serializer routes it to the
+    /// correct FHIR `value[x]` field based on `value_type`).
+    pub value: String,
 }
 
 /// One designation entry on an `ExpansionContains`.
@@ -434,6 +451,7 @@ mod tests {
             is_abstract: None,
             inactive: None,
             designations: vec![],
+            properties: vec![],
             contains: vec![],
         };
         let parent = ExpansionContains {
@@ -443,6 +461,7 @@ mod tests {
             is_abstract: None,
             inactive: None,
             designations: vec![],
+            properties: vec![],
             contains: vec![child.clone()],
         };
         let json = serde_json::to_string(&parent).unwrap();

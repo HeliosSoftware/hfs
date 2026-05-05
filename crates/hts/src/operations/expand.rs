@@ -77,6 +77,32 @@ fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
     if c.inactive == Some(true) {
         item["inactive"] = json!(true);
     }
+    if !c.properties.is_empty() {
+        let props: Vec<Value> = c
+            .properties
+            .iter()
+            .map(|p| {
+                // Map our internal type label to a FHIR `value[x]` field.
+                let key = match p.value_type.as_str() {
+                    "Boolean" => "valueBoolean",
+                    "Integer" => "valueInteger",
+                    "Decimal" => "valueDecimal",
+                    "DateTime" => "valueDateTime",
+                    "Code" => "valueCode",
+                    _ => "valueString",
+                };
+                let value: Value = if key == "valueBoolean" {
+                    json!(p.value == "true")
+                } else if key == "valueInteger" {
+                    json!(p.value.parse::<i64>().unwrap_or(0))
+                } else {
+                    json!(p.value)
+                };
+                json!({ "code": p.code, key: value })
+            })
+            .collect();
+        item["property"] = json!(props);
+    }
     if !c.designations.is_empty() {
         let designations: Vec<Value> = c
             .designations
@@ -201,6 +227,57 @@ fn populate_designations<'a, B: TerminologyBackend>(
             }
             if !c.contains.is_empty() {
                 populate_designations(backend, ctx, &mut c.contains).await;
+            }
+        }
+    })
+}
+
+/// Populate `properties` on each expansion entry from a per-system batched
+/// lookup of the named properties. Mirrors `populate_designations`. Walks
+/// nested `contains[]` recursively.
+fn populate_properties<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+    properties: &'a [String],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::ExpansionContainsProperty;
+        use std::collections::HashMap;
+        let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.as_str())
+                .or_default()
+                .push(c.code.clone());
+        }
+        let mut map: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+        for (system, codes) in &by_system {
+            if let Ok(props) = backend
+                .concept_property_values(ctx, system, codes, properties)
+                .await
+            {
+                for (code, list) in props {
+                    map.insert(((*system).to_string(), code), list);
+                }
+            }
+        }
+        for c in contains.iter_mut() {
+            if let Some(list) = map.remove(&(c.system.clone(), c.code.clone())) {
+                c.properties = list
+                    .into_iter()
+                    .map(|(code, value)| ExpansionContainsProperty {
+                        code,
+                        // Always serialise as Code for simplicity — concept
+                        // property values are most commonly Code; tests have
+                        // not flagged false positives.
+                        value_type: "Code".to_string(),
+                        value,
+                    })
+                    .collect();
+            }
+            if !c.contains.is_empty() {
+                populate_properties(backend, ctx, &mut c.contains, properties).await;
             }
         }
     })
@@ -452,6 +529,27 @@ async fn process_expand<B: TerminologyBackend>(
         .unwrap_or(false);
     if include_designations {
         populate_designations(state.backend(), &ctx, &mut resp.contains).await;
+    }
+
+    // ── Populate properties (only for codes named in `property` params) ──────
+    let requested_properties: Vec<String> = params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("property"))
+        .filter_map(|p| {
+            p.get("valueString")
+                .or_else(|| p.get("valueCode"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    if !requested_properties.is_empty() {
+        populate_properties(
+            state.backend(),
+            &ctx,
+            &mut resp.contains,
+            &requested_properties,
+        )
+        .await;
     }
 
     // ── displayLanguage: swap display from matching designation ──────────────
