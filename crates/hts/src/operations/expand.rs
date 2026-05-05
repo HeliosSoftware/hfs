@@ -296,6 +296,42 @@ async fn process_expand<B: TerminologyBackend>(
 
     let hierarchical = find_str_param(&params, "hierarchical").map(|s| s == "true");
 
+    // Reject early when the request asks for a `useSupplement` we don't have.
+    // The IG fixtures expect 4xx for unknown supplements (parameters/* and
+    // extensions/* tests). Iterate every useSupplement entry; a missing one
+    // becomes an InvalidRequest so it surfaces as 400 with a descriptive
+    // OperationOutcome.
+    {
+        let supplements: Vec<&str> = params
+            .iter()
+            .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
+            .filter_map(|p| {
+                p.get("valueCanonical")
+                    .or_else(|| p.get("valueUri"))
+                    .and_then(|v| v.as_str())
+            })
+            .collect();
+        if !supplements.is_empty() {
+            let ctx = TenantContext::system();
+            for s in &supplements {
+                // Strip any |version suffix for the lookup.
+                let bare = s.split('|').next().unwrap_or(s);
+                let exists = state
+                    .backend()
+                    .code_system_version_for_url(&ctx, bare)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if !exists {
+                    return Err(HtsError::InvalidRequest(format!(
+                        "Required supplement not found: {bare}"
+                    )));
+                }
+            }
+        }
+    }
+
     // ── Cache lookup ─────────────────────────────────────────────────────────
     // Build a stable key from the request parameters. For inline ValueSets
     // (ad-hoc POST) we serialise the body to compact JSON; k6 sends identical
