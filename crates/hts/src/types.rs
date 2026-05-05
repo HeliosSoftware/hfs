@@ -69,12 +69,16 @@ pub struct LookupRequest {
 }
 
 /// Response from `CodeSystem/$lookup`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct LookupResponse {
     /// The canonical name of the code system.
     pub name: String,
     pub version: Option<String>,
     pub display: Option<String>,
+    /// Optional concept definition text — surfaced as a top-level
+    /// `definition` parameter in the FHIR Parameters response.
+    #[serde(default)]
+    pub definition: Option<String>,
     pub properties: Vec<PropertyValue>,
     pub designations: Vec<DesignationValue>,
 }

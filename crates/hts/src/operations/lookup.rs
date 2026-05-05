@@ -172,6 +172,11 @@ async fn process_lookup<B: TerminologyBackend>(
         parameter.push(json!({"name": "display", "valueString": display}));
     }
 
+    // Top-level concept definition (free-form text from concepts.definition).
+    if let Some(def) = resp.definition {
+        parameter.push(json!({"name": "definition", "valueString": def}));
+    }
+
     // Echo back the system + code so the IG fixtures can confirm what we
     // looked up; also surface `abstract` from the notSelectable property
     // when set.
@@ -612,6 +617,40 @@ mod tests {
             .with_state(state)
     }
 
+    /// Build an app with a small hierarchy so we can exercise the synthesised
+    /// `parent` / `child` properties and the top-level `definition` parameter
+    /// emitted by `process_lookup` for `property=*` requests (mirroring the
+    /// IG simple-lookup fixture shape).
+    fn make_hierarchical_app() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at)
+                 VALUES ('cs-h', 'http://example.org/h', '0.1.0', 'HierCS',
+                         'active', 'complete', '2024-01-01', '2024-01-01');
+
+                 INSERT INTO concepts (id, system_id, code, display, definition)
+                 VALUES (10, 'cs-h', 'top',  'Top display',  NULL),
+                        (11, 'cs-h', 'mid',  'Middle display', 'Middle definition'),
+                        (12, 'cs-h', 'leaf', 'Leaf display', NULL);
+
+                 INSERT INTO concept_hierarchy (system_id, parent_code, child_code)
+                 VALUES ('cs-h', 'top', 'mid'),
+                        ('cs-h', 'mid', 'leaf');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/CodeSystem/$lookup",
+                post(lookup_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
     #[tokio::test]
     async fn lookup_with_use_supplement_includes_designation_with_source() {
         let app = make_supplement_app();
@@ -719,5 +758,86 @@ mod tests {
         });
         let resp = post_json(app, "/CodeSystem/$lookup", body).await;
         assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn lookup_wildcard_emits_definition_parent_child_inactive() {
+        let app = make_hierarchical_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "system", "valueUri": "http://example.org/h"},
+                {"name": "code",   "valueCode": "mid"},
+                {"name": "property", "valueCode": "*"}
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$lookup", body).await;
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        // Top-level `definition` from concepts.definition.
+        let def = params.iter().find(|p| p["name"] == "definition").unwrap();
+        assert_eq!(def["valueString"], "Middle definition");
+
+        // Synthesised parent property pointing at "top" with description.
+        let parent = params
+            .iter()
+            .find(|p| {
+                p["name"] == "property"
+                    && p["part"]
+                        .as_array()
+                        .map(|parts| parts.iter().any(|x| x["valueCode"] == "parent"))
+                        .unwrap_or(false)
+            })
+            .expect("synthesised parent property should be present");
+        let parent_parts = parent["part"].as_array().unwrap();
+        let parent_value = parent_parts.iter().find(|x| x["name"] == "value").unwrap();
+        assert_eq!(parent_value["valueCode"], "top");
+        let parent_desc = parent_parts
+            .iter()
+            .find(|x| x["name"] == "description")
+            .unwrap();
+        assert_eq!(parent_desc["valueString"], "Top display");
+
+        // Synthesised child property pointing at "leaf".
+        let child = params
+            .iter()
+            .find(|p| {
+                p["name"] == "property"
+                    && p["part"]
+                        .as_array()
+                        .map(|parts| parts.iter().any(|x| x["valueCode"] == "child"))
+                        .unwrap_or(false)
+            })
+            .expect("synthesised child property should be present");
+        let child_value = child["part"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == "value")
+            .unwrap();
+        assert_eq!(child_value["valueCode"], "leaf");
+
+        // Synthesised inactive=false (no status property on `mid`).
+        let inactive = params
+            .iter()
+            .find(|p| {
+                p["name"] == "property"
+                    && p["part"]
+                        .as_array()
+                        .map(|parts| parts.iter().any(|x| x["valueCode"] == "inactive"))
+                        .unwrap_or(false)
+            })
+            .expect("synthesised inactive property should be present");
+        let inactive_value = inactive["part"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == "value")
+            .unwrap();
+        assert_eq!(inactive_value["valueBoolean"], false);
     }
 }

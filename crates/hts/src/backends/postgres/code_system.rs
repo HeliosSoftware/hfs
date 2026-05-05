@@ -43,17 +43,30 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         )
         .await?;
 
-        let (concept_id, display, _definition) =
+        let (concept_id, display, definition) =
             find_concept(&client, &system_id, &req.code).await?;
 
-        let all_props = fetch_properties(&client, concept_id).await?;
-        let properties = if req.properties.is_empty() {
-            all_props
+        let stored_props = fetch_properties(&client, concept_id).await?;
+        // Per FHIR spec, property="*" is the wildcard meaning "include
+        // every property the concept has".
+        let want_all = req.properties.is_empty() || req.properties.iter().any(|p| p == "*");
+        let synth_props =
+            fetch_synthesised_properties(&client, &system_id, &req.code, &stored_props).await?;
+        let properties = if want_all {
+            let mut out = stored_props;
+            out.extend(synth_props);
+            out
         } else {
-            all_props
+            let mut out: Vec<PropertyValue> = stored_props
                 .into_iter()
                 .filter(|p| req.properties.contains(&p.code))
-                .collect()
+                .collect();
+            out.extend(
+                synth_props
+                    .into_iter()
+                    .filter(|p| req.properties.contains(&p.code)),
+            );
+            out
         };
 
         let all_designations = fetch_designations(&client, concept_id).await?;
@@ -81,6 +94,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             name: cs_name,
             version: cs_version,
             display,
+            definition,
             properties,
             designations,
         })
@@ -548,6 +562,91 @@ async fn fetch_properties(
             description: None,
         })
         .collect())
+}
+
+/// Synthesise hierarchy- and status-derived properties for `$lookup`.
+///
+/// Mirrors the SQLite backend implementation — see
+/// [`super::super::sqlite::code_system::fetch_synthesised_properties`] for
+/// rationale.
+async fn fetch_synthesised_properties(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    code: &str,
+    stored: &[PropertyValue],
+) -> Result<Vec<PropertyValue>, HtsError> {
+    let mut out = Vec::new();
+
+    // Parents.
+    let parent_rows = client
+        .query(
+            "SELECT h.parent_code, c.display
+             FROM concept_hierarchy h
+             LEFT JOIN concepts c
+                    ON c.system_id = h.system_id AND c.code = h.parent_code
+             WHERE h.system_id = $1 AND h.child_code = $2
+             ORDER BY h.parent_code",
+            &[&system_id, &code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    for row in parent_rows {
+        out.push(PropertyValue {
+            code: "parent".into(),
+            value_type: "code".into(),
+            value: row.get(0),
+            description: row.get(1),
+        });
+    }
+
+    // Children.
+    let child_rows = client
+        .query(
+            "SELECT h.child_code, c.display
+             FROM concept_hierarchy h
+             LEFT JOIN concepts c
+                    ON c.system_id = h.system_id AND c.code = h.child_code
+             WHERE h.system_id = $1 AND h.parent_code = $2
+             ORDER BY h.child_code",
+            &[&system_id, &code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    for row in child_rows {
+        out.push(PropertyValue {
+            code: "child".into(),
+            value_type: "code".into(),
+            value: row.get(0),
+            description: row.get(1),
+        });
+    }
+
+    // Inactive flag (only when not already stored explicitly).
+    if !stored.iter().any(|p| p.code == "inactive") {
+        let row = client
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM concept_properties cp
+                     JOIN concepts c ON c.id = cp.concept_id
+                     WHERE c.system_id = $1
+                       AND c.code = $2
+                       AND cp.property = 'status'
+                       AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
+                 )",
+                &[&system_id, &code],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let inactive: bool = row.get(0);
+        out.push(PropertyValue {
+            code: "inactive".into(),
+            value_type: "boolean".into(),
+            value: inactive.to_string(),
+            description: None,
+        });
+    }
+
+    Ok(out)
 }
 
 /// Fetch all designations for a concept.
