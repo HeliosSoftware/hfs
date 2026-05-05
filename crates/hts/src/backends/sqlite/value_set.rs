@@ -38,6 +38,7 @@
 
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
+use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1378,9 +1379,11 @@ fn expand_inline_filtered(
         //               SNOMED on cold EBS storage, causing 10–18 s per request
         //               and 30 s timeouts at high concurrency.
         //
-        // `all_batchable` — true when every compose filter is either a property=
-        // or a hierarchy op (is-a / descendent-of / generalizes); false for ECL
-        // `constraint` filters which need full ECL evaluation.
+        // `all_batchable` — true when every compose filter has a fast in-Rust
+        // implementation in `apply_compose_filters_to_candidates`: property=,
+        // hierarchy ops (is-a / descendent-of / generalizes / child-of), or
+        // regex.  False for ECL `constraint` filters which need full ECL
+        // evaluation.
         let compose_filters: &[serde_json::Value] = inc["filter"]
             .as_array()
             .map(|a| a.as_slice())
@@ -1390,7 +1393,9 @@ fn expand_inline_filtered(
                 let op = f["op"].as_str().unwrap_or("");
                 let prop = f["property"].as_str().unwrap_or("");
                 (op == "=" && prop != "constraint")
-                    || (prop == "concept" && matches!(op, "is-a" | "descendent-of" | "generalizes"))
+                    || (prop == "concept"
+                        && matches!(op, "is-a" | "descendent-of" | "generalizes" | "child-of"))
+                    || op == "regex"
             });
 
         // `has_eq_filter` — true when any compose filter is a property= filter.
@@ -1853,16 +1858,21 @@ fn apply_compose_filters(
         _ => return Ok(None),
     };
 
-    // Partition into property= filters (fast, indexed) and hierarchy filters
-    // (potentially O(N_descendants)).  Property filters run in phase 1; hierarchy
-    // filters run in phase 2 and can exploit the bounded candidate set from
-    // phase 1 to switch from a top-down tree expansion to per-candidate ancestor
-    // walks.
-    let (property_filters, hierarchy_filters): (Vec<_>, Vec<_>) = filters.iter().partition(|f| {
+    // Partition into property= filters (fast, indexed), regex filters (must
+    // load candidates and match in Rust), and the remaining hierarchy / ECL
+    // filters (potentially O(N_descendants)).  Property filters run in
+    // phase 1; hierarchy filters in phase 2 and can exploit the bounded
+    // candidate set from phase 1 to switch from a top-down tree expansion to
+    // per-candidate ancestor walks; regex filters run last so they only need
+    // to materialise the (already narrowed) candidate set.
+    let (property_filters, mut rest): (Vec<_>, Vec<_>) = filters.iter().partition(|f| {
         let op = f["op"].as_str().unwrap_or("");
         let property = f["property"].as_str().unwrap_or("");
         op == "=" && property != "constraint"
     });
+    let (regex_filters, hierarchy_filters): (Vec<_>, Vec<_>) = rest
+        .drain(..)
+        .partition(|f| f["op"].as_str() == Some("regex"));
 
     // ── Fast path: single is-a / descendent-of + property= filters ────────────
     // When there is exactly one hierarchy filter (is-a or descendent-of) and one
@@ -1932,6 +1942,30 @@ fn apply_compose_filters(
         let property = f["property"].as_str().unwrap_or("");
         let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
+
+        // `child-of` is a single-level hierarchy filter and does not have a
+        // direct ECL equivalent — handle it before the ECL fallback so the
+        // (property, op) wildcard at the bottom never sees it.
+        if property == "concept" && op == "child-of" {
+            if value.is_empty() {
+                return Err(HtsError::VsInvalid(
+                    "ValueSet compose filter with op='child-of' is missing a value".to_string(),
+                ));
+            }
+            any_filter_seen = true;
+            if let Some(prev) = result.as_mut() {
+                if prev.is_empty() {
+                    continue;
+                }
+                let codes: Vec<String> = prev.iter().map(|c| c.code.clone()).collect();
+                let valid = batch_direct_children_in_set(conn, system_id, value, &codes)?;
+                prev.retain(|c| valid.contains(&c.code));
+                continue;
+            }
+            let children = query_direct_children(conn, system_url, system_id, value)?;
+            result = Some(children);
+            continue;
+        }
 
         let ecl_expr: String = match (property, op) {
             ("constraint", "=") => value.to_owned(),
@@ -2026,6 +2060,59 @@ fn apply_compose_filters(
             }
             None => result = Some(concepts),
         }
+    }
+
+    // ── Phase 3: regex filters ────────────────────────────────────────────────
+    // Regex evaluation requires materialising rows and matching in Rust.  When
+    // a bounded candidate set is already in `result`, we filter that set in
+    // place; otherwise we load the full match set from the system and AND-merge.
+    for f in &regex_filters {
+        let property = f["property"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+        any_filter_seen = true;
+
+        if let Some(prev) = result.as_mut() {
+            // Compile up-front so a malformed pattern surfaces as VsInvalid
+            // even when the candidate set is already empty.
+            let regex = compile_vs_regex(value)?;
+            if prev.is_empty() {
+                continue;
+            }
+            if property == "code" || property.is_empty() {
+                prev.retain(|c| regex.is_match(&c.code));
+            } else {
+                let codes: Vec<String> = prev.iter().map(|c| c.code.clone()).collect();
+                let json_codes = serde_json::to_string(&codes)
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT c.code, cp.value
+                         FROM   concept_properties cp
+                         JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?1
+                         WHERE  cp.property = ?2
+                           AND  c.code IN (SELECT value FROM json_each(?3))",
+                    )
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![system_id, property, json_codes], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let mut keep: HashSet<String> = HashSet::new();
+                for (code, val) in rows {
+                    if regex.is_match(&val) {
+                        keep.insert(code);
+                    }
+                }
+                prev.retain(|c| keep.contains(&c.code));
+            }
+            continue;
+        }
+
+        let concepts = query_regex_match(conn, system_url, system_id, property, value)?;
+        result = Some(concepts);
     }
 
     if any_filter_seen && result.is_none() {
@@ -2486,6 +2573,203 @@ fn query_ancestors_full(
     Ok(rows)
 }
 
+/// Compile a ValueSet compose-filter regex with FHIR full-string semantics.
+///
+/// FHIR R5 §4.9.5 specifies that a `regex` filter matches when the entire
+/// property value matches the pattern (anchored at both ends).  The Rust
+/// `regex` crate is unanchored by default, so we wrap the user pattern with
+/// `\A(?:…)\z` — these are absolute anchors (immune to multiline flags) and
+/// the non-capturing group keeps top-level alternation working as the user
+/// expects (e.g. `a|b` becomes `\A(?:a|b)\z`, not `\Aa|b\z`).
+///
+/// On parse failure returns [`HtsError::VsInvalid`] so the IG fixtures see a
+/// `tx-issue-type=vs-invalid` coding rather than a generic `invalid` error.
+///
+/// The Rust `regex` crate uses an RE2-style linear-time engine: it does not
+/// support PCRE features such as backreferences (`\1`) or lookaround
+/// (`(?=…)`, `(?!…)`).  Patterns that rely on those constructs are rejected
+/// with `vs-invalid`; the HL7 tx-ecosystem fixtures we know of do not use
+/// them.
+fn compile_vs_regex(pattern: &str) -> Result<Regex, HtsError> {
+    if pattern.is_empty() {
+        return Err(HtsError::VsInvalid(
+            "ValueSet compose filter with op='regex' has an empty value".to_string(),
+        ));
+    }
+    let anchored = format!("\\A(?:{pattern})\\z");
+    Regex::new(&anchored).map_err(|e| {
+        HtsError::VsInvalid(format!(
+            "ValueSet compose filter has an invalid regular expression '{pattern}': {e}"
+        ))
+    })
+}
+
+/// Evaluate a `regex` compose filter — returns concepts in `system_id` whose
+/// `code` (when `property == "code"`) or whose `concept_properties` value for
+/// `property` fully matches `pattern`.
+///
+/// The match is performed in Rust after the candidate rows have been loaded.
+/// For property-value regex we narrow at the SQL level to rows that even have
+/// a value for `property`; for `code` regex we scan all concepts in the system.
+fn query_regex_match(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    pattern: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let regex = compile_vs_regex(pattern)?;
+
+    if property == "code" || property.is_empty() {
+        // Match against the concept code itself.  Load all concepts for the
+        // system and filter in Rust — there is no cheap SQL primitive for an
+        // arbitrary regex, and concept counts in tx-ecosystem fixtures are
+        // small (the regex-bad CodeSystem is 3 concepts; SNOMED-scale code
+        // regex would be expensive but is not exercised by the IG suite).
+        let mut stmt = conn
+            .prepare_cached("SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code")
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map([system_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .filter(|(code, _)| regex.is_match(code))
+            .map(|(code, display)| ExpansionContains {
+                system: system_url.to_owned(),
+                code,
+                display,
+                is_abstract: None,
+                inactive: None,
+                designations: vec![],
+                properties: vec![],
+                contains: vec![],
+            })
+            .collect())
+    } else {
+        // Match against a named property value.  Pre-narrow at SQL to rows
+        // that carry the property — the `idx_concept_properties_value` index
+        // covers the (property, value, concept_id) triple.
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code, c.display, cp.value
+                 FROM   concept_properties cp
+                 JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?1
+                 WHERE  cp.property = ?2",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map([system_id, property], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        // A concept may have multiple values for the same property; keep it if
+        // any value matches.  Dedupe by code in case more than one value matches.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<ExpansionContains> = Vec::new();
+        for (code, display, value) in rows {
+            if regex.is_match(&value) && seen.insert(code.clone()) {
+                out.push(ExpansionContains {
+                    system: system_url.to_owned(),
+                    code,
+                    display,
+                    is_abstract: None,
+                    inactive: None,
+                    designations: vec![],
+                    properties: vec![],
+                    contains: vec![],
+                });
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Evaluate a `child-of` compose filter — returns the **direct** children of
+/// `parent_code` in `system_id`.  Per FHIR R5 §4.9.5 `child-of` selects only
+/// concepts whose immediate parent (one level) is the supplied value, never
+/// the value itself and never deeper descendants.  Use the pre-materialized
+/// `concept_hierarchy(parent_code, child_code)` parent-link table rather than
+/// `concept_closure`, which would also return transitive descendants.
+fn query_direct_children(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    parent_code: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT c.code, c.display
+             FROM   concept_hierarchy h
+             JOIN   concepts c ON c.system_id = ?1 AND c.code = h.child_code
+             WHERE  h.system_id = ?1 AND h.parent_code = ?2 AND h.child_code != ?2",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let rows = stmt
+        .query_map([system_id, parent_code], |r| {
+            Ok(ExpansionContains {
+                system: system_url.to_owned(),
+                code: r.get(0)?,
+                display: r.get(1)?,
+                is_abstract: None,
+                inactive: None,
+                designations: vec![],
+                properties: vec![],
+                contains: vec![],
+            })
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(rows)
+}
+
+/// Returns the subset of `candidates` whose immediate parent (one level) in
+/// `concept_hierarchy` is `parent_code`.  Used by
+/// [`apply_compose_filters_to_candidates`] to intersect a `child-of` filter
+/// against an already-bounded candidate set without re-querying every concept
+/// in the system.
+fn batch_direct_children_in_set(
+    conn: &Connection,
+    system_id: &str,
+    parent_code: &str,
+    candidates: &[String],
+) -> Result<HashSet<String>, HtsError> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let json_candidates =
+        serde_json::to_string(candidates).map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT j.value
+             FROM   json_each(?3) j
+             JOIN   concept_hierarchy h
+                    ON h.system_id = ?2 AND h.parent_code = ?1 AND h.child_code = j.value
+             WHERE  j.value != ?1",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let codes = stmt
+        .query_map(
+            rusqlite::params![parent_code, system_id, json_candidates],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(codes)
+}
+
 /// Return all concepts in `system_id` matching `filter_lower` via FTS5 trigram.
 ///
 /// The caller is responsible for calling [`ensure_concepts_fts`] first.
@@ -2567,6 +2851,49 @@ fn apply_compose_filters_to_candidates(
                 let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
                 let valid = batch_ancestors_in_set(conn, system_id, value, &codes)?;
                 candidates.retain(|c| valid.contains(&c.code));
+            }
+            ("concept", "child-of") => {
+                if value.is_empty() {
+                    return Err(HtsError::VsInvalid(
+                        "ValueSet compose filter with op='child-of' is missing a value".to_string(),
+                    ));
+                }
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let valid = batch_direct_children_in_set(conn, system_id, value, &codes)?;
+                candidates.retain(|c| valid.contains(&c.code));
+            }
+            (_, "regex") => {
+                let regex = compile_vs_regex(value)?;
+                if property == "code" || property.is_empty() {
+                    candidates.retain(|c| regex.is_match(&c.code));
+                } else {
+                    let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                    let json_codes = serde_json::to_string(&codes)
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    let mut stmt = conn
+                        .prepare_cached(
+                            "SELECT c.code, cp.value
+                             FROM   concept_properties cp
+                             JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?1
+                             WHERE  cp.property = ?2
+                               AND  c.code IN (SELECT value FROM json_each(?3))",
+                        )
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![system_id, property, json_codes], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    let mut keep: HashSet<String> = HashSet::new();
+                    for (code, val) in rows {
+                        if regex.is_match(&val) {
+                            keep.insert(code);
+                        }
+                    }
+                    candidates.retain(|c| keep.contains(&c.code));
+                }
             }
             (_, "=") => {
                 let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
@@ -7150,5 +7477,402 @@ mod tests {
         let codes1: Vec<&str> = resp1.contains.iter().map(|c| c.code.as_str()).collect();
         let codes2: Vec<&str> = resp2.contains.iter().map(|c| c.code.as_str()).collect();
         assert_eq!(codes1, codes2);
+    }
+
+    /// Mirror of the tx-ecosystem `simple-expand-regex` test: a `regex` filter
+    /// on `code` should match the FULL string against the pattern.
+    /// `[^ \t\r\n\f]{4}[0-9]` selects the three 5-character codes whose last
+    /// character is a digit (`code1`, `code2`, `code3`).  Without anchored
+    /// semantics every multi-segment code (`code2a`, `code2aI`, …) would also
+    /// match — the test keeps us honest about full-string matching.
+    #[tokio::test]
+    async fn expand_inline_regex_filter_on_code_full_string_match() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-simple-regex",
+              "url": "http://example.org/cs-simple-regex",
+              "status": "active", "content": "complete",
+              "concept": [
+                { "code": "code1", "display": "Display 1" },
+                { "code": "code2", "display": "Display 2",
+                  "concept": [
+                    { "code": "code2a", "display": "Display 2a",
+                      "concept": [
+                        { "code": "code2aI",  "display": "Display 2aI" },
+                        { "code": "code2aII", "display": "Display 2aII" }
+                      ]
+                    },
+                    { "code": "code2b", "display": "Display 2b" }
+                  ]
+                },
+                { "code": "code3", "display": "Display 3" }
+              ]
+            }
+          }]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-simple-regex",
+                    "filter": [{
+                        "property": "code",
+                        "op": "regex",
+                        "value": "[^ \\t\\r\\n\\f]{4}[0-9]"
+                    }]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec!["code1", "code2", "code3"],
+            "regex on code matches full-string only"
+        );
+    }
+
+    /// Mirror of `simple-expand-regex-prop`: regex on a named property selects
+    /// concepts whose property value fully matches.  `o[a-z]*` matches `old`
+    /// (full-string) but not `new`.
+    #[tokio::test]
+    async fn expand_inline_regex_filter_on_property() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-prop-regex",
+              "url": "http://example.org/cs-prop-regex",
+              "status": "active", "content": "complete",
+              "property": [{ "code": "prop", "type": "code" }],
+              "concept": [
+                { "code": "code1",   "display": "Display 1",
+                  "property": [{ "code": "prop", "valueCode": "old" }] },
+                { "code": "code2aI", "display": "Display 2aI",
+                  "property": [{ "code": "prop", "valueCode": "old" }] },
+                { "code": "code2b",  "display": "Display 2b",
+                  "property": [{ "code": "prop", "valueCode": "old" }] },
+                { "code": "code3",   "display": "Display 3",
+                  "property": [{ "code": "prop", "valueCode": "old" }] },
+                { "code": "code2",   "display": "Display 2",
+                  "property": [{ "code": "prop", "valueCode": "new" }] },
+                { "code": "code2a",  "display": "Display 2a",
+                  "property": [{ "code": "prop", "valueCode": "new" }] }
+              ]
+            }
+          }]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-prop-regex",
+                    "filter": [{
+                        "property": "prop",
+                        "op": "regex",
+                        "value": "o[a-z]*"
+                    }]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec!["code1", "code2aI", "code2b", "code3"],
+            "regex on property selects all concepts with prop value matching pattern"
+        );
+    }
+
+    /// Regex `(a+)+` on the regex-bad code system: only the pure `aaaa…` code
+    /// (no trailing chars) matches a full-string anchored pattern.  The codes
+    /// with trailing `Y` / `Z` must NOT match.  Rust's RE2-style engine handles
+    /// the otherwise-catastrophic backtracking pattern in linear time.
+    #[tokio::test]
+    async fn expand_inline_regex_filter_anchored_rejects_trailing_chars() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-regex-bad",
+              "url": "http://example.org/cs-regex-bad",
+              "status": "active", "content": "complete",
+              "concept": [
+                { "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  "display": "Pure" },
+                { "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaY", "display": "Y" },
+                { "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaZ", "display": "Z" }
+              ]
+            }
+          }]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-regex-bad",
+                    "filter": [{
+                        "property": "code",
+                        "op": "regex",
+                        "value": "(a+)+"
+                    }]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert_eq!(codes.len(), 1, "only the pure-a code matches full-string");
+        assert!(codes[0].chars().all(|c| c == 'a'));
+    }
+
+    /// A malformed regex must surface as `HtsError::VsInvalid` so the IG
+    /// fixtures see the `tx-issue-type=vs-invalid` coding rather than a
+    /// generic `invalid` error.  An unbalanced `[` is rejected by every
+    /// regex engine.
+    #[tokio::test]
+    async fn expand_inline_regex_invalid_pattern_returns_vs_invalid() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-rx-broken",
+              "url": "http://example.org/cs-rx-broken",
+              "status": "active", "content": "complete",
+              "concept": [{ "code": "X", "display": "X" }]
+            }
+          }]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-rx-broken",
+                    "filter": [{
+                        "property": "code",
+                        "op": "regex",
+                        "value": "[unclosed"
+                    }]
+                }]
+            }
+        });
+
+        let err = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("malformed regex must error");
+        assert!(
+            matches!(err, HtsError::VsInvalid(_)),
+            "expected VsInvalid, got: {err:?}"
+        );
+    }
+
+    /// Mirror of `simple-expand-child-of`: `child-of code2` should select only
+    /// the **direct** children of `code2` (`code2a`, `code2b`) and exclude
+    /// transitive descendants (`code2aI`, `code2aII`) and the value itself.
+    #[tokio::test]
+    async fn expand_inline_child_of_filter_returns_direct_children_only() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-childof",
+              "url": "http://example.org/cs-childof",
+              "status": "active", "content": "complete",
+              "hierarchyMeaning": "is-a",
+              "concept": [
+                { "code": "code1", "display": "Display 1" },
+                { "code": "code2", "display": "Display 2",
+                  "concept": [
+                    { "code": "code2a", "display": "Display 2a",
+                      "concept": [
+                        { "code": "code2aI",  "display": "Display 2aI" },
+                        { "code": "code2aII", "display": "Display 2aII" }
+                      ]
+                    },
+                    { "code": "code2b", "display": "Display 2b" }
+                  ]
+                },
+                { "code": "code3", "display": "Display 3" }
+              ]
+            }
+          }]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-childof",
+                    "filter": [{
+                        "property": "concept",
+                        "op": "child-of",
+                        "value": "code2"
+                    }]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec!["code2a", "code2b"],
+            "child-of returns direct children only"
+        );
+        assert!(!codes.contains(&"code2"), "child-of must exclude self");
+        assert!(
+            !codes.contains(&"code2aI"),
+            "child-of must exclude grandchildren"
+        );
+    }
+
+    /// Validate that `is-a` correctly returns the full transitive-closure
+    /// expansion when the value has both children and grandchildren.  The
+    /// tx-ecosystem `simple-expand-isa` test sets `value=code2`, expecting all
+    /// 5 concepts in the subtree (self + 2 children + 2 grandchildren).
+    #[tokio::test]
+    async fn expand_inline_is_a_filter_returns_full_subtree_including_self() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-isa-deep",
+              "url": "http://example.org/cs-isa-deep",
+              "status": "active", "content": "complete",
+              "hierarchyMeaning": "is-a",
+              "concept": [
+                { "code": "code1", "display": "Display 1" },
+                { "code": "code2", "display": "Display 2",
+                  "concept": [
+                    { "code": "code2a", "display": "Display 2a",
+                      "concept": [
+                        { "code": "code2aI",  "display": "Display 2aI" },
+                        { "code": "code2aII", "display": "Display 2aII" }
+                      ]
+                    },
+                    { "code": "code2b", "display": "Display 2b" }
+                  ]
+                },
+                { "code": "code3", "display": "Display 3" }
+              ]
+            }
+          }]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-isa-deep",
+                    "filter": [{
+                        "property": "concept",
+                        "op": "is-a",
+                        "value": "code2"
+                    }]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec!["code2", "code2a", "code2aI", "code2aII", "code2b"],
+            "is-a returns the full subtree including self"
+        );
+        // `total` is intentionally not asserted — the BFS fast path used by
+        // single-include is-a expansions returns `total: None` to avoid the
+        // separate count round-trip when the caller only asked for a page.
     }
 }
