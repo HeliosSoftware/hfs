@@ -898,26 +898,70 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // a "Coding has no system" message rather than matching by code
         // alone.
         if system.is_empty() {
-            // The IG fixtures expect a single `invalid` / `invalid-data`
-            // issue here, not a generic `code-invalid` / `not-in-vs`. Build
-            // it as a structured issue so the message text matches the
-            // fixture and result=false flows naturally.
-            let text = "No System defined; Coding has no system - cannot validate".to_string();
+            // The IG `validation/simple-coding-no-system` fixture expects two
+            // issues: an error-level not-in-vs (the code clearly isn't in the
+            // VS expansion since we have no system to anchor it) plus a
+            // warning-level invalid-data with the canonical
+            // "Coding has no system. A code with no system has no defined
+            // meaning..." text. Result is false because of the error issue.
+            // Need vs_version to format the not-in-vs URL with `|version`.
+            let vs_version_owned = crate::traits::ValueSetOperations::search(
+                state.backend(),
+                &ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(url.clone()),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+            .and_then(|mut hits| {
+                hits.pop()
+                    .and_then(|vs| {
+                        vs.get("version")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+            });
+            let vs_qualified = match vs_version_owned.as_deref() {
+                Some(v) => format!("{url}|{v}"),
+                None => url.clone(),
+            };
+            let not_in_vs_text = format!(
+                "The provided code '#{code}' was not found in the value set '{vs_qualified}'"
+            );
+            let no_system_text =
+                "Coding has no system. A code with no system has no defined meaning, \
+                 and it cannot be validated. A system should be provided"
+                    .to_string();
             return Ok(build_validate_response(
                 ValidateCodeResponse {
                     result: false,
-                    message: Some(text.clone()),
+                    message: Some(no_system_text.clone()),
                     display: None,
                     system: None,
                     inactive: None,
-                    issues: vec![ValidationIssue {
-                        severity: "error".into(),
-                        fhir_code: "invalid".into(),
-                        tx_code: "invalid-data".into(),
-                        text,
-                        location: Some("Coding.system".into()),
-                        message_id: Some("UNABLE_TO_INFER_CODESYSTEM".into()),
-                    }],
+                    issues: vec![
+                        ValidationIssue {
+                            severity: "error".into(),
+                            fhir_code: "code-invalid".into(),
+                            tx_code: "not-in-vs".into(),
+                            text: not_in_vs_text,
+                            location: Some("Coding.code".into()),
+                            message_id: Some(
+                                "None_of_the_provided_codes_are_in_the_value_set_one".into(),
+                            ),
+                        },
+                        ValidationIssue {
+                            severity: "warning".into(),
+                            fhir_code: "invalid".into(),
+                            tx_code: "invalid-data".into(),
+                            text: no_system_text,
+                            location: Some("Coding.system".into()),
+                            message_id: Some("UNABLE_TO_INFER_CODESYSTEM".into()),
+                        },
+                    ],
                 },
                 Some(&code),
                 None,
