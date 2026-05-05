@@ -422,42 +422,81 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
 /// Resolve a code system by URL, optional version, and optional date.
 ///
 /// Returns `(id, name_or_url, version)`.
+///
+/// Mirrors the SQLite implementation: an unspecified version defaults to the
+/// most recent (textual COALESCE-DESC), an explicit version with `.x` segments
+/// (or a bare numeric prefix like `"1"`) matches the highest version that
+/// shares the literal segments, and an exact version requires an exact match.
 async fn resolve_code_system(
     client: &tokio_postgres::Client,
     url: &str,
     version: Option<&str>,
     date: Option<&str>,
 ) -> Result<(String, String, Option<String>), HtsError> {
-    let rows = if let Some(ver) = version {
-        client
-            .query(
-                "SELECT id, COALESCE(name, url), version
-                 FROM code_systems
-                 WHERE url = $1 AND version = $2
-                   AND ($3::text IS NULL OR (resource_json->>'date') <= $3)",
-                &[&url, &ver, &date],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-    } else {
-        client
-            .query(
-                "SELECT id, COALESCE(name, url), version
-                 FROM code_systems
-                 WHERE url = $1
-                   AND ($2::text IS NULL OR (resource_json->>'date') <= $2)",
-                &[&url, &date],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-    };
+    let rows = client
+        .query(
+            "SELECT id, COALESCE(name, url), version
+             FROM code_systems
+             WHERE url = $1
+               AND ($2::text IS NULL OR (resource_json->>'date') <= $2)
+             ORDER BY COALESCE(version, '') DESC",
+            &[&url, &date],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    let row = rows
+    if rows.is_empty() {
+        return Err(HtsError::NotFound(format!("CodeSystem not found: {url}")));
+    }
+    let candidates: Vec<(String, String, Option<String>)> = rows
         .into_iter()
-        .next()
-        .ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {url}")))?;
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
 
-    Ok((row.get(0), row.get(1), row.get(2)))
+    match version {
+        Some(ver) if ver.contains(".x") || ver == "x" || is_short_version(ver) => {
+            select_best_version_match(&candidates, ver).ok_or_else(|| {
+                HtsError::NotFound(format!("CodeSystem not found: {url} (version {ver})"))
+            })
+        }
+        Some(ver) => candidates
+            .into_iter()
+            .find(|(_, _, v)| v.as_deref() == Some(ver))
+            .ok_or_else(|| {
+                HtsError::NotFound(format!("CodeSystem not found: {url} (version {ver})"))
+            }),
+        None => Ok(candidates.into_iter().next().expect("non-empty checked")),
+    }
+}
+
+fn is_short_version(ver: &str) -> bool {
+    !ver.contains('.') && ver.chars().all(|c| c.is_ascii_digit())
+}
+
+fn select_best_version_match(
+    candidates: &[(String, String, Option<String>)],
+    pattern: &str,
+) -> Option<(String, String, Option<String>)> {
+    let pattern_segments: Vec<&str> = pattern.split('.').collect();
+    candidates
+        .iter()
+        .filter(|(_, _, v)| match v {
+            Some(actual) => version_matches(actual, &pattern_segments),
+            None => false,
+        })
+        .max_by(|a, b| a.2.cmp(&b.2))
+        .cloned()
+}
+
+fn version_matches(actual: &str, pattern_segments: &[&str]) -> bool {
+    let actual_segments: Vec<&str> = actual.split('.').collect();
+    if pattern_segments.len() > actual_segments.len() {
+        return false;
+    }
+    pattern_segments
+        .iter()
+        .zip(actual_segments.iter())
+        .all(|(p, a)| *p == "x" || *p == *a)
 }
 
 /// Look up a concept row by `(system_id, code)`.

@@ -673,64 +673,88 @@ fn check_ancestor(
 ///
 /// Returns `(id, name_or_url, version)`.
 ///
-/// When `date` is provided, only code systems whose `$.date` (from `resource_json`)
-/// is ≤ the requested date are matched, enabling point-in-time evaluation.
+/// Version-matching rules (mirroring tx.fhir.org behaviour exercised by the
+/// tx-ecosystem `version/` test suite):
+///
+/// * `Some("1.x.x")` / `Some("1.x")` / `Some("1")` — partial match.  Each `x`
+///   segment acts as a wildcard, so `1.x.x` matches `1.0.0`, `1.2.0`, etc.
+///   The highest matching version wins.
+/// * `Some("1.0.0")` — exact match required.
+/// * `None` — no version pinning; the row with the highest `version` (sorted
+///   descending as text) wins so callers default to the most recent revision.
+///
+/// When `date` is provided, only code systems whose `$.date` (from
+/// `resource_json`) is ≤ the requested date are considered.
 fn resolve_code_system(
     conn: &rusqlite::Connection,
     url: &str,
     version: Option<&str>,
     date: Option<&str>,
 ) -> Result<(String, String, Option<String>), HtsError> {
-    let no_version_query = |conn: &rusqlite::Connection| {
-        conn.query_row(
+    let candidates = fetch_versions(conn, url, date)?;
+    if candidates.is_empty() {
+        return Err(HtsError::NotFound(format!("CodeSystem not found: {url}")));
+    }
+
+    let chosen = match version {
+        Some(ver)
+            if ver.contains(".x") || ver == "x" || super::code_system_version_is_short(ver) =>
+        {
+            // Project to (id, version) for the shared matcher then re-attach name.
+            let id_ver: Vec<(String, Option<String>)> = candidates
+                .iter()
+                .map(|(id, _, v)| (id.clone(), v.clone()))
+                .collect();
+            let (matched_id, _) = super::code_system_select_version_match(&id_ver, ver)
+                .ok_or_else(|| {
+                    HtsError::NotFound(format!("CodeSystem not found: {url} (version {ver})"))
+                })?;
+            candidates
+                .into_iter()
+                .find(|(id, _, _)| id == &matched_id)
+                .expect("matched id was sourced from candidates")
+        }
+        Some(ver) => candidates
+            .iter()
+            .find(|(_, _, v)| v.as_deref() == Some(ver))
+            .cloned()
+            .ok_or_else(|| {
+                HtsError::NotFound(format!("CodeSystem not found: {url} (version {ver})"))
+            })?,
+        None => candidates.into_iter().next().expect("non-empty checked"),
+    };
+    Ok(chosen)
+}
+
+/// Fetch every (id, name, version) row for `url`, sorted with the highest
+/// version first so `None`-version requests default to the newest revision.
+fn fetch_versions(
+    conn: &rusqlite::Connection,
+    url: &str,
+    date: Option<&str>,
+) -> Result<Vec<(String, String, Option<String>)>, HtsError> {
+    let mut stmt = conn
+        .prepare(
             "SELECT id, COALESCE(name, url), version \
              FROM code_systems \
              WHERE url = ?1 \
-               AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2)",
-            rusqlite::params![url, date],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
+               AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2) \
+             ORDER BY COALESCE(version, '') DESC",
         )
-    };
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    let result = if let Some(ver) = version {
-        // Try exact version first; fall back to any version of the same URL so
-        // clients that pass an informational version string (e.g. the pool was
-        // generated from v3-ActCode "9.0.0" but we have "2.1.0" imported) still
-        // get a result rather than a spurious 404.
-        let exact = conn.query_row(
-            "SELECT id, COALESCE(name, url), version \
-             FROM code_systems \
-             WHERE url = ?1 AND version = ?2 \
-               AND (?3 IS NULL OR json_extract(resource_json, '$.date') <= ?3)",
-            rusqlite::params![url, ver, date],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
-        );
-        match exact {
-            Err(rusqlite::Error::QueryReturnedNoRows) => no_version_query(conn),
-            other => other,
-        }
-    } else {
-        no_version_query(conn)
-    };
+    let rows = stmt
+        .query_map(rusqlite::params![url, date], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    result.map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => {
-            HtsError::NotFound(format!("CodeSystem not found: {url}"))
-        }
-        other => HtsError::StorageError(other.to_string()),
-    })
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
 /// Look up a concept row by `(system_id, code)`.
@@ -1470,6 +1494,133 @@ mod tests {
         assert!(resp.designations.is_empty());
         // Display falls back to concept default.
         assert_eq!(resp.display, Some("Term (English default)".into()));
+    }
+
+    // ── Multi-version resolution ──────────────────────────────────────────────
+
+    /// Insert two versions of the same canonical URL with different concept
+    /// displays so we can assert which version got picked.
+    fn seed_two_versions(b: &SqliteTerminologyBackend) {
+        let conn = b.pool().get().unwrap();
+        conn.execute_batch(
+            "INSERT INTO code_systems
+                 (id, url, version, name, status, content, created_at, updated_at)
+             VALUES ('mv|1.0.0', 'http://example.org/mv', '1.0.0', 'MV',
+                     'active', 'complete', '2024-01-01', '2024-01-01'),
+                    ('mv|1.2.0', 'http://example.org/mv', '1.2.0', 'MV',
+                     'active', 'complete', '2024-01-02', '2024-01-02');
+
+             INSERT INTO concepts (id, system_id, code, display)
+             VALUES (300, 'mv|1.0.0', 'code1', 'Display 1 (1.0)'),
+                    (301, 'mv|1.2.0', 'code1', 'Display 1 (1.2)');",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lookup_without_version_picks_latest() {
+        let b = backend();
+        seed_two_versions(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/mv".into(),
+                    code: "code1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.version.as_deref(), Some("1.2.0"));
+        assert_eq!(resp.display.as_deref(), Some("Display 1 (1.2)"));
+    }
+
+    #[tokio::test]
+    async fn lookup_with_exact_version_targets_that_row() {
+        let b = backend();
+        seed_two_versions(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/mv".into(),
+                    code: "code1".into(),
+                    version: Some("1.0.0".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.version.as_deref(), Some("1.0.0"));
+        assert_eq!(resp.display.as_deref(), Some("Display 1 (1.0)"));
+    }
+
+    #[tokio::test]
+    async fn lookup_with_partial_wildcard_picks_highest_match() {
+        let b = backend();
+        seed_two_versions(&b);
+
+        // `1.x.x` matches both 1.0.0 and 1.2.0; the higher one wins.
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/mv".into(),
+                    code: "code1".into(),
+                    version: Some("1.x.x".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.version.as_deref(), Some("1.2.0"));
+    }
+
+    #[tokio::test]
+    async fn lookup_with_short_version_prefix_matches_any_in_family() {
+        let b = backend();
+        seed_two_versions(&b);
+
+        // Bare numeric prefix `1` should match any 1.x.x version.
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/mv".into(),
+                    code: "code1".into(),
+                    version: Some("1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.version.as_deref(), Some("1.2.0"));
+    }
+
+    #[tokio::test]
+    async fn lookup_with_unknown_version_returns_not_found() {
+        let b = backend();
+        seed_two_versions(&b);
+
+        let err = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/mv".into(),
+                    code: "code1".into(),
+                    version: Some("9.9.9".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HtsError::NotFound(_)));
     }
 
     #[tokio::test]

@@ -100,7 +100,11 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
 
         for (system_url, codes) in &by_system {
             let id_rows = client
-                .query("SELECT id FROM code_systems WHERE url = $1", &[system_url])
+                .query(
+                    "SELECT id FROM code_systems WHERE url = $1 \
+                     ORDER BY COALESCE(version, '') DESC LIMIT 1",
+                    &[system_url],
+                )
                 .await
                 .map_err(|e| HtsError::StorageError(format!("DB error: {e}")))?;
 

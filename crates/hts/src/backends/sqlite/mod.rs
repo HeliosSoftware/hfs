@@ -168,7 +168,7 @@ impl SqliteTerminologyBackend {
         let plain_fts_cache: PlainFtsCache = Arc::new(RwLock::new(HashMap::new()));
         // Bootstrap: apply WAL + schema on a single connection.
         {
-            let conn = pool.get().map_err(|e| {
+            let mut conn = pool.get().map_err(|e| {
                 HtsError::StorageError(format!("Failed to acquire connection for init: {e}"))
             })?;
 
@@ -184,6 +184,14 @@ impl SqliteTerminologyBackend {
             })?;
             schema::migrate_concept_closure(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
+            })?;
+            // Drop legacy column-level UNIQUE on code_systems.url so multi-version
+            // CodeSystems can share a canonical URL. Idempotent — no-op when the
+            // table was already created without that constraint.
+            schema::migrate_code_systems_drop_url_unique(&mut conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to drop legacy code_systems.url UNIQUE: {e}"
+                ))
             })?;
 
             // Clear the concept FTS index on every startup — it is always rebuilt
@@ -258,7 +266,7 @@ impl SqliteTerminologyBackend {
             .map_err(|e| HtsError::StorageError(format!("Failed to create in-memory pool: {e}")))?;
 
         {
-            let conn = pool.get().map_err(|e| {
+            let mut conn = pool.get().map_err(|e| {
                 HtsError::StorageError(format!("Failed to acquire in-memory connection: {e}"))
             })?;
             conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")
@@ -271,6 +279,11 @@ impl SqliteTerminologyBackend {
             schema::migrate_search_columns(&conn).map_err(|e| {
                 HtsError::StorageError(format!(
                     "Failed to apply in-memory search column migration: {e}"
+                ))
+            })?;
+            schema::migrate_code_systems_drop_url_unique(&mut conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to drop legacy code_systems.url UNIQUE: {e}"
                 ))
             })?;
         }
@@ -323,19 +336,88 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
 
     /// Look up the canonical URL for a ValueSet or ConceptMap by its FHIR `id`.
     ///
-    /// Queries the HTS normalized table for the resource type.  Returns `None`
-    /// when the ID is unknown.
+    /// CodeSystem rows can share a FHIR id across versions (the synthetic
+    /// storage id encodes the version), so for CodeSystem we also try matching
+    /// `resource_json.id` and pick the latest version when several rows match.
+    ///
+    /// Returns `None` when the ID is unknown.
     fn resource_url_by_id(&self, resource_type: &str, id: &str) -> Option<String> {
         let conn = self.pool.get().ok()?;
-        let sql = match resource_type {
-            "CodeSystem" => "SELECT url FROM code_systems WHERE id = ?1",
-            "ValueSet" => "SELECT url FROM value_sets WHERE id = ?1",
-            "ConceptMap" => "SELECT url FROM concept_maps WHERE id = ?1",
-            _ => return None,
-        };
-        conn.query_row(sql, rusqlite::params![id], |row| row.get::<_, String>(0))
-            .ok()
+        match resource_type {
+            "CodeSystem" => {
+                if let Ok(url) = conn.query_row(
+                    "SELECT url FROM code_systems WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    return Some(url);
+                }
+                conn.query_row(
+                    "SELECT url FROM code_systems \
+                     WHERE json_extract(resource_json, '$.id') = ?1 \
+                     ORDER BY COALESCE(version, '') DESC \
+                     LIMIT 1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            }
+            "ValueSet" => conn
+                .query_row(
+                    "SELECT url FROM value_sets WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok(),
+            "ConceptMap" => conn
+                .query_row(
+                    "SELECT url FROM concept_maps WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok(),
+            _ => None,
+        }
     }
+}
+
+// ── Multi-version helpers (shared by code_system.rs + value_set.rs) ───────────
+
+/// `true` for versions like `"1"` or `"2"` that should match any version
+/// starting with that segment.
+pub(super) fn code_system_version_is_short(ver: &str) -> bool {
+    !ver.contains('.') && ver.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Pick the highest-version row that matches `pattern`.
+///
+/// Each `x` segment in the pattern is a wildcard.  Bare numeric prefixes
+/// (e.g. `"1"`) match any version starting with that segment.  Returns
+/// `None` when no candidate matches.
+pub(super) fn code_system_select_version_match(
+    candidates: &[(String, Option<String>)],
+    pattern: &str,
+) -> Option<(String, Option<String>)> {
+    let segments: Vec<&str> = pattern.split('.').collect();
+    candidates
+        .iter()
+        .filter(|(_, v)| match v {
+            Some(actual) => code_system_version_matches(actual, &segments),
+            None => false,
+        })
+        .max_by(|a, b| a.1.cmp(&b.1))
+        .cloned()
+}
+
+fn code_system_version_matches(actual: &str, pattern_segments: &[&str]) -> bool {
+    let actual_segments: Vec<&str> = actual.split('.').collect();
+    if pattern_segments.len() > actual_segments.len() {
+        return false;
+    }
+    pattern_segments
+        .iter()
+        .zip(actual_segments.iter())
+        .all(|(p, a)| *p == "x" || *p == *a)
 }
 
 // ── BundleImportBackend ────────────────────────────────────────────────────────

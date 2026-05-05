@@ -1622,7 +1622,7 @@ fn compute_expansion_depth(
     if let Some(result) = try_multi_include_property_only(conn, includes, warnings)? {
         included = result;
     } else {
-        let mut system_id_cache: HashMap<String, String> = HashMap::new();
+        let mut system_id_cache: HashMap<(String, Option<String>), String> = HashMap::new();
         for inc in includes {
             // Handle include.valueSet references (FHIR R4 §4.8.5):
             // one ValueSet includes all concepts from another ValueSet by URL.
@@ -1671,35 +1671,30 @@ fn compute_expansion_depth(
                 Some(s) if !s.is_empty() => s,
                 _ => continue,
             };
+            let inc_version = inc["version"].as_str();
 
-            // Resolve code system id — cached so repeated includes for the same
-            // system URL don't round-trip to the database more than once.
-            let system_id = match system_id_cache.get(system_url) {
+            // Resolve the code_systems row honouring an optional version pin.
+            // When the include declares a version we look up that specific (url,
+            // version) row; otherwise we pick the highest-versioned row so a
+            // version-less include still expands the latest revision. Cached so
+            // repeated (url, version) pairs don't round-trip more than once.
+            let cache_key = (system_url.to_owned(), inc_version.map(str::to_owned));
+            let system_id = match system_id_cache.get(&cache_key) {
                 Some(id) => id.clone(),
-                None => {
-                    let raw_id: Option<String> = conn
-                        .query_row(
-                            "SELECT id FROM code_systems WHERE url = ?1",
-                            [system_url],
-                            |row| row.get(0),
-                        )
-                        .optional()
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                    match raw_id {
-                        Some(id) => {
-                            system_id_cache.insert(system_url.to_owned(), id.clone());
-                            id
-                        }
-                        None => {
-                            let msg = format!(
-                                "CodeSystem {system_url} was not found and has been excluded from the expansion"
-                            );
-                            tracing::warn!(%system_url, "{msg}");
-                            warnings.push(msg);
-                            continue;
-                        }
+                None => match resolve_compose_system_id(conn, system_url, inc_version)? {
+                    Some(id) => {
+                        system_id_cache.insert(cache_key, id.clone());
+                        id
                     }
-                }
+                    None => {
+                        let msg = format!(
+                            "CodeSystem {system_url} was not found and has been excluded from the expansion"
+                        );
+                        tracing::warn!(%system_url, ?inc_version, "{msg}");
+                        warnings.push(msg);
+                        continue;
+                    }
+                },
             };
 
             // Check for ECL / is-a filters before falling through to the explicit
@@ -3292,6 +3287,52 @@ fn bfs_isa_page(
     .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
+/// Look up the storage id of a code_systems row given a canonical URL and an
+/// optional version constraint from a `compose.include[]` entry.
+///
+/// Mirrors the version-resolution rules used by `$lookup` /
+/// `$validate-code` / `$subsumes`: an exact version requires a literal match,
+/// `1.x.x` / `1.x` / bare `1` patterns match the highest version that shares
+/// the literal segments, and `None` falls back to the most recent revision.
+///
+/// Returns `Ok(None)` when no row matches so callers can skip the include
+/// rather than abort the whole expansion.
+fn resolve_compose_system_id(
+    conn: &Connection,
+    url: &str,
+    version: Option<&str>,
+) -> Result<Option<String>, HtsError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, version FROM code_systems \
+             WHERE url = ?1 \
+             ORDER BY COALESCE(version, '') DESC",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let rows: Vec<(String, Option<String>)> = stmt
+        .query_map(rusqlite::params![url], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let chosen = match version {
+        Some(v) if v.contains(".x") || v == "x" || super::code_system_version_is_short(v) => {
+            super::code_system_select_version_match(&rows, v)
+        }
+        Some(v) => rows.into_iter().find(|(_, ver)| ver.as_deref() == Some(v)),
+        None => rows.into_iter().next(),
+    };
+
+    Ok(chosen.map(|(id, _)| id))
+}
+
 /// Find the canonical URL of a CodeSystem whose `valueSet` property equals `vs_url`.
 ///
 /// When a CodeSystem carries `"valueSet": "http://..."` it implicitly defines a
@@ -3349,13 +3390,16 @@ fn build_hierarchical_expansion(
         .map(|c| (c.system.clone(), c.code.clone()))
         .collect();
 
-    // For each unique system URL, look up the system_id from code_systems.
+    // For each unique system URL, pick the latest-versioned id so the
+    // hierarchy edges we walk reflect the most recent revision when the
+    // expansion combines codes from multiple versions of the same URL.
     let system_urls: HashSet<String> = flat.iter().map(|c| c.system.clone()).collect();
     let mut system_id_map: HashMap<String, String> = HashMap::new();
     for sys_url in &system_urls {
         if let Some(id) = conn
             .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1",
+                "SELECT id FROM code_systems WHERE url = ?1 \
+                 ORDER BY COALESCE(version, '') DESC LIMIT 1",
                 [sys_url],
                 |row| row.get::<_, String>(0),
             )
@@ -5672,6 +5716,177 @@ mod tests {
             }
           ]
         }"#
+    }
+
+    /// `compose.include[].version` must select the matching code_systems row,
+    /// not just the latest one.
+    ///
+    /// The bundle imports two CodeSystems sharing
+    /// `http://example.org/cs-mv` with versions `1.0.0` (codes A, B) and
+    /// `2.0.0` (codes C, D), plus three ValueSets that pin different versions
+    /// in their compose includes. Each $expand should return only the codes
+    /// belonging to the selected version.
+    fn bundle_with_mv_compose() -> &'static str {
+        r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "mv",
+                "url": "http://example.org/cs-mv",
+                "version": "1.0.0",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  { "code": "A", "display": "A v1" },
+                  { "code": "B", "display": "B v1" }
+                ]
+              }
+            },
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "mv",
+                "url": "http://example.org/cs-mv",
+                "version": "2.0.0",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  { "code": "C", "display": "C v2" },
+                  { "code": "D", "display": "D v2" }
+                ]
+              }
+            },
+            {
+              "resource": {
+                "resourceType": "ValueSet",
+                "id": "vs-pin-v1",
+                "url": "http://example.org/vs-pin-v1",
+                "status": "active",
+                "compose": {
+                  "include": [{
+                    "system": "http://example.org/cs-mv",
+                    "version": "1.0.0"
+                  }]
+                }
+              }
+            },
+            {
+              "resource": {
+                "resourceType": "ValueSet",
+                "id": "vs-pin-v2",
+                "url": "http://example.org/vs-pin-v2",
+                "status": "active",
+                "compose": {
+                  "include": [{
+                    "system": "http://example.org/cs-mv",
+                    "version": "2.0.0"
+                  }]
+                }
+              }
+            },
+            {
+              "resource": {
+                "resourceType": "ValueSet",
+                "id": "vs-mixed",
+                "url": "http://example.org/vs-mixed",
+                "status": "active",
+                "compose": {
+                  "include": [
+                    {
+                      "system": "http://example.org/cs-mv",
+                      "version": "1.0.0",
+                      "concept": [{ "code": "A" }]
+                    },
+                    {
+                      "system": "http://example.org/cs-mv",
+                      "version": "2.0.0",
+                      "concept": [{ "code": "C" }]
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }"#
+    }
+
+    #[tokio::test]
+    async fn expand_compose_version_pin_selects_v1_codes() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_with_mv_compose().as_bytes())
+            .await
+            .unwrap();
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some("http://example.org/vs-pin-v1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(codes.contains(&"A"), "v1.0.0 codes only: {codes:?}");
+        assert!(codes.contains(&"B"));
+        assert!(!codes.contains(&"C"), "v2.0.0 codes must not leak in");
+        assert!(!codes.contains(&"D"));
+    }
+
+    #[tokio::test]
+    async fn expand_compose_version_pin_selects_v2_codes() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_with_mv_compose().as_bytes())
+            .await
+            .unwrap();
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some("http://example.org/vs-pin-v2".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(codes.contains(&"C"));
+        assert!(codes.contains(&"D"));
+        assert!(!codes.contains(&"A"));
+        assert!(!codes.contains(&"B"));
+    }
+
+    /// Mirrors `tx-ecosystem/tests/version/valueset-version-mixed.json`:
+    /// each include clause pulls a single code from its own pinned version.
+    #[tokio::test]
+    async fn expand_compose_mixed_versions_combines_codes_per_version() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_with_mv_compose().as_bytes())
+            .await
+            .unwrap();
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some("http://example.org/vs-mixed".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(codes.contains(&"A"), "v1 code A pulled from version 1.0.0");
+        assert!(codes.contains(&"C"), "v2 code C pulled from version 2.0.0");
+        assert_eq!(resp.total, Some(2), "exactly two codes: {codes:?}");
     }
 
     #[tokio::test]

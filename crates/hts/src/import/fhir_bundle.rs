@@ -19,7 +19,7 @@ use r2d2::Pool;
 #[cfg(feature = "sqlite")]
 use r2d2_sqlite::SqliteConnectionManager;
 #[cfg(feature = "sqlite")]
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -174,54 +174,24 @@ fn write_code_system(
     let resource_json = serde_json::to_string(&cs.resource_json).ok();
     let now = utc_now();
 
-    // Resolve the id to use:
-    //   1. If a row for this URL already exists, reuse its id (in-place update).
-    //   2. Otherwise use cs.id, unless cs.id is already taken by a different URL
-    //      (can happen when two distinct CodeSystems share a short FHIR id like
-    //      "observation-status") — in that case mint a fresh UUID.
-    let existing_id: Option<String> = conn
-        .prepare_cached("SELECT id FROM code_systems WHERE url = ?1")
-        .and_then(|mut s| {
-            s.query_row(rusqlite::params![cs.url], |row| row.get(0))
-                .optional()
-        })
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // Synthetic storage id: `<fhir-id>|<version>` (or `<fhir-id>` when version
+    // is absent). This guarantees distinct rows per (url, version) even when
+    // the upstream resource ships the same FHIR `id` for multiple versions
+    // (e.g. tx-ecosystem `version/codesystem-version-1.json` + `-2.json` both
+    // declare `"id":"version"`). The pipe character is reserved in canonical
+    // URLs so it cannot collide with a legitimate FHIR id.
+    let storage_id = storage_id_for(&cs.id, cs.version.as_deref());
 
-    let system_id: String = if let Some(id) = existing_id {
-        id
-    } else {
-        let id_taken: bool = conn
-            .prepare_cached("SELECT COUNT(*) FROM code_systems WHERE id = ?1")
-            .and_then(|mut s| s.query_row(rusqlite::params![cs.id], |row| row.get::<_, i64>(0)))
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-            > 0;
-        if id_taken {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            cs.id.clone()
-        }
-    };
-
-    // Use ON CONFLICT(url) DO UPDATE instead of INSERT OR REPLACE to avoid
-    // triggering the ON DELETE CASCADE on concepts — a stub CodeSystem from
-    // an hl7-npm package (content=not-present) must never wipe existing
-    // RF2/LOINC concepts that were imported separately.
-    conn.prepare_cached(
-        "INSERT INTO code_systems
+    // Upsert keyed on (url, version): a re-import of the same version updates
+    // the existing row rather than creating a new one or wiping sibling
+    // versions. The composite UNIQUE index on (url, COALESCE(version,''))
+    // guarantees each (url, version) maps to at most one storage row.
+    conn.execute(
+        "INSERT OR IGNORE INTO code_systems
          (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
-         ON CONFLICT(url) DO UPDATE SET
-             version       = excluded.version,
-             name          = excluded.name,
-             title         = excluded.title,
-             status        = excluded.status,
-             content       = excluded.content,
-             resource_json = excluded.resource_json,
-             updated_at    = excluded.updated_at",
-    )
-    .and_then(|mut s| {
-        s.execute(rusqlite::params![
-            system_id,
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        rusqlite::params![
+            storage_id,
             cs.url,
             cs.version,
             cs.name,
@@ -230,15 +200,51 @@ fn write_code_system(
             cs.content,
             resource_json,
             now
-        ])
-    })
+        ],
+    )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    // Upsert the concept and read back its id in one round-trip via
-    // `RETURNING id` — replacing the previous INSERT OR REPLACE +
-    // last_insert_rowid() pattern, which forced a synchronous round-trip
-    // after every row. ON CONFLICT here avoids the row delete/reinsert that
-    // INSERT OR REPLACE would cause (and the cascade on concept_id children).
+    // INSERT OR IGNORE skips the update path on conflict; force-update the
+    // metadata for this (url, version) row so re-imports refresh title/status
+    // /resource_json without disturbing sibling versions.
+    conn.execute(
+        "UPDATE code_systems SET
+           name          = ?1,
+           title         = ?2,
+           status        = ?3,
+           content       = ?4,
+           resource_json = ?5,
+           updated_at    = ?6
+         WHERE url = ?7 AND COALESCE(version, '') = COALESCE(?8, '')",
+        rusqlite::params![
+            cs.name,
+            cs.title,
+            cs.status,
+            cs.content,
+            resource_json,
+            now,
+            cs.url,
+            cs.version,
+        ],
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    // Resolve the authoritative storage id for this (url, version) pair.
+    // A prior import that used a different synthesised FHIR id still wins,
+    // so we always look it up via the composite index rather than trusting
+    // `storage_id` directly.
+    let system_id: String = conn
+        .query_row(
+            "SELECT id FROM code_systems \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![cs.url, cs.version],
+            |row| row.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(format!("Failed to resolve CodeSystem id: {e}")))?;
+
+    // Upsert each concept with `RETURNING id` to avoid a second round-trip per
+    // row.  ON CONFLICT preserves child rows (no cascade-delete) so reimports
+    // refresh display/definition without losing properties or designations.
     const UPSERT_CONCEPT_SQL: &str = "INSERT INTO concepts (system_id, code, display, definition)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(system_id, code) DO UPDATE SET
@@ -492,12 +498,32 @@ fn write_concept_map(
 
 /// Look up a CodeSystem's canonical URL by its FHIR resource `id`.
 ///
+/// Falls back to matching the original FHIR id stored inside `resource_json`
+/// when the synthetic storage id (`<id>|<version>`) doesn't directly match —
+/// this is what CRUD callers see in URL paths like `/CodeSystem/version`.
+/// When several versions share the same FHIR id we return the latest version
+/// (sorted descending as text) so the caller has a defined target.
+///
 /// Returns `Ok(None)` when no code system with that `id` exists.
 #[cfg(feature = "sqlite")]
 pub(crate) fn get_code_system_url(conn: &Connection, id: &str) -> Result<Option<String>, HtsError> {
     use rusqlite::OptionalExtension;
+    if let Some(url) = conn
+        .query_row(
+            "SELECT url FROM code_systems WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+    {
+        return Ok(Some(url));
+    }
     conn.query_row(
-        "SELECT url FROM code_systems WHERE id = ?1",
+        "SELECT url FROM code_systems \
+         WHERE json_extract(resource_json, '$.id') = ?1 \
+         ORDER BY COALESCE(version, '') DESC \
+         LIMIT 1",
         rusqlite::params![id],
         |row| row.get::<_, String>(0),
     )
@@ -524,10 +550,15 @@ pub(crate) fn invalidate_expansion_cache_for_system(
 }
 
 /// Delete a CodeSystem and all its normalized data by its FHIR resource `id`.
+///
+/// Multi-version: matches both the synthetic storage id (`<id>|<version>`)
+/// and the original FHIR id captured in `resource_json.id`, so a CRUD DELETE
+/// `/CodeSystem/version` removes every stored version of that resource.
 #[cfg(feature = "sqlite")]
 pub(crate) fn delete_code_system(conn: &Connection, id: &str) -> Result<(), HtsError> {
     conn.execute(
-        "DELETE FROM code_systems WHERE id = ?1",
+        "DELETE FROM code_systems \
+         WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
         rusqlite::params![id],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -560,6 +591,21 @@ pub(crate) fn delete_concept_map(conn: &Connection, id: &str) -> Result<(), HtsE
 
 fn utc_now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// Build a multi-version-safe storage id for a CodeSystem.
+///
+/// The HTS schema permits multiple `code_systems` rows that share a canonical
+/// `url` provided each row has a distinct `version`. Tx-ecosystem fixtures
+/// frequently ship the same FHIR `id` (e.g. `"version"`) for every version of
+/// a CodeSystem, so a 1:1 use of `id` would collide on the PK. Suffixing the
+/// version makes the storage id deterministic per (url, version) without
+/// forcing callers to thread the URL through.
+pub(crate) fn storage_id_for(fhir_id: &str, version: Option<&str>) -> String {
+    match version {
+        Some(v) if !v.is_empty() => format!("{fhir_id}|{v}"),
+        _ => fhir_id.to_owned(),
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -699,6 +745,89 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Two CodeSystems sharing a canonical URL but declaring distinct
+    /// `version` values (and the same FHIR `id`) must coexist.
+    ///
+    /// Mirrors `tx-ecosystem/tests/version/codesystem-version-{1,2}.json`,
+    /// which both ship `"id":"version"` + the same `url`. The legacy
+    /// `UNIQUE(url)` constraint dropped one of them; the new composite
+    /// `(url, version)` index lets both survive.
+    #[tokio::test]
+    async fn import_two_versions_same_url_keeps_both() {
+        let b = backend();
+        let ctx = ctx();
+
+        let bundle = r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "version",
+                "url": "http://example.org/cs/multi",
+                "version": "1.0.0",
+                "status": "active",
+                "content": "complete",
+                "concept": [{ "code": "code1", "display": "Display 1 (1.0)" }]
+              }
+            },
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "version",
+                "url": "http://example.org/cs/multi",
+                "version": "1.2.0",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  { "code": "code1", "display": "Display 1 (1.2)" },
+                  { "code": "code3", "display": "Display 3 (1.2)" }
+                ]
+              }
+            }
+          ]
+        }"#;
+
+        let stats = b.import_bundle(&ctx, bundle.as_bytes()).await.unwrap();
+        assert_eq!(stats.code_systems, 2);
+        assert!(
+            stats.errors.is_empty(),
+            "no errors expected, got: {:?}",
+            stats.errors
+        );
+
+        let conn = b.pool().get().unwrap();
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_systems WHERE url = 'http://example.org/cs/multi'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 2, "both versions must coexist");
+
+        // Each version owns its own concept set.
+        let v1_concepts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concepts c JOIN code_systems s ON c.system_id = s.id \
+                 WHERE s.url = 'http://example.org/cs/multi' AND s.version = '1.0.0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v2_concepts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concepts c JOIN code_systems s ON c.system_id = s.id \
+                 WHERE s.url = 'http://example.org/cs/multi' AND s.version = '1.2.0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v1_concepts, 1);
+        assert_eq!(v2_concepts, 2);
+    }
+
     #[tokio::test]
     async fn hierarchy_materialized_from_nesting() {
         let b = backend();
@@ -707,11 +836,19 @@ mod tests {
             .await
             .unwrap();
 
+        // Multi-version storage_id is opaque, so resolve it via URL first.
         let conn = b.pool().get().unwrap();
+        let system_id: String = conn
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = 'http://example.org/cs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM concept_hierarchy WHERE system_id='cs-test'",
-                [],
+                "SELECT COUNT(*) FROM concept_hierarchy WHERE system_id = ?1",
+                [&system_id],
                 |r| r.get(0),
             )
             .unwrap();
