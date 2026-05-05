@@ -102,6 +102,31 @@ fn standards_statuses(resource: &Value) -> Vec<String> {
     out
 }
 
+/// Like [`standards_statuses`] but for ValueSets — only the standards-status
+/// extension contributes a warning. The bare `status` and `experimental`
+/// flags on a VS do NOT emit a `warning-<status>` per the IG fixtures
+/// (`search/*`, `deprecated/*`); those rules apply only to CodeSystems.
+fn vs_extension_statuses(resource: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(exts) = resource.get("extension").and_then(|e| e.as_array()) {
+        for ext in exts {
+            if ext.get("url").and_then(|u| u.as_str())
+                == Some(
+                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                )
+            {
+                if let Some(code) = ext.get("valueCode").and_then(|v| v.as_str()) {
+                    if !code.is_empty() && !out.iter().any(|c| c == code) {
+                        out.push(code.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// Recursively serializes nested `contains` arrays, so that a hierarchical
 /// expansion (produced when `hierarchical=true`) is correctly represented as
 /// nested `contains[]` objects rather than a flat list.
@@ -1298,7 +1323,10 @@ async fn process_expand<B: TerminologyBackend>(
         }
     }
 
-    // Then add any warning-* derived from the source VS itself.
+    // Then add any warning-* derived from the source VS itself. ValueSets
+    // only contribute warnings via the explicit standards-status extension —
+    // the IG fixtures (search/*, deprecated/*) treat a VS-level
+    // `status: draft` as a non-event, unlike the same field on a CodeSystem.
     if let Some(vs) = source_vs.as_ref() {
         let vs_url = vs.get("url").and_then(|v| v.as_str());
         let vs_version = vs.get("version").and_then(|v| v.as_str());
@@ -1308,7 +1336,7 @@ async fn process_expand<B: TerminologyBackend>(
             _ => None,
         };
         if let Some(uri) = vs_value_uri {
-            for status_code in standards_statuses(vs) {
+            for status_code in vs_extension_statuses(vs) {
                 warning_params.push(json!({
                     "name": format!("warning-{status_code}"),
                     "valueUri": uri,
