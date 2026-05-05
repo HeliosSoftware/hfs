@@ -304,6 +304,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // Accumulates FHIR expansion warnings for unknown/skipped systems.
             // Only populated by the inline ValueSet path.
             let mut warnings: Vec<String> = Vec::new();
+            // True when every compose.include[] is purely an explicit
+            // concept[] enumeration (no filter, no valueSet refs). Set by
+            // the URL-based path below; used to skip tree-building when the
+            // IG enum-* fixtures want a flat expansion even with
+            // excludeNested=false.
+            let mut compose_is_enumerated = false;
 
             let all_codes = if let Some(vs_resource) = req.value_set {
                 // Inline ValueSet: extract compose and expand directly.
@@ -514,6 +520,35 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     req.date.as_deref(),
                 ) {
                     Ok((vs_id, compose_json)) => {
+                        // Detect "every include uses explicit concept[]
+                        // enumeration" so we can skip tree-building below —
+                        // the IG `parameters/parameters-expand-enum-*`
+                        // fixtures want enumerated expansions flat, even
+                        // when excludeNested=false (children of an abstract
+                        // parent are surfaced as siblings, not nested).
+                        compose_is_enumerated = compose_json
+                            .as_deref()
+                            .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                            .and_then(|v| v.get("include").cloned())
+                            .and_then(|incs| incs.as_array().cloned())
+                            .map(|incs| {
+                                !incs.is_empty()
+                                    && incs.iter().all(|inc| {
+                                        inc.get("concept")
+                                            .and_then(|c| c.as_array())
+                                            .is_some_and(|a| !a.is_empty())
+                                            && inc
+                                                .get("filter")
+                                                .and_then(|f| f.as_array())
+                                                .is_none_or(|a| a.is_empty())
+                                            && inc
+                                                .get("valueSet")
+                                                .and_then(|v| v.as_array())
+                                                .is_none_or(|a| a.is_empty())
+                                    })
+                            })
+                            .unwrap_or(false);
+
                         // Normal path: try the expansion cache first.
                         let cached = fetch_cache(&conn, &vs_id)?;
                         if cached.is_empty() {
@@ -760,7 +795,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             // Hierarchical mode: build tree from the filtered flat list and
             // return without pagination (total = flat count, no offset/count).
-            if req.hierarchical == Some(true) {
+            // Skip tree-building when the source compose is purely enumerated
+            // — the IG `parameters/parameters-expand-enum-*` fixtures want
+            // those expansions flat (children of abstract parents are
+            // surfaced as siblings, not nested under the parent), regardless
+            // of excludeNested.
+            if req.hierarchical == Some(true) && !compose_is_enumerated {
                 let total = filtered.len() as u32;
                 let tree = build_hierarchical_expansion(&conn, filtered)?;
                 return Ok(ExpandResponse {
