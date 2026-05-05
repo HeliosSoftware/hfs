@@ -1858,6 +1858,25 @@ fn apply_compose_filters(
         _ => return Ok(None),
     };
 
+    // Validate every filter carries a non-empty `value`. ValueSet.compose.
+    // include.filter.value is mandatory per the FHIR spec; the HL7 IG
+    // `errors/broken-filter` fixtures expect a 400 with diagnostic text
+    // "The system <url> filter with property = <p>, op = <o> has no value"
+    // and `tx-issue-type=vs-invalid` whenever it is missing or empty.
+    for f in filters {
+        let value_present = f
+            .get("value")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty());
+        if !value_present {
+            let property = f["property"].as_str().unwrap_or("");
+            let op = f["op"].as_str().unwrap_or("");
+            return Err(HtsError::VsInvalid(format!(
+                "The system {system_url} filter with property = {property}, op = {op} has no value"
+            )));
+        }
+    }
+
     // Partition into property= filters (fast, indexed) and hierarchy filters
     // (potentially O(N_descendants)).  Property filters run in phase 1; hierarchy
     // filters run in phase 2 and can exploit the bounded candidate set from

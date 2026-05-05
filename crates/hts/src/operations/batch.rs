@@ -42,7 +42,7 @@ fn error_status(e: &HtsError) -> &'static str {
     match e {
         HtsError::NotFound(_) => "404",
         HtsError::NotSupported(_) => "501",
-        HtsError::InvalidRequest(_) => "400",
+        HtsError::InvalidRequest(_) | HtsError::VsInvalid(_) => "400",
         HtsError::Internal(_) | HtsError::StorageError(_) => "500",
         HtsError::PreconditionFailed(_) => "412",
         HtsError::TooCostly(_) => "422",
@@ -54,7 +54,7 @@ fn error_to_outcome(e: &HtsError) -> Value {
     let (code, diagnostics) = match e {
         HtsError::NotFound(msg) => ("not-found", msg.as_str()),
         HtsError::NotSupported(msg) => ("not-supported", msg.as_str()),
-        HtsError::InvalidRequest(msg) => ("invalid", msg.as_str()),
+        HtsError::InvalidRequest(msg) | HtsError::VsInvalid(msg) => ("invalid", msg.as_str()),
         HtsError::Internal(msg) => ("exception", msg.as_str()),
         HtsError::StorageError(msg) => ("exception", msg.as_str()),
         HtsError::PreconditionFailed(msg) => ("conflict", msg.as_str()),
