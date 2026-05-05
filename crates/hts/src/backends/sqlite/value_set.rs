@@ -2351,10 +2351,18 @@ fn apply_compose_filters(
     // candidate set from phase 1 to switch from a top-down tree expansion to
     // per-candidate ancestor walks; regex filters run last so they only need
     // to materialise the (already narrowed) candidate set.
+    // Treat `op="in"` with a single non-comma value identically to `op="="`
+    // — the IG `notSelectable/notSelectable-prop-in*` fixtures use
+    // `filter: { property: notSelectable, op: in, value: "true" }`. FHIR
+    // spec `in` is a comma-separated list; the single-value case is the
+    // common one and reduces cleanly to equality. (Multi-value `in`
+    // expansion remains TODO — those fixtures aren't currently in scope.)
     let (property_filters, mut rest): (Vec<_>, Vec<_>) = filters.iter().partition(|f| {
         let op = f["op"].as_str().unwrap_or("");
         let property = f["property"].as_str().unwrap_or("");
-        op == "=" && property != "constraint"
+        let value = f["value"].as_str().unwrap_or("");
+        let in_single_value = op == "in" && !value.contains(',');
+        (op == "=" || in_single_value) && property != "constraint"
     });
     let (regex_filters, hierarchy_filters): (Vec<_>, Vec<_>) = rest
         .drain(..)
