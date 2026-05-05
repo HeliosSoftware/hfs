@@ -959,21 +959,25 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
 
-        // Verify HTS normalized tables were populated.
+        // Verify HTS normalized tables were populated. The synthetic storage
+        // id (`<fhir-id>|<version>`) is opaque, so we look up by URL.
         let conn = hts_pool.get().unwrap();
-        let count: i64 = conn
+        let storage_id: String = conn
             .query_row(
-                "SELECT COUNT(*) FROM code_systems WHERE id = 'cs-index'",
+                "SELECT id FROM code_systems WHERE url = 'http://example.org/cs/cs-index'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "code_systems row should be created");
+        assert!(
+            storage_id.starts_with("cs-index"),
+            "storage id should be derived from FHIR id, got {storage_id}"
+        );
 
         let concept_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM concepts WHERE system_id = 'cs-index'",
-                [],
+                "SELECT COUNT(*) FROM concepts WHERE system_id = ?1",
+                [&storage_id],
                 |r| r.get(0),
             )
             .unwrap();
@@ -1028,11 +1032,12 @@ mod tests {
             .unwrap();
         assert_eq!(del.status(), StatusCode::NO_CONTENT);
 
-        // Verify normalized rows are gone.
+        // Verify normalized rows are gone. Match by URL to avoid coupling to
+        // the synthetic storage-id format.
         let conn = hts_pool.get().unwrap();
         let cs_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM code_systems WHERE id = 'cs-del'",
+                "SELECT COUNT(*) FROM code_systems WHERE url = 'http://example.org/cs/cs-del'",
                 [],
                 |r| r.get(0),
             )
@@ -1041,7 +1046,7 @@ mod tests {
 
         let concept_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM concepts WHERE system_id = 'cs-del'",
+                "SELECT COUNT(*) FROM concepts WHERE system_id LIKE 'cs-del%'",
                 [],
                 |r| r.get(0),
             )

@@ -337,17 +337,14 @@ async fn compute_expansion(
             Some(s) if !s.is_empty() => s,
             _ => continue,
         };
+        let inc_version = inc["version"].as_str();
 
-        let rows = client
-            .query("SELECT id FROM code_systems WHERE url = $1", &[&system_url])
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-        let system_id: String = match rows.into_iter().next() {
-            Some(r) => r.get(0),
+        let system_id = match resolve_compose_system_id(client, system_url, inc_version).await? {
+            Some(id) => id,
             None => {
                 tracing::warn!(
                     system_url,
+                    inc_version,
                     "Skipping unknown code system in ValueSet compose"
                 );
                 continue;
@@ -422,6 +419,77 @@ async fn compute_expansion(
     Ok(included)
 }
 
+/// Resolve the storage id of the `code_systems` row matching the (url,
+/// optional version) pair declared on a `compose.include[]` entry.
+///
+/// Mirrors the SQLite helper: `1.x.x`-style patterns match the highest
+/// version sharing the literal segments, an exact version requires a literal
+/// match, and `None` falls back to the latest revision.
+async fn resolve_compose_system_id(
+    client: &tokio_postgres::Client,
+    url: &str,
+    version: Option<&str>,
+) -> Result<Option<String>, HtsError> {
+    let rows = client
+        .query(
+            "SELECT id, version FROM code_systems \
+             WHERE url = $1 \
+             ORDER BY COALESCE(version, '') DESC",
+            &[&url],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let candidates: Vec<(String, Option<String>)> = rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let chosen = match version {
+        Some(v) if v.contains(".x") || v == "x" || compose_short_version(v) => {
+            compose_select_version(&candidates, v)
+        }
+        Some(v) => candidates
+            .into_iter()
+            .find(|(_, ver)| ver.as_deref() == Some(v)),
+        None => candidates.into_iter().next(),
+    };
+    Ok(chosen.map(|(id, _)| id))
+}
+
+fn compose_short_version(ver: &str) -> bool {
+    !ver.contains('.') && ver.chars().all(|c| c.is_ascii_digit())
+}
+
+fn compose_select_version(
+    candidates: &[(String, Option<String>)],
+    pattern: &str,
+) -> Option<(String, Option<String>)> {
+    let segments: Vec<&str> = pattern.split('.').collect();
+    candidates
+        .iter()
+        .filter(|(_, v)| match v {
+            Some(actual) => compose_version_matches(actual, &segments),
+            None => false,
+        })
+        .max_by(|a, b| a.1.cmp(&b.1))
+        .cloned()
+}
+
+fn compose_version_matches(actual: &str, pattern_segments: &[&str]) -> bool {
+    let actual_segments: Vec<&str> = actual.split('.').collect();
+    if pattern_segments.len() > actual_segments.len() {
+        return false;
+    }
+    pattern_segments
+        .iter()
+        .zip(actual_segments.iter())
+        .all(|(p, a)| *p == "x" || *p == *a)
+}
+
 /// Find the canonical URL of a CodeSystem whose `valueSet` property equals `vs_url`.
 async fn find_cs_for_implicit_vs(
     client: &tokio_postgres::Client,
@@ -468,7 +536,11 @@ async fn build_hierarchical_expansion(
     let mut system_id_map: HashMap<String, String> = HashMap::new();
     for sys_url in &system_urls {
         let rows = client
-            .query("SELECT id FROM code_systems WHERE url = $1", &[sys_url])
+            .query(
+                "SELECT id FROM code_systems WHERE url = $1 \
+                 ORDER BY COALESCE(version, '') DESC LIMIT 1",
+                &[sys_url],
+            )
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
         if let Some(row) = rows.into_iter().next() {

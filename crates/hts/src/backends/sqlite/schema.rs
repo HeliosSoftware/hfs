@@ -17,11 +17,20 @@
 ///
 /// All statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`
 /// so this can be applied safely on every startup without error.
+///
+/// # Multi-version code systems
+///
+/// `code_systems` allows multiple rows with the same `url` provided each row
+/// has a distinct `version`. Uniqueness is enforced via the composite index
+/// `idx_code_systems_url_version` (the column-level `UNIQUE` constraint on
+/// `url` was dropped to make multi-version coexistence possible). Rows whose
+/// `version` is `NULL` are coalesced to the empty string by the index so two
+/// imports of the same URL with no version still collide.
 pub const SCHEMA: &str = "
 -- ── Code Systems ──────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS code_systems (
     id          TEXT PRIMARY KEY,
-    url         TEXT NOT NULL UNIQUE,
+    url         TEXT NOT NULL,
     version     TEXT,
     name        TEXT,
     status      TEXT NOT NULL DEFAULT 'active',
@@ -29,6 +38,9 @@ CREATE TABLE IF NOT EXISTS code_systems (
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
+    ON code_systems(url, COALESCE(version, ''));
+CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);
 
 -- ── Concepts ───────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concepts (
@@ -149,6 +161,59 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
         }
     }
     Ok(())
+}
+
+/// Drop the legacy `UNIQUE` constraint on `code_systems.url` so multiple rows
+/// with the same canonical URL but different `version` values can coexist.
+///
+/// The original DDL declared `url TEXT NOT NULL UNIQUE`, baking the constraint
+/// into an internal `sqlite_autoindex_*` index that cannot be dropped directly.
+/// We detect that legacy index by inspecting `sqlite_master.sql` and, when
+/// present, rebuild the table without the column-level `UNIQUE` so the new
+/// composite `(url, version)` index in [`SCHEMA`] becomes the sole uniqueness
+/// guarantee. Idempotent: a no-op once the rebuild has run.
+pub fn migrate_code_systems_drop_url_unique(
+    conn: &mut rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    let needs_rebuild: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master \
+             WHERE type='table' AND name='code_systems' \
+               AND sql LIKE '%url%TEXT%NOT NULL%UNIQUE%'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if !needs_rebuild {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE code_systems_new (
+             id            TEXT PRIMARY KEY,
+             url           TEXT NOT NULL,
+             version       TEXT,
+             name          TEXT,
+             status        TEXT NOT NULL DEFAULT 'active',
+             content       TEXT NOT NULL DEFAULT 'complete',
+             created_at    TEXT NOT NULL,
+             updated_at    TEXT NOT NULL,
+             title         TEXT,
+             resource_json TEXT
+         );
+         INSERT INTO code_systems_new
+             (id, url, version, name, status, content, created_at, updated_at, title, resource_json)
+         SELECT id, url, version, name, status, content, created_at, updated_at, title, resource_json
+           FROM code_systems;
+         DROP TABLE code_systems;
+         ALTER TABLE code_systems_new RENAME TO code_systems;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
+             ON code_systems(url, COALESCE(version, ''));
+         CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);",
+    )?;
+    tx.commit()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

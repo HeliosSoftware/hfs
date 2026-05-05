@@ -15,9 +15,14 @@ pub const SCHEMA: &str = "
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ── Code Systems ──────────────────────────────────────────────────────────────
+-- Multi-version: a canonical URL may have multiple rows so long as each row has
+-- a distinct `version`. Uniqueness is enforced via the composite expression
+-- index `idx_code_systems_url_version` (the column-level UNIQUE on `url` was
+-- dropped). Rows with NULL version are coalesced to the empty string by the
+-- index so two un-versioned imports of the same URL still collide.
 CREATE TABLE IF NOT EXISTS code_systems (
     id           TEXT PRIMARY KEY,
-    url          TEXT NOT NULL UNIQUE,
+    url          TEXT NOT NULL,
     version      TEXT,
     name         TEXT,
     title        TEXT,
@@ -27,6 +32,29 @@ CREATE TABLE IF NOT EXISTS code_systems (
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
+    ON code_systems(url, COALESCE(version, ''));
+CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);
+
+-- Legacy installs created code_systems with `url TEXT NOT NULL UNIQUE`, which
+-- bakes uniqueness into a hidden constraint that blocks multi-version imports.
+-- Drop both the standalone constraint name and the auto-named one so subsequent
+-- (url, version) duplicates can coexist; both forms are silently ignored when
+-- absent (legacy index is unnamed across PG versions).
+DO $$
+DECLARE
+    cons_name text;
+BEGIN
+    FOR cons_name IN
+        SELECT conname FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = 'code_systems'
+          AND c.contype = 'u'
+          AND pg_get_constraintdef(c.oid) = 'UNIQUE (url)'
+    LOOP
+        EXECUTE format('ALTER TABLE code_systems DROP CONSTRAINT %I', cons_name);
+    END LOOP;
+END $$;
 
 -- ── Concepts ───────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concepts (

@@ -298,10 +298,12 @@ fn closure_sync(conn: &Connection, req: &ClosureRequest) -> Result<ClosureRespon
     let mut groups: Vec<serde_json::Value> = Vec::new();
 
     for (system_url, codes) in &by_system {
-        // Look up the internal code_system.id.
+        // Look up the internal code_system.id, picking the latest version when
+        // a URL has multiple stored revisions.
         let system_id_opt: Option<String> = conn
             .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1",
+                "SELECT id FROM code_systems WHERE url = ?1 \
+                 ORDER BY COALESCE(version, '') DESC LIMIT 1",
                 rusqlite::params![system_url],
                 |row| row.get(0),
             )

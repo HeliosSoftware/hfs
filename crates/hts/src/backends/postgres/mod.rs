@@ -113,14 +113,48 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let client = pool.get().await.ok()?;
-                let sql = match resource_type.as_str() {
-                    "CodeSystem" => "SELECT url FROM code_systems WHERE id = $1",
-                    "ValueSet" => "SELECT url FROM value_sets WHERE id = $1",
-                    "ConceptMap" => "SELECT url FROM concept_maps WHERE id = $1",
-                    _ => return None,
-                };
-                let rows = client.query(sql, &[&id]).await.ok()?;
-                rows.into_iter().next().map(|r| r.get::<_, String>(0))
+                match resource_type.as_str() {
+                    "CodeSystem" => {
+                        // Storage id may be the synthetic `<id>|<version>` form,
+                        // so first try a direct hit, then fall back to matching
+                        // the FHIR resource id captured in `resource_json` and
+                        // pick the latest version.
+                        if let Ok(rows) = client
+                            .query("SELECT url FROM code_systems WHERE id = $1", &[&id])
+                            .await
+                        {
+                            if let Some(row) = rows.into_iter().next() {
+                                return Some(row.get::<_, String>(0));
+                            }
+                        }
+                        let rows = client
+                            .query(
+                                "SELECT url FROM code_systems \
+                                 WHERE (resource_json->>'id') = $1 \
+                                 ORDER BY COALESCE(version, '') DESC \
+                                 LIMIT 1",
+                                &[&id],
+                            )
+                            .await
+                            .ok()?;
+                        rows.into_iter().next().map(|r| r.get::<_, String>(0))
+                    }
+                    "ValueSet" => {
+                        let rows = client
+                            .query("SELECT url FROM value_sets WHERE id = $1", &[&id])
+                            .await
+                            .ok()?;
+                        rows.into_iter().next().map(|r| r.get::<_, String>(0))
+                    }
+                    "ConceptMap" => {
+                        let rows = client
+                            .query("SELECT url FROM concept_maps WHERE id = $1", &[&id])
+                            .await
+                            .ok()?;
+                        rows.into_iter().next().map(|r| r.get::<_, String>(0))
+                    }
+                    _ => None,
+                }
             })
         })
     }
@@ -255,13 +289,17 @@ async fn write_code_system(
     let resource_json = Some(cs.resource_json.clone());
     let now = utc_now();
 
-    // Two-step upsert so we handle conflicts on *either* unique constraint
-    // (the `url` index and the PK on `id`). `ON CONFLICT (url) DO UPDATE`
-    // alone does not catch a PK collision that would happen when two
-    // concurrent importers use the same `cs.id` — the INSERT can fail on the
-    // PK arbiter index before the URL arbiter is consulted. `ON CONFLICT DO
-    // NOTHING` (no target) swallows any unique-constraint conflict, after
-    // which a plain UPDATE by URL refreshes the row and returns its id.
+    // Synthetic storage id encodes the version so multiple versions of the
+    // same canonical URL coexist even when they share the same FHIR `id`
+    // (tx-ecosystem `version/codesystem-version-1.json` + `-2.json` both ship
+    // `"id":"version"`). See `crate::import::fhir_bundle::storage_id_for`.
+    let storage_id = crate::import::fhir_bundle::storage_id_for(&cs.id, cs.version.as_deref());
+
+    // Upsert keyed on (url, version). The composite UNIQUE index
+    // `idx_code_systems_url_version` is the conflict arbiter; the legacy
+    // `ON CONFLICT (url)` is no longer applicable now that two rows can share
+    // a URL. `ON CONFLICT DO NOTHING` keeps a prior row in place; the UPDATE
+    // below then refreshes its mutable columns by (url, version).
     client
         .execute(
             "INSERT INTO code_systems
@@ -269,7 +307,7 @@ async fn write_code_system(
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
              ON CONFLICT DO NOTHING",
             &[
-                &cs.id,
+                &storage_id,
                 &cs.url,
                 &cs.version,
                 &cs.name,
@@ -286,17 +324,15 @@ async fn write_code_system(
     let cs_rows = client
         .query(
             "UPDATE code_systems SET
-               version       = $1,
-               name          = $2,
-               title         = $3,
-               status        = $4,
-               content       = $5,
-               resource_json = $6,
-               updated_at    = $7
-             WHERE url = $8
+               name          = $1,
+               title         = $2,
+               status        = $3,
+               content       = $4,
+               resource_json = $5,
+               updated_at    = $6
+             WHERE url = $7 AND COALESCE(version, '') = COALESCE($8, '')
              RETURNING id",
             &[
-                &cs.version,
                 &cs.name,
                 &cs.title,
                 &cs.status,
@@ -304,6 +340,7 @@ async fn write_code_system(
                 &resource_json,
                 &now,
                 &cs.url,
+                &cs.version,
             ],
         )
         .await
