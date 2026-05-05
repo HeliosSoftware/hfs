@@ -880,6 +880,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     .as_deref()
                                     .map(|s| is_concept_inactive(&conn, s, &req.code))
                                     .unwrap_or(false);
+                            let code_unknown_in_cs = found.is_none()
+                                && req
+                                    .system
+                                    .as_deref()
+                                    .map(|s| !is_code_in_cs(&conn, s, &req.code))
+                                    .unwrap_or(false);
+                            let cs_version = req
+                                .system
+                                .as_deref()
+                                .and_then(|s| cs_version_for_msg(&conn, s));
                             let vs_version_owned = lookup_value_set_version(&conn, &url);
                             return finish_validate_code_response(
                                 found,
@@ -891,6 +901,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 inactive_for_msg,
                                 vs_version_owned.as_deref(),
                                 inactive_in_cs,
+                                code_unknown_in_cs,
+                                cs_version.as_deref(),
                             );
                         }
 
@@ -919,6 +931,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 .as_deref()
                                 .map(|s| is_concept_inactive(&conn, s, &req.code))
                                 .unwrap_or(false);
+                        let code_unknown_in_cs = found.is_none()
+                            && req
+                                .system
+                                .as_deref()
+                                .map(|s| !is_code_in_cs(&conn, s, &req.code))
+                                .unwrap_or(false);
+                        let cs_version = req
+                            .system
+                            .as_deref()
+                            .and_then(|s| cs_version_for_msg(&conn, s));
                         let vs_version_owned = lookup_value_set_version(&conn, &url);
                         return finish_validate_code_response(
                             found,
@@ -930,6 +952,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             inactive_for_msg,
                             vs_version_owned.as_deref(),
                             inactive_in_cs,
+                            code_unknown_in_cs,
+                            cs_version.as_deref(),
                         );
                     }
                     Err(e) => return Err(e),
@@ -968,6 +992,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .as_deref()
                     .map(|s| is_concept_inactive(&conn, s, &req.code))
                     .unwrap_or(false);
+            let code_unknown_in_cs = found.is_none()
+                && req
+                    .system
+                    .as_deref()
+                    .map(|s| !is_code_in_cs(&conn, s, &req.code))
+                    .unwrap_or(false);
+            let cs_version = req
+                .system
+                .as_deref()
+                .and_then(|s| cs_version_for_msg(&conn, s));
             let vs_version_owned = lookup_value_set_version(&conn, &url);
             finish_validate_code_response(
                 found,
@@ -979,6 +1013,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 inactive_for_msg,
                 vs_version_owned.as_deref(),
                 inactive_in_cs,
+                code_unknown_in_cs,
+                cs_version.as_deref(),
             )
         })
         .await
@@ -4407,6 +4443,38 @@ fn lookup_value_set_version(conn: &Connection, url: &str) -> Option<String> {
 /// Returns true when the concept has a status property in the inactive set
 /// (retired/deprecated/withdrawn/inactive). Used by $validate-code so the
 /// response can surface a top-level `inactive` parameter per the IG fixtures.
+/// `true` when the code exists in the named CodeSystem (regardless of any
+/// flags). Used by validate_code to decide whether to emit a separate
+/// `code-invalid` / `invalid-code` issue ("Unknown code 'X' in the
+/// CodeSystem 'url' version 'Y'") when the VS validation already failed
+/// because the code is absent from the underlying CS.
+fn is_code_in_cs(conn: &Connection, system_url: &str, code: &str) -> bool {
+    conn.query_row(
+        "SELECT 1
+         FROM concepts c
+         JOIN code_systems s ON s.id = c.system_id
+         WHERE s.url = ?1 AND c.code = ?2
+         LIMIT 1",
+        rusqlite::params![system_url, code],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Returns the highest stored version for a CodeSystem URL, used to format
+/// the IG-expected "Unknown code in CodeSystem 'url' version 'X'" message.
+fn cs_version_for_msg(conn: &Connection, system_url: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT version FROM code_systems \
+         WHERE url = ?1 \
+         ORDER BY COALESCE(version, '') DESC LIMIT 1",
+        rusqlite::params![system_url],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
 fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool {
     // Honour both the legacy `status` property convention (value in
     // {retired, deprecated, withdrawn, inactive}) AND the FHIR `inactive`
@@ -4462,6 +4530,8 @@ fn finish_validate_code_response(
     is_inactive: bool,
     vs_version: Option<&str>,
     is_inactive_in_underlying_cs: bool,
+    code_unknown_in_cs: bool,
+    cs_version_for_msg: Option<&str>,
 ) -> Result<ValidateCodeResponse, HtsError> {
     let qualified = match system_for_msg {
         Some(s) => format!("{s}#{code}"),
@@ -4503,6 +4573,31 @@ fn finish_validate_code_response(
                 location: Some("Coding.code".into()),
                 message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
             });
+            // Companion issue: when the code isn't in the underlying CodeSystem
+            // at all (but the CodeSystem itself IS loaded), the IG fixtures
+            // (permutations/bad-coding-*-request) expect a separate
+            // `code-invalid` / `invalid-code` issue. Skip when the CodeSystem
+            // is itself unknown — the operations layer already adds a
+            // `not-found` / `not-found` issue for that case, and double-emitting
+            // would inflate the issue count.
+            if code_unknown_in_cs && cs_version_for_msg.is_some() {
+                if let Some(sys) = system_for_msg {
+                    let cs_text = match cs_version_for_msg {
+                        Some(v) => format!(
+                            "Unknown code '{code}' in the CodeSystem '{sys}' version '{v}'"
+                        ),
+                        None => format!("Unknown code '{code}' in the CodeSystem '{sys}'"),
+                    };
+                    issues.push(crate::types::ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "code-invalid".into(),
+                        tx_code: "invalid-code".into(),
+                        text: cs_text,
+                        location: Some("Coding.code".into()),
+                        message_id: Some("Unknown_Code_in_Version".into()),
+                    });
+                }
+            }
             if is_inactive_in_underlying_cs {
                 issues.push(crate::types::ValidationIssue {
                     severity: "warning".into(),
