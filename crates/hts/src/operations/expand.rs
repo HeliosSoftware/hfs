@@ -1165,7 +1165,13 @@ async fn process_expand<B: TerminologyBackend>(
             // `filter` is emitted later as a normalised valueString.
             // `property` is a request-side filter for contains[].property —
             // the IG fixtures don't echo it back.
-            if matches!(name, "url" | "valueSet" | "filter" | "property") {
+            // `valueSetVersion` selects which (url, version) ValueSet — the
+            // IG fixtures expose the chosen version via the response's
+            // top-level `version` field, not as an expansion.parameter echo.
+            if matches!(
+                name,
+                "url" | "valueSet" | "valueSetVersion" | "filter" | "property"
+            ) {
                 return false;
             }
             // Configuration inputs that the IG validator passes via the
