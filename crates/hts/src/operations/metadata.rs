@@ -226,7 +226,47 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
 
 #[cfg(not(feature = "R4"))]
 pub fn build_terminology_capabilities(_backend: &impl TerminologyMetadata) -> Value {
-    json!({ "resourceType": "TerminologyCapabilities", "status": "active", "kind": "instance" })
+    json!({
+        "resourceType": "TerminologyCapabilities",
+        "version": HTS_VERSION,
+        "name": "HeliosTerminologyServer",
+        "title": HTS_NAME,
+        "status": "active",
+        "kind": "instance",
+        "date": "2026-04-01",
+        "experimental": false,
+        "software": {
+            "name": HTS_NAME,
+            "version": HTS_VERSION,
+            "releaseDate": "2026-04-01",
+        },
+        "implementation": {
+            "description": "Helios Terminology Server SQLite backend"
+        },
+        "codeSystem": [],
+        "expansion": {
+            "hierarchical": false,
+            "paging": true,
+            "incomplete": false,
+            "parameter": [
+                {"name": "activeOnly"},
+                {"name": "check-system-version"},
+                {"name": "count"},
+                {"name": "displayLanguage"},
+                {"name": "excludeNested"},
+                {"name": "force-system-version"},
+                {"name": "includeDefinition"},
+                {"name": "includeDesignations"},
+                {"name": "offset"},
+                {"name": "property"},
+                {"name": "system-version"},
+                {"name": "tx-resource"}
+            ]
+        },
+        "validateCode": { "translations": false },
+        "translation": { "needsMap": true },
+        "closure": {}
+    })
 }
 
 /// Build a FHIR R4 CapabilityStatement for the HTS server.
@@ -350,6 +390,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 }
             ],
             "operation": [
+                {"name": "versions", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-versions"},
                 {"name": "lookup", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"},
                 {"name": "validate-code", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"},
                 {"name": "subsumes", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-subsumes"},
