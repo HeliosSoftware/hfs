@@ -1477,25 +1477,25 @@ async fn process_expand<B: TerminologyBackend>(
                 Some((u, v)) => (u.to_string(), Some(v.to_string())),
                 None => (raw_ref.clone(), None),
             };
-            let resolved_version: Option<String> =
-                ValueSetOperations::search(
-                    state.backend(),
-                    &ctx,
-                    crate::types::ResourceSearchQuery {
-                        url: Some(bare_url.clone()),
-                        version: pinned_version.clone(),
-                        count: Some(1),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .ok()
-                .and_then(|mut hits| {
-                    hits.pop().and_then(|h| {
-                        h.get("version")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
+            let referenced_vs: Option<Value> = ValueSetOperations::search(
+                state.backend(),
+                &ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(bare_url.clone()),
+                    version: pinned_version.clone(),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+            .and_then(|mut hits| hits.pop());
+            let resolved_version = referenced_vs
+                .as_ref()
+                .and_then(|h| {
+                    h.get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
                 })
                 .or(pinned_version.clone());
             let value_uri = match resolved_version {
@@ -1508,6 +1508,18 @@ async fn process_expand<B: TerminologyBackend>(
                     "name": "used-valueset",
                     "valueUri": value_uri,
                 }));
+                // Surface warnings for the referenced VS the same way we do
+                // for the source VS — IG `deprecated/not-withdrawn` expects
+                // a `warning-withdrawn` for the referenced (withdrawn) VS
+                // alongside its `used-valueset` entry.
+                if let Some(ref ref_vs) = referenced_vs {
+                    for status_code in vs_extension_statuses(ref_vs) {
+                        warning_params.push(json!({
+                            "name": format!("warning-{status_code}"),
+                            "valueUri": value_uri,
+                        }));
+                    }
+                }
             }
         }
     }
