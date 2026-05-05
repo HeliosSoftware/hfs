@@ -2061,8 +2061,13 @@ fn expand_includes_per_clause(
                 if let Some(obj) = single_inc.as_object_mut() {
                     obj.remove("valueSet");
                 }
-                let base_codes =
-                    expand_single_include_local(conn, &single_inc, warnings, &mut system_id_cache)?;
+                let base_codes = expand_single_include_local(
+                    conn,
+                    &single_inc,
+                    warnings,
+                    &mut system_id_cache,
+                    depth,
+                )?;
                 let mut bs: HashSet<(String, String)> = HashSet::new();
                 for c in &base_codes {
                     bs.insert((c.system.clone(), c.code.clone()));
@@ -2097,7 +2102,13 @@ fn expand_includes_per_clause(
 
         // No `valueSet[]` reference on this include — fall through to the
         // local single-include expansion (system + concept + filter).
-        let local = expand_single_include_local(conn, inc, warnings, &mut system_id_cache)?;
+        let local = expand_single_include_local(
+            conn,
+            inc,
+            warnings,
+            &mut system_id_cache,
+            depth,
+        )?;
         included.extend(local);
     }
 
@@ -2115,6 +2126,7 @@ fn expand_single_include_local(
     inc: &serde_json::Value,
     warnings: &mut Vec<String>,
     system_id_cache: &mut HashMap<String, String>,
+    depth: u8,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let system_url = match inc["system"].as_str() {
         Some(s) if !s.is_empty() => s,
@@ -2204,11 +2216,20 @@ fn expand_single_include_local(
         // the top level even when nested mode is requested. Surface direct
         // children here; the activeOnly splice in the operations layer then
         // reshapes the tree as needed.
-        let abstract_codes_in_set: Vec<String> = out
-            .iter()
-            .filter(|c| is_concept_abstract(conn, &c.system, &c.code))
-            .map(|c| c.code.clone())
-            .collect();
+        //
+        // Skip when depth > 0 — the simple/expand-contained fixture
+        // intersects an inline `#vs1` ref (also enumerated, also includes
+        // an abstract code2) with another VS, and the IG expects the
+        // inner expansion to be exactly the enumerated codes (no children
+        // bolted on) so the intersection is well-defined.
+        let abstract_codes_in_set: Vec<String> = if depth == 0 {
+            out.iter()
+                .filter(|c| is_concept_abstract(conn, &c.system, &c.code))
+                .map(|c| c.code.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         for parent_code in abstract_codes_in_set {
             let mut child_stmt = conn
                 .prepare_cached(
@@ -2326,8 +2347,13 @@ fn build_exclude_set(
                 if let Some(obj) = single_exc.as_object_mut() {
                     obj.remove("valueSet");
                 }
-                let local =
-                    expand_single_include_local(conn, &single_exc, warnings, &mut system_id_cache)?;
+                let local = expand_single_include_local(
+                    conn,
+                    &single_exc,
+                    warnings,
+                    &mut system_id_cache,
+                    depth,
+                )?;
                 let local_set: HashSet<(String, String)> =
                     local.into_iter().map(|c| (c.system, c.code)).collect();
                 intersected.retain(|k| local_set.contains(k));
@@ -2355,7 +2381,8 @@ fn build_exclude_set(
 
         // No concept[], no valueSet[] — fall back to the same per-include
         // expansion path (covers exclude.filter[], full-system exclude, etc.).
-        let local = expand_single_include_local(conn, exc, warnings, &mut system_id_cache)?;
+        let local =
+            expand_single_include_local(conn, exc, warnings, &mut system_id_cache, depth)?;
         for c in local {
             denied.insert((c.system, c.code));
         }
