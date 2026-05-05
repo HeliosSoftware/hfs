@@ -35,6 +35,21 @@ use super::params::{
     parse_query_string, query_params_to_fhir_params,
 };
 
+/// Identifies which FHIR `$validate-code` input form the operations layer is
+/// rendering a response for. Used to keep `OperationOutcome.issue.location`
+/// on each emitted issue aligned with the FHIRPath the IG fixtures expect:
+/// the bare-code path uses `code` / `system`, while the Coding and
+/// CodeableConcept paths use `Coding.code` / `Coding.system`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestPath {
+    /// `code` (+ optional `system`/`version`/`display`) parameter.
+    BareCode,
+    /// `coding` (`valueCoding`) parameter.
+    Coding,
+    /// `codeableConcept` (`valueCodeableConcept`) parameter.
+    CodeableConcept,
+}
+
 /// Render a single [`ValidationIssue`] as a FHIR `OperationOutcome.issue`.
 ///
 /// The resulting JSON includes the `operationoutcome-message-id` extension
@@ -93,6 +108,7 @@ fn build_validate_response(
     version: Option<&str>,
     codeable_concept: Option<&Value>,
     unknown_system: Option<&str>,
+    request_path: RequestPath,
 ) -> Value {
     let mut parameter: Vec<Value> = Vec::new();
     if let Some(c) = code {
@@ -117,16 +133,34 @@ fn build_validate_response(
     // `not-in-vs` issue (from the backend) AND a `not-found` / `not-found`
     // issue pointing at the unknown CodeSystem URL.
     let mut issues: Vec<ValidationIssue> = resp.issues.clone();
+    // Rewrite Coding.X locations to bare X for the bare-code request path
+    // (per IG `validation-simple-code-bad-code`: location is `code` not
+    // `Coding.code` when there is no Coding wrapper in the request).
+    if matches!(request_path, RequestPath::BareCode) {
+        for issue in &mut issues {
+            if let Some(loc) = issue.location.as_deref() {
+                if let Some(stripped) = loc.strip_prefix("Coding.") {
+                    issue.location = Some(stripped.to_string());
+                } else if loc == "Coding" {
+                    issue.location = None;
+                }
+            }
+        }
+    }
     if let Some(unknown) = unknown_system {
         let text = format!(
             "A definition for CodeSystem {unknown} could not be found, so the code cannot be validated"
         );
+        let location = match request_path {
+            RequestPath::BareCode => "system".to_string(),
+            _ => "Coding.system".to_string(),
+        };
         issues.push(ValidationIssue {
             severity: "error".into(),
             fhir_code: "not-found".into(),
             tx_code: "not-found".into(),
             text,
-            location: Some("Coding.system".into()),
+            location: Some(location),
             message_id: Some("UNKNOWN_CODESYSTEM".into()),
         });
     }
@@ -217,6 +251,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     code: Option<&str>,
     system: Option<&str>,
     codeable_concept: Option<&Value>,
+    request_path: RequestPath,
 ) -> Value {
     // Prefer the system the caller passed; otherwise fall back to whatever
     // the backend inferred from the VS expansion (e.g. inferSystem=true).
@@ -247,6 +282,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
         version.as_deref(),
         codeable_concept,
         unknown_system,
+        request_path,
     )
 }
 
@@ -473,6 +509,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             Some(&code),
             Some(&system),
             None,
+            RequestPath::BareCode,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -518,6 +555,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             Some(&code),
             Some(&system),
             None,
+            RequestPath::Coding,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -568,6 +606,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                     Some(&code),
                     Some(&system),
                     cc_value.as_ref(),
+                    RequestPath::CodeableConcept,
                 )
                 .await);
             }
@@ -587,6 +626,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             None,
             cc_value.as_ref(),
             None,
+            RequestPath::CodeableConcept,
         ));
     }
 
@@ -711,6 +751,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             Some(&code),
             system.as_deref(),
             None,
+            RequestPath::BareCode,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -750,6 +791,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 None,
                 None,
                 None,
+                RequestPath::Coding,
             ));
         }
         // Coding.display takes precedence over a top-level `display` param —
@@ -789,6 +831,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             Some(&code),
             Some(&system),
             None,
+            RequestPath::Coding,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -836,6 +879,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     Some(&code),
                     Some(&system),
                     cc_value.as_ref(),
+                    RequestPath::CodeableConcept,
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
@@ -856,6 +900,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             None,
             cc_value.as_ref(),
             None,
+            RequestPath::CodeableConcept,
         );
         append_used_supplements(&mut value, &supplements);
         return Ok(value);
