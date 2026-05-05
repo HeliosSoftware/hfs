@@ -138,54 +138,6 @@ fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
     item
 }
 
-/// Populate `is_abstract` / `inactive` on the given expansion entries in-place.
-///
-/// Groups entries by system URL, runs a single batched lookup against the
-/// backend per system, then walks both the entry list and any nested
-/// `contains[]` (hierarchical expansions) to set the flags.
-///
-/// Failures are silently ignored — the flags are best-effort and a backend
-/// error here should never fail the expansion itself.
-fn populate_concept_flags<'a, B: TerminologyBackend>(
-    backend: &'a B,
-    ctx: &'a TenantContext,
-    contains: &'a mut [ExpansionContains],
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-    Box::pin(async move {
-        use std::collections::HashMap;
-        // Bucket codes per system so we issue one query per system.
-        let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
-        for c in contains.iter() {
-            by_system
-                .entry(c.system.as_str())
-                .or_default()
-                .push(c.code.clone());
-        }
-        let mut flag_map: HashMap<(String, String), crate::traits::ConceptExpansionFlags> =
-            HashMap::new();
-        for (system, codes) in &by_system {
-            if let Ok(flags) = backend.concept_expansion_flags(ctx, system, codes).await {
-                for (code, f) in flags {
-                    flag_map.insert(((*system).to_string(), code), f);
-                }
-            }
-        }
-        for c in contains.iter_mut() {
-            if let Some(f) = flag_map.get(&(c.system.clone(), c.code.clone())) {
-                if f.is_abstract {
-                    c.is_abstract = Some(true);
-                }
-                if f.inactive {
-                    c.inactive = Some(true);
-                }
-            }
-            if !c.contains.is_empty() {
-                populate_concept_flags(backend, ctx, &mut c.contains).await;
-            }
-        }
-    })
-}
-
 /// Populate `designations` on each expansion entry in-place via a per-system
 /// batched lookup. Mirrors `populate_concept_flags` and is only invoked when
 /// the caller passes `includeDesignations=true`.
@@ -516,11 +468,6 @@ async fn process_expand<B: TerminologyBackend>(
         Err(e) => return Err(e),
     };
 
-    // ── Populate abstract / inactive flags ───────────────────────────────────
-    // Backends construct ExpansionContains with both flags as None; resolve
-    // them here in a per-system batch so the per-concept SQL stays cold-path.
-    populate_concept_flags(state.backend(), &ctx, &mut resp.contains).await;
-
     // ── Populate designations (only if explicitly requested) ─────────────────
     let include_designations = params
         .iter()
@@ -729,37 +676,6 @@ async fn process_expand<B: TerminologyBackend>(
                 }
             }
         }
-    }
-
-    // Emit one `used-codesystem` entry per distinct CodeSystem that contributed
-    // concepts. The IG validator compares these as `<url>|<version>` strings,
-    // so omitting the version (or omitting the entry entirely) is a hard fail.
-    let mut used_systems: Vec<&String> =
-        resp.contains
-            .iter()
-            .map(|c| &c.system)
-            .fold(Vec::<&String>::new(), |mut acc, s| {
-                if !acc.contains(&s) {
-                    acc.push(s);
-                }
-                acc
-            });
-    used_systems.sort();
-    for system_url in used_systems {
-        let version = state
-            .backend()
-            .code_system_version_for_url(&ctx, system_url)
-            .await
-            .ok()
-            .flatten();
-        let value_uri = match version {
-            Some(v) => format!("{system_url}|{v}"),
-            None => system_url.clone(),
-        };
-        emitted_params.push(json!({
-            "name": "used-codesystem",
-            "valueUri": value_uri,
-        }));
     }
 
     // Append any expansion warnings as parameter entries with name=warning.
