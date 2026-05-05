@@ -187,10 +187,29 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let display = match find_concept(&conn, &system_id, &req.code) {
                 Ok((_, display, _)) => display,
                 Err(HtsError::NotFound(_)) => {
-                    let text = format!(
-                        "Unknown_Code_in_Version: The code '{}' is not valid in the system {}",
-                        req.code, system
-                    );
+                    // Match the IG `validation/cs-code-bad-code` text format
+                    // exactly: "Unknown code 'X' in the CodeSystem 'url'
+                    // version 'Y'" (with version when known).
+                    let cs_version_str: Option<String> = conn
+                        .query_row(
+                            "SELECT version FROM code_systems \
+                             WHERE url = ?1 \
+                             ORDER BY COALESCE(version, '') DESC LIMIT 1",
+                            rusqlite::params![system],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .ok()
+                        .flatten();
+                    let text = match cs_version_str.as_deref() {
+                        Some(v) => format!(
+                            "Unknown code '{}' in the CodeSystem '{}' version '{}'",
+                            req.code, system, v
+                        ),
+                        None => format!(
+                            "Unknown code '{}' in the CodeSystem '{}'",
+                            req.code, system
+                        ),
+                    };
                     return Ok(ValidateCodeResponse {
                         result: false,
                         message: Some(text.clone()),
