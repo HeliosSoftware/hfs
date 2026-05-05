@@ -476,6 +476,15 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Upload HTS server log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hts-server-log-${{ matrix.label }}
+          path: /tmp/hts-${{ matrix.label }}.log
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: Assert all tx-ecosystem tests passed
         run: |
           set -e
