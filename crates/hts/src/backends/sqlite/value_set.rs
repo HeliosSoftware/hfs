@@ -549,6 +549,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     })
                             })
                             .unwrap_or(false);
+                        tracing::warn!(
+                            url,
+                            compose_is_enumerated,
+                            "tx-debug: compose_is_enumerated detection"
+                        );
 
                         // Normal path: try the expansion cache first.
                         let cached = fetch_cache(&conn, &vs_id)?;
