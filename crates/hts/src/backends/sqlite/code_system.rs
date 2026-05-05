@@ -496,13 +496,20 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .collect::<Vec<_>>()
                 .join(",");
             // Per FHIR concept-properties IG, the standard `notSelectable`
-            // property's local CodeSystem.property.code can be ANY local name
-            // (e.g. `not-selectable` in the tx-ecosystem `notSelectable/`
-            // fixtures). Resolve via uri → local-code mapping when available;
-            // fall back to the obvious case-insensitive variants so a CS that
-            // never declares the property uri still reports correctly.
+            // and `inactive` properties' local CodeSystem.property.code can
+            // be ANY local name (e.g. `not-selectable` with a hyphen in the
+            // tx-ecosystem `notSelectable/` fixtures). Resolve via uri →
+            // local-code mapping when available; always fall back to the
+            // canonical names so a CS that never declares property[] still
+            // reports correctly.
             let abstract_codes = abstract_property_codes(&conn, &system_url);
+            let inactive_codes = inactive_property_codes(&conn, &system_url);
             let abstract_in = abstract_codes
+                .iter()
+                .map(|c| format!("'{}'", c.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            let inactive_in = inactive_codes
                 .iter()
                 .map(|c| format!("'{}'", c.replace('\'', "''")))
                 .collect::<Vec<_>>()
@@ -516,6 +523,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                    AND c.code IN ({placeholders})
                    AND (
                        (cp.property IN ({abstract_in}) AND cp.value = 'true')
+                    OR (cp.property IN ({inactive_in}) AND cp.value = 'true')
                     OR (cp.property = 'status'
                         AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive'))
                    )"
@@ -546,7 +554,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 let (code, property, _value) =
                     r.map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let flags = out.entry(code).or_default();
-                if property == "status" {
+                if property == "status" || inactive_codes.iter().any(|c| c == &property) {
                     flags.inactive = true;
                 } else if abstract_codes.iter().any(|c| c == &property) {
                     flags.is_abstract = true;
@@ -961,7 +969,30 @@ pub(super) fn abstract_property_codes(
     conn: &rusqlite::Connection,
     system_url: &str,
 ) -> Vec<String> {
-    let mut codes: Vec<String> = vec!["notSelectable".to_string()];
+    cs_property_local_codes(conn, system_url, "notSelectable")
+}
+
+/// Same idea as [`abstract_property_codes`] but for the FHIR
+/// `http://hl7.org/fhir/concept-properties#inactive` property — used by
+/// $expand to populate `contains[].inactive` and by $validate-code to
+/// flag inactive codes. Always includes the canonical `inactive` name.
+pub(super) fn inactive_property_codes(
+    conn: &rusqlite::Connection,
+    system_url: &str,
+) -> Vec<String> {
+    cs_property_local_codes(conn, system_url, "inactive")
+}
+
+/// Resolve the local property code(s) on `system_url`'s CodeSystem that
+/// declare a `uri` ending in `#<canonical>` (or `<canonical>` exactly).
+/// Always includes `<canonical>` as a fallback so a CS that didn't declare
+/// `property[]` still reports correctly.
+fn cs_property_local_codes(
+    conn: &rusqlite::Connection,
+    system_url: &str,
+    canonical: &str,
+) -> Vec<String> {
+    let mut codes: Vec<String> = vec![canonical.to_string()];
     let resource_json: Option<String> = conn
         .query_row(
             "SELECT resource_json FROM code_systems \
@@ -972,12 +1003,13 @@ pub(super) fn abstract_property_codes(
         )
         .ok()
         .flatten();
+    let suffix = format!("#{canonical}");
     if let Some(json) = resource_json {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
             if let Some(props) = v.get("property").and_then(|p| p.as_array()) {
                 for p in props {
                     let uri = p.get("uri").and_then(|u| u.as_str()).unwrap_or("");
-                    if uri.ends_with("#notSelectable") || uri == "notSelectable" {
+                    if uri.ends_with(&suffix) || uri == canonical {
                         if let Some(local_code) = p.get("code").and_then(|c| c.as_str()) {
                             if !codes.iter().any(|c| c == local_code) {
                                 codes.push(local_code.to_string());

@@ -4408,20 +4408,36 @@ fn lookup_value_set_version(conn: &Connection, url: &str) -> Option<String> {
 /// (retired/deprecated/withdrawn/inactive). Used by $validate-code so the
 /// response can surface a top-level `inactive` parameter per the IG fixtures.
 fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool {
-    conn.query_row(
+    // Honour both the legacy `status` property convention (value in
+    // {retired, deprecated, withdrawn, inactive}) AND the FHIR `inactive`
+    // boolean property — including locally-renamed variants that the
+    // CodeSystem.property[] declarations alias to the canonical URI.
+    let inactive_codes = super::code_system::inactive_property_codes(conn, system_url);
+    let placeholders = (3..=inactive_codes.len() + 2)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
         "SELECT 1
          FROM concept_properties cp
          JOIN concepts c ON c.id = cp.concept_id
          JOIN code_systems s ON s.id = c.system_id
          WHERE s.url = ?1
            AND c.code = ?2
-           AND cp.property = 'status'
-           AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
-         LIMIT 1",
-        rusqlite::params![system_url, code],
-        |_| Ok(()),
-    )
-    .is_ok()
+           AND (
+               (cp.property = 'status'
+                AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive'))
+            OR (cp.property IN ({placeholders}) AND cp.value = 'true')
+           )
+         LIMIT 1"
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(inactive_codes.len() + 2);
+    params.push(&system_url);
+    params.push(&code);
+    for c in &inactive_codes {
+        params.push(c as &dyn rusqlite::ToSql);
+    }
+    conn.query_row(&sql, params.as_slice(), |_| Ok(())).is_ok()
 }
 
 // Keep all message-format inputs explicit so the IG-fixture text strings are
