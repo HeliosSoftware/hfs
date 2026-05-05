@@ -343,6 +343,11 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
 
     json!({
         "resourceType": "CapabilityStatement",
+        "url": "http://heliossoftware.com/fhir/hts/CapabilityStatement/hts",
+        "version": HTS_VERSION,
+        "name": "HeliosTerminologyServer",
+        "title": HTS_NAME,
+        "instantiates": ["http://hl7.org/fhir/CapabilityStatement/terminology-server"],
         "status": "active",
         "kind": "instance",
         "date": "2026-04-01",
