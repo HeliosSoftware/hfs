@@ -59,20 +59,37 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 req.date.as_deref(),
             )?;
 
-            let (concept_id, display, _definition) = find_concept(&conn, &system_id, &req.code)?;
+            let (concept_id, display, definition) = find_concept(&conn, &system_id, &req.code)?;
 
-            let all_props = fetch_properties(&conn, concept_id)?;
+            let stored_props = fetch_properties(&conn, concept_id)?;
             // Per FHIR spec, property="*" is the wildcard meaning "include
             // every property the concept has". Treat any "*" entry as
             // equivalent to omitting the filter.
             let want_all = req.properties.is_empty() || req.properties.iter().any(|p| p == "*");
+
+            // Synthesised properties (parent/child/inactive) are derived from
+            // the hierarchy and status tables rather than concept_properties.
+            // Most callers (and the tx-ecosystem IG fixtures) expect these to
+            // appear alongside the stored properties when property=* or any
+            // explicit filter names them.
+            let synth_props =
+                fetch_synthesised_properties(&conn, &system_id, &req.code, &stored_props)?;
+
             let properties = if want_all {
-                all_props
+                let mut out = stored_props;
+                out.extend(synth_props);
+                out
             } else {
-                all_props
+                let mut out: Vec<PropertyValue> = stored_props
                     .into_iter()
                     .filter(|p| req.properties.contains(&p.code))
-                    .collect()
+                    .collect();
+                out.extend(
+                    synth_props
+                        .into_iter()
+                        .filter(|p| req.properties.contains(&p.code)),
+                );
+                out
             };
 
             let all_designations = fetch_designations(&conn, concept_id)?;
@@ -103,6 +120,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 name: cs_name,
                 version: cs_version,
                 display,
+                definition,
                 properties,
                 designations,
             })
@@ -821,6 +839,116 @@ fn fetch_properties(
     .collect()
 }
 
+/// Synthesise hierarchy- and status-derived properties for `$lookup`.
+///
+/// FHIR defines several "well-known" concept properties whose values are not
+/// stored in `concept_properties` directly but are inferred from other tables:
+///
+/// - `parent` / `child` — derived from `concept_hierarchy`. Each row carries
+///   the parent/child code in `value` and the parent/child display in
+///   `description`.
+/// - `inactive` — boolean derived from a `status` property in the inactive
+///   set (retired/deprecated/withdrawn/inactive). Skipped when the concept
+///   already has an explicitly-stored `inactive` property to avoid duplicates.
+///
+/// Returned properties carry `description` populated from the related
+/// concept's display so the response includes human-readable context.
+fn fetch_synthesised_properties(
+    conn: &rusqlite::Connection,
+    system_id: &str,
+    code: &str,
+    stored: &[PropertyValue],
+) -> Result<Vec<PropertyValue>, HtsError> {
+    let mut out = Vec::new();
+
+    // Parents — `concept_hierarchy.parent_code WHERE child_code = code`.
+    {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT h.parent_code, c.display
+                 FROM concept_hierarchy h
+                 LEFT JOIN concepts c
+                        ON c.system_id = h.system_id AND c.code = h.parent_code
+                 WHERE h.system_id = ?1 AND h.child_code = ?2
+                 ORDER BY h.parent_code",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![system_id, code], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        for r in rows {
+            let (parent_code, parent_display) =
+                r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+            out.push(PropertyValue {
+                code: "parent".into(),
+                value_type: "code".into(),
+                value: parent_code,
+                description: parent_display,
+            });
+        }
+    }
+
+    // Children — `concept_hierarchy.child_code WHERE parent_code = code`.
+    {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT h.child_code, c.display
+                 FROM concept_hierarchy h
+                 LEFT JOIN concepts c
+                        ON c.system_id = h.system_id AND c.code = h.child_code
+                 WHERE h.system_id = ?1 AND h.parent_code = ?2
+                 ORDER BY h.child_code",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![system_id, code], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        for r in rows {
+            let (child_code, child_display) =
+                r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+            out.push(PropertyValue {
+                code: "child".into(),
+                value_type: "code".into(),
+                value: child_code,
+                description: child_display,
+            });
+        }
+    }
+
+    // Inactive flag — synthesise from the `status` property when the concept
+    // doesn't already carry an explicit `inactive` row. `inactive=true` when
+    // status is in the FHIR inactive set, otherwise `false` (so the response
+    // always communicates the active/inactive state).
+    if !stored.iter().any(|p| p.code == "inactive") {
+        let inactive: bool = conn
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM concept_properties cp
+                     JOIN concepts c ON c.id = cp.concept_id
+                     WHERE c.system_id = ?1
+                       AND c.code = ?2
+                       AND cp.property = 'status'
+                       AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
+                 )",
+                rusqlite::params![system_id, code],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        out.push(PropertyValue {
+            code: "inactive".into(),
+            value_type: "boolean".into(),
+            value: inactive.to_string(),
+            description: None,
+        });
+    }
+
+    Ok(out)
+}
+
 /// Fetch all designations for a concept.
 fn fetch_designations(
     conn: &rusqlite::Connection,
@@ -1528,5 +1656,241 @@ mod tests {
         assert_eq!(resp.designations.len(), 3);
         // Default display is unchanged.
         assert_eq!(resp.display, Some("Term (English default)".into()));
+    }
+
+    // ── Synthesised properties (parent / child / inactive / definition) ───────
+
+    /// Seed a three-concept hierarchy used by the synthesis tests below.
+    ///
+    ///     PARENT
+    ///       └── MIDDLE  (status=retired → inactive)
+    ///             ├── CHILD_A
+    ///             └── CHILD_B
+    fn seed_synth(b: &SqliteTerminologyBackend) {
+        let conn = b.pool().get().unwrap();
+        conn.execute_batch(
+            "INSERT INTO code_systems
+                 (id, url, version, name, status, content, created_at, updated_at)
+             VALUES ('cs-syn', 'http://example.org/syn', '1.0', 'Synth CS',
+                     'active', 'complete', '2024-01-01', '2024-01-01');
+
+             INSERT INTO concepts (id, system_id, code, display, definition)
+             VALUES (200, 'cs-syn', 'PARENT',  'Parent display', NULL),
+                    (201, 'cs-syn', 'MIDDLE',  'Middle display', 'Middle defn'),
+                    (202, 'cs-syn', 'CHILD_A', 'Child A display', NULL),
+                    (203, 'cs-syn', 'CHILD_B', 'Child B display', NULL);
+
+             INSERT INTO concept_hierarchy (system_id, parent_code, child_code)
+             VALUES ('cs-syn', 'PARENT', 'MIDDLE'),
+                    ('cs-syn', 'MIDDLE', 'CHILD_A'),
+                    ('cs-syn', 'MIDDLE', 'CHILD_B');
+
+             INSERT INTO concept_properties (concept_id, property, value_type, value)
+             VALUES (201, 'status', 'code', 'retired');",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lookup_synthesises_parent_and_child_properties() {
+        let b = backend();
+        seed_synth(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/syn".into(),
+                    code: "MIDDLE".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let parents: Vec<_> = resp
+            .properties
+            .iter()
+            .filter(|p| p.code == "parent")
+            .collect();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].value, "PARENT");
+        assert_eq!(parents[0].description.as_deref(), Some("Parent display"));
+
+        let children: Vec<_> = resp
+            .properties
+            .iter()
+            .filter(|p| p.code == "child")
+            .collect();
+        assert_eq!(children.len(), 2);
+        // Children are ORDER BY child_code → CHILD_A then CHILD_B.
+        assert_eq!(children[0].value, "CHILD_A");
+        assert_eq!(children[0].description.as_deref(), Some("Child A display"));
+        assert_eq!(children[1].value, "CHILD_B");
+    }
+
+    #[tokio::test]
+    async fn lookup_synthesises_inactive_from_status_property() {
+        let b = backend();
+        seed_synth(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/syn".into(),
+                    code: "MIDDLE".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // status=retired → inactive=true, surfaced even though concept_properties
+        // has no explicit `inactive` row.
+        let inactive: Vec<_> = resp
+            .properties
+            .iter()
+            .filter(|p| p.code == "inactive")
+            .collect();
+        assert_eq!(inactive.len(), 1);
+        assert_eq!(inactive[0].value, "true");
+        assert_eq!(inactive[0].value_type, "boolean");
+    }
+
+    #[tokio::test]
+    async fn lookup_synthesises_inactive_false_when_no_status() {
+        let b = backend();
+        seed_synth(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/syn".into(),
+                    code: "PARENT".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let inactive = resp
+            .properties
+            .iter()
+            .find(|p| p.code == "inactive")
+            .unwrap();
+        assert_eq!(inactive.value, "false");
+    }
+
+    #[tokio::test]
+    async fn lookup_does_not_duplicate_explicit_inactive() {
+        let b = backend();
+        let conn = b.pool().get().unwrap();
+        conn.execute_batch(
+            "INSERT INTO code_systems
+                 (id, url, version, name, status, content, created_at, updated_at)
+             VALUES ('cs-i', 'http://example.org/i', '1.0', 'I CS',
+                     'active', 'complete', '2024-01-01', '2024-01-01');
+             INSERT INTO concepts (id, system_id, code, display)
+             VALUES (300, 'cs-i', 'X', 'X display');
+             INSERT INTO concept_properties (concept_id, property, value_type, value)
+             VALUES (300, 'inactive', 'boolean', 'false');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/i".into(),
+                    code: "X".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Exactly one inactive property — synthesis is skipped because the
+        // concept already has an explicit `inactive` row.
+        let inactive: Vec<_> = resp
+            .properties
+            .iter()
+            .filter(|p| p.code == "inactive")
+            .collect();
+        assert_eq!(inactive.len(), 1);
+        assert_eq!(inactive[0].value, "false");
+    }
+
+    #[tokio::test]
+    async fn lookup_returns_definition_field() {
+        let b = backend();
+        seed_synth(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/syn".into(),
+                    code: "MIDDLE".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.definition.as_deref(), Some("Middle defn"));
+    }
+
+    #[tokio::test]
+    async fn lookup_property_filter_includes_synthesised_codes() {
+        let b = backend();
+        seed_synth(&b);
+
+        // Asking only for `parent` should return just the synthesised parent —
+        // no children, no inactive, even though those would surface under `*`.
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/syn".into(),
+                    code: "MIDDLE".into(),
+                    properties: vec!["parent".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.properties.len(), 1);
+        assert_eq!(resp.properties[0].code, "parent");
+        assert_eq!(resp.properties[0].value, "PARENT");
+    }
+
+    #[tokio::test]
+    async fn lookup_wildcard_includes_synthesised_and_stored() {
+        let b = backend();
+        seed_synth(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/syn".into(),
+                    code: "MIDDLE".into(),
+                    properties: vec!["*".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Stored: status. Synthesised: parent, child x2, inactive.
+        let codes: Vec<_> = resp.properties.iter().map(|p| p.code.as_str()).collect();
+        assert!(codes.contains(&"status"));
+        assert!(codes.contains(&"parent"));
+        assert!(codes.contains(&"child"));
+        assert!(codes.contains(&"inactive"));
     }
 }
