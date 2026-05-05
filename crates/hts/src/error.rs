@@ -7,16 +7,16 @@
 //!
 //! ## HTTP mapping
 //!
-//! | Variant | HTTP status | FHIR issue code |
-//! |---------|-------------|-----------------|
-//! | [`NotFound`] | 404 | `not-found` |
-//! | [`NotSupported`] | 501 | `not-supported` |
-//! | [`InvalidRequest`] | 400 | `invalid` |
-//! | [`VsInvalid`] | 400 | `invalid` (with `tx-issue-type=vs-invalid`) |
-//! | [`Internal`] | 500 | `exception` |
-//! | [`StorageError`] | 500 | `exception` |
-//! | [`PreconditionFailed`] | 412 | `conflict` |
-//! | [`TooCostly`] | 422 | `too-costly` |
+//! | Variant | HTTP status | FHIR issue code | tx-issue-type |
+//! |---------|-------------|-----------------|---------------|
+//! | [`NotFound`] | 404 | `not-found` | `not-found` |
+//! | [`NotSupported`] | 501 | `not-supported` | `not-supported` |
+//! | [`InvalidRequest`] | 400 | `invalid` | `invalid` |
+//! | [`VsInvalid`] | 400 | `invalid` | `vs-invalid` |
+//! | [`Internal`] | 500 | `exception` | `exception` |
+//! | [`StorageError`] | 500 | `exception` | `exception` |
+//! | [`PreconditionFailed`] | 412 | `conflict` | `conflict` |
+//! | [`TooCostly`] | 422 | `too-costly` | `too-costly` |
 //!
 //! [`NotFound`]: HtsError::NotFound
 //! [`NotSupported`]: HtsError::NotSupported
@@ -60,7 +60,7 @@ pub enum HtsError {
     InvalidRequest(String),
 
     /// A ValueSet definition is itself invalid — for example a compose filter
-    /// that references an unknown operator, omits a required value, or supplies
+    /// that omits the required `value`, names an unknown operator, or supplies
     /// a regular expression that fails to compile.  Maps to HTTP 400 with FHIR
     /// issue code `invalid` and a `tx-issue-type=vs-invalid` coding so the
     /// HL7 tx-ecosystem fixtures can distinguish ValueSet-definition errors
@@ -121,9 +121,10 @@ impl IntoResponse for HtsError {
 
         // (status, FHIR-issue-code, tx-issue-type, diagnostics)
         // The FHIR issue `code` and the `tx-issue-type` coding are usually
-        // identical, but `VsInvalid` splits them: the FHIR code stays
-        // `invalid` (preserving the HTTP-level meaning) while `tx-issue-type`
-        // signals `vs-invalid` to the IG validator.
+        // identical, but VsInvalid splits them: FHIR code stays `invalid`
+        // (preserving the HTTP-level meaning) while tx-issue-type signals
+        // `vs-invalid` so the IG validator can route the failure to a
+        // ValueSet-definition diagnostic.
         let (status, code, tx_issue_type, diagnostics) = match &self {
             HtsError::NotFound(msg) => (
                 StatusCode::NOT_FOUND,
