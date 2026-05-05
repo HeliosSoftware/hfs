@@ -324,7 +324,7 @@ async fn process_expand<B: TerminologyBackend>(
                     .flatten()
                     .is_some();
                 if !exists {
-                    return Err(HtsError::InvalidRequest(format!(
+                    return Err(HtsError::NotFound(format!(
                         "Required supplement not found: {bare}"
                     )));
                 }

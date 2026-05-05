@@ -79,6 +79,30 @@ async fn process_lookup<B: TerminologyBackend>(
     };
 
     let ctx = TenantContext::system();
+    // Reject early when the request asks for a `useSupplement` we don't have.
+    for s in params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
+        .filter_map(|p| {
+            p.get("valueCanonical")
+                .or_else(|| p.get("valueUri"))
+                .and_then(|v| v.as_str())
+        })
+    {
+        let bare = s.split('|').next().unwrap_or(s);
+        let exists = state
+            .backend()
+            .code_system_version_for_url(&ctx, bare)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !exists {
+            return Err(HtsError::NotFound(format!(
+                "Required supplement not found: {bare}"
+            )));
+        }
+    }
     let resp = state.backend().lookup(&ctx, req).await?;
 
     // ── Build FHIR Parameters response ─────────────────────────────────────────

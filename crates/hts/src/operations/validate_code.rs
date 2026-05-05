@@ -152,6 +152,39 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     )
 }
 
+/// Reject any `useSupplement` request param that names a CodeSystem we don't
+/// have stored. The IG fixtures expect 4xx (with issue.code=not-found) when
+/// a supplement is unknown — applies equally to $expand and $validate-code.
+async fn check_supplements<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    params: &[Value],
+) -> Result<(), HtsError> {
+    for s in params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
+        .filter_map(|p| {
+            p.get("valueCanonical")
+                .or_else(|| p.get("valueUri"))
+                .and_then(|v| v.as_str())
+        })
+    {
+        let bare = s.split('|').next().unwrap_or(s);
+        let exists = backend
+            .code_system_version_for_url(ctx, bare)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !exists {
+            return Err(HtsError::NotFound(format!(
+                "Required supplement not found: {bare}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Core validate-code logic for `CodeSystem/$validate-code`.
 ///
 /// Accepts three input forms (checked in priority order):
@@ -176,6 +209,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
     let ctx = TenantContext::system();
+    check_supplements(state.backend(), &ctx, &params).await?;
 
     // ── Path 1: bare `code` parameter (requires `url` = CodeSystem canonical URL) ──
     if let Some(code) = find_str_param(&params, "code") {
@@ -358,6 +392,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     })?;
 
     let ctx = TenantContext::system();
+    check_supplements(state.backend(), &ctx, &params).await?;
     // Used to rewrite "...'url'..." → "...'url|version'..." in NotFound
     // messages so the IG-expected text format is met.
     let vs_version = find_str_param(&params, "valueSetVersion");
