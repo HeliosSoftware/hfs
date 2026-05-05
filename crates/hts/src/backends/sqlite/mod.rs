@@ -66,6 +66,30 @@ pub(crate) type PropertyResultCache =
 /// and r2d2 pool contention under high concurrency.
 pub(crate) type PlainFtsCache = Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
 
+/// Shared in-memory cache for CodeSystem version strings.
+///
+/// Keyed by CodeSystem URL.  Populated lazily on the first
+/// `code_system_version_for_url` call for each system.  CodeSystem versions
+/// never change during a server run, so this eliminates the per-request
+/// `spawn_blocking` + pool connection that the DB lookup would otherwise
+/// require.  The `Option<String>` value distinguishes "version is null/absent"
+/// (None) from "not yet queried" (key missing from the map).
+pub(crate) type SystemVersionCache = Arc<RwLock<HashMap<String, Option<String>>>>;
+
+/// Shared in-memory cache of abstract / inactive flags for expansion.
+///
+/// Keyed by CodeSystem URL; values are a map from concept code to its flags.
+/// Only concepts with at least one flag set (`is_abstract` or `inactive`) are
+/// stored — the happy-path code has no entry and defaults to both false.
+///
+/// Populated on the first `concept_expansion_flags` call for each system by
+/// loading ALL flagged concepts for that system in a single query.  Subsequent
+/// calls for the same system return from memory without any pool access,
+/// eliminating the per-expand `spawn_blocking` + pool connection that the
+/// original implementation incurred on every cache miss.
+pub(crate) type ConceptFlagsCache =
+    Arc<RwLock<HashMap<String, Arc<HashMap<String, crate::traits::ConceptExpansionFlags>>>>>;
+
 /// SQLite-backed terminology service backend.
 ///
 /// Wraps an r2d2 connection pool. Schema migrations are applied automatically
@@ -124,6 +148,19 @@ pub struct SqliteTerminologyBackend {
     /// is served entirely from process memory via the trigram index, bypassing
     /// `spawn_blocking` and r2d2 pool contention.
     pub(crate) plain_fts_cache: PlainFtsCache,
+
+    /// In-memory cache of CodeSystem version strings, keyed by system URL.
+    ///
+    /// Populated lazily; serves `code_system_version_for_url` without
+    /// acquiring a pool connection after the first lookup per system.
+    pub(crate) system_version_cache: SystemVersionCache,
+
+    /// In-memory cache of abstract / inactive flags per CodeSystem.
+    ///
+    /// Populated on first use per system by loading all flagged concepts in
+    /// one query.  Serves subsequent `concept_expansion_flags` calls from
+    /// memory, eliminating pool pressure on every `$expand` cache miss.
+    pub(crate) concept_flags_cache: ConceptFlagsCache,
 }
 
 impl SqliteTerminologyBackend {
@@ -165,6 +202,8 @@ impl SqliteTerminologyBackend {
         let inline_compose_index: InlineComposeIndex = Arc::new(RwLock::new(HashMap::new()));
         let property_result_cache: PropertyResultCache = Arc::new(RwLock::new(HashMap::new()));
         let plain_fts_cache: PlainFtsCache = Arc::new(RwLock::new(HashMap::new()));
+        let system_version_cache: SystemVersionCache = Arc::new(RwLock::new(HashMap::new()));
+        let concept_flags_cache: ConceptFlagsCache = Arc::new(RwLock::new(HashMap::new()));
 
         // Bootstrap: apply WAL + schema on a single connection.
         {
@@ -237,6 +276,8 @@ impl SqliteTerminologyBackend {
             inline_compose_index,
             property_result_cache,
             plain_fts_cache,
+            system_version_cache,
+            concept_flags_cache,
         })
     }
 
@@ -282,6 +323,8 @@ impl SqliteTerminologyBackend {
             inline_compose_index: Arc::new(RwLock::new(HashMap::new())),
             property_result_cache: Arc::new(RwLock::new(HashMap::new())),
             plain_fts_cache: Arc::new(RwLock::new(HashMap::new())),
+            system_version_cache: Arc::new(RwLock::new(HashMap::new())),
+            concept_flags_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -360,6 +403,9 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         let property_result_cache = self.property_result_cache.clone();
         let plain_fts_cache = self.plain_fts_cache.clone();
 
+        let system_version_cache = self.system_version_cache.clone();
+        let concept_flags_cache = self.concept_flags_cache.clone();
+
         let result = tokio::task::spawn_blocking(move || {
             crate::import::fhir_bundle::import_bundle_sync(&pool, &data_vec)
         })
@@ -378,6 +424,12 @@ impl BundleImportBackend for SqliteTerminologyBackend {
                 guard.clear();
             }
             if let Ok(mut guard) = plain_fts_cache.write() {
+                guard.clear();
+            }
+            if let Ok(mut guard) = system_version_cache.write() {
+                guard.clear();
+            }
+            if let Ok(mut guard) = concept_flags_cache.write() {
                 guard.clear();
             }
         }

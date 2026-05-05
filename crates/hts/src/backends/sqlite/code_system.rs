@@ -9,6 +9,8 @@
 //! instead of recursive traversals.  SNOMED post-coordination expressions are
 //! deliberately unsupported and return [`HtsError::NotSupported`].
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use rusqlite::OptionalExtension;
@@ -254,8 +256,16 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         _ctx: &TenantContext,
         url: &str,
     ) -> Result<Option<String>, HtsError> {
+        // Fast path: version is immutable during a server run, serve from cache.
+        if let Ok(guard) = self.system_version_cache.read() {
+            if let Some(cached) = guard.get(url) {
+                return Ok(cached.clone());
+            }
+        }
+
         let pool = self.pool().clone();
         let url = url.to_string();
+        let cache = self.system_version_cache.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -270,6 +280,9 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .optional()
                 .map_err(|e| HtsError::StorageError(e.to_string()))?
                 .flatten();
+            if let Ok(mut guard) = cache.write() {
+                guard.insert(url, version.clone());
+            }
             Ok(version)
         })
         .await
@@ -355,44 +368,56 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         if codes.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+
+        // Fast path: if the per-system flag map is already cached, look up each
+        // code in memory with no pool access.
+        if let Ok(guard) = self.concept_flags_cache.read() {
+            if let Some(system_flags) = guard.get(system_url) {
+                let system_flags = Arc::clone(system_flags);
+                drop(guard);
+                let mut out = std::collections::HashMap::new();
+                for code in codes {
+                    if let Some(f) = system_flags.get(code) {
+                        out.insert(code.clone(), *f);
+                    }
+                }
+                return Ok(out);
+            }
+        }
+
+        // Cache miss: load ALL flagged concepts for this system in one query, then
+        // cache the full set.  Only concepts with at least one flag set are stored
+        // (the common case — no flags — has no entry).
         let pool = self.pool().clone();
         let system_url = system_url.to_string();
         let codes = codes.to_vec();
+        let cache = self.concept_flags_cache.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-            // Build a parameterised IN-list: (?2, ?3, ...). The first param is
-            // the system URL.
-            let placeholders = (2..=codes.len() + 1)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT c.code, cp.property, cp.value
-                 FROM concept_properties cp
-                 JOIN concepts c ON c.id = cp.concept_id
-                 JOIN code_systems s ON s.id = c.system_id
-                 WHERE s.url = ?1
-                   AND c.code IN ({placeholders})
-                   AND cp.property IN ('notSelectable', 'status')",
-            );
             let mut stmt = conn
-                .prepare(&sql)
+                .prepare(
+                    "SELECT c.code, cp.property, cp.value
+                     FROM concept_properties cp
+                     JOIN concepts c ON c.id = cp.concept_id
+                     JOIN code_systems s ON s.id = c.system_id
+                     WHERE s.url = ?1
+                       AND cp.property IN ('notSelectable', 'status')
+                       AND (
+                           (cp.property = 'notSelectable' AND cp.value = 'true')
+                        OR (cp.property = 'status'
+                            AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive'))
+                       )",
+                )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(codes.len() + 1);
-            params.push(&system_url);
-            for c in &codes {
-                params.push(c as &dyn rusqlite::ToSql);
-            }
-
-            let mut out: std::collections::HashMap<String, ConceptExpansionFlags> =
+            let mut system_flags: std::collections::HashMap<String, ConceptExpansionFlags> =
                 std::collections::HashMap::new();
             let rows = stmt
-                .query_map(params.as_slice(), |row| {
+                .query_map(rusqlite::params![system_url], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -404,18 +429,25 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             for r in rows {
                 let (code, property, value) =
                     r.map_err(|e| HtsError::StorageError(e.to_string()))?;
-                let flags = out.entry(code).or_default();
+                let flags = system_flags.entry(code).or_default();
                 match property.as_str() {
-                    "notSelectable" if value == "true" => flags.is_abstract = true,
-                    "status"
-                        if matches!(
-                            value.as_str(),
-                            "retired" | "deprecated" | "withdrawn" | "inactive"
-                        ) =>
-                    {
-                        flags.inactive = true;
-                    }
+                    "notSelectable" => flags.is_abstract = true,
+                    "status" => flags.inactive = true,
                     _ => {}
+                }
+                let _ = value;
+            }
+
+            let system_flags = Arc::new(system_flags);
+            if let Ok(mut guard) = cache.write() {
+                guard.insert(system_url.clone(), Arc::clone(&system_flags));
+            }
+
+            // Return only the codes that were requested.
+            let mut out = std::collections::HashMap::new();
+            for code in &codes {
+                if let Some(f) = system_flags.get(code) {
+                    out.insert(code.clone(), *f);
                 }
             }
             Ok(out)
