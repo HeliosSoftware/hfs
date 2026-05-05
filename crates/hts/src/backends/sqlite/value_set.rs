@@ -2073,7 +2073,11 @@ fn expand_single_include_local(
 
     if let Some(explicit_codes) = inc["concept"].as_array() {
         // Explicit code list: single json_each batch join instead of N
-        // individual point lookups.
+        // individual point lookups. INNER JOIN drops codes that don't
+        // exist in the concepts table — the IG `simple-expand-enum-bad`
+        // fixture explicitly asserts that an unknown code in
+        // compose.include[].concept[] is silently filtered out of the
+        // expansion rather than appearing as a phantom entry.
         let codes_json: serde_json::Value = explicit_codes
             .iter()
             .filter_map(|e| e["code"].as_str())
@@ -2083,9 +2087,9 @@ fn expand_single_include_local(
 
         let mut stmt = conn
             .prepare_cached(
-                "SELECT je.value, c.display
+                "SELECT c.code, c.display
                  FROM json_each(?1) je
-                 LEFT JOIN concepts c
+                 JOIN concepts c
                      ON c.system_id = ?2 AND c.code = je.value",
             )
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
