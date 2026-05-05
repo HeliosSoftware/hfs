@@ -1432,6 +1432,86 @@ async fn process_expand<B: TerminologyBackend>(
         }
     }
 
+    // ── used-valueset entries ────────────────────────────────────────────────
+    // The IG `valueset-version/expand-indirect-*` and `simple/expand-contained`
+    // fixtures expect one `used-valueset` parameter per distinct ValueSet
+    // referenced from the source VS's compose.include[].valueSet[] array,
+    // formatted as `<url>|<version>` matching the resolved row. Walk the
+    // compose, dedupe by URL, look up each via search.
+    if let Some(vs) = source_vs.as_ref() {
+        let mut emitted_used_vs: Vec<String> = Vec::new();
+        let collect_vs_refs = |inc: &Value, out: &mut Vec<String>| {
+            if let Some(refs) = inc.get("valueSet").and_then(|v| v.as_array()) {
+                for r in refs {
+                    if let Some(s) = r.as_str() {
+                        // tx-ecosystem's #fragment refs aren't surfaced as
+                        // used-valueset (they're contained-only). Skip them.
+                        if !s.starts_with('#') && !out.contains(&s.to_string()) {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        };
+        let mut vs_refs: Vec<String> = Vec::new();
+        if let Some(includes) = vs
+            .get("compose")
+            .and_then(|c| c.get("include"))
+            .and_then(|i| i.as_array())
+        {
+            for inc in includes {
+                collect_vs_refs(inc, &mut vs_refs);
+            }
+        }
+        if let Some(excludes) = vs
+            .get("compose")
+            .and_then(|c| c.get("exclude"))
+            .and_then(|i| i.as_array())
+        {
+            for exc in excludes {
+                collect_vs_refs(exc, &mut vs_refs);
+            }
+        }
+        for raw_ref in &vs_refs {
+            let (bare_url, pinned_version) = match raw_ref.split_once('|') {
+                Some((u, v)) => (u.to_string(), Some(v.to_string())),
+                None => (raw_ref.clone(), None),
+            };
+            let resolved_version: Option<String> =
+                ValueSetOperations::search(
+                    state.backend(),
+                    &ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(bare_url.clone()),
+                        version: pinned_version.clone(),
+                        count: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|mut hits| {
+                    hits.pop().and_then(|h| {
+                        h.get("version")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                })
+                .or(pinned_version.clone());
+            let value_uri = match resolved_version {
+                Some(v) => format!("{bare_url}|{v}"),
+                None => bare_url.clone(),
+            };
+            if !emitted_used_vs.contains(&value_uri) {
+                emitted_used_vs.push(value_uri.clone());
+                emitted_params.push(json!({
+                    "name": "used-valueset",
+                    "valueUri": value_uri,
+                }));
+            }
+        }
+    }
+
     // Then add any warning-* derived from the source VS itself. ValueSets
     // only contribute warnings via the explicit standards-status extension —
     // the IG fixtures (search/*, deprecated/*) treat a VS-level
