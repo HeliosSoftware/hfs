@@ -1280,6 +1280,12 @@ async fn process_expand<B: TerminologyBackend>(
                     }
                 }
                 if let (Some(n), Some((k, v))) = (name, value_entry) {
+                    // `versionsMatch` is a tx-ecosystem-internal pin used by
+                    // overload/* fixtures to colour their compose; the IG
+                    // doesn't expect it echoed back in expansion.parameter.
+                    if n == "versionsMatch" {
+                        continue;
+                    }
                     // Don't double-emit if the caller already provided this knob.
                     let already = emitted_params
                         .iter()
