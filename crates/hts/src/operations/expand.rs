@@ -283,17 +283,96 @@ fn populate_properties<'a, B: TerminologyBackend>(
     })
 }
 
+/// Parsed `displayLanguage` request parameter.
+///
+/// FHIR allows simple language codes (`de`), comma-separated lists with an
+/// optional wildcard (`de,*`), and Accept-Language style q-weights
+/// (`de,*; q=0`). The HL7 IG `language/expand-xform-*` fixtures distinguish:
+///
+/// | Form | preferred | hard_fallback | Meaning |
+/// |------|-----------|---------------|---------|
+/// | `de` | `de` | `false` | Try de; otherwise keep CS-default display |
+/// | `de,*` | `de` | `false` | Same as above (`*` is just an explicit fallback) |
+/// | `de,*; q=0` | `de` | `true` | Try de; if missing, drop top-level display |
+///
+/// `preferred` is the first non-wildcard tag (the language we want to swap
+/// in); `hard_fallback` is `true` when the wildcard carries `q=0`, signalling
+/// that no fallback is allowed.
+struct DisplayLangSpec {
+    preferred: String,
+    hard_fallback: bool,
+}
+
+/// Parse a `displayLanguage` parameter value into a [`DisplayLangSpec`].
+fn parse_display_language(raw: &str) -> Option<DisplayLangSpec> {
+    let mut preferred: Option<String> = None;
+    let mut hard_fallback = false;
+
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Split q= weight (Accept-Language style): "*; q=0" → tag="*", q=Some(0.0)
+        let (tag, q) = if let Some((t, rest)) = trimmed.split_once(';') {
+            let q = rest
+                .trim()
+                .strip_prefix("q=")
+                .or_else(|| rest.trim().strip_prefix("Q="))
+                .and_then(|s| s.parse::<f32>().ok());
+            (t.trim(), q)
+        } else {
+            (trimmed, None)
+        };
+        if tag == "*" {
+            // q=0 on wildcard means "do not fall back to anything" → hard mode.
+            if q == Some(0.0) {
+                hard_fallback = true;
+            }
+        } else if preferred.is_none() && !tag.is_empty() {
+            preferred = Some(tag.to_string());
+        }
+    }
+
+    preferred.map(|p| DisplayLangSpec {
+        preferred: p,
+        hard_fallback,
+    })
+}
+
+/// The HL7 `hl7TermMaintInfra` system + code identifying a designation as
+/// the "preferred for language" entry. Used when the displayLanguage swap
+/// rotates the CodeSystem's original-language display into the designation
+/// list — the IG fixtures expect this `use` coding to flag that entry.
+const HL7_TERM_MAINT_INFRA_SYSTEM: &str = "http://terminology.hl7.org/CodeSystem/hl7TermMaintInfra";
+
 /// Replace each contains[] entry's `display` with a designation matching the
-/// requested displayLanguage (when one exists). Mirrors the `lookup()`
-/// language-aware behavior. Walks nested `contains[]` recursively.
+/// requested displayLanguage. Mirrors the `lookup()` language-aware behavior
+/// and walks nested `contains[]` recursively.
+///
+/// Per the HL7 IG `language/expand-xform-*` fixtures, when a swap fires we
+/// also rotate the original CS-language display into `c.designations` as a
+/// `{language: <cs-lang>, use: preferredForLanguage, value: <orig display>}`
+/// entry, and remove the now-redundant matching-language designation. The
+/// `cs_lang_by_url` map is read from the contributing CodeSystem's top-level
+/// `language` field.
+///
+/// `hard_fallback` controls behavior when no matching designation exists:
+/// `true` drops the top-level display entirely (per the `*; q=0` convention),
+/// `false` leaves the original display in place.
 fn apply_display_language<'a, B: TerminologyBackend>(
     backend: &'a B,
     ctx: &'a TenantContext,
     contains: &'a mut [ExpansionContains],
-    language: &'a str,
+    spec: &'a DisplayLangSpec,
+    cs_lang_by_url: &'a std::collections::HashMap<String, Option<String>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
+        use crate::types::ExpansionContainsDesignation;
         use std::collections::HashMap;
+        let language = spec.preferred.as_str();
+
+        // Bucket codes per system for a single batched designation lookup.
         let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
         for c in contains.iter() {
             by_system
@@ -301,25 +380,96 @@ fn apply_display_language<'a, B: TerminologyBackend>(
                 .or_default()
                 .push(c.code.clone());
         }
-        let mut map: HashMap<(String, String), String> = HashMap::new();
+        // (system, code) → (designation language tag, designation value).
+        // Match using BCP 47 / RFC 4647 Lookup: prefer an exact match, then
+        // accept any designation whose tag starts with the requested tag plus
+        // a `-` subtag separator (so `de` matches `de-CH` but not `den`).
+        let mut match_map: HashMap<(String, String), (Option<String>, String)> = HashMap::new();
         for (system, codes) in &by_system {
             if let Ok(ds) = backend.concept_designations(ctx, system, codes).await {
                 for (code, list) in ds {
-                    if let Some(d) = list
-                        .into_iter()
-                        .find(|d| d.language.as_deref() == Some(language))
-                    {
-                        map.insert(((*system).to_string(), code), d.value);
+                    let exact = list
+                        .iter()
+                        .find(|d| d.language.as_deref() == Some(language));
+                    let chosen = exact.cloned().or_else(|| {
+                        list.into_iter().find(|d| {
+                            d.language.as_deref().is_some_and(|lang| {
+                                let prefix = format!("{language}-");
+                                lang.eq_ignore_ascii_case(language)
+                                    || lang
+                                        .to_ascii_lowercase()
+                                        .starts_with(&prefix.to_ascii_lowercase())
+                            })
+                        })
+                    });
+                    if let Some(d) = chosen {
+                        match_map.insert(((*system).to_string(), code), (d.language, d.value));
                     }
                 }
             }
         }
+
         for c in contains.iter_mut() {
-            if let Some(v) = map.remove(&(c.system.clone(), c.code.clone())) {
-                c.display = Some(v);
+            let cs_lang = cs_lang_by_url.get(&c.system).cloned().flatten();
+            let original_display = c.display.clone();
+            if let Some((matched_lang, matched_value)) =
+                match_map.remove(&(c.system.clone(), c.code.clone()))
+            {
+                // Swap top-level display for the matching-language designation.
+                c.display = Some(matched_value.clone());
+
+                // Drop the source designation we just promoted (matched on
+                // both language + value to be precise — broader-match designations
+                // for unrelated codes survive untouched).
+                c.designations
+                    .retain(|d| !(d.language == matched_lang && d.value == matched_value));
+
+                // Rotate the former display into designations[] tagged with the
+                // CS's own language and `use=preferredForLanguage`. Skip when
+                // the original display would just duplicate the matched value
+                // (degenerate case where CS-lang == requested lang).
+                if let Some(orig) = original_display
+                    .filter(|s| !s.is_empty() && cs_lang.as_deref() != Some(language))
+                {
+                    let already = c
+                        .designations
+                        .iter()
+                        .any(|d| d.language == cs_lang && d.value == orig);
+                    if !already {
+                        c.designations.push(ExpansionContainsDesignation {
+                            language: cs_lang.clone(),
+                            use_system: Some(HL7_TERM_MAINT_INFRA_SYSTEM.to_string()),
+                            use_code: Some("preferredForLanguage".to_string()),
+                            value: orig,
+                        });
+                    }
+                }
+            } else if spec.hard_fallback {
+                // No matching designation and the caller forbade fallback —
+                // drop the top-level display entirely. The IG fixtures still
+                // surface the original (CS-default) display as a designation
+                // with `use=preferredForLanguage` so consumers can recover it.
+                if let Some(orig) = original_display {
+                    if !orig.is_empty() {
+                        let already = c
+                            .designations
+                            .iter()
+                            .any(|d| d.language == cs_lang && d.value == orig);
+                        if !already {
+                            c.designations.push(ExpansionContainsDesignation {
+                                language: cs_lang.clone(),
+                                use_system: Some(HL7_TERM_MAINT_INFRA_SYSTEM.to_string()),
+                                use_code: Some("preferredForLanguage".to_string()),
+                                value: orig,
+                            });
+                        }
+                    }
+                }
+                c.display = None;
             }
+
             if !c.contains.is_empty() {
-                apply_display_language(backend, ctx, &mut c.contains, language).await;
+                apply_display_language(backend, ctx, &mut c.contains, spec, cs_lang_by_url).await;
             }
         }
     })
@@ -547,6 +697,56 @@ async fn process_expand<B: TerminologyBackend>(
         .await;
     }
 
+    // ── Per-system CodeSystem metadata lookup (one search per distinct URL) ──
+    // The CS resource is consulted by THREE downstream blocks:
+    //   - apply_display_language (for CS.language → preferredForLanguage)
+    //   - the used-codesystem emission (for CS.version)
+    //   - the warning-<status> emission (for extension/status/experimental)
+    //
+    // Centralising the lookup here avoids duplicating the search and keeps
+    // the call count to one per system on the cache-miss path.
+    use std::collections::HashMap;
+    let mut cs_by_url: HashMap<String, Option<Value>> = HashMap::new();
+    {
+        let mut systems: Vec<&String> =
+            resp.contains
+                .iter()
+                .map(|c| &c.system)
+                .fold(Vec::<&String>::new(), |mut acc, s| {
+                    if !acc.contains(&s) {
+                        acc.push(s);
+                    }
+                    acc
+                });
+        systems.sort();
+        for system_url in systems {
+            let cs = crate::traits::CodeSystemOperations::search(
+                state.backend(),
+                &ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(system_url.clone()),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+            .and_then(|mut v| v.pop());
+            cs_by_url.insert(system_url.clone(), cs);
+        }
+    }
+    let cs_lang_by_url: HashMap<String, Option<String>> = cs_by_url
+        .iter()
+        .map(|(url, cs)| {
+            let lang = cs
+                .as_ref()
+                .and_then(|c| c.get("language"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            (url.clone(), lang)
+        })
+        .collect();
+
     // ── displayLanguage: swap display from matching designation ──────────────
     let display_language = params
         .iter()
@@ -557,8 +757,17 @@ async fn process_expand<B: TerminologyBackend>(
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         });
-    if let Some(lang) = display_language.as_deref() {
-        apply_display_language(state.backend(), &ctx, &mut resp.contains, lang).await;
+    if let Some(raw) = display_language.as_deref() {
+        if let Some(spec) = parse_display_language(raw) {
+            apply_display_language(
+                state.backend(),
+                &ctx,
+                &mut resp.contains,
+                &spec,
+                &cs_lang_by_url,
+            )
+            .await;
+        }
     }
 
     // ── Look up source ValueSet (used for both parameter extension and metadata copy) ──
@@ -738,11 +947,8 @@ async fn process_expand<B: TerminologyBackend>(
     // The source ValueSet is checked the same way, so a deprecated VS that
     // includes an active CS still surfaces a `warning-deprecated` for the VS.
     //
-    // Performance: this issues one CodeSystem search per distinct system.
-    // Hot-path requests are served from `state.expand_cache`, so the cost is
-    // amortised across repeated identical $expand calls. We keep the lookup
-    // inside the cache-miss path (after the cache.read above and before
-    // cache.write below).
+    // Reuses the per-system CS metadata that `cs_by_url` collected before the
+    // displayLanguage swap — no extra SQL round-trips here.
     let mut used_systems: Vec<&String> =
         resp.contains
             .iter()
@@ -756,21 +962,9 @@ async fn process_expand<B: TerminologyBackend>(
     used_systems.sort();
     let mut warning_params: Vec<Value> = Vec::new();
     for system_url in &used_systems {
-        let cs = crate::traits::CodeSystemOperations::search(
-            state.backend(),
-            &ctx,
-            crate::types::ResourceSearchQuery {
-                url: Some((**system_url).clone()),
-                count: Some(1),
-                ..Default::default()
-            },
-        )
-        .await
-        .ok()
-        .and_then(|mut v| v.pop());
+        let cs = cs_by_url.get(*system_url).and_then(|c| c.as_ref());
 
         let cs_version = cs
-            .as_ref()
             .and_then(|c| c.get("version"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
@@ -787,7 +981,7 @@ async fn process_expand<B: TerminologyBackend>(
         // extension, status, and experimental flag. Each rule emits at most
         // one warning name; multiple rules can fire in parallel for the same
         // CS (e.g. status=draft + experimental=true → both warnings).
-        if let Some(cs) = cs.as_ref() {
+        if let Some(cs) = cs {
             for status_code in standards_statuses(cs) {
                 warning_params.push(json!({
                     "name": format!("warning-{status_code}"),
@@ -1370,6 +1564,51 @@ mod tests {
             "status": "draft"
         });
         assert_eq!(standards_statuses(&cs), vec!["draft".to_string()]);
+    }
+
+    // ── parse_display_language helper ──────────────────────────────────────────
+
+    #[test]
+    fn parse_display_language_simple_tag() {
+        let spec = parse_display_language("de").unwrap();
+        assert_eq!(spec.preferred, "de");
+        assert!(!spec.hard_fallback);
+    }
+
+    #[test]
+    fn parse_display_language_with_explicit_fallback() {
+        let spec = parse_display_language("de,*").unwrap();
+        assert_eq!(spec.preferred, "de");
+        assert!(!spec.hard_fallback);
+    }
+
+    #[test]
+    fn parse_display_language_hard_mode_q0() {
+        // Wildcard with q=0 → no fallback allowed.
+        let spec = parse_display_language("de,*; q=0").unwrap();
+        assert_eq!(spec.preferred, "de");
+        assert!(spec.hard_fallback);
+    }
+
+    #[test]
+    fn parse_display_language_hard_mode_with_extra_whitespace() {
+        let spec = parse_display_language("de, *; q=0").unwrap();
+        assert_eq!(spec.preferred, "de");
+        assert!(spec.hard_fallback);
+    }
+
+    #[test]
+    fn parse_display_language_picks_first_real_tag() {
+        let spec = parse_display_language("de-CH,en,*").unwrap();
+        assert_eq!(spec.preferred, "de-CH");
+        assert!(!spec.hard_fallback);
+    }
+
+    #[test]
+    fn parse_display_language_only_wildcard_returns_none() {
+        // No real preferred tag — caller should treat as "no displayLanguage".
+        assert!(parse_display_language("*").is_none());
+        assert!(parse_display_language("*; q=0").is_none());
     }
 }
 // rebuild marker
