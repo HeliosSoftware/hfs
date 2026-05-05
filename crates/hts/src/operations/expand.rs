@@ -771,6 +771,27 @@ async fn process_expand<B: TerminologyBackend>(
         expansion["parameter"] = json!(emitted_params);
     }
 
+    // ── expansion.property declarations ──────────────────────────────────────
+    // When the caller asked for specific concept properties to surface in
+    // contains[].property, the IG fixtures expect a parallel
+    // expansion.property[] array declaring each property's code (and ideally
+    // its uri). Use a synthetic uri based on the first contributing
+    // CodeSystem when available — close enough for the IG fixture pattern.
+    if !requested_properties.is_empty() {
+        let primary_system = resp.contains.first().map(|c| c.system.clone());
+        let prop_decls: Vec<Value> = requested_properties
+            .iter()
+            .map(|code| {
+                let mut entry = json!({"code": code});
+                if let Some(sys) = &primary_system {
+                    entry["uri"] = json!(format!("{sys}/properties#{code}"));
+                }
+                entry
+            })
+            .collect();
+        expansion["property"] = json!(prop_decls);
+    }
+
     // ── Copy metadata from the source ValueSet ───────────────────────────────
     // The IG fixtures expect the response to mirror the original ValueSet's
     // top-level fields (url, version, name, title, status, ...) — without
