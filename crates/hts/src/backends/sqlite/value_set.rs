@@ -1464,7 +1464,7 @@ fn expand_inline_filtered(
                     let op = f["op"].as_str().unwrap_or("");
                     let prop = f["property"].as_str().unwrap_or("");
                     (op == "=" && prop != "constraint")
-                        || (prop == "concept"
+                        || ((prop == "concept" || prop == "code")
                             && matches!(op, "is-a" | "descendent-of" | "generalizes"))
                 })
                 && inc["concept"].as_array().is_none_or(|a| a.is_empty())
@@ -1532,7 +1532,7 @@ fn expand_inline_filtered(
                 let op = f["op"].as_str().unwrap_or("");
                 let prop = f["property"].as_str().unwrap_or("");
                 (op == "=" && prop != "constraint")
-                    || (prop == "concept"
+                    || ((prop == "concept" || prop == "code")
                         && matches!(op, "is-a" | "descendent-of" | "generalizes" | "child-of"))
                     || op == "regex"
             });
@@ -2379,7 +2379,7 @@ fn apply_compose_filters(
             let f = &hierarchy_filters[0];
             let p = f["property"].as_str().unwrap_or("");
             let o = f["op"].as_str().unwrap_or("");
-            p == "concept" && (o == "is-a" || o == "descendent-of")
+            (p == "concept" || p == "code") && (o == "is-a" || o == "descendent-of")
         }
     };
     if !property_filters.is_empty() && one_isa_hier() {
@@ -2440,7 +2440,7 @@ fn apply_compose_filters(
         // `child-of` is a single-level hierarchy filter and does not have a
         // direct ECL equivalent — handle it before the ECL fallback so the
         // (property, op) wildcard at the bottom never sees it.
-        if property == "concept" && op == "child-of" {
+        if (property == "concept" || property == "code") && op == "child-of" {
             if value.is_empty() {
                 return Err(HtsError::VsInvalid(
                     "ValueSet compose filter with op='child-of' is missing a value".to_string(),
@@ -2461,7 +2461,11 @@ fn apply_compose_filters(
             continue;
         }
 
-        let ecl_expr: String = match (property, op) {
+        // Normalise `code` → `concept` so IG fixtures that use either property
+        // alias for the concept identifier (e.g. search/search-filter-yes uses
+        // `property=code, op=is-a`) hit the same hierarchy paths.
+        let property_norm = if property == "code" { "concept" } else { property };
+        let ecl_expr: String = match (property_norm, op) {
             ("constraint", "=") => value.to_owned(),
             ("concept", "is-a") => format!("<< {value}"),
             ("concept", "descendent-of") => format!("< {value}"),
@@ -2489,7 +2493,7 @@ fn apply_compose_filters(
             if prev.is_empty() {
                 continue;
             }
-            match (property, op) {
+            match (property_norm, op) {
                 ("concept", "is-a") => {
                     let codes: Vec<String> = prev.iter().map(|c| c.code.clone()).collect();
                     let valid = batch_descendants_in_set(conn, system_id, value, true, &codes)?;
@@ -2516,7 +2520,7 @@ fn apply_compose_filters(
         // Fast path for generalizes with no prior candidate set: ancestors are
         // few (≤ ~20 in SNOMED), so a recursive CTE is O(depth) — much faster
         // than full ECL evaluation which resolves the entire ancestor chain.
-        if property == "concept" && op == "generalizes" {
+        if (property == "concept" || property == "code") && op == "generalizes" {
             let ancestors = query_ancestors_full(conn, system_url, system_id, value)?;
             match result.as_mut() {
                 Some(prev) => {
@@ -3330,7 +3334,12 @@ fn apply_compose_filters_to_candidates(
         let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
 
-        match (property, op) {
+        // `code` and `concept` both refer to the concept-id property in
+        // various IG fixtures (search/* uses `code`, simple/* uses
+        // `concept`). Normalise to the canonical `concept` for matching.
+        let property_norm = if property == "code" { "concept" } else { property };
+
+        match (property_norm, op) {
             ("concept", "is-a") => {
                 let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
                 let valid = batch_descendants_in_set(conn, system_id, value, true, &codes)?;

@@ -1322,17 +1322,41 @@ async fn process_expand<B: TerminologyBackend>(
     //
     // Reuses the per-system CS metadata that `cs_by_url` collected before the
     // displayLanguage swap — no extra SQL round-trips here.
-    let mut used_systems: Vec<&String> =
-        resp.contains
-            .iter()
-            .map(|c| &c.system)
-            .fold(Vec::<&String>::new(), |mut acc, s| {
-                if !acc.contains(&s) {
-                    acc.push(s);
+    // Start from systems that contributed concepts to the expansion. When
+    // the filter narrows to zero matches, fall back to systems referenced by
+    // the source VS's compose.include[] so used-codesystem still surfaces
+    // (matches the IG `search/search-*-no` fixtures: filter='xxx' → empty
+    // contains[] but used-codesystem is still echoed for the included CS).
+    let mut used_systems: Vec<String> = resp
+        .contains
+        .iter()
+        .map(|c| c.system.clone())
+        .fold(Vec::<String>::new(), |mut acc, s| {
+            if !acc.contains(&s) {
+                acc.push(s);
+            }
+            acc
+        });
+    if used_systems.is_empty() {
+        if let Some(vs) = source_vs.as_ref() {
+            if let Some(includes) = vs
+                .get("compose")
+                .and_then(|c| c.get("include"))
+                .and_then(|i| i.as_array())
+            {
+                for inc in includes {
+                    if let Some(sys) = inc.get("system").and_then(|s| s.as_str()) {
+                        let s = sys.to_string();
+                        if !used_systems.contains(&s) {
+                            used_systems.push(s);
+                        }
+                    }
                 }
-                acc
-            });
+            }
+        }
+    }
     used_systems.sort();
+    let used_systems: Vec<&String> = used_systems.iter().collect();
     let mut warning_params: Vec<Value> = Vec::new();
     for system_url in &used_systems {
         let cs = cs_by_url.get(*system_url).and_then(|c| c.as_ref());
