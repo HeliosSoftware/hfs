@@ -1296,18 +1296,62 @@ async fn process_expand<B: TerminologyBackend>(
     for system_url in &used_systems {
         let cs = cs_by_url.get(*system_url).and_then(|c| c.as_ref());
 
-        let cs_version = cs
-            .and_then(|c| c.get("version"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let value_uri = match &cs_version {
-            Some(v) => format!("{system_url}|{v}"),
-            None => (*system_url).clone(),
-        };
-        emitted_params.push(json!({
-            "name": "used-codesystem",
-            "valueUri": value_uri,
-        }));
+        // The IG `overload/expand-all` fixture pins TWO `used-codesystem`
+        // entries when a single CS URL has multiple versions in the store
+        // and the expansion draws from all of them. Search all versions
+        // sharing this URL (sorted ascending so the IG-fixture order
+        // 1.0.0, 2.0.0 is preserved). Falls back to the cached single CS
+        // metadata when only one row exists.
+        let mut all_versions: Vec<Option<String>> =
+            crate::traits::CodeSystemOperations::search(
+                state.backend(),
+                &ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some((*system_url).clone()),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+            .map(|hits| {
+                hits.into_iter()
+                    .map(|h| {
+                        h.get("version")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if all_versions.is_empty() {
+            // Fall back to the per-system metadata cached earlier.
+            let cs_version = cs
+                .and_then(|c| c.get("version"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            all_versions.push(cs_version);
+        }
+        all_versions.sort_by(|a, b| {
+            a.as_deref()
+                .unwrap_or("")
+                .cmp(b.as_deref().unwrap_or(""))
+        });
+        let mut warning_uri: Option<String> = None;
+        for version in &all_versions {
+            let value_uri = match version {
+                Some(v) => format!("{system_url}|{v}"),
+                None => (*system_url).clone(),
+            };
+            if warning_uri.is_none() {
+                warning_uri = Some(value_uri.clone());
+            }
+            emitted_params.push(json!({
+                "name": "used-codesystem",
+                "valueUri": value_uri,
+            }));
+        }
+        let value_uri = warning_uri.unwrap_or_else(|| (*system_url).clone());
 
         // Derive any `warning-<status>` entries from the CS's standards-status
         // extension, status, and experimental flag. Each rule emits at most
