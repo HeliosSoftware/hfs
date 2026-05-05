@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 
 use crate::error::HtsError;
 use crate::state::AppState;
-use crate::traits::{CodeSystemOperations, TerminologyBackend, ValueSetOperations};
+use crate::traits::{CodeSystemOperations, SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ValidateCodeRequest, ValidateCodeResponse};
 
 use super::format::{fhir_respond, negotiate_format};
@@ -152,14 +152,26 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     )
 }
 
-/// Reject any `useSupplement` request param that names a CodeSystem we don't
-/// have stored. The IG fixtures expect 4xx (with issue.code=not-found) when
-/// a supplement is unknown — applies equally to $expand and $validate-code.
-async fn check_supplements<B: TerminologyBackend>(
+/// Resolve every `useSupplement` request param against the backend.
+///
+/// For each supplement URL provided by the caller:
+/// - Verify a stored CodeSystem exists with that URL **and** `content =
+///   supplement` (via `supplement_target`).
+/// - When `expected_target` is `Some`, also enforce that the supplement's
+///   `supplements` URL matches it (so a supplement targeting CS-A cannot
+///   silently apply to CS-B).
+///
+/// Returns the resolved [`SupplementInfo`] list on success — operations
+/// layer code merges supplement-derived data into the response. Returns
+/// `HtsError::NotFound` when any supplement is unknown / mistargeted, so
+/// the IG fixtures' `bad-supplement` cases produce a 4xx OperationOutcome.
+async fn resolve_supplements<B: TerminologyBackend>(
     backend: &B,
     ctx: &TenantContext,
     params: &[Value],
-) -> Result<(), HtsError> {
+    expected_target: Option<&str>,
+) -> Result<Vec<SupplementInfo>, HtsError> {
+    let mut out = Vec::new();
     for s in params
         .iter()
         .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
@@ -170,19 +182,124 @@ async fn check_supplements<B: TerminologyBackend>(
         })
     {
         let bare = s.split('|').next().unwrap_or(s);
-        let exists = backend
-            .code_system_version_for_url(ctx, bare)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        if !exists {
-            return Err(HtsError::NotFound(format!(
-                "Required supplement not found: {bare}"
-            )));
+        let info = backend.supplement_target(ctx, bare).await?;
+        let info = match info {
+            Some(i) => i,
+            None => {
+                return Err(HtsError::NotFound(format!(
+                    "Required supplement not found: {bare}"
+                )));
+            }
+        };
+        if let Some(target) = expected_target {
+            if info.target_url != target {
+                return Err(HtsError::NotFound(format!(
+                    "Required supplement not found: {bare}"
+                )));
+            }
+        }
+        out.push(info);
+    }
+    Ok(out)
+}
+
+/// True when `expected` matches the concept's stored display OR any
+/// supplement designation value (case-insensitive ASCII compare, the same
+/// rule used inside the backend's display check). Used to "rescue" a
+/// validate-code response whose only failure was a display mismatch that
+/// is in fact resolved by an applied supplement.
+async fn display_matches_supplement<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    supplements: &[SupplementInfo],
+    system_url: &str,
+    code: &str,
+    expected: &str,
+) -> bool {
+    if supplements.is_empty() {
+        return false;
+    }
+    let supp_urls: Vec<String> = supplements
+        .iter()
+        .map(|s| {
+            s.supplement_canonical
+                .split('|')
+                .next()
+                .unwrap_or(&s.supplement_canonical)
+                .to_string()
+        })
+        .collect();
+    let codes = vec![code.to_string()];
+    let designs = match backend
+        .supplement_designations(ctx, &supp_urls, &codes)
+        .await
+    {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let _ = system_url; // supplements are already filtered by their own URL list
+    if let Some(list) = designs.get(code) {
+        for d in list {
+            if d.value.eq_ignore_ascii_case(expected) {
+                return true;
+            }
         }
     }
-    Ok(())
+    false
+}
+
+/// Append a `used-supplement` parameter to a built validate-code response,
+/// once per applied supplement. The value is the supplement's canonical
+/// (`url|version` when available). Mutates `value` in place.
+fn append_used_supplements(value: &mut Value, supplements: &[SupplementInfo]) {
+    if supplements.is_empty() {
+        return;
+    }
+    if let Some(arr) = value.get_mut("parameter").and_then(|p| p.as_array_mut()) {
+        for info in supplements {
+            arr.push(json!({
+                "name": "used-supplement",
+                "valueCanonical": info.supplement_canonical,
+            }));
+        }
+    }
+}
+
+/// If `resp` reports `result=false` solely because of a display mismatch,
+/// and the supplied display in fact matches one of the supplement-derived
+/// alt-display designations, mutate `resp` in place to clear the message
+/// and set `result=true`. No-op when no supplements are applied or when
+/// the response wasn't a display-mismatch failure.
+async fn rescue_via_supplements<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    supplements: &[SupplementInfo],
+    system_url: &str,
+    code: &str,
+    expected_display: Option<&str>,
+    resp: &mut ValidateCodeResponse,
+) {
+    if supplements.is_empty() || resp.result {
+        return;
+    }
+    let Some(expected) = expected_display else {
+        return;
+    };
+    // Heuristic: only "rescue" display-mismatch failures, not
+    // code-not-in-VS or unknown-code rejections. The backend's display
+    // mismatch message starts with either "Display mismatch:" (CodeSystem
+    // path, see code_system.rs) or "Provided display ... does not match"
+    // (ValueSet path, see finish_validate_code_response in value_set.rs).
+    let msg = resp.message.as_deref().unwrap_or("");
+    let looks_like_display_mismatch =
+        msg.starts_with("Display mismatch:") || msg.contains("does not match stored display");
+    if !looks_like_display_mismatch {
+        return;
+    }
+    if display_matches_supplement(backend, ctx, supplements, system_url, code, expected).await {
+        resp.result = true;
+        resp.message = None;
+    }
 }
 
 /// Core validate-code logic for `CodeSystem/$validate-code`.
@@ -209,8 +326,6 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
     let ctx = TenantContext::system();
-    check_supplements(state.backend(), &ctx, &params).await?;
-
     // ── Path 1: bare `code` parameter (requires `url` = CodeSystem canonical URL) ──
     if let Some(code) = find_str_param(&params, "code") {
         let system = find_str_param(&params, "url").ok_or_else(|| {
@@ -220,20 +335,33 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                     .into(),
             )
         })?;
+        let supplements =
+            resolve_supplements(state.backend(), &ctx, &params, Some(&system)).await?;
+        let display = find_str_param(&params, "display");
         let req = ValidateCodeRequest {
             url: None,
             system: Some(system.clone()),
             code: code.clone(),
             version: find_str_param(&params, "version"),
-            display: find_str_param(&params, "display"),
+            display: display.clone(),
             date: find_str_param(&params, "date"),
             include_abstract: params
                 .iter()
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
-        let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
-        return Ok(build_validate_response_async(
+        let mut resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
+        rescue_via_supplements(
+            state.backend(),
+            &ctx,
+            &supplements,
+            &system,
+            &code,
+            display.as_deref(),
+            &mut resp,
+        )
+        .await;
+        let mut value = build_validate_response_async(
             state.backend(),
             &ctx,
             resp,
@@ -241,25 +369,43 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             Some(&system),
             None,
         )
-        .await);
+        .await;
+        append_used_supplements(&mut value, &supplements);
+        return Ok(value);
     }
 
     // ── Path 2: `coding` parameter (valueCoding — system+code bundled together) ──
-    if let Some((system, code, _display)) = extract_coding(&params, "coding") {
+    if let Some((system, code, coding_display)) = extract_coding(&params, "coding") {
+        // Coding.display takes precedence over a top-level `display` param —
+        // the IG fixtures pin display via the Coding so the server can
+        // report a mismatch.
+        let display = coding_display.or_else(|| find_str_param(&params, "display"));
+        let supplements =
+            resolve_supplements(state.backend(), &ctx, &params, Some(&system)).await?;
         let req = ValidateCodeRequest {
             url: None,
             system: Some(system.clone()),
             code: code.clone(),
             version: find_str_param(&params, "version"),
-            display: find_str_param(&params, "display"),
+            display: display.clone(),
             date: find_str_param(&params, "date"),
             include_abstract: params
                 .iter()
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
-        let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
-        return Ok(build_validate_response_async(
+        let mut resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
+        rescue_via_supplements(
+            state.backend(),
+            &ctx,
+            &supplements,
+            &system,
+            &code,
+            display.as_deref(),
+            &mut resp,
+        )
+        .await;
+        let mut value = build_validate_response_async(
             state.backend(),
             &ctx,
             resp,
@@ -267,7 +413,9 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             Some(&system),
             None,
         )
-        .await);
+        .await;
+        append_used_supplements(&mut value, &supplements);
+        return Ok(value);
     }
 
     // ── Path 3: `codeableConcept` parameter (multiple codings — true if any matches) ──
@@ -277,6 +425,10 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 "codeableConcept parameter has no valid coding entries".into(),
             ));
         }
+        // Bad-supplement rejection still applies — we don't yet know which
+        // coding's system will win, so verify each supplement is *known* (no
+        // target enforcement until we know the matched coding's system).
+        let _ = resolve_supplements(state.backend(), &ctx, &params, None).await?;
         // Capture the original valueCodeableConcept so we can echo it in the response.
         let cc_value = params
             .iter()
@@ -392,7 +544,11 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     })?;
 
     let ctx = TenantContext::system();
-    check_supplements(state.backend(), &ctx, &params).await?;
+    // ValueSet validate-code can carry useSupplement that targets ANY
+    // CodeSystem in the VS expansion. We can't (yet) verify the target
+    // matches a system in the VS without expanding, so pass `None` for
+    // expected_target here — bad-supplement-not-found is still rejected.
+    let supplements = resolve_supplements(state.backend(), &ctx, &params, None).await?;
     // Used to rewrite "...'url'..." → "...'url|version'..." in NotFound
     // messages so the IG-expected text format is met.
     let vs_version = find_str_param(&params, "valueSetVersion");
@@ -410,22 +566,35 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // ── Path 1: bare `code` parameter ────────────────────────────────────────────
     if let Some(code) = find_str_param(&params, "code") {
         let system = find_str_param(&params, "system");
+        let display = find_str_param(&params, "display");
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
             system: system.clone(),
             code: code.clone(),
             version: find_str_param(&params, "version"),
-            display: find_str_param(&params, "display"),
+            display: display.clone(),
             date: find_str_param(&params, "date"),
             include_abstract: params
                 .iter()
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
-        let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
+        let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
             .await
             .map_err(&rewrite)?;
-        return Ok(build_validate_response_async(
+        if let Some(sys) = system.as_deref() {
+            rescue_via_supplements(
+                state.backend(),
+                &ctx,
+                &supplements,
+                sys,
+                &code,
+                display.as_deref(),
+                &mut resp,
+            )
+            .await;
+        }
+        let mut value = build_validate_response_async(
             state.backend(),
             &ctx,
             resp,
@@ -433,11 +602,13 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             system.as_deref(),
             None,
         )
-        .await);
+        .await;
+        append_used_supplements(&mut value, &supplements);
+        return Ok(value);
     }
 
     // ── Path 2: `coding` parameter (valueCoding) ──────────────────────────────
-    if let Some((system, code, _display)) = extract_coding(&params, "coding") {
+    if let Some((system, code, coding_display)) = extract_coding(&params, "coding") {
         // Empty system from extract_coding means the Coding had no system
         // field. Per the IG fixtures, that should produce result=false with
         // a "Coding has no system" message rather than matching by code
@@ -457,22 +628,36 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 None,
             ));
         }
+        // Coding.display takes precedence over a top-level `display` param —
+        // the IG fixtures pin display via the Coding so the server can
+        // report a mismatch.
+        let display = coding_display.or_else(|| find_str_param(&params, "display"));
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
             system: Some(system.clone()),
             code: code.clone(),
             version: find_str_param(&params, "version"),
-            display: find_str_param(&params, "display"),
+            display: display.clone(),
             date: find_str_param(&params, "date"),
             include_abstract: params
                 .iter()
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
-        let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
+        let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
             .await
             .map_err(&rewrite)?;
-        return Ok(build_validate_response_async(
+        rescue_via_supplements(
+            state.backend(),
+            &ctx,
+            &supplements,
+            &system,
+            &code,
+            display.as_deref(),
+            &mut resp,
+        )
+        .await;
+        let mut value = build_validate_response_async(
             state.backend(),
             &ctx,
             resp,
@@ -480,7 +665,9 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             Some(&system),
             None,
         )
-        .await);
+        .await;
+        append_used_supplements(&mut value, &supplements);
+        return Ok(value);
     }
 
     // ── Path 3: `codeableConcept` parameter (true if any coding is in the ValueSet) ──
@@ -516,7 +703,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .await
                 .map_err(&rewrite)?;
             if resp.result {
-                return Ok(build_validate_response_async(
+                let mut value = build_validate_response_async(
                     state.backend(),
                     &ctx,
                     resp,
@@ -524,10 +711,12 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     Some(&system),
                     cc_value.as_ref(),
                 )
-                .await);
+                .await;
+                append_used_supplements(&mut value, &supplements);
+                return Ok(value);
             }
         }
-        return Ok(build_validate_response(
+        let mut value = build_validate_response(
             ValidateCodeResponse {
                 result: false,
                 message: Some("None of the provided codings were found in the ValueSet".into()),
@@ -539,7 +728,9 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             None,
             cc_value.as_ref(),
             None,
-        ));
+        );
+        append_used_supplements(&mut value, &supplements);
+        return Ok(value);
     }
 
     Err(HtsError::InvalidRequest(
@@ -1184,5 +1375,129 @@ mod tests {
 
         let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
         assert_eq!(resp.status(), 400);
+    }
+
+    // ── Supplement-aware display matching (IG `parameters-validate-supplement-good`) ──
+
+    fn make_supplement_vs_app() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at, resource_json)
+                 VALUES ('base', 'http://hl7.org/fhir/test/CodeSystem/extensions', '5.0.0',
+                         'ExtensionsTestCodeSystem', 'active', 'complete',
+                         '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\"}');
+
+                 INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at, resource_json)
+                 VALUES ('supp', 'http://hl7.org/fhir/test/CodeSystem/supplement', '0.1.1',
+                         'SupplementCS', 'active', 'supplement',
+                         '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\",\"supplements\":\"http://hl7.org/fhir/test/CodeSystem/extensions\"}');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (10, 'base', 'code1', 'Display 1'),
+                        (11, 'supp', 'code1', NULL);
+
+                 INSERT INTO concept_designations (concept_id, language, value)
+                 VALUES (10, 'de', 'Mein erster Code'),
+                        (11, 'nl', 'ectenoot');
+
+                 INSERT INTO value_sets
+                     (id, url, name, status, compose_json, created_at, updated_at, resource_json)
+                 VALUES ('vs-extns', 'http://hl7.org/fhir/test/ValueSet/extensions-all-ns',
+                         'ExtensionsValueSetAllNS', 'active',
+                         '{\"include\":[{\"system\":\"http://hl7.org/fhir/test/CodeSystem/extensions\"}]}',
+                         '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"ValueSet\"}');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/ValueSet/$validate-code",
+                post(vs_validate_code_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn vs_validate_supplement_display_matches_via_supplement_designation() {
+        let app = make_supplement_vs_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://hl7.org/fhir/test/ValueSet/extensions-all-ns"},
+                {"name": "coding", "valueCoding": {
+                    "system": "http://hl7.org/fhir/test/CodeSystem/extensions",
+                    "code": "code1",
+                    "display": "ectenoot"
+                }},
+                {"name": "useSupplement", "valueCanonical": "http://hl7.org/fhir/test/CodeSystem/supplement"}
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result["valueBoolean"], true,
+            "supplement designation 'ectenoot' should be accepted as alt display"
+        );
+        let used = params
+            .iter()
+            .find(|p| p["name"] == "used-supplement")
+            .expect("used-supplement parameter must be echoed");
+        assert_eq!(
+            used["valueCanonical"],
+            "http://hl7.org/fhir/test/CodeSystem/supplement|0.1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn vs_validate_supplement_omitted_then_display_mismatch_fails() {
+        // Mirror IG `parameters-validate-supplement-none-response`: same
+        // request shape but no useSupplement → result=false because
+        // 'ectenoot' is not in the base CS.
+        let app = make_supplement_vs_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://hl7.org/fhir/test/ValueSet/extensions-all-ns"},
+                {"name": "coding", "valueCoding": {
+                    "system": "http://hl7.org/fhir/test/CodeSystem/extensions",
+                    "code": "code1",
+                    "display": "ectenoot"
+                }}
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$validate-code", body).await;
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], false);
+    }
+
+    #[tokio::test]
+    async fn vs_validate_unknown_supplement_returns_404() {
+        let app = make_supplement_vs_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://hl7.org/fhir/test/ValueSet/extensions-all-ns"},
+                {"name": "coding", "valueCoding": {
+                    "system": "http://hl7.org/fhir/test/CodeSystem/extensions",
+                    "code": "code1"
+                }},
+                {"name": "useSupplement", "valueCanonical": "http://does-not-exist/cs"}
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$validate-code", body).await;
+        assert_eq!(resp.status(), 404);
     }
 }
