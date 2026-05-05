@@ -100,7 +100,7 @@ CREATE INDEX IF NOT EXISTS idx_code_systems_meta
 
 CREATE TABLE IF NOT EXISTS value_sets (
     id            TEXT PRIMARY KEY,
-    url           TEXT NOT NULL UNIQUE,
+    url           TEXT NOT NULL,
     version       TEXT,
     name          TEXT,
     title         TEXT,
@@ -110,6 +110,9 @@ CREATE TABLE IF NOT EXISTS value_sets (
     updated_at    TEXT NOT NULL,
     resource_json TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_value_sets_url_version
+    ON value_sets(url, COALESCE(version, ''));
+CREATE INDEX IF NOT EXISTS idx_value_sets_url ON value_sets(url);
 CREATE INDEX IF NOT EXISTS idx_value_sets_created_at ON value_sets(created_at);
 -- Covering index for metadata-only list queries (analogous to idx_code_systems_meta).
 CREATE INDEX IF NOT EXISTS idx_value_sets_meta
@@ -486,6 +489,56 @@ pub fn migrate_code_systems_drop_url_unique(
          CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
              ON code_systems(url, COALESCE(version, ''));
          CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);",
+    )?;
+    tx.commit()
+}
+
+/// Drop the legacy `UNIQUE` constraint on `value_sets.url`. Mirror of
+/// [`migrate_code_systems_drop_url_unique`] for the value_sets table — the
+/// HL7 tx-ecosystem ships per-version ValueSet fixtures (e.g.
+/// `valueset-version-1.json` + `valueset-version-2.json`) that share a
+/// canonical URL, and the legacy column-level UNIQUE caused later imports
+/// to silently overwrite earlier rows.
+pub fn migrate_value_sets_drop_url_unique(
+    conn: &mut rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    let needs_rebuild: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master \
+             WHERE type='table' AND name='value_sets' \
+               AND sql LIKE '%url%TEXT%NOT NULL%UNIQUE%'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if !needs_rebuild {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE value_sets_new (
+             id            TEXT PRIMARY KEY,
+             url           TEXT NOT NULL,
+             version       TEXT,
+             name          TEXT,
+             title         TEXT,
+             status        TEXT NOT NULL DEFAULT 'active',
+             compose_json  TEXT,
+             created_at    TEXT NOT NULL,
+             updated_at    TEXT NOT NULL,
+             resource_json TEXT
+         );
+         INSERT INTO value_sets_new
+             (id, url, version, name, title, status, compose_json, created_at, updated_at, resource_json)
+         SELECT id, url, version, name, title, status, compose_json, created_at, updated_at, resource_json
+           FROM value_sets;
+         DROP TABLE value_sets;
+         ALTER TABLE value_sets_new RENAME TO value_sets;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_value_sets_url_version
+             ON value_sets(url, COALESCE(version, ''));
+         CREATE INDEX IF NOT EXISTS idx_value_sets_url ON value_sets(url);",
     )?;
     tx.commit()
 }

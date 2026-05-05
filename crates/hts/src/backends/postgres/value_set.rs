@@ -35,7 +35,14 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-        let all_codes = match resolve_value_set(&client, &url, req.date.as_deref()).await {
+        let all_codes = match resolve_value_set_versioned(
+            &client,
+            &url,
+            req.value_set_version.as_deref(),
+            req.date.as_deref(),
+        )
+        .await
+        {
             Ok((vs_id, compose_json)) => {
                 let cached = fetch_cache(&client, &vs_id).await?;
                 if cached.is_empty() {
@@ -137,7 +144,14 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
         let (vs_id, compose_json) =
-            match resolve_value_set(&client, &url, req.date.as_deref()).await {
+            match resolve_value_set_versioned(
+                &client,
+                &url,
+                req.value_set_version.as_deref(),
+                req.date.as_deref(),
+            )
+            .await
+            {
                 Ok(vs) => vs,
                 Err(HtsError::NotFound(_)) => {
                     return Ok(ValidateCodeResponse {
@@ -278,29 +292,50 @@ impl ValueSetOperations for PostgresTerminologyBackend {
 
 // ── Private helpers ────────────────────────────────────────────────────────────
 
-/// Resolve a value set by canonical URL and optional point-in-time date.
+/// Look up a ValueSet by canonical URL with an optional version pin.
 ///
-/// Returns `(id, compose_json)`.
-async fn resolve_value_set(
+/// Mirrors `sqlite::value_set::resolve_value_set_versioned`: when `version`
+/// is `Some`, only the matching `(url, version)` row is returned (or
+/// NotFound). When `version` is `None`, the highest-versioned row sharing
+/// the URL wins.
+async fn resolve_value_set_versioned(
     client: &tokio_postgres::Client,
     url: &str,
+    version: Option<&str>,
     date: Option<&str>,
 ) -> Result<(String, Option<String>), HtsError> {
     let rows = client
         .query(
-            "SELECT id, compose_json FROM value_sets
+            "SELECT id, compose_json, version FROM value_sets
              WHERE url = $1
-               AND ($2::text IS NULL OR (resource_json->>'date') <= $2)",
+               AND ($2::text IS NULL OR (resource_json->>'date') <= $2)
+             ORDER BY COALESCE(version, '') DESC",
             &[&url, &date],
         )
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    let row = rows.into_iter().next().ok_or_else(|| {
-        HtsError::NotFound(format!(
-            "A definition for the value Set \'{url}\' could not be found"
-        ))
-    })?;
+    if rows.is_empty() {
+        let qualified = match version {
+            Some(v) => format!("{url}|{v}"),
+            None => url.to_string(),
+        };
+        return Err(HtsError::NotFound(format!(
+            "A definition for the value Set \'{qualified}\' could not be found"
+        )));
+    }
+
+    let row = match version {
+        Some(v) => rows
+            .into_iter()
+            .find(|r| r.get::<_, Option<String>>(2).as_deref() == Some(v))
+            .ok_or_else(|| {
+                HtsError::NotFound(format!(
+                    "A definition for the value Set \'{url}|{v}\' could not be found"
+                ))
+            })?,
+        None => rows.into_iter().next().expect("non-empty"),
+    };
 
     Ok((row.get(0), row.get(1)))
 }

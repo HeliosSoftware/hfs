@@ -476,8 +476,13 @@ async fn write_value_set(
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
     }
 
-    // Two-step upsert — see `write_code_system` for why `ON CONFLICT (url)`
-    // alone is not safe under concurrent imports that share `vs.id`.
+    // Synthetic storage id keyed by (fhir_id, version) so multi-version
+    // ValueSets don't collide on the primary key — same strategy code
+    // systems use. UPDATE below is keyed by (url, version) so each row
+    // refreshes independently of its siblings.
+    let storage_id =
+        crate::import::fhir_bundle::storage_id_for(&vs.id, vs.version.as_deref());
+
     client
         .execute(
             "INSERT INTO value_sets
@@ -485,7 +490,7 @@ async fn write_value_set(
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
              ON CONFLICT DO NOTHING",
             &[
-                &vs.id,
+                &storage_id,
                 &vs.url,
                 &vs.version,
                 &vs.name,
@@ -502,16 +507,14 @@ async fn write_value_set(
     client
         .execute(
             "UPDATE value_sets SET
-               version       = $1,
-               name          = $2,
-               title         = $3,
-               status        = $4,
-               compose_json  = $5,
-               resource_json = $6,
-               updated_at    = $7
-             WHERE url = $8",
+               name          = $1,
+               title         = $2,
+               status        = $3,
+               compose_json  = $4,
+               resource_json = $5,
+               updated_at    = $6
+             WHERE url = $7 AND COALESCE(version, '') = COALESCE($8, '')",
             &[
-                &vs.version,
                 &vs.name,
                 &vs.title,
                 &vs.status,
@@ -519,6 +522,7 @@ async fn write_value_set(
                 &resource_json,
                 &now,
                 &vs.url,
+                &vs.version,
             ],
         )
         .await

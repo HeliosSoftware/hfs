@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS concept_designations (
 -- ── Value Sets ─────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS value_sets (
     id            TEXT PRIMARY KEY,
-    url           TEXT NOT NULL UNIQUE,
+    url           TEXT NOT NULL,
     version       TEXT,
     name          TEXT,
     title         TEXT,
@@ -110,6 +110,27 @@ CREATE TABLE IF NOT EXISTS value_sets (
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_value_sets_url_version
+    ON value_sets(url, COALESCE(version, ''));
+CREATE INDEX IF NOT EXISTS idx_value_sets_url ON value_sets(url);
+
+-- Drop any legacy column-level UNIQUE on value_sets.url for the same reason
+-- code_systems above had it removed: tx-ecosystem ships per-version VS
+-- fixtures sharing a canonical URL.
+DO $$
+DECLARE
+    cons_name text;
+BEGIN
+    FOR cons_name IN
+        SELECT conname FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = 'value_sets'
+          AND c.contype = 'u'
+          AND pg_get_constraintdef(c.oid) = 'UNIQUE (url)'
+    LOOP
+        EXECUTE format('ALTER TABLE value_sets DROP CONSTRAINT %I', cons_name);
+    END LOOP;
+END $$;
 
 -- ── Value Set Expansions (materialized cache) ─────────────────────────────────
 CREATE TABLE IF NOT EXISTS value_set_expansions (

@@ -401,14 +401,22 @@ fn write_value_set(
     let resource_json = serde_json::to_string(&vs.resource_json).ok();
     let now = utc_now();
 
-    conn.prepare_cached(
-        "INSERT OR REPLACE INTO value_sets
+    // Synthetic storage id: `<fhir-id>|<version>` (or `<fhir-id>` when version
+    // is absent). Mirrors the code_systems strategy so multiple ValueSets that
+    // share a canonical URL but differ in version don't collide on either the
+    // primary key or the composite UNIQUE index.
+    let storage_id = storage_id_for(&vs.id, vs.version.as_deref());
+
+    // Upsert keyed on (url, version): a re-import refreshes the existing row
+    // for the same version without disturbing sibling versions. The composite
+    // UNIQUE index on (url, COALESCE(version,'')) guarantees one storage row
+    // per (url, version).
+    conn.execute(
+        "INSERT OR IGNORE INTO value_sets
          (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-    )
-    .and_then(|mut s| {
-        s.execute(rusqlite::params![
-            vs.id,
+        rusqlite::params![
+            storage_id,
             vs.url,
             vs.version,
             vs.name,
@@ -417,8 +425,33 @@ fn write_value_set(
             vs.compose_json,
             resource_json,
             now
-        ])
-    })
+        ],
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    // INSERT OR IGNORE skipped the metadata refresh on conflict — apply it
+    // explicitly so re-imports of the same (url, version) get the latest
+    // name/title/status/compose without disturbing siblings.
+    conn.execute(
+        "UPDATE value_sets SET
+           name          = ?1,
+           title         = ?2,
+           status        = ?3,
+           compose_json  = ?4,
+           resource_json = ?5,
+           updated_at    = ?6
+         WHERE url = ?7 AND COALESCE(version, '') = COALESCE(?8, '')",
+        rusqlite::params![
+            vs.name,
+            vs.title,
+            vs.status,
+            vs.compose_json,
+            resource_json,
+            now,
+            vs.url,
+            vs.version,
+        ],
+    )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     stats.value_sets += 1;

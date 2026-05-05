@@ -192,6 +192,11 @@ impl SqliteTerminologyBackend {
                     "Failed to drop legacy code_systems.url UNIQUE: {e}"
                 ))
             })?;
+            schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to drop legacy value_sets.url UNIQUE: {e}"
+                ))
+            })?;
 
             // Clear the concept FTS index on every startup — it is always rebuilt
             // synchronously by prebuild_concepts_fts below, so stale rows from a
@@ -283,6 +288,11 @@ impl SqliteTerminologyBackend {
             schema::migrate_code_systems_drop_url_unique(&mut conn).map_err(|e| {
                 HtsError::StorageError(format!(
                     "Failed to drop legacy code_systems.url UNIQUE: {e}"
+                ))
+            })?;
+            schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to drop legacy value_sets.url UNIQUE: {e}"
                 ))
             })?;
         }

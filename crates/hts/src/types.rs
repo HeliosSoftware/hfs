@@ -92,6 +92,11 @@ pub struct LookupResponse {
 pub struct ValidateCodeRequest {
     /// ValueSet URL (used when validating against a value set).
     pub url: Option<String>,
+    /// ValueSet version pin (per FHIR `valueSetVersion` request param). When
+    /// set, only the matching `(url, version)` ValueSet is consulted; without
+    /// it the highest-versioned ValueSet sharing the URL wins.
+    #[serde(default)]
+    pub value_set_version: Option<String>,
     /// CodeSystem URL (used when validating directly against a code system).
     pub system: Option<String>,
     /// The code to validate.
@@ -266,6 +271,11 @@ pub struct ExpansionContainsDesignation {
 pub struct ExpandRequest {
     /// ValueSet canonical URL.
     pub url: Option<String>,
+    /// ValueSet version pin (per FHIR `valueSetVersion` request param). When
+    /// set, only the matching `(url, version)` ValueSet is consulted; without
+    /// it the highest-versioned ValueSet sharing the URL wins.
+    #[serde(default)]
+    pub value_set_version: Option<String>,
     /// Inline ValueSet resource (used when no `url` is provided).
     pub value_set: Option<serde_json::Value>,
     /// Free-text filter applied to code + display.

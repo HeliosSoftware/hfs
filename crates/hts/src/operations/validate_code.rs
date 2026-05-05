@@ -439,6 +439,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
         let display = find_str_param(&params, "display");
         let req = ValidateCodeRequest {
             url: None,
+            value_set_version: None,
             system: Some(system.clone()),
             code: code.clone(),
             version: find_str_param(&params, "version"),
@@ -483,6 +484,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             resolve_supplements(state.backend(), &ctx, &params, Some(&system)).await?;
         let req = ValidateCodeRequest {
             url: None,
+            value_set_version: None,
             system: Some(system.clone()),
             code: code.clone(),
             version: find_str_param(&params, "version"),
@@ -541,6 +543,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
         for (system, code) in codings.into_iter().rev() {
             let req = ValidateCodeRequest {
                 url: None,
+                value_set_version: None,
                 system: Some(system.clone()),
                 code: code.clone(),
                 version: find_str_param(&params, "version"),
@@ -669,6 +672,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         let display = find_str_param(&params, "display");
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
+            value_set_version: vs_version.clone(),
             system: system.clone(),
             code: code.clone(),
             version: find_str_param(&params, "version"),
@@ -747,6 +751,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         let display = coding_display.or_else(|| find_str_param(&params, "display"));
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
+            value_set_version: vs_version.clone(),
             system: Some(system.clone()),
             code: code.clone(),
             version: find_str_param(&params, "version"),
@@ -802,6 +807,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         for (system, code) in codings.into_iter().rev() {
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),
+                value_set_version: vs_version.clone(),
                 system: Some(system.clone()),
                 code: code.clone(),
                 version: find_str_param(&params, "version"),

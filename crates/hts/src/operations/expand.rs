@@ -834,6 +834,7 @@ async fn process_expand<B: TerminologyBackend>(
     // ── Cache miss: compute ───────────────────────────────────────────────────
     let req = ExpandRequest {
         url,
+        value_set_version: find_str_param(&params, "valueSetVersion"),
         value_set,
         filter: filter.clone(),
         count,

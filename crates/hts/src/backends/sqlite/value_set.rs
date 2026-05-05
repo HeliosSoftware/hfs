@@ -507,7 +507,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 let url = req.url.as_deref().unwrap();
                 // Resolve expansion codes — either from an explicit ValueSet or from an
                 // implicit one defined by `CodeSystem.valueSet`.
-                match resolve_value_set(&conn, url, req.date.as_deref()) {
+                match resolve_value_set_versioned(
+                    &conn,
+                    url,
+                    req.value_set_version.as_deref(),
+                    req.date.as_deref(),
+                ) {
                     Ok((vs_id, compose_json)) => {
                         // Normal path: try the expansion cache first.
                         let cached = fetch_cache(&conn, &vs_id)?;
@@ -826,7 +831,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // Resolve the expansion — try explicit ValueSet first, then the two
             // implicit-ValueSet fallbacks used by $expand.
             let all_codes: Vec<ExpansionContains> =
-                match resolve_value_set(&conn, &url, req.date.as_deref()) {
+                match resolve_value_set_versioned(
+                    &conn,
+                    &url,
+                    req.value_set_version.as_deref(),
+                    req.date.as_deref(),
+                ) {
                     Ok((vs_id, compose_json)) => {
                         let cached = fetch_cache(&conn, &vs_id)?;
                         if cached.is_empty() {
@@ -1134,19 +1144,66 @@ fn resolve_value_set(
     url: &str,
     date: Option<&str>,
 ) -> Result<(String, Option<String>), HtsError> {
-    conn.query_row(
-        "SELECT id, compose_json FROM value_sets \
-         WHERE url = ?1 \
-           AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2)",
-        rusqlite::params![url, date],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-    )
-    .map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => HtsError::NotFound(format!(
-            "A definition for the value Set \'{url}\' could not be found"
-        )),
-        other => HtsError::StorageError(other.to_string()),
-    })
+    resolve_value_set_versioned(conn, url, None, date)
+}
+
+/// Look up a ValueSet by canonical URL with an optional version pin.
+///
+/// When `version` is `Some`, only the row whose `version` matches exactly is
+/// returned (or NotFound). When `version` is `None`, the highest-versioned
+/// row sharing the URL wins (matches the multi-version-cs default behaviour
+/// for code systems). The IG fixtures distinguish these cases via the
+/// `valueSetVersion` request param + the `url|version` canonical syntax.
+fn resolve_value_set_versioned(
+    conn: &Connection,
+    url: &str,
+    version: Option<&str>,
+    date: Option<&str>,
+) -> Result<(String, Option<String>), HtsError> {
+    // Fetch every (id, compose, version) candidate ordered with the highest
+    // version first so the version=None path picks the latest.
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, compose_json, version FROM value_sets \
+             WHERE url = ?1 \
+               AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2) \
+             ORDER BY COALESCE(version, '') DESC",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+        .query_map(rusqlite::params![url, date], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    if rows.is_empty() {
+        let qualified = match version {
+            Some(v) => format!("{url}|{v}"),
+            None => url.to_string(),
+        };
+        return Err(HtsError::NotFound(format!(
+            "A definition for the value Set \'{qualified}\' could not be found"
+        )));
+    }
+
+    let chosen = match version {
+        Some(v) => rows
+            .into_iter()
+            .find(|(_, _, ver)| ver.as_deref() == Some(v))
+            .ok_or_else(|| {
+                HtsError::NotFound(format!(
+                    "A definition for the value Set \'{url}|{v}\' could not be found"
+                ))
+            })?,
+        None => rows.into_iter().next().expect("non-empty"),
+    };
+    Ok((chosen.0, chosen.1))
 }
 
 /// Fetch all cached expansion entries for `vs_id`.
@@ -4316,8 +4373,13 @@ fn is_concept_abstract(conn: &Connection, system_url: &str, code: &str) -> bool 
 /// format `url|version` in $validate-code "code not found" messages, which
 /// is what the IG fixtures expect.
 fn lookup_value_set_version(conn: &Connection, url: &str) -> Option<String> {
+    // Pick the highest stored version for this URL — matches the
+    // resolve_value_set_versioned default-when-no-pin behaviour, so $expand
+    // and $validate-code echoes converge on the same row.
     conn.query_row(
-        "SELECT version FROM value_sets WHERE url = ?1 LIMIT 1",
+        "SELECT version FROM value_sets \
+         WHERE url = ?1 \
+         ORDER BY COALESCE(version, '') DESC LIMIT 1",
         rusqlite::params![url],
         |row| row.get::<_, Option<String>>(0),
     )
