@@ -1028,11 +1028,28 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
             .and_then(|p| p.get("valueCodeableConcept"))
             .cloned();
+        // Capture per-coding `display` from the original CodeableConcept so
+        // the IG `permutations/bad-cc*` fixtures' `'sys#code (\"Display\")'`
+        // text format is preserved.
+        let coding_displays: std::collections::HashMap<(String, String), String> = cc_value
+            .as_ref()
+            .and_then(|cc| cc.get("coding").and_then(|v| v.as_array()))
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        let s = c.get("system").and_then(|v| v.as_str())?.to_string();
+                        let cd = c.get("code").and_then(|v| v.as_str())?.to_string();
+                        let d = c.get("display").and_then(|v| v.as_str())?.to_string();
+                        Some(((s, cd), d))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // The IG fixtures expect the LAST matching coding to win (when several
         // codings in a CodeableConcept all validate, the response echoes the
         // last one). Iterate in reverse so the earliest "yes" we find is the
         // last entry in the input.
-        for (system, code) in codings.into_iter().rev() {
+        for (system, code) in codings.clone().into_iter().rev() {
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),
                 value_set_version: vs_version.clone(),
@@ -1065,14 +1082,121 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 return Ok(value);
             }
         }
+
+        // No coding matched. The IG `permutations/bad-cc*` fixtures expect:
+        //   1. one error code-invalid/not-in-vs "No valid coding was found ..."
+        //   2. per-coding error code-invalid/invalid-code "Unknown code 'X' in
+        //      the CodeSystem 'sys' version 'Y'" when the code isn't in CS
+        //   3. per-coding info code-invalid/this-code-not-in-vs "The provided
+        //      code 'sys#code ('Display')' was not found in the value set ..."
+        let vs_version_owned = crate::traits::ValueSetOperations::search(
+            state.backend(),
+            &ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some(url.clone()),
+                version: vs_version.clone(),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()
+        .and_then(|mut hits| {
+            hits.pop()
+                .and_then(|vs| vs.get("version").and_then(|v| v.as_str()).map(str::to_string))
+        });
+        let url_with_version = match vs_version_owned.as_deref() {
+            Some(v) => format!("{url}|{v}"),
+            None => url.clone(),
+        };
+
+        let mut issues: Vec<ValidationIssue> = vec![ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "not-in-vs".into(),
+            text: format!(
+                "No valid coding was found for the value set '{url_with_version}'"
+            ),
+            location: Some("CodeableConcept".into()),
+            message_id: Some("TX_GENERAL_CC_ERROR_MESSAGE".into()),
+        }];
+
+        // For each coding, emit per-coding issues based on whether the
+        // CodeSystem and code exist.
+        for (idx, (system, code)) in codings.iter().enumerate() {
+            // Look up the CS version for messaging.
+            let cs_version = state
+                .backend()
+                .code_system_version_for_url(&ctx, system)
+                .await
+                .ok()
+                .flatten();
+            let cs_known = cs_version.is_some();
+            // Per-coding lookup: does the code exist in the CS at all?
+            let code_in_cs = if cs_known {
+                let req = ValidateCodeRequest {
+                    url: None,
+                    value_set_version: None,
+                    system: Some(system.clone()),
+                    code: code.clone(),
+                    version: None,
+                    display: None,
+                    date: None,
+                    include_abstract: None,
+                };
+                CodeSystemOperations::validate_code(state.backend(), &ctx, req)
+                    .await
+                    .map(|r| r.result)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            if cs_known && !code_in_cs {
+                let cs_text = match cs_version.as_deref() {
+                    Some(v) => format!(
+                        "Unknown code '{code}' in the CodeSystem '{system}' version '{v}'"
+                    ),
+                    None => format!("Unknown code '{code}' in the CodeSystem '{system}'"),
+                };
+                issues.push(ValidationIssue {
+                    severity: "error".into(),
+                    fhir_code: "code-invalid".into(),
+                    tx_code: "invalid-code".into(),
+                    text: cs_text,
+                    location: Some(format!("CodeableConcept.coding[{idx}].code")),
+                    message_id: Some("Unknown_Code_in_Version".into()),
+                });
+            }
+
+            // Always emit the per-coding "this code wasn't in VS" info.
+            let display = coding_displays.get(&(system.clone(), code.clone()));
+            let qualified = match display {
+                Some(d) => format!("{system}#{code} ('{d}')"),
+                None => format!("{system}#{code}"),
+            };
+            issues.push(ValidationIssue {
+                severity: "information".into(),
+                fhir_code: "code-invalid".into(),
+                tx_code: "this-code-not-in-vs".into(),
+                text: format!(
+                    "The provided code '{qualified}' was not found in the value set '{url_with_version}'"
+                ),
+                location: Some(format!("CodeableConcept.coding[{idx}].code")),
+                message_id: Some(
+                    "None_of_the_provided_codes_are_in_the_value_set_one".into(),
+                ),
+            });
+        }
+
         let mut value = build_validate_response(
             ValidateCodeResponse {
                 result: false,
-                message: Some("None of the provided codings were found in the ValueSet".into()),
+                message: None,
                 display: None,
                 system: None,
                 inactive: None,
-                issues: vec![],
+                issues,
             },
             None,
             None,
