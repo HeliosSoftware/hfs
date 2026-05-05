@@ -2138,8 +2138,10 @@ fn expand_single_include_local(
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-        let mut out = Vec::with_capacity(rows.len());
+        let mut out: Vec<ExpansionContains> = Vec::with_capacity(rows.len());
+        let mut seen_codes: HashSet<String> = HashSet::new();
         for (code, display) in rows {
+            seen_codes.insert(code.clone());
             out.push(ExpansionContains {
                 system: system_url.to_owned(),
                 code,
@@ -2150,6 +2152,50 @@ fn expand_single_include_local(
                 properties: vec![],
                 contains: vec![],
             });
+        }
+        // IG `parameters/parameters-expand-enum-*` semantics: when an
+        // explicitly-enumerated concept is abstract (notSelectable=true), the
+        // immediate children appear alongside it in the expansion. This isn't
+        // tied to excludeNested — the IG fixture lists the children flat at
+        // the top level even when nested mode is requested. Surface direct
+        // children here; the activeOnly splice in the operations layer then
+        // reshapes the tree as needed.
+        let abstract_codes_in_set: Vec<String> = out
+            .iter()
+            .filter(|c| is_concept_abstract(conn, &c.system, &c.code))
+            .map(|c| c.code.clone())
+            .collect();
+        for parent_code in abstract_codes_in_set {
+            let mut child_stmt = conn
+                .prepare_cached(
+                    "SELECT c.code, c.display
+                     FROM concept_hierarchy h
+                     JOIN concepts c
+                         ON c.system_id = h.system_id AND c.code = h.child_code
+                     WHERE h.system_id = ?1 AND h.parent_code = ?2",
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let child_rows = child_stmt
+                .query_map(rusqlite::params![system_id, parent_code], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            for (child_code, child_display) in child_rows {
+                if seen_codes.insert(child_code.clone()) {
+                    out.push(ExpansionContains {
+                        system: system_url.to_owned(),
+                        code: child_code,
+                        display: child_display,
+                        is_abstract: None,
+                        inactive: None,
+                        designations: vec![],
+                        properties: vec![],
+                        contains: vec![],
+                    });
+                }
+            }
         }
         return Ok(out);
     }
