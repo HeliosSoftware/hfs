@@ -114,6 +114,11 @@ pub struct ValidateCodeRequest {
     /// Point-in-time date for evaluation (ISO-8601).
     #[serde(default)]
     pub date: Option<String>,
+    /// Which FHIR parameter form was used to supply the code. One of:
+    /// `"code"` (bare code), `"coding"` (valueCoding), `"codeableConcept"`.
+    /// Drives the `location[]` field in version-mismatch issues.
+    #[serde(default)]
+    pub input_form: Option<String>,
 }
 
 /// One discrete concern detected during `$validate-code`. Multiple issues are

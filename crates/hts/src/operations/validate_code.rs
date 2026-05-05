@@ -169,14 +169,14 @@ fn build_validate_response(
     // their texts alphabetically and join with `; ` (matches the IG fixture
     // convention). When we don't, fall back to the response's own `message`
     // (legacy single-message path used by older code in $translate, etc.).
-    // Only the texts of warning- or error-severity issues are joined; info
-    // issues (e.g. MSG_DEPRECATED status-check) are diagnostic only and the
-    // IG `deprecated/validate-*` fixtures expect them to never surface in
-    // the top-level `message` parameter.
+    // Only error-severity issues contribute to the top-level `message`
+    // parameter — warnings (e.g. VALUESET_VALUE_MISMATCH_DEFAULT, inactive)
+    // and information issues (e.g. status-check) are diagnostic only and the
+    // IG fixtures never expect them in the top-level `message`.
     let message_str: Option<String> = if !issues.is_empty() {
         let mut texts: Vec<&str> = issues
             .iter()
-            .filter(|i| i.severity != "information")
+            .filter(|i| i.severity == "error")
             .map(|i| i.text.as_str())
             .collect();
         if texts.is_empty() {
@@ -626,6 +626,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 .iter()
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
+            input_form: Some("code".into()),
         };
         let mut resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
         rescue_via_supplements(
@@ -677,6 +678,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 .iter()
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
+            input_form: Some("coding".into()),
         };
         let mut resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
         rescue_via_supplements(
@@ -738,6 +740,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                     .iter()
                     .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                     .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
+                input_form: Some("codeableConcept".into()),
             };
             let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
             if resp.result {
@@ -872,6 +875,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .iter()
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
+            input_form: Some("code".into()),
         };
         let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
             .await
@@ -1003,6 +1007,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .iter()
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
+            input_form: Some("coding".into()),
         };
         let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
             .await
@@ -1078,6 +1083,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     .iter()
                     .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                     .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
+                input_form: Some("codeableConcept".into()),
             };
             let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
                 .await
@@ -1160,6 +1166,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     display: None,
                     date: None,
                     include_abstract: None,
+                    input_form: None,
                 };
                 CodeSystemOperations::validate_code(state.backend(), &ctx, req)
                     .await

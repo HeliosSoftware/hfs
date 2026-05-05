@@ -1032,6 +1032,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .clone()
                 .or_else(|| found.as_ref().map(|c| c.system.clone()));
 
+            // Location strings depend on which FHIR input form was used.
+            let (version_loc, system_loc) = match req.input_form.as_deref() {
+                Some("code") => ("version", "system"),
+                Some("codeableConcept") => (
+                    "CodeableConcept.coding[0].version",
+                    "CodeableConcept.coding[0].system",
+                ),
+                _ => ("Coding.version", "Coding.system"), // "coding" or unspecified
+            };
+
             // Version mismatch detection: verify the caller's version (when
             // supplied) against stored CS versions and the VS include pin.
             // Also fires when the caller supplies no version but the VS pins
@@ -1044,11 +1054,18 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     system,
                     req_ver,
                     compose_json_for_version.as_deref(),
+                    version_loc,
+                    system_loc,
                 )
             } else if let Some(system) = effective_system.as_deref() {
                 // Caller supplied no version → check whether the VS include
                 // pins a version that doesn't exist in the DB.
-                detect_vs_pin_unknown(&conn, system, compose_json_for_version.as_deref())
+                detect_vs_pin_unknown(
+                    &conn,
+                    system,
+                    compose_json_for_version.as_deref(),
+                    system_loc,
+                )
             } else {
                 None
             };
@@ -1057,7 +1074,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 let display = found.as_ref().and_then(|c| c.display.clone());
                 let mut texts: Vec<&str> = issues
                     .iter()
-                    .filter(|i| i.severity != "information")
+                    .filter(|i| i.severity == "error")
                     .map(|i| i.text.as_str())
                     .collect();
                 texts.sort_unstable();
@@ -4757,6 +4774,8 @@ fn detect_cs_version_mismatch(
     system_url: &str,
     req_ver: &str,
     compose_json: Option<&str>,
+    version_loc: &str,
+    system_loc: &str,
 ) -> Option<(Vec<crate::types::ValidationIssue>, Option<String>)> {
     // Build (id, version) candidate list sorted desc so the first entry is the
     // highest version — used for both resolution and picking the "actual" ver.
@@ -4798,57 +4817,50 @@ fn detect_cs_version_mismatch(
              so the code cannot be validated. Valid versions: {valid_str}"
         );
 
-        // Supplement with a VALUESET_VALUE_MISMATCH describing the VS include context.
-        let (warning_text, warning_id) = match include_pin.as_ref() {
-            Some(Some(inc_ver)) => (
+        // Optionally supplement with a VALUESET_VALUE_MISMATCH when a VS include
+        // provides context about which version was expected.
+        let extra: Option<(String, &str, &str)> = match include_pin.as_ref() {
+            Some(Some(inc_ver)) => Some((
                 format!(
                     "The code system '{system_url}' version '{inc_ver}' in the ValueSet include \
                      is different to the one in the value ('{req_ver}')"
                 ),
                 "VALUESET_VALUE_MISMATCH",
-            ),
-            // Versionless include: use latest stored version as the effective version.
+                "warning",
+            )),
             Some(None) => {
                 let latest = actual_ver.as_deref().unwrap_or(req_ver);
-                (
+                Some((
                     format!(
                         "The code system '{system_url}' version '{latest}' for the versionless \
                          include in the ValueSet include is different to the one in the value ('{req_ver}')"
                     ),
                     "VALUESET_VALUE_MISMATCH_DEFAULT",
-                )
+                    "warning",
+                ))
             }
-            // No VS context (bare CS validate-code) — just report the unknown version.
-            None => {
-                let latest = actual_ver.as_deref().unwrap_or(req_ver);
-                (
-                    format!(
-                        "The code system '{system_url}' version '{latest}' for the versionless \
-                         include in the ValueSet include is different to the one in the value ('{req_ver}')"
-                    ),
-                    "VALUESET_VALUE_MISMATCH_DEFAULT",
-                )
-            }
+            // No VS context — just UNKNOWN_CODESYSTEM_VERSION, no mismatch supplement.
+            None => None,
         };
 
-        let issues = vec![
-            crate::types::ValidationIssue {
-                severity: "error".into(),
-                fhir_code: "not-found".into(),
-                tx_code: "not-found".into(),
-                text: error_text,
-                location: Some("Coding.system".into()),
-                message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
-            },
-            crate::types::ValidationIssue {
-                severity: "warning".into(),
+        let mut issues = vec![crate::types::ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "not-found".into(),
+            tx_code: "not-found".into(),
+            text: error_text,
+            location: Some(system_loc.into()),
+            message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
+        }];
+        if let Some((warn_text, warn_id, warn_sev)) = extra {
+            issues.push(crate::types::ValidationIssue {
+                severity: warn_sev.into(),
                 fhir_code: "invalid".into(),
                 tx_code: "vs-invalid".into(),
-                text: warning_text,
-                location: Some("Coding.version".into()),
-                message_id: Some(warning_id.into()),
-            },
-        ];
+                text: warn_text,
+                location: Some(version_loc.into()),
+                message_id: Some(warn_id.into()),
+            });
+        }
         let caused_by = Some(format!("{system_url}|{req_ver}"));
         return Some((issues, caused_by));
     }
@@ -4881,7 +4893,7 @@ fn detect_cs_version_mismatch(
                             fhir_code: "invalid".into(),
                             tx_code: "vs-invalid".into(),
                             text: mismatch_text,
-                            location: Some("Coding.version".into()),
+                            location: Some(version_loc.into()),
                             message_id: Some("VALUESET_VALUE_MISMATCH".into()),
                         },
                         crate::types::ValidationIssue {
@@ -4889,7 +4901,7 @@ fn detect_cs_version_mismatch(
                             fhir_code: "not-found".into(),
                             tx_code: "not-found".into(),
                             text: unknown_text,
-                            location: Some("Coding.system".into()),
+                            location: Some(system_loc.into()),
                             message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
                         },
                     ];
@@ -4902,7 +4914,7 @@ fn detect_cs_version_mismatch(
                     fhir_code: "invalid".into(),
                     tx_code: "vs-invalid".into(),
                     text: mismatch_text,
-                    location: Some("Coding.version".into()),
+                    location: Some(version_loc.into()),
                     message_id: Some("VALUESET_VALUE_MISMATCH".into()),
                 }];
                 return Some((issues, None));
@@ -4910,20 +4922,21 @@ fn detect_cs_version_mismatch(
         }
         Some(None) => {
             // Versionless VS include: the effective CS version is the latest stored.
-            // If the caller requested an older version, emit VALUESET_VALUE_MISMATCH_DEFAULT.
+            // When the caller requested a different (but existing) version, emit
+            // VALUESET_VALUE_MISMATCH (error) — same form as a pinned-version conflict.
             let latest = actual_ver.as_deref().unwrap_or(req_ver);
             if latest != req_full {
                 let mismatch_text = format!(
-                    "The code system '{system_url}' version '{latest}' for the versionless \
-                     include in the ValueSet include is different to the one in the value ('{req_full}')"
+                    "The code system '{system_url}' version '{latest}' in the ValueSet include \
+                     is different to the one in the value ('{req_full}')"
                 );
                 let issues = vec![crate::types::ValidationIssue {
                     severity: "error".into(),
                     fhir_code: "invalid".into(),
                     tx_code: "vs-invalid".into(),
                     text: mismatch_text,
-                    location: Some("Coding.version".into()),
-                    message_id: Some("VALUESET_VALUE_MISMATCH_DEFAULT".into()),
+                    location: Some(version_loc.into()),
+                    message_id: Some("VALUESET_VALUE_MISMATCH".into()),
                 }];
                 return Some((issues, None));
             }
@@ -4944,6 +4957,7 @@ fn detect_vs_pin_unknown(
     conn: &Connection,
     system_url: &str,
     compose_json: Option<&str>,
+    system_loc: &str,
 ) -> Option<(Vec<crate::types::ValidationIssue>, Option<String>)> {
     let inc_ver = compose_json
         .and_then(|cj| vs_pinned_include_version(cj, system_url))
@@ -4986,7 +5000,7 @@ fn detect_vs_pin_unknown(
         fhir_code: "not-found".into(),
         tx_code: "not-found".into(),
         text: error_text,
-        location: Some("Coding.system".into()),
+        location: Some(system_loc.into()),
         message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
     }];
     let caused_by = Some(format!("{system_url}|{inc_ver}"));
