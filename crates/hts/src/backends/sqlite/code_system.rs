@@ -178,6 +178,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             location: Some("Coding.system".into()),
                             message_id: Some("UNKNOWN_CODESYSTEM".into()),
                         }],
+                        caused_by_unknown_system: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -224,6 +225,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             location: Some("Coding.code".into()),
                             message_id: Some("Unknown_Code_in_Version".into()),
                         }],
+                        caused_by_unknown_system: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -262,6 +264,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 system: None,
                 inactive: None,
                 issues,
+                caused_by_unknown_system: None,
             })
         })
         .await
@@ -341,7 +344,9 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
             let version: Option<String> = conn
                 .query_row(
-                    "SELECT version FROM code_systems WHERE url = ?1 LIMIT 1",
+                    "SELECT version FROM code_systems \
+                     WHERE url = ?1 \
+                     ORDER BY COALESCE(version, '') DESC LIMIT 1",
                     rusqlite::params![url],
                     |row| row.get(0),
                 )
@@ -511,8 +516,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 let mut def_stmt = conn
                     .prepare(&def_sql)
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                let mut def_params: Vec<&dyn rusqlite::ToSql> =
-                    Vec::with_capacity(1 + codes.len());
+                let mut def_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + codes.len());
                 def_params.push(&system_url);
                 for c in &codes {
                     def_params.push(c as &dyn rusqlite::ToSql);

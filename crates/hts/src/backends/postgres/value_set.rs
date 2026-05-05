@@ -143,28 +143,28 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-        let (vs_id, compose_json) =
-            match resolve_value_set_versioned(
-                &client,
-                &url,
-                req.value_set_version.as_deref(),
-                req.date.as_deref(),
-            )
-            .await
-            {
-                Ok(vs) => vs,
-                Err(HtsError::NotFound(_)) => {
-                    return Ok(ValidateCodeResponse {
-                        result: false,
-                        message: Some(format!("Unknown value set: {url}")),
-                        display: None,
-                        system: None,
-                        inactive: None,
-                        issues: vec![],
-                    });
-                }
-                Err(e) => return Err(e),
-            };
+        let (vs_id, compose_json) = match resolve_value_set_versioned(
+            &client,
+            &url,
+            req.value_set_version.as_deref(),
+            req.date.as_deref(),
+        )
+        .await
+        {
+            Ok(vs) => vs,
+            Err(HtsError::NotFound(_)) => {
+                return Ok(ValidateCodeResponse {
+                    result: false,
+                    message: Some(format!("Unknown value set: {url}")),
+                    display: None,
+                    system: None,
+                    inactive: None,
+                    issues: vec![],
+                    caused_by_unknown_system: None,
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         let cached = fetch_cache(&client, &vs_id).await?;
         let all_codes = if cached.is_empty() {
@@ -198,6 +198,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     system: None,
                     inactive: None,
                     issues: vec![],
+                    caused_by_unknown_system: None,
                 })
             }
             Some(concept) => {
@@ -218,6 +219,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     system: None,
                     inactive: None,
                     issues: vec![],
+                    caused_by_unknown_system: None,
                 })
             }
         }

@@ -172,6 +172,11 @@ pub struct ValidateCodeResponse {
     /// path driven off `message`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<ValidationIssue>,
+    /// When set, emitted as `x-caused-by-unknown-system` in the Parameters
+    /// response. Carries the `url|version` canonical for version-not-found
+    /// cases (e.g. the caller requested version 1.0.0 but only 0.1.0 exists).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caused_by_unknown_system: Option<String>,
 }
 
 // ─── $subsumes ────────────────────────────────────────────────────────────────

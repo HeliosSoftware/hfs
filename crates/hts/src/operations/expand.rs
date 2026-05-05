@@ -1039,7 +1039,10 @@ async fn process_expand<B: TerminologyBackend>(
                     .or_else(|| p.get("valueCode"))
                     .and_then(|v| v.as_str())
             })
-            .filter_map(|s| s.split_once('|').map(|(a, b)| (a.to_string(), b.to_string())))
+            .filter_map(|s| {
+                s.split_once('|')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+            })
             .collect();
         if !designation_filters.is_empty() {
             fn filter_designations(
@@ -1201,7 +1204,8 @@ async fn process_expand<B: TerminologyBackend>(
             let mut removed: u32 = 0;
             let mut out: Vec<crate::types::ExpansionContains> = Vec::new();
             for mut entry in input {
-                let (children, child_removed) = splice_inactive(std::mem::take(&mut entry.contains));
+                let (children, child_removed) =
+                    splice_inactive(std::mem::take(&mut entry.contains));
                 removed += child_removed;
                 if entry.inactive == Some(true) {
                     removed += 1;
@@ -1373,16 +1377,16 @@ async fn process_expand<B: TerminologyBackend>(
     // the source VS's compose.include[] so used-codesystem still surfaces
     // (matches the IG `search/search-*-no` fixtures: filter='xxx' → empty
     // contains[] but used-codesystem is still echoed for the included CS).
-    let mut used_systems: Vec<String> = resp
-        .contains
-        .iter()
-        .map(|c| c.system.clone())
-        .fold(Vec::<String>::new(), |mut acc, s| {
-            if !acc.contains(&s) {
-                acc.push(s);
-            }
-            acc
-        });
+    let mut used_systems: Vec<String> =
+        resp.contains
+            .iter()
+            .map(|c| c.system.clone())
+            .fold(Vec::<String>::new(), |mut acc, s| {
+                if !acc.contains(&s) {
+                    acc.push(s);
+                }
+                acc
+            });
     if used_systems.is_empty() {
         if let Some(vs) = source_vs.as_ref() {
             if let Some(includes) = vs
@@ -1413,28 +1417,27 @@ async fn process_expand<B: TerminologyBackend>(
         // sharing this URL (sorted ascending so the IG-fixture order
         // 1.0.0, 2.0.0 is preserved). Falls back to the cached single CS
         // metadata when only one row exists.
-        let mut all_versions: Vec<Option<String>> =
-            crate::traits::CodeSystemOperations::search(
-                state.backend(),
-                &ctx,
-                crate::types::ResourceSearchQuery {
-                    url: Some((*system_url).clone()),
-                    count: Some(20),
-                    ..Default::default()
-                },
-            )
-            .await
-            .ok()
-            .map(|hits| {
-                hits.into_iter()
-                    .map(|h| {
-                        h.get("version")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut all_versions: Vec<Option<String>> = crate::traits::CodeSystemOperations::search(
+            state.backend(),
+            &ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some((*system_url).clone()),
+                count: Some(20),
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()
+        .map(|hits| {
+            hits.into_iter()
+                .map(|h| {
+                    h.get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
         if all_versions.is_empty() {
             // Fall back to the per-system metadata cached earlier.
             let cs_version = cs
@@ -1443,11 +1446,7 @@ async fn process_expand<B: TerminologyBackend>(
                 .map(str::to_string);
             all_versions.push(cs_version);
         }
-        all_versions.sort_by(|a, b| {
-            a.as_deref()
-                .unwrap_or("")
-                .cmp(b.as_deref().unwrap_or(""))
-        });
+        all_versions.sort_by(|a, b| a.as_deref().unwrap_or("").cmp(b.as_deref().unwrap_or("")));
         let mut warning_uri: Option<String> = None;
         for version in &all_versions {
             let value_uri = match version {

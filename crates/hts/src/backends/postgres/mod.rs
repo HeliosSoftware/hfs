@@ -480,8 +480,7 @@ async fn write_value_set(
     // ValueSets don't collide on the primary key — same strategy code
     // systems use. UPDATE below is keyed by (url, version) so each row
     // refreshes independently of its siblings.
-    let storage_id =
-        crate::import::fhir_bundle::storage_id_for(&vs.id, vs.version.as_deref());
+    let storage_id = crate::import::fhir_bundle::storage_id_for(&vs.id, vs.version.as_deref());
 
     client
         .execute(

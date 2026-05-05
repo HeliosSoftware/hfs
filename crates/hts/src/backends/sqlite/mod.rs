@@ -193,9 +193,7 @@ impl SqliteTerminologyBackend {
                 ))
             })?;
             schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
-                HtsError::StorageError(format!(
-                    "Failed to drop legacy value_sets.url UNIQUE: {e}"
-                ))
+                HtsError::StorageError(format!("Failed to drop legacy value_sets.url UNIQUE: {e}"))
             })?;
 
             // Clear the concept FTS index on every startup — it is always rebuilt
@@ -291,9 +289,7 @@ impl SqliteTerminologyBackend {
                 ))
             })?;
             schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
-                HtsError::StorageError(format!(
-                    "Failed to drop legacy value_sets.url UNIQUE: {e}"
-                ))
+                HtsError::StorageError(format!("Failed to drop legacy value_sets.url UNIQUE: {e}"))
             })?;
         }
 

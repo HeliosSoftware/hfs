@@ -248,6 +248,9 @@ fn build_validate_response(
     if let Some(u) = unknown_system {
         parameter.push(json!({"name": "x-unknown-system", "valueCanonical": u}));
     }
+    if let Some(ref canonical) = resp.caused_by_unknown_system {
+        parameter.push(json!({"name": "x-caused-by-unknown-system", "valueCanonical": canonical}));
+    }
     json!({
         "resourceType": "Parameters",
         "parameter": parameter
@@ -256,6 +259,7 @@ fn build_validate_response(
 
 /// Build a validate-code response and resolve the system's version via a
 /// backend lookup (so the response can echo `version` per the IG fixtures).
+#[allow(clippy::too_many_arguments)]
 async fn build_validate_response_async<B: TerminologyBackend>(
     backend: &B,
     ctx: &TenantContext,
@@ -397,7 +401,10 @@ fn collect_status_check_codes(resource: &Value) -> Vec<String> {
     if resource.get("experimental").and_then(|v| v.as_bool()) == Some(true) {
         push_unique("experimental");
     }
-    let status = resource.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let status = resource
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if matches!(status, "draft" | "retired") {
         push_unique(status);
     }
@@ -752,6 +759,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 system: None,
                 inactive: None,
                 issues: vec![],
+                caused_by_unknown_system: None,
             },
             None,
             None,
@@ -917,12 +925,11 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             .await
             .ok()
             .and_then(|mut hits| {
-                hits.pop()
-                    .and_then(|vs| {
-                        vs.get("version")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
+                hits.pop().and_then(|vs| {
+                    vs.get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
             });
             let vs_qualified = match vs_version_owned.as_deref() {
                 Some(v) => format!("{url}|{v}"),
@@ -962,6 +969,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                             message_id: Some("Coding_has_no_system__cannot_validate".into()),
                         },
                     ],
+                    caused_by_unknown_system: None,
                 },
                 Some(&code),
                 None,
@@ -1102,8 +1110,11 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         .await
         .ok()
         .and_then(|mut hits| {
-            hits.pop()
-                .and_then(|vs| vs.get("version").and_then(|v| v.as_str()).map(str::to_string))
+            hits.pop().and_then(|vs| {
+                vs.get("version")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
         });
         let url_with_version = match vs_version_owned.as_deref() {
             Some(v) => format!("{url}|{v}"),
@@ -1114,9 +1125,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             severity: "error".into(),
             fhir_code: "code-invalid".into(),
             tx_code: "not-in-vs".into(),
-            text: format!(
-                "No valid coding was found for the value set '{url_with_version}'"
-            ),
+            text: format!("No valid coding was found for the value set '{url_with_version}'"),
             location: Some("CodeableConcept".into()),
             message_id: Some("TX_GENERAL_CC_ERROR_MESSAGE".into()),
         }];
@@ -1154,9 +1163,9 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
 
             if cs_known && !code_in_cs {
                 let cs_text = match cs_version.as_deref() {
-                    Some(v) => format!(
-                        "Unknown code '{code}' in the CodeSystem '{system}' version '{v}'"
-                    ),
+                    Some(v) => {
+                        format!("Unknown code '{code}' in the CodeSystem '{system}' version '{v}'")
+                    }
                     None => format!("Unknown code '{code}' in the CodeSystem '{system}'"),
                 };
                 issues.push(ValidationIssue {
@@ -1197,6 +1206,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 system: None,
                 inactive: None,
                 issues,
+                caused_by_unknown_system: None,
             },
             None,
             None,

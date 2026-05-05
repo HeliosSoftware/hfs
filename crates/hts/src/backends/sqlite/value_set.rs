@@ -879,101 +879,53 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             // Resolve the expansion — try explicit ValueSet first, then the two
             // implicit-ValueSet fallbacks used by $expand.
-            let all_codes: Vec<ExpansionContains> =
+            // Tuple: (expansion codes, compose_json saved for version-mismatch check).
+            let (all_codes, compose_json_for_version): (Vec<ExpansionContains>, Option<String>) =
                 match resolve_value_set_versioned(
                     &conn,
                     &url,
                     req.value_set_version.as_deref(),
                     req.date.as_deref(),
                 ) {
-                    Ok((vs_id, compose_json)) => {
-                        let cached = fetch_cache(&conn, &vs_id)?;
-                        if cached.is_empty() {
-                            let codes =
-                                compute_expansion(&conn, compose_json.as_deref(), &mut vec![])?;
-                            populate_cache(&conn, &vs_id, &codes)?;
-                            codes
-                        } else {
-                            cached
-                        }
-                    }
-                    Err(HtsError::NotFound(_)) => {
-                        // ?fhir_vs implicit ValueSet: do a targeted O(1)/O(depth) lookup
-                        // instead of materializing all concepts (which times out for large
-                        // code systems like SNOMED CT with ~350k concepts).
-                        if let Some((cs_url, pattern)) = parse_fhir_vs_url(&url) {
-                            let found = validate_fhir_vs(
-                                &conn,
-                                &cs_url,
-                                &pattern,
-                                &req.code,
-                                req.system.as_deref(),
-                            )?;
-                            let abstract_for_msg = req.include_abstract == Some(false)
-                                && found
-                                    .as_ref()
-                                    .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
-                                    .unwrap_or(false);
-                            let inactive_for_msg = found
-                                .as_ref()
-                                .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
-                                .unwrap_or(false);
-                            // For the not-found-in-VS branch: check if the
-                            // code IS in the underlying CodeSystem but
-                            // inactive (compose.inactive=false / activeOnly
-                            // filtered it out). Only meaningful when found
-                            // is None and the request named a system.
-                            let inactive_in_cs = found.is_none()
-                                && req
-                                    .system
-                                    .as_deref()
-                                    .map(|s| is_concept_inactive(&conn, s, &req.code))
-                                    .unwrap_or(false);
-                            let code_unknown_in_cs = found.is_none()
-                                && req
-                                    .system
-                                    .as_deref()
-                                    .map(|s| !is_code_in_cs(&conn, s, &req.code))
-                                    .unwrap_or(false);
-                            let cs_version = req
-                                .system
-                                .as_deref()
-                                .and_then(|s| cs_version_for_msg(&conn, s));
-                            let vs_version_owned = lookup_value_set_version(&conn, &url);
-                            return finish_validate_code_response(
-                                found,
-                                &req.code,
-                                &url,
-                                req.display.as_deref(),
-                                req.system.as_deref(),
-                                abstract_for_msg,
-                                inactive_for_msg,
-                                vs_version_owned.as_deref(),
-                                inactive_in_cs,
-                                code_unknown_in_cs,
-                                cs_version.as_deref(),
-                            );
-                        }
-
-                        // Other implicit ValueSets (e.g. CodeSystem.valueSet link): use the
-                        // expansion cache, then do an O(1) indexed SQL lookup.
-                        ensure_implicit_cache(&conn, &url, req.date.as_deref())?;
-
-                        let found = lookup_in_implicit_cache(
+                Ok((vs_id, compose_json)) => {
+                    let saved = compose_json.clone();
+                    let cached = fetch_cache(&conn, &vs_id)?;
+                    let codes = if cached.is_empty() {
+                        let codes =
+                            compute_expansion(&conn, compose_json.as_deref(), &mut vec![])?;
+                        populate_cache(&conn, &vs_id, &codes)?;
+                        codes
+                    } else {
+                        cached
+                    };
+                    (codes, saved)
+                }
+                Err(HtsError::NotFound(_)) => {
+                    // ?fhir_vs implicit ValueSet: do a targeted O(1)/O(depth) lookup
+                    // instead of materializing all concepts (which times out for large
+                    // code systems like SNOMED CT with ~350k concepts).
+                    if let Some((cs_url, pattern)) = parse_fhir_vs_url(&url) {
+                        let found = validate_fhir_vs(
                             &conn,
-                            &url,
+                            &cs_url,
+                            &pattern,
                             &req.code,
                             req.system.as_deref(),
                         )?;
-
-                        let abstract_for_msg = found
-                            .as_ref()
-                            .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
-                            .unwrap_or(false);
+                        let abstract_for_msg = req.include_abstract == Some(false)
+                            && found
+                                .as_ref()
+                                .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
+                                .unwrap_or(false);
                         let inactive_for_msg = found
                             .as_ref()
                             .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
                             .unwrap_or(false);
+                        // For the not-found-in-VS branch: check if the
+                        // code IS in the underlying CodeSystem but
+                        // inactive (compose.inactive=false / activeOnly
+                        // filtered it out). Only meaningful when found
+                        // is None and the request named a system.
                         let inactive_in_cs = found.is_none()
                             && req
                                 .system
@@ -1005,8 +957,55 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             cs_version.as_deref(),
                         );
                     }
-                    Err(e) => return Err(e),
-                };
+
+                    // Other implicit ValueSets (e.g. CodeSystem.valueSet link): use the
+                    // expansion cache, then do an O(1) indexed SQL lookup.
+                    ensure_implicit_cache(&conn, &url, req.date.as_deref())?;
+
+                    let found =
+                        lookup_in_implicit_cache(&conn, &url, &req.code, req.system.as_deref())?;
+
+                    let abstract_for_msg = found
+                        .as_ref()
+                        .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
+                        .unwrap_or(false);
+                    let inactive_for_msg = found
+                        .as_ref()
+                        .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
+                        .unwrap_or(false);
+                    let inactive_in_cs = found.is_none()
+                        && req
+                            .system
+                            .as_deref()
+                            .map(|s| is_concept_inactive(&conn, s, &req.code))
+                            .unwrap_or(false);
+                    let code_unknown_in_cs = found.is_none()
+                        && req
+                            .system
+                            .as_deref()
+                            .map(|s| !is_code_in_cs(&conn, s, &req.code))
+                            .unwrap_or(false);
+                    let cs_version = req
+                        .system
+                        .as_deref()
+                        .and_then(|s| cs_version_for_msg(&conn, s));
+                    let vs_version_owned = lookup_value_set_version(&conn, &url);
+                    return finish_validate_code_response(
+                        found,
+                        &req.code,
+                        &url,
+                        req.display.as_deref(),
+                        req.system.as_deref(),
+                        abstract_for_msg,
+                        inactive_for_msg,
+                        vs_version_owned.as_deref(),
+                        inactive_in_cs,
+                        code_unknown_in_cs,
+                        cs_version.as_deref(),
+                    );
+                }
+                Err(e) => return Err(e),
+            };
 
             // Search the expansion for the requested code.
             // When `system` is provided, match on both system + code.
@@ -1019,6 +1018,37 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             } else {
                 all_codes.iter().find(|c| c.code == req.code).cloned()
             };
+
+            // Version mismatch detection: when the caller specifies a CS
+            // version, verify it exists in the DB and matches the VS include
+            // pin. Emit UNKNOWN_CODESYSTEM_VERSION or VALUESET_VALUE_MISMATCH
+            // issues before falling through to the normal result path.
+            if let (Some(req_ver), Some(system)) = (req.version.as_deref(), req.system.as_deref()) {
+                if let Some((issues, caused_by)) = detect_cs_version_mismatch(
+                    &conn,
+                    system,
+                    req_ver,
+                    compose_json_for_version.as_deref(),
+                ) {
+                    let display = found.as_ref().and_then(|c| c.display.clone());
+                    let mut texts: Vec<&str> = issues
+                        .iter()
+                        .filter(|i| i.severity != "information")
+                        .map(|i| i.text.as_str())
+                        .collect();
+                    texts.sort_unstable();
+                    let message = texts.join("; ");
+                    return Ok(crate::types::ValidateCodeResponse {
+                        result: false,
+                        message: Some(message),
+                        display,
+                        system: None,
+                        inactive: None,
+                        issues,
+                        caused_by_unknown_system: caused_by,
+                    });
+                }
+            }
 
             // Prefer the matched concept's system if present (in case the
             // request didn't pass a system).
@@ -2107,13 +2137,7 @@ fn expand_includes_per_clause(
 
         // No `valueSet[]` reference on this include — fall through to the
         // local single-include expansion (system + concept + filter).
-        let local = expand_single_include_local(
-            conn,
-            inc,
-            warnings,
-            &mut system_id_cache,
-            depth,
-        )?;
+        let local = expand_single_include_local(conn, inc, warnings, &mut system_id_cache, depth)?;
         included.extend(local);
     }
 
@@ -2386,8 +2410,7 @@ fn build_exclude_set(
 
         // No concept[], no valueSet[] — fall back to the same per-include
         // expansion path (covers exclude.filter[], full-system exclude, etc.).
-        let local =
-            expand_single_include_local(conn, exc, warnings, &mut system_id_cache, depth)?;
+        let local = expand_single_include_local(conn, exc, warnings, &mut system_id_cache, depth)?;
         for c in local {
             denied.insert((c.system, c.code));
         }
@@ -2586,7 +2609,11 @@ fn apply_compose_filters(
         // Normalise `code` → `concept` so IG fixtures that use either property
         // alias for the concept identifier (e.g. search/search-filter-yes uses
         // `property=code, op=is-a`) hit the same hierarchy paths.
-        let property_norm = if property == "code" { "concept" } else { property };
+        let property_norm = if property == "code" {
+            "concept"
+        } else {
+            property
+        };
         let ecl_expr: String = match (property_norm, op) {
             ("constraint", "=") => value.to_owned(),
             ("concept", "is-a") => format!("<< {value}"),
@@ -3459,7 +3486,11 @@ fn apply_compose_filters_to_candidates(
         // `code` and `concept` both refer to the concept-id property in
         // various IG fixtures (search/* uses `code`, simple/* uses
         // `concept`). Normalise to the canonical `concept` for matching.
-        let property_norm = if property == "code" { "concept" } else { property };
+        let property_norm = if property == "code" {
+            "concept"
+        } else {
+            property
+        };
 
         match (property_norm, op) {
             ("concept", "is-a") => {
@@ -4614,6 +4645,188 @@ fn cs_version_for_msg(conn: &Connection, system_url: &str) -> Option<String> {
     .flatten()
 }
 
+/// Returns all non-null stored versions for a CS URL, sorted ascending for
+/// display in "Valid versions: X or Y" messages.
+fn cs_all_stored_versions(conn: &Connection, system_url: &str) -> Vec<String> {
+    let mut stmt = match conn.prepare_cached(
+        "SELECT version FROM code_systems \
+         WHERE url = ?1 AND version IS NOT NULL \
+         ORDER BY COALESCE(version, '') ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map(rusqlite::params![system_url], |row| row.get::<_, String>(0))
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Format a list of versions as "X", "X or Y", or "X, Y or Z".
+fn format_valid_versions_msg(versions: &[String]) -> String {
+    match versions {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} or {second}"),
+        _ => {
+            let (last, rest) = versions.split_last().unwrap();
+            format!("{} or {}", rest.join(", "), last)
+        }
+    }
+}
+
+/// Return `Some(pin)` where `pin` is the version string (or `None` for a
+/// versionless include) when `system_url` appears in `compose.include[]`.
+/// Returns `None` when the system is not found in any include.
+fn vs_pinned_include_version(compose_json: &str, system_url: &str) -> Option<Option<String>> {
+    let compose: serde_json::Value = serde_json::from_str(compose_json).ok()?;
+    let includes = compose.get("include")?.as_array()?;
+    for inc in includes {
+        if inc.get("system").and_then(|v| v.as_str()) == Some(system_url) {
+            let ver = inc
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            return Some(ver);
+        }
+    }
+    None
+}
+
+/// Resolve a version string (possibly short-form like "1.0") against a set of
+/// `(id, version)` candidate pairs. Returns the matched full version string, or
+/// `None` when no candidate matches.
+fn resolve_ver_against_candidates(
+    candidates: &[(String, Option<String>)],
+    ver: &str,
+) -> Option<String> {
+    if ver.contains(".x") || ver == "x" || super::code_system_version_is_short(ver) {
+        super::code_system_select_version_match(candidates, ver).and_then(|(_, v)| v)
+    } else {
+        candidates
+            .iter()
+            .find(|(_, v)| v.as_deref() == Some(ver))
+            .and_then(|(_, v)| v.clone())
+    }
+}
+
+/// Check whether `req_ver` (caller-supplied CS version) conflicts with what is
+/// stored in the DB or pinned in the VS compose.
+///
+/// Returns `Some((issues, caused_by))` when a mismatch is detected:
+/// - issues: validation issues to report
+/// - caused_by: `Some(url|ver)` canonical for the `x-caused-by-unknown-system`
+///   parameter (only when the requested version is missing from the DB).
+///
+/// Returns `None` when there is no mismatch (caller should proceed normally).
+fn detect_cs_version_mismatch(
+    conn: &Connection,
+    system_url: &str,
+    req_ver: &str,
+    compose_json: Option<&str>,
+) -> Option<(Vec<crate::types::ValidationIssue>, Option<String>)> {
+    // Build (id, version) candidate list sorted desc so the first entry is the
+    // highest version — used for both resolution and picking the "actual" ver.
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id, version FROM code_systems \
+             WHERE url = ?1 \
+             ORDER BY COALESCE(version, '') DESC",
+        )
+        .ok()?;
+    let candidates: Vec<(String, Option<String>)> = stmt
+        .query_map(rusqlite::params![system_url], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if candidates.is_empty() {
+        return None; // CS not in DB — handled by the not-found path elsewhere
+    }
+
+    // Resolve req_ver (handles short-forms like "1.0" → "1.0.0")
+    let resolved_req = resolve_ver_against_candidates(&candidates, req_ver);
+
+    // Parse compose to find include pin for this system
+    let include_pin: Option<Option<String>> =
+        compose_json.and_then(|cj| vs_pinned_include_version(cj, system_url));
+
+    // Highest stored version (for use in warning text when req_ver is missing)
+    let actual_ver: Option<String> = candidates.iter().find_map(|(_, v)| v.clone());
+
+    if resolved_req.is_none() {
+        // req_ver does not match any stored CS version → UNKNOWN_CODESYSTEM_VERSION
+        let all_versions = cs_all_stored_versions(conn, system_url);
+        let valid_str = format_valid_versions_msg(&all_versions);
+        let error_text = format!(
+            "A definition for CodeSystem '{system_url}' version '{req_ver}' could not be found, \
+             so the code cannot be validated. Valid versions: {valid_str}"
+        );
+
+        let warning_text = match include_pin.as_ref() {
+            Some(Some(inc_ver)) => format!(
+                "The code system '{system_url}' version '{inc_ver}' in the ValueSet include \
+                 is different to the one in the value ('{req_ver}')"
+            ),
+            // Versionless include or no include found
+            _ => {
+                let actual = actual_ver.as_deref().unwrap_or(req_ver);
+                format!(
+                    "The code system '{system_url}' version '{actual}' for the versionless \
+                     include in the ValueSet include is different to the one in the value ('{req_ver}')"
+                )
+            }
+        };
+
+        let issues = vec![
+            crate::types::ValidationIssue {
+                severity: "error".into(),
+                fhir_code: "not-found".into(),
+                tx_code: "not-found".into(),
+                text: error_text,
+                location: Some("Coding.system".into()),
+                message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
+            },
+            crate::types::ValidationIssue {
+                severity: "warning".into(),
+                fhir_code: "invalid".into(),
+                tx_code: "vs-invalid".into(),
+                text: warning_text,
+                location: Some("Coding.version".into()),
+                message_id: Some("VALUESET_VALUE_MISMATCH_DEFAULT".into()),
+            },
+        ];
+        let caused_by = Some(format!("{system_url}|{req_ver}"));
+        return Some((issues, caused_by));
+    }
+
+    // req_ver exists in the CS. Check if the VS include pins a conflicting version.
+    if let Some(Some(inc_ver)) = include_pin {
+        let resolved_inc = resolve_ver_against_candidates(&candidates, &inc_ver);
+        let req_full = resolved_req.as_deref().unwrap_or(req_ver);
+        let inc_full = resolved_inc.as_deref().unwrap_or(&inc_ver);
+        if inc_full != req_full {
+            let error_text = format!(
+                "The code system '{system_url}' version '{inc_full}' in the ValueSet include \
+                 is different to the one in the value ('{req_full}')"
+            );
+            let issues = vec![crate::types::ValidationIssue {
+                severity: "error".into(),
+                fhir_code: "invalid".into(),
+                tx_code: "vs-invalid".into(),
+                text: error_text,
+                location: Some("Coding.version".into()),
+                message_id: Some("VALUESET_VALUE_MISMATCH".into()),
+            }];
+            return Some((issues, None));
+        }
+    }
+
+    None // No mismatch detected
+}
+
 fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool {
     // Honour both the legacy `status` property convention (value in
     // {retired, deprecated, withdrawn, inactive}) AND the FHIR `inactive`
@@ -4722,9 +4935,9 @@ fn finish_validate_code_response(
             if code_unknown_in_cs && cs_version_for_msg.is_some() {
                 if let Some(sys) = system_for_msg {
                     let cs_text = match cs_version_for_msg {
-                        Some(v) => format!(
-                            "Unknown code '{code}' in the CodeSystem '{sys}' version '{v}'"
-                        ),
+                        Some(v) => {
+                            format!("Unknown code '{code}' in the CodeSystem '{sys}' version '{v}'")
+                        }
                         None => format!("Unknown code '{code}' in the CodeSystem '{sys}'"),
                     };
                     issues.push(crate::types::ValidationIssue {
@@ -4765,6 +4978,7 @@ fn finish_validate_code_response(
                     None
                 },
                 issues,
+                caused_by_unknown_system: None,
             })
         }
         Some(concept) => {
@@ -4803,6 +5017,7 @@ fn finish_validate_code_response(
                     system: None,
                     inactive: None,
                     issues,
+                    caused_by_unknown_system: None,
                 });
             }
             // Inactive: the IG fixtures expect a warning-severity
@@ -4866,6 +5081,7 @@ fn finish_validate_code_response(
                 system: Some(concept.system),
                 inactive: if is_inactive { Some(true) } else { None },
                 issues,
+                caused_by_unknown_system: None,
             })
         }
     }

@@ -134,6 +134,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     system: None,
                     inactive: None,
                     issues: vec![],
+                    caused_by_unknown_system: None,
                 });
             }
             Err(e) => return Err(e),
@@ -149,6 +150,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     system: None,
                     inactive: None,
                     issues: vec![],
+                    caused_by_unknown_system: None,
                 });
             }
             Err(e) => return Err(e),
@@ -173,6 +175,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             system: None,
             inactive: None,
             issues: vec![],
+            caused_by_unknown_system: None,
         })
     }
 

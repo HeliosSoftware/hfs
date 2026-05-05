@@ -499,9 +499,7 @@ pub fn migrate_code_systems_drop_url_unique(
 /// `valueset-version-1.json` + `valueset-version-2.json`) that share a
 /// canonical URL, and the legacy column-level UNIQUE caused later imports
 /// to silently overwrite earlier rows.
-pub fn migrate_value_sets_drop_url_unique(
-    conn: &mut rusqlite::Connection,
-) -> rusqlite::Result<()> {
+pub fn migrate_value_sets_drop_url_unique(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
     let needs_rebuild: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master \
