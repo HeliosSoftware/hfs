@@ -523,7 +523,8 @@ async fn process_expand<B: TerminologyBackend>(
         .filter(|p| {
             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
             // Discriminator inputs (identify the ValueSet) — not knobs to echo.
-            if matches!(name, "url" | "valueSet" | "filter") {
+            // `filter` IS echoed per the IG fixtures (search/* tests).
+            if matches!(name, "url" | "valueSet") {
                 return false;
             }
             // Configuration inputs that the IG validator passes via the
