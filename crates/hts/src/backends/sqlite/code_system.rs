@@ -168,6 +168,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         result: false,
                         message: Some(text.clone()),
                         display: None,
+                        system: None,
                         inactive: None,
                         issues: vec![crate::types::ValidationIssue {
                             severity: "error".into(),
@@ -194,6 +195,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         result: false,
                         message: Some(text.clone()),
                         display: None,
+                        system: None,
                         inactive: None,
                         issues: vec![crate::types::ValidationIssue {
                             severity: "error".into(),
@@ -238,6 +240,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 result: message.is_none(),
                 message,
                 display,
+                system: None,
                 inactive: None,
                 issues,
             })

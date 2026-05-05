@@ -218,7 +218,12 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     system: Option<&str>,
     codeable_concept: Option<&Value>,
 ) -> Value {
-    let version = if let Some(s) = system {
+    // Prefer the system the caller passed; otherwise fall back to whatever
+    // the backend inferred from the VS expansion (e.g. inferSystem=true).
+    let inferred_system = resp.system.clone();
+    let effective_system: Option<&str> = system.or(inferred_system.as_deref());
+
+    let version = if let Some(s) = effective_system {
         backend
             .code_system_version_for_url(ctx, s)
             .await
@@ -231,14 +236,14 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     // parameter pointing at the unknown URL (only when validate-code reported
     // result=false).
     let unknown_system = if !resp.result && version.is_none() {
-        system
+        effective_system
     } else {
         None
     };
     build_validate_response(
         resp,
         code,
-        system,
+        effective_system,
         version.as_deref(),
         codeable_concept,
         unknown_system,
@@ -573,6 +578,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 result: false,
                 message: Some("None of the provided codings were found in any CodeSystem".into()),
                 display: None,
+                system: None,
                 inactive: None,
                 issues: vec![],
             },
@@ -728,6 +734,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     result: false,
                     message: Some(text.clone()),
                     display: None,
+                    system: None,
                     inactive: None,
                     issues: vec![ValidationIssue {
                         severity: "error".into(),
@@ -840,6 +847,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 result: false,
                 message: Some("None of the provided codings were found in the ValueSet".into()),
                 display: None,
+                system: None,
                 inactive: None,
                 issues: vec![],
             },

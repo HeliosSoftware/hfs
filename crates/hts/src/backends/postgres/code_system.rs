@@ -131,6 +131,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     result: false,
                     message: Some(format!("Unknown code system: {system}")),
                     display: None,
+                    system: None,
                     inactive: None,
                     issues: vec![],
                 });
@@ -145,6 +146,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     result: false,
                     message: Some(format!("Unknown code: {}", req.code)),
                     display: None,
+                    system: None,
                     inactive: None,
                     issues: vec![],
                 });
@@ -168,6 +170,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             result: message.is_none(),
             message,
             display,
+            system: None,
             inactive: None,
             issues: vec![],
         })

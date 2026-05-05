@@ -146,7 +146,7 @@ pub struct ValidationIssue {
 }
 
 /// Response from `$validate-code`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ValidateCodeResponse {
     /// `true` if the code is valid.
     pub result: bool,
@@ -154,6 +154,12 @@ pub struct ValidateCodeResponse {
     pub message: Option<String>,
     /// The preferred display for the code (present on success).
     pub display: Option<String>,
+    /// CodeSystem URL the matched concept came from. Set when the operations
+    /// layer used `inferSystem=true` (or the request omitted `system` and the
+    /// backend inferred it from the VS expansion). Surfaces as the top-level
+    /// `system` parameter so the IG `inferSystem` fixtures can echo it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
     /// `Some(true)` when the matched concept is inactive (status in
     /// retired/deprecated/withdrawn/inactive). The IG fixtures expect this
     /// to surface as a top-level `inactive` parameter on the response.

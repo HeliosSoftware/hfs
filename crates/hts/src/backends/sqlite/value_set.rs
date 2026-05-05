@@ -4619,6 +4619,7 @@ fn finish_validate_code_response(
                 result: false,
                 message: Some(message),
                 display: None,
+                system: None,
                 inactive: if is_inactive_in_underlying_cs {
                     Some(true)
                 } else {
@@ -4660,6 +4661,7 @@ fn finish_validate_code_response(
                     result: false,
                     message: Some(abstract_text),
                     display: concept.display,
+                    system: None,
                     inactive: None,
                     issues,
                 });
@@ -4722,6 +4724,7 @@ fn finish_validate_code_response(
                 result: !has_error,
                 message,
                 display: concept.display,
+                system: Some(concept.system),
                 inactive: if is_inactive { Some(true) } else { None },
                 issues,
             })
