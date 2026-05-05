@@ -3082,6 +3082,7 @@ dependencies = [
  "helios-persistence",
  "r2d2",
  "r2d2_sqlite",
+ "regex",
  "roxmltree",
  "rusqlite",
  "serde",

@@ -124,7 +124,6 @@ pub struct SqliteTerminologyBackend {
     /// is served entirely from process memory via the trigram index, bypassing
     /// `spawn_blocking` and r2d2 pool contention.
     pub(crate) plain_fts_cache: PlainFtsCache,
-
 }
 
 impl SqliteTerminologyBackend {

@@ -12,6 +12,7 @@
 //! | [`NotFound`] | 404 | `not-found` |
 //! | [`NotSupported`] | 501 | `not-supported` |
 //! | [`InvalidRequest`] | 400 | `invalid` |
+//! | [`VsInvalid`] | 400 | `invalid` (with `tx-issue-type=vs-invalid`) |
 //! | [`Internal`] | 500 | `exception` |
 //! | [`StorageError`] | 500 | `exception` |
 //! | [`PreconditionFailed`] | 412 | `conflict` |
@@ -20,6 +21,7 @@
 //! [`NotFound`]: HtsError::NotFound
 //! [`NotSupported`]: HtsError::NotSupported
 //! [`InvalidRequest`]: HtsError::InvalidRequest
+//! [`VsInvalid`]: HtsError::VsInvalid
 //! [`Internal`]: HtsError::Internal
 //! [`StorageError`]: HtsError::StorageError
 //! [`PreconditionFailed`]: HtsError::PreconditionFailed
@@ -56,6 +58,15 @@ pub enum HtsError {
     /// or violate FHIR operation constraints.  Maps to HTTP 400.
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+
+    /// A ValueSet definition is itself invalid — for example a compose filter
+    /// that references an unknown operator, omits a required value, or supplies
+    /// a regular expression that fails to compile.  Maps to HTTP 400 with FHIR
+    /// issue code `invalid` and a `tx-issue-type=vs-invalid` coding so the
+    /// HL7 tx-ecosystem fixtures can distinguish ValueSet-definition errors
+    /// from other 400-class request problems.
+    #[error("Invalid ValueSet: {0}")]
+    VsInvalid(String),
 
     /// An unexpected server-side error that is not attributable to the caller.
     /// Maps to HTTP 500.
@@ -108,21 +119,51 @@ impl IntoResponse for HtsError {
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
         }
 
-        let (status, code, diagnostics) = match &self {
-            HtsError::NotFound(msg) => (StatusCode::NOT_FOUND, "not-found", msg.as_str()),
-            HtsError::NotSupported(msg) => {
-                (StatusCode::NOT_IMPLEMENTED, "not-supported", msg.as_str())
+        // (status, FHIR-issue-code, tx-issue-type, diagnostics)
+        // The FHIR issue `code` and the `tx-issue-type` coding are usually
+        // identical, but `VsInvalid` splits them: the FHIR code stays
+        // `invalid` (preserving the HTTP-level meaning) while `tx-issue-type`
+        // signals `vs-invalid` to the IG validator.
+        let (status, code, tx_issue_type, diagnostics) = match &self {
+            HtsError::NotFound(msg) => (
+                StatusCode::NOT_FOUND,
+                "not-found",
+                "not-found",
+                msg.as_str(),
+            ),
+            HtsError::NotSupported(msg) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "not-supported",
+                "not-supported",
+                msg.as_str(),
+            ),
+            HtsError::InvalidRequest(msg) => {
+                (StatusCode::BAD_REQUEST, "invalid", "invalid", msg.as_str())
             }
-            HtsError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, "invalid", msg.as_str()),
-            HtsError::Internal(msg) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "exception", msg.as_str())
-            }
-            HtsError::StorageError(msg) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "exception", msg.as_str())
-            }
-            HtsError::PreconditionFailed(msg) => {
-                (StatusCode::PRECONDITION_FAILED, "conflict", msg.as_str())
-            }
+            HtsError::VsInvalid(msg) => (
+                StatusCode::BAD_REQUEST,
+                "invalid",
+                "vs-invalid",
+                msg.as_str(),
+            ),
+            HtsError::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+                "exception",
+                msg.as_str(),
+            ),
+            HtsError::StorageError(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+                "exception",
+                msg.as_str(),
+            ),
+            HtsError::PreconditionFailed(msg) => (
+                StatusCode::PRECONDITION_FAILED,
+                "conflict",
+                "conflict",
+                msg.as_str(),
+            ),
             HtsError::TooCostly(_) => unreachable!("handled above"),
         };
 
@@ -138,7 +179,7 @@ impl IntoResponse for HtsError {
                 "details": {
                     "coding": [{
                         "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
-                        "code": code,
+                        "code": tx_issue_type,
                     }],
                     "text": diagnostics,
                 },
