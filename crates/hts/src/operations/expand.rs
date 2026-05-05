@@ -1374,35 +1374,43 @@ async fn process_expand<B: TerminologyBackend>(
     }
 
     // ── used-codesystem + warning-<status> per contributing CodeSystem ───────
-    // The IG fixtures expect one `used-codesystem` parameter per distinct
-    // CodeSystem URL that contributed concepts, with valueUri formatted as
-    // `<url>|<version>` (or just `<url>` when the version is unknown). When
-    // a contributing CS is itself flagged as deprecated/withdrawn/draft/
-    // experimental — by either the `structuredefinition-standards-status`
-    // extension, `status: "draft"`, or `experimental: true` — emit a parallel
-    // `warning-<status>` entry.
+    // Derive `used-codesystem` from the actual `(system, version)` pairs in
+    // the expansion contains items. This is more accurate than querying all
+    // stored CS versions: it emits only the versions that were actually used,
+    // handling both single-version (vs-expand-all-v → one entry) and
+    // multi-version (overload-expand-all → two entries) expansions correctly.
     //
-    // The source ValueSet is checked the same way, so a deprecated VS that
-    // includes an active CS still surfaces a `warning-deprecated` for the VS.
+    // Post-processing rule: FHIR only requires `version` on contains items
+    // when the expansion mixes different versions of the same system URL.
+    // When all items for a given system come from the same version, clear the
+    // `version` field so it is not emitted in the JSON output.
     //
-    // Reuses the per-system CS metadata that `cs_by_url` collected before the
-    // displayLanguage swap — no extra SQL round-trips here.
-    // Start from systems that contributed concepts to the expansion. When
-    // the filter narrows to zero matches, fall back to systems referenced by
-    // the source VS's compose.include[] so used-codesystem still surfaces
-    // (matches the IG `search/search-*-no` fixtures: filter='xxx' → empty
-    // contains[] but used-codesystem is still echoed for the included CS).
-    let mut used_systems: Vec<String> =
-        resp.contains
-            .iter()
-            .map(|c| c.system.clone())
-            .fold(Vec::<String>::new(), |mut acc, s| {
-                if !acc.contains(&s) {
-                    acc.push(s);
+    // When the filter narrows to zero matches, fall back to the compose.include[]
+    // system+version references so `used-codesystem` still surfaces even for
+    // empty expansions (filter='xxx' → empty contains[] but used-codesystem
+    // is still echoed for the included CS).
+
+    // Collect distinct (system_url, version) pairs from contains (flat walk).
+    let mut used_pairs: Vec<(String, Option<String>)> = {
+        fn collect_pairs(
+            items: &[crate::types::ExpansionContains],
+            out: &mut Vec<(String, Option<String>)>,
+        ) {
+            for item in items {
+                let pair = (item.system.clone(), item.version.clone());
+                if !out.contains(&pair) {
+                    out.push(pair);
                 }
-                acc
-            });
-    if used_systems.is_empty() {
+                collect_pairs(&item.contains, out);
+            }
+        }
+        let mut pairs = Vec::new();
+        collect_pairs(&resp.contains, &mut pairs);
+        pairs
+    };
+
+    // Fallback when the expansion is empty (e.g. filter matched nothing).
+    if used_pairs.is_empty() {
         if let Some(vs) = source_vs.as_ref() {
             if let Some(includes) = vs
                 .get("compose")
@@ -1411,83 +1419,91 @@ async fn process_expand<B: TerminologyBackend>(
             {
                 for inc in includes {
                     if let Some(sys) = inc.get("system").and_then(|s| s.as_str()) {
-                        let s = sys.to_string();
-                        if !used_systems.contains(&s) {
-                            used_systems.push(s);
+                        let ver = inc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        // When no version pin, use the single cached CS version.
+                        let resolved_ver = ver.or_else(|| {
+                            cs_by_url
+                                .get(sys)
+                                .and_then(|c| c.as_ref())
+                                .and_then(|c| c.get("version"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        });
+                        let pair = (sys.to_string(), resolved_ver);
+                        if !used_pairs.contains(&pair) {
+                            used_pairs.push(pair);
                         }
                     }
                 }
             }
         }
     }
-    used_systems.sort();
-    let used_systems: Vec<&String> = used_systems.iter().collect();
-    let mut warning_params: Vec<Value> = Vec::new();
-    for system_url in &used_systems {
-        let cs = cs_by_url.get(*system_url).and_then(|c| c.as_ref());
 
-        // The IG `overload/expand-all` fixture pins TWO `used-codesystem`
-        // entries when a single CS URL has multiple versions in the store
-        // and the expansion draws from all of them. Search all versions
-        // sharing this URL (sorted ascending so the IG-fixture order
-        // 1.0.0, 2.0.0 is preserved). Falls back to the cached single CS
-        // metadata when only one row exists.
-        let mut all_versions: Vec<Option<String>> = crate::traits::CodeSystemOperations::search(
-            state.backend(),
-            &ctx,
-            crate::types::ResourceSearchQuery {
-                url: Some((*system_url).clone()),
-                count: Some(20),
-                ..Default::default()
-            },
+    // Group pairs by system URL to detect multi-version systems.
+    // Sort within each group for deterministic output (ascending version).
+    used_pairs.sort_by(|a, b| {
+        a.0.cmp(&b.0).then(
+            a.1.as_deref()
+                .unwrap_or("")
+                .cmp(b.1.as_deref().unwrap_or("")),
         )
-        .await
-        .ok()
-        .map(|hits| {
-            hits.into_iter()
-                .map(|h| {
-                    h.get("version")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-        if all_versions.is_empty() {
-            // Fall back to the per-system metadata cached earlier.
-            let cs_version = cs
-                .and_then(|c| c.get("version"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            all_versions.push(cs_version);
-        }
-        all_versions.sort_by(|a, b| a.as_deref().unwrap_or("").cmp(b.as_deref().unwrap_or("")));
-        let mut warning_uri: Option<String> = None;
-        for version in &all_versions {
-            let value_uri = match version {
-                Some(v) => format!("{system_url}|{v}"),
-                None => (*system_url).clone(),
-            };
-            if warning_uri.is_none() {
-                warning_uri = Some(value_uri.clone());
-            }
-            emitted_params.push(json!({
-                "name": "used-codesystem",
-                "valueUri": value_uri,
-            }));
-        }
-        let value_uri = warning_uri.unwrap_or_else(|| (*system_url).clone());
+    });
+    let mut versions_per_system: std::collections::HashMap<&str, Vec<Option<String>>> =
+        std::collections::HashMap::new();
+    for (sys, ver) in &used_pairs {
+        versions_per_system
+            .entry(sys)
+            .or_default()
+            .push(ver.clone());
+    }
 
-        // Derive any `warning-<status>` entries from the CS's standards-status
-        // extension, status, and experimental flag. Each rule emits at most
-        // one warning name; multiple rules can fire in parallel for the same
-        // CS (e.g. status=draft + experimental=true → both warnings).
-        if let Some(cs) = cs {
-            for status_code in standards_statuses(cs) {
-                warning_params.push(json!({
-                    "name": format!("warning-{status_code}"),
-                    "valueUri": value_uri,
-                }));
+    // Clear `version` on contains items for single-version systems — FHIR only
+    // requires it when a system appears with multiple different versions.
+    {
+        fn clear_single_version(
+            items: &mut Vec<crate::types::ExpansionContains>,
+            multi_version_systems: &std::collections::HashSet<String>,
+        ) {
+            for item in items {
+                if !multi_version_systems.contains(&item.system) {
+                    item.version = None;
+                }
+                clear_single_version(&mut item.contains, multi_version_systems);
+            }
+        }
+        let multi_version_systems: std::collections::HashSet<String> = versions_per_system
+            .iter()
+            .filter(|(_, vers)| vers.len() > 1)
+            .map(|(sys, _)| sys.to_string())
+            .collect();
+        clear_single_version(&mut resp.contains, &multi_version_systems);
+    }
+
+    let mut warning_params: Vec<Value> = Vec::new();
+    // Emit one `used-codesystem` per distinct (system, version) pair.
+    let mut warned_systems: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (system_url, version) in &used_pairs {
+        let value_uri = match version {
+            Some(v) => format!("{system_url}|{v}"),
+            None => system_url.clone(),
+        };
+        emitted_params.push(json!({
+            "name": "used-codesystem",
+            "valueUri": value_uri,
+        }));
+        // Emit `warning-<status>` only once per system URL (first pair wins).
+        if warned_systems.insert(system_url.clone()) {
+            let cs = cs_by_url.get(system_url).and_then(|c| c.as_ref());
+            if let Some(cs) = cs {
+                for status_code in standards_statuses(cs) {
+                    warning_params.push(json!({
+                        "name": format!("warning-{status_code}"),
+                        "valueUri": value_uri,
+                    }));
+                }
             }
         }
     }

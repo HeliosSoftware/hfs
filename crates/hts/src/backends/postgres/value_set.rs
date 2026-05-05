@@ -365,6 +365,7 @@ async fn fetch_cache(
         .into_iter()
         .map(|row| ExpansionContains {
             system: row.get(0),
+            version: None,
             code: row.get(1),
             display: row.get(2),
             is_abstract: None,
@@ -433,6 +434,7 @@ async fn compute_expansion(
 
                 included.push(ExpansionContains {
                     system: system_url.to_owned(),
+                    version: None,
                     code,
                     display,
                     is_abstract: None,
@@ -457,6 +459,7 @@ async fn compute_expansion(
             for row in code_rows {
                 included.push(ExpansionContains {
                     system: system_url.to_owned(),
+                    version: None,
                     code: row.get(0),
                     display: row.get(1),
                     is_abstract: None,

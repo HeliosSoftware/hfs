@@ -238,6 +238,13 @@ pub struct SubsumesResponse {
 pub struct ExpansionContains {
     /// Code system URL.
     pub system: String,
+    /// Code system version this concept came from. Set by the backend when the
+    /// expansion draws from a specific CS version. The operations layer clears
+    /// it when all contains items for a given system share the same version
+    /// (FHIR only requires `version` when the expansion mixes versions of the
+    /// same system URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub code: String,
     pub display: Option<String>,
     /// FHIR `abstract` flag — mirrors the concept's `notSelectable` property.
@@ -563,6 +570,7 @@ mod tests {
     fn expansion_contains_nested() {
         let child = ExpansionContains {
             system: "http://example.org/cs".into(),
+            version: None,
             code: "CHILD".into(),
             display: Some("Child Concept".into()),
             is_abstract: None,
@@ -573,6 +581,7 @@ mod tests {
         };
         let parent = ExpansionContains {
             system: "http://example.org/cs".into(),
+            version: None,
             code: "PARENT".into(),
             display: Some("Parent Concept".into()),
             is_abstract: None,

@@ -389,6 +389,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             .query_map([&cache_key], |r| {
                                 Ok(ExpansionContains {
                                     system: r.get(0)?,
+                                    version: None,
                                     code: r.get(1)?,
                                     display: r.get(2)?,
                                     is_abstract: None,
@@ -1377,6 +1378,7 @@ fn fetch_cache(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionContains>,
     stmt.query_map([vs_id], |row| {
         Ok(ExpansionContains {
             system: row.get(0)?,
+            version: None,
             code: row.get(1)?,
             display: row.get(2)?,
             is_abstract: None,
@@ -1487,6 +1489,7 @@ fn expand_inline_plain_fts(
         if let Some(&system_url) = id_to_url.get(system_id.as_str()) {
             results.push(ExpansionContains {
                 system: system_url.to_owned(),
+                version: None,
                 code,
                 display,
                 is_abstract: None,
@@ -1733,6 +1736,7 @@ fn expand_inline_filtered(
                 if matches {
                     results.push(ExpansionContains {
                         system: system_url.to_owned(),
+                        version: None,
                         code: code.to_owned(),
                         display,
                         is_abstract: None,
@@ -1774,6 +1778,7 @@ fn expand_inline_filtered(
                         |row| {
                             Ok(ExpansionContains {
                                 system: system_url.to_owned(),
+                                version: None,
                                 code: row.get(0)?,
                                 display: row.get(1)?,
                                 is_abstract: None,
@@ -1808,6 +1813,7 @@ fn expand_inline_filtered(
                         |row| {
                             Ok(ExpansionContains {
                                 system: system_url.to_owned(),
+                                version: None,
                                 code: row.get(0)?,
                                 display: row.get(1)?,
                                 is_abstract: None,
@@ -2077,7 +2083,7 @@ fn expand_includes_per_clause(
     ctx: &InlineResolutionContext<'_>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let mut included: Vec<ExpansionContains> = Vec::new();
-    let mut system_id_cache: HashMap<String, String> = HashMap::new();
+    let mut system_id_cache: HashMap<String, (String, Option<String>)> = HashMap::new();
 
     for inc in includes {
         let vs_refs_present = inc["valueSet"].as_array().is_some_and(|a| !a.is_empty());
@@ -2162,6 +2168,7 @@ fn expand_includes_per_clause(
                     .unwrap_or(None);
                 included.push(ExpansionContains {
                     system,
+                    version: None,
                     code,
                     display,
                     is_abstract: None,
@@ -2194,7 +2201,7 @@ fn expand_single_include_local(
     conn: &Connection,
     inc: &serde_json::Value,
     warnings: &mut Vec<String>,
-    system_id_cache: &mut HashMap<String, String>,
+    system_id_cache: &mut HashMap<String, (String, Option<String>)>,
     depth: u8,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let system_url = match inc["system"].as_str() {
@@ -2210,12 +2217,12 @@ fn expand_single_include_local(
         Some(v) => format!("{system_url}|{v}"),
         None => system_url.to_owned(),
     };
-    let system_id = match system_id_cache.get(&cache_key) {
-        Some(id) => id.clone(),
+    let (system_id, cs_version) = match system_id_cache.get(&cache_key) {
+        Some(cached) => cached.clone(),
         None => match resolve_compose_system_id(conn, system_url, inc_version)? {
-            Some(id) => {
-                system_id_cache.insert(cache_key, id.clone());
-                id
+            Some((id, ver)) => {
+                system_id_cache.insert(cache_key, (id.clone(), ver.clone()));
+                (id, ver)
             }
             None => {
                 let msg = format!(
@@ -2228,7 +2235,11 @@ fn expand_single_include_local(
         },
     };
 
-    if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc, None)? {
+    if let Some(mut filter_result) = apply_compose_filters(conn, system_url, &system_id, inc, None)?
+    {
+        for item in &mut filter_result {
+            item.version = cs_version.clone();
+        }
         return Ok(filter_result);
     }
 
@@ -2269,6 +2280,7 @@ fn expand_single_include_local(
             seen_codes.insert(code.clone());
             out.push(ExpansionContains {
                 system: system_url.to_owned(),
+                version: cs_version.clone(),
                 code,
                 display,
                 is_abstract: None,
@@ -2320,6 +2332,7 @@ fn expand_single_include_local(
                 if seen_codes.insert(child_code.clone()) {
                     out.push(ExpansionContains {
                         system: system_url.to_owned(),
+                        version: cs_version.clone(),
                         code: child_code,
                         display: child_display,
                         is_abstract: None,
@@ -2344,6 +2357,7 @@ fn expand_single_include_local(
         .query_map([&system_id], |row| {
             Ok(ExpansionContains {
                 system: system_url.to_owned(),
+                version: cs_version.clone(),
                 code: row.get(0)?,
                 display: row.get(1)?,
                 is_abstract: None,
@@ -2375,7 +2389,7 @@ fn build_exclude_set(
     ctx: &InlineResolutionContext<'_>,
 ) -> Result<HashSet<(String, String)>, HtsError> {
     let mut denied: HashSet<(String, String)> = HashSet::new();
-    let mut system_id_cache: HashMap<String, String> = HashMap::new();
+    let mut system_id_cache: HashMap<String, (String, Option<String>)> = HashMap::new();
 
     for exc in excludes {
         let vs_refs_present = exc["valueSet"].as_array().is_some_and(|a| !a.is_empty());
@@ -2727,6 +2741,7 @@ fn apply_compose_filters(
             .into_iter()
             .map(|c| ExpansionContains {
                 system: system_url.to_owned(),
+                version: None,
                 code: c.code,
                 display: c.display,
                 is_abstract: None,
@@ -2962,6 +2977,7 @@ fn try_multi_include_property_only(
         .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok(ExpansionContains {
                 system: first_system.to_owned(),
+                version: None,
                 code: row.get(0)?,
                 display: row.get(1)?,
                 is_abstract: None,
@@ -3017,6 +3033,7 @@ fn query_subtree_with_property(
         |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?));
     let make = |(code, display): (String, Option<String>)| ExpansionContains {
         system: system_url.to_owned(),
+        version: None,
         code,
         display,
         is_abstract: None,
@@ -3114,6 +3131,7 @@ fn query_property_eq(
         .into_iter()
         .map(|(code, display)| ExpansionContains {
             system: system_url.to_owned(),
+            version: None,
             code,
             display,
             is_abstract: None,
@@ -3241,6 +3259,7 @@ fn query_ancestors_full(
         .query_map(rusqlite::params![value_code, system_id], |r| {
             Ok(ExpansionContains {
                 system: system_url.to_owned(),
+                version: None,
                 code: r.get(0)?,
                 display: r.get(1)?,
                 is_abstract: None,
@@ -3328,6 +3347,7 @@ fn query_regex_match(
             .filter(|(code, _)| regex.is_match(code))
             .map(|(code, display)| ExpansionContains {
                 system: system_url.to_owned(),
+                version: None,
                 code,
                 display,
                 is_abstract: None,
@@ -3368,6 +3388,7 @@ fn query_regex_match(
             if regex.is_match(&value) && seen.insert(code.clone()) {
                 out.push(ExpansionContains {
                     system: system_url.to_owned(),
+                    version: None,
                     code,
                     display,
                     is_abstract: None,
@@ -3406,6 +3427,7 @@ fn query_direct_children(
         .query_map([system_id, parent_code], |r| {
             Ok(ExpansionContains {
                 system: system_url.to_owned(),
+                version: None,
                 code: r.get(0)?,
                 display: r.get(1)?,
                 is_abstract: None,
@@ -3479,6 +3501,7 @@ fn fts_candidates_for_system(
         .query_map(rusqlite::params![match_expr, system_id], |row| {
             Ok(ExpansionContains {
                 system: system_url.to_owned(),
+                version: None,
                 code: row.get(0)?,
                 display: row.get(1)?,
                 is_abstract: None,
@@ -3965,6 +3988,7 @@ fn compose_page_fast(
 
         result.push(ExpansionContains {
             system: system_url.clone(),
+            version: None,
             code: code.clone(),
             display,
             is_abstract: None,
@@ -4089,6 +4113,7 @@ fn bfs_expand_page(
                             |r| {
                                 Ok(ExpansionContains {
                                     system: cs_url.to_owned(),
+                                    version: None,
                                     code: r.get(0)?,
                                     display: r.get(1)?,
                                     is_abstract: None,
@@ -4122,6 +4147,7 @@ fn bfs_expand_page(
                     |r| {
                         Ok(ExpansionContains {
                             system: cs_url.to_owned(),
+                            version: None,
                             code: r.get(0)?,
                             display: r.get(1)?,
                             is_abstract: None,
@@ -4148,6 +4174,7 @@ fn bfs_expand_page(
                 stmt.query_map(rusqlite::params![system_id, sql_limit, sql_offset], |r| {
                     Ok(ExpansionContains {
                         system: cs_url.to_owned(),
+                        version: None,
                         code: r.get(0)?,
                         display: r.get(1)?,
                         is_abstract: None,
@@ -4208,6 +4235,7 @@ fn bfs_isa_page(
     let row_mapper = |r: &rusqlite::Row<'_>| {
         Ok(ExpansionContains {
             system: cs_url.to_owned(),
+            version: None,
             code: r.get(0)?,
             display: r.get(1)?,
             is_abstract: None,
@@ -4324,7 +4352,7 @@ fn resolve_compose_system_id(
     conn: &Connection,
     url: &str,
     version: Option<&str>,
-) -> Result<Option<String>, HtsError> {
+) -> Result<Option<(String, Option<String>)>, HtsError> {
     let mut stmt = conn
         .prepare(
             "SELECT id, version FROM code_systems \
@@ -4353,7 +4381,7 @@ fn resolve_compose_system_id(
         None => rows.into_iter().next(),
     };
 
-    Ok(chosen.map(|(id, _)| id))
+    Ok(chosen)
 }
 
 /// Find the canonical URL of a CodeSystem whose `valueSet` property equals `vs_url`.
@@ -5339,6 +5367,7 @@ fn validate_fhir_vs(
 
             Ok(row.map(|(code, display)| ExpansionContains {
                 system: cs_url.to_owned(),
+                version: None,
                 code,
                 display,
                 is_abstract: None,
@@ -5380,6 +5409,7 @@ fn validate_fhir_vs(
 
             Ok(Some(ExpansionContains {
                 system: cs_url.to_owned(),
+                version: None,
                 code: code.to_owned(),
                 display,
                 is_abstract: None,
@@ -5516,6 +5546,7 @@ fn lookup_in_implicit_cache(
             |r| {
                 Ok(ExpansionContains {
                     system: r.get(0)?,
+                    version: None,
                     code: r.get(1)?,
                     display: r.get(2)?,
                     is_abstract: None,
@@ -5539,6 +5570,7 @@ fn lookup_in_implicit_cache(
             |r| {
                 Ok(ExpansionContains {
                     system: r.get(0)?,
+                    version: None,
                     code: r.get(1)?,
                     display: r.get(2)?,
                     is_abstract: None,
@@ -5779,6 +5811,7 @@ fn page_in_memory(
 
     let entry_to_contains = |e: &ImplicitConceptEntry| ExpansionContains {
         system: e.system_url.clone(),
+        version: None,
         code: e.code.clone(),
         display: e.display.clone(),
         is_abstract: None,
@@ -6098,6 +6131,7 @@ fn implicit_cache_page(
                 .query_map(rusqlite::params![match_expr, url, limit, offset], |r| {
                     Ok(ExpansionContains {
                         system: r.get(0)?,
+                        version: None,
                         code: r.get(1)?,
                         display: r.get(2)?,
                         is_abstract: None,
@@ -6133,6 +6167,7 @@ fn implicit_cache_page(
                 .query_map(rusqlite::params![prefix_expr, url, limit, offset], |r| {
                     Ok(ExpansionContains {
                         system: r.get(0)?,
+                        version: None,
                         code: r.get(1)?,
                         display: r.get(2)?,
                         is_abstract: None,
@@ -6164,6 +6199,7 @@ fn implicit_cache_page(
             stmt.query_map(rusqlite::params![url, limit, offset], |r| {
                 Ok(ExpansionContains {
                     system: r.get(0)?,
+                    version: None,
                     code: r.get(1)?,
                     display: r.get(2)?,
                     is_abstract: None,
