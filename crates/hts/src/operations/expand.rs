@@ -686,7 +686,21 @@ async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
-    let url = find_str_param(&params, "url");
+    // Parse the `url` parameter. FHIR supports pipe-separated canonical URLs
+    // (`http://example.org/vs|1.0.0`) — split and promote the version to
+    // `valueSetVersion` when no explicit `valueSetVersion` param is present.
+    let (url, pipe_version) = match find_str_param(&params, "url") {
+        Some(raw) => {
+            if let Some(pos) = raw.find('|') {
+                let base = raw[..pos].to_string();
+                let ver = raw[pos + 1..].to_string();
+                (Some(base), Some(ver))
+            } else {
+                (Some(raw), None)
+            }
+        }
+        None => (None, None),
+    };
     let value_set = if url.is_none() {
         find_resource_param(&params, "valueSet")
     } else {
@@ -873,7 +887,8 @@ async fn process_expand<B: TerminologyBackend>(
     // ── Cache miss: compute ───────────────────────────────────────────────────
     let req = ExpandRequest {
         url,
-        value_set_version: find_str_param(&params, "valueSetVersion"),
+        // Explicit `valueSetVersion` param wins; fall back to pipe-parsed version.
+        value_set_version: find_str_param(&params, "valueSetVersion").or(pipe_version),
         value_set,
         filter: filter.clone(),
         count,

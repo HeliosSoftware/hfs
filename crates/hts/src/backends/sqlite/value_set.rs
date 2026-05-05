@@ -4819,6 +4819,9 @@ fn detect_cs_version_mismatch(
 
         // Optionally supplement with a VALUESET_VALUE_MISMATCH when a VS include
         // provides context about which version was expected.
+        // - VS pins a specific (known) version that differs → VALUESET_VALUE_MISMATCH (error)
+        // - VS is versionless (effective = latest) and latest differs → VALUESET_VALUE_MISMATCH_DEFAULT (warning)
+        // - No VS context → no supplement
         let extra: Option<(String, &str, &str)> = match include_pin.as_ref() {
             Some(Some(inc_ver)) => Some((
                 format!(
@@ -4826,7 +4829,7 @@ fn detect_cs_version_mismatch(
                      is different to the one in the value ('{req_ver}')"
                 ),
                 "VALUESET_VALUE_MISMATCH",
-                "warning",
+                "error",
             )),
             Some(None) => {
                 let latest = actual_ver.as_deref().unwrap_or(req_ver);
@@ -4843,24 +4846,45 @@ fn detect_cs_version_mismatch(
             None => None,
         };
 
-        let mut issues = vec![crate::types::ValidationIssue {
+        let unknown_issue = crate::types::ValidationIssue {
             severity: "error".into(),
             fhir_code: "not-found".into(),
             tx_code: "not-found".into(),
             text: error_text,
             location: Some(system_loc.into()),
             message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
-        }];
-        if let Some((warn_text, warn_id, warn_sev)) = extra {
-            issues.push(crate::types::ValidationIssue {
-                severity: warn_sev.into(),
-                fhir_code: "invalid".into(),
-                tx_code: "vs-invalid".into(),
-                text: warn_text,
-                location: Some(version_loc.into()),
-                message_id: Some(warn_id.into()),
-            });
-        }
+        };
+        // Order: VALUESET_VALUE_MISMATCH (error) before UNKNOWN when present as error;
+        //        UNKNOWN before VALUESET_VALUE_MISMATCH_DEFAULT (warning).
+        let issues = match extra {
+            Some((mismatch_text, mismatch_id, "error")) => {
+                vec![
+                    crate::types::ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "invalid".into(),
+                        tx_code: "vs-invalid".into(),
+                        text: mismatch_text,
+                        location: Some(version_loc.into()),
+                        message_id: Some(mismatch_id.into()),
+                    },
+                    unknown_issue,
+                ]
+            }
+            Some((warn_text, warn_id, warn_sev)) => {
+                vec![
+                    unknown_issue,
+                    crate::types::ValidationIssue {
+                        severity: warn_sev.into(),
+                        fhir_code: "invalid".into(),
+                        tx_code: "vs-invalid".into(),
+                        text: warn_text,
+                        location: Some(version_loc.into()),
+                        message_id: Some(warn_id.into()),
+                    },
+                ]
+            }
+            None => vec![unknown_issue],
+        };
         let caused_by = Some(format!("{system_url}|{req_ver}"));
         return Some((issues, caused_by));
     }
