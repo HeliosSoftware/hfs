@@ -31,7 +31,7 @@ use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    extract_codeable_concept, extract_coding, extract_parameter_array, find_str_param,
+    extract_codeable_concept, extract_coding_full, extract_parameter_array, find_str_param,
     parse_query_string, query_params_to_fhir_params,
 };
 
@@ -654,11 +654,15 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     }
 
     // ── Path 2: `coding` parameter (valueCoding — system+code bundled together) ──
-    if let Some((system, code, coding_display)) = extract_coding(&params, "coding") {
+    if let Some((system, code, coding_display, coding_version)) =
+        extract_coding_full(&params, "coding")
+    {
         // Coding.display takes precedence over a top-level `display` param —
         // the IG fixtures pin display via the Coding so the server can
         // report a mismatch.
         let display = coding_display.or_else(|| find_str_param(&params, "display"));
+        // Coding.version takes precedence over a top-level `version` param.
+        let version = coding_version.or_else(|| find_str_param(&params, "version"));
         let supplements =
             resolve_supplements(state.backend(), &ctx, &params, Some(&system)).await?;
         let req = ValidateCodeRequest {
@@ -666,7 +670,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             value_set_version: None,
             system: Some(system.clone()),
             code: code.clone(),
-            version: find_str_param(&params, "version"),
+            version,
             display: display.clone(),
             date: find_str_param(&params, "date"),
             include_abstract: params
@@ -900,7 +904,9 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     }
 
     // ── Path 2: `coding` parameter (valueCoding) ──────────────────────────────
-    if let Some((system, code, coding_display)) = extract_coding(&params, "coding") {
+    if let Some((system, code, coding_display, coding_version)) =
+        extract_coding_full(&params, "coding")
+    {
         // Empty system from extract_coding means the Coding had no system
         // field. Per the IG fixtures, that should produce result=false with
         // a "Coding has no system" message rather than matching by code
@@ -983,12 +989,14 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // the IG fixtures pin display via the Coding so the server can
         // report a mismatch.
         let display = coding_display.or_else(|| find_str_param(&params, "display"));
+        // Coding.version takes precedence over a top-level `version` param.
+        let version = coding_version.or_else(|| find_str_param(&params, "version"));
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
             value_set_version: vs_version.clone(),
             system: Some(system.clone()),
             code: code.clone(),
-            version: find_str_param(&params, "version"),
+            version,
             display: display.clone(),
             date: find_str_param(&params, "date"),
             include_abstract: params

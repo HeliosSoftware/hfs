@@ -90,6 +90,15 @@ fn extract_any_string_value(param: &Value) -> Option<String> {
 /// object and returns the `system`, `code`, and optional `display` from it.
 /// Returns `None` if the parameter is absent or incomplete.
 pub fn extract_coding(params: &[Value], name: &str) -> Option<(String, String, Option<String>)> {
+    let (s, c, d, _) = extract_coding_full(params, name)?;
+    Some((s, c, d))
+}
+
+/// Like [`extract_coding`] but also returns `Coding.version` as the 4th element.
+pub fn extract_coding_full(
+    params: &[Value],
+    name: &str,
+) -> Option<(String, String, Option<String>, Option<String>)> {
     let coding = params
         .iter()
         .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?
@@ -108,7 +117,11 @@ pub fn extract_coding(params: &[Value], name: &str) -> Option<(String, String, O
         .get("display")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    Some((system, code, display))
+    let version = coding
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some((system, code, display, version))
 }
 
 /// Extract a `resource`-typed parameter by name, returning the resource JSON.
