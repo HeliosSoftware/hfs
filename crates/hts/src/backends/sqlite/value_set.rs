@@ -310,6 +310,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 // Systems not in the DB push a warning and are skipped; callers
                 // receive partial results plus `expansion.parameter` warnings.
                 let compose = &vs_resource["compose"];
+                // Build the inline-resolution context up front so every nested
+                // `compose.include[].valueSet[]` lookup can find `#contained`
+                // refs in the request body and `tx-resource` shadowed VS bodies.
+                let inline_ctx =
+                    InlineResolutionContext::from_inline(Some(&vs_resource), &req.tx_resources);
                 let codes = if let Some(filter) = req.filter.as_deref() {
                     let limit_hint = req.count.map(|c| ((c as usize) * 3).max(100));
                     let compose_str = compose.to_string();
@@ -453,10 +458,21 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             }
                         }
 
-                        let codes = compute_expansion(&conn, Some(&compose_str), &mut warnings)?;
-                        // Only cache when all systems were resolved (no warnings mean
-                        // the expansion is complete and safe to reuse).
-                        if warnings.is_empty() {
+                        let codes = compute_expansion_with_ctx(
+                            &conn,
+                            Some(&compose_str),
+                            &mut warnings,
+                            &inline_ctx,
+                        )?;
+                        // Only cache when there are no warnings AND the inline
+                        // body had no `contained[]` / `tx-resource` shadow
+                        // resources — otherwise the cache key (compose hash)
+                        // would not encode those supplemental resources and a
+                        // later request without them could hit the wrong row.
+                        let safe_to_cache = warnings.is_empty()
+                            && inline_ctx.contained.is_empty()
+                            && inline_ctx.tx_resources.is_empty();
+                        if safe_to_cache {
                             let _ = populate_implicit_cache(&conn, &cache_key, &codes);
                             // Populate the in-memory inline compose index so that
                             // subsequent requests for the same compose body are served
@@ -471,11 +487,15 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     }
                 };
 
-                // Total-miss guard: if every include clause was skipped (all
-                // systems unknown), surface a NotFound rather than silently
-                // returning an empty expansion with no explanation.
+                // Total-miss guard: if EVERY include clause failed to resolve
+                // (no system, no contained ref, no tx-resource, no DB hit) AND
+                // the expansion produced zero codes, surface a NotFound rather
+                // than silently returning an empty expansion. We compare the
+                // produced code count, not just `warnings.len()` — partial
+                // successes (e.g. one valueSet ref hits, another misses) emit
+                // a warning but still return useful data.
                 let include_count = compose["include"].as_array().map_or(0, |a| a.len());
-                if include_count > 0 && warnings.len() >= include_count {
+                if include_count > 0 && codes.is_empty() && warnings.len() >= include_count {
                     return Err(HtsError::NotFound(
                         "None of the systems in the inline ValueSet compose could be resolved"
                             .into(),
@@ -1589,27 +1609,185 @@ fn expand_inline_filtered(
     Ok(results)
 }
 
+/// Per-request context for resolving `compose.include[].valueSet[]` references.
+///
+/// Carries the inline ValueSet body's `contained[]` array (so `#fragment`
+/// references can be looked up locally) plus any `tx-resource` ValueSets the
+/// caller supplied. Both lists are checked **before** falling back to the
+/// `value_sets` table when nested refs are resolved during expansion.
+///
+/// `visited` tracks the canonical URLs (and `#fragment` ids) currently being
+/// expanded so a self-reference such as
+/// `vs1.compose.include.valueSet = ["vs1"]` does not infinite-loop. The
+/// depth counter is enforced separately by `compute_expansion_depth_inner`.
+#[derive(Default, Clone)]
+struct InlineResolutionContext<'a> {
+    contained: Vec<&'a serde_json::Value>,
+    tx_resources: Vec<&'a serde_json::Value>,
+    visited: std::collections::BTreeSet<String>,
+}
+
+impl<'a> InlineResolutionContext<'a> {
+    /// Build a context from an inline ValueSet body and an optional tx-resource list.
+    fn from_inline(
+        inline_vs: Option<&'a serde_json::Value>,
+        tx_resources: &'a [serde_json::Value],
+    ) -> Self {
+        let contained = inline_vs
+            .and_then(|vs| vs.get("contained"))
+            .and_then(|c| c.as_array())
+            .map(|arr| arr.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let tx_refs: Vec<&'a serde_json::Value> = tx_resources
+            .iter()
+            .filter(|r| r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet"))
+            .collect();
+        Self {
+            contained,
+            tx_resources: tx_refs,
+            visited: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Resolve a `valueSet[]` entry to its compose JSON without touching the DB.
+    ///
+    /// `#fragment` refs search the inline body's `contained[]`; canonical URLs
+    /// check `tx_resources`. Returns `Some(compose_string)` when an inline
+    /// match is found; the caller falls back to the DB on `None`.
+    fn lookup_compose(&self, ref_str: &str) -> Option<String> {
+        if let Some(id) = ref_str.strip_prefix('#') {
+            for r in &self.contained {
+                if r.get("id").and_then(|v| v.as_str()) == Some(id)
+                    && r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet")
+                {
+                    return r.get("compose").map(|c| c.to_string());
+                }
+            }
+            return None;
+        }
+        // Non-fragment refs may carry a `|version` pin; tx-resource matching
+        // ignores the version because the IG fixtures usually pass the bare URL.
+        let bare = ref_str.split('|').next().unwrap_or(ref_str);
+        for r in &self.tx_resources {
+            if r.get("url").and_then(|v| v.as_str()) == Some(bare) {
+                return r.get("compose").map(|c| c.to_string());
+            }
+        }
+        None
+    }
+}
+
 /// Compute an expansion from the raw `compose_json`.
 ///
 /// Supports:
 /// - `compose.include[].system` — required in each include clause.
 /// - `compose.include[].concept[]` — explicit code list; when absent, all
 ///   codes from the referenced system are included.
-/// - `compose.exclude[]` — removes specific (system, code) pairs after
-///   includes are resolved.
+/// - `compose.include[].valueSet[]` — references that are intersected with
+///   the include's local conditions; multiple entries are intersected.
+/// - `compose.exclude[]` — removes the (system, code) pairs that match the
+///   same conditions, including `valueSet[]` references.
 fn compute_expansion(
     conn: &Connection,
     compose_json: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
-    compute_expansion_depth(conn, compose_json, warnings, 0)
+    compute_expansion_with_ctx(
+        conn,
+        compose_json,
+        warnings,
+        &InlineResolutionContext::default(),
+    )
 }
 
-fn compute_expansion_depth(
+/// Variant of [`compute_expansion`] that threads an inline-resolution context
+/// through nested `compose.include[].valueSet[]` lookups.
+fn compute_expansion_with_ctx(
+    conn: &Connection,
+    compose_json: Option<&str>,
+    warnings: &mut Vec<String>,
+    ctx: &InlineResolutionContext<'_>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    compute_expansion_depth_inner(conn, compose_json, warnings, 0, ctx)
+}
+
+/// Resolve a single `compose.include[].valueSet[]` reference to a flat code
+/// list, consulting (in order) the inline `contained[]` array, the
+/// `tx-resource` map, and finally the local `value_sets` table.
+///
+/// The visited-URL set guards against cycles (e.g. `vsA` references `vsB`
+/// which references `vsA`); a re-entry pushes a `vs-invalid` warning instead
+/// of recursing.
+fn expand_vs_reference(
+    conn: &Connection,
+    ref_url: &str,
+    warnings: &mut Vec<String>,
+    depth: u8,
+    ctx: &InlineResolutionContext<'_>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    if ctx.visited.contains(ref_url) {
+        warnings.push(format!(
+            "Cyclic ValueSet reference detected for {ref_url}; excluded from expansion (vs-invalid)"
+        ));
+        return Ok(vec![]);
+    }
+
+    let mut child_ctx = ctx.clone();
+    child_ctx.visited.insert(ref_url.to_owned());
+
+    if let Some(compose_str) = ctx.lookup_compose(ref_url) {
+        return compute_expansion_depth_inner(
+            conn,
+            Some(&compose_str),
+            warnings,
+            depth + 1,
+            &child_ctx,
+        );
+    }
+
+    // `#fragment` refs that didn't match any contained[] are unresolvable —
+    // there is no DB fallback for them.
+    if ref_url.starts_with('#') {
+        warnings.push(format!(
+            "Referenced contained ValueSet {ref_url} not found; excluded from expansion"
+        ));
+        return Ok(vec![]);
+    }
+
+    // Strip an optional `|version` suffix before the DB lookup; the
+    // `value_sets` table is keyed only on `url`.
+    let bare_url = ref_url.split('|').next().unwrap_or(ref_url);
+    match resolve_value_set(conn, bare_url, None) {
+        Ok((ref_vs_id, ref_compose)) => {
+            let cached = fetch_cache(conn, &ref_vs_id)?;
+            if !cached.is_empty() {
+                return Ok(cached);
+            }
+            // Recurse with the child context so further refs inside the
+            // referenced ValueSet still see contained / tx-resource shadows.
+            compute_expansion_depth_inner(
+                conn,
+                ref_compose.as_deref(),
+                warnings,
+                depth + 1,
+                &child_ctx,
+            )
+        }
+        Err(_) => {
+            warnings.push(format!(
+                "Referenced ValueSet {ref_url} not found; excluded from expansion"
+            ));
+            Ok(vec![])
+        }
+    }
+}
+
+fn compute_expansion_depth_inner(
     conn: &Connection,
     compose_json: Option<&str>,
     warnings: &mut Vec<String>,
     depth: u8,
+    ctx: &InlineResolutionContext<'_>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let Some(raw) = compose_json else {
         return Ok(vec![]);
@@ -1620,191 +1798,357 @@ fn compute_expansion_depth(
 
     let empty_arr = vec![];
     let includes = compose["include"].as_array().unwrap_or(&empty_arr);
-    let mut included: Vec<ExpansionContains> = Vec::new();
 
     // Fast path: 2+ includes all using property-equality on the same system.
-    // Collapses N×M individual SQL round-trips into a single CTE query.
-    if let Some(result) = try_multi_include_property_only(conn, includes, warnings)? {
-        included = result;
+    // Only safe when no include carries a `valueSet[]` ref — those need the
+    // full per-include path so the reference can be intersected with the
+    // local system/concept/filter portion of the same include.
+    let any_vs_ref = includes
+        .iter()
+        .any(|inc| inc["valueSet"].as_array().is_some_and(|a| !a.is_empty()));
+    let mut included: Vec<ExpansionContains> = if !any_vs_ref {
+        if let Some(result) = try_multi_include_property_only(conn, includes, warnings)? {
+            result
+        } else {
+            expand_includes_per_clause(conn, includes, warnings, depth, ctx)?
+        }
     } else {
-        let mut system_id_cache: HashMap<(String, Option<String>), String> = HashMap::new();
-        for inc in includes {
-            // Handle include.valueSet references (FHIR R4 §4.8.5):
-            // one ValueSet includes all concepts from another ValueSet by URL.
-            // These includes have no `system` and would otherwise be silently skipped.
-            if let Some(vs_refs) = inc["valueSet"].as_array() {
-                if !vs_refs.is_empty() {
-                    if depth >= 4 {
-                        warnings.push(
-                        "Max ValueSet include depth (4) reached; skipping nested valueSet references"
-                            .to_owned(),
-                    );
-                        continue;
-                    }
-                    for vs_ref in vs_refs {
-                        let ref_url = match vs_ref.as_str() {
-                            Some(u) => u,
-                            None => continue,
-                        };
-                        match resolve_value_set(conn, ref_url, None) {
-                            Ok((ref_vs_id, ref_compose)) => {
-                                let cached = fetch_cache(conn, &ref_vs_id)?;
-                                if cached.is_empty() {
-                                    let nested = compute_expansion_depth(
-                                        conn,
-                                        ref_compose.as_deref(),
-                                        warnings,
-                                        depth + 1,
-                                    )?;
-                                    included.extend(nested);
-                                } else {
-                                    included.extend(cached);
-                                }
-                            }
-                            Err(_) => {
-                                warnings.push(format!(
-                                "Referenced ValueSet {ref_url} not found; excluded from expansion"
-                            ));
-                            }
-                        }
-                    }
-                    continue;
-                }
-            }
+        expand_includes_per_clause(conn, includes, warnings, depth, ctx)?
+    };
 
-            let system_url = match inc["system"].as_str() {
-                Some(s) if !s.is_empty() => s,
-                _ => continue,
-            };
-            let inc_version = inc["version"].as_str();
-
-            // Resolve the code_systems row honouring an optional version pin.
-            // When the include declares a version we look up that specific (url,
-            // version) row; otherwise we pick the highest-versioned row so a
-            // version-less include still expands the latest revision. Cached so
-            // repeated (url, version) pairs don't round-trip more than once.
-            let cache_key = (system_url.to_owned(), inc_version.map(str::to_owned));
-            let system_id = match system_id_cache.get(&cache_key) {
-                Some(id) => id.clone(),
-                None => match resolve_compose_system_id(conn, system_url, inc_version)? {
-                    Some(id) => {
-                        system_id_cache.insert(cache_key, id.clone());
-                        id
-                    }
-                    None => {
-                        let msg = format!(
-                            "CodeSystem {system_url} was not found and has been excluded from the expansion"
-                        );
-                        tracing::warn!(%system_url, ?inc_version, "{msg}");
-                        warnings.push(msg);
-                        continue;
-                    }
-                },
-            };
-
-            // Check for ECL / is-a filters before falling through to the explicit
-            // code list or "all concepts" paths.
-            if let Some(filter_result) =
-                apply_compose_filters(conn, system_url, &system_id, inc, None)?
-            {
-                included.extend(filter_result);
-            } else if let Some(explicit_codes) = inc["concept"].as_array() {
-                // Explicit code list: single json_each batch join instead of N
-                // individual point lookups.  For large VSAC ValueSets (6000+ codes)
-                // this reduces the round-trips from O(N) to O(1).
-                let codes_json: serde_json::Value = explicit_codes
-                    .iter()
-                    .filter_map(|e| e["code"].as_str())
-                    .collect::<Vec<_>>()
-                    .into();
-                let codes_str = codes_json.to_string();
-
-                let mut stmt = conn
-                    .prepare_cached(
-                        "SELECT je.value, c.display
-                     FROM json_each(?1) je
-                     LEFT JOIN concepts c
-                         ON c.system_id = ?2 AND c.code = je.value",
-                    )
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-                let rows = stmt
-                    .query_map(rusqlite::params![codes_str, system_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                    })
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-                for (code, display) in rows {
-                    included.push(ExpansionContains {
-                        system: system_url.to_owned(),
-                        code,
-                        display,
-                        is_abstract: None,
-
-                        inactive: None,
-
-                        designations: vec![],
-
-                        properties: vec![],
-                        contains: vec![],
-                    });
-                }
-            } else {
-                // No explicit codes and no filters: include ALL concepts from the
-                // referenced system.
-                let mut stmt = conn
-                    .prepare_cached(
-                        "SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code",
-                    )
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-                let rows = stmt
-                    .query_map([&system_id], |row| {
-                        Ok(ExpansionContains {
-                            system: system_url.to_owned(),
-                            code: row.get(0)?,
-                            display: row.get(1)?,
-                            is_abstract: None,
-
-                            inactive: None,
-
-                            designations: vec![],
-
-                            properties: vec![],
-                            contains: vec![],
-                        })
-                    })
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-                included.extend(rows);
-            }
-        }
-    } // end fast-path else
-
-    // Apply excludes: build a (system, code) deny-set and filter.
+    // Apply excludes — each clause may carry concept[], filter[], and/or
+    // valueSet[] references. See `build_exclude_set` for the intersection
+    // semantics applied within a single exclude clause.
     let excludes = compose["exclude"].as_array().unwrap_or(&empty_arr);
-    let mut denied: HashSet<(String, String)> = HashSet::new();
-
-    for exc in excludes {
-        let exc_system = exc["system"].as_str().unwrap_or("").to_owned();
-        if let Some(codes) = exc["concept"].as_array() {
-            for entry in codes {
-                if let Some(code) = entry["code"].as_str() {
-                    denied.insert((exc_system.clone(), code.to_owned()));
-                }
-            }
+    if !excludes.is_empty() {
+        let denied = build_exclude_set(conn, excludes, warnings, depth, ctx)?;
+        if !denied.is_empty() {
+            included.retain(|c| !denied.contains(&(c.system.clone(), c.code.clone())));
         }
-    }
-
-    if !denied.is_empty() {
-        included.retain(|c| !denied.contains(&(c.system.clone(), c.code.clone())));
     }
 
     Ok(included)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_includes_per_clause(
+    conn: &Connection,
+    includes: &[serde_json::Value],
+    warnings: &mut Vec<String>,
+    depth: u8,
+    ctx: &InlineResolutionContext<'_>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let mut included: Vec<ExpansionContains> = Vec::new();
+    let mut system_id_cache: HashMap<String, String> = HashMap::new();
+
+    for inc in includes {
+        let vs_refs_present = inc["valueSet"].as_array().is_some_and(|a| !a.is_empty());
+        let has_local_system = inc["system"].as_str().is_some_and(|s| !s.is_empty());
+
+        // ── compose.include[].valueSet[] handling (FHIR R5 §4.9.5) ─────────
+        // Each entry is an additional condition on the include: a concept
+        // matches only if it appears in EVERY referenced ValueSet. When the
+        // include also has system / concept / filter, those local conditions
+        // are intersected with the ref expansions. When the include has only
+        // valueSet[] entries, the result is the intersection of the refs.
+        if vs_refs_present {
+            if depth >= 4 {
+                warnings.push(
+                    "Max ValueSet include depth (4) reached; skipping nested valueSet references"
+                        .to_owned(),
+                );
+                continue;
+            }
+
+            let vs_refs = inc["valueSet"].as_array().unwrap();
+            let mut ref_sets: Vec<HashSet<(String, String)>> = Vec::new();
+            let mut display_index: HashMap<(String, String), Option<String>> = HashMap::new();
+
+            for vs_ref in vs_refs {
+                let ref_url = match vs_ref.as_str() {
+                    Some(u) => u,
+                    None => continue,
+                };
+                let codes = expand_vs_reference(conn, ref_url, warnings, depth, ctx)?;
+                let mut set: HashSet<(String, String)> = HashSet::new();
+                for c in codes {
+                    let key = (c.system.clone(), c.code.clone());
+                    display_index
+                        .entry(key.clone())
+                        .or_insert(c.display.clone());
+                    set.insert(key);
+                }
+                ref_sets.push(set);
+            }
+
+            // Intersect across every referenced ValueSet.
+            let mut intersected: HashSet<(String, String)> = match ref_sets.first() {
+                Some(first) => first.clone(),
+                None => HashSet::new(),
+            };
+            for set in ref_sets.iter().skip(1) {
+                intersected.retain(|k| set.contains(k));
+            }
+
+            // Build the local "base set" (system + concept + filter) and
+            // intersect with the ref intersection. When the include has no
+            // local system the result is just the ref intersection.
+            let final_set: HashSet<(String, String)> = if has_local_system {
+                let mut single_inc = inc.clone();
+                if let Some(obj) = single_inc.as_object_mut() {
+                    obj.remove("valueSet");
+                }
+                let base_codes =
+                    expand_single_include_local(conn, &single_inc, warnings, &mut system_id_cache)?;
+                let mut bs: HashSet<(String, String)> = HashSet::new();
+                for c in &base_codes {
+                    bs.insert((c.system.clone(), c.code.clone()));
+                    display_index
+                        .entry((c.system.clone(), c.code.clone()))
+                        .or_insert(c.display.clone());
+                }
+                intersected.intersection(&bs).cloned().collect()
+            } else {
+                intersected
+            };
+
+            for (system, code) in final_set {
+                let display = display_index
+                    .get(&(system.clone(), code.clone()))
+                    .cloned()
+                    .unwrap_or(None);
+                included.push(ExpansionContains {
+                    system,
+                    code,
+                    display,
+                    is_abstract: None,
+                    inactive: None,
+                    designations: vec![],
+                    properties: vec![],
+                    contains: vec![],
+                });
+            }
+
+            continue;
+        }
+
+        // No `valueSet[]` reference on this include — fall through to the
+        // local single-include expansion (system + concept + filter).
+        let local = expand_single_include_local(conn, inc, warnings, &mut system_id_cache)?;
+        included.extend(local);
+    }
+
+    Ok(included)
+}
+
+/// Expand the local (system + concept + filter) portion of a single
+/// `compose.include[]` clause without consulting any nested `valueSet[]`
+/// references. Used both as the per-include path inside
+/// `expand_includes_per_clause` and as the "base set" computation when an
+/// include carries both local conditions and `valueSet[]` references that need
+/// to be intersected together.
+fn expand_single_include_local(
+    conn: &Connection,
+    inc: &serde_json::Value,
+    warnings: &mut Vec<String>,
+    system_id_cache: &mut HashMap<String, String>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let system_url = match inc["system"].as_str() {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(vec![]),
+    };
+    let inc_version = inc["version"].as_str();
+
+    // Cache key folds the optional version into the URL so versioned and
+    // versionless includes for the same canonical URL don't clobber each
+    // other's resolved id.
+    let cache_key = match inc_version {
+        Some(v) => format!("{system_url}|{v}"),
+        None => system_url.to_owned(),
+    };
+    let system_id = match system_id_cache.get(&cache_key) {
+        Some(id) => id.clone(),
+        None => match resolve_compose_system_id(conn, system_url, inc_version)? {
+            Some(id) => {
+                system_id_cache.insert(cache_key, id.clone());
+                id
+            }
+            None => {
+                let msg = format!(
+                    "CodeSystem {system_url} was not found and has been excluded from the expansion"
+                );
+                tracing::warn!(%system_url, ?inc_version, "{msg}");
+                warnings.push(msg);
+                return Ok(vec![]);
+            }
+        },
+    };
+
+    if let Some(filter_result) = apply_compose_filters(conn, system_url, &system_id, inc, None)? {
+        return Ok(filter_result);
+    }
+
+    if let Some(explicit_codes) = inc["concept"].as_array() {
+        // Explicit code list: single json_each batch join instead of N
+        // individual point lookups.
+        let codes_json: serde_json::Value = explicit_codes
+            .iter()
+            .filter_map(|e| e["code"].as_str())
+            .collect::<Vec<_>>()
+            .into();
+        let codes_str = codes_json.to_string();
+
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT je.value, c.display
+                 FROM json_each(?1) je
+                 LEFT JOIN concepts c
+                     ON c.system_id = ?2 AND c.code = je.value",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![codes_str, system_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (code, display) in rows {
+            out.push(ExpansionContains {
+                system: system_url.to_owned(),
+                code,
+                display,
+                is_abstract: None,
+                inactive: None,
+                designations: vec![],
+                properties: vec![],
+                contains: vec![],
+            });
+        }
+        return Ok(out);
+    }
+
+    // No explicit codes and no filters: include ALL concepts from the
+    // referenced system.
+    let mut stmt = conn
+        .prepare_cached("SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code")
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let rows = stmt
+        .query_map([&system_id], |row| {
+            Ok(ExpansionContains {
+                system: system_url.to_owned(),
+                code: row.get(0)?,
+                display: row.get(1)?,
+                is_abstract: None,
+                inactive: None,
+                designations: vec![],
+                properties: vec![],
+                contains: vec![],
+            })
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    Ok(rows)
+}
+
+/// Build a `(system, code)` deny-set from the `compose.exclude[]` array.
+///
+/// Each exclude clause may carry `concept[]` (explicit codes), `filter[]`
+/// (ECL / is-a / property=) and/or `valueSet[]` references. When a
+/// `valueSet[]` is present its expansion is intersected with the local
+/// system/concept/filter to determine which codes to deny — matching the
+/// FHIR semantics that "the codes match if they meet ALL of the conditions".
+fn build_exclude_set(
+    conn: &Connection,
+    excludes: &[serde_json::Value],
+    warnings: &mut Vec<String>,
+    depth: u8,
+    ctx: &InlineResolutionContext<'_>,
+) -> Result<HashSet<(String, String)>, HtsError> {
+    let mut denied: HashSet<(String, String)> = HashSet::new();
+    let mut system_id_cache: HashMap<String, String> = HashMap::new();
+
+    for exc in excludes {
+        let vs_refs_present = exc["valueSet"].as_array().is_some_and(|a| !a.is_empty());
+
+        if vs_refs_present {
+            if depth >= 4 {
+                warnings.push(
+                    "Max ValueSet exclude depth (4) reached; skipping nested valueSet references"
+                        .to_owned(),
+                );
+                continue;
+            }
+            let mut ref_sets: Vec<HashSet<(String, String)>> = Vec::new();
+            for vs_ref in exc["valueSet"].as_array().unwrap() {
+                let ref_url = match vs_ref.as_str() {
+                    Some(u) => u,
+                    None => continue,
+                };
+                let resolved = expand_vs_reference(conn, ref_url, warnings, depth, ctx)?;
+                let mut set = HashSet::new();
+                for c in resolved {
+                    set.insert((c.system, c.code));
+                }
+                ref_sets.push(set);
+            }
+            let mut intersected: HashSet<(String, String)> = match ref_sets.first() {
+                Some(first) => first.clone(),
+                None => HashSet::new(),
+            };
+            for set in ref_sets.iter().skip(1) {
+                intersected.retain(|k| set.contains(k));
+            }
+
+            // Intersect with the local exclude condition when one is present.
+            let has_local_system = exc["system"].as_str().is_some_and(|s| !s.is_empty());
+            if has_local_system {
+                let mut single_exc = exc.clone();
+                if let Some(obj) = single_exc.as_object_mut() {
+                    obj.remove("valueSet");
+                }
+                let local =
+                    expand_single_include_local(conn, &single_exc, warnings, &mut system_id_cache)?;
+                let local_set: HashSet<(String, String)> =
+                    local.into_iter().map(|c| (c.system, c.code)).collect();
+                intersected.retain(|k| local_set.contains(k));
+            }
+
+            for k in intersected {
+                denied.insert(k);
+            }
+            continue;
+        }
+
+        let exc_system = exc["system"].as_str().unwrap_or("").to_owned();
+
+        if exc["concept"].as_array().is_some_and(|a| !a.is_empty()) {
+            // Explicit codes: deny each (system, code) pair without consulting the DB.
+            if let Some(codes) = exc["concept"].as_array() {
+                for entry in codes {
+                    if let Some(code) = entry["code"].as_str() {
+                        denied.insert((exc_system.clone(), code.to_owned()));
+                    }
+                }
+            }
+            continue;
+        }
+
+        // No concept[], no valueSet[] — fall back to the same per-include
+        // expansion path (covers exclude.filter[], full-system exclude, etc.).
+        let local = expand_single_include_local(conn, exc, warnings, &mut system_id_cache)?;
+        for c in local {
+            denied.insert((c.system, c.code));
+        }
+    }
+
+    Ok(denied)
 }
 
 /// Evaluate any ECL or `is-a` filters declared on a compose include clause.
@@ -7897,5 +8241,320 @@ mod tests {
         // `total` is intentionally not asserted — the BFS fast path used by
         // single-include is-a expansions returns `total: None` to avoid the
         // separate count round-trip when the caller only asked for a page.
+    }
+    // ── inline `#contained` ValueSet ref + canonical URL intersection ──────────
+
+    /// Bundle that covers the simple-expand-contained tx-ecosystem fixture:
+    /// CodeSystem `simple` with codes `code1`, `code2`; ValueSet
+    /// `simple-filter-isa` whose compose explicitly includes `code2`. The
+    /// inline request body adds a `contained[]` ValueSet `vs1` with
+    /// `concept: [{code: "code2"}]`. The intersection is `{code2}`.
+    fn bundle_for_contained_intersection() -> &'static str {
+        r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [
+            { "resource": {
+                "resourceType": "CodeSystem",
+                "id": "cs-simple",
+                "url": "http://example.org/cs/simple",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  { "code": "code1", "display": "One" },
+                  { "code": "code2", "display": "Two" },
+                  { "code": "code3", "display": "Three" }
+                ]
+            }},
+            { "resource": {
+                "resourceType": "ValueSet",
+                "id": "vs-isa",
+                "url": "http://example.org/vs/simple-filter-isa",
+                "status": "active",
+                "compose": { "include": [
+                    { "system": "http://example.org/cs/simple",
+                      "concept": [{ "code": "code2" }] }
+                ]}
+            }}
+          ]
+        }"#
+    }
+
+    #[tokio::test]
+    async fn inline_contained_fragment_ref_intersects_with_canonical_ref() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_for_contained_intersection().as_bytes())
+            .await
+            .unwrap();
+
+        // Inline VS with one include that names two ValueSets to intersect:
+        // a `#vs1` contained ref plus a canonical URL.
+        let inline = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "valueSet": [
+                        "#vs1",
+                        "http://example.org/vs/simple-filter-isa"
+                    ]
+                }]
+            },
+            "contained": [{
+                "resourceType": "ValueSet",
+                "id": "vs1",
+                "url": "http://example.org/vs/contained",
+                "status": "active",
+                "compose": { "include": [
+                    { "system": "http://example.org/cs/simple",
+                      "concept": [{ "code": "code2" }] }
+                ]}
+            }]
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.total, Some(1));
+        assert_eq!(resp.contains.len(), 1);
+        assert_eq!(resp.contains[0].code, "code2");
+        // Both refs resolved → no warning emitted for these.
+        assert!(
+            resp.warnings.iter().all(|w| !w.contains("not found")),
+            "expected no not-found warnings, got {:?}",
+            resp.warnings
+        );
+    }
+
+    /// `#fragment` references that don't exist in `contained[]` push a
+    /// warning but the rest of the expansion still proceeds — they don't
+    /// cause a 404.
+    #[tokio::test]
+    async fn inline_unknown_fragment_ref_warns_but_does_not_404() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_for_contained_intersection().as_bytes())
+            .await
+            .unwrap();
+
+        let inline = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [
+                    { "valueSet": ["#missing"] },
+                    { "system": "http://example.org/cs/simple",
+                      "concept": [{ "code": "code1" }] }
+                ]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Second include still resolves — the missing #fragment doesn't
+        // poison the whole request.
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(codes.contains(&"code1"));
+        assert!(
+            resp.warnings.iter().any(|w| w.contains("#missing")),
+            "expected a warning for the missing contained ref, got {:?}",
+            resp.warnings
+        );
+    }
+
+    /// `tx-resource` ValueSets are consulted *before* the local DB when
+    /// resolving canonical URL refs inside an inline compose.
+    #[tokio::test]
+    async fn inline_tx_resource_shadows_canonical_ref() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_for_contained_intersection().as_bytes())
+            .await
+            .unwrap();
+
+        // tx-resource VS that exists nowhere in the DB. It includes only `code1`.
+        let tx_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "url": "http://example.org/vs/tx-only",
+            "status": "active",
+            "compose": { "include": [
+                { "system": "http://example.org/cs/simple",
+                  "concept": [{ "code": "code1" }] }
+            ]}
+        });
+
+        let inline = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{ "valueSet": ["http://example.org/vs/tx-only"] }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline),
+                    tx_resources: vec![tx_vs],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.total, Some(1));
+        assert_eq!(resp.contains[0].code, "code1");
+    }
+
+    /// Cycle in `compose.include[].valueSet[]` resolution must not loop —
+    /// the visited-set guard breaks recursion. The non-cyclic include in
+    /// the same compose still resolves.
+    #[tokio::test]
+    async fn cyclic_value_set_reference_is_rejected_without_loop() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_for_contained_intersection().as_bytes())
+            .await
+            .unwrap();
+
+        // Two contained VSes that reference each other plus a real include
+        // so the request as a whole isn't 100% cycle. Without cycle
+        // detection this would recurse forever.
+        let inline = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [
+                    { "valueSet": ["#a"] },
+                    { "system": "http://example.org/cs/simple",
+                      "concept": [{ "code": "code1" }] }
+                ]
+            },
+            "contained": [
+                {
+                    "resourceType": "ValueSet",
+                    "id": "a",
+                    "url": "http://example.org/vs/a",
+                    "status": "active",
+                    "compose": { "include": [{ "valueSet": ["#b"] }] }
+                },
+                {
+                    "resourceType": "ValueSet",
+                    "id": "b",
+                    "url": "http://example.org/vs/b",
+                    "status": "active",
+                    "compose": { "include": [{ "valueSet": ["#a"] }] }
+                }
+            ]
+        });
+
+        // Returns Ok rather than hanging. The non-cyclic include still
+        // resolves so the response is non-empty.
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert!(codes.contains(&"code1"));
+        assert!(
+            resp.warnings.iter().any(|w| w.contains("Cyclic")),
+            "expected a vs-invalid cycle warning, got {:?}",
+            resp.warnings
+        );
+    }
+
+    /// `compose.exclude[].valueSet[]` intersected with explicit codes —
+    /// covers the exclude-combo tx-ecosystem fixture pattern.
+    #[tokio::test]
+    async fn exclude_with_value_set_ref_intersects_with_local_concepts() {
+        let b = backend();
+        // Bundle: gender CS with male/female/other/unknown + a VS `gender-vs`
+        // that includes ALL of those.
+        let bundle = r#"{
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+              { "resource": {
+                  "resourceType": "CodeSystem",
+                  "id": "cs-gender",
+                  "url": "http://example.org/cs/gender",
+                  "status": "active",
+                  "content": "complete",
+                  "concept": [
+                    { "code": "male" },
+                    { "code": "female" },
+                    { "code": "other" },
+                    { "code": "unknown" }
+                  ]
+              }},
+              { "resource": {
+                  "resourceType": "ValueSet",
+                  "id": "gender-vs",
+                  "url": "http://example.org/vs/gender",
+                  "status": "active",
+                  "compose": { "include": [
+                      { "system": "http://example.org/cs/gender" }
+                  ]}
+              }}
+            ]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        // Inline VS that includes male+female and excludes (female + other)
+        // intersected with the gender VS — so only `female` is excluded
+        // because `other` is not in the include.
+        let inline = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs/gender",
+                    "concept": [
+                        { "code": "male" },
+                        { "code": "female" }
+                    ]
+                }],
+                "exclude": [{
+                    "system": "http://example.org/cs/gender",
+                    "concept": [
+                        { "code": "female" },
+                        { "code": "other" }
+                    ],
+                    "valueSet": ["http://example.org/vs/gender"]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.total, Some(1));
+        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        assert_eq!(codes, vec!["male"]);
     }
 }

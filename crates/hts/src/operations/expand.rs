@@ -48,8 +48,8 @@ use crate::types::{ExpandRequest, ExpansionContains};
 
 use super::format::{ResponseFormat, json_to_fhir_xml, negotiate_format};
 use super::params::{
-    extract_parameter_array, find_resource_param, find_str_param, parse_query_string,
-    query_params_to_fhir_params,
+    collect_resource_params, extract_parameter_array, find_resource_param, find_str_param,
+    parse_query_string, query_params_to_fhir_params,
 };
 
 /// Collect the standards-status codes that should fire `warning-<status>`
@@ -792,6 +792,38 @@ async fn process_expand<B: TerminologyBackend>(
         }
     }
 
+    // `tx-resource` parameters provide ad-hoc terminology that the caller does
+    // not want to import. Each is a full FHIR resource (typically a ValueSet)
+    // that the backend should treat as in-scope only for this single request —
+    // used heavily by the tx-ecosystem IG include-combo / exclude-combo
+    // fixtures, which provide the entire ValueSet whose URL was passed in the
+    // `url` parameter.
+    let tx_resources = collect_resource_params(&params, "tx-resource");
+
+    // ── tx-resource shortcut for URL-based requests ──────────────────────────
+    // When the request carries a `url` parameter and one of the supplied
+    // `tx-resource` resources is a ValueSet whose URL matches, promote that
+    // ValueSet to the inline-body path. This means the backend never queries
+    // its own store for that URL — the tx-resource fully shadows it for this
+    // request — which matches the IG semantics for the include-combo /
+    // exclude-combo fixtures.
+    let (url, value_set) = if value_set.is_none() {
+        if let Some(ref url_str) = url {
+            let inline_match = tx_resources.iter().find(|r| {
+                r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet")
+                    && r.get("url").and_then(|v| v.as_str()) == Some(url_str.as_str())
+            });
+            if let Some(vs) = inline_match {
+                (None, Some(vs.clone()))
+            } else {
+                (url, value_set)
+            }
+        } else {
+            (url, value_set)
+        }
+    } else {
+        (url, value_set)
+    };
     // Preserve the URL before it moves into ExpandRequest so we can record it
     // in the negative cache if the backend returns NotFound. Also clone the
     // inline ValueSet body (when present) so we can echo its top-level
@@ -809,6 +841,7 @@ async fn process_expand<B: TerminologyBackend>(
         max_expansion_size: Some(state.max_expansion_size),
         date: find_str_param(&params, "date"),
         hierarchical,
+        tx_resources,
     };
 
     let ctx = TenantContext::system();
