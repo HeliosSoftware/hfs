@@ -336,13 +336,23 @@ fn populate_properties<'a, B: TerminologyBackend>(
             if let Some(list) = map.remove(&(c.system.clone(), c.code.clone())) {
                 c.properties = list
                     .into_iter()
-                    .map(|(code, value)| ExpansionContainsProperty {
-                        code,
-                        // Always serialise as Code for simplicity — concept
-                        // property values are most commonly Code; tests have
-                        // not flagged false positives.
-                        value_type: "Code".to_string(),
-                        value,
+                    .map(|(code, value)| {
+                        // Pick the FHIR `value[x]` shape from the property
+                        // code: `definition` is always a string per FHIR
+                        // (it's the synthesised CS column); everything else
+                        // we treat as a Code primitive — concept property
+                        // values are most commonly Code and tests have not
+                        // flagged false positives for the simple case.
+                        let value_type = if code == "definition" {
+                            "string".to_string()
+                        } else {
+                            "Code".to_string()
+                        };
+                        ExpansionContainsProperty {
+                            code,
+                            value_type,
+                            value,
+                        }
                     })
                     .collect();
             }

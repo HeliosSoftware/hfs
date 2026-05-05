@@ -469,6 +469,53 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 let (code, prop, value) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
                 out.entry(code).or_default().push((prop, value));
             }
+
+            // FHIR `definition` is stored as a column on `concepts` rather
+            // than in concept_properties (it ships in a dedicated CodeSystem
+            // field). When the caller asks for `property=definition`, surface
+            // the column value so $expand emits it as a synthesised property —
+            // matches the IG `parameters/parameters-expand-*-definitions*`
+            // fixtures.
+            if properties.iter().any(|p| p == "definition") {
+                let def_code_ph = (2..=codes.len() + 1)
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let def_sql = format!(
+                    "SELECT c.code, c.definition
+                     FROM concepts c
+                     JOIN code_systems s ON s.id = c.system_id
+                     WHERE s.url = ?1
+                       AND c.code IN ({def_code_ph})
+                       AND c.definition IS NOT NULL"
+                );
+                let mut def_stmt = conn
+                    .prepare(&def_sql)
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let mut def_params: Vec<&dyn rusqlite::ToSql> =
+                    Vec::with_capacity(1 + codes.len());
+                def_params.push(&system_url);
+                for c in &codes {
+                    def_params.push(c as &dyn rusqlite::ToSql);
+                }
+                let def_rows = def_stmt
+                    .query_map(def_params.as_slice(), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                for r in def_rows {
+                    let (code, definition) =
+                        r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    let entry = out.entry(code).or_default();
+                    // Don't double-emit if a `definition` already came from
+                    // concept_properties (unusual but possible for hand-rolled
+                    // CSes that mirror the field as a property).
+                    if !entry.iter().any(|(p, _)| p == "definition") {
+                        entry.push(("definition".to_string(), definition));
+                    }
+                }
+            }
+
             Ok(out)
         })
         .await
