@@ -169,10 +169,22 @@ fn build_validate_response(
     // their texts alphabetically and join with `; ` (matches the IG fixture
     // convention). When we don't, fall back to the response's own `message`
     // (legacy single-message path used by older code in $translate, etc.).
+    // Only the texts of warning- or error-severity issues are joined; info
+    // issues (e.g. MSG_DEPRECATED status-check) are diagnostic only and the
+    // IG `deprecated/validate-*` fixtures expect them to never surface in
+    // the top-level `message` parameter.
     let message_str: Option<String> = if !issues.is_empty() {
-        let mut texts: Vec<&str> = issues.iter().map(|i| i.text.as_str()).collect();
-        texts.sort();
-        Some(texts.join("; "))
+        let mut texts: Vec<&str> = issues
+            .iter()
+            .filter(|i| i.severity != "information")
+            .map(|i| i.text.as_str())
+            .collect();
+        if texts.is_empty() {
+            None
+        } else {
+            texts.sort();
+            Some(texts.join("; "))
+        }
     } else {
         resp.message.clone()
     };
