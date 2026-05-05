@@ -322,16 +322,31 @@ pub struct TranslationMatch {
     pub concept_display: Option<String>,
     /// Reference to the source of the mapping (ConceptMap URL).
     pub source: Option<String>,
+    /// Optional ConceptMap version, used to build the `originMap` canonical
+    /// reference (`url|version`) in the response.
+    #[serde(default)]
+    pub map_version: Option<String>,
+    /// The source-side Coding of this mapping. Populated for reverse
+    /// translations so the response can include a `source` part identifying
+    /// the original code that was reverse-mapped from.
+    #[serde(default)]
+    pub source_system: Option<String>,
+    #[serde(default)]
+    pub source_code: Option<String>,
 }
 
 /// Request for `ConceptMap/$translate`.
+///
+/// Supports both R4 parameter names (`code`, `system`) and R5 names
+/// (`sourceCode`, `sourceSystem`, `targetCode`, `targetSystem`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TranslateRequest {
     /// ConceptMap canonical URL (optional; if absent, all maps are searched).
     pub url: Option<String>,
-    /// Source code system URL.
+    /// Source code system URL (R4 `system` / R5 `sourceSystem`).
     pub system: Option<String>,
-    /// Source code to translate.
+    /// Source code to translate (R4 `code` / R5 `sourceCode`).
+    /// Empty string when reverse mode is driven by `target_code` instead.
     pub code: String,
     /// Source value set URL.
     pub source: Option<String>,
@@ -339,6 +354,10 @@ pub struct TranslateRequest {
     pub target: Option<String>,
     /// Target code system URL.
     pub target_system: Option<String>,
+    /// Target code (R5 `targetCode`) — used to drive reverse translations
+    /// without an explicit `reverse=true` flag.
+    #[serde(default)]
+    pub target_code: Option<String>,
     /// If `true`, reverse the mapping direction (look up target → source).
     #[serde(default)]
     pub reverse: bool,
