@@ -371,13 +371,28 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
                 )
                 .ok()
             }
-            "ValueSet" => conn
-                .query_row(
+            "ValueSet" => {
+                if let Ok(url) = conn.query_row(
                     "SELECT url FROM value_sets WHERE id = ?1",
                     rusqlite::params![id],
                     |row| row.get::<_, String>(0),
+                ) {
+                    return Some(url);
+                }
+                // Multi-version path: storage rows are keyed `<fhir-id>|<version>`,
+                // so when the URL-path id is the bare FHIR id, fall back to a
+                // resource_json scan and pick the latest version (matches how
+                // CodeSystem reads handle the same case).
+                conn.query_row(
+                    "SELECT url FROM value_sets \
+                     WHERE json_extract(resource_json, '$.id') = ?1 \
+                     ORDER BY COALESCE(version, '') DESC \
+                     LIMIT 1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
                 )
-                .ok(),
+                .ok()
+            }
             "ConceptMap" => conn
                 .query_row(
                     "SELECT url FROM concept_maps WHERE id = ?1",
