@@ -51,8 +51,56 @@ use super::params::{
     query_params_to_fhir_params,
 };
 
-/// Serialize a single [`ExpansionContains`] entry to a FHIR-compliant JSON value.
+/// Collect the standards-status codes that should fire `warning-<status>`
+/// expansion parameters for a CodeSystem or ValueSet.
 ///
+/// Surveys three FHIR markers, in this order:
+///
+/// 1. The `http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status`
+///    extension's `valueCode` — typically `deprecated`, `withdrawn`, or `draft`.
+/// 2. `experimental: true` → emits `experimental` (only on CodeSystem; ValueSets
+///    use the same field but the IG fixtures don't ask for `warning-experimental`
+///    on a VS-level basis — driven by the contributing CS).
+/// 3. `status: "draft"` → emits `draft` (mirrors the standards-status pattern
+///    when the resource simply uses FHIR's status field rather than the
+///    extension).
+///
+/// Returns the deduplicated list of status codes, preserving the order above.
+/// The IG fixtures use this list to populate `warning-<code>` entries in
+/// `expansion.parameter[]`.
+fn standards_statuses(resource: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |code: &str| {
+        if !code.is_empty() && !out.iter().any(|c| c == code) {
+            out.push(code.to_string());
+        }
+    };
+
+    if let Some(exts) = resource.get("extension").and_then(|e| e.as_array()) {
+        for ext in exts {
+            if ext.get("url").and_then(|u| u.as_str())
+                == Some(
+                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                )
+            {
+                if let Some(code) = ext.get("valueCode").and_then(|v| v.as_str()) {
+                    push_unique(code);
+                }
+            }
+        }
+    }
+
+    if resource.get("experimental").and_then(|v| v.as_bool()) == Some(true) {
+        push_unique("experimental");
+    }
+
+    if resource.get("status").and_then(|v| v.as_str()) == Some("draft") {
+        push_unique("draft");
+    }
+
+    out
+}
+
 /// Recursively serializes nested `contains` arrays, so that a hierarchical
 /// expansion (produced when `hierarchical=true`) is correctly represented as
 /// nested `contains[]` objects rather than a flat list.
@@ -678,6 +726,97 @@ async fn process_expand<B: TerminologyBackend>(
         }
     }
 
+    // ── used-codesystem + warning-<status> per contributing CodeSystem ───────
+    // The IG fixtures expect one `used-codesystem` parameter per distinct
+    // CodeSystem URL that contributed concepts, with valueUri formatted as
+    // `<url>|<version>` (or just `<url>` when the version is unknown). When
+    // a contributing CS is itself flagged as deprecated/withdrawn/draft/
+    // experimental — by either the `structuredefinition-standards-status`
+    // extension, `status: "draft"`, or `experimental: true` — emit a parallel
+    // `warning-<status>` entry.
+    //
+    // The source ValueSet is checked the same way, so a deprecated VS that
+    // includes an active CS still surfaces a `warning-deprecated` for the VS.
+    //
+    // Performance: this issues one CodeSystem search per distinct system.
+    // Hot-path requests are served from `state.expand_cache`, so the cost is
+    // amortised across repeated identical $expand calls. We keep the lookup
+    // inside the cache-miss path (after the cache.read above and before
+    // cache.write below).
+    let mut used_systems: Vec<&String> =
+        resp.contains
+            .iter()
+            .map(|c| &c.system)
+            .fold(Vec::<&String>::new(), |mut acc, s| {
+                if !acc.contains(&s) {
+                    acc.push(s);
+                }
+                acc
+            });
+    used_systems.sort();
+    let mut warning_params: Vec<Value> = Vec::new();
+    for system_url in &used_systems {
+        let cs = crate::traits::CodeSystemOperations::search(
+            state.backend(),
+            &ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some((**system_url).clone()),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()
+        .and_then(|mut v| v.pop());
+
+        let cs_version = cs
+            .as_ref()
+            .and_then(|c| c.get("version"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let value_uri = match &cs_version {
+            Some(v) => format!("{system_url}|{v}"),
+            None => (*system_url).clone(),
+        };
+        emitted_params.push(json!({
+            "name": "used-codesystem",
+            "valueUri": value_uri,
+        }));
+
+        // Derive any `warning-<status>` entries from the CS's standards-status
+        // extension, status, and experimental flag. Each rule emits at most
+        // one warning name; multiple rules can fire in parallel for the same
+        // CS (e.g. status=draft + experimental=true → both warnings).
+        if let Some(cs) = cs.as_ref() {
+            for status_code in standards_statuses(cs) {
+                warning_params.push(json!({
+                    "name": format!("warning-{status_code}"),
+                    "valueUri": value_uri,
+                }));
+            }
+        }
+    }
+
+    // Then add any warning-* derived from the source VS itself.
+    if let Some(vs) = source_vs.as_ref() {
+        let vs_url = vs.get("url").and_then(|v| v.as_str());
+        let vs_version = vs.get("version").and_then(|v| v.as_str());
+        let vs_value_uri = match (vs_url, vs_version) {
+            (Some(u), Some(v)) => Some(format!("{u}|{v}")),
+            (Some(u), None) => Some(u.to_string()),
+            _ => None,
+        };
+        if let Some(uri) = vs_value_uri {
+            for status_code in standards_statuses(vs) {
+                warning_params.push(json!({
+                    "name": format!("warning-{status_code}"),
+                    "valueUri": uri,
+                }));
+            }
+        }
+    }
+    emitted_params.extend(warning_params);
+
     // Append any expansion warnings as parameter entries with name=warning.
     for w in &resp.warnings {
         emitted_params.push(json!({ "name": "warning", "valueString": w }));
@@ -1145,6 +1284,92 @@ mod tests {
 
         let resp = post_json(app, "/ValueSet/$expand", body).await;
         assert_eq!(resp.status(), 400);
+    }
+
+    // ── standards_statuses helper ──────────────────────────────────────────────
+    //
+    // These exercise the deprecated/withdrawn/experimental/draft → warning-*
+    // mapping that drives expansion.parameter emission in process_expand.
+
+    #[test]
+    fn standards_statuses_picks_extension_status() {
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                "valueCode": "deprecated"
+            }],
+            "status": "active",
+            "experimental": false
+        });
+        assert_eq!(standards_statuses(&cs), vec!["deprecated".to_string()]);
+    }
+
+    #[test]
+    fn standards_statuses_picks_experimental_flag() {
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "status": "active",
+            "experimental": true
+        });
+        assert_eq!(standards_statuses(&cs), vec!["experimental".to_string()]);
+    }
+
+    #[test]
+    fn standards_statuses_picks_draft_status() {
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "status": "draft",
+            "experimental": false
+        });
+        assert_eq!(standards_statuses(&cs), vec!["draft".to_string()]);
+    }
+
+    #[test]
+    fn standards_statuses_combines_multiple_markers() {
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                "valueCode": "withdrawn"
+            }],
+            "status": "draft",
+            "experimental": true
+        });
+        // Order: extension first, then experimental, then draft.
+        assert_eq!(
+            standards_statuses(&cs),
+            vec![
+                "withdrawn".to_string(),
+                "experimental".to_string(),
+                "draft".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn standards_statuses_returns_empty_for_active_resource() {
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "status": "active",
+            "experimental": false
+        });
+        assert!(standards_statuses(&cs).is_empty());
+    }
+
+    #[test]
+    fn standards_statuses_dedupes_when_extension_matches_status() {
+        // Both the standards-status extension and the FHIR status field say
+        // "draft" — emit only one entry.
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                "valueCode": "draft"
+            }],
+            "status": "draft"
+        });
+        assert_eq!(standards_statuses(&cs), vec!["draft".to_string()]);
     }
 }
 // rebuild marker
