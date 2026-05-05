@@ -301,6 +301,14 @@ pub struct ExpandRequest {
     /// hierarchy instead of a flat list. Pagination is not applied in tree mode.
     #[serde(default)]
     pub hierarchical: Option<bool>,
+    /// When `true`, the caller explicitly set the legacy HL7-tx
+    /// `hierarchical=true` parameter (rather than triggering tree mode via
+    /// `excludeNested=false`). Backends use this to decide whether to nest
+    /// enumerated expansions: `hierarchical=true` always builds a tree;
+    /// `excludeNested=false` keeps enumerated VSes flat to match the IG
+    /// `parameters/parameters-expand-enum-*` fixtures.
+    #[serde(default)]
+    pub hierarchical_explicit: bool,
     /// `tx-resource` parameters supplied with the request.
     ///
     /// Each entry is a FHIR resource (typically a `ValueSet`) whose canonical

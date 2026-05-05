@@ -736,6 +736,10 @@ async fn process_expand<B: TerminologyBackend>(
         (_, Some(false)) => Some(true),
         (other, _) => other,
     };
+    // Track which signal turned tree mode on so the backend can keep
+    // enumerated expansions flat when only excludeNested=false was the
+    // trigger (per the IG enum-* fixtures).
+    let hierarchical_explicit = hierarchical_param == Some(true);
 
     // ── Resolve supplements (request `useSupplement` params) ────────────────
     // Walk every `useSupplement` and confirm a matching `content=supplement`
@@ -877,6 +881,7 @@ async fn process_expand<B: TerminologyBackend>(
         max_expansion_size: Some(state.max_expansion_size),
         date: find_str_param(&params, "date"),
         hierarchical,
+        hierarchical_explicit,
         tx_resources,
     };
 

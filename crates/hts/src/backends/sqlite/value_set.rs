@@ -795,12 +795,15 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             // Hierarchical mode: build tree from the filtered flat list and
             // return without pagination (total = flat count, no offset/count).
-            // Skip tree-building when the source compose is purely enumerated
-            // — the IG `parameters/parameters-expand-enum-*` fixtures want
-            // those expansions flat (children of abstract parents are
-            // surfaced as siblings, not nested under the parent), regardless
-            // of excludeNested.
-            if req.hierarchical == Some(true) && !compose_is_enumerated {
+            // The IG `parameters/parameters-expand-enum-*` fixtures want
+            // enumerated expansions FLAT (children of abstract parents
+            // surfaced as siblings) when the trigger was excludeNested=false
+            // (FHIR R5 convention), but the legacy `hierarchical=true`
+            // (HL7-tx convention) still asks for an explicit tree even on
+            // enumerated composes.
+            let want_tree = req.hierarchical == Some(true)
+                && (!compose_is_enumerated || req.hierarchical_explicit);
+            if want_tree {
                 let total = filtered.len() as u32;
                 let tree = build_hierarchical_expansion(&conn, filtered)?;
                 return Ok(ExpandResponse {
