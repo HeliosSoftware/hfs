@@ -778,13 +778,47 @@ async fn process_expand<B: TerminologyBackend>(
     // its uri). Use a synthetic uri based on the first contributing
     // CodeSystem when available — close enough for the IG fixture pattern.
     if !requested_properties.is_empty() {
-        // Emit just the code; the URI's exact form is CS-defined and
-        // synthesising it from the system URL doesn't match the IG's
-        // CS-relative URIs. The validator's $optional$ pattern tolerates
-        // a missing uri.
+        // Look up the URI for each requested property from the source
+        // CodeSystem definition (CodeSystem.property[].uri). Falls back to a
+        // synthesised URI when the CS isn't found or doesn't define a uri.
+        use std::collections::HashMap;
+        let primary_system = resp.contains.first().map(|c| c.system.clone());
+        let mut uri_by_code: HashMap<String, String> = HashMap::new();
+        if let Some(sys) = &primary_system {
+            if let Ok(mut hits) = crate::traits::CodeSystemOperations::search(
+                state.backend(),
+                &ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(sys.clone()),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                if let Some(cs) = hits.pop() {
+                    if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
+                        for entry in props {
+                            if let (Some(code), Some(uri)) = (
+                                entry.get("code").and_then(|v| v.as_str()),
+                                entry.get("uri").and_then(|v| v.as_str()),
+                            ) {
+                                uri_by_code.insert(code.to_string(), uri.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let prop_decls: Vec<Value> = requested_properties
             .iter()
-            .map(|code| json!({"code": code}))
+            .map(|code| {
+                let mut entry = json!({"code": code});
+                if let Some(uri) = uri_by_code.get(code) {
+                    entry["uri"] = json!(uri);
+                }
+                entry
+            })
             .collect();
         expansion["property"] = json!(prop_decls);
     }
