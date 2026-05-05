@@ -580,7 +580,15 @@ async fn fetch_synthesised_properties(
 ) -> Result<Vec<PropertyValue>, HtsError> {
     let mut out = Vec::new();
 
-    // Parents.
+    // Parents — synthesised from concept_hierarchy. Skip when the concept
+    // already carries explicit `parent` properties (the bundle importer
+    // mirrors `parent` properties into concept_hierarchy, so synthesising
+    // here would duplicate every stored parent edge).
+    let stored_parent_codes: std::collections::HashSet<&str> = stored
+        .iter()
+        .filter(|p| p.code == "parent")
+        .map(|p| p.value.as_str())
+        .collect();
     let parent_rows = client
         .query(
             "SELECT h.parent_code, c.display
@@ -594,10 +602,14 @@ async fn fetch_synthesised_properties(
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
     for row in parent_rows {
+        let parent_code: String = row.get(0);
+        if stored_parent_codes.contains(parent_code.as_str()) {
+            continue;
+        }
         out.push(PropertyValue {
             code: "parent".into(),
             value_type: "code".into(),
-            value: row.get(0),
+            value: parent_code,
             description: row.get(1),
         });
     }

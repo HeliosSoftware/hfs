@@ -1125,7 +1125,15 @@ fn fetch_synthesised_properties(
 ) -> Result<Vec<PropertyValue>, HtsError> {
     let mut out = Vec::new();
 
-    // Parents — `concept_hierarchy.parent_code WHERE child_code = code`.
+    // Parents — synthesised from concept_hierarchy. Skip when the concept
+    // already carries explicit `parent` properties (the bundle importer
+    // mirrors `parent` properties into concept_hierarchy, so synthesising
+    // here would duplicate every stored parent edge).
+    let stored_parent_codes: std::collections::HashSet<&str> = stored
+        .iter()
+        .filter(|p| p.code == "parent")
+        .map(|p| p.value.as_str())
+        .collect();
     {
         let mut stmt = conn
             .prepare_cached(
@@ -1145,6 +1153,9 @@ fn fetch_synthesised_properties(
         for r in rows {
             let (parent_code, parent_display) =
                 r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+            if stored_parent_codes.contains(parent_code.as_str()) {
+                continue;
+            }
             out.push(PropertyValue {
                 code: "parent".into(),
                 value_type: "code".into(),
