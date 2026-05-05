@@ -4357,20 +4357,33 @@ fn populate_cache(
 /// produce result=false with an "abstract, and not allowed in this context"
 /// message.
 fn is_concept_abstract(conn: &Connection, system_url: &str, code: &str) -> bool {
-    conn.query_row(
+    // Match against every local property code that maps to the FHIR
+    // concept-properties#notSelectable URI in this CodeSystem. Tx-ecosystem
+    // fixtures rename the property locally (e.g. `not-selectable` with a
+    // hyphen), so a query hardcoded to `notSelectable` would miss them.
+    let abstract_codes = super::code_system::abstract_property_codes(conn, system_url);
+    let placeholders = (3..=abstract_codes.len() + 2)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
         "SELECT 1
          FROM concept_properties cp
          JOIN concepts c ON c.id = cp.concept_id
          JOIN code_systems s ON s.id = c.system_id
          WHERE s.url = ?1
            AND c.code = ?2
-           AND cp.property = 'notSelectable'
+           AND cp.property IN ({placeholders})
            AND cp.value = 'true'
-         LIMIT 1",
-        rusqlite::params![system_url, code],
-        |_| Ok(()),
-    )
-    .is_ok()
+         LIMIT 1"
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(abstract_codes.len() + 2);
+    params.push(&system_url);
+    params.push(&code);
+    for c in &abstract_codes {
+        params.push(c as &dyn rusqlite::ToSql);
+    }
+    conn.query_row(&sql, params.as_slice(), |_| Ok(())).is_ok()
 }
 
 /// Returns the stored version for a ValueSet URL (None if unknown). Used to

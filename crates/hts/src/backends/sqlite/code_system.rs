@@ -495,6 +495,18 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
                 .join(",");
+            // Per FHIR concept-properties IG, the standard `notSelectable`
+            // property's local CodeSystem.property.code can be ANY local name
+            // (e.g. `not-selectable` in the tx-ecosystem `notSelectable/`
+            // fixtures). Resolve via uri → local-code mapping when available;
+            // fall back to the obvious case-insensitive variants so a CS that
+            // never declares the property uri still reports correctly.
+            let abstract_codes = abstract_property_codes(&conn, &system_url);
+            let abstract_in = abstract_codes
+                .iter()
+                .map(|c| format!("'{}'", c.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
             let sql = format!(
                 "SELECT c.code, cp.property, cp.value
                  FROM concept_properties cp
@@ -502,9 +514,8 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                  JOIN code_systems s ON s.id = c.system_id
                  WHERE s.url = ?1
                    AND c.code IN ({placeholders})
-                   AND cp.property IN ('notSelectable', 'status')
                    AND (
-                       (cp.property = 'notSelectable' AND cp.value = 'true')
+                       (cp.property IN ({abstract_in}) AND cp.value = 'true')
                     OR (cp.property = 'status'
                         AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive'))
                    )"
@@ -535,10 +546,10 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 let (code, property, _value) =
                     r.map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let flags = out.entry(code).or_default();
-                match property.as_str() {
-                    "notSelectable" => flags.is_abstract = true,
-                    "status" => flags.inactive = true,
-                    _ => {}
+                if property == "status" {
+                    flags.inactive = true;
+                } else if abstract_codes.iter().any(|c| c == &property) {
+                    flags.is_abstract = true;
                 }
             }
             Ok(out)
@@ -940,6 +951,46 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
 /// O(1) PRIMARY KEY lookup against the precomputed `concept_closure` table.
 /// Self-links are stored in the closure, so `ancestor_code == descendant_code`
 /// returns `true`.
+/// Resolve the local property code(s) that map to the FHIR `notSelectable`
+/// concept-property URI in `system_url`'s CodeSystem definition. Tx-ecosystem
+/// fixtures may rename it locally (e.g. `not-selectable` with a hyphen) so the
+/// concept_expansion_flags lookup needs to know which property name(s) on this
+/// CS encode the abstract flag. Always includes the canonical names as a safety
+/// net for systems that didn't declare property[].
+pub(super) fn abstract_property_codes(
+    conn: &rusqlite::Connection,
+    system_url: &str,
+) -> Vec<String> {
+    let mut codes: Vec<String> = vec!["notSelectable".to_string()];
+    let resource_json: Option<String> = conn
+        .query_row(
+            "SELECT resource_json FROM code_systems \
+             WHERE url = ?1 \
+             ORDER BY COALESCE(version, '') DESC LIMIT 1",
+            rusqlite::params![system_url],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    if let Some(json) = resource_json {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+            if let Some(props) = v.get("property").and_then(|p| p.as_array()) {
+                for p in props {
+                    let uri = p.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                    if uri.ends_with("#notSelectable") || uri == "notSelectable" {
+                        if let Some(local_code) = p.get("code").and_then(|c| c.as_str()) {
+                            if !codes.iter().any(|c| c == local_code) {
+                                codes.push(local_code.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    codes
+}
+
 fn check_ancestor(
     conn: &rusqlite::Connection,
     system_id: &str,
