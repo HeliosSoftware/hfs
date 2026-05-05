@@ -247,7 +247,7 @@ fn build_validate_response(
 async fn build_validate_response_async<B: TerminologyBackend>(
     backend: &B,
     ctx: &TenantContext,
-    resp: ValidateCodeResponse,
+    mut resp: ValidateCodeResponse,
     code: Option<&str>,
     system: Option<&str>,
     codeable_concept: Option<&Value>,
@@ -275,6 +275,41 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     } else {
         None
     };
+
+    // Append info-level "Reference to <status> CodeSystem url|version" issues
+    // when the validated CodeSystem carries a non-active standards-status —
+    // matches the IG `deprecated/validate-*` fixtures.
+    if let Some(sys) = effective_system {
+        if let Ok(mut hits) = crate::traits::CodeSystemOperations::search(
+            backend,
+            ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some(sys.to_string()),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            if let Some(cs) = hits.pop() {
+                for status in collect_status_check_codes(&cs) {
+                    let cs_uri = match version.as_deref() {
+                        Some(v) => format!("{sys}|{v}"),
+                        None => sys.to_string(),
+                    };
+                    resp.issues.push(ValidationIssue {
+                        severity: "information".into(),
+                        fhir_code: "business-rule".into(),
+                        tx_code: "status-check".into(),
+                        text: format!("Reference to {status} CodeSystem {cs_uri}"),
+                        location: None,
+                        message_id: Some(status_message_id(&status).into()),
+                    });
+                }
+            }
+        }
+    }
+
     build_validate_response(
         resp,
         code,
@@ -284,6 +319,52 @@ async fn build_validate_response_async<B: TerminologyBackend>(
         unknown_system,
         request_path,
     )
+}
+
+/// Collect the standards-status codes (deprecated, withdrawn, draft, etc.)
+/// declared on a CodeSystem or ValueSet resource_json. Used by the
+/// validate-code response builder to emit IG `MSG_DEPRECATED`-style
+/// info-level issues. Returns at most one of each status, in the order:
+/// extension first, then `experimental`, then `status`.
+fn collect_status_check_codes(resource: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |code: &str| {
+        if !code.is_empty() && !out.iter().any(|c| c == code) {
+            out.push(code.to_string());
+        }
+    };
+    if let Some(exts) = resource.get("extension").and_then(|e| e.as_array()) {
+        for ext in exts {
+            if ext.get("url").and_then(|u| u.as_str())
+                == Some(
+                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                )
+            {
+                if let Some(code) = ext.get("valueCode").and_then(|v| v.as_str()) {
+                    push_unique(code);
+                }
+            }
+        }
+    }
+    if resource.get("experimental").and_then(|v| v.as_bool()) == Some(true) {
+        push_unique("experimental");
+    }
+    let status = resource.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if matches!(status, "draft" | "retired") {
+        push_unique(status);
+    }
+    out
+}
+
+fn status_message_id(status: &str) -> &'static str {
+    match status {
+        "deprecated" => "MSG_DEPRECATED",
+        "withdrawn" => "MSG_WITHDRAWN",
+        "experimental" => "MSG_EXPERIMENTAL",
+        "draft" => "MSG_DRAFT",
+        "retired" => "MSG_RETIRED",
+        _ => "MSG_DEPRECATED",
+    }
 }
 
 /// Resolve every `useSupplement` request param against the backend.
