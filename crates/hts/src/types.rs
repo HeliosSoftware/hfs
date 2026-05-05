@@ -231,6 +231,16 @@ pub struct ExpandRequest {
     /// hierarchy instead of a flat list. Pagination is not applied in tree mode.
     #[serde(default)]
     pub hierarchical: Option<bool>,
+    /// `tx-resource` parameters supplied with the request.
+    ///
+    /// Each entry is a FHIR resource (typically a `ValueSet`) whose canonical
+    /// URL becomes resolvable for this single request only — the resource is
+    /// never persisted to the database. Used by the tx-ecosystem IG to provide
+    /// ad-hoc terminology that the caller doesn't want to upload separately.
+    /// Resolution order during nested `compose.include[].valueSet[]` walks:
+    /// `tx-resource` map first, then the local store, then NotFound.
+    #[serde(default)]
+    pub tx_resources: Vec<serde_json::Value>,
 }
 
 /// Response from `ValueSet/$expand`.

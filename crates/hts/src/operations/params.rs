@@ -123,6 +123,17 @@ pub fn find_resource_param(params: &[Value], name: &str) -> Option<Value> {
         .cloned()
 }
 
+/// Collect every `resource`-typed parameter named `name` (handles repeated
+/// `tx-resource` entries that supply ad-hoc terminology only valid for the
+/// current request).
+pub fn collect_resource_params(params: &[Value], name: &str) -> Vec<Value> {
+    params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+        .filter_map(|p| p.get("resource").cloned())
+        .collect()
+}
+
 /// Extract a `valueCodeableConcept` parameter, returning all `(system, code)` pairs.
 ///
 /// Looks for the first parameter named `name` that carries a
