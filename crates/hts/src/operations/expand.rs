@@ -778,16 +778,13 @@ async fn process_expand<B: TerminologyBackend>(
     // its uri). Use a synthetic uri based on the first contributing
     // CodeSystem when available — close enough for the IG fixture pattern.
     if !requested_properties.is_empty() {
-        let primary_system = resp.contains.first().map(|c| c.system.clone());
+        // Emit just the code; the URI's exact form is CS-defined and
+        // synthesising it from the system URL doesn't match the IG's
+        // CS-relative URIs. The validator's $optional$ pattern tolerates
+        // a missing uri.
         let prop_decls: Vec<Value> = requested_properties
             .iter()
-            .map(|code| {
-                let mut entry = json!({"code": code});
-                if let Some(sys) = &primary_system {
-                    entry["uri"] = json!(format!("{sys}/properties#{code}"));
-                }
-                entry
-            })
+            .map(|code| json!({"code": code}))
             .collect();
         expansion["property"] = json!(prop_decls);
     }
