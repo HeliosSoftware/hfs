@@ -364,7 +364,7 @@ async fn process_expand<B: TerminologyBackend>(
     let req = ExpandRequest {
         url,
         value_set,
-        filter,
+        filter: filter.clone(),
         count,
         offset,
         max_expansion_size: Some(state.max_expansion_size),
@@ -523,8 +523,8 @@ async fn process_expand<B: TerminologyBackend>(
         .filter(|p| {
             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
             // Discriminator inputs (identify the ValueSet) — not knobs to echo.
-            // `filter` IS echoed per the IG fixtures (search/* tests).
-            if matches!(name, "url" | "valueSet") {
+            // `filter` is emitted later as a normalised valueString.
+            if matches!(name, "url" | "valueSet" | "filter") {
                 return false;
             }
             // Configuration inputs that the IG validator passes via the
@@ -542,6 +542,12 @@ async fn process_expand<B: TerminologyBackend>(
         })
         .cloned()
         .collect();
+
+    // Emit `filter` as a normalised valueString (the IG fixtures expect that
+    // form regardless of whether the request used valueString or valueUri).
+    if let Some(f) = filter.as_deref() {
+        emitted_params.push(json!({"name": "filter", "valueString": f}));
+    }
 
     // Pull additional default expansion parameters from the source ValueSet's
     // `compose.extension[].valueset-expansion-parameter` entries. The IG fixtures
