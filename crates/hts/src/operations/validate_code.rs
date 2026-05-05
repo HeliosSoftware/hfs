@@ -439,15 +439,27 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // ── Path 2: `coding` parameter (valueCoding) ──────────────────────────────
     if let Some((system, code, _display)) = extract_coding(&params, "coding") {
         // Empty system from extract_coding means the Coding had no system
-        // field — match by code alone.
-        let system_opt = if system.is_empty() {
-            None
-        } else {
-            Some(system.clone())
-        };
+        // field. Per the IG fixtures, that should produce result=false with
+        // a "Coding has no system" message rather than matching by code
+        // alone.
+        if system.is_empty() {
+            return Ok(build_validate_response(
+                ValidateCodeResponse {
+                    result: false,
+                    message: Some("Coding has no system - cannot validate".into()),
+                    display: None,
+                    inactive: None,
+                },
+                Some(&code),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
-            system: system_opt.clone(),
+            system: Some(system.clone()),
             code: code.clone(),
             version: find_str_param(&params, "version"),
             display: find_str_param(&params, "display"),
@@ -465,7 +477,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             &ctx,
             resp,
             Some(&code),
-            system_opt.as_deref(),
+            Some(&system),
             None,
         )
         .await);
