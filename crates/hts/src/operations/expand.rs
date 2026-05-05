@@ -1132,11 +1132,36 @@ async fn process_expand<B: TerminologyBackend>(
         .and_then(|i| i.as_bool())
         == Some(false);
     if active_only_request || compose_inactive_false {
-        let before = resp.contains.len();
-        resp.contains.retain(|c| c.inactive != Some(true));
-        let removed = before - resp.contains.len();
+        // Walk the tree splicing out inactive nodes and promoting their
+        // active descendants up to the parent's level. Mirrors the IG
+        // `parameters/parameters-expand-all-active` semantics: when an
+        // inactive code has active children, those children stay in the
+        // response as roots rather than being dropped with their parent.
+        // Returns the new top-level list and the count of inactive nodes
+        // that were spliced out (used to keep `total` aligned).
+        fn splice_inactive(
+            input: Vec<crate::types::ExpansionContains>,
+        ) -> (Vec<crate::types::ExpansionContains>, u32) {
+            let mut removed: u32 = 0;
+            let mut out: Vec<crate::types::ExpansionContains> = Vec::new();
+            for mut entry in input {
+                let (children, child_removed) = splice_inactive(std::mem::take(&mut entry.contains));
+                removed += child_removed;
+                if entry.inactive == Some(true) {
+                    removed += 1;
+                    out.extend(children);
+                } else {
+                    entry.contains = children;
+                    out.push(entry);
+                }
+            }
+            (out, removed)
+        }
+
+        let (filtered, removed) = splice_inactive(std::mem::take(&mut resp.contains));
+        resp.contains = filtered;
         if let Some(t) = resp.total.as_mut() {
-            *t = t.saturating_sub(removed as u32);
+            *t = t.saturating_sub(removed);
         }
     }
 
