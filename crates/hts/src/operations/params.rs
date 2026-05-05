@@ -94,7 +94,15 @@ pub fn extract_coding(params: &[Value], name: &str) -> Option<(String, String, O
         .iter()
         .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?
         .get("valueCoding")?;
-    let system = coding.get("system").and_then(|v| v.as_str())?.to_string();
+    // FHIR ValueSet/$validate-code allows a Coding without `system` (validate
+    // by code alone, scoped by VS membership). Fall back to an empty string
+    // so downstream paths can detect "no system" without rejecting the
+    // request as malformed.
+    let system = coding
+        .get("system")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let code = coding.get("code").and_then(|v| v.as_str())?.to_string();
     let display = coding
         .get("display")

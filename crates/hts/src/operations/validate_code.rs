@@ -438,9 +438,16 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
 
     // ── Path 2: `coding` parameter (valueCoding) ──────────────────────────────
     if let Some((system, code, _display)) = extract_coding(&params, "coding") {
+        // Empty system from extract_coding means the Coding had no system
+        // field — match by code alone.
+        let system_opt = if system.is_empty() {
+            None
+        } else {
+            Some(system.clone())
+        };
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
-            system: Some(system.clone()),
+            system: system_opt.clone(),
             code: code.clone(),
             version: find_str_param(&params, "version"),
             display: find_str_param(&params, "display"),
@@ -458,7 +465,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             &ctx,
             resp,
             Some(&code),
-            Some(&system),
+            system_opt.as_deref(),
             None,
         )
         .await);
