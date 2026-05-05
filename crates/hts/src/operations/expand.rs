@@ -19,6 +19,7 @@
 //! | `offset` | integer | Zero-based page start |
 //! | `date` | dateTime | Point-in-time ISO-8601 date for evaluation |
 //! | `hierarchical` | boolean | Return a tree-structured expansion instead of a flat list |
+//! | `excludeNested` | boolean | When `false`, return a tree-structured expansion (alias for `hierarchical=true`); when `true` or absent, return a flat list |
 //!
 //! ## Implicit ValueSets
 //!
@@ -686,7 +687,20 @@ async fn process_expand<B: TerminologyBackend>(
                 .map(|v| v as u32)
         });
 
-    let hierarchical = find_str_param(&params, "hierarchical").map(|s| s == "true");
+    // `hierarchical` and `excludeNested` both control nesting:
+    // - `hierarchical=true` (HL7-tx convention) → tree.
+    // - `excludeNested=false` (FHIR R5 §$expand) → tree.
+    //   `excludeNested=true` (or absent) → flat list.
+    // The IG conformance suite's `parameters/parameters-expand-*` fixtures all
+    // pass `excludeNested=false` and expect nested `contains[]`, so we treat
+    // either signal as a request for tree mode.
+    let hierarchical_param = find_str_param(&params, "hierarchical").map(|s| s == "true");
+    let exclude_nested = find_str_param(&params, "excludeNested").map(|s| s == "true");
+    let hierarchical = match (hierarchical_param, exclude_nested) {
+        (Some(true), _) => Some(true),
+        (_, Some(false)) => Some(true),
+        (other, _) => other,
+    };
 
     // ── Resolve supplements (request `useSupplement` params) ────────────────
     // Walk every `useSupplement` and confirm a matching `content=supplement`
@@ -1425,7 +1439,7 @@ pub async fn expand_handler<B: TerminologyBackend>(
 ///
 /// URL query parameters are mapped to FHIR `Parameters` name/value pairs and
 /// processed identically to the POST form.  `url`, `filter`, `count`, `offset`,
-/// `date`, and `hierarchical` are all accepted.
+/// `date`, `hierarchical`, and `excludeNested` are all accepted.
 pub async fn get_expand_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
     headers: HeaderMap,
@@ -1903,6 +1917,49 @@ mod tests {
             .with_state(state)
     }
 
+    // ── excludeNested parameter (tree-mode trigger) ────────────────────────────
+
+    /// Seeds an in-memory backend with a 3-level hierarchy:
+    ///   root → child → grandchild
+    /// plus a sibling "orphan" with no parent. The companion ValueSet
+    /// includes the entire system, so all 4 codes are in the expansion.
+    fn make_app_with_hierarchy() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at)
+                 VALUES ('cs-h', 'http://example.org/cs-h', '1.0', 'HierCS',
+                         'active', 'complete', '2024-01-01', '2024-01-01');
+
+                 INSERT INTO concepts (id, system_id, code, display) VALUES
+                     (10, 'cs-h', 'root',       'Root'),
+                     (11, 'cs-h', 'child',      'Child'),
+                     (12, 'cs-h', 'grandchild', 'Grandchild'),
+                     (13, 'cs-h', 'orphan',     'Orphan');
+
+                 INSERT INTO concept_hierarchy (system_id, parent_code, child_code) VALUES
+                     ('cs-h', 'root',  'child'),
+                     ('cs-h', 'child', 'grandchild');
+
+                 INSERT INTO value_sets
+                     (id, url, name, status, compose_json, created_at, updated_at)
+                 VALUES ('vs-h', 'http://example.org/vs-h', 'HierVS', 'active',
+                         '{\"include\":[{\"system\":\"http://example.org/cs-h\"}]}',
+                         '2024-01-01', '2024-01-01');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
     #[tokio::test]
     async fn expand_with_use_supplement_emits_used_supplement_param() {
         let app = make_supplement_app();
@@ -1951,6 +2008,119 @@ mod tests {
         });
         let resp = post_json(app, "/ValueSet/$expand", body).await;
         assert_eq!(resp.status(), 404);
+    }
+
+    /// `excludeNested=false` should produce a tree (root contains child contains grandchild,
+    /// plus orphan as a sibling root).  Total stays 4 (full count); contains[] has 2 roots.
+    #[tokio::test]
+    async fn expand_exclude_nested_false_returns_tree() {
+        let app = make_app_with_hierarchy();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs-h" },
+                { "name": "excludeNested", "valueBoolean": false }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+
+        // Total reflects the full flat count.
+        assert_eq!(json["expansion"]["total"], 4);
+
+        // Roots: "orphan" and "root".
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 2, "expected 2 root entries (orphan + root)");
+
+        let root = contains
+            .iter()
+            .find(|c| c["code"] == "root")
+            .expect("root should be a top-level entry");
+        let root_children = root["contains"].as_array().unwrap();
+        assert_eq!(root_children.len(), 1);
+        assert_eq!(root_children[0]["code"], "child");
+
+        let grandchildren = root_children[0]["contains"].as_array().unwrap();
+        assert_eq!(grandchildren.len(), 1);
+        assert_eq!(grandchildren[0]["code"], "grandchild");
+    }
+
+    /// `excludeNested=true` (default) should keep the historical flat behaviour.
+    #[tokio::test]
+    async fn expand_exclude_nested_true_returns_flat_list() {
+        let app = make_app_with_hierarchy();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs-h" },
+                { "name": "excludeNested", "valueBoolean": true }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        let json = body_json(resp).await;
+
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 4, "all four codes should appear flat");
+        for c in contains {
+            assert!(
+                c.get("contains").is_none(),
+                "flat entries must not carry nested contains[]"
+            );
+        }
+    }
+
+    /// Omitting both `excludeNested` and `hierarchical` keeps the historical
+    /// flat behaviour — the simple/* IG fixtures rely on this.
+    #[tokio::test]
+    async fn expand_no_nesting_param_returns_flat_list() {
+        let app = make_app_with_hierarchy();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs-h" }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        let json = body_json(resp).await;
+
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 4);
+        for c in contains {
+            assert!(c.get("contains").is_none());
+        }
+    }
+
+    /// `hierarchical=true` (legacy alias) and `excludeNested=false` must agree.
+    #[tokio::test]
+    async fn expand_hierarchical_true_matches_exclude_nested_false() {
+        let app1 = make_app_with_hierarchy();
+        let body1 = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs-h" },
+                { "name": "hierarchical", "valueBoolean": true }
+            ]
+        });
+        let resp1 = body_json(post_json(app1, "/ValueSet/$expand", body1).await).await;
+
+        let app2 = make_app_with_hierarchy();
+        let body2 = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs-h" },
+                { "name": "excludeNested", "valueBoolean": false }
+            ]
+        });
+        let resp2 = body_json(post_json(app2, "/ValueSet/$expand", body2).await).await;
+
+        assert_eq!(
+            resp1["expansion"]["contains"],
+            resp2["expansion"]["contains"]
+        );
     }
 }
 // rebuild marker
