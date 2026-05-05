@@ -524,7 +524,9 @@ async fn process_expand<B: TerminologyBackend>(
             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
             // Discriminator inputs (identify the ValueSet) — not knobs to echo.
             // `filter` is emitted later as a normalised valueString.
-            if matches!(name, "url" | "valueSet" | "filter") {
+            // `property` is a request-side filter for contains[].property —
+            // the IG fixtures don't echo it back.
+            if matches!(name, "url" | "valueSet" | "filter" | "property") {
                 return false;
             }
             // Configuration inputs that the IG validator passes via the
