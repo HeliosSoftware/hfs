@@ -19,7 +19,7 @@ use r2d2::Pool;
 #[cfg(feature = "sqlite")]
 use r2d2_sqlite::SqliteConnectionManager;
 #[cfg(feature = "sqlite")]
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -180,7 +180,39 @@ fn write_code_system(
     // (e.g. tx-ecosystem `version/codesystem-version-1.json` + `-2.json` both
     // declare `"id":"version"`). The pipe character is reserved in canonical
     // URLs so it cannot collide with a legitimate FHIR id.
-    let storage_id = storage_id_for(&cs.id, cs.version.as_deref());
+    //
+    // When two distinct CodeSystems share both fhir-id AND version (e.g. two
+    // unrelated CSes ship `id`="status" with no version), reuse the existing
+    // row for the matching (url, version) or mint a fresh UUID rather than
+    // letting the second import collide on the primary key and silently get
+    // dropped by INSERT OR IGNORE.
+    let preferred_id = storage_id_for(&cs.id, cs.version.as_deref());
+    let existing_for_url_version: Option<String> = conn
+        .query_row(
+            "SELECT id FROM code_systems \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![cs.url, cs.version],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let storage_id = if let Some(id) = existing_for_url_version {
+        id
+    } else {
+        let preferred_taken: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_systems WHERE id = ?1",
+                rusqlite::params![preferred_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            > 0;
+        if preferred_taken {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            preferred_id
+        }
+    };
 
     // Upsert keyed on (url, version): a re-import of the same version updates
     // the existing row rather than creating a new one or wiping sibling
@@ -404,8 +436,38 @@ fn write_value_set(
     // Synthetic storage id: `<fhir-id>|<version>` (or `<fhir-id>` when version
     // is absent). Mirrors the code_systems strategy so multiple ValueSets that
     // share a canonical URL but differ in version don't collide on either the
-    // primary key or the composite UNIQUE index.
-    let storage_id = storage_id_for(&vs.id, vs.version.as_deref());
+    // primary key or the composite UNIQUE index. When two distinct VSes share
+    // both a fhir-id AND a version (e.g. tx-ecosystem ships several VSes
+    // whose `id` is "version-all" but whose canonical URLs differ), reuse the
+    // existing row for the matching (url, version) or mint a fresh UUID so
+    // the second import doesn't silently get dropped by INSERT OR IGNORE.
+    let preferred_id = storage_id_for(&vs.id, vs.version.as_deref());
+    let existing_for_url_version: Option<String> = conn
+        .query_row(
+            "SELECT id FROM value_sets \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![vs.url, vs.version],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let storage_id = if let Some(id) = existing_for_url_version {
+        id
+    } else {
+        let preferred_taken: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM value_sets WHERE id = ?1",
+                rusqlite::params![preferred_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            > 0;
+        if preferred_taken {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            preferred_id
+        }
+    };
 
     // Upsert keyed on (url, version): a re-import refreshes the existing row
     // for the same version without disturbing sibling versions. The composite

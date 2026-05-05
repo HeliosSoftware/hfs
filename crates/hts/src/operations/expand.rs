@@ -884,19 +884,39 @@ async fn process_expand<B: TerminologyBackend>(
     // ── Look up source ValueSet (used for parameter extension, metadata copy,
     // and to discover the `valueset-supplement` extension that auto-applies a
     // supplement without needing an explicit `useSupplement` request param). ──
+    // Honour the requested valueSetVersion (when present) so the metadata
+    // we echo back — including the top-level `version` field — matches the
+    // ValueSet that was actually used for expansion. With multiple VSes
+    // sharing a canonical URL, a URL-only search would otherwise pick
+    // whichever row came first in created_at order.
+    let req_vs_version = find_str_param(&params, "valueSetVersion");
     let source_vs: Option<Value> = if let Some(ref u) = url_for_neg_cache {
         ValueSetOperations::search(
             state.backend(),
             &ctx,
             crate::types::ResourceSearchQuery {
                 url: Some(u.clone()),
-                count: Some(1),
+                version: req_vs_version.clone(),
+                count: Some(20),
                 ..Default::default()
             },
         )
         .await
         .ok()
-        .and_then(|mut v| v.pop())
+        .and_then(|mut v| {
+            // If a specific version was requested, return only that row.
+            // Otherwise pick the highest version (matches resolve_value_set_versioned).
+            if req_vs_version.is_some() {
+                v.into_iter().next()
+            } else {
+                v.sort_by(|a, b| {
+                    let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                    let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                    bv.cmp(av)
+                });
+                v.into_iter().next()
+            }
+        })
     } else {
         value_set_for_response.clone()
     };
