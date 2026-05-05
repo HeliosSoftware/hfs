@@ -549,10 +549,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     })
                             })
                             .unwrap_or(false);
-                        tracing::warn!(
-                            url,
-                            compose_is_enumerated,
-                            "tx-debug: compose_is_enumerated detection"
+                        eprintln!(
+                            "tx-debug url={url} compose_is_enumerated={compose_is_enumerated} \
+                             hierarchical={:?} hierarchical_explicit={}",
+                            req.hierarchical, req.hierarchical_explicit
                         );
 
                         // Normal path: try the expansion cache first.
