@@ -3975,6 +3975,10 @@ fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool 
     .is_ok()
 }
 
+// Keep all message-format inputs explicit so the IG-fixture text strings are
+// composed in one place — splitting into a struct just to placate the lint
+// would scatter the format logic across the file.
+#[allow(clippy::too_many_arguments)]
 fn finish_validate_code_response(
     found: Option<ExpansionContains>,
     code: &str,

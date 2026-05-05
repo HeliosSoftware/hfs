@@ -23,12 +23,18 @@ pub struct PropertyValue {
 }
 
 /// An alternate name or translation for a concept.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DesignationValue {
     pub language: Option<String>,
     pub use_system: Option<String>,
     pub use_code: Option<String>,
     pub value: String,
+    /// CodeSystem URL (`url|version` when known) that contributed this
+    /// designation. `None` for the base CodeSystem; `Some` when the value was
+    /// merged in from an applied supplement (FHIR `useSupplement`). Surfaced
+    /// in `$lookup` responses as a `designation.source` part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 // ─── $lookup ──────────────────────────────────────────────────────────────────
@@ -52,6 +58,14 @@ pub struct LookupRequest {
     /// `$.date` field is ≤ this value are considered.
     #[serde(default)]
     pub date: Option<String>,
+    /// Canonical URLs of CodeSystem supplements to apply on top of the base
+    /// CodeSystem. Each must be the URL of a stored CodeSystem with
+    /// `content=supplement` and `supplements=<base url>`. The supplement's
+    /// designations and properties for the requested code (matched by code)
+    /// are merged into the response. See FHIR R5 §4.7.10 (CodeSystem
+    /// supplements) and the IG `useSupplement` parameter.
+    #[serde(default)]
+    pub use_supplements: Vec<String>,
 }
 
 /// Response from `CodeSystem/$lookup`.

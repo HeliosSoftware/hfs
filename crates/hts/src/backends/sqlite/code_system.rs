@@ -14,7 +14,9 @@ use helios_persistence::tenant::TenantContext;
 use rusqlite::OptionalExtension;
 
 use crate::error::HtsError;
-use crate::traits::{CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags};
+use crate::traits::{
+    CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags, SupplementInfo,
+};
 use crate::types::{
     DesignationValue, LookupRequest, LookupResponse, PropertyValue, ResourceSearchQuery,
     SubsumesRequest, SubsumesResponse, SubsumptionOutcome, ValidateCodeRequest,
@@ -338,6 +340,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     use_system,
                     use_code,
                     value,
+                    source: None,
                 });
             }
             Ok(out)
@@ -637,6 +640,242 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
     }
+
+    // ── Supplements ──────────────────────────────────────────────────────────
+    //
+    // Supplements are stored in the same `code_systems` table as any other
+    // CodeSystem; the only distinguishing fields are `content='supplement'`
+    // and a `supplements` field on the resource_json pointing at the URL of
+    // the base CS being modified. We deliberately do NOT add a column to the
+    // schema for the supplement target — the value lives in `resource_json`
+    // and is read on demand. This keeps the schema migration-free.
+    async fn supplement_target(
+        &self,
+        _ctx: &TenantContext,
+        supplement_url: &str,
+    ) -> Result<Option<SupplementInfo>, HtsError> {
+        let pool = self.pool().clone();
+        let supplement_url = supplement_url.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            // Read content + resource_json + version in one query so we can
+            // confirm the row really is a supplement before returning.
+            let row: Option<(String, Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT content, version, json_extract(resource_json, '$.supplements')
+                     FROM code_systems
+                     WHERE url = ?1
+                     LIMIT 1",
+                    rusqlite::params![supplement_url],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let Some((content, version, target)) = row else {
+                return Ok(None);
+            };
+            if content != "supplement" {
+                return Ok(None);
+            }
+            let target_url = match target {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let supplement_canonical = match version {
+                Some(v) => format!("{supplement_url}|{v}"),
+                None => supplement_url.clone(),
+            };
+            Ok(Some(SupplementInfo {
+                target_url,
+                supplement_canonical,
+            }))
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn supplement_designations(
+        &self,
+        _ctx: &TenantContext,
+        supplement_urls: &[String],
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<ConceptDesignation>>, HtsError> {
+        if supplement_urls.is_empty() || codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let pool = self.pool().clone();
+        let supplement_urls = supplement_urls.to_vec();
+        let codes = codes.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+            // Two IN-clauses: one for the supplement URL set, one for the
+            // code set. We also pull s.url and s.version so the response can
+            // report `source = "url|version"`.
+            let url_ph = (1..=supplement_urls.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let code_ph = (supplement_urls.len() + 1..=supplement_urls.len() + codes.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT c.code, cd.language, cd.use_system, cd.use_code, cd.value,
+                        s.url, s.version
+                 FROM concept_designations cd
+                 JOIN concepts c ON c.id = cd.concept_id
+                 JOIN code_systems s ON s.id = c.system_id
+                 WHERE s.url IN ({url_ph})
+                   AND s.content = 'supplement'
+                   AND c.code IN ({code_ph})",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let mut params: Vec<&dyn rusqlite::ToSql> =
+                Vec::with_capacity(supplement_urls.len() + codes.len());
+            for u in &supplement_urls {
+                params.push(u as &dyn rusqlite::ToSql);
+            }
+            for c in &codes {
+                params.push(c as &dyn rusqlite::ToSql);
+            }
+            let mut out: std::collections::HashMap<String, Vec<ConceptDesignation>> =
+                std::collections::HashMap::new();
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            for r in rows {
+                let (code, language, use_system, use_code, value, supp_url, supp_ver) =
+                    r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let source = match supp_ver {
+                    Some(v) => format!("{supp_url}|{v}"),
+                    None => supp_url,
+                };
+                out.entry(code).or_default().push(ConceptDesignation {
+                    language,
+                    use_system,
+                    use_code,
+                    value,
+                    source: Some(source),
+                });
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn supplement_property_values(
+        &self,
+        _ctx: &TenantContext,
+        supplement_urls: &[String],
+        codes: &[String],
+        properties: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+        if supplement_urls.is_empty() || codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        // Empty `properties` slice = "every property defined on the
+        // matching supplement concepts". Used by lookup wildcard mode.
+        let want_all_props = properties.is_empty();
+        let pool = self.pool().clone();
+        let supplement_urls = supplement_urls.to_vec();
+        let codes = codes.to_vec();
+        let properties = properties.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            let mut idx = 1usize;
+            let url_ph = (idx..idx + supplement_urls.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            idx += supplement_urls.len();
+            let code_ph = (idx..idx + codes.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            idx += codes.len();
+            let prop_clause = if want_all_props {
+                String::new()
+            } else {
+                let prop_ph = (idx..idx + properties.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(" AND cp.property IN ({prop_ph})")
+            };
+            let sql = format!(
+                "SELECT c.code, cp.property, cp.value
+                 FROM concept_properties cp
+                 JOIN concepts c ON c.id = cp.concept_id
+                 JOIN code_systems s ON s.id = c.system_id
+                 WHERE s.url IN ({url_ph})
+                   AND s.content = 'supplement'
+                   AND c.code IN ({code_ph})
+                   {prop_clause}",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let mut params: Vec<&dyn rusqlite::ToSql> =
+                Vec::with_capacity(supplement_urls.len() + codes.len() + properties.len());
+            for u in &supplement_urls {
+                params.push(u as &dyn rusqlite::ToSql);
+            }
+            for c in &codes {
+                params.push(c as &dyn rusqlite::ToSql);
+            }
+            if !want_all_props {
+                for p in &properties {
+                    params.push(p as &dyn rusqlite::ToSql);
+                }
+            }
+            let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+                std::collections::HashMap::new();
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            for r in rows {
+                let (code, prop, value) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                out.entry(code).or_default().push((prop, value));
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
 }
 
 // ── Private DB helpers ─────────────────────────────────────────────────────────
@@ -828,6 +1067,7 @@ fn fetch_designations(
             use_system: row.get(1)?,
             use_code: row.get(2)?,
             value: row.get(3)?,
+            source: None,
         })
     })
     .map_err(|e| HtsError::StorageError(e.to_string()))?

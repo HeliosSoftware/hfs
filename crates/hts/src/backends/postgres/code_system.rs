@@ -251,6 +251,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 use_system: row.get(2),
                 use_code: row.get(3),
                 value: row.get(4),
+                source: None,
             });
         }
         Ok(out)
@@ -570,6 +571,7 @@ async fn fetch_designations(
             use_system: row.get(1),
             use_code: row.get(2),
             value: row.get(3),
+            source: None,
         })
         .collect())
 }

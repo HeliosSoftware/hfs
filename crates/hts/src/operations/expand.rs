@@ -42,7 +42,7 @@ use serde_json::{Value, json};
 
 use crate::error::HtsError;
 use crate::state::{AppState, EXPAND_CACHE_MAX, ExpandCacheKey, NOT_FOUND_CACHE_MAX};
-use crate::traits::{TerminologyBackend, ValueSetOperations};
+use crate::traits::{SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ExpandRequest, ExpansionContains};
 
 use super::format::{ResponseFormat, json_to_fhir_xml, negotiate_format};
@@ -184,6 +184,50 @@ fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
         item["contains"] = json!(nested);
     }
     item
+}
+
+/// Resolve `is_abstract` / `inactive` flags on each expansion entry via a
+/// per-system batched lookup. Backends construct ExpansionContains entries
+/// with both flags as `None`; this fills them so $expand responses surface
+/// the standard FHIR contains[].abstract / contains[].inactive fields.
+fn populate_concept_flags<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use std::collections::HashMap;
+        // Bucket codes per system so we issue one query per system.
+        let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.as_str())
+                .or_default()
+                .push(c.code.clone());
+        }
+        let mut flag_map: HashMap<(String, String), crate::traits::ConceptExpansionFlags> =
+            HashMap::new();
+        for (system, codes) in &by_system {
+            if let Ok(flags) = backend.concept_expansion_flags(ctx, system, codes).await {
+                for (code, f) in flags {
+                    flag_map.insert(((*system).to_string(), code), f);
+                }
+            }
+        }
+        for c in contains.iter_mut() {
+            if let Some(f) = flag_map.get(&(c.system.clone(), c.code.clone())) {
+                if f.is_abstract {
+                    c.is_abstract = Some(true);
+                }
+                if f.inactive {
+                    c.inactive = Some(true);
+                }
+            }
+            if !c.contains.is_empty() {
+                populate_concept_flags(backend, ctx, &mut c.contains).await;
+            }
+        }
+    })
 }
 
 /// Populate `designations` on each expansion entry in-place via a per-system
@@ -345,6 +389,127 @@ fn parse_display_language(raw: &str) -> Option<DisplayLangSpec> {
 /// rotates the CodeSystem's original-language display into the designation
 /// list — the IG fixtures expect this `use` coding to flag that entry.
 const HL7_TERM_MAINT_INFRA_SYSTEM: &str = "http://terminology.hl7.org/CodeSystem/hl7TermMaintInfra";
+
+/// Append designations contributed by applied CodeSystem supplements onto
+/// each expansion entry. Mirrors [`populate_designations`] but reads via the
+/// backend's `supplement_designations` API and merges into the existing
+/// `designations` vec rather than replacing it. Walks nested `contains[]`
+/// recursively.
+///
+/// Supplements live in the same `code_systems` table (with `content =
+/// 'supplement'`) so we look them up by URL — the supplement-side rows are
+/// matched to base concepts by code only. The backend tags each returned
+/// row with `source = "url|version"` so callers can emit the FHIR
+/// `designation.source` part on `$lookup`; for `$expand.contains[]` the
+/// source is informational only.
+fn apply_supplement_designations<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+    supplement_urls: &'a [String],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::ExpansionContainsDesignation;
+        use std::collections::HashMap;
+        if supplement_urls.is_empty() {
+            return;
+        }
+        let mut codes: Vec<String> = Vec::new();
+        for c in contains.iter() {
+            if !codes.contains(&c.code) {
+                codes.push(c.code.clone());
+            }
+        }
+        let map = backend
+            .supplement_designations(ctx, supplement_urls, &codes)
+            .await
+            .unwrap_or_default();
+        // Build a flat code → designations map keyed only by code (supplements
+        // are typically scoped to a single base CS, so collisions on code
+        // across systems are unusual and acceptable here).
+        let mut by_code: HashMap<String, Vec<ExpansionContainsDesignation>> = HashMap::new();
+        for (code, list) in map {
+            let entries = list
+                .into_iter()
+                .map(|d| ExpansionContainsDesignation {
+                    language: d.language,
+                    use_system: d.use_system,
+                    use_code: d.use_code,
+                    value: d.value,
+                })
+                .collect();
+            by_code.insert(code, entries);
+        }
+        for c in contains.iter_mut() {
+            if let Some(extra) = by_code.get(&c.code) {
+                for d in extra {
+                    c.designations.push(d.clone());
+                }
+            }
+            if !c.contains.is_empty() {
+                apply_supplement_designations(backend, ctx, &mut c.contains, supplement_urls).await;
+            }
+        }
+    })
+}
+
+/// Append property values contributed by applied CodeSystem supplements onto
+/// each expansion entry. Mirrors [`populate_properties`] but reads via the
+/// backend's `supplement_property_values` API. Walks nested `contains[]`
+/// recursively. When a supplement defines a property for a code that the
+/// base CS doesn't, the supplement value is added to the entry; values
+/// defined in BOTH base and supplement are surfaced once each (the IG
+/// fixtures don't deduplicate by property code).
+fn apply_supplement_properties<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+    supplement_urls: &'a [String],
+    properties: &'a [String],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::ExpansionContainsProperty;
+        use std::collections::HashMap;
+        if supplement_urls.is_empty() || properties.is_empty() {
+            return;
+        }
+        let mut codes: Vec<String> = Vec::new();
+        for c in contains.iter() {
+            if !codes.contains(&c.code) {
+                codes.push(c.code.clone());
+            }
+        }
+        let map = backend
+            .supplement_property_values(ctx, supplement_urls, &codes, properties)
+            .await
+            .unwrap_or_default();
+        let mut by_code: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (code, list) in map {
+            by_code.insert(code, list);
+        }
+        for c in contains.iter_mut() {
+            if let Some(extra) = by_code.get(&c.code) {
+                for (prop, value) in extra {
+                    c.properties.push(ExpansionContainsProperty {
+                        code: prop.clone(),
+                        value_type: "Code".to_string(),
+                        value: value.clone(),
+                    });
+                }
+            }
+            if !c.contains.is_empty() {
+                apply_supplement_properties(
+                    backend,
+                    ctx,
+                    &mut c.contains,
+                    supplement_urls,
+                    properties,
+                )
+                .await;
+            }
+        }
+    })
+}
 
 /// Replace each contains[] entry's `display` with a designation matching the
 /// requested displayLanguage. Mirrors the `lookup()` language-aware behavior
@@ -523,34 +688,29 @@ async fn process_expand<B: TerminologyBackend>(
 
     let hierarchical = find_str_param(&params, "hierarchical").map(|s| s == "true");
 
-    // Reject early when the request asks for a `useSupplement` we don't have.
-    // The IG fixtures expect 4xx for unknown supplements (parameters/* and
-    // extensions/* tests). Iterate every useSupplement entry; a missing one
-    // becomes an InvalidRequest so it surfaces as 400 with a descriptive
-    // OperationOutcome.
-    {
-        let supplements: Vec<&str> = params
-            .iter()
-            .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
-            .filter_map(|p| {
-                p.get("valueCanonical")
-                    .or_else(|| p.get("valueUri"))
-                    .and_then(|v| v.as_str())
-            })
-            .collect();
-        if !supplements.is_empty() {
-            let ctx = TenantContext::system();
-            for s in &supplements {
-                // Strip any |version suffix for the lookup.
-                let bare = s.split('|').next().unwrap_or(s);
-                let exists = state
-                    .backend()
-                    .code_system_version_for_url(&ctx, bare)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if !exists {
+    // ── Resolve supplements (request `useSupplement` params) ────────────────
+    // Walk every `useSupplement` and confirm a matching `content=supplement`
+    // CodeSystem exists. Unknown supplements become a NotFound error so the
+    // bad-supplement IG fixtures reject with 4xx. The resolved info list is
+    // applied later, after expansion completes.
+    let mut applied_supplements: Vec<SupplementInfo> = Vec::new();
+    let mut supplement_inputs: Vec<String> = params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
+        .filter_map(|p| {
+            p.get("valueCanonical")
+                .or_else(|| p.get("valueUri"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    if !supplement_inputs.is_empty() {
+        let ctx = TenantContext::system();
+        for raw in &supplement_inputs {
+            let bare = raw.split('|').next().unwrap_or(raw);
+            match state.backend().supplement_target(&ctx, bare).await? {
+                Some(info) => applied_supplements.push(info),
+                None => {
                     return Err(HtsError::NotFound(format!(
                         "Required supplement not found: {bare}"
                     )));
@@ -558,6 +718,8 @@ async fn process_expand<B: TerminologyBackend>(
             }
         }
     }
+    // (bare_supplement_urls is rebuilt below after the source-VS extension
+    // pass appends any auto-applied supplements to `supplement_inputs`.)
 
     // ── Cache lookup ─────────────────────────────────────────────────────────
     // Build a stable key from the request parameters. For inline ValueSets
@@ -666,6 +828,73 @@ async fn process_expand<B: TerminologyBackend>(
         Err(e) => return Err(e),
     };
 
+    // ── Populate abstract / inactive flags ───────────────────────────────────
+    // Backends construct ExpansionContains with both flags as None; resolve
+    // them here in a per-system batch so the per-concept SQL stays cold-path.
+    populate_concept_flags(state.backend(), &ctx, &mut resp.contains).await;
+
+    // ── Look up source ValueSet (used for parameter extension, metadata copy,
+    // and to discover the `valueset-supplement` extension that auto-applies a
+    // supplement without needing an explicit `useSupplement` request param). ──
+    let source_vs: Option<Value> = if let Some(ref u) = url_for_neg_cache {
+        ValueSetOperations::search(
+            state.backend(),
+            &ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some(u.clone()),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()
+        .and_then(|mut v| v.pop())
+    } else {
+        value_set_for_response.clone()
+    };
+
+    // Pull additional supplements pinned by the source VS via the
+    // `valueset-supplement` extension (per HL7 IG `extensions/extensions-all`,
+    // which omits `useSupplement` from the request and relies on the VS to
+    // declare which supplement applies). Resolve each via `supplement_target`,
+    // skipping any URL we can't validate (so missing supplements don't kill
+    // an expansion that the IG fixture marks valid).
+    if let Some(vs) = source_vs.as_ref() {
+        if let Some(exts) = vs.get("extension").and_then(|e| e.as_array()) {
+            for ext in exts {
+                if ext.get("url").and_then(|u| u.as_str())
+                    != Some("http://hl7.org/fhir/StructureDefinition/valueset-supplement")
+                {
+                    continue;
+                }
+                let raw = match ext
+                    .get("valueCanonical")
+                    .or_else(|| ext.get("valueUri"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let bare = raw.split('|').next().unwrap_or(&raw).to_string();
+                if supplement_inputs
+                    .iter()
+                    .any(|s| s.split('|').next() == Some(&bare))
+                {
+                    continue;
+                }
+                if let Ok(Some(info)) = state.backend().supplement_target(&ctx, &bare).await {
+                    supplement_inputs.push(raw.clone());
+                    applied_supplements.push(info);
+                }
+            }
+        }
+    }
+    // Rebuild bare_supplement_urls including any VS-extension additions.
+    let bare_supplement_urls: Vec<String> = supplement_inputs
+        .iter()
+        .map(|s| s.split('|').next().unwrap_or(s).to_string())
+        .collect();
+
     // ── Populate designations (only if explicitly requested) ─────────────────
     let include_designations = params
         .iter()
@@ -674,6 +903,18 @@ async fn process_expand<B: TerminologyBackend>(
         .unwrap_or(false);
     if include_designations {
         populate_designations(state.backend(), &ctx, &mut resp.contains).await;
+        // After base designations are loaded, append any supplement-derived
+        // entries so contains[].designation contains BOTH the base and
+        // supplement values for each concept (matched by code).
+        if !bare_supplement_urls.is_empty() {
+            apply_supplement_designations(
+                state.backend(),
+                &ctx,
+                &mut resp.contains,
+                &bare_supplement_urls,
+            )
+            .await;
+        }
     }
 
     // ── Populate properties (only for codes named in `property` params) ──────
@@ -695,6 +936,16 @@ async fn process_expand<B: TerminologyBackend>(
             &requested_properties,
         )
         .await;
+        if !bare_supplement_urls.is_empty() {
+            apply_supplement_properties(
+                state.backend(),
+                &ctx,
+                &mut resp.contains,
+                &bare_supplement_urls,
+                &requested_properties,
+            )
+            .await;
+        }
     }
 
     // ── Per-system CodeSystem metadata lookup (one search per distinct URL) ──
@@ -769,24 +1020,6 @@ async fn process_expand<B: TerminologyBackend>(
             .await;
         }
     }
-
-    // ── Look up source ValueSet (used for both parameter extension and metadata copy) ──
-    let source_vs: Option<Value> = if let Some(ref u) = url_for_neg_cache {
-        ValueSetOperations::search(
-            state.backend(),
-            &ctx,
-            crate::types::ResourceSearchQuery {
-                url: Some(u.clone()),
-                count: Some(1),
-                ..Default::default()
-            },
-        )
-        .await
-        .ok()
-        .and_then(|mut v| v.pop())
-    } else {
-        value_set_for_response.clone()
-    };
 
     // ── activeOnly / compose.inactive=false filter ──────────────────────────
     // The IG fixtures drop inactive concepts when EITHER:
@@ -1010,6 +1243,18 @@ async fn process_expand<B: TerminologyBackend>(
         }
     }
     emitted_params.extend(warning_params);
+
+    // ── used-supplement entries ──────────────────────────────────────────────
+    // Echo each applied supplement so the IG validator sees we honored it
+    // (matches `parameters-expand-supplement-good` and the
+    // `extensions/expand-echo-all` fixtures). Value is the supplement's
+    // canonical (`url|version` when stored).
+    for info in &applied_supplements {
+        emitted_params.push(json!({
+            "name": "used-supplement",
+            "valueUri": info.supplement_canonical,
+        }));
+    }
 
     // Append any expansion warnings as parameter entries with name=warning.
     for w in &resp.warnings {
@@ -1609,6 +1854,103 @@ mod tests {
         // No real preferred tag — caller should treat as "no displayLanguage".
         assert!(parse_display_language("*").is_none());
         assert!(parse_display_language("*; q=0").is_none());
+    }
+
+    // ── useSupplement (IG `parameters-expand-supplement-good`) ────────────────
+
+    fn make_supplement_app() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, status, content, created_at, updated_at, resource_json)
+                 VALUES ('base', 'http://hl7.org/fhir/test/CodeSystem/extensions', '5.0.0',
+                         'active', 'complete',
+                         '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\"}');
+
+                 INSERT INTO code_systems
+                     (id, url, version, status, content, created_at, updated_at, resource_json)
+                 VALUES ('supp', 'http://hl7.org/fhir/test/CodeSystem/supplement', '0.1.1',
+                         'active', 'supplement',
+                         '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\",\"supplements\":\"http://hl7.org/fhir/test/CodeSystem/extensions\"}');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (20, 'base', 'code1', 'Display 1'),
+                        (21, 'supp', 'code1', NULL);
+
+                 INSERT INTO concept_designations (concept_id, language, value)
+                 VALUES (21, 'nl', 'ectenoot');
+
+                 INSERT INTO value_sets
+                     (id, url, status, compose_json, created_at, updated_at, resource_json)
+                 VALUES ('vs-extns', 'http://hl7.org/fhir/test/ValueSet/extensions-all-ns',
+                         'active',
+                         '{\"include\":[{\"system\":\"http://hl7.org/fhir/test/CodeSystem/extensions\"}]}',
+                         '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"ValueSet\"}');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn expand_with_use_supplement_emits_used_supplement_param() {
+        let app = make_supplement_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://hl7.org/fhir/test/ValueSet/extensions-all-ns"},
+                {"name": "useSupplement", "valueCanonical": "http://hl7.org/fhir/test/CodeSystem/supplement"},
+                {"name": "includeDesignations", "valueBoolean": true}
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["expansion"]["parameter"].as_array().unwrap();
+        let used = params
+            .iter()
+            .find(|p| p["name"] == "used-supplement")
+            .expect("used-supplement parameter expected in expansion.parameter");
+        assert_eq!(
+            used["valueUri"],
+            "http://hl7.org/fhir/test/CodeSystem/supplement|0.1.1"
+        );
+
+        // Designation merged into contains[code1].
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        let code1 = contains.iter().find(|c| c["code"] == "code1").unwrap();
+        let designations = code1["designation"].as_array().unwrap();
+        assert!(
+            designations
+                .iter()
+                .any(|d| d["value"] == "ectenoot" && d["language"] == "nl"),
+            "supplement designation 'ectenoot' must appear in contains[code1].designation"
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_unknown_supplement_returns_404() {
+        let app = make_supplement_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://hl7.org/fhir/test/ValueSet/extensions-all-ns"},
+                {"name": "useSupplement", "valueCanonical": "http://does-not-exist/cs"}
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 404);
     }
 }
 // rebuild marker

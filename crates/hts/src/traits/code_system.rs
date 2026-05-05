@@ -112,6 +112,68 @@ pub trait CodeSystemOperations: Send + Sync {
         system_url: &str,
         codes: &[String],
     ) -> Result<std::collections::HashMap<String, ConceptExpansionFlags>, HtsError>;
+
+    /// Resolve a supplement CS canonical URL to the (system_url, version)
+    /// pair stored on the supplement resource itself.
+    ///
+    /// Returns `Ok(Some((url, Some(version))))` when the supplement is stored
+    /// and is a `content=supplement` CodeSystem, `Ok(None)` when no such
+    /// supplement exists. The default implementation returns `Ok(None)` so
+    /// backends without supplement support degrade silently.
+    async fn supplement_target(
+        &self,
+        _ctx: &TenantContext,
+        _supplement_url: &str,
+    ) -> Result<Option<SupplementInfo>, HtsError> {
+        Ok(None)
+    }
+
+    /// Batch-fetch designations contributed by named CodeSystem supplements.
+    ///
+    /// Mirrors [`Self::concept_designations`] but reads from CSes whose URLs
+    /// are listed in `supplement_urls`. Each returned designation is tagged
+    /// with `source = "url|version"` so callers can emit the FHIR
+    /// `designation.source` part on `$lookup` responses (per IG fixture
+    /// `parameters-lookup-supplement-good`).
+    ///
+    /// Default implementation returns an empty map so backends without
+    /// supplement support behave as if no supplement data exists.
+    async fn supplement_designations(
+        &self,
+        _ctx: &TenantContext,
+        _supplement_urls: &[String],
+        _codes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<ConceptDesignation>>, HtsError> {
+        Ok(std::collections::HashMap::new())
+    }
+
+    /// Batch-fetch concept-property values contributed by named CodeSystem
+    /// supplements. Mirrors [`Self::concept_property_values`] but for
+    /// supplement CodeSystems. Returns `(property, value)` pairs grouped by
+    /// concept code.
+    async fn supplement_property_values(
+        &self,
+        _ctx: &TenantContext,
+        _supplement_urls: &[String],
+        _codes: &[String],
+        _properties: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+        Ok(std::collections::HashMap::new())
+    }
+}
+
+/// Resolved supplement metadata returned by
+/// [`CodeSystemOperations::supplement_target`].
+///
+/// `target_url` is the URL of the base CodeSystem the supplement modifies
+/// (read from the supplement's `CodeSystem.supplements` field).
+/// `supplement_canonical` is the supplement's own canonical, ready to drop
+/// into a `used-supplement` parameter (`"url|version"` when version is
+/// available).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupplementInfo {
+    pub target_url: String,
+    pub supplement_canonical: String,
 }
 
 /// Per-concept flags surfaced in `expansion.contains[]`.
@@ -124,10 +186,21 @@ pub struct ConceptExpansionFlags {
 }
 
 /// A single designation row for a concept (translation or alternate label).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `source` is the CodeSystem URL (with optional `|version`) that contributed
+/// this designation. For designations defined in the base CodeSystem itself
+/// `source` is left as `None`; for designations supplied by an applied
+/// CodeSystem supplement (`useSupplement`) `source` is set so the operations
+/// layer can emit a `designation.source` part on `$lookup` responses (per IG
+/// fixture `parameters-lookup-supplement-good`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConceptDesignation {
     pub language: Option<String>,
     pub use_system: Option<String>,
     pub use_code: Option<String>,
     pub value: String,
+    /// CodeSystem URL (`url|version` when known) of the CS row that produced
+    /// this designation. `None` for the base CodeSystem; populated when the
+    /// designation comes from an applied supplement.
+    pub source: Option<String>,
 }
