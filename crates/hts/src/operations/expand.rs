@@ -1018,6 +1018,47 @@ async fn process_expand<B: TerminologyBackend>(
             )
             .await;
         }
+
+        // Apply the `designation` filter parameters when supplied. Each
+        // entry uses the FHIR token shape `<system>|<code>`. The
+        // `urn:ietf:bcp:47|<lang>` family pins a language; otherwise
+        // `<use-system>|<use-code>` pins designation.use. The IG fixtures
+        // (language/expand-echo-en-designation) expect codes whose
+        // matching designations don't exist to ship with no designation
+        // array at all.
+        let designation_filters: Vec<(String, String)> = params
+            .iter()
+            .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("designation"))
+            .filter_map(|p| {
+                p.get("valueString")
+                    .or_else(|| p.get("valueCode"))
+                    .and_then(|v| v.as_str())
+            })
+            .filter_map(|s| s.split_once('|').map(|(a, b)| (a.to_string(), b.to_string())))
+            .collect();
+        if !designation_filters.is_empty() {
+            fn filter_designations(
+                contains: &mut [crate::types::ExpansionContains],
+                filters: &[(String, String)],
+            ) {
+                for c in contains.iter_mut() {
+                    c.designations.retain(|d| {
+                        filters.iter().any(|(sys, code)| {
+                            if sys == "urn:ietf:bcp:47" {
+                                d.language.as_deref() == Some(code.as_str())
+                            } else {
+                                d.use_system.as_deref() == Some(sys.as_str())
+                                    && d.use_code.as_deref() == Some(code.as_str())
+                            }
+                        })
+                    });
+                    if !c.contains.is_empty() {
+                        filter_designations(&mut c.contains, filters);
+                    }
+                }
+            }
+            filter_designations(&mut resp.contains, &designation_filters);
+        }
     }
 
     // ── Populate properties (only for codes named in `property` params) ──────
