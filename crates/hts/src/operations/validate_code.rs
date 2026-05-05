@@ -252,6 +252,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     system: Option<&str>,
     codeable_concept: Option<&Value>,
     request_path: RequestPath,
+    value_set_url: Option<&str>,
 ) -> Value {
     // Prefer the system the caller passed; otherwise fall back to whatever
     // the backend inferred from the VS expansion (e.g. inferSystem=true).
@@ -302,6 +303,41 @@ async fn build_validate_response_async<B: TerminologyBackend>(
                         fhir_code: "business-rule".into(),
                         tx_code: "status-check".into(),
                         text: format!("Reference to {status} CodeSystem {cs_uri}"),
+                        location: None,
+                        message_id: Some(status_message_id(&status).into()),
+                    });
+                }
+            }
+        }
+    }
+
+    // Mirror the same status-check emission for the validated ValueSet on
+    // the VS-validate-code path. The IG `deprecated/validate-withdrawn`
+    // fixture expects BOTH a deprecated-CS issue AND a withdrawn-VS issue.
+    if let Some(vs_url) = value_set_url {
+        if let Ok(mut hits) = crate::traits::ValueSetOperations::search(
+            backend,
+            ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some(vs_url.to_string()),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            if let Some(vs) = hits.pop() {
+                let vs_version = vs.get("version").and_then(|v| v.as_str());
+                for status in collect_status_check_codes(&vs) {
+                    let vs_uri = match vs_version {
+                        Some(v) => format!("{vs_url}|{v}"),
+                        None => vs_url.to_string(),
+                    };
+                    resp.issues.push(ValidationIssue {
+                        severity: "information".into(),
+                        fhir_code: "business-rule".into(),
+                        tx_code: "status-check".into(),
+                        text: format!("Reference to {status} ValueSet {vs_uri}"),
                         location: None,
                         message_id: Some(status_message_id(&status).into()),
                     });
@@ -591,6 +627,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             Some(&system),
             None,
             RequestPath::BareCode,
+            None,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -637,6 +674,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             Some(&system),
             None,
             RequestPath::Coding,
+            None,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -688,6 +726,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                     Some(&system),
                     cc_value.as_ref(),
                     RequestPath::CodeableConcept,
+                    None,
                 )
                 .await);
             }
@@ -833,6 +872,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             system.as_deref(),
             None,
             RequestPath::BareCode,
+            Some(&url),
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -913,6 +953,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             Some(&system),
             None,
             RequestPath::Coding,
+            Some(&url),
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -961,6 +1002,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     Some(&system),
                     cc_value.as_ref(),
                     RequestPath::CodeableConcept,
+                    Some(&url),
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
