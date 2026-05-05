@@ -145,6 +145,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         message: Some(format!("Unknown value set: {url}")),
                         display: None,
                         inactive: None,
+                        issues: vec![],
                     });
                 }
                 Err(e) => return Err(e),
@@ -180,6 +181,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     )),
                     display: None,
                     inactive: None,
+                    issues: vec![],
                 })
             }
             Some(concept) => {
@@ -198,6 +200,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     message,
                     display: concept.display.clone(),
                     inactive: None,
+                    issues: vec![],
                 })
             }
         }
