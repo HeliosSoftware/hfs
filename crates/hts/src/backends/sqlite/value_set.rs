@@ -838,6 +838,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 .as_ref()
                                 .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
                                 .unwrap_or(false);
+                            // For the not-found-in-VS branch: check if the
+                            // code IS in the underlying CodeSystem but
+                            // inactive (compose.inactive=false / activeOnly
+                            // filtered it out). Only meaningful when found
+                            // is None and the request named a system.
+                            let inactive_in_cs = found.is_none()
+                                && req
+                                    .system
+                                    .as_deref()
+                                    .map(|s| is_concept_inactive(&conn, s, &req.code))
+                                    .unwrap_or(false);
                             let vs_version_owned = lookup_value_set_version(&conn, &url);
                             return finish_validate_code_response(
                                 found,
@@ -848,6 +859,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 abstract_for_msg,
                                 inactive_for_msg,
                                 vs_version_owned.as_deref(),
+                                inactive_in_cs,
                             );
                         }
 
@@ -870,6 +882,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             .as_ref()
                             .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
                             .unwrap_or(false);
+                        let inactive_in_cs = found.is_none()
+                            && req
+                                .system
+                                .as_deref()
+                                .map(|s| is_concept_inactive(&conn, s, &req.code))
+                                .unwrap_or(false);
                         let vs_version_owned = lookup_value_set_version(&conn, &url);
                         return finish_validate_code_response(
                             found,
@@ -880,6 +898,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             abstract_for_msg,
                             inactive_for_msg,
                             vs_version_owned.as_deref(),
+                            inactive_in_cs,
                         );
                     }
                     Err(e) => return Err(e),
@@ -912,6 +931,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .as_ref()
                 .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
                 .unwrap_or(false);
+            let inactive_in_cs = found.is_none()
+                && req
+                    .system
+                    .as_deref()
+                    .map(|s| is_concept_inactive(&conn, s, &req.code))
+                    .unwrap_or(false);
             let vs_version_owned = lookup_value_set_version(&conn, &url);
             finish_validate_code_response(
                 found,
@@ -922,6 +947,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 abstract_for_msg,
                 inactive_for_msg,
                 vs_version_owned.as_deref(),
+                inactive_in_cs,
             )
         })
         .await
@@ -3585,6 +3611,14 @@ fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool 
     .is_ok()
 }
 
+/// `is_inactive_in_underlying_cs` is set when the code is NOT in the
+/// expansion (`found.is_none()`) but IS present in the underlying CodeSystem
+/// with an inactive status. The IG fixtures (e.g.
+/// `inactive/validate-inactive-2a`) expect three additional issues in that
+/// case: a business-rule "...is valid but is not active" error, the
+/// not-in-vs error, and a code-comment "...has a status of inactive..."
+/// warning.
+#[allow(clippy::too_many_arguments)]
 fn finish_validate_code_response(
     found: Option<ExpansionContains>,
     code: &str,
@@ -3594,6 +3628,7 @@ fn finish_validate_code_response(
     is_abstract: bool,
     is_inactive: bool,
     vs_version: Option<&str>,
+    is_inactive_in_underlying_cs: bool,
 ) -> Result<ValidateCodeResponse, HtsError> {
     let qualified = match system_for_msg {
         Some(s) => format!("{s}#{code}"),
@@ -3603,48 +3638,164 @@ fn finish_validate_code_response(
         Some(v) => format!("{url}|{v}"),
         None => url.to_string(),
     };
+    let mut issues: Vec<crate::types::ValidationIssue> = Vec::new();
     match found {
         None => {
             // The IG validator compares this text with the format
             //   "The provided code 'system#code' was not found in the value set 'url'"
             // (see notSelectable/* and validation/* response fixtures).
+            let not_in_vs_text = format!(
+                "The provided code '{qualified}' was not found in the value set '{url_with_version}'"
+            );
+            // Special case: code is valid in the underlying CodeSystem but
+            // inactive, and the VS filtered it out (compose.inactive=false
+            // or activeOnly=true). The IG expects a business-rule error
+            // ("valid but not active"), the not-in-vs error, AND a
+            // code-comment warning ("has a status of inactive").
+            if is_inactive_in_underlying_cs {
+                issues.push(crate::types::ValidationIssue {
+                    severity: "error".into(),
+                    fhir_code: "business-rule".into(),
+                    tx_code: "code-rule".into(),
+                    text: format!("The concept '{code}' is valid but is not active"),
+                    location: Some("Coding.code".into()),
+                    message_id: Some("STATUS_CODE_WARNING_CODE".into()),
+                });
+            }
+            issues.push(crate::types::ValidationIssue {
+                severity: "error".into(),
+                fhir_code: "code-invalid".into(),
+                tx_code: "not-in-vs".into(),
+                text: not_in_vs_text.clone(),
+                location: Some("Coding.code".into()),
+                message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
+            });
+            if is_inactive_in_underlying_cs {
+                issues.push(crate::types::ValidationIssue {
+                    severity: "warning".into(),
+                    fhir_code: "business-rule".into(),
+                    tx_code: "code-comment".into(),
+                    text: format!(
+                        "The concept '{code}' has a status of inactive and its use should be reviewed"
+                    ),
+                    location: Some("Coding".into()),
+                    message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
+                });
+            }
+            // Compose the message text from issues sorted alphabetically,
+            // joined with `; ` — matches the IG fixture's `message` parameter.
+            let mut texts: Vec<&str> = issues.iter().map(|i| i.text.as_str()).collect();
+            texts.sort();
+            let message = texts.join("; ");
             Ok(ValidateCodeResponse {
                 result: false,
-                message: Some(format!(
-                    "The provided code '{qualified}' was not found in the value set '{url_with_version}'"
-                )),
+                message: Some(message),
                 display: None,
-                inactive: None,
+                inactive: if is_inactive_in_underlying_cs {
+                    Some(true)
+                } else {
+                    None
+                },
+                issues,
             })
         }
         Some(concept) => {
             // Abstract / notSelectable concepts are present in the VS but
             // cannot be selected by users — reject with the IG wording.
+            // The IG fixtures expect TWO issues here: a `business-rule` /
+            // `code-rule` for the abstract violation, and a `code-invalid` /
+            // `not-in-vs` because the abstract code is excluded from the
+            // selectable set.
             if is_abstract {
+                let abstract_text =
+                    format!("Code '{qualified}' is abstract, and not allowed in this context");
+                let not_in_vs_text = format!(
+                    "The provided code '{qualified}' was not found in the value set '{url_with_version}'"
+                );
+                issues.push(crate::types::ValidationIssue {
+                    severity: "error".into(),
+                    fhir_code: "business-rule".into(),
+                    tx_code: "code-rule".into(),
+                    text: abstract_text.clone(),
+                    location: Some("Coding.code".into()),
+                    message_id: Some("ABSTRACT_CODE_NOT_ALLOWED".into()),
+                });
+                issues.push(crate::types::ValidationIssue {
+                    severity: "error".into(),
+                    fhir_code: "code-invalid".into(),
+                    tx_code: "not-in-vs".into(),
+                    text: not_in_vs_text,
+                    location: Some("Coding.code".into()),
+                    message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
+                });
                 return Ok(ValidateCodeResponse {
                     result: false,
-                    message: Some(format!(
-                        "The code '{qualified}' is abstract, and not allowed in this context"
-                    )),
+                    message: Some(abstract_text),
                     display: concept.display,
                     inactive: None,
+                    issues,
                 });
             }
-            let mut message = None;
+            // Inactive: the IG fixtures expect a warning-severity
+            // `business-rule` / `code-comment` issue ("...has a status of
+            // inactive and its use should be reviewed"). Emitted for every
+            // inactive match — even when validation otherwise succeeds —
+            // because that's what the validator-and-fixtures contract is.
+            if is_inactive {
+                issues.push(crate::types::ValidationIssue {
+                    severity: "warning".into(),
+                    fhir_code: "business-rule".into(),
+                    tx_code: "code-comment".into(),
+                    text: format!(
+                        "The concept '{code}' has a status of inactive and its use should be reviewed"
+                    ),
+                    location: Some("Coding".into()),
+                    message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
+                });
+            }
+            let mut display_message: Option<String> = None;
             if let Some(expected) = expected_display {
                 if let Some(actual) = concept.display.as_deref() {
                     if !actual.eq_ignore_ascii_case(expected) {
-                        message = Some(format!(
+                        let text = format!(
                             "Provided display '{expected}' does not match stored display '{actual}'"
-                        ));
+                        );
+                        display_message = Some(text.clone());
+                        // Display mismatch is an error per the IG fixtures
+                        // (`validation/simple-coding-bad-display`): severity
+                        // error, fhir_code `invalid`, tx_code
+                        // `invalid-display`. result flips to false.
+                        issues.push(crate::types::ValidationIssue {
+                            severity: "error".into(),
+                            fhir_code: "invalid".into(),
+                            tx_code: "invalid-display".into(),
+                            text,
+                            location: Some("Coding.display".into()),
+                            message_id: Some(
+                                "Display_Name_for__should_be_one_of__instead_of".into(),
+                            ),
+                        });
                     }
                 }
             }
+            // Result is false iff there's at least one error-severity issue.
+            // Display mismatch is a warning so it does not flip result; the
+            // legacy `display_message` is preserved on `message` for the
+            // single-issue fallback path.
+            let has_error = issues.iter().any(|i| i.severity == "error");
+            let message = if !issues.is_empty() {
+                let mut sorted: Vec<&str> = issues.iter().map(|i| i.text.as_str()).collect();
+                sorted.sort();
+                Some(sorted.join("; "))
+            } else {
+                display_message
+            };
             Ok(ValidateCodeResponse {
-                result: message.is_none(),
+                result: !has_error,
                 message,
                 display: concept.display,
                 inactive: if is_inactive { Some(true) } else { None },
+                issues,
             })
         }
     }

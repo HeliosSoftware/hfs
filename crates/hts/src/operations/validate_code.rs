@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use crate::error::HtsError;
 use crate::state::AppState;
 use crate::traits::{CodeSystemOperations, TerminologyBackend, ValueSetOperations};
-use crate::types::{ValidateCodeRequest, ValidateCodeResponse};
+use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
@@ -35,10 +35,55 @@ use super::params::{
     parse_query_string, query_params_to_fhir_params,
 };
 
+/// Render a single [`ValidationIssue`] as a FHIR `OperationOutcome.issue`.
+///
+/// The resulting JSON includes the `operationoutcome-message-id` extension
+/// when the issue carries one, plus `details.coding[]` with the tx-issue-type
+/// coding and `details.text`. `expression` and `location` echo the structured
+/// FHIRPath location.
+fn render_issue(issue: &ValidationIssue) -> Value {
+    let mut json_issue = json!({
+        "severity": issue.severity,
+        "code": issue.fhir_code,
+        "details": {
+            "coding": [{
+                "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                "code": issue.tx_code,
+            }],
+            "text": issue.text,
+        }
+    });
+    if let Some(msg_id) = issue.message_id.as_deref() {
+        json_issue.as_object_mut().unwrap().insert(
+            "extension".into(),
+            json!([{
+                "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                "valueString": msg_id
+            }]),
+        );
+    }
+    if let Some(loc) = issue.location.as_deref() {
+        json_issue
+            .as_object_mut()
+            .unwrap()
+            .insert("location".into(), json!([loc]));
+        json_issue
+            .as_object_mut()
+            .unwrap()
+            .insert("expression".into(), json!([loc]));
+    }
+    json_issue
+}
+
 /// Serialize a [`ValidateCodeResponse`] into a FHIR Parameters JSON value.
 ///
-/// Always includes `result` (boolean).  Includes `message` when set (e.g.,
-/// when a display mismatch is detected).  Includes `display` on success.
+/// Always includes `result` (boolean). When `resp.issues` is non-empty (or
+/// `unknown_system` is supplied), wraps every concern in a multi-entry
+/// `OperationOutcome` under the `issues` parameter and joins the issue
+/// texts (alphabetically, semicolon-separated) into the top-level `message`
+/// parameter — matching the IG tx-ecosystem fixture convention. Falls back
+/// to the legacy single-issue path when only `resp.message` is set.
+///
 /// Echoes `code`, `system`, and `version` (when known) so the IG fixtures
 /// can confirm what we validated.
 fn build_validate_response(
@@ -65,17 +110,56 @@ fn build_validate_response(
     if resp.inactive == Some(true) {
         parameter.push(json!({"name": "inactive", "valueBoolean": true}));
     }
-    // When validation has anything to report (negative result or display
-    // mismatch), wrap the message in an OperationOutcome and surface it via
-    // the `issues` parameter — every IG fixture for failed validation
-    // expects it.
-    if let Some(msg) = resp.message.as_deref() {
+    // Compose the issue list: backend-provided issues first, then synthesise
+    // an `unknown CodeSystem` issue from the operations layer when the input
+    // system isn't stored. The IG fixtures (e.g.
+    // validation/simple-coding-bad-system) expect both a `code-invalid` /
+    // `not-in-vs` issue (from the backend) AND a `not-found` / `not-found`
+    // issue pointing at the unknown CodeSystem URL.
+    let mut issues: Vec<ValidationIssue> = resp.issues.clone();
+    if let Some(unknown) = unknown_system {
+        let text = format!(
+            "A definition for CodeSystem {unknown} could not be found, so the code cannot be validated"
+        );
+        issues.push(ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "not-found".into(),
+            tx_code: "not-found".into(),
+            text,
+            location: Some("Coding.system".into()),
+            message_id: Some("UNKNOWN_CODESYSTEM".into()),
+        });
+    }
+
+    // Determine the message string: when we have structured issues, sort
+    // their texts alphabetically and join with `; ` (matches the IG fixture
+    // convention). When we don't, fall back to the response's own `message`
+    // (legacy single-message path used by older code in $translate, etc.).
+    let message_str: Option<String> = if !issues.is_empty() {
+        let mut texts: Vec<&str> = issues.iter().map(|i| i.text.as_str()).collect();
+        texts.sort();
+        Some(texts.join("; "))
+    } else {
+        resp.message.clone()
+    };
+
+    if !issues.is_empty() {
+        let oo_issues: Vec<Value> = issues.iter().map(render_issue).collect();
+        parameter.push(json!({
+            "name": "issues",
+            "resource": {
+                "resourceType": "OperationOutcome",
+                "issue": oo_issues,
+            }
+        }));
+    } else if let Some(msg) = message_str.as_deref() {
+        // Legacy fallback: no structured issues but we still have a message
+        // (e.g. an unknown ValueSet path in postgres backend). Emit a single
+        // catch-all OperationOutcome so the response shape stays compatible
+        // with older fixture matchers.
         let (issue_code, tx_code) = if resp.result {
-            // result=true with a message means a soft warning (e.g. display mismatch).
             ("invalid", "invalid-display")
         } else {
-            // result=false → hard failure; "code-invalid" + "not-in-vs" is
-            // the catch-all the IG uses when the code isn't part of the VS.
             ("code-invalid", "not-in-vs")
         };
         let severity = if resp.result { "warning" } else { "error" };
@@ -97,9 +181,18 @@ fn build_validate_response(
                 }]
             }
         }));
+    }
+    if let Some(msg) = message_str.as_deref() {
         parameter.push(json!({"name": "message", "valueString": msg}));
     }
-    parameter.push(json!({"name": "result", "valueBoolean": resp.result}));
+    // result is driven by error-severity issues when we have any; otherwise
+    // honour the backend's `resp.result`.
+    let final_result = if issues.is_empty() {
+        resp.result
+    } else {
+        !issues.iter().any(|i| i.severity == "error")
+    };
+    parameter.push(json!({"name": "result", "valueBoolean": final_result}));
     if let Some(s) = system {
         parameter.push(json!({"name": "system", "valueUri": s}));
     }
@@ -320,6 +413,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 message: Some("None of the provided codings were found in any CodeSystem".into()),
                 display: None,
                 inactive: None,
+                issues: vec![],
             },
             None,
             None,
@@ -443,12 +537,25 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // a "Coding has no system" message rather than matching by code
         // alone.
         if system.is_empty() {
+            // The IG fixtures expect a single `invalid` / `invalid-data`
+            // issue here, not a generic `code-invalid` / `not-in-vs`. Build
+            // it as a structured issue so the message text matches the
+            // fixture and result=false flows naturally.
+            let text = "No System defined; Coding has no system - cannot validate".to_string();
             return Ok(build_validate_response(
                 ValidateCodeResponse {
                     result: false,
-                    message: Some("Coding has no system - cannot validate".into()),
+                    message: Some(text.clone()),
                     display: None,
                     inactive: None,
+                    issues: vec![ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "invalid".into(),
+                        tx_code: "invalid-data".into(),
+                        text,
+                        location: Some("Coding.system".into()),
+                        message_id: Some("UNABLE_TO_INFER_CODESYSTEM".into()),
+                    }],
                 },
                 Some(&code),
                 None,
@@ -533,6 +640,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 message: Some("None of the provided codings were found in the ValueSet".into()),
                 display: None,
                 inactive: None,
+                issues: vec![],
             },
             None,
             None,
@@ -1184,5 +1292,93 @@ mod tests {
 
         let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
         assert_eq!(resp.status(), 400);
+    }
+
+    // ── Multi-issue OperationOutcome ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn vs_validate_unknown_system_emits_two_issues() {
+        // Mirror IG fixture validation/simple-coding-bad-system: when the
+        // Coding's system isn't loaded, the OperationOutcome should carry
+        // BOTH a `code-invalid`/`not-in-vs` issue (code not in VS) and a
+        // `not-found`/`not-found` issue (CodeSystem unknown).
+        let app = make_vs_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/vs"},
+                {
+                    "name": "coding",
+                    "valueCoding": {
+                        "system": "http://unknown.org/cs",
+                        "code": "anything"
+                    }
+                }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let issues_param = params.iter().find(|p| p["name"] == "issues").unwrap();
+        let issues = issues_param["resource"]["issue"].as_array().unwrap();
+        assert_eq!(
+            issues.len(),
+            2,
+            "expected 2 issues (code-invalid + not-found), got {issues:?}"
+        );
+        // One of the two issues must be code-invalid + not-in-vs.
+        assert!(
+            issues.iter().any(|i| {
+                i["code"] == "code-invalid" && i["details"]["coding"][0]["code"] == "not-in-vs"
+            }),
+            "missing code-invalid/not-in-vs issue: {issues:?}"
+        );
+        // The other must be not-found / not-found pointing at the unknown CS.
+        assert!(
+            issues.iter().any(|i| {
+                i["code"] == "not-found" && i["details"]["coding"][0]["code"] == "not-found"
+            }),
+            "missing not-found/not-found issue: {issues:?}"
+        );
+        // x-unknown-system parameter still echoed.
+        assert!(
+            params.iter().any(|p| p["name"] == "x-unknown-system"
+                && p["valueCanonical"] == "http://unknown.org/cs"),
+            "missing x-unknown-system param"
+        );
+    }
+
+    #[tokio::test]
+    async fn vs_validate_no_system_on_coding_emits_invalid_data_issue() {
+        // Coding without `system` is a structural problem — emit
+        // `invalid` / `invalid-data` rather than a generic not-in-vs issue.
+        let app = make_vs_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/vs"},
+                {"name": "coding", "valueCoding": {"code": "A"}}
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], false);
+        let issues = params.iter().find(|p| p["name"] == "issues").unwrap()["resource"]["issue"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            issues.iter().any(|i| {
+                i["code"] == "invalid" && i["details"]["coding"][0]["code"] == "invalid-data"
+            }),
+            "expected invalid/invalid-data issue: {issues:?}"
+        );
     }
 }

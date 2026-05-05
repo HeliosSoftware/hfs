@@ -93,6 +93,35 @@ pub struct ValidateCodeRequest {
     pub date: Option<String>,
 }
 
+/// One discrete concern detected during `$validate-code`. Multiple issues are
+/// joined into a single `OperationOutcome.issue[]` in the response, and their
+/// text values are concatenated (sorted, semicolon-separated) into the
+/// top-level `message` parameter — that matches the IG tx-ecosystem fixtures
+/// in `validation/`, `notSelectable/`, `inactive/`, etc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationIssue {
+    /// `error` | `warning` | `information`. The IG drives `result=false` from
+    /// any error-severity issue; warnings/info do not.
+    pub severity: String,
+    /// FHIR `OperationOutcome.issue.code` (e.g. `code-invalid`, `not-found`,
+    /// `business-rule`, `invalid`).
+    pub fhir_code: String,
+    /// FHIR tx-issue-type code emitted in `details.coding` (e.g. `not-in-vs`,
+    /// `not-found`, `code-rule`, `code-comment`, `invalid-display`).
+    pub tx_code: String,
+    /// Human-readable text — also concatenated into the top-level `message`.
+    pub text: String,
+    /// FHIRPath-style location inside the input (e.g. `Coding.code`).
+    /// Emitted into both `location[]` and `expression[]`. None means the
+    /// input form (CodeableConcept vs Coding) decides.
+    pub location: Option<String>,
+    /// IG `operationoutcome-message-id` extension value (e.g.
+    /// `None_of_the_provided_codes_are_in_the_value_set_one`). The fixtures
+    /// mark the extension `$optional$: "!tx.fhir.org"`, so it's optional —
+    /// but supplying it improves diagnostic equivalence.
+    pub message_id: Option<String>,
+}
+
 /// Response from `$validate-code`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidateCodeResponse {
@@ -107,6 +136,13 @@ pub struct ValidateCodeResponse {
     /// to surface as a top-level `inactive` parameter on the response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inactive: Option<bool>,
+    /// Structured per-concern issues. The operations layer renders these as
+    /// `OperationOutcome.issue[]` entries inside the `issues` parameter and
+    /// joins their `.text` values into the top-level `message` parameter.
+    /// When empty, the operations layer falls back to the legacy single-issue
+    /// path driven off `message`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<ValidationIssue>,
 }
 
 // ─── $subsumes ────────────────────────────────────────────────────────────────

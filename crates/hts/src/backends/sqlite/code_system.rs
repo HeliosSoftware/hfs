@@ -141,11 +141,22 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             ) {
                 Ok((id, _, _)) => id,
                 Err(HtsError::NotFound(_)) => {
+                    let text = format!(
+                        "A definition for CodeSystem {system} could not be found, so the code cannot be validated"
+                    );
                     return Ok(ValidateCodeResponse {
                         result: false,
-                        message: Some(format!("Unknown code system: {system}")),
+                        message: Some(text.clone()),
                         display: None,
                         inactive: None,
+                        issues: vec![crate::types::ValidationIssue {
+                            severity: "error".into(),
+                            fhir_code: "not-found".into(),
+                            tx_code: "not-found".into(),
+                            text,
+                            location: Some("Coding.system".into()),
+                            message_id: Some("UNKNOWN_CODESYSTEM".into()),
+                        }],
                     });
                 }
                 Err(e) => return Err(e),
@@ -155,11 +166,23 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let display = match find_concept(&conn, &system_id, &req.code) {
                 Ok((_, display, _)) => display,
                 Err(HtsError::NotFound(_)) => {
+                    let text = format!(
+                        "Unknown_Code_in_Version: The code '{}' is not valid in the system {}",
+                        req.code, system
+                    );
                     return Ok(ValidateCodeResponse {
                         result: false,
-                        message: Some(format!("Unknown code: {}", req.code)),
+                        message: Some(text.clone()),
                         display: None,
                         inactive: None,
+                        issues: vec![crate::types::ValidationIssue {
+                            severity: "error".into(),
+                            fhir_code: "code-invalid".into(),
+                            tx_code: "invalid-code".into(),
+                            text,
+                            location: Some("Coding.code".into()),
+                            message_id: Some("Unknown_Code_in_Version".into()),
+                        }],
                     });
                 }
                 Err(e) => return Err(e),
@@ -167,13 +190,25 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
 
             // Optionally validate the caller's expected display.
             // Per FHIR spec, a display mismatch causes result=false (with a message).
+            let mut issues: Vec<crate::types::ValidationIssue> = Vec::new();
             let message = req.display.as_ref().and_then(|expected| {
                 let actual = display.as_deref().unwrap_or("");
                 if actual != expected.as_str() {
-                    Some(format!(
+                    let text = format!(
                         "Display mismatch: expected '{}', found '{}'",
                         expected, actual
-                    ))
+                    );
+                    issues.push(crate::types::ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "invalid".into(),
+                        tx_code: "invalid-display".into(),
+                        text: text.clone(),
+                        location: Some("Coding.display".into()),
+                        message_id: Some(
+                            "Display_Name_for__should_be_one_of__instead_of".into(),
+                        ),
+                    });
+                    Some(text)
                 } else {
                     None
                 }
@@ -184,6 +219,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 message,
                 display,
                 inactive: None,
+                issues,
             })
         })
         .await
