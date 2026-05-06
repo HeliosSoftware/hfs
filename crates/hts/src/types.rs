@@ -119,6 +119,11 @@ pub struct ValidateCodeRequest {
     /// Drives the `location[]` field in version-mismatch issues.
     #[serde(default)]
     pub input_form: Option<String>,
+    /// When true, display mismatches are reported as `severity: warning`
+    /// and do not flip `result` to false. Corresponds to the FHIR
+    /// `lenient-display-validation` parameter.
+    #[serde(default)]
+    pub lenient_display_validation: Option<bool>,
 }
 
 /// One discrete concern detected during `$validate-code`. Multiple issues are

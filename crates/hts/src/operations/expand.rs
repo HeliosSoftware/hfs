@@ -133,7 +133,10 @@ fn vs_extension_statuses(resource: &Value) -> Vec<String> {
 ///
 /// The `display` field is omitted when absent, and `contains` is omitted when
 /// the entry has no children — keeping the output compact for flat expansions.
-fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
+fn serialize_expansion_contains(
+    c: &ExpansionContains,
+    multi_version_systems: &std::collections::HashSet<String>,
+) -> Value {
     let mut item = json!({
         "system": c.system,
         "code": c.code,
@@ -141,8 +144,13 @@ fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
     if let Some(display) = &c.display {
         item["display"] = json!(display);
     }
-    if let Some(version) = &c.version {
-        item["version"] = json!(version);
+    // Only emit version when the expansion mixes multiple versions of this
+    // system — for single-version CSes the version is implicit (and the IG
+    // fixtures don't expect it in the contains items).
+    if multi_version_systems.contains(&c.system) {
+        if let Some(version) = &c.version {
+            item["version"] = json!(version);
+        }
     }
     // FHIR expansion.contains.abstract / .inactive — only emit when true.
     // Both flags signal that the concept exists in the system but should not
@@ -208,7 +216,7 @@ fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
         let nested: Vec<Value> = c
             .contains
             .iter()
-            .map(serialize_expansion_contains)
+            .map(|child| serialize_expansion_contains(child, multi_version_systems))
             .collect();
         item["contains"] = json!(nested);
     }
@@ -1244,10 +1252,28 @@ async fn process_expand<B: TerminologyBackend>(
     }
 
     // ── Build FHIR ValueSet response with expansion ──────────────────────────
+    // Determine which systems appear with more than one distinct version in
+    // this expansion. Only for those systems do we emit the version field on
+    // individual contains items (so multi-version expansions are unambiguous
+    // while single-version expansions stay compact).
+    let multi_version_systems: std::collections::HashSet<String> = {
+        use std::collections::HashMap;
+        let mut sys_versions: HashMap<&str, Option<&str>> = HashMap::new();
+        let mut multi = std::collections::HashSet::new();
+        for c in &resp.contains {
+            let ver = c.version.as_deref();
+            match sys_versions.get(c.system.as_str()) {
+                None => { sys_versions.insert(&c.system, ver); }
+                Some(&prev) if prev != ver => { multi.insert(c.system.clone()); }
+                _ => {}
+            }
+        }
+        multi
+    };
     let contains: Vec<Value> = resp
         .contains
         .iter()
-        .map(serialize_expansion_contains)
+        .map(|c| serialize_expansion_contains(c, &multi_version_systems))
         .collect();
 
     // The IG validator (txTests) treats `expansion.identifier` and

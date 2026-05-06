@@ -957,6 +957,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 code_unknown_in_cs,
                                 cs_version.as_deref(),
                                 req.version.as_deref(),
+                                req.lenient_display_validation.unwrap_or(false),
                             );
                         }
 
@@ -1009,6 +1010,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             code_unknown_in_cs,
                             cs_version.as_deref(),
                             req.version.as_deref(),
+                            req.lenient_display_validation.unwrap_or(false),
                         );
                     }
                     Err(e) => return Err(e),
@@ -1154,6 +1156,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 code_unknown_in_cs,
                 cs_version.as_deref(),
                 req.version.as_deref(),
+                req.lenient_display_validation.unwrap_or(false),
             )
         })
         .await
@@ -5144,6 +5147,7 @@ fn finish_validate_code_response(
     code_unknown_in_cs: bool,
     cs_version_for_msg: Option<&str>,
     req_version_hint: Option<&str>,
+    lenient_display: bool,
 ) -> Result<ValidateCodeResponse, HtsError> {
     let qualified = match system_for_msg {
         Some(s) => format!("{s}#{code}"),
@@ -5324,12 +5328,11 @@ fn finish_validate_code_response(
                             "Provided display '{expected}' does not match stored display '{actual}'"
                         );
                         display_message = Some(text.clone());
-                        // Display mismatch is an error per the IG fixtures
-                        // (`validation/simple-coding-bad-display`): severity
-                        // error, fhir_code `invalid`, tx_code
-                        // `invalid-display`. result flips to false.
+                        // With lenient-display-validation the mismatch is a
+                        // warning (result stays true); without it it's an
+                        // error that flips result to false.
                         issues.push(crate::types::ValidationIssue {
-                            severity: "error".into(),
+                            severity: if lenient_display { "warning" } else { "error" }.into(),
                             fhir_code: "invalid".into(),
                             tx_code: "invalid-display".into(),
                             text,

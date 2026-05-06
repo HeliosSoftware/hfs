@@ -648,6 +648,10 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
             input_form: Some("code".into()),
+            lenient_display_validation: params
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
+                .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
         let mut resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
         rescue_via_supplements(
@@ -700,6 +704,10 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
             input_form: Some("coding".into()),
+            lenient_display_validation: params
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
+                .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
         let mut resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
         rescue_via_supplements(
@@ -749,6 +757,10 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
         // last one). Iterate in reverse so the earliest "yes" we find is the
         // last entry in the input.
         let cc_req_version = find_str_param(&params, "version");
+        let cs_lenient = params
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
+            .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()));
         for (system, code) in codings.into_iter().rev() {
             let req = ValidateCodeRequest {
                 url: None,
@@ -763,6 +775,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                     .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                     .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
                 input_form: Some("codeableConcept".into()),
+                lenient_display_validation: cs_lenient,
             };
             let resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
             if resp.result {
@@ -871,6 +884,10 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // Used to rewrite "...'url'..." → "...'url|version'..." in NotFound
     // messages so the IG-expected text format is met.
     let vs_version = find_str_param(&params, "valueSetVersion");
+    let lenient_display = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
+        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()));
     let rewrite = |e: HtsError| -> HtsError {
         match (e, vs_version.as_deref()) {
             (HtsError::NotFound(msg), Some(v)) => {
@@ -900,6 +917,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
             input_form: Some("code".into()),
+            lenient_display_validation: lenient_display,
         };
         let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
             .await
@@ -1035,6 +1053,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
             input_form: Some("coding".into()),
+            lenient_display_validation: lenient_display,
         };
         let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
             .await
@@ -1112,6 +1131,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("abstract"))
                     .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
                 input_form: Some("codeableConcept".into()),
+                lenient_display_validation: lenient_display,
             };
             let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
                 .await
@@ -1198,6 +1218,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     date: None,
                     include_abstract: None,
                     input_form: None,
+                    lenient_display_validation: None,
                 };
                 CodeSystemOperations::validate_code(state.backend(), &ctx, req)
                     .await
