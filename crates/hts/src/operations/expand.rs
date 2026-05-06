@@ -141,6 +141,9 @@ fn serialize_expansion_contains(c: &ExpansionContains) -> Value {
     if let Some(display) = &c.display {
         item["display"] = json!(display);
     }
+    if let Some(version) = &c.version {
+        item["version"] = json!(version);
+    }
     // FHIR expansion.contains.abstract / .inactive — only emit when true.
     // Both flags signal that the concept exists in the system but should not
     // be selected by users (abstract = grouper / placeholder; inactive = the
@@ -1299,6 +1302,15 @@ async fn process_expand<B: TerminologyBackend>(
             ) {
                 return false;
             }
+            // Version-override request parameters — these are instruction knobs
+            // to the server, not expansion metadata. The IG fixtures do NOT
+            // expect them echoed back in expansion.parameter[].
+            if matches!(
+                name,
+                "system-version" | "check-system-version" | "force-system-version"
+            ) {
+                return false;
+            }
             // Configuration inputs that the IG validator passes via the
             // `profile` parameter set — they steer test execution rather than
             // request semantics, and the validator does NOT expect them back
@@ -1488,7 +1500,20 @@ async fn process_expand<B: TerminologyBackend>(
     for (system_url, version) in &used_pairs {
         let value_uri = match version {
             Some(v) => format!("{system_url}|{v}"),
-            None => system_url.clone(),
+            None => {
+                // Single-version systems don't populate version on contains items.
+                // Fall back to the CS metadata in cs_by_url so used-codesystem
+                // still carries the |version suffix.
+                let cs_ver = cs_by_url
+                    .get(system_url.as_str())
+                    .and_then(|c| c.as_ref())
+                    .and_then(|c| c.get("version"))
+                    .and_then(|v| v.as_str());
+                match cs_ver {
+                    Some(v) => format!("{system_url}|{v}"),
+                    None => system_url.clone(),
+                }
+            }
         };
         emitted_params.push(json!({
             "name": "used-codesystem",

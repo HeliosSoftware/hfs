@@ -956,6 +956,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 inactive_in_cs,
                                 code_unknown_in_cs,
                                 cs_version.as_deref(),
+                                req.version.as_deref(),
                             );
                         }
 
@@ -1007,6 +1008,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             inactive_in_cs,
                             code_unknown_in_cs,
                             cs_version.as_deref(),
+                            req.version.as_deref(),
                         );
                     }
                     Err(e) => return Err(e),
@@ -1151,6 +1153,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 inactive_in_cs,
                 code_unknown_in_cs,
                 cs_version.as_deref(),
+                req.version.as_deref(),
             )
         })
         .await
@@ -5140,6 +5143,7 @@ fn finish_validate_code_response(
     is_inactive_in_underlying_cs: bool,
     code_unknown_in_cs: bool,
     cs_version_for_msg: Option<&str>,
+    req_version_hint: Option<&str>,
 ) -> Result<ValidateCodeResponse, HtsError> {
     let qualified = match system_for_msg {
         Some(s) => format!("{s}#{code}"),
@@ -5357,6 +5361,7 @@ fn finish_validate_code_response(
                 system: Some(concept.system),
                 cs_version: concept
                     .version
+                    .or_else(|| req_version_hint.map(|s| s.to_string()))
                     .or_else(|| cs_version_for_msg.map(|s| s.to_string())),
                 inactive: if is_inactive { Some(true) } else { None },
                 issues,
