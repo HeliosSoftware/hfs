@@ -1075,7 +1075,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 None
             };
 
-            if let Some((issues, caused_by)) = mismatch {
+            if let Some((issues, caused_by, echo_version)) = mismatch {
                 let display = found.as_ref().and_then(|c| c.display.clone());
                 let mut texts: Vec<&str> = issues
                     .iter()
@@ -1089,7 +1089,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     message: Some(message),
                     display,
                     system: None,
-                    cs_version: None,
+                    cs_version: echo_version,
                     inactive: None,
                     issues,
                     caused_by_unknown_system: caused_by,
@@ -1109,6 +1109,23 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 found.filter(|c| !is_concept_inactive(&conn, &c.system, &c.code))
             } else {
                 found
+            };
+
+            // When req.version is set (exact, not wildcard), override the found
+            // concept's display with the one from that specific CS version.
+            // The expansion may have been computed against a different version
+            // (e.g., wildcard "1.x" resolved to "1.2.0"), but the caller wants
+            // the canonical display for their requested version "1.0.0".
+            let found = match (found, req.version.as_deref(), effective_system.as_deref()) {
+                (Some(mut concept), Some(ver), Some(sys))
+                    if !ver.contains(".x") && ver != "x" =>
+                {
+                    if let Some(disp) = lookup_display_at_version(&conn, sys, ver, &req.code) {
+                        concept.display = Some(disp);
+                    }
+                    Some(concept)
+                }
+                (f, _, _) => f,
             };
 
             // Prefer the matched concept's system if present (in case the
@@ -1138,13 +1155,21 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .as_deref()
                     .map(|s| !is_code_in_cs(&conn, s, &req.code))
                     .unwrap_or(false);
-            let cs_version = req
-                .system
-                .as_deref()
-                .and_then(|s| {
-                    cs_version_from_compose(compose_json_for_version.as_deref(), s)
-                        .or_else(|| cs_version_for_msg(&conn, s))
-                });
+            // cs_version priority: (1) req.version when exact, (2) VS compose pin when
+            // exact, (3) latest from DB. Wildcards are resolved/skipped since raw
+            // wildcard strings must not appear in the response.
+            let cs_version = req.system.as_deref().and_then(|s| {
+                let from_req = req
+                    .version
+                    .as_deref()
+                    .filter(|v| !v.contains(".x") && *v != "x")
+                    .map(str::to_string);
+                let from_compose = cs_version_from_compose(compose_json_for_version.as_deref(), s)
+                    .filter(|v| !v.contains(".x") && v.as_str() != "x");
+                from_req
+                    .or(from_compose)
+                    .or_else(|| cs_version_for_msg(&conn, s))
+            });
             let vs_version_owned = lookup_value_set_version(&conn, &url);
             finish_validate_code_response(
                 found,
@@ -4833,13 +4858,45 @@ fn resolve_ver_against_candidates(
     }
 }
 
+/// Returns true if `version` satisfies the wildcard `pattern`.
+/// "1.x" matches "1.0.0", "1.2.0", etc. "1.0.x" matches "1.0.0", "1.0.1".
+fn version_satisfies_wildcard(version: &str, pattern: &str) -> bool {
+    if pattern == "x" {
+        return true;
+    }
+    let prefix = pattern.trim_end_matches('x').trim_end_matches('.');
+    if prefix.is_empty() {
+        return true;
+    }
+    version.starts_with(&format!("{prefix}.")) || version == prefix
+}
+
+/// Look up the display for a specific code at a specific CS version.
+fn lookup_display_at_version(
+    conn: &Connection,
+    system_url: &str,
+    version: &str,
+    code: &str,
+) -> Option<String> {
+    conn.query_row(
+        "SELECT c.display FROM concepts c \
+         JOIN code_systems cs ON c.system_id = cs.id \
+         WHERE cs.url = ?1 AND cs.version = ?2 AND c.code = ?3",
+        rusqlite::params![system_url, version, code],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
 /// Check whether `req_ver` (caller-supplied CS version) conflicts with what is
 /// stored in the DB or pinned in the VS compose.
 ///
-/// Returns `Some((issues, caused_by))` when a mismatch is detected:
+/// Returns `Some((issues, caused_by, echo_version))` when a mismatch is detected:
 /// - issues: validation issues to report
 /// - caused_by: `Some(url|ver)` canonical for the `x-caused-by-unknown-system`
 ///   parameter (only when the requested version is missing from the DB).
+/// - echo_version: the CS version to echo in the response `version` parameter.
 ///
 /// Returns `None` when there is no mismatch (caller should proceed normally).
 fn detect_cs_version_mismatch(
@@ -4849,7 +4906,7 @@ fn detect_cs_version_mismatch(
     compose_json: Option<&str>,
     version_loc: &str,
     system_loc: &str,
-) -> Option<(Vec<crate::types::ValidationIssue>, Option<String>)> {
+) -> Option<(Vec<crate::types::ValidationIssue>, Option<String>, Option<String>)> {
     // Build (id, version) candidate list sorted desc so the first entry is the
     // highest version — used for both resolution and picking the "actual" ver.
     let mut stmt = conn
@@ -4919,6 +4976,14 @@ fn detect_cs_version_mismatch(
             None => None,
         };
 
+        // Echo version: use the VS-pinned resolved version when available,
+        // otherwise use the highest stored version.
+        let echo_version: Option<String> = match include_pin.as_ref() {
+            Some(Some(inc_ver)) => resolve_ver_against_candidates(&candidates, inc_ver)
+                .or_else(|| actual_ver.clone()),
+            _ => actual_ver.clone(),
+        };
+
         let unknown_issue = crate::types::ValidationIssue {
             severity: "error".into(),
             fhir_code: "not-found".into(),
@@ -4962,7 +5027,7 @@ fn detect_cs_version_mismatch(
             None => vec![unknown_issue],
         };
         let caused_by = Some(format!("{system_url}|{req_ver}"));
-        return Some((issues, caused_by));
+        return Some((issues, caused_by, echo_version));
     }
 
     let req_full = resolved_req.as_deref().unwrap_or(req_ver);
@@ -4970,6 +5035,14 @@ fn detect_cs_version_mismatch(
     // req_ver exists in the CS. Check if the VS include pins a conflicting version.
     match include_pin {
         Some(Some(ref inc_ver)) => {
+            // When inc_ver is a wildcard pattern (e.g. "1.x"), check whether
+            // req_full satisfies it. If so, no mismatch — "1.0.0" matches "1.x".
+            if inc_ver.contains(".x") || inc_ver.as_str() == "x" {
+                if version_satisfies_wildcard(req_full, inc_ver.as_str()) {
+                    return None;
+                }
+            }
+
             let resolved_inc = resolve_ver_against_candidates(&candidates, inc_ver);
             let inc_full = resolved_inc.as_deref().unwrap_or(inc_ver.as_str());
             if inc_full != req_full {
@@ -5008,7 +5081,8 @@ fn detect_cs_version_mismatch(
                         },
                     ];
                     let caused_by = Some(format!("{system_url}|{inc_ver}"));
-                    return Some((issues, caused_by));
+                    // Echo req_full (the code's existing version) when pin doesn't exist.
+                    return Some((issues, caused_by, Some(req_full.to_string())));
                 }
                 // Both versions exist but differ → VALUESET_VALUE_MISMATCH only.
                 let issues = vec![crate::types::ValidationIssue {
@@ -5020,7 +5094,8 @@ fn detect_cs_version_mismatch(
                     location: Some(version_loc.into()),
                     message_id: Some("VALUESET_VALUE_MISMATCH".into()),
                 }];
-                return Some((issues, None));
+                // Echo req_full (the code's existing version).
+                return Some((issues, None, Some(req_full.to_string())));
             }
         }
         Some(None) => {
@@ -5042,7 +5117,7 @@ fn detect_cs_version_mismatch(
                     location: Some(version_loc.into()),
                     message_id: Some("VALUESET_VALUE_MISMATCH".into()),
                 }];
-                return Some((issues, None));
+                return Some((issues, None, Some(req_full.to_string())));
             }
         }
         None => {} // No VS context — req_ver was found, no mismatch to report.
@@ -5062,7 +5137,7 @@ fn detect_vs_pin_unknown(
     system_url: &str,
     compose_json: Option<&str>,
     system_loc: &str,
-) -> Option<(Vec<crate::types::ValidationIssue>, Option<String>)> {
+) -> Option<(Vec<crate::types::ValidationIssue>, Option<String>, Option<String>)> {
     let inc_ver = compose_json
         .and_then(|cj| vs_pinned_include_version(cj, system_url))
         .and_then(|pin| pin)?; // only when the include has an explicit version
@@ -5109,7 +5184,9 @@ fn detect_vs_pin_unknown(
         message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
     }];
     let caused_by = Some(format!("{system_url}|{inc_ver}"));
-    Some((issues, caused_by))
+    // Echo the highest stored version when pin doesn't exist.
+    let echo_version = candidates.iter().find_map(|(_, v)| v.clone());
+    Some((issues, caused_by, echo_version))
 }
 
 fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool {
