@@ -1137,18 +1137,38 @@ async fn process_expand<B: TerminologyBackend>(
     use std::collections::HashMap;
     let mut cs_by_url: HashMap<String, Option<Value>> = HashMap::new();
     {
-        let mut systems: Vec<&String> =
-            resp.contains
-                .iter()
-                .map(|c| &c.system)
-                .fold(Vec::<&String>::new(), |mut acc, s| {
-                    if !acc.contains(&s) {
-                        acc.push(s);
+        // Collect systems from expansion items first.
+        let mut systems: Vec<String> = resp
+            .contains
+            .iter()
+            .map(|c| c.system.clone())
+            .fold(Vec::<String>::new(), |mut acc, s| {
+                if !acc.contains(&s) {
+                    acc.push(s);
+                }
+                acc
+            });
+        // Also add systems from compose.include[] so that empty expansions
+        // (e.g. count=0 or filter matched nothing) still populate cs_by_url,
+        // enabling used-codesystem to carry the |version suffix.
+        if let Some(vs) = source_vs.as_ref() {
+            if let Some(includes) = vs
+                .get("compose")
+                .and_then(|c| c.get("include"))
+                .and_then(|i| i.as_array())
+            {
+                for inc in includes {
+                    if let Some(sys) = inc.get("system").and_then(|s| s.as_str()) {
+                        let s = sys.to_string();
+                        if !systems.contains(&s) {
+                            systems.push(s);
+                        }
                     }
-                    acc
-                });
+                }
+            }
+        }
         systems.sort();
-        for system_url in systems {
+        for system_url in &systems {
             let cs = crate::traits::CodeSystemOperations::search(
                 state.backend(),
                 &ctx,

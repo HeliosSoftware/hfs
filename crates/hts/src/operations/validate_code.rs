@@ -884,6 +884,9 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // Used to rewrite "...'url'..." → "...'url|version'..." in NotFound
     // messages so the IG-expected text format is met.
     let vs_version = find_str_param(&params, "valueSetVersion");
+    // systemVersion pins the CS version to use for this validation call.
+    // Falls back when the explicit `version` param is absent.
+    let system_version = find_str_param(&params, "systemVersion");
     let lenient_display = params
         .iter()
         .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
@@ -903,7 +906,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     if let Some(code) = find_str_param(&params, "code") {
         let system = find_str_param(&params, "system");
         let display = find_str_param(&params, "display");
-        let req_version = find_str_param(&params, "version");
+        let req_version = find_str_param(&params, "version").or(system_version.clone());
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
             value_set_version: vs_version.clone(),
@@ -1038,8 +1041,10 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // the IG fixtures pin display via the Coding so the server can
         // report a mismatch.
         let display = coding_display.or_else(|| find_str_param(&params, "display"));
-        // Coding.version takes precedence over a top-level `version` param.
-        let req_version = coding_version.or_else(|| find_str_param(&params, "version"));
+        // Coding.version > explicit `version` param > systemVersion pin.
+        let req_version = coding_version
+            .or_else(|| find_str_param(&params, "version"))
+            .or(system_version.clone());
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
             value_set_version: vs_version.clone(),
@@ -1116,7 +1121,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // codings in a CodeableConcept all validate, the response echoes the
         // last one). Iterate in reverse so the earliest "yes" we find is the
         // last entry in the input.
-        let cc_req_version = find_str_param(&params, "version");
+        let cc_req_version = find_str_param(&params, "version").or(system_version.clone());
         for (system, code) in codings.clone().into_iter().rev() {
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),

@@ -1141,7 +1141,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             let cs_version = req
                 .system
                 .as_deref()
-                .and_then(|s| cs_version_for_msg(&conn, s));
+                .and_then(|s| {
+                    cs_version_from_compose(compose_json_for_version.as_deref(), s)
+                        .or_else(|| cs_version_for_msg(&conn, s))
+                });
             let vs_version_owned = lookup_value_set_version(&conn, &url);
             finish_validate_code_response(
                 found,
@@ -4735,6 +4738,26 @@ fn cs_version_for_msg(conn: &Connection, system_url: &str) -> Option<String> {
     .flatten()
 }
 
+/// Extract the pinned CS version from a VS compose JSON for a given system URL.
+/// Returns `Some(version)` when `compose.include[].version` is set for that system.
+fn cs_version_from_compose(compose_json: Option<&str>, system_url: &str) -> Option<String> {
+    compose_json
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| {
+            v.get("include")
+                .and_then(|i| i.as_array())
+                .and_then(|includes| {
+                    includes
+                        .iter()
+                        .find(|inc| {
+                            inc.get("system").and_then(|s| s.as_str()) == Some(system_url)
+                        })
+                        .and_then(|inc| inc.get("version").and_then(|v| v.as_str()))
+                        .map(str::to_string)
+                })
+        })
+}
+
 /// Returns all non-null stored versions for a CS URL, sorted ascending for
 /// display in "Valid versions: X or Y" messages.
 fn cs_all_stored_versions(conn: &Connection, system_url: &str) -> Vec<String> {
@@ -5242,12 +5265,27 @@ fn finish_validate_code_response(
             let mut texts: Vec<&str> = issues.iter().map(|i| i.text.as_str()).collect();
             texts.sort();
             let message = texts.join("; ");
+            // When the code exists in the underlying CS (just excluded from
+            // this VS), echo display/system/version so the IG fixtures can
+            // show which code was checked.
+            let (echo_display, echo_system) = if !code_unknown_in_cs {
+                (
+                    expected_display.map(str::to_string),
+                    system_for_msg.map(str::to_string),
+                )
+            } else {
+                (None, None)
+            };
             Ok(ValidateCodeResponse {
                 result: false,
                 message: Some(message),
-                display: None,
-                system: None,
-                cs_version: cs_version_for_msg.map(|s| s.to_string()),
+                display: echo_display,
+                system: echo_system,
+                cs_version: if !code_unknown_in_cs {
+                    cs_version_for_msg.map(|s| s.to_string())
+                } else {
+                    None
+                },
                 inactive: if is_inactive_in_underlying_cs {
                     Some(true)
                 } else {
