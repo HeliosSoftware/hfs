@@ -29,29 +29,44 @@ use crate::terminology::service::{TerminologyService, TerminologyServiceSync};
 use crate::validation_issue_detail::{ValidationIssueDetailCode, ValidationSourceKind};
 use crate::{FhirPathEvaluator, InvariantExprRef};
 
+use crate::profile::cardinality;
 use crate::profile::profile_registry::ProfileRegistry;
+use crate::strict_properties;
 use helios_fhirpath::handlers::json_value_to_evaluation_result;
+use std::collections::HashMap;
 use tracing::debug;
 
 #[cfg(feature = "R4")]
 use crate::r4::{
     validate_r4_resource, validate_r4_resource_async, validate_r4_resource_async_with_profiles,
-    validate_r4_resource_with_profiles,
+    validate_r4_resource_async_with_profiles_and_validation_addons,
+    validate_r4_resource_async_with_validation_addons, validate_r4_resource_with_profiles,
+    validate_r4_resource_with_profiles_and_validation_addons,
+    validate_r4_resource_with_validation_addons,
 };
 #[cfg(feature = "R4B")]
 use crate::r4b::{
     validate_r4b_resource, validate_r4b_resource_async, validate_r4b_resource_async_with_profiles,
-    validate_r4b_resource_with_profiles,
+    validate_r4b_resource_async_with_profiles_and_validation_addons,
+    validate_r4b_resource_async_with_validation_addons, validate_r4b_resource_with_profiles,
+    validate_r4b_resource_with_profiles_and_validation_addons,
+    validate_r4b_resource_with_validation_addons,
 };
 #[cfg(feature = "R5")]
 use crate::r5::{
     validate_r5_resource, validate_r5_resource_async, validate_r5_resource_async_with_profiles,
-    validate_r5_resource_with_profiles,
+    validate_r5_resource_async_with_profiles_and_validation_addons,
+    validate_r5_resource_async_with_validation_addons, validate_r5_resource_with_profiles,
+    validate_r5_resource_with_profiles_and_validation_addons,
+    validate_r5_resource_with_validation_addons,
 };
 #[cfg(feature = "R6")]
 use crate::r6::{
     validate_r6_resource, validate_r6_resource_async, validate_r6_resource_async_with_profiles,
-    validate_r6_resource_with_profiles,
+    validate_r6_resource_async_with_profiles_and_validation_addons,
+    validate_r6_resource_async_with_validation_addons, validate_r6_resource_with_profiles,
+    validate_r6_resource_with_profiles_and_validation_addons,
+    validate_r6_resource_with_validation_addons,
 };
 
 /// A single validation issue that can later be mapped to
@@ -269,6 +284,23 @@ pub struct ValidationConfig {
 
     /// Severity when a `mustSupport` element has no instance values (`validate_must_support`).
     pub must_support_missing_severity: Severity,
+
+    /// When true, reject JSON property names not allowed by a **base** extracted profile loaded in
+    /// the runtime [`ProfileRegistry`] (see [`strict_properties::validate_json_against_extracted_profile`]).
+    pub strict_json_properties: bool,
+
+    /// When true, enforce min/max cardinality from the **base** snapshot loaded for the resource
+    /// type (same registry lookup as [`Self::strict_json_properties`]).
+    pub validate_base_snapshot_cardinality: bool,
+
+    /// Map `resourceType` → canonical `StructureDefinition.url` key used in [`ProfileRegistry`]
+    /// when it differs from `http://hl7.org/fhir/StructureDefinition/{type}`.
+    pub base_structure_definition_url_overrides: HashMap<String, String>,
+
+    /// Emit a warning when [`Self::strict_json_properties`] or
+    /// [`Self::validate_base_snapshot_cardinality`] is enabled but no matching base profile exists
+    /// in the registry (instead of silently skipping add-ons).
+    pub warn_on_missing_base_profile_for_validation_addons: bool,
 }
 
 impl Default for ValidationConfig {
@@ -294,6 +326,10 @@ impl Default for ValidationConfig {
             type_profile_match_mode: TypeProfileMatchMode::Any,
             validate_must_support: true,
             must_support_missing_severity: Severity::Warning,
+            strict_json_properties: true,
+            validate_base_snapshot_cardinality: true,
+            base_structure_definition_url_overrides: HashMap::new(),
+            warn_on_missing_base_profile_for_validation_addons: true,
         }
     }
 }
@@ -488,6 +524,297 @@ impl Validator {
             #[cfg(feature = "R6")]
             helios_fhir::FhirResource::R6(res) => {
                 validate_r6_resource_async_with_profiles(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Structural add-ons (strict JSON keys, base snapshot cardinality) using a [`ProfileRegistry`]
+    /// that includes the **base** `StructureDefinition` for `resource_type`.
+    pub fn apply_validation_addons<T: serde::Serialize>(
+        &self,
+        resource: &T,
+        resource_type: &str,
+        profile_registry: &ProfileRegistry,
+    ) -> Vec<ValidationIssue> {
+        let cfg = &self.config;
+        if !cfg.strict_json_properties && !cfg.validate_base_snapshot_cardinality {
+            return Vec::new();
+        }
+
+        let base = strict_properties::resolve_base_profile_in_registry(
+            resource_type,
+            profile_registry,
+            &cfg.base_structure_definition_url_overrides,
+        );
+        if base.is_none() {
+            let want = cfg.strict_json_properties || cfg.validate_base_snapshot_cardinality;
+            if want && cfg.warn_on_missing_base_profile_for_validation_addons {
+                return vec![ValidationIssue::warning(
+                    "incomplete",
+                    resource_type,
+                    format!(
+                        "Validation add-ons require a base StructureDefinition for '{resource_type}' in the \
+                         ProfileRegistry (HL7 canonical URL or base_structure_definition_url_overrides)."
+                    ),
+                )
+                .with_summary(
+                    "Base profile missing for strict JSON / snapshot cardinality validation",
+                )];
+            }
+            return Vec::new();
+        }
+        let base = base.expect("checked");
+
+        let mut issues = Vec::new();
+        if cfg.strict_json_properties {
+            let root = match serde_json::to_value(resource) {
+                Ok(v) => v,
+                Err(err) => {
+                    return vec![
+                        ValidationIssue::error(
+                            "processing",
+                            resource_type,
+                            format!(
+                                "Could not serialize resource for strict JSON validation: {err}"
+                            ),
+                        )
+                        .with_summary("Serialization failed during strict property validation"),
+                    ];
+                }
+            };
+            issues.extend(strict_properties::validate_json_against_extracted_profile(
+                &root,
+                base,
+                Some(profile_registry),
+            ));
+        }
+        if cfg.validate_base_snapshot_cardinality {
+            issues.extend(cardinality::validate_min_cardinality(
+                resource,
+                resource_type,
+                &base.element_rules,
+            ));
+            issues.extend(cardinality::validate_max_cardinality(
+                resource,
+                resource_type,
+                &base.element_rules,
+            ));
+        }
+        issues
+    }
+
+    pub fn validate_resource_with_validation_addons(
+        &self,
+        resource: &helios_fhir::FhirResource,
+        terminology: Option<&dyn TerminologyServiceSync>,
+        evaluator: &dyn FhirPathEvaluator,
+        profile_registry: &ProfileRegistry,
+    ) -> Vec<ValidationIssue> {
+        match resource {
+            #[cfg(feature = "R4")]
+            helios_fhir::FhirResource::R4(res) => validate_r4_resource_with_validation_addons(
+                self,
+                res.as_ref(),
+                terminology,
+                evaluator,
+                profile_registry,
+            ),
+
+            #[cfg(feature = "R4B")]
+            helios_fhir::FhirResource::R4B(res) => validate_r4b_resource_with_validation_addons(
+                self,
+                res.as_ref(),
+                terminology,
+                evaluator,
+                profile_registry,
+            ),
+
+            #[cfg(feature = "R5")]
+            helios_fhir::FhirResource::R5(res) => validate_r5_resource_with_validation_addons(
+                self,
+                res.as_ref(),
+                terminology,
+                evaluator,
+                profile_registry,
+            ),
+
+            #[cfg(feature = "R6")]
+            helios_fhir::FhirResource::R6(res) => validate_r6_resource_with_validation_addons(
+                self,
+                res.as_ref(),
+                terminology,
+                evaluator,
+                profile_registry,
+            ),
+        }
+    }
+
+    pub fn validate_resource_with_profiles_and_validation_addons(
+        &self,
+        resource: &helios_fhir::FhirResource,
+        terminology: Option<&dyn TerminologyServiceSync>,
+        evaluator: &dyn FhirPathEvaluator,
+        profile_registry: &ProfileRegistry,
+    ) -> Vec<ValidationIssue> {
+        match resource {
+            #[cfg(feature = "R4")]
+            helios_fhir::FhirResource::R4(res) => {
+                validate_r4_resource_with_profiles_and_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+            }
+
+            #[cfg(feature = "R4B")]
+            helios_fhir::FhirResource::R4B(res) => {
+                validate_r4b_resource_with_profiles_and_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+            }
+
+            #[cfg(feature = "R5")]
+            helios_fhir::FhirResource::R5(res) => {
+                validate_r5_resource_with_profiles_and_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+            }
+
+            #[cfg(feature = "R6")]
+            helios_fhir::FhirResource::R6(res) => {
+                validate_r6_resource_with_profiles_and_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+            }
+        }
+    }
+
+    pub async fn validate_resource_async_with_validation_addons(
+        &self,
+        resource: &helios_fhir::FhirResource,
+        terminology: Option<&dyn TerminologyService>,
+        evaluator: &dyn FhirPathEvaluator,
+        profile_registry: &ProfileRegistry,
+    ) -> Vec<ValidationIssue> {
+        match resource {
+            #[cfg(feature = "R4")]
+            helios_fhir::FhirResource::R4(res) => {
+                validate_r4_resource_async_with_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+                .await
+            }
+
+            #[cfg(feature = "R4B")]
+            helios_fhir::FhirResource::R4B(res) => {
+                validate_r4b_resource_async_with_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+                .await
+            }
+
+            #[cfg(feature = "R5")]
+            helios_fhir::FhirResource::R5(res) => {
+                validate_r5_resource_async_with_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+                .await
+            }
+
+            #[cfg(feature = "R6")]
+            helios_fhir::FhirResource::R6(res) => {
+                validate_r6_resource_async_with_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn validate_resource_async_with_profiles_and_validation_addons(
+        &self,
+        resource: &helios_fhir::FhirResource,
+        terminology: Option<&dyn TerminologyService>,
+        evaluator: &dyn FhirPathEvaluator,
+        profile_registry: &ProfileRegistry,
+    ) -> Vec<ValidationIssue> {
+        match resource {
+            #[cfg(feature = "R4")]
+            helios_fhir::FhirResource::R4(res) => {
+                validate_r4_resource_async_with_profiles_and_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+                .await
+            }
+
+            #[cfg(feature = "R4B")]
+            helios_fhir::FhirResource::R4B(res) => {
+                validate_r4b_resource_async_with_profiles_and_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+                .await
+            }
+
+            #[cfg(feature = "R5")]
+            helios_fhir::FhirResource::R5(res) => {
+                validate_r5_resource_async_with_profiles_and_validation_addons(
+                    self,
+                    res.as_ref(),
+                    terminology,
+                    evaluator,
+                    profile_registry,
+                )
+                .await
+            }
+
+            #[cfg(feature = "R6")]
+            helios_fhir::FhirResource::R6(res) => {
+                validate_r6_resource_async_with_profiles_and_validation_addons(
                     self,
                     res.as_ref(),
                     terminology,

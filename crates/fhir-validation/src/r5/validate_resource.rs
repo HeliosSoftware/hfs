@@ -113,3 +113,84 @@ async fn validate_r5_declared_profiles_async(
     let mut state = ValidationState::default();
     validate_declared_profiles_async(&ctx, &mut state, resource, resource.resource_name()).await
 }
+
+#[cfg(feature = "R5")]
+pub fn validate_r5_resource_with_validation_addons(
+    validator: &Validator,
+    resource: &helios_fhir::r5::Resource,
+    terminology: Option<&dyn TerminologyServiceSync>,
+    evaluator: &dyn FhirPathEvaluator,
+    profile_registry: &ProfileRegistry,
+) -> Vec<ValidationIssue> {
+    let mut issues = validate_r5_resource(validator, resource, terminology, evaluator);
+    issues.extend(validator.apply_validation_addons(
+        resource,
+        resource.resource_name(),
+        profile_registry,
+    ));
+    issues
+}
+
+#[cfg(feature = "R5")]
+pub fn validate_r5_resource_with_profiles_and_validation_addons(
+    validator: &Validator,
+    resource: &helios_fhir::r5::Resource,
+    terminology: Option<&dyn TerminologyServiceSync>,
+    evaluator: &dyn FhirPathEvaluator,
+    profile_registry: &ProfileRegistry,
+) -> Vec<ValidationIssue> {
+    let mut issues = validate_r5_resource_with_profiles(
+        validator,
+        resource,
+        terminology,
+        evaluator,
+        profile_registry,
+    );
+    issues.extend(validator.apply_validation_addons(
+        resource,
+        resource.resource_name(),
+        profile_registry,
+    ));
+    issues
+}
+
+#[cfg(feature = "R5")]
+pub async fn validate_r5_resource_async_with_validation_addons(
+    validator: &Validator,
+    resource: &helios_fhir::r5::Resource,
+    terminology: Option<&dyn TerminologyService>,
+    evaluator: &dyn FhirPathEvaluator,
+    profile_registry: &ProfileRegistry,
+) -> Vec<ValidationIssue> {
+    let mut issues = validate_r5_resource_async(validator, resource, terminology, evaluator).await;
+    issues.extend(validator.apply_validation_addons(
+        resource,
+        resource.resource_name(),
+        profile_registry,
+    ));
+    issues
+}
+
+#[cfg(feature = "R5")]
+pub async fn validate_r5_resource_async_with_profiles_and_validation_addons(
+    validator: &Validator,
+    resource: &helios_fhir::r5::Resource,
+    terminology: Option<&dyn TerminologyService>,
+    evaluator: &dyn FhirPathEvaluator,
+    profile_registry: &ProfileRegistry,
+) -> Vec<ValidationIssue> {
+    let mut issues = validate_r5_resource_async_with_profiles(
+        validator,
+        resource,
+        terminology,
+        evaluator,
+        profile_registry,
+    )
+    .await;
+    issues.extend(validator.apply_validation_addons(
+        resource,
+        resource.resource_name(),
+        profile_registry,
+    ));
+    issues
+}

@@ -4,6 +4,7 @@
 
 use crate::ValidationError;
 use crate::issue_code::FHIR_JSON_VALUE;
+use crate::profile::base_definition_fetch_url::parse_snapshot_base_version_from_sd_json;
 use crate::profile::structure_definition_extract::StructureDefinitionExtractMessage as SdMsg;
 use crate::profile::types::{
     ExtractedDiscriminatorType, ExtractedElementRule, ExtractedProfile,
@@ -54,7 +55,9 @@ pub fn extract_structure_definition_profile_from_json(
     {
         Some(r) => r,
         None => {
-            if obj.get("kind").is_some() && obj.get("differential").is_some() {
+            if obj.get("kind").is_some()
+                && (obj.get("differential").is_some() || obj.get("snapshot").is_some())
+            {
                 "StructureDefinition"
             } else {
                 return Err(ValidationError::from(SdMsg::MissingResourceType));
@@ -99,33 +102,7 @@ pub fn extract_structure_definition_profile_from_json(
         .ok_or_else(|| ValidationError::from(SdMsg::TypeRequired))?
         .to_string();
 
-    let diff = obj
-        .get("differential")
-        .and_then(|d| d.get("element"))
-        .and_then(|e| e.as_array())
-        .ok_or_else(|| ValidationError::from(SdMsg::DifferentialElementMustBeArray))?;
-    if diff.is_empty() {
-        return Err(ValidationError::from(SdMsg::DifferentialElementNonEmpty));
-    }
-
-    let mut differential_id_by_path: HashMap<String, String> = HashMap::new();
-    for diff_el in diff {
-        let diff_obj = diff_el
-            .as_object()
-            .ok_or_else(|| ValidationError::from(SdMsg::DifferentialElementEntryMustBeObject))?;
-        let path = diff_obj
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ValidationError::from(SdMsg::DifferentialElementMissingPath))?;
-        let id = diff_obj
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(path)
-            .to_string();
-        differential_id_by_path.insert(path.to_string(), id);
-    }
-
-    let snapshot_elements = if obj.get("snapshot").is_some() {
+    let snapshot_elements: Option<&Vec<Value>> = if obj.get("snapshot").is_some() {
         let arr = obj
             .get("snapshot")
             .and_then(|s| s.get("element"))
@@ -138,6 +115,38 @@ pub fn extract_structure_definition_profile_from_json(
     } else {
         None
     };
+
+    let diff_elements: Option<&Vec<Value>> = obj
+        .get("differential")
+        .and_then(|d| d.get("element"))
+        .and_then(|e| e.as_array());
+
+    let mut differential_id_by_path: HashMap<String, String> = HashMap::new();
+    if let Some(diff) = diff_elements {
+        if diff.is_empty() {
+            if snapshot_elements.is_none() {
+                return Err(ValidationError::from(SdMsg::DifferentialElementNonEmpty));
+            }
+        } else {
+            for diff_el in diff {
+                let diff_obj = diff_el.as_object().ok_or_else(|| {
+                    ValidationError::from(SdMsg::DifferentialElementEntryMustBeObject)
+                })?;
+                let path = diff_obj
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ValidationError::from(SdMsg::DifferentialElementMissingPath))?;
+                let id = diff_obj
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(path)
+                    .to_string();
+                differential_id_by_path.insert(path.to_string(), id);
+            }
+        }
+    } else if snapshot_elements.is_none() {
+        return Err(ValidationError::from(SdMsg::DifferentialElementMustBeArray));
+    }
 
     let version = obj
         .get("version")
@@ -160,7 +169,7 @@ pub fn extract_structure_definition_profile_from_json(
     let mut element_rules = Vec::new();
 
     if let Some(snapshot_elements) = snapshot_elements {
-        for snapshot_el in snapshot_elements {
+        for snapshot_el in snapshot_elements.iter() {
             let snapshot_obj = snapshot_el
                 .as_object()
                 .ok_or_else(|| ValidationError::from(SdMsg::SnapshotElementEntryMustBeObject))?;
@@ -193,6 +202,8 @@ pub fn extract_structure_definition_profile_from_json(
             element_rules.push(extract_element_rule(id, path.to_string(), snapshot_el)?);
         }
     } else {
+        let diff = diff_elements
+            .ok_or_else(|| ValidationError::from(SdMsg::DifferentialElementMustBeArray))?;
         for diff_el in diff {
             let diff_obj = diff_el.as_object().ok_or_else(|| {
                 ValidationError::from(SdMsg::DifferentialElementEntryMustBeObject)
@@ -222,6 +233,8 @@ pub fn extract_structure_definition_profile_from_json(
         }
     }
 
+    let snapshot_base_version = parse_snapshot_base_version_from_sd_json(obj);
+
     Ok(ExtractedProfile {
         url,
         version,
@@ -229,6 +242,7 @@ pub fn extract_structure_definition_profile_from_json(
         title,
         resource_type,
         base_definition,
+        snapshot_base_version,
         kind,
         derivation,
         invariants: profile_invariants,
@@ -603,4 +617,66 @@ fn extract_max_value(obj: &Map<String, Value>) -> Option<Value> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod snapshot_only_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// HL7 and tooling often ship base resource definitions with `snapshot` only.
+    #[test]
+    fn extract_snapshot_only_without_differential_succeeds() {
+        let v = json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://hl7.org/fhir/StructureDefinition/Patient",
+            "kind": "resource",
+            "derivation": "specialization",
+            "type": "Patient",
+            "snapshot": {
+                "element": [
+                    {
+                        "path": "Patient",
+                        "id": "Patient"
+                    },
+                    {
+                        "path": "Patient.identifier",
+                        "id": "Patient.identifier",
+                        "min": 1,
+                        "max": "10"
+                    }
+                ]
+            }
+        });
+        let p = extract_structure_definition_profile_from_json(&v).expect("extract");
+        assert_eq!(p.resource_type, "Patient");
+        assert_eq!(p.url, "http://hl7.org/fhir/StructureDefinition/Patient");
+        assert_eq!(p.element_rules.len(), 1);
+        assert_eq!(p.element_rules[0].path, "Patient.identifier");
+        assert_eq!(p.element_rules[0].min, Some(1));
+        assert_eq!(p.element_rules[0].max.as_deref(), Some("10"));
+    }
+
+    /// Empty differential with snapshot is treated as snapshot-only.
+    #[test]
+    fn extract_snapshot_with_empty_differential_element_array_succeeds() {
+        let v = json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://example.org/fhir/StructureDefinition/SnapOnly",
+            "kind": "resource",
+            "derivation": "specialization",
+            "type": "Patient",
+            "differential": {
+                "element": []
+            },
+            "snapshot": {
+                "element": [
+                    { "path": "Patient", "id": "Patient" },
+                    { "path": "Patient.active", "id": "Patient.active", "min": 0, "max": "1" }
+                ]
+            }
+        });
+        let p = extract_structure_definition_profile_from_json(&v).expect("extract");
+        assert!(p.element_rules.iter().any(|r| r.path == "Patient.active"));
+    }
 }

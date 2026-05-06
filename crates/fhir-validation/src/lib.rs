@@ -117,9 +117,15 @@ pub mod evaluators;
 pub mod issue_code;
 pub mod issue_to_op_outcome;
 pub mod profile;
+pub mod profile_manifest;
+pub mod reference_resolution;
+pub mod strict_properties;
 pub mod terminology;
 pub mod validation_context;
 pub mod validation_issue_detail;
+
+#[cfg(feature = "R5")]
+pub mod questionnaire;
 
 pub use binding::common::{TerminologyIssueContext, validation_error_to_issues};
 pub use core::*;
@@ -130,6 +136,16 @@ pub use error::{
 };
 pub use evaluators::*;
 pub use issue_to_op_outcome::VALIDATION_SOURCE_INVARIANT_KEY_URL;
+pub use profile_manifest::{
+    ProfileManifest, load_profile_registry_from_manifest, load_profile_registry_from_manifest_file,
+};
+#[cfg(feature = "R5")]
+pub use questionnaire::validate_questionnaire_response_against_questionnaire;
+pub use reference_resolution::ReferenceResolver;
+pub use strict_properties::{
+    hl7_core_structure_definition_url, resolve_base_profile_in_registry,
+    validate_json_against_extracted_profile,
+};
 use terminology::service::{TerminologyService, TerminologyServiceSync};
 pub use terminology::*;
 pub use validation_context::*;

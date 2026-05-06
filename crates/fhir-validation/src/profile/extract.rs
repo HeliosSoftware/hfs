@@ -25,8 +25,9 @@
 //! alignment when a matching path exists; otherwise snapshot `id` (or `path`) is
 //! used.
 //!
-//! Snapshot-only `StructureDefinition`s (no differential) are currently **not**
-//! supported; extraction still requires a non-empty differential element list.
+//! Snapshot-only `StructureDefinition`s (**no** `differential.element`, or an empty
+//! differential when `snapshot.element` is present) are supported: extraction walks
+//! snapshot rows and uses each element’s `id` when no matching differential path exists.
 //!
 //! # `ElementDefinition.condition`
 //!

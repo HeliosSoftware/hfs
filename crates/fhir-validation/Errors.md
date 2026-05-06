@@ -78,6 +78,24 @@ These concerns are primarily owned by **callers** (HTTP clients, servers, loggin
 | **PII / logs** | [`TerminologyRemoteError`](src/terminology/types.rs) may include **raw response bodies**; treat as sensitive. **Redact or truncate** bodies in production logs. [`ValidationIssue::diagnostics`](src/core.rs) may surface server text to clients—**API layers** should decide what to expose externally vs. keep internal-only. |
 | **Observability** | [`TerminologyService::member_of`](src/terminology/service.rs) and [`LocalTerminologyService`](src/terminology/local.rs) emit **`tracing::warn!`** on `Err` with `valueset_url` and `error_kind` (and `remote_detail` for remote failures). Use these fields in metrics or log aggregation without logging full bodies when possible. |
 
+## Boundary: validation vs business rules
+
+`fhir-validation` is intentionally scoped to **FHIR semantic validation**:
+
+- base spec structure/invariants/bindings
+- profile constraints (`meta.profile`, `type.profile`, `baseDefinition` recursion policy)
+- optional structural add-ons (strict unknown JSON keys, base snapshot min/max checks)
+- optional questionnaire conformance checks when the caller supplies `Questionnaire`
+
+The following stay in an **outer application layer** (server/business middleware), not this crate:
+
+- authorization and tenant policy decisions
+- duplicate detection / idempotency policy
+- workflow/state-machine constraints outside FHIR cardinality/invariants
+- cross-resource referential policy that depends on persistence, not the submitted payload alone
+
+Recommended contract: run `fhir-validation` first to produce `ValidationIssue` / `OperationOutcome`; then run business checks and map failures to additional operation outcomes or application-specific errors.
+
 ## Crate re-exports
 
 The crate root re-exports [`ValidationError`](src/lib.rs), [`RemoteTerminologyError`](src/lib.rs), [`MalformedValidateCodeParameters`](src/lib.rs), [`TerminologyRequestInvalid`](src/lib.rs), [`TerminologyIssueContext`](src/lib.rs), [`validation_error_to_issues`](src/lib.rs), [`validation_error_kind_label`](src/lib.rs), [`remote_terminology_error_kind_label`](src/lib.rs), and [`malformed_validate_code_parameters_kind_label`](src/lib.rs) for convenience.

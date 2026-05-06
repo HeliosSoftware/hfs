@@ -13,6 +13,8 @@ R4 = ["helios-fhir/R4", "helios-fhirpath/R4"]
 R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B"]
 R5 = ["helios-fhir/R5", "helios-fhirpath/R5"]
 R6 = ["helios-fhir/R6", "helios-fhirpath/R6"]
+# R5 `Questionnaire` / `QuestionnaireResponse` structural checks (off by default).
+questionnaire = ["R5"]
 
 [dependencies]
 helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }

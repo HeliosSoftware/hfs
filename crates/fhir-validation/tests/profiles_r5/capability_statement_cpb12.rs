@@ -17,6 +17,7 @@ fn cpb12_profile() -> ExtractedProfile {
         title: None,
         resource_type: "CapabilityStatement".to_string(),
         base_definition: None,
+        snapshot_base_version: None,
         kind: StructureDefinitionKind::Resource,
         derivation: TypeDerivationRule::Constraint,
         invariants: vec![],

@@ -2203,6 +2203,7 @@ fn profile_discriminator_falls_back_to_validation_when_no_meta_profile_present()
             title: None,
             resource_type: "Observation".to_string(),
             base_definition: None,
+            snapshot_base_version: None,
             element_rules: vec![],
             invariants: vec![],
             ..Default::default()

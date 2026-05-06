@@ -121,11 +121,16 @@ fn validate_must_support_from_json(
             continue;
         };
 
+        if skip_when_optional_parent_absent(root, relative_path) {
+            continue;
+        }
+
         let count = count_relative_path(root, relative_path);
         if count > 0 {
             continue;
         }
 
+        let display_path = profile_element_display_path(rule);
         issues.push(ValidationIssue {
             severity: config.must_support_missing_severity,
             code: issue_code::STRUCTURE.to_string(),
@@ -138,11 +143,11 @@ fn validate_must_support_from_json(
             detail_code: Some(ValidationIssueDetailCode::BusinessRuleViolation),
             diagnostics: format!(
                 "Element '{}' is mustSupport but is not populated in the instance.",
-                rule.path
+                display_path
             ),
             expression: None,
-            fhir_path: rule.path.clone(),
-            instance_path: Some(rule.path.clone()),
+            fhir_path: display_path.clone(),
+            instance_path: Some(display_path),
         });
     }
 
@@ -169,11 +174,16 @@ fn validate_min_cardinality_from_json(
             continue;
         };
 
+        if skip_when_optional_parent_absent(root, relative_path) {
+            continue;
+        }
+
         let count = count_relative_path(root, relative_path);
         if count >= min as usize {
             continue;
         }
 
+        let display_path = profile_element_display_path(rule);
         issues.push(ValidationIssue {
             severity: Severity::Error,
             code: "required".to_string(),
@@ -183,11 +193,11 @@ fn validate_min_cardinality_from_json(
             detail_code: Some(ValidationIssueDetailCode::RequiredElementMissing),
             diagnostics: format!(
                 "Required element '{}' is missing or does not meet minimum cardinality {}.",
-                rule.path, min
+                display_path, min
             ),
             expression: None,
-            fhir_path: rule.path.clone(),
-            instance_path: Some(rule.path.clone()),
+            fhir_path: display_path.clone(),
+            instance_path: Some(display_path),
         });
     }
 
@@ -218,11 +228,16 @@ fn validate_max_cardinality_from_json(
             continue;
         };
 
+        if skip_when_optional_parent_absent(root, relative_path) {
+            continue;
+        }
+
         let count = count_relative_path(root, relative_path);
         if count <= max_value {
             continue;
         }
 
+        let display_path = profile_element_display_path(rule);
         issues.push(ValidationIssue {
             severity: Severity::Error,
             code: issue_code::STRUCTURE.to_string(),
@@ -232,11 +247,11 @@ fn validate_max_cardinality_from_json(
             detail_code: Some(ValidationIssueDetailCode::MaximumCardinalityExceeded),
             diagnostics: format!(
                 "Element '{}' exceeds maximum cardinality {}.",
-                rule.path, max
+                display_path, max
             ),
             expression: None,
-            fhir_path: rule.path.clone(),
-            instance_path: Some(rule.path.clone()),
+            fhir_path: display_path.clone(),
+            instance_path: Some(display_path),
         });
     }
 
@@ -250,6 +265,15 @@ pub fn relative_profile_path<'a>(resource_type: &str, absolute_path: &'a str) ->
 
     let prefix = format!("{}.", resource_type);
     absolute_path.strip_prefix(&prefix)
+}
+
+/// FHIR element path for user-facing messages — includes slice discriminator when present
+/// (`Patient.extension:birthPlace`), matching [`crate::profile::slicing`].
+fn profile_element_display_path(rule: &ExtractedElementRule) -> String {
+    match rule.slice_name.as_deref() {
+        Some(slice) => format!("{}:{}", rule.path, slice),
+        None => rule.path.clone(),
+    }
 }
 
 /// `true` when `structure_path` is only the resource root (e.g. `Patient`).
@@ -298,6 +322,18 @@ fn terminal_count(value: &Value) -> usize {
     }
 }
 
+/// For nested `relative_path` (`communication.language`), ignore the rule when the parent
+/// (`communication`) has no instances: child minimums apply only inside an existing slice.
+fn skip_when_optional_parent_absent(root: &Value, relative_path: &str) -> bool {
+    let Some((parent_rel, _)) = relative_path.rsplit_once('.') else {
+        return false;
+    };
+    if parent_rel.is_empty() {
+        return false;
+    }
+    count_relative_path(root, parent_rel) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::{validate_max_cardinality, validate_min_cardinality, validate_must_support};
@@ -331,6 +367,41 @@ mod tests {
             must_support: Some(ms),
             ..rule(path, None, None)
         }
+    }
+
+    fn must_support_rule_slice(path: &str, slice: &str, ms: bool) -> ExtractedElementRule {
+        ExtractedElementRule {
+            id: format!("{path}:{slice}"),
+            path: path.to_string(),
+            slice_name: Some(slice.to_string()),
+            must_support: Some(ms),
+            ..rule(path, None, None)
+        }
+    }
+
+    #[test]
+    fn must_support_slice_name_in_issue_paths() {
+        let patient = json!({ "resourceType": "Patient" });
+        let rules = vec![must_support_rule_slice(
+            "Patient.extension",
+            "birthPlace",
+            true,
+        )];
+        let issues =
+            validate_must_support(&patient, "Patient", &rules, &ValidationConfig::default());
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].fhir_path, "Patient.extension:birthPlace");
+        assert_eq!(
+            issues[0].instance_path.as_deref(),
+            Some("Patient.extension:birthPlace")
+        );
+        assert!(
+            issues[0]
+                .diagnostics
+                .contains("Patient.extension:birthPlace"),
+            "diagnostics should name the slice: {:?}",
+            issues[0].diagnostics
+        );
     }
 
     #[test]
@@ -375,6 +446,19 @@ mod tests {
         let issues = validate_must_support(&patient, "Patient", &rules, &cfg);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn nested_min_skipped_when_parent_slice_absent() {
+        let patient = json!({
+            "resourceType": "Patient"
+        });
+        let rules = vec![rule("Patient.contact.name", Some(1), None)];
+        let issues = validate_min_cardinality(&patient, "Patient", &rules);
+        assert!(
+            issues.is_empty(),
+            "min on contact.name should not apply when contact is absent: {issues:?}"
+        );
     }
 
     #[test]

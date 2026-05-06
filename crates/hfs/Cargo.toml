@@ -47,6 +47,7 @@ reqwest = { version = "0.12", features = ["blocking"] }
 
 [dependencies]
 helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
+fhir-validation = { path = "../fhir-validation", version = "0.1.47", default-features = false, features = ["R4","R4B","R5","R6"] }
 helios-rest = { path = "../rest", version = "0.1.47", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false, features = ["audit"] }
 helios-auth = { path = "../auth", version = "0.1.47" }

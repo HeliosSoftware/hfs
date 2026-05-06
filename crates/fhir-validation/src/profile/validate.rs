@@ -35,6 +35,7 @@
 //! rules such as `ele-1` on nested structures.
 
 use crate::issue_code;
+use crate::profile::base_definition_fetch_url::structure_definition_json_fetch_url;
 use crate::profile::cardinality::{
     is_root_profile_element_path, relative_profile_path, validate_max_cardinality,
     validate_min_cardinality, validate_must_support,
@@ -61,6 +62,28 @@ use std::time::Duration;
 static REMOTE_BASE_PROFILE_CACHE: OnceLock<
     Mutex<std::collections::HashMap<String, Option<ExtractedProfile>>>,
 > = OnceLock::new();
+
+fn dedupe_exact_issues(issues: Vec<ValidationIssue>) -> Vec<ValidationIssue> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(issues.len());
+    for issue in issues {
+        let k = format!(
+            "{:?}|{}|{}|{:?}|{:?}|{:?}|{}|{}",
+            issue.severity,
+            issue.code,
+            issue.fhir_path,
+            issue.instance_path,
+            issue.expression,
+            issue.source_invariant_key,
+            issue.summary.clone().unwrap_or_default(),
+            issue.diagnostics
+        );
+        if seen.insert(k) {
+            out.push(issue);
+        }
+    }
+    out
+}
 
 /// Validate a resource instance against a single extracted profile.
 ///
@@ -313,7 +336,7 @@ pub(crate) fn validate_profile_with_depth_async<'a, T: Serialize + 'a>(
         );
 
         state.active_profiles.remove(&profile.url);
-        issues
+        dedupe_exact_issues(issues)
     })
 }
 
@@ -475,7 +498,7 @@ pub(crate) fn validate_profile_with_depth<T: Serialize>(
     ));
 
     state.active_profiles.remove(&profile.url);
-    issues
+    dedupe_exact_issues(issues)
 }
 
 fn validate_base_definition_profile<T: Serialize>(
@@ -497,7 +520,9 @@ fn validate_base_definition_profile<T: Serialize>(
         return Vec::new();
     }
 
-    let Some(base_profile) = resolve_base_profile_sync(ctx, base_url) else {
+    let Some(base_profile) =
+        resolve_base_profile_sync(ctx, base_url, profile.snapshot_base_version.as_deref())
+    else {
         return Vec::new();
     };
 
@@ -517,6 +542,7 @@ fn validate_base_definition_profile<T: Serialize>(
 fn resolve_base_profile_sync(
     ctx: &ValidationContext<'_>,
     base_url: &str,
+    snapshot_base_version: Option<&str>,
 ) -> Option<ExtractedProfile> {
     if let Some(registry) = ctx.runtime_profile_registry {
         if let Some(profile) = registry
@@ -530,7 +556,7 @@ fn resolve_base_profile_sync(
     if !ctx.validator.config.enable_base_definition_url_lookup {
         return None;
     }
-    fetch_remote_profile_sync(ctx, base_url)
+    fetch_remote_profile_sync(ctx, base_url, snapshot_base_version)
 }
 
 async fn validate_base_definition_profile_async<'a, T: Serialize + 'a>(
@@ -552,7 +578,9 @@ async fn validate_base_definition_profile_async<'a, T: Serialize + 'a>(
         return Vec::new();
     }
 
-    let Some(base_profile) = resolve_base_profile_async(ctx, base_url).await else {
+    let Some(base_profile) =
+        resolve_base_profile_async(ctx, base_url, profile.snapshot_base_version.as_deref()).await
+    else {
         return Vec::new();
     };
 
@@ -573,6 +601,7 @@ async fn validate_base_definition_profile_async<'a, T: Serialize + 'a>(
 async fn resolve_base_profile_async(
     ctx: &AsyncValidationContext<'_>,
     base_url: &str,
+    snapshot_base_version: Option<&str>,
 ) -> Option<ExtractedProfile> {
     if let Some(registry) = ctx.runtime_profile_registry {
         if let Some(profile) = registry
@@ -586,14 +615,28 @@ async fn resolve_base_profile_async(
     if !ctx.validator.config.enable_base_definition_url_lookup {
         return None;
     }
-    fetch_remote_profile_async(ctx, base_url).await
+    fetch_remote_profile_async(ctx, base_url, snapshot_base_version).await
+}
+
+/// User-Agent for remote `StructureDefinition` fetches. Hosts such as `hl7.org` have been
+/// observed to respond with **405** and HTML to the default `reqwest` UA while accepting the same
+/// request from browsers or `curl`.
+#[doc(hidden)]
+pub fn remote_structure_definition_fetch_user_agent() -> &'static str {
+    concat!(
+        "Mozilla/5.0 (compatible; helios-fhir-validation/",
+        env!("CARGO_PKG_VERSION"),
+        "; +https://github.com/HeliosSoftware/hfs)"
+    )
 }
 
 fn fetch_remote_profile_sync(
     ctx: &ValidationContext<'_>,
     base_url: &str,
+    snapshot_base_version: Option<&str>,
 ) -> Option<ExtractedProfile> {
-    if !is_allowed_base_profile_url(base_url, &ctx.validator.config) {
+    let fetch_url = structure_definition_json_fetch_url(base_url, snapshot_base_version);
+    if !is_allowed_base_profile_url(&fetch_url, &ctx.validator.config) {
         return None;
     }
     let cache =
@@ -607,9 +650,17 @@ fn fetch_remote_profile_sync(
     let timeout = Duration::from_millis(ctx.validator.config.base_definition_url_lookup_timeout_ms);
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
+        .user_agent(remote_structure_definition_fetch_user_agent())
         .build()
         .ok()?;
-    let resp = client.get(base_url).send().ok()?;
+    let resp = client
+        .get(fetch_url.as_str())
+        .header(
+            reqwest::header::ACCEPT,
+            "application/fhir+json, application/json;q=0.9",
+        )
+        .send()
+        .ok()?;
     if !resp.status().is_success() {
         if let Ok(mut guard) = cache.lock() {
             guard.insert(base_url.to_string(), None);
@@ -634,8 +685,10 @@ fn fetch_remote_profile_sync(
 async fn fetch_remote_profile_async(
     ctx: &AsyncValidationContext<'_>,
     base_url: &str,
+    snapshot_base_version: Option<&str>,
 ) -> Option<ExtractedProfile> {
-    if !is_allowed_base_profile_url(base_url, &ctx.validator.config) {
+    let fetch_url = structure_definition_json_fetch_url(base_url, snapshot_base_version);
+    if !is_allowed_base_profile_url(&fetch_url, &ctx.validator.config) {
         return None;
     }
     let cache =
@@ -647,8 +700,20 @@ async fn fetch_remote_profile_async(
     }
 
     let timeout = Duration::from_millis(ctx.validator.config.base_definition_url_lookup_timeout_ms);
-    let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
-    let resp = client.get(base_url).send().await.ok()?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(remote_structure_definition_fetch_user_agent())
+        .build()
+        .ok()?;
+    let resp = client
+        .get(fetch_url.as_str())
+        .header(
+            reqwest::header::ACCEPT,
+            "application/fhir+json, application/json;q=0.9",
+        )
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         if let Ok(mut guard) = cache.lock() {
             guard.insert(base_url.to_string(), None);

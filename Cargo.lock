@@ -3019,6 +3019,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "fhir-validation",
  "helios-audit",
  "helios-auth",
  "helios-fhir",

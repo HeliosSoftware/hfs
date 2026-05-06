@@ -89,6 +89,62 @@ ValidationIssue output
 
 ⸻
 
+## Profile registry and IG packages
+
+For **multi-IG** validation (national IG + vendor profiles + optional HTTP `baseDefinition` fetch), see **[Profile registry and IG materialization](docs/Profile_registry_and_IG_materialization.md)** — production `ValidationConfig` guidance for remote base lookup, and a **package → extract → `ProfileRegistry`** materialization pipeline.
+
+⸻
+
+## Validation add-ons (v1): strict JSON keys + base snapshot cardinality
+
+These checks run **after** (or alongside) generated binding and invariant passes when you use
+`Validator::validate_resource_with_validation_addons` (full resource + FHIRPath context) or
+`Validator::apply_validation_addons` (JSON value + resource type string — same path as `tests/addons_r4`).
+
+They are enabled by default via `ValidationConfig`:
+
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `strict_json_properties` | **`true`** | Reject unknown JSON property names under each logical path using allowed child names from the **base** `ExtractedProfile` (from `StructureDefinition.snapshot` extraction). Always allows standard JSON envelope keys at the resource root: `resourceType`, `id`, `meta`, `implicitRules`, `language`, `text`, `contained`, `extension`, `modifierExtension` (these are not always listed as snapshot element paths). |
+| `validate_base_snapshot_cardinality` | **`true`** | Enforce `min` / `max` from the base profile’s element rules against the instance JSON. For nested paths (e.g. `Patient.communication.language`), rules apply only when the **immediate parent** slice is present (e.g. a `communication` entry exists); this matches common IG semantics for optional parents. |
+
+**Requirements**
+
+1. **Load the HL7 base `StructureDefinition`** for the resource type into a `ProfileRegistry`, keyed by canonical URL `http://hl7.org/fhir/StructureDefinition/{Type}` (or use `ValidationConfig.base_structure_definition_url_overrides` if your tooling uses a different key).
+2. Use `extract_structure_definition_profile_from_json` (or version-specific extractors) — snapshot-only IGs are supported when `snapshot.element` is non-empty.
+3. Prefer **`ProfileManifest`** / `load_profile_registry_from_manifest_file` at startup for IG materialization (see the doc linked above).
+
+**Example (R4 `Patient`, JSON + registry — mirrors `tests/addons_r4/strict_properties.rs`)**
+
+```rust
+use fhir_validation::profile::extract::extract_structure_definition_profile_from_json;
+use fhir_validation::profile::profile_registry::ProfileRegistry;
+use fhir_validation::{Validator, ValidationConfig};
+use serde_json::json;
+
+let patient_sd: serde_json::Value = /* HL7 R4 patient.profile.json */;
+let mut registry = ProfileRegistry::new();
+registry.insert(
+    extract_structure_definition_profile_from_json(&patient_sd).expect("extract base Patient"),
+);
+
+let validator = Validator::new(ValidationConfig::default());
+let root = json!({
+    "resourceType": "Patient",
+    "notARealField": true
+});
+let issues = validator.apply_validation_addons(&root, "Patient", &registry);
+// … inspect `issues` for strict-property / cardinality diagnostics …
+```
+
+For the **typed resource** entry point (bindings + invariants + add-ons), call `Validator::validate_resource_with_validation_addons(&fhir_resource, terminology, &evaluator, &registry)` with the same registry.
+
+**Tests:** `cargo test -p fhir-validation --features R4 --test addons_r4` (and `--features R5 --test addons_r5`).
+
+**Questionnaire (R5):** optional; build with `--features questionnaire` to expose `validate_questionnaire_response_against_questionnaire`.
+
+⸻
+
 ### Core Concepts
 
 ## InvariantDef

@@ -23,6 +23,9 @@ pub struct ExtractedProfile {
     /// The `StructureDefinition.type` code (root path / type name); e.g. `Patient` or `Address`.
     pub resource_type: String,
     pub base_definition: Option<String>,
+    /// `StructureDefinition.snapshot.extension` `snapshot-base-version` `valueString`, when
+    /// present (FHIR IG tooling); used to pick HL7 web package paths for `baseDefinition` fetch.
+    pub snapshot_base_version: Option<String>,
 
     pub kind: StructureDefinitionKind,
     pub derivation: TypeDerivationRule,

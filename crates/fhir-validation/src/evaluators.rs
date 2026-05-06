@@ -672,7 +672,7 @@ fn normalize_declared_path(declared_path: &str) -> String {
     }
 
     match path.split_once('.') {
-        Some((_, rest)) => rest.to_string(),
+        Some((_, rest)) => rest.replace("[x]", ""),
         None => String::new(),
     }
 }

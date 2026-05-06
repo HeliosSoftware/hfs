@@ -29,7 +29,7 @@ use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
 use helios_rest::{
     AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth, init_logging,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
@@ -664,6 +664,29 @@ async fn main() -> anyhow::Result<()> {
                 std::env::set_var("FHIRPATH_TERMINOLOGY_SERVER", ts_url);
             }
             info!(url = %ts_url, "HFS_TERMINOLOGY_SERVER wired to FHIRPath context");
+        }
+    }
+
+    // Optional IG/profile materialization manifest for validation contexts.
+    // This does not yet wire runtime validation in `helios-rest`; it verifies and
+    // reports manifest loadability at startup so deployments can fail fast.
+    if let Ok(manifest_path) = std::env::var("HFS_PROFILE_MANIFEST") {
+        let path = std::path::Path::new(&manifest_path);
+        match fhir_validation::load_profile_registry_from_manifest_file(path) {
+            Ok(reg) => {
+                info!(
+                    manifest = %path.display(),
+                    profile_count = reg.len(),
+                    "Loaded profile manifest for validation context"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    manifest = %path.display(),
+                    error = %err,
+                    "Failed to load HFS_PROFILE_MANIFEST (continuing startup)"
+                );
+            }
         }
     }
 
