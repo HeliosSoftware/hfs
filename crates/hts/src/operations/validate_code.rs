@@ -1135,12 +1135,14 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             None => url.clone(),
         };
 
+        // TX_GENERAL_CC_ERROR_MESSAGE: top-level "no valid coding" error. The IG
+        // fixtures do NOT expect location or expression on this issue.
         let mut issues: Vec<ValidationIssue> = vec![ValidationIssue {
             severity: "error".into(),
             fhir_code: "code-invalid".into(),
             tx_code: "not-in-vs".into(),
             text: format!("No valid coding was found for the value set '{url_with_version}'"),
-            location: Some("CodeableConcept".into()),
+            location: None,
             message_id: Some("TX_GENERAL_CC_ERROR_MESSAGE".into()),
         }];
 
@@ -1193,16 +1195,17 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 });
             }
 
-            // Always emit the per-coding "this code wasn't in VS" info.
+            // Per-coding "this code wasn't in VS" error. The IG fixtures expect
+            // severity=error and tx_code=not-in-vs (not "this-code-not-in-vs").
             let display = coding_displays.get(&(system.clone(), code.clone()));
             let qualified = match display {
                 Some(d) => format!("{system}#{code} ('{d}')"),
                 None => format!("{system}#{code}"),
             };
             issues.push(ValidationIssue {
-                severity: "information".into(),
+                severity: "error".into(),
                 fhir_code: "code-invalid".into(),
-                tx_code: "this-code-not-in-vs".into(),
+                tx_code: "not-in-vs".into(),
                 text: format!(
                     "The provided code '{qualified}' was not found in the value set '{url_with_version}'"
                 ),

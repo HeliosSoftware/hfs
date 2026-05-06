@@ -1091,6 +1091,21 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 });
             }
 
+            // When compose.inactive=false the VS excludes inactive concepts.
+            // The expansion cache was computed without this filter, so we must
+            // apply it here: if the matched concept is inactive, treat it as
+            // not-found (the IG `inactive/validate-inactive-2a` fixture).
+            let compose_inactive_false = compose_json_for_version
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v| v.get("inactive").and_then(|b| b.as_bool()))
+                == Some(false);
+            let found = if compose_inactive_false {
+                found.filter(|c| !is_concept_inactive(&conn, &c.system, &c.code))
+            } else {
+                found
+            };
+
             // Prefer the matched concept's system if present (in case the
             // request didn't pass a system).
             let system_for_msg: Option<String> = req
@@ -5121,6 +5136,12 @@ fn finish_validate_code_response(
         Some(s) => format!("{s}#{code}"),
         None => code.to_string(),
     };
+    // When the caller provided a display for the code (e.g. Coding.display),
+    // the IG fixtures include it in the not-found text as `#code ('Display')`.
+    let qualified_with_display = match (system_for_msg, expected_display) {
+        (Some(s), Some(d)) => format!("{s}#{code} ('{d}')"),
+        _ => qualified.clone(),
+    };
     let url_with_version = match vs_version {
         Some(v) => format!("{url}|{v}"),
         None => url.to_string(),
@@ -5129,10 +5150,10 @@ fn finish_validate_code_response(
     match found {
         None => {
             // The IG validator compares this text with the format
-            //   "The provided code 'system#code' was not found in the value set 'url'"
-            // (see notSelectable/* and validation/* response fixtures).
+            //   "The provided code 'system#code ('Display')' was not found in the value set 'url'"
+            // when the caller provided a display, otherwise without the display.
             let not_in_vs_text = format!(
-                "The provided code '{qualified}' was not found in the value set '{url_with_version}'"
+                "The provided code '{qualified_with_display}' was not found in the value set '{url_with_version}'"
             );
             // Special case: code is valid in the underlying CodeSystem but
             // inactive, and the VS filtered it out (compose.inactive=false
