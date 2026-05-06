@@ -168,6 +168,12 @@ pub struct ValidateCodeResponse {
     /// `system` parameter so the IG `inferSystem` fixtures can echo it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    /// The CodeSystem version that the backend actually resolved and used
+    /// during validation. Populated by the storage backend so the operations
+    /// layer can echo the correct version regardless of what the caller
+    /// requested. `None` when the system is unknown or has no stored version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cs_version: Option<String>,
     /// `Some(true)` when the matched concept is inactive (status in
     /// retired/deprecated/withdrawn/inactive). The IG fixtures expect this
     /// to surface as a top-level `inactive` parameter on the response.

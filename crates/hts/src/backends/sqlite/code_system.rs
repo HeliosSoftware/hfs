@@ -153,13 +153,13 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
             // Unknown code system is not an error — just a "false" result.
-            let system_id = match resolve_code_system(
+            let (system_id, resolved_cs_version) = match resolve_code_system(
                 &conn,
                 &system,
                 req.version.as_deref(),
                 req.date.as_deref(),
             ) {
-                Ok((id, _, _)) => id,
+                Ok((id, _, version)) => (id, version),
                 Err(HtsError::NotFound(_)) => {
                     let text = format!(
                         "A definition for CodeSystem {system} could not be found, so the code cannot be validated"
@@ -169,6 +169,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         message: Some(text.clone()),
                         display: None,
                         system: None,
+                        cs_version: None,
                         inactive: None,
                         issues: vec![crate::types::ValidationIssue {
                             severity: "error".into(),
@@ -217,6 +218,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         message: Some(text.clone()),
                         display: None,
                         system: None,
+                        cs_version: cs_version_str,
                         inactive: None,
                         issues: vec![crate::types::ValidationIssue {
                             severity: "error".into(),
@@ -265,6 +267,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 message,
                 display,
                 system: None,
+                cs_version: resolved_cs_version,
                 inactive: None,
                 issues,
                 caused_by_unknown_system: None,

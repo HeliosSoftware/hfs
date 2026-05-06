@@ -262,11 +262,12 @@ fn build_validate_response(
 /// Build a validate-code response and resolve the system's version via a
 /// backend lookup (so the response can echo `version` per the IG fixtures).
 ///
-/// `req_version` is the version the caller explicitly requested (e.g.
-/// `Coding.version` or the `version` parameter).  When provided and the
-/// validation succeeded, it is echoed back verbatim instead of doing a
-/// backend lookup that would return the *latest* stored version — the wrong
-/// answer when the DB holds multiple versions (e.g. 1.0.0 **and** 1.2.0).
+/// The version echoed in the response is taken from `resp.cs_version` — the
+/// version the backend **actually resolved and used** during validation.  This
+/// is set by the storage layer to the CS version it picked (latest stored
+/// when no version was pinned, or the exact version it fell back to when the
+/// requested version didn't exist).  A separate DB lookup is still done for
+/// `x-unknown-system` detection and status-check issue generation.
 #[allow(clippy::too_many_arguments)]
 async fn build_validate_response_async<B: TerminologyBackend>(
     backend: &B,
@@ -274,7 +275,6 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     mut resp: ValidateCodeResponse,
     code: Option<&str>,
     system: Option<&str>,
-    req_version: Option<&str>,
     codeable_concept: Option<&Value>,
     request_path: RequestPath,
     value_set_url: Option<&str>,
@@ -285,8 +285,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     let effective_system: Option<&str> = system.or(inferred_system.as_deref());
 
     // Look up the stored CS version for `x-unknown-system` detection and
-    // status-check issue generation.  The result is ONLY used as the response
-    // `version` echo when the caller did not supply an explicit version.
+    // status-check issue generation.
     let stored_version = if let Some(s) = effective_system {
         backend
             .code_system_version_for_url(ctx, s)
@@ -297,13 +296,11 @@ async fn build_validate_response_async<B: TerminologyBackend>(
         None
     };
 
-    // When the caller provided an explicit version use it for the `version`
-    // echo — that is the version that was actually validated against.
-    // Fall back to the backend-resolved (latest) version only when no version
-    // was requested.
-    let version: Option<String> = req_version
-        .map(|v| v.to_string())
-        .or(stored_version.clone());
+    // Use the version the backend actually resolved and used.  The backend
+    // populates `resp.cs_version` with the CS version it picked; fall back
+    // to the stored_version (latest) when the backend didn't set it (e.g.
+    // older backends or paths that bypass finish_validate_code_response).
+    let version: Option<String> = resp.cs_version.take().or(stored_version.clone());
 
     // If the input system isn't stored, the IG expects an `x-unknown-system`
     // parameter pointing at the unknown URL (only when validate-code reported
@@ -669,7 +666,6 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             Some(&system),
-            req_version.as_deref(),
             None,
             RequestPath::BareCode,
             None,
@@ -722,7 +718,6 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             Some(&system),
-            req_version.as_deref(),
             None,
             RequestPath::Coding,
             None,
@@ -777,7 +772,6 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                     resp,
                     Some(&code),
                     Some(&system),
-                    cc_req_version.as_deref(),
                     cc_value.as_ref(),
                     RequestPath::CodeableConcept,
                     None,
@@ -792,6 +786,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 message: Some("None of the provided codings were found in any CodeSystem".into()),
                 display: None,
                 system: None,
+                cs_version: None,
                 inactive: None,
                 issues: vec![],
                 caused_by_unknown_system: None,
@@ -927,7 +922,6 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             system.as_deref(),
-            req_version.as_deref(),
             None,
             RequestPath::BareCode,
             Some(&url),
@@ -988,6 +982,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     message: Some(no_system_text.clone()),
                     display: None,
                     system: None,
+                    cs_version: None,
                     inactive: None,
                     issues: vec![
                         ValidationIssue {
@@ -1060,7 +1055,6 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             Some(&system),
-            req_version.as_deref(),
             None,
             RequestPath::Coding,
             Some(&url),
@@ -1129,7 +1123,6 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     resp,
                     Some(&code),
                     Some(&system),
-                    cc_req_version.as_deref(),
                     cc_value.as_ref(),
                     RequestPath::CodeableConcept,
                     Some(&url),
@@ -1260,6 +1253,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 message: None,
                 display: None,
                 system: None,
+                cs_version: None,
                 inactive: None,
                 issues,
                 caused_by_unknown_system: None,

@@ -1085,6 +1085,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     message: Some(message),
                     display,
                     system: None,
+                    cs_version: None,
                     inactive: None,
                     issues,
                     caused_by_unknown_system: caused_by,
@@ -5238,6 +5239,7 @@ fn finish_validate_code_response(
                 message: Some(message),
                 display: None,
                 system: None,
+                cs_version: cs_version_for_msg.map(|s| s.to_string()),
                 inactive: if is_inactive_in_underlying_cs {
                     Some(true)
                 } else {
@@ -5283,6 +5285,9 @@ fn finish_validate_code_response(
                     message: Some(abstract_text),
                     display: concept.display,
                     system: None,
+                    cs_version: concept
+                        .version
+                        .or_else(|| cs_version_for_msg.map(|s| s.to_string())),
                     inactive: None,
                     issues,
                     caused_by_unknown_system: None,
@@ -5350,6 +5355,9 @@ fn finish_validate_code_response(
                 message,
                 display: concept.display,
                 system: Some(concept.system),
+                cs_version: concept
+                    .version
+                    .or_else(|| cs_version_for_msg.map(|s| s.to_string())),
                 inactive: if is_inactive { Some(true) } else { None },
                 issues,
                 caused_by_unknown_system: None,
