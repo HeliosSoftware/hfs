@@ -4894,6 +4894,7 @@ fn detect_cs_version_mismatch(
             fhir_code: "not-found".into(),
             tx_code: "not-found".into(),
             text: error_text,
+            expression: Some(system_loc.into()),
             location: Some(system_loc.into()),
             message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
         };
@@ -4907,6 +4908,7 @@ fn detect_cs_version_mismatch(
                         fhir_code: "invalid".into(),
                         tx_code: "vs-invalid".into(),
                         text: mismatch_text,
+                        expression: Some(version_loc.into()),
                         location: Some(version_loc.into()),
                         message_id: Some(mismatch_id.into()),
                     },
@@ -4921,6 +4923,7 @@ fn detect_cs_version_mismatch(
                         fhir_code: "invalid".into(),
                         tx_code: "vs-invalid".into(),
                         text: warn_text,
+                        expression: Some(version_loc.into()),
                         location: Some(version_loc.into()),
                         message_id: Some(warn_id.into()),
                     },
@@ -4960,6 +4963,7 @@ fn detect_cs_version_mismatch(
                             fhir_code: "invalid".into(),
                             tx_code: "vs-invalid".into(),
                             text: mismatch_text,
+                            expression: Some(version_loc.into()),
                             location: Some(version_loc.into()),
                             message_id: Some("VALUESET_VALUE_MISMATCH".into()),
                         },
@@ -4968,6 +4972,7 @@ fn detect_cs_version_mismatch(
                             fhir_code: "not-found".into(),
                             tx_code: "not-found".into(),
                             text: unknown_text,
+                            expression: Some(system_loc.into()),
                             location: Some(system_loc.into()),
                             message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
                         },
@@ -4981,6 +4986,7 @@ fn detect_cs_version_mismatch(
                     fhir_code: "invalid".into(),
                     tx_code: "vs-invalid".into(),
                     text: mismatch_text,
+                    expression: Some(version_loc.into()),
                     location: Some(version_loc.into()),
                     message_id: Some("VALUESET_VALUE_MISMATCH".into()),
                 }];
@@ -5002,6 +5008,7 @@ fn detect_cs_version_mismatch(
                     fhir_code: "invalid".into(),
                     tx_code: "vs-invalid".into(),
                     text: mismatch_text,
+                    expression: Some(version_loc.into()),
                     location: Some(version_loc.into()),
                     message_id: Some("VALUESET_VALUE_MISMATCH".into()),
                 }];
@@ -5067,6 +5074,7 @@ fn detect_vs_pin_unknown(
         fhir_code: "not-found".into(),
         tx_code: "not-found".into(),
         text: error_text,
+        expression: Some(system_loc.into()),
         location: Some(system_loc.into()),
         message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
     }];
@@ -5166,7 +5174,8 @@ fn finish_validate_code_response(
                     fhir_code: "business-rule".into(),
                     tx_code: "code-rule".into(),
                     text: format!("The concept '{code}' is valid but is not active"),
-                    location: Some("Coding.code".into()),
+                    expression: Some("Coding.code".into()),
+                    location: None,
                     message_id: Some("STATUS_CODE_WARNING_CODE".into()),
                 });
             }
@@ -5175,7 +5184,8 @@ fn finish_validate_code_response(
                 fhir_code: "code-invalid".into(),
                 tx_code: "not-in-vs".into(),
                 text: not_in_vs_text.clone(),
-                location: Some("Coding.code".into()),
+                expression: Some("Coding.code".into()),
+                location: None,
                 message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
             });
             // Companion issue: when the code isn't in the underlying CodeSystem
@@ -5198,7 +5208,8 @@ fn finish_validate_code_response(
                         fhir_code: "code-invalid".into(),
                         tx_code: "invalid-code".into(),
                         text: cs_text,
-                        location: Some("Coding.code".into()),
+                        expression: Some("Coding.code".into()),
+                        location: None,
                         message_id: Some("Unknown_Code_in_Version".into()),
                     });
                 }
@@ -5211,6 +5222,8 @@ fn finish_validate_code_response(
                     text: format!(
                         "The concept '{code}' has a status of inactive and its use should be reviewed"
                     ),
+                    // code-comment requires both location[] and expression[]
+                    expression: Some("Coding".into()),
                     location: Some("Coding".into()),
                     message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
                 });
@@ -5252,7 +5265,8 @@ fn finish_validate_code_response(
                     fhir_code: "business-rule".into(),
                     tx_code: "code-rule".into(),
                     text: abstract_text.clone(),
-                    location: Some("Coding.code".into()),
+                    expression: Some("Coding.code".into()),
+                    location: None,
                     message_id: Some("ABSTRACT_CODE_NOT_ALLOWED".into()),
                 });
                 issues.push(crate::types::ValidationIssue {
@@ -5260,7 +5274,8 @@ fn finish_validate_code_response(
                     fhir_code: "code-invalid".into(),
                     tx_code: "not-in-vs".into(),
                     text: not_in_vs_text,
-                    location: Some("Coding.code".into()),
+                    expression: Some("Coding.code".into()),
+                    location: None,
                     message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
                 });
                 return Ok(ValidateCodeResponse {
@@ -5286,6 +5301,8 @@ fn finish_validate_code_response(
                     text: format!(
                         "The concept '{code}' has a status of inactive and its use should be reviewed"
                     ),
+                    // code-comment requires both location[] and expression[]
+                    expression: Some("Coding".into()),
                     location: Some("Coding".into()),
                     message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
                 });
@@ -5307,7 +5324,8 @@ fn finish_validate_code_response(
                             fhir_code: "invalid".into(),
                             tx_code: "invalid-display".into(),
                             text,
-                            location: Some("Coding.display".into()),
+                            expression: Some("Coding.display".into()),
+                            location: None,
                             message_id: Some(
                                 "Display_Name_for__should_be_one_of__instead_of".into(),
                             ),
@@ -9516,5 +9534,88 @@ mod tests {
         assert_eq!(resp.total, Some(1));
         let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
         assert_eq!(codes, vec!["male"]);
+    }
+
+    // ── VS import: compose.include[].valueSet[] in validate-code ─────────────
+
+    #[tokio::test]
+    async fn validate_code_via_vs_import_returns_true() {
+        // Scenario: VS "import" has compose.include[{valueSet:["base"]}].
+        // Code "A" is in "base" which includes all codes from the CS.
+        // validate-code against "import" must find "A" (result=true).
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "cs-import",
+                "url": "http://example.org/cs/import",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  { "code": "A", "display": "Concept A" },
+                  { "code": "B", "display": "Concept B" }
+                ]
+              }
+            },
+            {
+              "resource": {
+                "resourceType": "ValueSet",
+                "id": "vs-base",
+                "url": "http://example.org/vs/base",
+                "status": "active",
+                "compose": {
+                  "include": [{ "system": "http://example.org/cs/import" }]
+                }
+              }
+            },
+            {
+              "resource": {
+                "resourceType": "ValueSet",
+                "id": "vs-import",
+                "url": "http://example.org/vs/import",
+                "status": "active",
+                "compose": {
+                  "include": [{ "valueSet": ["http://example.org/vs/base"] }]
+                }
+              }
+            }
+          ]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let v_in = b
+            .validate_code(
+                &ctx(),
+                ValidateCodeRequest {
+                    url: Some("http://example.org/vs/import".into()),
+                    code: "A".into(),
+                    system: Some("http://example.org/cs/import".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            v_in.result,
+            "code A must be found in vs-import via VS import"
+        );
+
+        let v_out = b
+            .validate_code(
+                &ctx(),
+                ValidateCodeRequest {
+                    url: Some("http://example.org/vs/import".into()),
+                    code: "C".into(),
+                    system: Some("http://example.org/cs/import".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!v_out.result, "code C must not be found in vs-import");
     }
 }

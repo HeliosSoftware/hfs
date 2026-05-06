@@ -51,11 +51,6 @@ enum RequestPath {
 }
 
 /// Render a single [`ValidationIssue`] as a FHIR `OperationOutcome.issue`.
-///
-/// The resulting JSON includes the `operationoutcome-message-id` extension
-/// when the issue carries one, plus `details.coding[]` with the tx-issue-type
-/// coding and `details.text`. `expression` and `location` echo the structured
-/// FHIRPath location.
 fn render_issue(issue: &ValidationIssue) -> Value {
     let mut json_issue = json!({
         "severity": issue.severity,
@@ -82,10 +77,12 @@ fn render_issue(issue: &ValidationIssue) -> Value {
             .as_object_mut()
             .unwrap()
             .insert("location".into(), json!([loc]));
+    }
+    if let Some(expr) = issue.expression.as_deref() {
         json_issue
             .as_object_mut()
             .unwrap()
-            .insert("expression".into(), json!([loc]));
+            .insert("expression".into(), json!([expr]));
     }
     json_issue
 }
@@ -138,11 +135,15 @@ fn build_validate_response(
     // `Coding.code` when there is no Coding wrapper in the request).
     if matches!(request_path, RequestPath::BareCode) {
         for issue in &mut issues {
-            if let Some(loc) = issue.location.as_deref() {
-                if let Some(stripped) = loc.strip_prefix("Coding.") {
-                    issue.location = Some(stripped.to_string());
-                } else if loc == "Coding" {
-                    issue.location = None;
+            // Rewrite FHIRPath expression paths for bare-code requests:
+            // `Coding.code` → `code`, `Coding.system` → `system`, `Coding` → drop.
+            for field in [&mut issue.expression, &mut issue.location] {
+                if let Some(path) = field.as_deref() {
+                    if let Some(stripped) = path.strip_prefix("Coding.") {
+                        *field = Some(stripped.to_string());
+                    } else if path == "Coding" {
+                        *field = None;
+                    }
                 }
             }
         }
@@ -151,7 +152,7 @@ fn build_validate_response(
         let text = format!(
             "A definition for CodeSystem {unknown} could not be found, so the code cannot be validated"
         );
-        let location = match request_path {
+        let expression = match request_path {
             RequestPath::BareCode => "system".to_string(),
             _ => "Coding.system".to_string(),
         };
@@ -160,7 +161,8 @@ fn build_validate_response(
             fhir_code: "not-found".into(),
             tx_code: "not-found".into(),
             text,
-            location: Some(location),
+            expression: Some(expression),
+            location: None,
             message_id: Some("UNKNOWN_CODESYSTEM".into()),
         });
     }
@@ -319,6 +321,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
                         fhir_code: "business-rule".into(),
                         tx_code: "status-check".into(),
                         text: format!("Reference to {status} CodeSystem {cs_uri}"),
+                        expression: None,
                         location: None,
                         message_id: Some(status_message_id(&status).into()),
                     });
@@ -354,6 +357,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
                         fhir_code: "business-rule".into(),
                         tx_code: "status-check".into(),
                         text: format!("Reference to {status} ValueSet {vs_uri}"),
+                        expression: None,
                         location: None,
                         message_id: Some(status_message_id(&status).into()),
                     });
@@ -965,7 +969,8 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                             fhir_code: "code-invalid".into(),
                             tx_code: "not-in-vs".into(),
                             text: not_in_vs_text,
-                            location: Some("Coding.code".into()),
+                            expression: Some("Coding.code".into()),
+                            location: None,
                             message_id: Some(
                                 "None_of_the_provided_codes_are_in_the_value_set_one".into(),
                             ),
@@ -975,7 +980,8 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                             fhir_code: "invalid".into(),
                             tx_code: "invalid-data".into(),
                             text: no_system_text,
-                            location: Some("Coding".into()),
+                            expression: Some("Coding".into()),
+                            location: None,
                             message_id: Some("Coding_has_no_system__cannot_validate".into()),
                         },
                     ],
@@ -1135,13 +1141,14 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             None => url.clone(),
         };
 
-        // TX_GENERAL_CC_ERROR_MESSAGE: top-level "no valid coding" error. The IG
-        // fixtures do NOT expect location or expression on this issue.
+        // TX_GENERAL_CC_ERROR_MESSAGE: top-level "no valid coding" error.
+        // The IG fixtures do NOT expect location or expression on this issue.
         let mut issues: Vec<ValidationIssue> = vec![ValidationIssue {
             severity: "error".into(),
             fhir_code: "code-invalid".into(),
             tx_code: "not-in-vs".into(),
             text: format!("No valid coding was found for the value set '{url_with_version}'"),
+            expression: None,
             location: None,
             message_id: Some("TX_GENERAL_CC_ERROR_MESSAGE".into()),
         }];
@@ -1190,26 +1197,28 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     fhir_code: "code-invalid".into(),
                     tx_code: "invalid-code".into(),
                     text: cs_text,
-                    location: Some(format!("CodeableConcept.coding[{idx}].code")),
+                    expression: Some(format!("CodeableConcept.coding[{idx}].code")),
+                    location: None,
                     message_id: Some("Unknown_Code_in_Version".into()),
                 });
             }
 
-            // Per-coding "this code wasn't in VS" error. The IG fixtures expect
-            // severity=error and tx_code=not-in-vs (not "this-code-not-in-vs").
+            // Per-coding "this code wasn't in VS" issue. The IG fixtures expect
+            // severity=information and tx_code=this-code-not-in-vs.
             let display = coding_displays.get(&(system.clone(), code.clone()));
             let qualified = match display {
                 Some(d) => format!("{system}#{code} ('{d}')"),
                 None => format!("{system}#{code}"),
             };
             issues.push(ValidationIssue {
-                severity: "error".into(),
+                severity: "information".into(),
                 fhir_code: "code-invalid".into(),
-                tx_code: "not-in-vs".into(),
+                tx_code: "this-code-not-in-vs".into(),
                 text: format!(
                     "The provided code '{qualified}' was not found in the value set '{url_with_version}'"
                 ),
-                location: Some(format!("CodeableConcept.coding[{idx}].code")),
+                expression: Some(format!("CodeableConcept.coding[{idx}].code")),
+                location: None,
                 message_id: Some(
                     "None_of_the_provided_codes_are_in_the_value_set_one".into(),
                 ),

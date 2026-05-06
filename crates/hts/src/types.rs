@@ -139,9 +139,12 @@ pub struct ValidationIssue {
     pub tx_code: String,
     /// Human-readable text — also concatenated into the top-level `message`.
     pub text: String,
-    /// FHIRPath-style location inside the input (e.g. `Coding.code`).
-    /// Emitted into both `location[]` and `expression[]`. None means the
-    /// input form (CodeableConcept vs Coding) decides.
+    /// FHIRPath-style path inside the input (e.g. `Coding.code`).
+    /// Emitted as `expression[]`. Stripped to bare form for `BareCode` requests.
+    pub expression: Option<String>,
+    /// Structural location — emitted as `location[]` only. Set alongside
+    /// `expression` for version-mismatch issues (`vs-invalid`, `not-found`
+    /// UNKNOWN_CODESYSTEM_VERSION) and `code-comment`; `None` for all others.
     pub location: Option<String>,
     /// IG `operationoutcome-message-id` extension value (e.g.
     /// `None_of_the_provided_codes_are_in_the_value_set_one`). The fixtures
