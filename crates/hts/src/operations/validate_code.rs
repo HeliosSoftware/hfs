@@ -261,6 +261,12 @@ fn build_validate_response(
 
 /// Build a validate-code response and resolve the system's version via a
 /// backend lookup (so the response can echo `version` per the IG fixtures).
+///
+/// `req_version` is the version the caller explicitly requested (e.g.
+/// `Coding.version` or the `version` parameter).  When provided and the
+/// validation succeeded, it is echoed back verbatim instead of doing a
+/// backend lookup that would return the *latest* stored version — the wrong
+/// answer when the DB holds multiple versions (e.g. 1.0.0 **and** 1.2.0).
 #[allow(clippy::too_many_arguments)]
 async fn build_validate_response_async<B: TerminologyBackend>(
     backend: &B,
@@ -268,6 +274,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     mut resp: ValidateCodeResponse,
     code: Option<&str>,
     system: Option<&str>,
+    req_version: Option<&str>,
     codeable_concept: Option<&Value>,
     request_path: RequestPath,
     value_set_url: Option<&str>,
@@ -277,7 +284,10 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     let inferred_system = resp.system.clone();
     let effective_system: Option<&str> = system.or(inferred_system.as_deref());
 
-    let version = if let Some(s) = effective_system {
+    // Look up the stored CS version for `x-unknown-system` detection and
+    // status-check issue generation.  The result is ONLY used as the response
+    // `version` echo when the caller did not supply an explicit version.
+    let stored_version = if let Some(s) = effective_system {
         backend
             .code_system_version_for_url(ctx, s)
             .await
@@ -286,10 +296,19 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     } else {
         None
     };
+
+    // When the caller provided an explicit version use it for the `version`
+    // echo — that is the version that was actually validated against.
+    // Fall back to the backend-resolved (latest) version only when no version
+    // was requested.
+    let version: Option<String> = req_version
+        .map(|v| v.to_string())
+        .or(stored_version.clone());
+
     // If the input system isn't stored, the IG expects an `x-unknown-system`
     // parameter pointing at the unknown URL (only when validate-code reported
     // result=false).
-    let unknown_system = if !resp.result && version.is_none() {
+    let unknown_system = if !resp.result && stored_version.is_none() {
         effective_system
     } else {
         None
@@ -618,12 +637,13 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
         let supplements =
             resolve_supplements(state.backend(), &ctx, &params, Some(&system)).await?;
         let display = find_str_param(&params, "display");
+        let req_version = find_str_param(&params, "version");
         let req = ValidateCodeRequest {
             url: None,
             value_set_version: None,
             system: Some(system.clone()),
             code: code.clone(),
-            version: find_str_param(&params, "version"),
+            version: req_version.clone(),
             display: display.clone(),
             date: find_str_param(&params, "date"),
             include_abstract: params
@@ -649,6 +669,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             Some(&system),
+            req_version.as_deref(),
             None,
             RequestPath::BareCode,
             None,
@@ -667,7 +688,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
         // report a mismatch.
         let display = coding_display.or_else(|| find_str_param(&params, "display"));
         // Coding.version takes precedence over a top-level `version` param.
-        let version = coding_version.or_else(|| find_str_param(&params, "version"));
+        let req_version = coding_version.or_else(|| find_str_param(&params, "version"));
         let supplements =
             resolve_supplements(state.backend(), &ctx, &params, Some(&system)).await?;
         let req = ValidateCodeRequest {
@@ -675,7 +696,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             value_set_version: None,
             system: Some(system.clone()),
             code: code.clone(),
-            version,
+            version: req_version.clone(),
             display: display.clone(),
             date: find_str_param(&params, "date"),
             include_abstract: params
@@ -701,6 +722,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             Some(&system),
+            req_version.as_deref(),
             None,
             RequestPath::Coding,
             None,
@@ -731,13 +753,14 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
         // codings in a CodeableConcept all validate, the response echoes the
         // last one). Iterate in reverse so the earliest "yes" we find is the
         // last entry in the input.
+        let cc_req_version = find_str_param(&params, "version");
         for (system, code) in codings.into_iter().rev() {
             let req = ValidateCodeRequest {
                 url: None,
                 value_set_version: None,
                 system: Some(system.clone()),
                 code: code.clone(),
-                version: find_str_param(&params, "version"),
+                version: cc_req_version.clone(),
                 display: None,
                 date: find_str_param(&params, "date"),
                 include_abstract: params
@@ -754,6 +777,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                     resp,
                     Some(&code),
                     Some(&system),
+                    cc_req_version.as_deref(),
                     cc_value.as_ref(),
                     RequestPath::CodeableConcept,
                     None,
@@ -867,12 +891,13 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     if let Some(code) = find_str_param(&params, "code") {
         let system = find_str_param(&params, "system");
         let display = find_str_param(&params, "display");
+        let req_version = find_str_param(&params, "version");
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
             value_set_version: vs_version.clone(),
             system: system.clone(),
             code: code.clone(),
-            version: find_str_param(&params, "version"),
+            version: req_version.clone(),
             display: display.clone(),
             date: find_str_param(&params, "date"),
             include_abstract: params
@@ -902,6 +927,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             system.as_deref(),
+            req_version.as_deref(),
             None,
             RequestPath::BareCode,
             Some(&url),
@@ -1000,13 +1026,13 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // report a mismatch.
         let display = coding_display.or_else(|| find_str_param(&params, "display"));
         // Coding.version takes precedence over a top-level `version` param.
-        let version = coding_version.or_else(|| find_str_param(&params, "version"));
+        let req_version = coding_version.or_else(|| find_str_param(&params, "version"));
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
             value_set_version: vs_version.clone(),
             system: Some(system.clone()),
             code: code.clone(),
-            version,
+            version: req_version.clone(),
             display: display.clone(),
             date: find_str_param(&params, "date"),
             include_abstract: params
@@ -1034,6 +1060,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             resp,
             Some(&code),
             Some(&system),
+            req_version.as_deref(),
             None,
             RequestPath::Coding,
             Some(&url),
@@ -1076,13 +1103,14 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // codings in a CodeableConcept all validate, the response echoes the
         // last one). Iterate in reverse so the earliest "yes" we find is the
         // last entry in the input.
+        let cc_req_version = find_str_param(&params, "version");
         for (system, code) in codings.clone().into_iter().rev() {
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),
                 value_set_version: vs_version.clone(),
                 system: Some(system.clone()),
                 code: code.clone(),
-                version: find_str_param(&params, "version"),
+                version: cc_req_version.clone(),
                 display: None,
                 date: find_str_param(&params, "date"),
                 include_abstract: params
@@ -1101,6 +1129,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     resp,
                     Some(&code),
                     Some(&system),
+                    cc_req_version.as_deref(),
                     cc_value.as_ref(),
                     RequestPath::CodeableConcept,
                     Some(&url),

@@ -132,6 +132,110 @@ async fn vs_validate_code_excluded_code_returns_false() {
     assert!(!result, "'head' should NOT be in the limbs ValueSet");
 }
 
+/// Regression: when a request specifies `version=1.0.0` and the CodeSystem
+/// exists at that version (even though a newer version also exists), the
+/// response `version` parameter must echo the *requested* version ("1.0.0"),
+/// not the latest stored version ("1.2.0").
+///
+/// Covers the IG `version-code-v10-vs10-response-parameters` fixture.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn vs_validate_code_version_echoes_requested_version() {
+    let app = TestApp::new();
+
+    // Import a bundle with two versions of the same CodeSystem plus a
+    // ValueSet that pins version 1.0.0.
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "CodeSystem",
+                    "id": "multi-version-cs-v100",
+                    "url": "http://hts.test/cs/multi-version",
+                    "version": "1.0.0",
+                    "status": "active",
+                    "content": "complete",
+                    "concept": [
+                        { "code": "code1", "display": "Code One v1.0.0" }
+                    ]
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "CodeSystem",
+                    "id": "multi-version-cs-v120",
+                    "url": "http://hts.test/cs/multi-version",
+                    "version": "1.2.0",
+                    "status": "active",
+                    "content": "complete",
+                    "concept": [
+                        { "code": "code1", "display": "Code One v1.2.0" },
+                        { "code": "code2", "display": "Code Two v1.2.0" }
+                    ]
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "ValueSet",
+                    "id": "vs-pins-v100",
+                    "url": "http://hts.test/vs/pins-v100",
+                    "version": "1.0",
+                    "status": "active",
+                    "compose": {
+                        "include": [
+                            {
+                                "system": "http://hts.test/cs/multi-version",
+                                "version": "1.0.0"
+                            }
+                        ]
+                    }
+                }
+            }
+        ]
+    })
+    .to_string();
+    app.import_bundle_ok(&bundle).await;
+
+    // Validate code1 with explicit version=1.0.0 against the VS that pins 1.0.0.
+    let req = TestApp::params(&[
+        ("url", "valueUri", "http://hts.test/vs/pins-v100"),
+        ("code", "valueCode", "code1"),
+        ("system", "valueUri", "http://hts.test/cs/multi-version"),
+        ("version", "valueString", "1.0.0"),
+    ]);
+    let (status, body) = app.post_fhir("/ValueSet/$validate-code", req).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let params = body["parameter"].as_array().expect("parameter array");
+
+    let result = params
+        .iter()
+        .find(|p| p["name"] == "result")
+        .and_then(|p| p["valueBoolean"].as_bool())
+        .expect("expected result parameter");
+
+    assert!(
+        result,
+        "code1 should be valid in the 1.0.0-pinned VS; body={body}"
+    );
+
+    // The version echoed back MUST be "1.0.0", not "1.2.0" (the latest stored
+    // version that `code_system_version_for_url` would otherwise return).
+    let version = params
+        .iter()
+        .find(|p| p["name"] == "version")
+        .and_then(|p| p["valueString"].as_str())
+        .expect("expected version parameter in response");
+
+    assert_eq!(
+        version, "1.0.0",
+        "response must echo the requested version (1.0.0), not the latest (1.2.0)"
+    );
+}
+
 // ── GET /ValueSet (search) ────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
