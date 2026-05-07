@@ -239,34 +239,38 @@ jobs:
         run: |
           set +e
           python3 - <<'PY'
-          import json, glob, os
+          import json, os
           base = 'tx-ecosystem-ig/tests'
-          paths = []
-          # Case-insensitive globbing — IG ships some files as `ConceptMap-*.json`
-          # (CamelCase) which Linux glob (case-sensitive) would otherwise miss.
-          import fnmatch
-          for root, _, files in os.walk(base):
-              for fn in files:
-                  for pattern in ('valueset-*.json', 'codesystem-*.json',
-                                  'conceptmap-*.json', 'ConceptMap-*.json'):
-                      if fnmatch.fnmatch(fn, pattern):
-                          paths.append(os.path.join(root, fn))
-                          break
+          # Drive imports from the test-cases.json setup arrays — that's the
+          # authoritative list of fixture files each suite needs loaded
+          # before its tests run. Globbing for `valueset-*` / `codesystem-*`
+          # misses suites that use shorthand names (e.g. `tho/cs-act-class.json`,
+          # `tho/vs-act-class.json`, `errors/cs1.json`, `icd-11/vs1.json`).
+          paths = set()
+          with open(os.path.join(base, 'test-cases.json')) as f:
+              cases = json.load(f)
+          for suite in cases.get('suites', []) or []:
+              for rel in suite.get('setup', []) or []:
+                  paths.add(os.path.join(base, rel))
           # Skip ConceptMap-novs.json — it shares a `url=.../ConceptMap/full`
           # with ConceptMap-full.json, and our schema does INSERT-OR-REPLACE
           # on (url) which causes the second file to wipe the first's
           # element rows via CASCADE. Picking `-full` consistently keeps
           # the translate/translate-1 test fixture in place.
-          paths = [p for p in paths
-                   if not os.path.basename(p) == 'ConceptMap-novs.json']
-          # Sort for deterministic import order. Without this, glob iteration
+          paths = {p for p in paths
+                   if os.path.basename(p) != 'ConceptMap-novs.json'}
+          # Sort for deterministic import order. Without this, iteration
           # order varies across runners, and same-URL-different-version pairs
           # (e.g. codesystem-version-1.json + -2.json) silently flip which one
           # "wins" the import — leading to non-reproducible 404 churn in the
           # version test suite.
-          paths.sort()
+          paths = sorted(paths)
           entries = []
+          missing = []
           for path in paths:
+              if not os.path.exists(path):
+                  missing.append(path)
+                  continue
               with open(path) as f:
                   r = json.load(f)
               if r.get('resourceType') in ('CodeSystem', 'ValueSet', 'ConceptMap'):
@@ -275,6 +279,10 @@ jobs:
           with open('tx-fixtures.json', 'w') as f:
               json.dump(bundle, f)
           print(f'Wrote tx-fixtures.json: {len(entries)} entries, {os.path.getsize("tx-fixtures.json")} bytes')
+          if missing:
+              print(f'WARNING: {len(missing)} setup file(s) referenced in test-cases.json were not found:')
+              for p in missing:
+                  print(f'  - {p}')
           PY
           ./hts import tx-fixtures.json \
             --database-url "./data/hts-${{ matrix.label }}.db" \
