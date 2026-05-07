@@ -3374,7 +3374,12 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
                         "The concept '{in_code}' has a status of inactive and its use should be reviewed"
                     ),
                     expression: Some("Coding".into()),
-                    location: Some("Coding".into()),
+                    // The inline-VS path's IG `validate-contained-good`
+                    // fixture pins the INACTIVE_CONCEPT_FOUND issue WITHOUT
+                    // a `location` (only `expression`).  The URL-based
+                    // path (e.g. `simple-coding-bad-code-inactive`) does
+                    // expect both — that issue is built elsewhere.
+                    location: None,
                     message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
                 });
             }

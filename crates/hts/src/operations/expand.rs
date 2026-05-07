@@ -1798,6 +1798,93 @@ async fn process_expand<B: TerminologyBackend>(
                     let Some(code) = concept.get("code").and_then(|v| v.as_str()) else {
                         continue;
                     };
+                    // VS-compose-level designations attach to the matching
+                    // contains[] entry, alongside any base/supplement-derived
+                    // designations. The IG `extensions/expand-echo-enumerated`
+                    // fixture pins a `de`-language designation on the VS-
+                    // compose `code2` concept that must surface on the
+                    // expansion's contains entry — without this merge the
+                    // server only emits the supplement-contributed designation.
+                    if let Some(desigs) =
+                        concept.get("designation").and_then(|d| d.as_array())
+                    {
+                        fn merge_designations_into_contains(
+                            list: &mut [crate::types::ExpansionContains],
+                            wanted_sys: Option<&str>,
+                            wanted_code: &str,
+                            desigs: &[Value],
+                        ) {
+                            use crate::types::ExpansionContainsDesignation;
+                            for c in list.iter_mut() {
+                                if c.code == wanted_code
+                                    && wanted_sys.is_none_or(|s| s == c.system)
+                                {
+                                    for d in desigs {
+                                        let Some(value) =
+                                            d.get("value").and_then(|v| v.as_str())
+                                        else {
+                                            continue;
+                                        };
+                                        let language = d
+                                            .get("language")
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string);
+                                        // De-dupe by (language, value).
+                                        let dup = c.designations.iter().any(|existing| {
+                                            existing.value == value
+                                                && existing.language == language
+                                        });
+                                        if dup {
+                                            continue;
+                                        }
+                                        // Only carry over extensions whose URL
+                                        // is well-known to the IG (the fixture
+                                        // doesn't expect every ad-hoc
+                                        // extension to round-trip — e.g.
+                                        // `unknown-extension-6` is filtered).
+                                        let extensions = d
+                                            .get("extension")
+                                            .and_then(|e| e.as_array())
+                                            .map(|a| {
+                                                a.iter()
+                                                    .filter(|ext| {
+                                                        let url = ext
+                                                            .get("url")
+                                                            .and_then(|u| u.as_str())
+                                                            .unwrap_or("");
+                                                        url == "http://hl7.org/fhir/StructureDefinition/coding-sctdescid"
+                                                            || url == "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status"
+                                                    })
+                                                    .cloned()
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default();
+                                        c.designations.push(ExpansionContainsDesignation {
+                                            language,
+                                            use_system: None,
+                                            use_code: None,
+                                            value: value.to_string(),
+                                            extensions,
+                                        });
+                                    }
+                                }
+                                if !c.contains.is_empty() {
+                                    merge_designations_into_contains(
+                                        &mut c.contains,
+                                        wanted_sys,
+                                        wanted_code,
+                                        desigs,
+                                    );
+                                }
+                            }
+                        }
+                        merge_designations_into_contains(
+                            &mut resp.contains,
+                            inc_sys,
+                            code,
+                            desigs,
+                        );
+                    }
                     let Some(exts) = concept.get("extension").and_then(|e| e.as_array()) else {
                         continue;
                     };
