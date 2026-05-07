@@ -1762,10 +1762,17 @@ fn apply_active_only_inactive(
         Some(v) => format!("{vs_url}|{v}"),
         None => vs_url.to_string(),
     };
-    // code-rule (business-rule error): "valid but not active"
+    // Build the two new issues. The IG fixture orders them as:
+    //   [code-rule (error), not-in-vs (error), <pre-existing code-comment warning>]
+    // — i.e. errors first, warnings retained at the end. Insert at index 0
+    // so the existing inactive-warning slides to the back.
     let code_rule_text = format!("The concept '{code}' is valid but is not active");
+    let not_in_vs_text = format!(
+        "The provided code '{system_url}#{code}' was not found in the value set '{url_with_version}'"
+    );
+    let mut prefix: Vec<ValidationIssue> = Vec::new();
     if !resp.issues.iter().any(|i| i.text == code_rule_text) {
-        resp.issues.push(ValidationIssue {
+        prefix.push(ValidationIssue {
             severity: "error".into(),
             fhir_code: "business-rule".into(),
             tx_code: "code-rule".into(),
@@ -1775,12 +1782,8 @@ fn apply_active_only_inactive(
             message_id: Some("STATUS_CODE_WARNING_CODE".into()),
         });
     }
-    // not-in-vs (code-invalid error): expansion would have excluded it.
-    let not_in_vs_text = format!(
-        "The provided code '{system_url}#{code}' was not found in the value set '{url_with_version}'"
-    );
     if !resp.issues.iter().any(|i| i.text == not_in_vs_text) {
-        resp.issues.push(ValidationIssue {
+        prefix.push(ValidationIssue {
             severity: "error".into(),
             fhir_code: "code-invalid".into(),
             tx_code: "not-in-vs".into(),
@@ -1789,6 +1792,10 @@ fn apply_active_only_inactive(
             location: Some("Coding.code".into()),
             message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
         });
+    }
+    if !prefix.is_empty() {
+        prefix.append(&mut resp.issues);
+        resp.issues = prefix;
     }
     resp.result = false;
     // Recompute message from sorted error texts (matches the convention used
