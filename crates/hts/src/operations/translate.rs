@@ -39,8 +39,11 @@ use super::params::{
 /// ## Returns
 ///
 /// A FHIR `Parameters` resource with a `result` boolean and zero or more
-/// `match` parts.  Each `match` part contains `equivalence`, `concept`
-/// (`valueCoding`), and optionally `source` (ConceptMap URL).
+/// `match` parts.  Each `match` part contains `equivalence` and
+/// `relationship` codes, a `concept` (`valueCoding`) for the target side
+/// of the matched ConceptMap element, an `originMap` canonical reference,
+/// and (in reverse responses) a `source` (`valueCoding`) for the source
+/// side of the matched element.
 ///
 /// ## Errors
 ///
@@ -100,13 +103,20 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
         let mut parts: Vec<Value> = Vec::with_capacity(5);
 
         // `concept` Coding always first — fixtures rely on this ordering.
+        // The IG translate fixtures expect bare {system, code} Codings here,
+        // so we only emit `display` when the backend resolved one. (For now
+        // it never does — see comment on `TranslateRow.display`.)
+        let mut concept_coding = serde_json::Map::new();
+        concept_coding.insert("system".into(), json!(m.concept_system));
+        concept_coding.insert("code".into(), json!(m.concept_code));
+        if let Some(disp) = m.concept_display.as_deref() {
+            if !disp.is_empty() {
+                concept_coding.insert("display".into(), json!(disp));
+            }
+        }
         parts.push(json!({
             "name": "concept",
-            "valueCoding": {
-                "system": m.concept_system,
-                "code": m.concept_code,
-                "display": m.concept_display
-            }
+            "valueCoding": Value::Object(concept_coding),
         }));
 
         // R4 emits `equivalence`; R5 emits `relationship`. Emit both — the
@@ -124,10 +134,11 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
             parts.push(json!({"name": "originMap", "valueCanonical": canonical}));
         }
 
-        // For reverse responses include the original (input-side) Coding as a
-        // `source` part — IG fixtures expect this so the caller can tell
-        // which source code each reverse match came from. Skip in forward
-        // mode: the caller already knows the source code they sent.
+        // For reverse responses include the source-side Coding of the
+        // matched ConceptMap element as a `source` part — IG `translate-
+        // reverse` fixture expects this so the caller can read the
+        // resolved source code. Skip in forward mode: the caller already
+        // knows the source code they sent.
         if is_reverse {
             if let (Some(sys), Some(code)) = (m.source_system.as_deref(), m.source_code.as_deref())
             {
@@ -380,7 +391,9 @@ mod tests {
         let concept = parts.iter().find(|p| p["name"] == "concept").unwrap();
         assert_eq!(concept["valueCoding"]["code"], "X");
         assert_eq!(concept["valueCoding"]["system"], "http://example.org/tgt");
-        assert_eq!(concept["valueCoding"]["display"], "X-Ray");
+        // The IG translate fixtures expect bare {system, code} Codings —
+        // display is intentionally omitted from the output.
+        assert!(concept["valueCoding"].get("display").is_none());
     }
 
     #[tokio::test]
@@ -446,8 +459,14 @@ mod tests {
 
         let match_param = params.iter().find(|p| p["name"] == "match").unwrap();
         let parts = match_param["part"].as_array().unwrap();
+        // Reverse output: `concept` carries the supplied target Coding (X in tgt CS);
+        // `source` carries the resolved source Coding (A in src CS).
         let concept = parts.iter().find(|p| p["name"] == "concept").unwrap();
-        assert_eq!(concept["valueCoding"]["code"], "A");
+        assert_eq!(concept["valueCoding"]["code"], "X");
+        assert_eq!(concept["valueCoding"]["system"], "http://example.org/tgt");
+        let source = parts.iter().find(|p| p["name"] == "source").unwrap();
+        assert_eq!(source["valueCoding"]["code"], "A");
+        assert_eq!(source["valueCoding"]["system"], "http://example.org/src");
     }
 
     // ── Error cases ────────────────────────────────────────────────────────────
@@ -528,16 +547,17 @@ mod tests {
         let m = params.iter().find(|p| p["name"] == "match").unwrap();
         let parts = m["part"].as_array().unwrap();
 
-        // Reverse output: concept is the source-side Coding.
+        // Reverse output: `concept` carries the *target* side of the
+        // matched element (i.e. the supplied targetCode), and `source`
+        // carries the *source* side (the resolved code). This matches
+        // the IG `translate/translate-reverse` fixture exactly.
         let concept = parts.iter().find(|p| p["name"] == "concept").unwrap();
-        assert_eq!(concept["valueCoding"]["code"], "A");
-        assert_eq!(concept["valueCoding"]["system"], "http://example.org/src");
+        assert_eq!(concept["valueCoding"]["code"], "X");
+        assert_eq!(concept["valueCoding"]["system"], "http://example.org/tgt");
 
-        // `source` part carries the original (input) Coding so the caller can
-        // tell which target code each reverse match came from.
         let source = parts.iter().find(|p| p["name"] == "source").unwrap();
-        assert_eq!(source["valueCoding"]["code"], "X");
-        assert_eq!(source["valueCoding"]["system"], "http://example.org/tgt");
+        assert_eq!(source["valueCoding"]["code"], "A");
+        assert_eq!(source["valueCoding"]["system"], "http://example.org/src");
     }
 
     /// `originMap` is emitted as `url|version` when the ConceptMap has a version.
