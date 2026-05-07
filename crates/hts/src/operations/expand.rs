@@ -3411,6 +3411,31 @@ async fn process_expand<B: TerminologyBackend>(
                     response[field] = v.clone();
                 }
             }
+            // Echo top-level `extension[]` from the source ValueSet, minus
+            // entries that the expansion pipeline has already "consumed" so
+            // they don't double-fire on the response.  The IG
+            // `parameters/parameters-expand-enum-definitions3` fixture pins
+            // both `valueset-supplement` and an unknown extension (the spec
+            // says unknown extensions are ignored, but the round-tripped
+            // resource still echoes them verbatim).  In contrast,
+            // `deprecated/expand-withdrawn-response-valueSet` drops the
+            // top-level `structuredefinition-standards-status` because that
+            // extension is what triggered the warning emission upstream.
+            if let Some(exts) = obj.get("extension").and_then(|e| e.as_array()) {
+                let filtered: Vec<Value> = exts
+                    .iter()
+                    .filter(|ext| {
+                        ext.get("url").and_then(|u| u.as_str())
+                            != Some(
+                                "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                            )
+                    })
+                    .cloned()
+                    .collect();
+                if !filtered.is_empty() {
+                    response["extension"] = Value::Array(filtered);
+                }
+            }
             // We deliberately do NOT echo `compose` on $expand responses.
             // Every IG `expand-*-response*` fixture lists `compose` under
             // `$optional-properties$`, so omitting it always satisfies the

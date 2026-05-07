@@ -2927,10 +2927,19 @@ fn expand_includes_per_clause(
             }
 
             let vs_refs = inc["valueSet"].as_array().unwrap();
+            // Preserve the order of the FIRST referenced ValueSet (which is the
+            // CodeSystem-defined order, since referenced VSes return codes in
+            // CS order). Subsequent refs only act as filters via intersection.
+            // Without this, downstream pagination (count=1) would return a
+            // hash-randomised concept rather than the spec-defined first one.
+            // Drives the IG `exclude/exclude-gender2` fixture which pins
+            // `male` as the first code from `administrative-gender`.
             let mut ref_sets: Vec<HashSet<(String, String)>> = Vec::new();
             let mut display_index: HashMap<(String, String), Option<String>> = HashMap::new();
+            let mut first_ref_order: Vec<(String, String)> = Vec::new();
+            let mut first_ref_seen: HashSet<(String, String)> = HashSet::new();
 
-            for vs_ref in vs_refs {
+            for (idx, vs_ref) in vs_refs.iter().enumerate() {
                 let ref_url = match vs_ref.as_str() {
                     Some(u) => u,
                     None => continue,
@@ -2942,12 +2951,16 @@ fn expand_includes_per_clause(
                     display_index
                         .entry(key.clone())
                         .or_insert(c.display.clone());
+                    if idx == 0 && first_ref_seen.insert(key.clone()) {
+                        first_ref_order.push(key.clone());
+                    }
                     set.insert(key);
                 }
                 ref_sets.push(set);
             }
 
-            // Intersect across every referenced ValueSet.
+            // Intersect across every referenced ValueSet, then re-project onto
+            // the first ref's emission order so pagination is deterministic.
             let mut intersected: HashSet<(String, String)> = match ref_sets.first() {
                 Some(first) => first.clone(),
                 None => HashSet::new(),
@@ -2983,11 +2996,14 @@ fn expand_includes_per_clause(
                 intersected
             };
 
-            for (system, code) in final_set {
-                let display = display_index
-                    .get(&(system.clone(), code.clone()))
-                    .cloned()
-                    .unwrap_or(None);
+            // Emit in the first ref's order; any survivors not present there
+            // (shouldn't happen — they must be in ref_sets[0]) get appended.
+            for key in &first_ref_order {
+                if !final_set.contains(key) {
+                    continue;
+                }
+                let (system, code) = key.clone();
+                let display = display_index.get(key).cloned().unwrap_or(None);
                 included.push(ExpansionContains {
                     system,
                     version: None,
