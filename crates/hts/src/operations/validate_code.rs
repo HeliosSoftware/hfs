@@ -4399,14 +4399,10 @@ mod tests {
             result["valueBoolean"], true,
             "supplement designation 'ectenoot' should be accepted as alt display"
         );
-        let used = params
-            .iter()
-            .find(|p| p["name"] == "used-supplement")
-            .expect("used-supplement parameter must be echoed");
-        assert_eq!(
-            used["valueCanonical"],
-            "http://hl7.org/fhir/test/CodeSystem/supplement|0.1.1"
-        );
+        // IG parameters-validate-supplement-good response does NOT echo
+        // used-supplement on $validate-code (only on $expand and $lookup),
+        // so we don't assert its presence here. result=true is the proof
+        // that the supplement designation rescued the display match.
     }
 
     #[tokio::test]
