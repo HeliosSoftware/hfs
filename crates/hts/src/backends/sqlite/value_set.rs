@@ -4862,15 +4862,37 @@ fn resolve_ver_against_candidates(
 
 /// Returns true if `version` satisfies the wildcard `pattern`.
 /// "1.x" matches "1.0.0", "1.2.0", etc. "1.0.x" matches "1.0.0", "1.0.1".
+/// "1.x.x" matches "1.0.0", "1.2.3", etc. (segment-wise: each "x" is any segment).
 fn version_satisfies_wildcard(version: &str, pattern: &str) -> bool {
     if pattern == "x" {
         return true;
     }
-    let prefix = pattern.trim_end_matches('x').trim_end_matches('.');
-    if prefix.is_empty() {
-        return true;
+    // Segment-wise comparison: each pattern segment of "x" matches any version segment.
+    // A trailing "x" segment also matches "any number of remaining segments" (greedy).
+    let pat_segs: Vec<&str> = pattern.split('.').collect();
+    let ver_segs: Vec<&str> = version.split('.').collect();
+
+    // If the pattern ends in "x", it can absorb extra version segments.
+    // Otherwise segment counts must match exactly.
+    let ends_with_x = pat_segs.last().is_some_and(|s| *s == "x");
+    if !ends_with_x && pat_segs.len() != ver_segs.len() {
+        return false;
     }
-    version.starts_with(&format!("{prefix}.")) || version == prefix
+    if ends_with_x && ver_segs.len() < pat_segs.len() - 1 {
+        return false;
+    }
+
+    for (i, ps) in pat_segs.iter().enumerate() {
+        if *ps == "x" {
+            // matches any version segment (or "absorbs" trailing if last)
+            continue;
+        }
+        match ver_segs.get(i) {
+            Some(vs) if vs == ps => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Look up the display for a specific code at a specific CS version.
