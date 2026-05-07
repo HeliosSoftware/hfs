@@ -1609,7 +1609,16 @@ async fn process_expand<B: TerminologyBackend>(
     // entry without the caller having to opt in — `status` is a FHIR
     // well-known concept property defined under
     // `http://hl7.org/fhir/concept-properties#status`.
-    let mut requested_properties: Vec<String> = params
+    //
+    // The caller's explicit `property=X` request list (no auto-injection) —
+    // used downstream to decide whether to emit an `expansion.property[]`
+    // declaration. Auto-including `status` in the *population* lookup is
+    // safe (it only surfaces a value when the CS actually carries one), but
+    // it MUST NOT bleed into the declaration block — otherwise vanilla
+    // expansions (language/exclude/search/...) gain a spurious
+    // `expansion.property[{code: status}]` that the IG fixtures don't
+    // expect.
+    let requested_properties: Vec<String> = params
         .iter()
         .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("property"))
         .filter_map(|p| {
@@ -1619,14 +1628,15 @@ async fn process_expand<B: TerminologyBackend>(
                 .map(str::to_string)
         })
         .collect();
-    if !requested_properties.iter().any(|p| p == "status") {
-        requested_properties.push("status".to_string());
+    let mut population_properties: Vec<String> = requested_properties.clone();
+    if !population_properties.iter().any(|p| p == "status") {
+        population_properties.push("status".to_string());
     }
     populate_properties(
         state.backend(),
         &ctx,
         &mut resp.contains,
-        &requested_properties,
+        &population_properties,
     )
     .await;
     if !bare_supplement_urls.is_empty() {
@@ -1635,7 +1645,7 @@ async fn process_expand<B: TerminologyBackend>(
             &ctx,
             &mut resp.contains,
             &bare_supplement_urls,
-            &requested_properties,
+            &population_properties,
         )
         .await;
     }
