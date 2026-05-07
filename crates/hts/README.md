@@ -140,7 +140,7 @@ See [Environment Variables](#environment-variables) for all available configurat
 
     Windows:
 
-      Download a pre-build binary from [llvm-project's GitHub page](https://github.com/llvm/llvm-project/releases).
+      Download a pre-built binary from [llvm-project's GitHub page](https://github.com/llvm/llvm-project/releases).
 
     macOS:
 
