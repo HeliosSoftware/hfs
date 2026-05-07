@@ -5097,8 +5097,8 @@ fn detect_cs_version_mismatch(
                     location: Some(version_loc.into()),
                     message_id: Some("VALUESET_VALUE_MISMATCH".into()),
                 }];
-                // Echo req_full (the code's existing version).
-                return Some((issues, None, Some(req_full.to_string())));
+                // Echo inc_full (the VS-pinned version), not the requested version.
+                return Some((issues, None, Some(inc_full.to_string())));
             }
         }
         Some(None) => {
