@@ -171,14 +171,18 @@ fn build_validate_response(
     // their texts alphabetically and join with `; ` (matches the IG fixture
     // convention). When we don't, fall back to the response's own `message`
     // (legacy single-message path used by older code in $translate, etc.).
-    // Only error-severity issues contribute to the top-level `message`
-    // parameter — warnings (e.g. VALUESET_VALUE_MISMATCH_DEFAULT, inactive)
-    // and information issues (e.g. status-check) are diagnostic only and the
-    // IG fixtures never expect them in the top-level `message`.
+    // Error-severity issues always contribute to the top-level `message`.
+    // Inactive/status warnings (`INACTIVE_CONCEPT_FOUND`) also contribute —
+    // the IG `inactive/validate-inactive-*` fixtures expect their text in
+    // the top-level `message` parameter even though they are warnings.
     let message_str: Option<String> = if !issues.is_empty() {
         let mut texts: Vec<&str> = issues
             .iter()
-            .filter(|i| i.severity == "error")
+            .filter(|i| {
+                i.severity == "error"
+                    || (i.severity == "warning"
+                        && i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND"))
+            })
             .map(|i| i.text.as_str())
             .collect();
         if texts.is_empty() {
@@ -854,6 +858,74 @@ pub async fn get_validate_code_handler<B: TerminologyBackend>(
 
 // ── ValueSet/$validate-code ────────────────────────────────────────────────────
 
+/// Inspect the compose.include[*].valueSet entries of the named ValueSet and
+/// return the first canonical URL that does not resolve to a stored
+/// ValueSet (after stripping any `|version` suffix). Returns `None` when the
+/// VS isn't found, has no compose.include, has no valueSet imports, or every
+/// import resolves successfully.
+///
+/// The IG `validation/simple-*-bad-import` fixtures expect a single
+/// `not-found / Unable_to_resolve_value_Set_` issue when an import cannot
+/// be resolved — this helper drives the early-exit detection in
+/// `process_vs_validate_code`.
+async fn detect_bad_vs_import<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    vs_url: &str,
+    vs_version: Option<&str>,
+) -> Option<String> {
+    let mut hits = ValueSetOperations::search(
+        backend,
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(vs_url.to_string()),
+            version: vs_version.map(str::to_string),
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?;
+    let vs = hits.pop()?;
+    let includes = vs
+        .get("compose")
+        .and_then(|c| c.get("include"))
+        .and_then(|v| v.as_array())?;
+    for inc in includes {
+        let imports = match inc.get("valueSet").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        for imp in imports {
+            let canonical = match imp.as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let (bare_url, ver) = match canonical.split_once('|') {
+                Some((u, v)) => (u, Some(v.to_string())),
+                None => (canonical, None),
+            };
+            let exists = ValueSetOperations::search(
+                backend,
+                ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(bare_url.to_string()),
+                    version: ver,
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|hs| !hs.is_empty())
+            .unwrap_or(false);
+            if !exists {
+                return Some(bare_url.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Core validate-code logic for `ValueSet/$validate-code`.
 ///
 /// Always requires the `url` parameter (ValueSet canonical URL).  The optional
@@ -884,6 +956,61 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // Used to rewrite "...'url'..." → "...'url|version'..." in NotFound
     // messages so the IG-expected text format is met.
     let vs_version = find_str_param(&params, "valueSetVersion");
+
+    // Detect a ValueSet whose compose.include[*].valueSet imports an
+    // unresolvable ValueSet up-front. The IG `validation/simple-*-bad-import`
+    // fixtures expect a single `not-found / Unable_to_resolve_value_Set_`
+    // issue with text "A definition for the value Set 'X' could not be
+    // found" — not the cascade of TX_GENERAL_CC_ERROR_MESSAGE/this-code-not-in-vs
+    // that the regular CC fallback emits.
+    if let Some(unresolved_vs_url) =
+        detect_bad_vs_import(state.backend(), &ctx, &url, vs_version.as_deref()).await
+    {
+        let cc_value = params
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
+            .and_then(|p| p.get("valueCodeableConcept"))
+            .cloned();
+        let req_path = if extract_codeable_concept(&params, "codeableConcept").is_some() {
+            RequestPath::CodeableConcept
+        } else if extract_coding_full(&params, "coding").is_some() {
+            RequestPath::Coding
+        } else {
+            RequestPath::BareCode
+        };
+        let text = format!(
+            "A definition for the value Set '{unresolved_vs_url}' could not be found"
+        );
+        let issue = ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "not-found".into(),
+            tx_code: "not-found".into(),
+            text,
+            expression: None,
+            location: None,
+            message_id: Some("Unable_to_resolve_value_Set_".into()),
+        };
+        let mut value = build_validate_response(
+            ValidateCodeResponse {
+                result: false,
+                message: None,
+                display: None,
+                system: None,
+                cs_version: None,
+                inactive: None,
+                issues: vec![issue],
+                caused_by_unknown_system: None,
+            },
+            None,
+            None,
+            None,
+            cc_value.as_ref(),
+            None,
+            req_path,
+        );
+        append_used_supplements(&mut value, &supplements);
+        return Ok(value);
+    }
     // systemVersion pins the CS version to use for this validation call.
     // Falls back when the explicit `version` param is absent.
     let system_version = find_str_param(&params, "systemVersion");
