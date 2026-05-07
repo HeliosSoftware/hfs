@@ -182,6 +182,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         }],
                         caused_by_unknown_system: None,
                         concept_status: None,
+                        normalized_code: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -246,6 +247,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             }],
                             caused_by_unknown_system: None,
                             concept_status: None,
+                            normalized_code: None,
                         });
                     }
                     let text = match cs_version_str.as_deref() {
@@ -276,6 +278,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         }],
                         caused_by_unknown_system: None,
                         concept_status: None,
+                        normalized_code: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -318,6 +321,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 issues,
                 caused_by_unknown_system: None,
                 concept_status: None,
+                normalized_code: None,
             })
         })
         .await

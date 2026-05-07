@@ -1112,6 +1112,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 req.lenient_display_validation.unwrap_or(false),
                                 cs_is_fragment,
                                 None, // cs_display_lookup — only used by the URL path below
+                                None, // normalized_code — case-insensitive fallback only fires on the explicit-VS path
                             );
                         }
 
@@ -1173,6 +1174,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             req.lenient_display_validation.unwrap_or(false),
                             cs_is_fragment,
                             None, // cs_display_lookup — only used by the URL path below
+                            None, // normalized_code — case-insensitive fallback only fires on the explicit-VS path
                         );
                     }
                     Err(e) => return Err(e),
@@ -1197,7 +1199,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .version
                 .as_deref()
                 .filter(|v| !v.contains(".x") && *v != "x");
-            let candidates: Vec<&ExpansionContains> = if let Some(system) = req.system.as_deref()
+            let mut candidates: Vec<&ExpansionContains> = if let Some(system) = req.system.as_deref()
             {
                 all_codes
                     .iter()
@@ -1206,6 +1208,125 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             } else {
                 all_codes.iter().filter(|c| c.code == req.code).collect()
             };
+            // Case-insensitive fallback: when the underlying CodeSystem is
+            // marked `caseSensitive: false` and the exact-case lookup found
+            // no candidates, retry with `eq_ignore_ascii_case`. The matched
+            // concept's canonical code becomes the response's
+            // `normalized-code` parameter and a `CODE_CASE_DIFFERENCE`
+            // informational issue is emitted (IG `case/case-coding-insensitive-*`).
+            // Only fires when at least one candidate's CS is case-insensitive
+            // — case-sensitive systems retain strict comparison.
+            let mut normalized_code: Option<String> = None;
+            if candidates.is_empty() {
+                let ci_candidates: Vec<&ExpansionContains> = if let Some(system) =
+                    req.system.as_deref()
+                {
+                    all_codes
+                        .iter()
+                        .filter(|c| {
+                            c.system == system && c.code.eq_ignore_ascii_case(&req.code)
+                        })
+                        .collect()
+                } else {
+                    all_codes
+                        .iter()
+                        .filter(|c| c.code.eq_ignore_ascii_case(&req.code))
+                        .collect()
+                };
+                // Only keep case-insensitive matches whose underlying CodeSystem
+                // is marked `caseSensitive: false`. Mixed-system VSes that
+                // include both case-sensitive and case-insensitive systems still
+                // get strict comparison for the case-sensitive ones.
+                let ci_filtered: Vec<&ExpansionContains> = ci_candidates
+                    .into_iter()
+                    .filter(|c| cs_is_case_insensitive(&conn, &c.system))
+                    .collect();
+                if !ci_filtered.is_empty() {
+                    if let Some(c) = ci_filtered.first() {
+                        if c.code != req.code {
+                            normalized_code = Some(c.code.clone());
+                        }
+                    }
+                    candidates = ci_filtered;
+                }
+            }
+            let candidates = candidates;
+
+            // inferSystem ambiguity: when the caller did not supply a system
+            // and the bare code matches in two or more *distinct* CodeSystems
+            // within the VS expansion, the system URI cannot be inferred. The
+            // IG `errors/errors-combination-bad` fixture expects two issues:
+            //   1. `not-in-vs` (the code is not unambiguously in the VS), and
+            //   2. `not-found` / cannot-infer with text
+            //      "The System URI could not be determined for the code 'X'
+            //       in the ValueSet 'url|version': value set expansion has
+            //       multiple matches: [sys1, sys2]"
+            // and `result=false`.
+            if req.system.is_none() && !candidates.is_empty() {
+                let mut distinct_systems: Vec<String> = candidates
+                    .iter()
+                    .map(|c| c.system.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                if distinct_systems.len() >= 2 {
+                    distinct_systems.sort();
+                    let vs_v = lookup_value_set_version(&conn, &url);
+                    let vs_canonical = match vs_v.as_deref() {
+                        Some(v) if !v.is_empty() => format!("{url}|{v}"),
+                        _ => url.clone(),
+                    };
+                    let systems_list = distinct_systems.join(", ");
+                    let cannot_infer_text = format!(
+                        "The System URI could not be determined for the code '{}' in the ValueSet '{}': value set expansion has multiple matches: [{}]",
+                        req.code, vs_canonical, systems_list
+                    );
+                    let not_in_vs_text = format!(
+                        "The provided code '#{}' was not found in the value set '{}'",
+                        req.code, vs_canonical
+                    );
+                    let issues = vec![
+                        crate::types::ValidationIssue {
+                            severity: "error".into(),
+                            fhir_code: "code-invalid".into(),
+                            tx_code: "not-in-vs".into(),
+                            text: not_in_vs_text.clone(),
+                            expression: Some("code".into()),
+                            location: Some("code".into()),
+                            message_id: Some(
+                                "None_of_the_provided_codes_are_in_the_value_set_one".into(),
+                            ),
+                        },
+                        crate::types::ValidationIssue {
+                            severity: "error".into(),
+                            fhir_code: "not-found".into(),
+                            tx_code: "cannot-infer".into(),
+                            text: cannot_infer_text.clone(),
+                            expression: Some("code".into()),
+                            location: Some("code".into()),
+                            message_id: Some(
+                                "Unable_to_resolve_system__value_set_has_multiple_matches".into(),
+                            ),
+                        },
+                    ];
+                    let mut texts: Vec<&str> = issues.iter().map(|i| i.text.as_str()).collect();
+                    texts.sort_unstable();
+                    let message = texts.join("; ");
+                    return Ok(crate::types::ValidateCodeResponse {
+                        result: false,
+                        message: Some(message),
+                        display: None,
+                        system: None,
+                        cs_version: None,
+                        inactive: None,
+                        issues,
+                        caused_by_unknown_system: None,
+                        concept_status: None,
+                        normalized_code: None,
+                    });
+                }
+            }
+
             let found: Option<ExpansionContains> = if candidates.is_empty() {
                 None
             } else if let Some(req_v) = req_ver_exact {
@@ -1367,6 +1488,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     issues,
                     caused_by_unknown_system: caused_by,
                     concept_status: None,
+                    normalized_code: None,
                 });
             }
 
@@ -1528,6 +1650,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 req.lenient_display_validation.unwrap_or(false),
                 cs_is_fragment,
                 echo_display_lookup.as_deref(),
+                normalized_code.as_deref(),
             )
         })
         .await
@@ -5720,6 +5843,28 @@ fn cs_content_for_url(conn: &Connection, system_url: &str) -> Option<String> {
     .flatten()
 }
 
+/// Returns `true` when the CodeSystem at `system_url` has `caseSensitive: false`
+/// in its stored resource. The FHIR spec defaults `caseSensitive` to absent
+/// (treated as case-sensitive by validators), so this returns `true` ONLY when
+/// the stored CS explicitly sets `caseSensitive: false`. Drives the
+/// case-insensitive code lookup fallback in `$validate-code` and emits the
+/// `CODE_CASE_DIFFERENCE` informational issue when the caller's code differs
+/// from the canonical form by case.
+fn cs_is_case_insensitive(conn: &Connection, system_url: &str) -> bool {
+    conn.query_row(
+        "SELECT json_extract(resource_json, '$.caseSensitive') \
+         FROM code_systems \
+         WHERE url = ?1 \
+         ORDER BY COALESCE(version, '') DESC LIMIT 1",
+        rusqlite::params![system_url],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .ok()
+    .flatten()
+    .map(|v| v == 0)
+    .unwrap_or(false)
+}
+
 /// Extract the pinned CS version from a VS compose JSON for a given system URL.
 /// Returns `Some(version)` when `compose.include[].version` is set for that system.
 fn cs_version_from_compose(compose_json: Option<&str>, system_url: &str) -> Option<String> {
@@ -6356,6 +6501,7 @@ fn finish_validate_code_response(
     lenient_display: bool,
     cs_is_fragment: bool,
     cs_display_lookup: Option<&str>,
+    normalized_code: Option<&str>,
 ) -> Result<ValidateCodeResponse, HtsError> {
     // When the caller pinned an exact version (req_version_hint) and the
     // code wasn't found, the IG fixtures qualify the code as
@@ -6422,6 +6568,7 @@ fn finish_validate_code_response(
                         }],
                         caused_by_unknown_system: None,
                         concept_status: None,
+                        normalized_code: None,
                     });
                 }
             }
@@ -6544,6 +6691,7 @@ fn finish_validate_code_response(
                 issues,
                 caused_by_unknown_system: None,
                 concept_status: None,
+                normalized_code: None,
             })
         }
         Some(concept) => {
@@ -6589,6 +6737,7 @@ fn finish_validate_code_response(
                     issues,
                     caused_by_unknown_system: None,
                     concept_status: None,
+                    normalized_code: None,
                 });
             }
             // Inactive: the IG fixtures expect a warning-severity
@@ -6608,6 +6757,29 @@ fn finish_validate_code_response(
                     expression: Some("Coding".into()),
                     location: Some("Coding".into()),
                     message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
+                });
+            }
+            // Case-insensitive match: emit a `CODE_CASE_DIFFERENCE` informational
+            // issue when the caller's code differs from the canonical code only
+            // by case, and the underlying CodeSystem is `caseSensitive: false`.
+            // Matches the IG `case/case-coding-insensitive-code1-{2,3}` fixtures.
+            if let Some(canonical) = normalized_code {
+                let cs_qualifier: String = match (system_for_msg, cs_version_for_msg) {
+                    (Some(s), Some(v)) => format!("{s}|{v}"),
+                    (Some(s), None) => s.to_string(),
+                    _ => String::new(),
+                };
+                let text = format!(
+                    "The code '{code}' differs from the correct code '{canonical}' by case. Although the code system '{cs_qualifier}' is case insensitive, implementers are strongly encouraged to use the correct case anyway"
+                );
+                issues.push(crate::types::ValidationIssue {
+                    severity: "information".into(),
+                    fhir_code: "business-rule".into(),
+                    tx_code: "code-rule".into(),
+                    text,
+                    expression: Some("Coding.code".into()),
+                    location: Some("Coding.code".into()),
+                    message_id: Some("CODE_CASE_DIFFERENCE".into()),
                 });
             }
             let mut display_message: Option<String> = None;
@@ -6686,6 +6858,7 @@ fn finish_validate_code_response(
                 issues,
                 caused_by_unknown_system: None,
                 concept_status: None,
+                normalized_code: normalized_code.map(|s| s.to_string()),
             })
         }
     }

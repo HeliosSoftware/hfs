@@ -163,6 +163,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     issues: vec![],
                     caused_by_unknown_system: None,
                     concept_status: None,
+                    normalized_code: None,
                 });
             }
             Err(e) => return Err(e),
@@ -203,6 +204,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     issues: vec![],
                     caused_by_unknown_system: None,
                     concept_status: None,
+                    normalized_code: None,
                 })
             }
             Some(concept) => {
@@ -226,6 +228,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     issues: vec![],
                     caused_by_unknown_system: None,
                     concept_status: None,
+                    normalized_code: None,
                 })
             }
         }

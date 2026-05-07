@@ -210,6 +210,15 @@ pub struct ValidateCodeResponse {
     /// `extensions/validate-code-inactive` etc. can echo the deprecated state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concept_status: Option<String>,
+    /// When set, emitted as a top-level `normalized-code` parameter on the
+    /// response. Populated when the caller's code differs from the canonical
+    /// code in a `caseSensitive: false` CodeSystem — the IG `case/` fixtures
+    /// expect the canonical (correct-case) code echoed back so consumers can
+    /// see what the case-insensitive match resolved to. The accompanying
+    /// `CODE_CASE_DIFFERENCE` informational issue (added by the backend)
+    /// describes which input differed and what the canonical form is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_code: Option<String>,
 }
 
 // ─── $subsumes ────────────────────────────────────────────────────────────────
