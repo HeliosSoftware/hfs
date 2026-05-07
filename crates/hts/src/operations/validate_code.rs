@@ -1733,6 +1733,78 @@ async fn rescue_via_supplements<B: TerminologyBackend>(
     }
 }
 
+/// Apply the `activeOnly=true` request-parameter semantics to the response of
+/// a VS-bound validation. The IG `validation/simple-coding-bad-code-inactive`
+/// fixture validates an inactive code against a VS that includes it, but with
+/// `activeOnly=true` — the IG expects the code to be treated as
+/// "not in VS" because the activeOnly filter would have excluded it from the
+/// expansion. Specifically:
+///   - `result` flips to `false`,
+///   - a `code-rule` business-rule error ("…is valid but is not active") is
+///     added,
+///   - a `not-in-vs` `code-invalid` error is added.
+///
+/// The pre-existing `code-comment` warning ("…has a status of inactive…") is
+/// kept. No-op when `active_only` isn't true, the response isn't currently a
+/// pass, or the concept isn't inactive. Mutates `resp` in place.
+fn apply_active_only_inactive(
+    active_only: bool,
+    resp: &mut ValidateCodeResponse,
+    code: &str,
+    system_url: &str,
+    vs_url: &str,
+    vs_version: Option<&str>,
+) {
+    if !active_only || !resp.result || resp.inactive != Some(true) {
+        return;
+    }
+    let url_with_version = match vs_version {
+        Some(v) => format!("{vs_url}|{v}"),
+        None => vs_url.to_string(),
+    };
+    // code-rule (business-rule error): "valid but not active"
+    let code_rule_text = format!("The concept '{code}' is valid but is not active");
+    if !resp.issues.iter().any(|i| i.text == code_rule_text) {
+        resp.issues.push(ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "business-rule".into(),
+            tx_code: "code-rule".into(),
+            text: code_rule_text,
+            expression: Some("Coding.code".into()),
+            location: Some("Coding.code".into()),
+            message_id: Some("STATUS_CODE_WARNING_CODE".into()),
+        });
+    }
+    // not-in-vs (code-invalid error): expansion would have excluded it.
+    let not_in_vs_text = format!(
+        "The provided code '{system_url}#{code}' was not found in the value set '{url_with_version}'"
+    );
+    if !resp.issues.iter().any(|i| i.text == not_in_vs_text) {
+        resp.issues.push(ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "not-in-vs".into(),
+            text: not_in_vs_text,
+            expression: Some("Coding.code".into()),
+            location: Some("Coding.code".into()),
+            message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
+        });
+    }
+    resp.result = false;
+    // Recompute message from sorted error texts (matches the convention used
+    // elsewhere in this file).
+    let mut texts: Vec<&str> = resp
+        .issues
+        .iter()
+        .filter(|i| i.severity != "information")
+        .map(|i| i.text.as_str())
+        .collect();
+    texts.sort_unstable();
+    if !texts.is_empty() {
+        resp.message = Some(texts.join("; "));
+    }
+}
+
 /// Build a CODESYSTEM_CS_NO_SUPPLEMENT failure response: when the caller's
 /// `system` URL points at a stored CodeSystem whose `content = supplement`,
 /// CodeSystem/$validate-code must reject the call (a supplement is not a
@@ -3275,6 +3347,22 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             )
             .await;
         }
+        // `activeOnly=true` semantics — see Path 2 handling for rationale.
+        let active_only = params
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
+            .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        if let Some(sys) = system.as_deref() {
+            apply_active_only_inactive(
+                active_only,
+                &mut resp,
+                &code,
+                sys,
+                &url,
+                effective_vs_version.as_deref(),
+            );
+        }
         // Capture cs_version BEFORE moving resp into build_validate_response_async,
         // so we can post-validate against the check pattern.
         let resolved_version = resp.cs_version.clone();
@@ -3541,6 +3629,23 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             &mut resp,
         )
         .await;
+        // `activeOnly=true` semantics — when the validated code is inactive,
+        // the activeOnly filter would have excluded it from the expansion.
+        // Flip result=false and add the missing not-in-vs / code-rule issues.
+        // Drives the IG `validation/simple-coding-bad-code-inactive` fixture.
+        let active_only = params
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
+            .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        apply_active_only_inactive(
+            active_only,
+            &mut resp,
+            &code,
+            &system,
+            &url,
+            effective_vs_version.as_deref(),
+        );
         let resolved_version = resp.cs_version.clone();
         let mut value = build_validate_response_async(
             state.backend(),
