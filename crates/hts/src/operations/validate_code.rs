@@ -3882,20 +3882,23 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             // Two trigger conditions:
             //   1. tx_code == "vs-invalid"  → the original mismatch path
             //      (multi-version overload, regex-bad VS pin, …).
-            //   2. message_id == "UNKNOWN_CODESYSTEM_VERSION"  → fired by
-            //      `detect_vs_pin_unknown` in the SQLite backend when the VS
-            //      include pins a CS version that doesn't exist (e.g. the
-            //      `version-w-bad` fixture pins `version="1"` against a CS
-            //      that only has `1.0.0` / `1.2.0`). Without this, the CC
-            //      path drops the diagnostic and emits the generic
-            //      `TX_GENERAL_CC_ERROR_MESSAGE` instead — the IG
+            //   2. message_id == "UNKNOWN_CODESYSTEM_VERSION" AND this is a
+            //      single-coding CC  → fired by `detect_vs_pin_unknown` in the
+            //      SQLite backend when the VS include pins a CS version that
+            //      doesn't exist (e.g. the `version-w-bad` fixture pins
+            //      `version="1"` against a CS that only has `1.0.0` / `1.2.0`).
+            //      Without this, the CC path drops the diagnostic and emits
+            //      the generic `TX_GENERAL_CC_ERROR_MESSAGE` instead — the IG
             //      `codeableconcept-vnn-vs1wb` family expects the
             //      `UNKNOWN_CODESYSTEM_VERSION` issue + `x-caused-by-unknown-system`
-            //      parameter.
-            let has_unknown_cs_version = resp
-                .issues
-                .iter()
-                .any(|i| i.message_id.as_deref() == Some("UNKNOWN_CODESYSTEM_VERSION"));
+            //      parameter. Limited to single-coding to avoid short-circuiting
+            //      the reverse loop before a later (good) coding gets visited
+            //      in multi-coding CCs.
+            let has_unknown_cs_version = codings.len() == 1
+                && resp
+                    .issues
+                    .iter()
+                    .any(|i| i.message_id.as_deref() == Some("UNKNOWN_CODESYSTEM_VERSION"));
             if resp.issues.iter().any(|i| i.tx_code == "vs-invalid") || has_unknown_cs_version {
                 let resolved_version = resp.cs_version.clone();
                 let coding_display = coding_displays

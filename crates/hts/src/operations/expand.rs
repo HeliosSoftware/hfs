@@ -1410,10 +1410,11 @@ async fn process_expand<B: TerminologyBackend>(
             // When no version is pinned, pick the highest version (matches
             // `resolve_value_set_versioned`).
             if let Some(ref want) = req_vs_version {
-                v.iter()
+                let exact: Option<Value> = v
+                    .iter()
                     .find(|r| r.get("version").and_then(|x| x.as_str()) == Some(want.as_str()))
-                    .cloned()
-                    .or_else(|| v.into_iter().next())
+                    .cloned();
+                exact.or_else(|| v.into_iter().next())
             } else {
                 v.sort_by(|a, b| {
                     let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
