@@ -1041,9 +1041,11 @@ async fn process_expand<B: TerminologyBackend>(
     // Pull additional supplements pinned by the source VS via the
     // `valueset-supplement` extension (per HL7 IG `extensions/extensions-all`,
     // which omits `useSupplement` from the request and relies on the VS to
-    // declare which supplement applies). Resolve each via `supplement_target`,
-    // skipping any URL we can't validate (so missing supplements don't kill
-    // an expansion that the IG fixture marks valid).
+    // declare which supplement applies). Resolve each via `supplement_target`.
+    // Unknown supplements pinned via this extension are a hard error — the
+    // IG `extensions/expand-echo-bad-supplement` fixture expects a 4xx
+    // OperationOutcome whose text mentions both "supplement" and the missing
+    // CS canonical URL (matching `$fragments:supplement|...$`).
     if let Some(vs) = source_vs.as_ref() {
         if let Some(exts) = vs.get("extension").and_then(|e| e.as_array()) {
             for ext in exts {
@@ -1067,9 +1069,17 @@ async fn process_expand<B: TerminologyBackend>(
                 {
                     continue;
                 }
-                if let Ok(Some(info)) = state.backend().supplement_target(&ctx, &bare).await {
-                    supplement_inputs.push(raw.clone());
-                    applied_supplements.push(info);
+                match state.backend().supplement_target(&ctx, &bare).await {
+                    Ok(Some(info)) => {
+                        supplement_inputs.push(raw.clone());
+                        applied_supplements.push(info);
+                    }
+                    Ok(None) => {
+                        return Err(HtsError::NotFound(format!(
+                            "Required supplement not found: {bare}"
+                        )));
+                    }
+                    Err(e) => return Err(e),
                 }
             }
         }

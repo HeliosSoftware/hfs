@@ -380,20 +380,13 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     // older backends or paths that bypass finish_validate_code_response).
     let version: Option<String> = resp.cs_version.take().or(stored_version.clone());
 
-    // If the input system isn't stored, the IG expects an `x-unknown-system`
-    // parameter pointing at the unknown URL (only when validate-code reported
-    // result=false).
-    let unknown_system = if !resp.result && stored_version.is_none() {
-        effective_system
-    } else {
-        None
-    };
-
-    // Append info-level "Reference to <status> CodeSystem url|version" issues
-    // when the validated CodeSystem carries a non-active standards-status —
-    // matches the IG `deprecated/validate-*` fixtures.
-    if let Some(sys) = effective_system {
-        if let Ok(mut hits) = crate::traits::CodeSystemOperations::search(
+    // Search to determine if the system URL exists as a CodeSystem. This is a
+    // more reliable existence check than `stored_version.is_some()` — a CS
+    // that has no `version` field yields `stored_version = None` despite
+    // existing. We need this distinction to avoid spurious `x-unknown-system`
+    // / `UNKNOWN_CODESYSTEM` emissions for stored-but-versionless CSes.
+    let cs_resource: Option<Value> = if let Some(sys) = effective_system {
+        crate::traits::CodeSystemOperations::search(
             backend,
             ctx,
             crate::types::ResourceSearchQuery {
@@ -403,24 +396,94 @@ async fn build_validate_response_async<B: TerminologyBackend>(
             },
         )
         .await
-        {
-            if let Some(cs) = hits.pop() {
-                for status in collect_status_check_codes(&cs) {
-                    let cs_uri = match version.as_deref() {
-                        Some(v) => format!("{sys}|{v}"),
-                        None => sys.to_string(),
-                    };
-                    resp.issues.push(ValidationIssue {
-                        severity: "information".into(),
-                        fhir_code: "business-rule".into(),
-                        tx_code: "status-check".into(),
-                        text: format!("Reference to {status} CodeSystem {cs_uri}"),
-                        expression: None,
-                        location: None,
-                        message_id: Some(status_message_id(&status).into()),
-                    });
-                }
+        .ok()
+        .and_then(|mut hits| hits.pop())
+    } else {
+        None
+    };
+    let cs_exists = cs_resource.is_some();
+
+    // Detect when the system URL is actually a stored ValueSet (not a
+    // CodeSystem). In that case the IG expects a `Terminology_TX_System_ValueSet2`
+    // issue rather than `UNKNOWN_CODESYSTEM`, and no `x-unknown-system` param
+    // (see `validation/simple-coding-bad-system2`).
+    let system_is_value_set = if !cs_exists {
+        if let Some(sys) = effective_system {
+            crate::traits::ValueSetOperations::search(
+                backend,
+                ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(sys.to_string()),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+            .map(|hits| !hits.is_empty())
+            .unwrap_or(false)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // If the input system isn't stored as a CS (and isn't a known VS), the IG
+    // expects an `x-unknown-system` parameter pointing at the unknown URL
+    // (only when validate-code reported result=false).
+    let unknown_system = if !resp.result && !cs_exists && !system_is_value_set {
+        effective_system
+    } else {
+        None
+    };
+
+    // When the input system URL is a stored ValueSet rather than a
+    // CodeSystem, synthesize the IG-expected `Terminology_TX_System_ValueSet2`
+    // issue instead of the unknown-system issue.
+    if system_is_value_set {
+        if let Some(sys) = effective_system {
+            let already_has = resp.issues.iter().any(|i| {
+                i.message_id.as_deref() == Some("Terminology_TX_System_ValueSet2")
+            });
+            if !already_has {
+                let expression = match request_path {
+                    RequestPath::BareCode => "system".to_string(),
+                    _ => "Coding.system".to_string(),
+                };
+                resp.issues.push(ValidationIssue {
+                    severity: "error".into(),
+                    fhir_code: "invalid".into(),
+                    tx_code: "invalid-data".into(),
+                    text: format!(
+                        "The Coding references a value set, not a code system ('{sys}')"
+                    ),
+                    expression: Some(expression),
+                    location: None,
+                    message_id: Some("Terminology_TX_System_ValueSet2".into()),
+                });
             }
+        }
+    }
+
+    // Append info-level "Reference to <status> CodeSystem url|version" issues
+    // when the validated CodeSystem carries a non-active standards-status —
+    // matches the IG `deprecated/validate-*` fixtures.
+    if let (Some(sys), Some(cs)) = (effective_system, cs_resource.as_ref()) {
+        for status in collect_status_check_codes(cs) {
+            let cs_uri = match version.as_deref() {
+                Some(v) => format!("{sys}|{v}"),
+                None => sys.to_string(),
+            };
+            resp.issues.push(ValidationIssue {
+                severity: "information".into(),
+                fhir_code: "business-rule".into(),
+                tx_code: "status-check".into(),
+                text: format!("Reference to {status} CodeSystem {cs_uri}"),
+                expression: None,
+                location: None,
+                message_id: Some(status_message_id(&status).into()),
+            });
         }
     }
 
@@ -676,6 +739,59 @@ async fn rescue_via_supplements<B: TerminologyBackend>(
     }
 }
 
+/// Build a CODESYSTEM_CS_NO_SUPPLEMENT failure response: when the caller's
+/// `system` URL points at a stored CodeSystem whose `content = supplement`,
+/// CodeSystem/$validate-code must reject the call (a supplement is not a
+/// valid Coding.system per FHIR R5 §4.7.10). Returns `Some(value)` when the
+/// system is a supplement and the response should be returned immediately.
+async fn supplement_url_in_coding_error<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system_url: &str,
+    code: Option<&str>,
+    request_path: RequestPath,
+) -> Option<Value> {
+    let info = match backend.supplement_target(ctx, system_url).await {
+        Ok(Some(i)) => i,
+        _ => return None,
+    };
+    let canonical = &info.supplement_canonical;
+    let text = format!(
+        "CodeSystem {canonical} is a supplement, so can't be used as a value in Coding.system"
+    );
+    let expression = match request_path {
+        RequestPath::BareCode => "system".to_string(),
+        _ => "Coding.system".to_string(),
+    };
+    let issue = ValidationIssue {
+        severity: "error".into(),
+        fhir_code: "invalid".into(),
+        tx_code: "invalid-data".into(),
+        text: text.clone(),
+        expression: Some(expression),
+        location: None,
+        message_id: Some("CODESYSTEM_CS_NO_SUPPLEMENT".into()),
+    };
+    Some(build_validate_response(
+        ValidateCodeResponse {
+            result: false,
+            message: Some(text),
+            display: None,
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues: vec![issue],
+            caused_by_unknown_system: None,
+        },
+        code,
+        Some(system_url),
+        None,
+        None,
+        None,
+        request_path,
+    ))
+}
+
 /// Core validate-code logic for `CodeSystem/$validate-code`.
 ///
 /// Accepts three input forms (checked in priority order):
@@ -709,6 +825,20 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                     .into(),
             )
         })?;
+        // Reject when the `url` resolves to a supplement (FHIR R5 §4.7.10):
+        // supplements aren't a valid Coding.system value. Matches the IG
+        // `extensions/validate-coding-bad-supplement-url` fixture.
+        if let Some(value) = supplement_url_in_coding_error(
+            state.backend(),
+            &ctx,
+            &system,
+            Some(&code),
+            RequestPath::BareCode,
+        )
+        .await
+        {
+            return Ok(value);
+        }
         let supplements =
             resolve_supplements(state.backend(), &ctx, &params, Some(&system)).await?;
         let display = find_str_param(&params, "display");
@@ -763,6 +893,18 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     if let Some((system, code, coding_display, coding_version)) =
         extract_coding_full(&params, "coding")
     {
+        // Reject when the Coding.system points at a supplement.
+        if let Some(value) = supplement_url_in_coding_error(
+            state.backend(),
+            &ctx,
+            &system,
+            Some(&code),
+            RequestPath::Coding,
+        )
+        .await
+        {
+            return Ok(value);
+        }
         // Coding.display takes precedence over a top-level `display` param —
         // the IG fixtures pin display via the Coding so the server can
         // report a mismatch.
@@ -1284,6 +1426,67 @@ async fn detect_bad_vs_import<B: TerminologyBackend>(
     None
 }
 
+/// Inspect the named ValueSet's `valueset-supplement` extensions and verify
+/// every referenced supplement CodeSystem is loaded. Returns `Err(NotFound)`
+/// when one is missing — matches the IG `extensions/validate-*-bad-supplement`
+/// fixtures which expect a 4xx OperationOutcome whose text mentions both
+/// "supplement" and the missing CS canonical URL.
+async fn enforce_vs_supplement_extensions<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    vs_url: &str,
+    vs_version: Option<&str>,
+) -> Result<(), HtsError> {
+    let mut hits = match ValueSetOperations::search(
+        backend,
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(vs_url.to_string()),
+            version: vs_version.map(str::to_string),
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(_) => return Ok(()),
+    };
+    let vs = match hits.pop() {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let exts = match vs.get("extension").and_then(|e| e.as_array()) {
+        Some(a) => a,
+        None => return Ok(()),
+    };
+    for ext in exts {
+        if ext.get("url").and_then(|u| u.as_str())
+            != Some("http://hl7.org/fhir/StructureDefinition/valueset-supplement")
+        {
+            continue;
+        }
+        let raw = match ext
+            .get("valueCanonical")
+            .or_else(|| ext.get("valueUri"))
+            .and_then(|v| v.as_str())
+        {
+            Some(s) => s,
+            None => continue,
+        };
+        let bare = raw.split('|').next().unwrap_or(raw);
+        match backend.supplement_target(ctx, bare).await? {
+            Some(_) => {}
+            None => {
+                return Err(HtsError::NotFound(format!(
+                    "Required supplement not found: {bare}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Core validate-code logic for `ValueSet/$validate-code`.
 ///
 /// Always requires the `url` parameter (ValueSet canonical URL).  The optional
@@ -1314,6 +1517,12 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // Used to rewrite "...'url'..." → "...'url|version'..." in NotFound
     // messages so the IG-expected text format is met.
     let vs_version = find_str_param(&params, "valueSetVersion");
+
+    // The VS may pin one or more CS supplements via the `valueset-supplement`
+    // extension. Reject the request with 4xx if any of those supplements is
+    // not loaded — matches the IG `extensions/validate-*-bad-supplement`
+    // fixtures.
+    enforce_vs_supplement_extensions(state.backend(), &ctx, &url, vs_version.as_deref()).await?;
 
     // Detect a ValueSet whose compose.include[*].valueSet imports an
     // unresolvable ValueSet up-front. The IG `validation/simple-*-bad-import`
@@ -1960,17 +2169,37 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
 
         // For each coding, emit per-coding issues based on whether the
         // CodeSystem and code exist.
+        // Track unknown CSes (per-coding) so we can emit `x-unknown-system`
+        // and the per-CS `UNKNOWN_CODESYSTEM` issue once per coding when the
+        // referenced CS isn't stored.
+        let mut single_unknown_system: Option<String> = None;
         for (idx, (system, code)) in codings.iter().enumerate() {
-            // Look up the CS version for messaging.
+            // Use a real existence check (search by URL) rather than relying
+            // on `code_system_version_for_url` — a stored CS that has no
+            // `version` field would otherwise look "unknown" here.
+            let cs_exists = crate::traits::CodeSystemOperations::search(
+                state.backend(),
+                &ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(system.clone()),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+            .map(|hits| !hits.is_empty())
+            .unwrap_or(false);
+            // Look up the CS version for messaging (best-effort; may be None
+            // even when cs_exists=true if the CS has no `version` field).
             let cs_version = state
                 .backend()
                 .code_system_version_for_url(&ctx, system)
                 .await
                 .ok()
                 .flatten();
-            let cs_known = cs_version.is_some();
             // Per-coding lookup: does the code exist in the CS at all?
-            let code_in_cs = if cs_known {
+            let code_in_cs = if cs_exists {
                 let req = ValidateCodeRequest {
                     url: None,
                     value_set_version: None,
@@ -1991,7 +2220,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 false
             };
 
-            if cs_known && !code_in_cs {
+            if cs_exists && !code_in_cs {
                 let cs_text = match cs_version.as_deref() {
                     Some(v) => {
                         format!("Unknown code '{code}' in the CodeSystem '{system}' version '{v}'")
@@ -2007,6 +2236,26 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     location: None,
                     message_id: Some("Unknown_Code_in_Version".into()),
                 });
+            } else if !cs_exists {
+                // CS not found: emit per-coding UNKNOWN_CODESYSTEM issue. Per
+                // IG fixture (validation/simple-codeableconcept-bad-system),
+                // text quotes the CS URL with single-quotes. Location goes
+                // on .system, expression too.
+                issues.push(ValidationIssue {
+                    severity: "error".into(),
+                    fhir_code: "not-found".into(),
+                    tx_code: "not-found".into(),
+                    text: format!(
+                        "A definition for CodeSystem '{system}' could not be found, so the code cannot be validated"
+                    ),
+                    expression: Some(format!("CodeableConcept.coding[{idx}].system")),
+                    location: None,
+                    message_id: Some("UNKNOWN_CODESYSTEM".into()),
+                });
+                // Track first unknown CS for the `x-unknown-system` param.
+                if single_unknown_system.is_none() {
+                    single_unknown_system = Some(system.clone());
+                }
             }
 
             // Per-coding "this code wasn't in VS" issue. The IG fixtures expect
@@ -2046,9 +2295,24 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             None,
             None,
             cc_value.as_ref(),
+            // We've already emitted UNKNOWN_CODESYSTEM issue(s) inline above
+            // with the IG-correct CodeableConcept location/expression. Pass
+            // None here to avoid build_validate_response synthesising a
+            // duplicate (with the generic Coding.system location).
             None,
             RequestPath::CodeableConcept,
         );
+        // Append `x-unknown-system` for the first unknown CS encountered.
+        // Matches the IG `validation/simple-codeableconcept-bad-system`
+        // fixture which expects exactly one such param.
+        if let Some(unknown) = single_unknown_system.as_deref() {
+            if let Some(arr) = value.get_mut("parameter").and_then(|p| p.as_array_mut()) {
+                arr.push(json!({
+                    "name": "x-unknown-system",
+                    "valueCanonical": unknown,
+                }));
+            }
+        }
         append_used_supplements(&mut value, &supplements);
         return Ok(value);
     }
