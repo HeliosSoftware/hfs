@@ -1100,9 +1100,10 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
             .and_then(|p| p.get("valueCodeableConcept"))
             .cloned();
-        // Capture per-coding `display` from the original CodeableConcept so
-        // the IG `permutations/bad-cc*` fixtures' `'sys#code (\"Display\")'`
-        // text format is preserved.
+        // Capture per-coding `display` and `version` from the original
+        // CodeableConcept. `display` is used for the IG `permutations/bad-cc*`
+        // text format; `version` is needed so the per-coding CS version check
+        // fires correctly (the coding's version is NOT a top-level parameter).
         let coding_displays: std::collections::HashMap<(String, String), String> = cc_value
             .as_ref()
             .and_then(|cc| cc.get("coding").and_then(|v| v.as_array()))
@@ -1117,18 +1118,39 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     .collect()
             })
             .unwrap_or_default();
+        let coding_versions: std::collections::HashMap<(String, String), String> = cc_value
+            .as_ref()
+            .and_then(|cc| cc.get("coding").and_then(|v| v.as_array()))
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        let s = c.get("system").and_then(|v| v.as_str())?.to_string();
+                        let cd = c.get("code").and_then(|v| v.as_str())?.to_string();
+                        let v = c.get("version").and_then(|v| v.as_str())?.to_string();
+                        Some(((s, cd), v))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // The IG fixtures expect the LAST matching coding to win (when several
         // codings in a CodeableConcept all validate, the response echoes the
         // last one). Iterate in reverse so the earliest "yes" we find is the
         // last entry in the input.
         let cc_req_version = find_str_param(&params, "version").or(system_version.clone());
         for (system, code) in codings.clone().into_iter().rev() {
+            // Prefer the per-coding version (embedded in the CC) over the
+            // top-level `version` parameter so that version-mismatch detection
+            // fires correctly for each coding.
+            let per_coding_version = coding_versions
+                .get(&(system.clone(), code.clone()))
+                .cloned()
+                .or(cc_req_version.clone());
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),
                 value_set_version: vs_version.clone(),
                 system: Some(system.clone()),
                 code: code.clone(),
-                version: cc_req_version.clone(),
+                version: per_coding_version,
                 display: None,
                 date: find_str_param(&params, "date"),
                 include_abstract: params
@@ -1142,6 +1164,24 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .await
                 .map_err(&rewrite)?;
             if resp.result {
+                let mut value = build_validate_response_async(
+                    state.backend(),
+                    &ctx,
+                    resp,
+                    Some(&code),
+                    Some(&system),
+                    cc_value.as_ref(),
+                    RequestPath::CodeableConcept,
+                    Some(&url),
+                )
+                .await;
+                append_used_supplements(&mut value, &supplements);
+                return Ok(value);
+            }
+            // Propagate version-mismatch failures — they carry the correct
+            // VALUESET_VALUE_MISMATCH / UNKNOWN_CODESYSTEM_VERSION issues and
+            // must not be replaced by the generic "no valid coding" fallback.
+            if resp.issues.iter().any(|i| i.tx_code == "vs-invalid") {
                 let mut value = build_validate_response_async(
                     state.backend(),
                     &ctx,

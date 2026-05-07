@@ -1051,6 +1051,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // supplied) against stored CS versions and the VS include pin.
             // Also fires when the caller supplies no version but the VS pins
             // a version that doesn't exist in the DB.
+            let vs_version_for_mismatch = lookup_value_set_version(&conn, &url);
             let mismatch = if let (Some(req_ver), Some(system)) =
                 (req.version.as_deref(), effective_system.as_deref())
             {
@@ -1059,6 +1060,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     system,
                     req_ver,
                     compose_json_for_version.as_deref(),
+                    vs_version_for_mismatch.as_deref(),
                     version_loc,
                     system_loc,
                 )
@@ -4904,6 +4906,7 @@ fn detect_cs_version_mismatch(
     system_url: &str,
     req_ver: &str,
     compose_json: Option<&str>,
+    vs_version: Option<&str>,
     version_loc: &str,
     system_loc: &str,
 ) -> Option<(Vec<crate::types::ValidationIssue>, Option<String>, Option<String>)> {
@@ -5102,6 +5105,16 @@ fn detect_cs_version_mismatch(
             // Versionless VS include: the effective CS version is the latest stored.
             // When the caller requested a different (but existing) version, emit
             // VALUESET_VALUE_MISMATCH (error) — same form as a pinned-version conflict.
+            //
+            // Exception: when the VS itself carries a wildcard version (e.g. "1.x")
+            // and req_full satisfies it (e.g. "1.0.0" satisfies "1.x"), no mismatch.
+            if let Some(vs_ver) = vs_version {
+                if (vs_ver.contains(".x") || vs_ver == "x")
+                    && version_satisfies_wildcard(req_full, vs_ver)
+                {
+                    return None;
+                }
+            }
             let latest = actual_ver.as_deref().unwrap_or(req_ver);
             if latest != req_full {
                 let mismatch_text = format!(
@@ -5117,7 +5130,8 @@ fn detect_cs_version_mismatch(
                     location: Some(version_loc.into()),
                     message_id: Some("VALUESET_VALUE_MISMATCH".into()),
                 }];
-                return Some((issues, None, Some(req_full.to_string())));
+                // Echo the stored version (latest), not the requested version.
+                return Some((issues, None, actual_ver.clone()));
             }
         }
         None => {} // No VS context — req_ver was found, no mismatch to report.
