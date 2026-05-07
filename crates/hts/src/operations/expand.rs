@@ -1361,7 +1361,7 @@ async fn process_expand<B: TerminologyBackend>(
         hierarchical,
         hierarchical_explicit,
         tx_resources,
-        force_system_versions,
+        force_system_versions: force_system_versions.clone(),
         system_version_defaults,
         default_value_set_versions,
     };
@@ -1935,6 +1935,19 @@ async fn process_expand<B: TerminologyBackend>(
                 if !incs.is_empty()
                     && !excs.is_empty()
                     && incs.iter().any(|i| !excs.contains(i))
+                {
+                    out.insert(sys.clone());
+                }
+                // `force-system-version` collapses multi-version include pins
+                // into a single forced version, but the IG
+                // `version/vs-expand-v-mixed-force` fixture still expects the
+                // forced version echoed on every contains item. Trigger
+                // version echo whenever the source VS pinned MULTIPLE distinct
+                // versions for this system AND a force pin is in effect.
+                let distinct_inc_versions: std::collections::HashSet<&str> =
+                    incs.iter().map(|s| s.as_str()).collect();
+                if distinct_inc_versions.len() >= 2
+                    && force_system_versions.contains_key(sys)
                 {
                     out.insert(sys.clone());
                 }
