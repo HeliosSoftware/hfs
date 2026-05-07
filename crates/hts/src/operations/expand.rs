@@ -52,6 +52,22 @@ use super::params::{
     parse_query_string, query_params_to_fhir_params,
 };
 
+/// Standards-status codes that warrant a `warning-<status>` expansion
+/// parameter. The IG fixtures only ever expect these four codes; surveying
+/// the entire `tx-ecosystem-ig/tests/**` corpus turns up no other
+/// `warning-*` parameter names. Anything else (notably `normative`,
+/// `trial-use`, `informative`) is informational metadata, not a warning,
+/// and emitting it produces spurious extra parameters that fail the
+/// `exclude/exclude-gender*` and `exclude/{include,exclude}-combo`
+/// fixtures (which reference FHIR-core `administrative-gender` and
+/// `publication-status` — both shipped with `standards-status=normative`).
+const WARNING_STANDARDS_STATUSES: &[&str] =
+    &["deprecated", "draft", "experimental", "withdrawn"];
+
+fn is_warning_status(code: &str) -> bool {
+    WARNING_STANDARDS_STATUSES.iter().any(|s| *s == code)
+}
+
 /// Collect the standards-status codes that should fire `warning-<status>`
 /// expansion parameters for a CodeSystem or ValueSet.
 ///
@@ -67,12 +83,13 @@ use super::params::{
 ///    extension).
 ///
 /// Returns the deduplicated list of status codes, preserving the order above.
-/// The IG fixtures use this list to populate `warning-<code>` entries in
-/// `expansion.parameter[]`.
+/// Only codes in [`WARNING_STANDARDS_STATUSES`] survive the filter — informational
+/// statuses (`normative`, `trial-use`, …) are dropped so we don't emit phantom
+/// `warning-normative` parameters that the IG fixtures never expect.
 fn standards_statuses(resource: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push_unique = |code: &str| {
-        if !code.is_empty() && !out.iter().any(|c| c == code) {
+        if !code.is_empty() && is_warning_status(code) && !out.iter().any(|c| c == code) {
             out.push(code.to_string());
         }
     };
@@ -116,7 +133,10 @@ fn vs_extension_statuses(resource: &Value) -> Vec<String> {
                 )
             {
                 if let Some(code) = ext.get("valueCode").and_then(|v| v.as_str()) {
-                    if !code.is_empty() && !out.iter().any(|c| c == code) {
+                    if !code.is_empty()
+                        && is_warning_status(code)
+                        && !out.iter().any(|c| c == code)
+                    {
                         out.push(code.to_string());
                     }
                 }
@@ -1205,11 +1225,38 @@ async fn process_expand<B: TerminologyBackend>(
     // its own store for that URL — the tx-resource fully shadows it for this
     // request — which matches the IG semantics for the include-combo /
     // exclude-combo fixtures.
+    //
+    // When the request URL pinned a specific version (`url|version`), require
+    // the tx-resource to ALSO match on `version`.  The IG validator injects
+    // every fixture VS as a tx-resource — so for tests that target a specific
+    // version (e.g. `vs-expand-v2` requesting `…/version|1.2.0`), URL-only
+    // matching would silently grab `valueset-version-1` and produce v1
+    // metadata + codes.  Skip the shortcut entirely when no version-aligned
+    // candidate exists so the backend's `resolve_value_set_versioned` path
+    // (which DOES filter on version) is used instead.
+    //
+    // The version pin can arrive via `url|version` pipe syntax OR an explicit
+    // `valueSetVersion` Parameters entry — both must be honoured here, or
+    // the `default-valueset-version/direct-expand-two` fixture (plain url
+    // + `valueSetVersion: 2.0.0`) silently latches onto v1.0.0's tx-resource.
+    let want_version_for_shortcut = pipe_version
+        .clone()
+        .or_else(|| find_str_param(&params, "valueSetVersion"));
     let (url, value_set) = if value_set.is_none() {
         if let Some(ref url_str) = url {
+            let want_version = want_version_for_shortcut.as_deref();
             let inline_match = tx_resources.iter().find(|r| {
-                r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet")
-                    && r.get("url").and_then(|v| v.as_str()) == Some(url_str.as_str())
+                if r.get("resourceType").and_then(|v| v.as_str()) != Some("ValueSet")
+                    || r.get("url").and_then(|v| v.as_str()) != Some(url_str.as_str())
+                {
+                    return false;
+                }
+                match want_version {
+                    Some(want) => {
+                        r.get("version").and_then(|v| v.as_str()) == Some(want)
+                    }
+                    None => true,
+                }
             });
             if let Some(vs) = inline_match {
                 (None, Some(vs.clone()))
@@ -1554,8 +1601,15 @@ async fn process_expand<B: TerminologyBackend>(
         }
     }
 
-    // ── Populate properties (only for codes named in `property` params) ──────
-    let requested_properties: Vec<String> = params
+    // ── Populate properties (always include the well-known `status` property,
+    // plus any others the caller asked for via `property=X` parameters). ─────
+    // The IG fixtures `simple/simple-expand-contained`, `fragment/fragment-expand`,
+    // `deprecated/expand-*`, and `notSelectable/*` emit a per-concept
+    // `status` (retired / deprecated / withdrawn) on the matching contains[]
+    // entry without the caller having to opt in — `status` is a FHIR
+    // well-known concept property defined under
+    // `http://hl7.org/fhir/concept-properties#status`.
+    let mut requested_properties: Vec<String> = params
         .iter()
         .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("property"))
         .filter_map(|p| {
@@ -1565,24 +1619,25 @@ async fn process_expand<B: TerminologyBackend>(
                 .map(str::to_string)
         })
         .collect();
-    if !requested_properties.is_empty() {
-        populate_properties(
+    if !requested_properties.iter().any(|p| p == "status") {
+        requested_properties.push("status".to_string());
+    }
+    populate_properties(
+        state.backend(),
+        &ctx,
+        &mut resp.contains,
+        &requested_properties,
+    )
+    .await;
+    if !bare_supplement_urls.is_empty() {
+        apply_supplement_properties(
             state.backend(),
             &ctx,
             &mut resp.contains,
+            &bare_supplement_urls,
             &requested_properties,
         )
         .await;
-        if !bare_supplement_urls.is_empty() {
-            apply_supplement_properties(
-                state.backend(),
-                &ctx,
-                &mut resp.contains,
-                &bare_supplement_urls,
-                &requested_properties,
-            )
-            .await;
-        }
     }
 
     // ── Walk concept-level extensions (base + supplements) ────────────────────
@@ -1623,6 +1678,20 @@ async fn process_expand<B: TerminologyBackend>(
                     let Some(exts) = concept.get("extension").and_then(|e| e.as_array()) else {
                         continue;
                     };
+                    // VS-compose-applied extensions get a SUPERSET of the
+                    // base passthrough list. The `deprecated/expand-deprecating`
+                    // fixture pins `structuredefinition-standards-status:
+                    // deprecated` on a VS-compose concept and expects it to
+                    // surface verbatim on the matching contains[] entry.
+                    // (We don't add it to `PASSTHROUGH_CONCEPT_EXTENSIONS` for
+                    // the CS-resource path because `apply_concept_extension_data`
+                    // already converts that extension to a `status` property
+                    // for CS-native concepts — see `extension_to_property_code`.)
+                    fn vs_compose_passthrough(url: &str) -> bool {
+                        PASSTHROUGH_CONCEPT_EXTENSIONS.contains(&url)
+                            || url
+                                == "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status"
+                    }
                     fn merge_into_contains(
                         list: &mut [crate::types::ExpansionContains],
                         wanted_sys: Option<&str>,
@@ -1638,7 +1707,7 @@ async fn process_expand<B: TerminologyBackend>(
                                         Some(s) => s,
                                         None => continue,
                                     };
-                                    if !PASSTHROUGH_CONCEPT_EXTENSIONS.contains(&url) {
+                                    if !vs_compose_passthrough(url) {
                                         continue;
                                     }
                                     c.extensions.retain(|existing| {
@@ -1813,31 +1882,51 @@ async fn process_expand<B: TerminologyBackend>(
     // individual contains items (so multi-version expansions are unambiguous
     // while single-version expansions stay compact).
     //
-    // ALSO retain `version` on contains items whose source ValueSet
-    // explicitly version-pins the system in any compose.include[] or
-    // compose.exclude[] entry. The IG `overload/overload-expand-exclude*`
-    // fixtures pin both include (`v2`) and exclude (`v1`) of the same system
-    // and expect the surviving codes to surface their resolved version even
-    // though the post-exclude expansion ends up single-version.
+    // ALSO retain `version` on contains items whose source ValueSet pins
+    // DIFFERENT versions in include[] and exclude[] for the same system —
+    // i.e. the `overload/overload-expand-exclude*` cross-version pattern.
+    // A single-version pin in include[] (e.g. version-1 / version-2 fixtures)
+    // does NOT trigger version echo: those expansions are single-version and
+    // the IG fixtures expect compact `contains[]` entries without per-item
+    // `version`.
     let pinned_systems_for_version_echo: std::collections::HashSet<String> = source_vs
         .as_ref()
         .and_then(|vs| vs.get("compose"))
         .map(|compose| {
             let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Map: system -> (include_versions, exclude_versions).
+            let mut by_system: std::collections::HashMap<String, (Vec<String>, Vec<String>)> =
+                std::collections::HashMap::new();
             for key in ["include", "exclude"] {
                 if let Some(arr) = compose.get(key).and_then(|v| v.as_array()) {
                     for inc in arr {
-                        let has_version = inc
+                        let v = inc
                             .get("version")
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
-                            .is_some();
-                        if has_version {
-                            if let Some(sys) = inc.get("system").and_then(|v| v.as_str()) {
-                                out.insert(sys.to_string());
+                            .map(str::to_string);
+                        if let (Some(sys), Some(ver)) = (
+                            inc.get("system").and_then(|s| s.as_str()),
+                            v,
+                        ) {
+                            let entry = by_system.entry(sys.to_string()).or_default();
+                            if key == "include" {
+                                entry.0.push(ver);
+                            } else {
+                                entry.1.push(ver);
                             }
                         }
                     }
+                }
+            }
+            for (sys, (incs, excs)) in &by_system {
+                // Only echo per-contains version when both include AND exclude
+                // pin a version for this system AND those version sets differ.
+                if !incs.is_empty()
+                    && !excs.is_empty()
+                    && incs.iter().any(|i| !excs.contains(i))
+                {
+                    out.insert(sys.clone());
                 }
             }
             out
@@ -1924,11 +2013,43 @@ async fn process_expand<B: TerminologyBackend>(
                 return false;
             }
             // `system-version` and `check-system-version` are instruction
-            // knobs (default / verify-only semantics) that the IG fixtures
-            // do NOT echo. Only `force-system-version` is echoed per the
-            // FHIR IG `version/parameters-fixed-version` profile fixtures.
+            // knobs (default / verify-only semantics).
+            //
+            // Echo them ONLY when the source VS's compose includes a
+            // VERSIONLESS reference for the system pinned by the param —
+            // i.e. when the param actually defaulted/checked the version
+            // resolution (`version/vs-expand-v-n-default`,
+            // `vs-expand-v-n-check`).  When the include already pins a
+            // version, the param is irrelevant and the IG fixtures do
+            // NOT echo it (`vs-expand-v1-default`, `vs-expand-v1-check`).
             if matches!(name, "system-version" | "check-system-version") {
-                return false;
+                let pin_sys = ["valueCanonical", "valueUri", "valueString", "valueUrl"]
+                    .iter()
+                    .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
+                    .and_then(|s| s.split_once('|').map(|(u, _)| u.to_string()));
+                let echo = match pin_sys {
+                    Some(sys) => source_vs
+                        .as_ref()
+                        .and_then(|vs| vs.get("compose"))
+                        .and_then(|c| c.get("include"))
+                        .and_then(|i| i.as_array())
+                        .map(|incs| {
+                            incs.iter().any(|inc| {
+                                inc.get("system").and_then(|s| s.as_str())
+                                    == Some(sys.as_str())
+                                    && inc
+                                        .get("version")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|s| !s.is_empty())
+                                        .is_none()
+                            })
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if !echo {
+                    return false;
+                }
             }
             // `useSupplement` is consumed (it drives `used-supplement`
             // emission) — the IG `parameters-expand-supplement-good` fixture
@@ -2335,32 +2456,50 @@ async fn process_expand<B: TerminologyBackend>(
     // Clear `version` on contains items for single-version systems — FHIR only
     // requires it when a system appears with multiple different versions.
     //
-    // Exception ("overload" pattern): when the source VS explicitly pins a
-    // version for the system in any compose.include[] *or* compose.exclude[]
-    // entry, keep the version even if the post-exclude expansion happens to
-    // contain only one version. The IG fixtures
-    // (overload-expand-exclude*) require this so the consumer can see which
-    // version of the CS the surviving codes came from.
+    // Exception ("overload" pattern): only retain `version` when the source VS
+    // pins DIFFERENT versions in include[] vs exclude[] for the same system
+    // (overload/overload-expand-exclude*).  A single-version pin in include[]
+    // alone (version-1, version-2 fixtures) does NOT require per-item
+    // `version` — those expansions are single-version, and the IG
+    // `version/vs-expand-v1` / `vs-expand-v2` fixtures expect compact
+    // contains[] without a version field.
     {
         let pinned_systems: std::collections::HashSet<String> = source_vs
             .as_ref()
             .and_then(|vs| vs.get("compose"))
             .map(|compose| {
                 let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut by_system: std::collections::HashMap<
+                    String,
+                    (Vec<String>, Vec<String>),
+                > = std::collections::HashMap::new();
                 for key in ["include", "exclude"] {
                     if let Some(arr) = compose.get(key).and_then(|v| v.as_array()) {
                         for inc in arr {
-                            let has_version = inc
+                            let v = inc
                                 .get("version")
                                 .and_then(|v| v.as_str())
                                 .filter(|s| !s.is_empty())
-                                .is_some();
-                            if has_version {
-                                if let Some(sys) = inc.get("system").and_then(|v| v.as_str()) {
-                                    out.insert(sys.to_string());
+                                .map(str::to_string);
+                            if let (Some(sys), Some(ver)) =
+                                (inc.get("system").and_then(|s| s.as_str()), v)
+                            {
+                                let entry = by_system.entry(sys.to_string()).or_default();
+                                if key == "include" {
+                                    entry.0.push(ver);
+                                } else {
+                                    entry.1.push(ver);
                                 }
                             }
                         }
+                    }
+                }
+                for (sys, (incs, excs)) in &by_system {
+                    if !incs.is_empty()
+                        && !excs.is_empty()
+                        && incs.iter().any(|i| !excs.contains(i))
+                    {
+                        out.insert(sys.clone());
                     }
                 }
                 out
@@ -2666,19 +2805,39 @@ async fn process_expand<B: TerminologyBackend>(
                     pinned_version = Some(default_v.clone());
                 }
             }
+            // When no version pin is in effect, fetch up to 20 candidates and
+            // pick the highest version — mirrors `resolve_value_set_versioned`'s
+            // order-by-version-DESC behaviour.  `count: Some(1)` against the
+            // search SQL (which orders by created_at) yields the earliest-
+            // imported row instead, silently picking vs-version-a1 over -a2
+            // for the `default-valueset-version/indirect-expand-zero` fixture.
+            let count_hint = if pinned_version.is_some() { 1 } else { 20 };
             let referenced_vs: Option<Value> = ValueSetOperations::search(
                 state.backend(),
                 &ctx,
                 crate::types::ResourceSearchQuery {
                     url: Some(bare_url.clone()),
                     version: pinned_version.clone(),
-                    count: Some(1),
+                    count: Some(count_hint),
                     ..Default::default()
                 },
             )
             .await
             .ok()
-            .and_then(|mut hits| hits.pop());
+            .and_then(|mut hits| {
+                if pinned_version.is_some() {
+                    hits.pop()
+                } else {
+                    // No pin: highest version wins (matches the backend's
+                    // `ORDER BY COALESCE(version,'') DESC` resolution).
+                    hits.sort_by(|a, b| {
+                        let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                        let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                        bv.cmp(av)
+                    });
+                    hits.into_iter().next()
+                }
+            });
             let resolved_version = referenced_vs
                 .as_ref()
                 .and_then(|h| {

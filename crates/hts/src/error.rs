@@ -101,16 +101,24 @@ impl IntoResponse for HtsError {
         // `TooCostly` has its own tuple so we can't borrow `self` for the
         // diagnostics string in the same `match`; handle it separately.
         if let HtsError::TooCostly(ref msg) = self {
+            // The IG `big/expand-no-limit-outcome` fixture expects:
+            //   - `extension` with `operationoutcome-message-id` =
+            //     `VALUESET_TOO_COSTLY` (optional for tx.fhir.org)
+            //   - `details.text` only (no `details.coding`)
+            //   - `diagnostics` carrying the same message (optional in fixture)
+            // Other servers (e.g. tx.fhir.org) don't emit the message-id
+            // extension, but the IG marks it `$optional$ : "!tx.fhir.org"` so
+            // including it is fine for everyone else.
             let body = json!({
                 "resourceType": "OperationOutcome",
                 "issue": [{
+                    "extension": [{
+                        "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                        "valueString": "VALUESET_TOO_COSTLY",
+                    }],
                     "severity": "error",
                     "code": "too-costly",
                     "details": {
-                        "coding": [{
-                            "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
-                            "code": "too-costly",
-                        }],
                         "text": msg,
                     },
                     "diagnostics": msg,

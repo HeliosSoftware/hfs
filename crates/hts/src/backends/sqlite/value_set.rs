@@ -106,7 +106,15 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         // index is populated we serve the entire request from process memory —
         // no pool connection acquired, no thread switch.  This eliminates pool
         // contention for hot EX03-style repeated implicit-expansion queries.
-        if req.value_set.is_none() {
+        //
+        // Skip the hot path when a specific `valueSetVersion` was requested:
+        // the in-memory index is keyed by URL only, so the same URL with two
+        // different VS versions in the DB would conflate (e.g. the `version`
+        // group's `valueset-version-1` vs `valueset-version-2` both share
+        // `http://hl7.org/fhir/test/ValueSet/version`).  Falling through to
+        // `spawn_blocking` ensures `resolve_value_set_versioned` filters on
+        // version correctly.
+        if req.value_set.is_none() && req.value_set_version.is_none() {
             if let Some(url) = req.url.as_deref() {
                 if let Ok(guard) = self.implicit_index.read() {
                     if let Some(concept_idx) = guard.get(url).cloned() {
@@ -307,8 +315,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             let mut warnings: Vec<String> = Vec::new();
             // True when every compose.include[] is purely an explicit
             // concept[] enumeration (no filter, no valueSet refs). Set by
-            // the URL-based path below; used to skip tree-building when the
-            // IG enum-* fixtures want a flat expansion even with
+            // both the inline-body path (where the validator's tx-resource
+            // shortcut may have shadowed a URL request with the fixture VS)
+            // and the URL-based path below; used to skip tree-building when
+            // the IG enum-* fixtures want a flat expansion even with
             // excludeNested=false.
             let mut compose_is_enumerated = false;
 
@@ -317,6 +327,37 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 // Systems not in the DB push a warning and are skipped; callers
                 // receive partial results plus `expansion.parameter` warnings.
                 let compose = &vs_resource["compose"];
+                // Detect "every include uses explicit concept[]" enumeration on
+                // the inline body, mirroring the URL-path detection below.
+                // The IG validator injects every fixture VS as a `tx-resource`
+                // for every request — combined with the tx-resource shortcut
+                // in the operations layer, this means a URL-only request for
+                // an enumerated VS arrives here as an inline body. Without
+                // this detection, `compose_is_enumerated` stays at its `false`
+                // initialiser and the enumerated fixture's hierarchy gets
+                // re-imposed by `build_hierarchical_expansion` even though
+                // the IG `parameters/parameters-expand-enum-*` fixtures want
+                // a flat list.
+                compose_is_enumerated = match compose.get("include").and_then(|v| v.as_array()) {
+                    Some(includes) if !includes.is_empty() => includes.iter().all(|inc| {
+                        let has_concept = inc
+                            .get("concept")
+                            .and_then(|c| c.as_array())
+                            .is_some_and(|a| !a.is_empty());
+                        let no_filter = inc
+                            .get("filter")
+                            .and_then(|f| f.as_array())
+                            .map(|a| a.is_empty())
+                            .unwrap_or(true);
+                        let no_vs_ref = inc
+                            .get("valueSet")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.is_empty())
+                            .unwrap_or(true);
+                        has_concept && no_filter && no_vs_ref
+                    }),
+                    _ => false,
+                };
                 // Build the inline-resolution context up front so every nested
                 // `compose.include[].valueSet[]` lookup can find `#contained`
                 // refs in the request body and `tx-resource` shadowed VS bodies.
@@ -538,28 +579,40 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // fixtures want enumerated expansions flat, even
                         // when excludeNested=false (children of an abstract
                         // parent are surfaced as siblings, not nested).
-                        compose_is_enumerated = compose_json
+                        compose_is_enumerated = match compose_json
                             .as_deref()
                             .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-                            .and_then(|v| v.get("include").cloned())
-                            .and_then(|incs| incs.as_array().cloned())
-                            .map(|incs| {
-                                !incs.is_empty()
-                                    && incs.iter().all(|inc| {
-                                        inc.get("concept")
+                        {
+                            Some(parsed) => {
+                                let includes = parsed
+                                    .get("include")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if includes.is_empty() {
+                                    false
+                                } else {
+                                    includes.iter().all(|inc| {
+                                        let has_concept = inc
+                                            .get("concept")
                                             .and_then(|c| c.as_array())
-                                            .is_some_and(|a| !a.is_empty())
-                                            && inc
-                                                .get("filter")
-                                                .and_then(|f| f.as_array())
-                                                .is_none_or(|a| a.is_empty())
-                                            && inc
-                                                .get("valueSet")
-                                                .and_then(|v| v.as_array())
-                                                .is_none_or(|a| a.is_empty())
+                                            .is_some_and(|a| !a.is_empty());
+                                        let no_filter = inc
+                                            .get("filter")
+                                            .and_then(|f| f.as_array())
+                                            .map(|a| a.is_empty())
+                                            .unwrap_or(true);
+                                        let no_vs_ref = inc
+                                            .get("valueSet")
+                                            .and_then(|v| v.as_array())
+                                            .map(|a| a.is_empty())
+                                            .unwrap_or(true);
+                                        has_concept && no_filter && no_vs_ref
                                     })
-                            })
-                            .unwrap_or(false);
+                                }
+                            }
+                            None => false,
+                        };
 
                         // Normal path: try the expansion cache first.
                         // For multi-version overload composes, bypass the
@@ -2292,6 +2345,16 @@ impl<'a> InlineResolutionContext<'a> {
     /// `#fragment` refs search the inline body's `contained[]`; canonical URLs
     /// check `tx_resources`. Returns `Some(compose_string)` when an inline
     /// match is found; the caller falls back to the DB on `None`.
+    ///
+    /// When `ref_str` carries a `|version` pin (or one is implied via the
+    /// request-level `default-valueset-version` map for the bare URL), an
+    /// EXACT (url, version) match is required — otherwise the IG
+    /// validator's habit of injecting every fixture as a tx-resource
+    /// causes a sibling version of the same canonical URL to silently
+    /// shadow the correct row (`default-valueset-version/indirect-expand-two`
+    /// returns v1.0.0 codes for a v2.0.0 ref without this guard).  When
+    /// no exact match is found, return `None` so the caller falls through
+    /// to the DB-backed `resolve_value_set_versioned` path.
     fn lookup_compose(&self, ref_str: &str) -> Option<String> {
         if let Some(id) = ref_str.strip_prefix('#') {
             for r in &self.contained {
@@ -2303,15 +2366,55 @@ impl<'a> InlineResolutionContext<'a> {
             }
             return None;
         }
-        // Non-fragment refs may carry a `|version` pin; tx-resource matching
-        // ignores the version because the IG fixtures usually pass the bare URL.
-        let bare = ref_str.split('|').next().unwrap_or(ref_str);
-        for r in &self.tx_resources {
-            if r.get("url").and_then(|v| v.as_str()) == Some(bare) {
-                return r.get("compose").map(|c| c.to_string());
+        // Non-fragment refs may carry a `|version` pin.  Compute the
+        // effective desired version: explicit pipe pin > request-level
+        // `default-valueset-version` for the bare URL > none.
+        let (bare, pinned_version) = match ref_str.split_once('|') {
+            Some((u, v)) => (u, Some(v.to_string())),
+            None => (ref_str, None),
+        };
+        let effective_version: Option<&str> = pinned_version.as_deref().or_else(|| {
+            self.default_value_set_versions
+                .get(bare)
+                .map(|s| s.as_str())
+        });
+
+        if let Some(want) = effective_version {
+            // Pinned: require EXACT (url, version) on the tx-resource.
+            // No fallback to URL-only — handing back the wrong version
+            // silently produces wrong expansion codes.
+            for r in &self.tx_resources {
+                if r.get("url").and_then(|v| v.as_str()) == Some(bare)
+                    && r.get("version").and_then(|v| v.as_str()) == Some(want)
+                {
+                    return r.get("compose").map(|c| c.to_string());
+                }
             }
+            return None;
         }
-        None
+        // No version pin: prefer the highest-versioned tx-resource for the
+        // URL.  Mirrors the DB-side behaviour of `resolve_value_set_versioned`
+        // which orders `(url, version) DESC` when no version is requested.
+        // For corpora with a single tx-resource per URL (the common case
+        // exercised by `exclude/{include,exclude}-combo` fixtures), the
+        // "highest version" is just the only candidate, so this preserves
+        // the legacy behaviour while fixing the
+        // `default-valueset-version/indirect-expand-zero` regression.
+        let mut best: Option<&serde_json::Value> = None;
+        for r in self.tx_resources.iter().copied() {
+            if r.get("url").and_then(|v| v.as_str()) != Some(bare) {
+                continue;
+            }
+            best = Some(match (best, r.get("version").and_then(|v| v.as_str())) {
+                (None, _) => r,
+                (Some(prev), Some(this_v)) => {
+                    let prev_v = prev.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                    if this_v > prev_v { r } else { prev }
+                }
+                (Some(prev), None) => prev,
+            });
+        }
+        best.and_then(|r| r.get("compose").map(|c| c.to_string()))
     }
 }
 
@@ -3219,7 +3322,19 @@ fn apply_compose_filters(
         let in_single_value = op == "in" && !value.contains(',');
         (op == "=" || in_single_value) && property != "constraint"
     });
-    let (regex_filters, hierarchy_filters): (Vec<_>, Vec<_>) = rest
+    // `not-in` (single-value) and `!=` filters select concepts whose property
+    // is NOT equal to the value (treating concepts with no such property as
+    // matching — they don't have notSelectable=true, so they pass).
+    // The IG `notSelectable/notSelectable-prop-out*` fixtures use
+    // `filter: { property: notSelectable, op: not-in, value: "true" }`.
+    let (property_ne_filters, mut rest_ne): (Vec<_>, Vec<_>) = rest.drain(..).partition(|f| {
+        let op = f["op"].as_str().unwrap_or("");
+        let property = f["property"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+        let not_in_single_value = op == "not-in" && !value.contains(',');
+        (op == "!=" || not_in_single_value) && property != "constraint"
+    });
+    let (regex_filters, hierarchy_filters): (Vec<_>, Vec<_>) = rest_ne
         .drain(..)
         .partition(|f| f["op"].as_str() == Some("regex"));
 
@@ -3283,6 +3398,37 @@ fn apply_compose_filters(
                 prev.retain(|c| keep.contains(&c.code));
             }
             None => result = Some(concepts),
+        }
+    }
+
+    // ── Phase 1.5: property-NOT-equality filters (`!=`, `not-in` single value) ─
+    // The IG `notSelectable/notSelectable-prop-out*` fixtures use
+    // `filter: { property: notSelectable, op: not-in, value: "true" }` which
+    // means "select all concepts whose `notSelectable` property is NOT true
+    // (or absent entirely)". We compute that as: all concepts in the CS
+    // MINUS those returned by `query_property_eq` for the same (prop, val).
+    for f in &property_ne_filters {
+        let property = f["property"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+        any_filter_seen = true;
+        let excluded: HashSet<String> =
+            query_property_eq(conn, system_url, system_id, property, value)?
+                .into_iter()
+                .map(|c| c.code)
+                .collect();
+        match result.as_mut() {
+            Some(prev) => {
+                prev.retain(|c| !excluded.contains(&c.code));
+            }
+            None => {
+                // No prior bounded set — start from the full CS and exclude.
+                let all = query_all_concepts_in_system(conn, system_url, system_id)?;
+                let kept: Vec<ExpansionContains> = all
+                    .into_iter()
+                    .filter(|c| !excluded.contains(&c.code))
+                    .collect();
+                result = Some(kept);
+            }
         }
     }
 
@@ -3806,6 +3952,42 @@ fn query_property_eq(
         .collect())
 }
 
+/// Return every concept stored in `system_id`, in a form suitable for direct
+/// inclusion in an `expansion.contains` array. Used by `not-in` / `!=` filter
+/// handling to seed "all concepts in the CS, then exclude those matching the
+/// equality" without going through the recursive ECL machinery.
+fn query_all_concepts_in_system(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let mut stmt = conn
+        .prepare_cached("SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code")
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let rows = stmt
+        .query_map([system_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .map(|(code, display)| ExpansionContains {
+            system: system_url.to_owned(),
+            version: None,
+            code,
+            display,
+            is_abstract: None,
+            inactive: None,
+            designations: vec![],
+            properties: vec![],
+            extensions: vec![],
+            contains: vec![],
+        })
+        .collect())
+}
+
 /// Returns the subset of `candidates` that are descendants (or self, when
 /// `include_self=true`) of `root_code`.
 ///
@@ -4283,6 +4465,18 @@ fn apply_compose_filters_to_candidates(
                 let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
                 let valid = batch_property_eq_in_set(conn, system_id, property, value, &codes)?;
                 candidates.retain(|c| valid.contains(&c.code));
+            }
+            // `not-in` (single value) and `!=`: keep candidates whose
+            // `(property, value)` does NOT match. The IG `notSelectable/
+            // notSelectable-prop-out*` fixtures rely on `not-in` semantics
+            // — concepts with no matching property entry pass too.
+            (_, "not-in") | (_, "!=") => {
+                if !value.contains(',') {
+                    let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                    let excluded =
+                        batch_property_eq_in_set(conn, system_id, property, value, &codes)?;
+                    candidates.retain(|c| !excluded.contains(&c.code));
+                }
             }
             _ => {}
         }

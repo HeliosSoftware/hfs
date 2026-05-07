@@ -1113,11 +1113,104 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     // If the input system isn't stored as a CS (and isn't a known VS), the IG
     // expects an `x-unknown-system` parameter pointing at the unknown URL
     // (only when validate-code reported result=false).
-    let unknown_system = if !resp.result && !cs_exists && !system_is_value_set {
-        effective_system
+    //
+    // VS-context wrinkle: the IG fixture `errors/errors-unknown-system1` —
+    // where the caller's `system` matches a VS-include's system AND the
+    // system is unknown — expects ONLY the `UNKNOWN_CODESYSTEM` issue
+    // (no `not-in-vs` companion) AND `x-caused-by-unknown-system` (not
+    // `x-unknown-system`). The companion fixture `errors-unknown-system2`
+    // — where the caller's `system` is unknown but DIFFERENT from any VS
+    // include — keeps both issues and `x-unknown-system`. Differentiate by
+    // checking whether the caller's `effective_system` literally appears in
+    // the resolved VS's compose.include[].system list.
+    let system_unknown = !resp.result && !cs_exists && !system_is_value_set;
+    let mut suppress_not_in_vs_for_unknown = false;
+    let unknown_system = if system_unknown {
+        let sys_matches_vs_include = if let (Some(vs_url), Some(sys)) =
+            (value_set_url, effective_system)
+        {
+            // Look up the VS to see if its compose.include[] mentions `sys`.
+            let bare_url = vs_url.split('|').next().unwrap_or(vs_url).to_string();
+            let vs_hit = crate::traits::ValueSetOperations::search(
+                backend,
+                ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(bare_url),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+            .and_then(|mut h| h.pop());
+            vs_hit
+                .as_ref()
+                .and_then(|v| v.get("compose"))
+                .and_then(|c| c.get("include"))
+                .and_then(|i| i.as_array())
+                .map(|incs| {
+                    incs.iter().any(|inc| {
+                        inc.get("system").and_then(|s| s.as_str()) == Some(sys)
+                    })
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if sys_matches_vs_include {
+            // Only set caused_by when nothing else has claimed it — version
+            // mismatch detection (`detect_cs_version_mismatch`) sets this on
+            // CSes that exist at *some* version but not the requested one,
+            // and we don't want to clobber that diagnostic with the simpler
+            // unknown-system canonical.
+            if resp.caused_by_unknown_system.is_none() {
+                if let Some(sys) = effective_system {
+                    resp.caused_by_unknown_system = Some(sys.to_string());
+                }
+            }
+            suppress_not_in_vs_for_unknown = true;
+            // Synthesise the UNKNOWN_CODESYSTEM issue inline (since we're
+            // returning `None` for `unknown_system`, `build_validate_response`
+            // won't add it in its standard path). The IG fixture expects a
+            // single UNKNOWN_CODESYSTEM issue with location/expression `system`
+            // (or `Coding.system` for non-bare paths).
+            if let Some(sys) = effective_system {
+                let already = resp
+                    .issues
+                    .iter()
+                    .any(|i| i.message_id.as_deref() == Some("UNKNOWN_CODESYSTEM"));
+                if !already {
+                    let expression = match request_path {
+                        RequestPath::BareCode => "system".to_string(),
+                        _ => "Coding.system".to_string(),
+                    };
+                    let text = format!(
+                        "A definition for CodeSystem '{sys}' could not be found, so the code cannot be validated"
+                    );
+                    resp.issues.push(ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "not-found".into(),
+                        tx_code: "not-found".into(),
+                        text,
+                        expression: Some(expression.clone()),
+                        location: Some(expression),
+                        message_id: Some("UNKNOWN_CODESYSTEM".into()),
+                    });
+                }
+            }
+            None
+        } else {
+            effective_system
+        }
     } else {
         None
     };
+    if suppress_not_in_vs_for_unknown {
+        resp.issues.retain(|i| {
+            i.message_id.as_deref() != Some("None_of_the_provided_codes_are_in_the_value_set_one")
+                && i.tx_code != "not-in-vs"
+        });
+    }
 
     // When the input system URL is a stored ValueSet rather than a
     // CodeSystem, synthesize the IG-expected `Terminology_TX_System_ValueSet2`
@@ -4250,25 +4343,45 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
 /// OperationOutcome shape (`code=processing`, `INVALID_DISPLAY_NAME`).
 const INVALID_DISPLAY_LANGUAGE_PREFIX: &str = "__INVALID_DISPLAY_LANGUAGE__:";
 
-/// Returns `true` when `lang` is a syntactically plausible BCP-47 tag.
+/// Returns `true` when `lang` is a syntactically plausible BCP-47 tag, OR a
+/// comma-separated list of such tags (e.g. `de,it,zh` or `en, en-AU`).
+///
 /// We reject the tag forms that the IG `display/validation-wrong-de-en-bad`
 /// fixture expects to fail: empty, leading hyphen, trailing hyphen, double
 /// hyphen, or non-ASCII letters in the primary subtag. This is intentionally
 /// loose — we don't validate against the IANA registry — so any reasonable
 /// language code (e.g. `de`, `en-US`, `zh-Hans-CN`) still passes.
+///
+/// FHIR R5 `displayLanguage` accepts a comma-separated preference list — IG
+/// `validation/simple-*-language*` fixtures pass `de,it,zh` / `en, en-AU` and
+/// expect the server to interpret each comma-separated token as a language
+/// preference rather than rejecting the whole string. We split on `,`, trim
+/// surrounding whitespace, and require every non-empty token to be
+/// well-formed; an empty token (e.g. trailing comma) makes the whole input
+/// malformed.
 fn is_well_formed_display_language(lang: &str) -> bool {
-    if lang.is_empty()
-        || lang.starts_with('-')
-        || lang.ends_with('-')
-        || lang.contains("--")
-    {
+    fn is_single_tag_well_formed(tag: &str) -> bool {
+        if tag.is_empty()
+            || tag.starts_with('-')
+            || tag.ends_with('-')
+            || tag.contains("--")
+        {
+            return false;
+        }
+        let primary = tag.split('-').next().unwrap_or("");
+        (2..=3).contains(&primary.len()) && primary.chars().all(|c| c.is_ascii_alphabetic())
+    }
+    if lang.is_empty() {
         return false;
     }
-    // Primary subtag (before first hyphen) must be 2-3 ASCII letters.
-    let primary = lang.split('-').next().unwrap_or("");
-    let primary_ok = (2..=3).contains(&primary.len())
-        && primary.chars().all(|c| c.is_ascii_alphabetic());
-    primary_ok
+    // Comma-separated list: every non-empty token must be well-formed; a
+    // bare comma (e.g. `,` or `de,`) is malformed.
+    if lang.contains(',') {
+        return lang
+            .split(',')
+            .all(|t| is_single_tag_well_formed(t.trim()));
+    }
+    is_single_tag_well_formed(lang)
 }
 
 /// If `err` carries the `__INVALID_DISPLAY_LANGUAGE__` sentinel, format the
