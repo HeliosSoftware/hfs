@@ -1995,10 +1995,15 @@ pub async fn expand_handler<B: TerminologyBackend>(
     inject_accept_language(&headers, &mut params);
     match process_expand(&state, params).await {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
-        Err(e) => match cyclic_reference_response(&e) {
-            Some(resp) => Ok(resp),
-            None => Err(e),
-        },
+        Err(e) => {
+            if let Some(resp) = version_check_response(&e) {
+                return Ok(resp);
+            }
+            match cyclic_reference_response(&e) {
+                Some(resp) => Ok(resp),
+                None => Err(e),
+            }
+        }
     }
 }
 
@@ -2019,10 +2024,15 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
     inject_accept_language(&headers, &mut params);
     match process_expand(&state, params).await {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
-        Err(e) => match cyclic_reference_response(&e) {
-            Some(resp) => Ok(resp),
-            None => Err(e),
-        },
+        Err(e) => {
+            if let Some(resp) = version_check_response(&e) {
+                return Ok(resp);
+            }
+            match cyclic_reference_response(&e) {
+                Some(resp) => Ok(resp),
+                None => Err(e),
+            }
+        }
     }
 }
 
@@ -2033,6 +2043,70 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
 /// `VALUESET_CIRCULAR_REFERENCE` `operationoutcome-message-id` extension.
 /// Returns `None` when the error is not a cycle so the caller falls through
 /// to the generic [`HtsError`] [`IntoResponse`] path.
+/// Sentinel marker prepended to a [`HtsError::VsInvalid`] when an $expand
+/// operation fails the `check-system-version` post-check.  Picked up by
+/// [`version_check_response`] to format the IG-spec OperationOutcome shape.
+const VERSION_CHECK_ERR_PREFIX: &str = "__VALUESET_VERSION_CHECK__:";
+
+/// Returns true if `version` satisfies the wildcard `pattern`. Local copy of
+/// the helper in `backends/sqlite/value_set.rs` so $expand can verify the
+/// `check-system-version` pattern without crossing crate boundaries.
+fn expand_version_satisfies_wildcard(version: &str, pattern: &str) -> bool {
+    if pattern == "x" {
+        return true;
+    }
+    let pat_segs: Vec<&str> = pattern.split('.').collect();
+    let ver_segs: Vec<&str> = version.split('.').collect();
+    let ends_with_x = pat_segs.last().is_some_and(|s| *s == "x");
+    if !ends_with_x && pat_segs.len() != ver_segs.len() {
+        return false;
+    }
+    if ends_with_x && ver_segs.len() < pat_segs.len() - 1 {
+        return false;
+    }
+    for (i, ps) in pat_segs.iter().enumerate() {
+        if *ps == "x" {
+            continue;
+        }
+        match ver_segs.get(i) {
+            Some(vs) if vs == ps => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// If `err` is a `check-system-version` failure raised inside `process_expand`,
+/// render the FHIR `OperationOutcome` shape the IG fixtures expect:
+/// `severity=error`, `code=exception`, `version-error` tx-issue-type,
+/// `VALUESET_VERSION_CHECK` message-id, HTTP 400.
+fn version_check_response(err: &HtsError) -> Option<Response> {
+    use axum::response::IntoResponse;
+    let HtsError::VsInvalid(msg) = err else {
+        return None;
+    };
+    let text = msg.strip_prefix(VERSION_CHECK_ERR_PREFIX)?;
+    let body = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                "valueString": "VALUESET_VERSION_CHECK"
+            }],
+            "severity": "error",
+            "code": "exception",
+            "details": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                    "code": "version-error"
+                }],
+                "text": text,
+            },
+        }]
+    });
+    Some((StatusCode::BAD_REQUEST, Json(body)).into_response())
+}
+
 fn cyclic_reference_response(err: &HtsError) -> Option<Response> {
     use axum::response::IntoResponse;
     let HtsError::VsInvalid(msg) = err else {
