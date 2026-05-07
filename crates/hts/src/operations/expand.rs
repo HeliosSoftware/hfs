@@ -1028,6 +1028,14 @@ async fn process_expand<B: TerminologyBackend>(
     } else {
         None
     };
+    // Did the caller pass an explicit `valueSet` body parameter?  This is the
+    // ONLY signal that should cause the response to echo `compose` /
+    // `contained` back to the client.  `tx-resource` matches (handled by the
+    // shortcut below) must NOT count — the IG validator silently injects
+    // every fixture VS as a `tx-resource` for every request, so using the
+    // shortcut's promoted `value_set` to gate compose echo would leak the
+    // stored VS shape on URL-only requests.
+    let caller_supplied_inline_vs = value_set.is_some();
 
     if url.is_none() && value_set.is_none() {
         return Err(HtsError::InvalidRequest(
@@ -2942,7 +2950,16 @@ async fn process_expand<B: TerminologyBackend>(
                     response[field] = v.clone();
                 }
             }
-            if value_set_for_response.is_some() {
+            // Echo `compose` / `contained` ONLY when the caller passed an
+            // explicit `valueSet` body parameter.  `tx-resource` shortcut
+            // promotions (URL-based requests where a tx-resource happens to
+            // match the URL) do NOT count — the IG validator injects fixture
+            // VSes as tx-resource for every request, and using the shortcut's
+            // promoted value_set as the signal leaks the stored VS shape on
+            // URL-only requests (every `expand-*-response*` IG fixture lists
+            // `compose` under `$optional-properties$`, and stored VSes carry
+            // include[] entries that don't match the expected echo shape).
+            if caller_supplied_inline_vs {
                 if let Some(c) = obj.get("compose") {
                     let mut composed = c.clone();
                     fn normalise_filter_ops(v: &mut Value) {
