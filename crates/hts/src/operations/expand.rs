@@ -823,13 +823,28 @@ async fn process_expand<B: TerminologyBackend>(
         serde_json::to_string(&sorted).unwrap_or_default()
     };
 
+    // When a pipe-version was supplied (or a `valueSetVersion` request param
+    // exists) include it in `url_or_body` so two URLs differing only in
+    // version do not collide. The IG `version/vs-expand-v1` and `vs-expand-v2`
+    // fixtures share the same bare URL but pin different versions; without
+    // this discriminator the second request would hit the first's cached
+    // bytes and report the wrong version's codes.
+    let cache_url_key = match url.clone() {
+        Some(u) => {
+            let v_explicit = find_str_param(&params, "valueSetVersion");
+            match (pipe_version.as_ref(), v_explicit.as_ref()) {
+                (Some(v), _) => format!("{u}|{v}"),
+                (None, Some(v)) => format!("{u}|{v}"),
+                _ => u,
+            }
+        }
+        None => value_set
+            .as_ref()
+            .and_then(|vs| serde_json::to_string(vs).ok())
+            .unwrap_or_default(),
+    };
     let cache_key = ExpandCacheKey {
-        url_or_body: url.clone().unwrap_or_else(|| {
-            value_set
-                .as_ref()
-                .and_then(|vs| serde_json::to_string(vs).ok())
-                .unwrap_or_default()
-        }),
+        url_or_body: cache_url_key,
         filter: filter.clone().unwrap_or_default(),
         count: count.unwrap_or(u32::MAX),
         offset: offset.unwrap_or(0),
@@ -1463,6 +1478,12 @@ async fn process_expand<B: TerminologyBackend>(
             if matches!(name, "system-version" | "check-system-version") {
                 return false;
             }
+            // `useSupplement` is consumed (it drives `used-supplement`
+            // emission) — the IG `parameters-expand-supplement-good` fixture
+            // does NOT echo `useSupplement` itself.
+            if name == "useSupplement" {
+                return false;
+            }
             // Configuration inputs that the IG validator passes via the
             // `profile` parameter set — they steer test execution rather than
             // request semantics, and the validator does NOT expect them back
@@ -1549,10 +1570,30 @@ async fn process_expand<B: TerminologyBackend>(
                     }
                 }
                 if let (Some(n), Some((k, v))) = (name, value_entry) {
-                    // `versionsMatch` is a tx-ecosystem-internal pin used by
-                    // overload/* fixtures to colour their compose; the IG
-                    // doesn't expect it echoed back in expansion.parameter.
+                    // `versionsMatch` is a tx-ecosystem-extension carried on
+                    // `compose` to choose between version-blind and
+                    // version-aware exclude/merge semantics. The IG fixtures
+                    // (`overload/overload-expand-all-merged` etc.) echo the
+                    // *true* form back as `valueBoolean: true` (and suppress
+                    // the *false* form entirely). Translate the valueString
+                    // from the extension into the Boolean shape the fixtures
+                    // assert against.
                     if n == "versionsMatch" {
+                        let val_str = match &v {
+                            Value::String(s) => s.as_str(),
+                            _ => "",
+                        };
+                        if val_str.eq_ignore_ascii_case("true") {
+                            let already = emitted_params.iter().any(|p| {
+                                p.get("name").and_then(|x| x.as_str()) == Some("versionsMatch")
+                            });
+                            if !already {
+                                emitted_params.push(json!({
+                                    "name": "versionsMatch",
+                                    "valueBoolean": true,
+                                }));
+                            }
+                        }
                         continue;
                     }
                     // Don't double-emit if the caller already provided this knob.
@@ -1562,6 +1603,98 @@ async fn process_expand<B: TerminologyBackend>(
                     if !already {
                         emitted_params.push(json!({ "name": n, k: v }));
                     }
+                }
+            }
+        }
+    }
+
+    // Default-versionsMatch heuristic (applies when no extension is set):
+    // the IG fixtures `overload/overload-expand-exclude` and
+    // `overload-expand-exclude-merged` expect a `versionsMatch=true`
+    // parameter when a whole-system `exclude[]` clause targets a different
+    // version than the contributing `include[]`s.  Per-concept excludes
+    // (with `concept[]`) do *not* trigger this — those are inherently
+    // version-aware (`overload-expand-exclude-enum`).
+    if let Some(vs) = source_vs.as_ref() {
+        let already = emitted_params
+            .iter()
+            .any(|p| p.get("name").and_then(|x| x.as_str()) == Some("versionsMatch"));
+        if !already {
+            let compose = vs.get("compose");
+            let has_versions_match_ext = compose
+                .and_then(|c| c.get("extension"))
+                .and_then(|e| e.as_array())
+                .map(|exts| {
+                    exts.iter().any(|ext| {
+                        ext.get("url").and_then(|u| u.as_str())
+                            == Some(
+                                "http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter",
+                            )
+                            && ext
+                                .get("extension")
+                                .and_then(|e| e.as_array())
+                                .is_some_and(|inner| {
+                                    inner.iter().any(|sub| {
+                                        sub.get("url").and_then(|u| u.as_str()) == Some("name")
+                                            && sub.get("valueCode").and_then(|v| v.as_str())
+                                                == Some("versionsMatch")
+                                    })
+                                })
+                    })
+                })
+                .unwrap_or(false);
+            if !has_versions_match_ext {
+                let mut include_versions: std::collections::HashMap<String, std::collections::HashSet<String>> =
+                    std::collections::HashMap::new();
+                if let Some(arr) = compose.and_then(|c| c.get("include")).and_then(|i| i.as_array())
+                {
+                    for inc in arr {
+                        let sys = match inc.get("system").and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        let ver = inc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        include_versions.entry(sys).or_default().insert(ver);
+                    }
+                }
+                let mut whole_system_cross_version_exclude = false;
+                if let Some(arr) = compose.and_then(|c| c.get("exclude")).and_then(|i| i.as_array())
+                {
+                    for exc in arr {
+                        let has_concept = exc
+                            .get("concept")
+                            .and_then(|c| c.as_array())
+                            .is_some_and(|a| !a.is_empty());
+                        if has_concept {
+                            // Per-concept excludes are inherently version-aware.
+                            continue;
+                        }
+                        let sys = match exc.get("system").and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        let ver = exc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if let Some(includes) = include_versions.get(&sys) {
+                            if !includes.contains(&ver) {
+                                whole_system_cross_version_exclude = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if whole_system_cross_version_exclude {
+                    emitted_params.push(json!({
+                        "name": "versionsMatch",
+                        "valueBoolean": true,
+                    }));
                 }
             }
         }
@@ -1603,15 +1736,21 @@ async fn process_expand<B: TerminologyBackend>(
         pairs
     };
 
-    // Fallback when the expansion is empty (e.g. filter matched nothing).
-    if used_pairs.is_empty() {
-        if let Some(vs) = source_vs.as_ref() {
-            if let Some(includes) = vs
+    // Augment with `compose.include[]` AND `compose.exclude[]` system/version
+    // pins so every CS that influenced the expansion shape (even ones that
+    // contributed only via exclusion, e.g. `overload/overload-expand-exclude`
+    // where the v1 include is fully exclude-subsumed) surfaces as a
+    // `used-codesystem` parameter.  Run unconditionally — not just on the
+    // empty-expansion fallback path — because the exclude-only contributors
+    // are missing from `contains[]` even when other includes produced rows.
+    if let Some(vs) = source_vs.as_ref() {
+        for key in ["include", "exclude"] {
+            if let Some(arr) = vs
                 .get("compose")
-                .and_then(|c| c.get("include"))
+                .and_then(|c| c.get(key))
                 .and_then(|i| i.as_array())
             {
-                for inc in includes {
+                for inc in arr {
                     if let Some(sys) = inc.get("system").and_then(|s| s.as_str()) {
                         let ver = inc
                             .get("version")
@@ -1829,6 +1968,18 @@ async fn process_expand<B: TerminologyBackend>(
                 })
             });
             resp.contains = indexed.into_iter().map(|(_, c)| c).collect();
+
+            // The serialized `contains` array (built earlier at the start of
+            // the response-build phase) was produced from the pre-sort order
+            // — re-serialize from `resp.contains` so the expansion reflects
+            // the latest-version-first ordering required by the
+            // overload/overload-expand-all* fixtures.
+            let resorted: Vec<Value> = resp
+                .contains
+                .iter()
+                .map(|c| serialize_expansion_contains(c, &multi_version_systems))
+                .collect();
+            expansion["contains"] = json!(resorted);
         }
     }
 
@@ -2338,7 +2489,7 @@ fn cyclic_reference_response(err: &HtsError) -> Option<Response> {
 /// (`client().setAcceptLanguage(lang)`), and the expected fixtures echo
 /// `displayLanguage` in `expansion.parameter` even when the request body
 /// didn't carry it explicitly.
-fn inject_accept_language(headers: &HeaderMap, params: &mut Vec<Value>) {
+pub(crate) fn inject_accept_language(headers: &HeaderMap, params: &mut Vec<Value>) {
     let lang = headers
         .get(header::ACCEPT_LANGUAGE)
         .and_then(|v| v.to_str().ok())

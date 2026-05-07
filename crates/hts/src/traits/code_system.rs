@@ -102,7 +102,9 @@ pub trait CodeSystemOperations: Send + Sync {
     /// Used by `$expand` to populate `expansion.contains[].abstract` (driven
     /// by the FHIR `notSelectable` concept-property) and
     /// `expansion.contains[].inactive` (driven by the `status` property having
-    /// a non-active value: `retired`, `deprecated`, `withdrawn`).
+    /// the value `retired` or `inactive`). Note that `deprecated` codes are
+    /// NOT inactive — per the FHIR concept-properties IG they're discouraged
+    /// but still selectable.
     ///
     /// Returns a map from code → flags. Codes with neither flag set may be
     /// omitted from the result.

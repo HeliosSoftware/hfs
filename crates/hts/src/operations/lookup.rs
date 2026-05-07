@@ -103,6 +103,42 @@ async fn process_lookup<B: TerminologyBackend>(
 
     let mut resp = state.backend().lookup(&ctx, req).await?;
 
+    // Surface the default display as a synthesised "preferredForLanguage"
+    // designation tagged with the CodeSystem's primary language. The IG
+    // `parameters/parameters-lookup-supplement-*` fixtures expect this row,
+    // and `simple/simple-lookup*` accepts it as optional.
+    let cs_language: Option<String> = crate::traits::CodeSystemOperations::search(
+        state.backend(),
+        &ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(system.clone()),
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()
+    .and_then(|mut hits| hits.pop())
+    .and_then(|v| {
+        v.get("language")
+            .and_then(|l| l.as_str())
+            .map(str::to_string)
+    });
+    if let (Some(lang), Some(disp)) = (cs_language.as_deref(), resp.display.clone()) {
+        let already = resp.designations.iter().any(|d| {
+            d.language.as_deref() == Some(lang) && d.value == disp
+        });
+        if !already {
+            resp.designations.push(DesignationValue {
+                language: Some(lang.to_string()),
+                use_system: None,
+                use_code: None,
+                value: disp,
+                source: None,
+            });
+        }
+    }
+
     // Merge supplement designations and properties (matched on concept code).
     if !applied_supplements.is_empty() {
         // The lookup keys for the supplement queries are the supplement CS

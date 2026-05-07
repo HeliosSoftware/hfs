@@ -566,7 +566,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         );
 
                         // Normal path: try the expansion cache first.
-                        let cached = fetch_cache(&conn, &vs_id)?;
+                        // For multi-version overload composes, bypass the
+                        // cache (its PK can't represent two versions of the
+                        // same code) and recompute inline.
+                        let multi_version =
+                            compose_has_multi_version_pins(compose_json.as_deref());
+                        let cached = if multi_version {
+                            Vec::new()
+                        } else {
+                            fetch_cache(&conn, &vs_id)?
+                        };
                         if cached.is_empty() {
                             // Fast page for paginated requests on large extensional ValueSets
                             // (e.g. VSAC ValueSets with thousands of explicit codes).
@@ -601,10 +610,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             // Cache only when no version overrides were
                             // applied — caching with overrides would poison
                             // subsequent unforced requests with the wrong
-                            // version's codes.
+                            // version's codes. Also skip caching for
+                            // multi-version overload composes (PK collisions).
                             if req.force_system_versions.is_empty()
                                 && req.system_version_defaults.is_empty()
                                 && req.default_value_set_versions.is_empty()
+                                && !multi_version
                             {
                                 populate_cache(&conn, &vs_id, &codes)?;
                             }
@@ -930,7 +941,18 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 ) {
                     Ok((vs_id, compose_json)) => {
                         let saved = compose_json.clone();
-                        let cached = fetch_cache(&conn, &vs_id)?;
+                        // Bypass the `value_set_expansions` cache when the
+                        // compose describes a multi-version overload — the
+                        // legacy PRIMARY KEY `(vs_id, system_url, code)`
+                        // silently dedupes the second-version row, dropping
+                        // half the expansion. Recomputing inline is cheap for
+                        // these (small) ValueSets.
+                        let multi_version = compose_has_multi_version_pins(compose_json.as_deref());
+                        let cached = if multi_version {
+                            Vec::new()
+                        } else {
+                            fetch_cache(&conn, &vs_id)?
+                        };
                         // When a `default-valueset-version` pin is in effect the
                         // cached entry (which reflects the unpinned expansion)
                         // would resolve nested `valueSet[]` refs to the latest
@@ -946,7 +968,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 &std::collections::HashMap::new(),
                                 &req.default_value_set_versions,
                             )?;
-                            if !has_vs_pin {
+                            if !has_vs_pin && !multi_version {
                                 populate_cache(&conn, &vs_id, &codes)?;
                             }
                             codes
@@ -997,6 +1019,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 .system
                                 .as_deref()
                                 .and_then(|s| cs_version_for_msg(&conn, s));
+                            let cs_is_fragment = req
+                                .system
+                                .as_deref()
+                                .map(|s| cs_content_for_url(&conn, s).as_deref() == Some("fragment"))
+                                .unwrap_or(false);
                             let vs_version_owned = lookup_value_set_version(&conn, &url);
                             return finish_validate_code_response(
                                 found,
@@ -1009,9 +1036,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 vs_version_owned.as_deref(),
                                 inactive_in_cs,
                                 code_unknown_in_cs,
+                                false, // version-only-unknown not applicable here
                                 cs_version.as_deref(),
                                 req.version.as_deref(),
                                 req.lenient_display_validation.unwrap_or(false),
+                                cs_is_fragment,
+                                None, // cs_display_lookup — only used by the URL path below
                             );
                         }
 
@@ -1050,6 +1080,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             .system
                             .as_deref()
                             .and_then(|s| cs_version_for_msg(&conn, s));
+                        let cs_is_fragment = req
+                            .system
+                            .as_deref()
+                            .map(|s| cs_content_for_url(&conn, s).as_deref() == Some("fragment"))
+                            .unwrap_or(false);
                         let vs_version_owned = lookup_value_set_version(&conn, &url);
                         return finish_validate_code_response(
                             found,
@@ -1062,9 +1097,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             vs_version_owned.as_deref(),
                             inactive_in_cs,
                             code_unknown_in_cs,
+                            false, // version-only-unknown not applicable here
                             cs_version.as_deref(),
                             req.version.as_deref(),
                             req.lenient_display_validation.unwrap_or(false),
+                            cs_is_fragment,
+                            None, // cs_display_lookup — only used by the URL path below
                         );
                     }
                     Err(e) => return Err(e),
@@ -1113,7 +1151,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 //   - In the single-include case there *is* a candidate but
                 //     the version differs; returning that candidate keeps
                 //     the legacy display echo + mismatch diagnostic the
-                //     existing tests rely on.
+                //     existing tests rely on — UNLESS the underlying CS
+                //     genuinely lacks the code at the requested version
+                //     (still the `validate-bad-v1code4` / `validate-bad-v2code3`
+                //     scenario, which only has one candidate after filtering).
                 let exact = candidates
                     .iter()
                     .find(|c| c.version.as_deref() == Some(req_v))
@@ -1121,7 +1162,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 if let Some(c) = exact {
                     Some(c.clone())
                 } else if candidates.len() == 1 {
-                    candidates.into_iter().next().cloned()
+                    // Only fall back to the lone candidate when the code
+                    // actually exists at the requested version. When the
+                    // candidate is from a *different* version and the code
+                    // is absent at the pinned version, return None so the
+                    // not-in-vs / Unknown_Code_in_Version diagnostics fire.
+                    let single = candidates.into_iter().next().cloned();
+                    let code_at_req = single
+                        .as_ref()
+                        .map(|c| is_code_in_cs_at_version(&conn, &c.system, req_v, &c.code))
+                        .unwrap_or(false);
+                    if code_at_req { single } else { None }
                 } else {
                     None
                 }
@@ -1285,7 +1336,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // see an "Unknown code in CodeSystem 'url' version 'X'" issue
             // even when the code exists at a different version — handled by
             // the version-scoped check below.
-            let code_unknown_in_cs = found.is_none()
+            let code_unknown_in_cs_anywhere = found.is_none()
                 && req
                     .system
                     .as_deref()
@@ -1303,7 +1354,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     }
                     _ => false,
                 };
-            let code_unknown_in_cs = code_unknown_in_cs || code_unknown_in_cs_at_version;
+            // The "version-only-unknown" sub-case: code IS in CS somewhere
+            // (so the bare-URL check passed) but NOT at the pinned version.
+            // This drives `finish_validate_code_response` to still echo
+            // `system` and `version` (without `display`) per the IG fixtures.
+            let code_unknown_at_version_only =
+                !code_unknown_in_cs_anywhere && code_unknown_in_cs_at_version;
+            let code_unknown_in_cs = code_unknown_in_cs_anywhere || code_unknown_in_cs_at_version;
             // cs_version priority for response/messaging:
             //   (1) req.version when exact
             //   (2) the matched concept's version (when found)
@@ -1340,6 +1397,30 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .or_else(|| cs_version_for_msg(&conn, s))
             });
             let vs_version_owned = lookup_value_set_version(&conn, &url);
+            let cs_is_fragment = system_for_msg
+                .as_deref()
+                .map(|s| cs_content_for_url(&conn, s).as_deref() == Some("fragment"))
+                .unwrap_or(false);
+            // When the caller didn't supply a display and we still need to
+            // echo one (the code is in the underlying CS, just not in this
+            // VS — the IG `overload/validate-bad-enum-code1` and
+            // `validate-bad-exclude-code1` fixtures expect the canonical
+            // display in the response), look it up from the CS at the
+            // resolved cs_version. Used *only* for the echoed `display`
+            // parameter — never substituted into the not-in-vs message text
+            // so the IG message stays "code 'system#code' was not found"
+            // (without a parenthetical display).
+            let echo_display_lookup: Option<String> = if req.display.is_some()
+                || code_unknown_in_cs
+            {
+                None
+            } else if let (Some(sys), Some(ver)) =
+                (system_for_msg.as_deref(), cs_version.as_deref())
+            {
+                lookup_display_at_version(&conn, sys, ver, &req.code)
+            } else {
+                None
+            };
             finish_validate_code_response(
                 found,
                 &req.code,
@@ -1351,9 +1432,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 vs_version_owned.as_deref(),
                 inactive_in_cs,
                 code_unknown_in_cs,
+                code_unknown_at_version_only,
                 cs_version.as_deref(),
                 req.version.as_deref(),
                 req.lenient_display_validation.unwrap_or(false),
+                cs_is_fragment,
+                echo_display_lookup.as_deref(),
             )
         })
         .await
@@ -1584,7 +1668,54 @@ fn resolve_value_set_versioned(
 /// Fetch all cached expansion entries for `vs_id`.
 ///
 /// Returns an empty vec when no cached entries exist (cache miss).
+///
+/// The `version` column is read alongside (system, code, display) so the
+/// validate-code path can return the correct CodeSystem version when echoing
+/// `version` in the response. Older databases predating the `version`
+/// migration are handled gracefully — a missing column produces a runtime
+/// error which we treat as a cache-miss-like condition by falling back to
+/// the version-less projection.
 fn fetch_cache(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionContains>, HtsError> {
+    let mut stmt = match conn.prepare_cached(
+        "SELECT system_url, code, display, version
+             FROM value_set_expansions
+             WHERE value_set_id = ?1
+             ORDER BY system_url, code",
+    ) {
+        Ok(s) => s,
+        // Legacy schema without the `version` column: silently fall back to
+        // the original projection so older deployments continue to work.
+        Err(e) if e.to_string().contains("no such column: version") => {
+            return fetch_cache_legacy(conn, vs_id);
+        }
+        Err(e) => return Err(HtsError::StorageError(e.to_string())),
+    };
+
+    stmt.query_map([vs_id], |row| {
+        Ok(ExpansionContains {
+            system: row.get(0)?,
+            version: row.get::<_, Option<String>>(3)?,
+            code: row.get(1)?,
+            display: row.get(2)?,
+            is_abstract: None,
+
+            inactive: None,
+
+            designations: vec![],
+
+            properties: vec![],
+            contains: vec![],
+        })
+    })
+    .map_err(|e| HtsError::StorageError(e.to_string()))?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Pre-version-column schema fallback. Identical to the original
+/// [`fetch_cache`] body — kept so a server brought up against an old DB file
+/// (without the `version` migration) still responds.
+fn fetch_cache_legacy(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionContains>, HtsError> {
     let mut stmt = conn
         .prepare_cached(
             "SELECT system_url, code, display
@@ -1601,11 +1732,8 @@ fn fetch_cache(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionContains>,
             code: row.get(1)?,
             display: row.get(2)?,
             is_abstract: None,
-
             inactive: None,
-
             designations: vec![],
-
             properties: vec![],
             contains: vec![],
         })
@@ -5094,24 +5222,54 @@ fn populate_cache(
     }
 
     {
-        let mut stmt = match conn.prepare_cached(
+        // Try the version-aware INSERT first. Falls back to the legacy
+        // 4-column form when the `version` column hasn't been migrated yet
+        // (older deployments).
+        let with_version = conn.prepare_cached(
             "INSERT OR IGNORE INTO value_set_expansions
-             (value_set_id, system_url, code, display)
-             VALUES (?1, ?2, ?3, ?4)",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(HtsError::StorageError(e.to_string()));
+             (value_set_id, system_url, code, display, version)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        );
+        match with_version {
+            Ok(mut stmt) => {
+                for item in codes {
+                    if let Err(e) = stmt.execute(rusqlite::params![
+                        vs_id,
+                        item.system,
+                        item.code,
+                        item.display,
+                        item.version
+                    ]) {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(HtsError::StorageError(e.to_string()));
+                    }
+                }
             }
-        };
-        for item in codes {
-            if let Err(e) = stmt.execute(rusqlite::params![
-                vs_id,
-                item.system,
-                item.code,
-                item.display
-            ]) {
+            Err(e) if e.to_string().contains("no such column: version") => {
+                let mut stmt = match conn.prepare_cached(
+                    "INSERT OR IGNORE INTO value_set_expansions
+                     (value_set_id, system_url, code, display)
+                     VALUES (?1, ?2, ?3, ?4)",
+                ) {
+                    Ok(s) => s,
+                    Err(e2) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(HtsError::StorageError(e2.to_string()));
+                    }
+                };
+                for item in codes {
+                    if let Err(e) = stmt.execute(rusqlite::params![
+                        vs_id,
+                        item.system,
+                        item.code,
+                        item.display
+                    ]) {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(HtsError::StorageError(e.to_string()));
+                    }
+                }
+            }
+            Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(HtsError::StorageError(e.to_string()));
             }
@@ -5181,8 +5339,9 @@ fn lookup_value_set_version(conn: &Connection, url: &str) -> Option<String> {
 }
 
 /// Returns true when the concept has a status property in the inactive set
-/// (retired/deprecated/withdrawn/inactive). Used by $validate-code so the
-/// response can surface a top-level `inactive` parameter per the IG fixtures.
+/// (retired/inactive). Used by $validate-code so the response can surface a
+/// top-level `inactive` parameter per the IG fixtures. Note: `deprecated`
+/// codes are NOT inactive per the FHIR concept-properties IG.
 /// `true` when the code exists in the named CodeSystem (regardless of any
 /// flags). Used by validate_code to decide whether to emit a separate
 /// `code-invalid` / `invalid-code` issue ("Unknown code 'X' in the
@@ -5229,6 +5388,22 @@ fn is_code_in_cs_at_version(
 fn cs_version_for_msg(conn: &Connection, system_url: &str) -> Option<String> {
     conn.query_row(
         "SELECT version FROM code_systems \
+         WHERE url = ?1 \
+         ORDER BY COALESCE(version, '') DESC LIMIT 1",
+        rusqlite::params![system_url],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
+/// Look up the `content` column for a stored CodeSystem URL.  Returns
+/// `Some("fragment")` when the CodeSystem is loaded as a fragment of the
+/// larger system, which downstream callers use to soften unknown-code
+/// diagnostics into the IG `UNKNOWN_CODE_IN_FRAGMENT` warning.
+fn cs_content_for_url(conn: &Connection, system_url: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT content FROM code_systems \
          WHERE url = ?1 \
          ORDER BY COALESCE(version, '') DESC LIMIT 1",
         rusqlite::params![system_url],
@@ -5329,6 +5504,42 @@ fn vs_all_pinned_include_versions(
         }
     }
     if hits.is_empty() { None } else { Some(hits) }
+}
+
+/// Returns true when `compose_json` describes the "overload" pattern: at
+/// least one `system` URL appearing in `include[]` (or `exclude[]`) at
+/// multiple distinct `version` values. Used to bypass the
+/// `value_set_expansions` cache for those ValueSets — its PRIMARY KEY does
+/// not include `version`, so caching would silently dedupe `(system, code)`
+/// pairs that legitimately differ across versions.
+fn compose_has_multi_version_pins(compose_json: Option<&str>) -> bool {
+    let cj = match compose_json {
+        Some(s) => s,
+        None => return false,
+    };
+    let compose: serde_json::Value = match serde_json::from_str(cj) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut by_system: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for key in ["include", "exclude"] {
+        if let Some(arr) = compose.get(key).and_then(|v| v.as_array()) {
+            for inc in arr {
+                let sys = match inc.get("system").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let ver = inc
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                by_system.entry(sys).or_default().insert(ver);
+            }
+        }
+    }
+    by_system.values().any(|s| s.len() > 1)
 }
 
 /// Resolve a version string against a set of `(id, version)` candidate pairs.
@@ -5765,9 +5976,14 @@ fn detect_vs_pin_unknown(
 
 fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool {
     // Honour both the legacy `status` property convention (value in
-    // {retired, deprecated, withdrawn, inactive}) AND the FHIR `inactive`
-    // boolean property — including locally-renamed variants that the
-    // CodeSystem.property[] declarations alias to the canonical URI.
+    // {retired, inactive}) AND the FHIR `inactive` boolean property —
+    // including locally-renamed variants that the CodeSystem.property[]
+    // declarations alias to the canonical URI.
+    //
+    // `deprecated` is intentionally excluded: per the FHIR concept-properties
+    // IG, deprecated codes are discouraged but still active (act-class
+    // expansion and the `deprecated/` test group both rely on this — deprecated
+    // codes survive `activeOnly=true` filtering).
     let inactive_codes = super::code_system::inactive_property_codes(conn, system_url);
     let placeholders = (3..=inactive_codes.len() + 2)
         .map(|i| format!("?{i}"))
@@ -5782,7 +5998,7 @@ fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool 
            AND c.code = ?2
            AND (
                (cp.property = 'status'
-                AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive'))
+                AND cp.value IN ('retired', 'inactive'))
             OR (cp.property IN ({placeholders}) AND cp.value = 'true')
            )
          LIMIT 1"
@@ -5807,6 +6023,14 @@ fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool 
 // case: a business-rule "...is valid but is not active" error, the
 // not-in-vs error, and a code-comment "...has a status of inactive..."
 // warning.
+//
+// `code_unknown_in_cs` is the union signal: true when the code is unknown
+// either anywhere in the underlying CS or only at the requested version.
+// `code_unknown_at_version_only` is true when the code DOES exist in the CS
+// (just not at the caller's pinned version) — in that case the IG fixtures
+// (`overload/validate-bad-v1code4`, `validate-bad-v2code3`) still echo
+// `system` and `version` (without `display`) so the consumer can see which
+// version was actually checked.
 #[allow(clippy::too_many_arguments)]
 fn finish_validate_code_response(
     found: Option<ExpansionContains>,
@@ -5819,9 +6043,12 @@ fn finish_validate_code_response(
     vs_version: Option<&str>,
     is_inactive_in_underlying_cs: bool,
     code_unknown_in_cs: bool,
+    code_unknown_at_version_only: bool,
     cs_version_for_msg: Option<&str>,
     req_version_hint: Option<&str>,
     lenient_display: bool,
+    cs_is_fragment: bool,
+    cs_display_lookup: Option<&str>,
 ) -> Result<ValidateCodeResponse, HtsError> {
     // When the caller pinned an exact version (req_version_hint) and the
     // code wasn't found, the IG fixtures qualify the code as
@@ -5854,6 +6081,42 @@ fn finish_validate_code_response(
     let mut issues: Vec<crate::types::ValidationIssue> = Vec::new();
     match found {
         None => {
+            // Fragment short-circuit: when the code is unknown in a CodeSystem
+            // whose `content == "fragment"`, the IG `fragment/validation-*-bad-code`
+            // fixtures expect ONE warning issue (not the not-in-vs/invalid-code
+            // pair), result=true, and the `UNKNOWN_CODE_IN_FRAGMENT` message-id —
+            // the missing code might still be valid in a different fragment of
+            // the same system.
+            if cs_is_fragment && code_unknown_in_cs {
+                if let Some(sys) = system_for_msg {
+                    let cs_text = match cs_version_for_msg {
+                        Some(v) => format!(
+                            "Unknown Code '{code}' in the CodeSystem '{sys}' version '{v}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment"
+                        ),
+                        None => format!(
+                            "Unknown Code '{code}' in the CodeSystem '{sys}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment"
+                        ),
+                    };
+                    return Ok(ValidateCodeResponse {
+                        result: true,
+                        message: None,
+                        display: None,
+                        system: Some(sys.to_string()),
+                        cs_version: cs_version_for_msg.map(|s| s.to_string()),
+                        inactive: None,
+                        issues: vec![crate::types::ValidationIssue {
+                            severity: "warning".into(),
+                            fhir_code: "code-invalid".into(),
+                            tx_code: "invalid-code".into(),
+                            text: cs_text,
+                            expression: Some("Coding.code".into()),
+                            location: Some("Coding.code".into()),
+                            message_id: Some("UNKNOWN_CODE_IN_FRAGMENT".into()),
+                        }],
+                        caused_by_unknown_system: None,
+                    });
+                }
+            }
             // The IG validator compares this text with the format
             //   "The provided code 'system#code ('Display')' was not found in the value set 'url'"
             // when the caller provided a display, otherwise without the display.
@@ -5933,11 +6196,25 @@ fn finish_validate_code_response(
             // When the code exists in the underlying CS (just excluded from
             // this VS), echo display/system/version so the IG fixtures can
             // show which code was checked.
+            //
+            // Special case: when the code is missing from the CS *only* at
+            // the requested version (overload pattern — code4 at v1, code3
+            // at v2), still echo system + version (without display) so the
+            // consumer can see which version was actually checked. This
+            // matches the IG `overload/validate-bad-v1code4` / `validate-bad-v2code3`
+            // fixtures.
+            //
+            // When the caller didn't supply a display but the CS does carry
+            // one for this (system, code, version), echo the looked-up CS
+            // display — IG `overload/validate-bad-enum-code1` etc. expect
+            // it in the response even when the code is *not* in this VS.
             let (echo_display, echo_system) = if !code_unknown_in_cs {
-                (
-                    expected_display.map(str::to_string),
-                    system_for_msg.map(str::to_string),
-                )
+                let disp = expected_display
+                    .map(str::to_string)
+                    .or_else(|| cs_display_lookup.map(str::to_string));
+                (disp, system_for_msg.map(str::to_string))
+            } else if code_unknown_at_version_only {
+                (None, system_for_msg.map(str::to_string))
             } else {
                 (None, None)
             };
@@ -5946,7 +6223,7 @@ fn finish_validate_code_response(
                 message: Some(message),
                 display: echo_display,
                 system: echo_system,
-                cs_version: if !code_unknown_in_cs {
+                cs_version: if !code_unknown_in_cs || code_unknown_at_version_only {
                     cs_version_for_msg.map(|s| s.to_string())
                 } else {
                     None
@@ -6071,15 +6348,30 @@ fn finish_validate_code_response(
             } else {
                 display_message
             };
+            // cs_version priority for the success path:
+            //   1. The caller's explicit (non-wildcard) request version, when
+            //      supplied — this is what the response should echo back.
+            //   2. The matched concept's version (from the expansion, which
+            //      may have used a different CS row when the include is a
+            //      wildcard like `1.x.x`).
+            //   3. The latest stored CS version, as a final fallback.
+            //
+            // The IG `version/coding-v10-vs1w` fixture pins request_version=1.0.0
+            // against a wildcard VS include (`1.x.x`); without this prefer-req
+            // ordering the echoed `version` would be 1.2.0 (the latest match
+            // for the wildcard) instead of 1.0.0.
+            let req_version_owned = req_version_hint
+                .filter(|v| !v.is_empty() && !v.contains(".x") && *v != "x")
+                .map(|s| s.to_string());
+            let cs_version = req_version_owned
+                .or_else(|| concept.version.clone())
+                .or_else(|| cs_version_for_msg.map(|s| s.to_string()));
             Ok(ValidateCodeResponse {
                 result: !has_error,
                 message,
                 display: concept.display,
                 system: Some(concept.system),
-                cs_version: concept
-                    .version
-                    .or_else(|| req_version_hint.map(|s| s.to_string()))
-                    .or_else(|| cs_version_for_msg.map(|s| s.to_string())),
+                cs_version,
                 inactive: if is_inactive { Some(true) } else { None },
                 issues,
                 caused_by_unknown_system: None,

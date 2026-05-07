@@ -119,11 +119,18 @@ CREATE INDEX IF NOT EXISTS idx_value_sets_meta
     ON value_sets(created_at, id, url, version, name, title, status);
 
 -- ── Value Set Expansions (materialized cache) ─────────────────────────────────
+-- `version` carries the resolved CodeSystem version for each cached entry so
+-- multi-version overload ValueSets (one VS pinning the same `system` at two
+-- distinct `version` values) round-trip correctly through the cache. Note
+-- the PRIMARY KEY still excludes `version`: when a VS pins the same code at
+-- multiple versions the cache is bypassed at the call sites (writer skips
+-- populate_cache, reader recomputes from compose) so the dedupe is fine.
 CREATE TABLE IF NOT EXISTS value_set_expansions (
     value_set_id TEXT NOT NULL REFERENCES value_sets(id) ON DELETE CASCADE,
     system_url   TEXT NOT NULL,
     code         TEXT NOT NULL,
     display      TEXT,
+    version      TEXT,
     PRIMARY KEY (value_set_id, system_url, code)
 );
 
@@ -408,6 +415,12 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
         "ALTER TABLE concept_maps ADD COLUMN name TEXT",
         "ALTER TABLE concept_maps ADD COLUMN title TEXT",
         "ALTER TABLE concept_maps ADD COLUMN resource_json TEXT",
+        // Track the resolved CodeSystem version that produced each expansion
+        // entry. Required so multi-version overload ValueSets (a single VS
+        // including the same `system` at two `version` pins) can return
+        // multiple `(system, code)` rows from the cache. Without it the
+        // PRIMARY KEY (vs_id, system_url, code) silently dedupes.
+        "ALTER TABLE value_set_expansions ADD COLUMN version TEXT",
     ];
     for sql in &migrations {
         match conn.execute_batch(sql) {

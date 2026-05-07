@@ -193,16 +193,59 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     // Match the IG `validation/cs-code-bad-code` text format
                     // exactly: "Unknown code 'X' in the CodeSystem 'url'
                     // version 'Y'" (with version when known).
-                    let cs_version_str: Option<String> = conn
+                    let row: Option<(Option<String>, Option<String>)> = conn
                         .query_row(
-                            "SELECT version FROM code_systems \
+                            "SELECT version, content FROM code_systems \
                              WHERE url = ?1 \
                              ORDER BY COALESCE(version, '') DESC LIMIT 1",
                             rusqlite::params![system],
-                            |row| row.get::<_, Option<String>>(0),
+                            |row| {
+                                Ok((
+                                    row.get::<_, Option<String>>(0)?,
+                                    row.get::<_, Option<String>>(1)?,
+                                ))
+                            },
                         )
-                        .ok()
-                        .flatten();
+                        .ok();
+                    let cs_version_str = row.as_ref().and_then(|(v, _)| v.clone());
+                    let cs_content = row.as_ref().and_then(|(_, c)| c.clone());
+                    // Fragment CodeSystems carry only a subset of the real
+                    // corpus, so an unknown code is not necessarily invalid —
+                    // it may live in a different fragment of the same system.
+                    // The IG `fragment/validation-fragment-*-bad-code`
+                    // fixtures expect ONE warning issue, result=true, and the
+                    // `UNKNOWN_CODE_IN_FRAGMENT` message-id with the
+                    // "...labeled as a fragment..." text.
+                    if cs_content.as_deref() == Some("fragment") {
+                        let text = match cs_version_str.as_deref() {
+                            Some(v) => format!(
+                                "Unknown Code '{}' in the CodeSystem '{}' version '{}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment",
+                                req.code, system, v
+                            ),
+                            None => format!(
+                                "Unknown Code '{}' in the CodeSystem '{}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment",
+                                req.code, system
+                            ),
+                        };
+                        return Ok(ValidateCodeResponse {
+                            result: true,
+                            message: None,
+                            display: None,
+                            system: Some(system.clone()),
+                            cs_version: cs_version_str,
+                            inactive: None,
+                            issues: vec![crate::types::ValidationIssue {
+                                severity: "warning".into(),
+                                fhir_code: "code-invalid".into(),
+                                tx_code: "invalid-code".into(),
+                                text,
+                                expression: Some("Coding.code".into()),
+                                location: Some("Coding.code".into()),
+                                message_id: Some("UNKNOWN_CODE_IN_FRAGMENT".into()),
+                            }],
+                            caused_by_unknown_system: None,
+                        });
+                    }
                     let text = match cs_version_str.as_deref() {
                         Some(v) => format!(
                             "Unknown code '{}' in the CodeSystem '{}' version '{}'",
@@ -593,6 +636,13 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map(|c| format!("'{}'", c.replace('\'', "''")))
                 .collect::<Vec<_>>()
                 .join(",");
+            // The legacy `status` property convention treats `retired` /
+            // `inactive` as inactive. `deprecated` is intentionally excluded:
+            // per the FHIR concept-properties IG, deprecated codes are
+            // discouraged but still active (the tho `expand-vs-act-class`
+            // fixtures and `deprecated/` group rely on this distinction —
+            // deprecated codes survive `activeOnly=true` and do NOT carry
+            // `inactive: true` in the expansion).
             let sql = format!(
                 "SELECT c.code, cp.property, cp.value
                  FROM concept_properties cp
@@ -604,7 +654,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                        (cp.property IN ({abstract_in}) AND cp.value = 'true')
                     OR (cp.property IN ({inactive_in}) AND cp.value = 'true')
                     OR (cp.property = 'status'
-                        AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive'))
+                        AND cp.value IN ('retired', 'inactive'))
                    )"
             );
             let mut stmt = conn

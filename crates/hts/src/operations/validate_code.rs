@@ -108,8 +108,51 @@ fn build_validate_response(
     request_path: RequestPath,
 ) -> Value {
     let mut parameter: Vec<Value> = Vec::new();
+    // For the CodeableConcept request path: when the validation produced an
+    // `UNKNOWN_CODESYSTEM_VERSION` issue whose caused-by canonical names a
+    // version that doesn't appear in any of the input codings, the unknown
+    // version came from the VS include's bad pin (not the caller's data).
+    // The IG fixtures (`codeableconcept-v10-vs1wb-*`, `codeableconcept-vnn-vs1wb-*`)
+    // drop `code` / `system` / `version` echoes in this case because those
+    // values describe the VS structure, not the caller's input. When the
+    // unknown version IS the caller's coding version (e.g. `vbb-vs10` with
+    // coding.version=2.4.0), the echoes ARE expected — the IG `vbb-vs10-*`
+    // fixtures show the coding's bad version + the VS's resolved version.
+    let suppress_cc_echoes = matches!(request_path, RequestPath::CodeableConcept)
+        && resp
+            .issues
+            .iter()
+            .any(|i| i.message_id.as_deref() == Some("UNKNOWN_CODESYSTEM_VERSION"))
+        && {
+            let coding_versions: Vec<String> = codeable_concept
+                .and_then(|cc| cc.get("coding"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| {
+                            c.get("version")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Extract the version part of `caused_by_unknown_system` (after
+            // the `|`). When it doesn't match any coding's version, the
+            // failure is from the VS include's bad pin.
+            let caused_version: Option<String> =
+                resp.caused_by_unknown_system.as_deref().and_then(|c| {
+                    c.split_once('|').map(|(_, v)| v.to_string())
+                });
+            match caused_version {
+                Some(v) => !coding_versions.iter().any(|cv| cv == &v),
+                None => true,
+            }
+        };
     if let Some(c) = code {
-        parameter.push(json!({"name": "code", "valueCode": c}));
+        if !suppress_cc_echoes {
+            parameter.push(json!({"name": "code", "valueCode": c}));
+        }
     }
     if let Some(cc) = codeable_concept {
         parameter.push(json!({"name": "codeableConcept", "valueCodeableConcept": cc}));
@@ -148,10 +191,37 @@ fn build_validate_response(
             }
         }
     }
+    // For the CodeableConcept request path, rewrite `Coding.X` → `CodeableConcept.coding[0].X`
+    // for issues that don't already use a `CodeableConcept.*` path. The IG
+    // `validation/simple-codeableconcept-bad-display*` fixtures expect the
+    // CodeableConcept-rooted path on display-mismatch issues.
+    if matches!(request_path, RequestPath::CodeableConcept) {
+        for issue in &mut issues {
+            for field in [&mut issue.expression, &mut issue.location] {
+                if let Some(path) = field.as_deref() {
+                    if let Some(stripped) = path.strip_prefix("Coding.") {
+                        *field = Some(format!("CodeableConcept.coding[0].{stripped}"));
+                    }
+                }
+            }
+        }
+    }
     if let Some(unknown) = unknown_system {
-        let text = format!(
-            "A definition for CodeSystem {unknown} could not be found, so the code cannot be validated"
-        );
+        // Absolute URLs (http://, https://, urn:) are quoted bare in the IG
+        // text. Relative/local references are wrapped in single quotes per
+        // `validation/simple-coding-bad-system-local`.
+        let is_absolute = unknown.starts_with("http://")
+            || unknown.starts_with("https://")
+            || unknown.starts_with("urn:");
+        let text = if is_absolute {
+            format!(
+                "A definition for CodeSystem {unknown} could not be found, so the code cannot be validated"
+            )
+        } else {
+            format!(
+                "A definition for CodeSystem '{unknown}' could not be found, so the code cannot be validated"
+            )
+        };
         let expression = match request_path {
             RequestPath::BareCode => "system".to_string(),
             _ => "Coding.system".to_string(),
@@ -161,10 +231,27 @@ fn build_validate_response(
             fhir_code: "not-found".into(),
             tx_code: "not-found".into(),
             text,
-            expression: Some(expression),
-            location: None,
+            expression: Some(expression.clone()),
+            location: Some(expression),
             message_id: Some("UNKNOWN_CODESYSTEM".into()),
         });
+        // Local/relative reference: also emit Terminology_TX_System_Relative.
+        if !is_absolute {
+            let rel_expr = match request_path {
+                RequestPath::BareCode => "system".to_string(),
+                _ => "Coding.system".to_string(),
+            };
+            issues.push(ValidationIssue {
+                severity: "error".into(),
+                fhir_code: "invalid".into(),
+                tx_code: "invalid-data".into(),
+                text: "Coding.system must be an absolute reference, not a local reference"
+                    .to_string(),
+                expression: Some(rel_expr.clone()),
+                location: Some(rel_expr),
+                message_id: Some("Terminology_TX_System_Relative".into()),
+            });
+        }
     }
 
     // Determine the message string: when we have structured issues, sort
@@ -187,6 +274,8 @@ fn build_validate_response(
                 i.severity == "error"
                     || (i.severity == "warning"
                         && (i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
+                            || i.message_id.as_deref()
+                                == Some("Coding_has_no_system__cannot_validate")
                             || i.tx_code == "invalid-display"))
                     || (i.severity == "information"
                         && i.message_id.as_deref().is_some_and(|m| {
@@ -256,10 +345,16 @@ fn build_validate_response(
     };
     parameter.push(json!({"name": "result", "valueBoolean": final_result}));
     if let Some(s) = system {
-        parameter.push(json!({"name": "system", "valueUri": s}));
+        // Suppress for CC path with UNKNOWN_CODESYSTEM_VERSION
+        // (see `suppress_cc_echoes` above for rationale).
+        if !suppress_cc_echoes {
+            parameter.push(json!({"name": "system", "valueUri": s}));
+        }
     }
     if let Some(v) = version {
-        parameter.push(json!({"name": "version", "valueString": v}));
+        if !suppress_cc_echoes {
+            parameter.push(json!({"name": "version", "valueString": v}));
+        }
     }
     if let Some(u) = unknown_system {
         parameter.push(json!({"name": "x-unknown-system", "valueCanonical": u}));
@@ -382,19 +477,35 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
         _ => "--".to_string(),
     };
 
-    // Find the "preferred" display in the requested language, if any.
-    // Returns the first designation whose language equals the requested
-    // language (case-insensitive, exact match — IG fixtures don't exercise
-    // language-tag fallback like `de-CH` → `de`).
-    let preferred_for_lang: Option<&(String, Option<String>)> = display_language
+    // The displayLanguage parameter may carry a comma-separated list (e.g.
+    // `de,it,zh` per the IG `validation/simple-code-good-language` fixture).
+    // Split on `,` (trim each) so we can match any of the requested languages.
+    let requested_langs: Vec<String> = display_language
         .filter(|s| !s.is_empty())
-        .and_then(|req_lang| {
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Find the "preferred" display in any of the requested languages, if any.
+    // Returns the first designation whose language equals one of the requested
+    // languages (case-insensitive, exact match — IG fixtures don't exercise
+    // language-tag fallback like `de-CH` → `de`).
+    let preferred_for_lang: Option<&(String, Option<String>)> =
+        if requested_langs.is_empty() {
+            None
+        } else {
             displays_for_lang.iter().find(|(_, lang_opt)| {
-                lang_opt
-                    .as_deref()
-                    .is_some_and(|l| l.eq_ignore_ascii_case(req_lang))
+                lang_opt.as_deref().is_some_and(|l| {
+                    requested_langs
+                        .iter()
+                        .any(|req| l.eq_ignore_ascii_case(req))
+                })
             })
-        });
+        };
 
     // Surface the language-preferred display on the response (overriding the
     // CS default). The IG `display/validation-right-de-ende-response` fixture
@@ -443,15 +554,18 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
             .any(|(v, _)| v.eq_ignore_ascii_case(expected))
     };
 
-    // Determine whether the CS has any display in the requested language.
-    let has_display_in_lang: bool = match display_language {
-        None => true,
-        Some(l) if l.is_empty() => true,
-        Some(req) => displays_for_lang.iter().any(|(_, lang_opt)| {
-            lang_opt
-                .as_deref()
-                .is_some_and(|x| x.eq_ignore_ascii_case(req))
-        }),
+    // Determine whether the CS has any display in any of the requested
+    // languages. `displayLanguage` may be a comma-separated list.
+    let has_display_in_lang: bool = if requested_langs.is_empty() {
+        true
+    } else {
+        displays_for_lang.iter().any(|(_, lang_opt)| {
+            lang_opt.as_deref().is_some_and(|x| {
+                requested_langs
+                    .iter()
+                    .any(|req| x.eq_ignore_ascii_case(req))
+            })
+        })
     };
 
     // Capture the severity of the existing `invalid-display` issue so the
@@ -471,9 +585,11 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     // Always emit `Coding.display` here; the downstream BareCode rewriter
     // in `build_validate_response` strips the `Coding.` prefix when the
     // request used the bare-code form, so we don't branch on the request
-    // path here.
+    // path here. Many IG `parameters/` and `validation/` fixtures omit
+    // `location` from the issue body and don't mark it `$optional-properties$`,
+    // so we only emit `expression` to stay strict-comparator-safe.
     let expression: Option<String> = Some("Coding.display".to_string());
-    let location: Option<String> = expression.clone();
+    let location: Option<String> = None;
 
     if display_matches {
         // The supplied display is valid. If the request asked for a language
@@ -504,17 +620,40 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
         }
     } else {
         // Supplied display is wrong. Pick the wording variant.
-        let default = default_display.as_deref().unwrap_or("");
+
+        // Whitespace-only mismatch detection: if the supplied display equals
+        // some valid display after collapsing whitespace, the IG uses the
+        // `Display_Name_WS_*` message-id variant (text wording is identical).
+        fn collapse_ws(s: &str) -> String {
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        let expected_collapsed = collapse_ws(expected);
+        let is_whitespace_only_mismatch = displays_for_lang
+            .iter()
+            .any(|(v, _)| collapse_ws(v).eq_ignore_ascii_case(&expected_collapsed))
+            && displays_for_lang
+                .iter()
+                .all(|(v, _)| !v.eq_ignore_ascii_case(expected));
 
         let (text, message_id) = if !has_display_in_lang
             && cs_language.is_some()
             && display_language.is_some()
         {
             // No designation in the requested language — fall back to default.
+            let default = default_display.as_deref().unwrap_or("");
             let txt = format!(
                 "Wrong Display Name '{expected}' for {system_url}#{code}. There are no valid display names found for language(s) '{lang_tail}'. Default display is '{default}'"
             );
             (txt, "NO_VALID_DISPLAY_FOUND_NONE_FOR_LANG_ERR".to_string())
+        } else if is_whitespace_only_mismatch {
+            let valid_str = format_valid_displays(&displays_for_lang, display_language);
+            let txt = format!(
+                "Wrong Display Name '{expected}' for {system_url}#{code}. {valid_str} (for the language(s) '{lang_tail}')"
+            );
+            (
+                txt,
+                "Display_Name_WS_for__should_be_one_of__instead_of".to_string(),
+            )
         } else {
             // CS has a display in the requested language (or no language
             // requested): list the valid display(s).
@@ -799,6 +938,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
         }
     }
 
+
     // Apply IG-style language-aware display validation: rewrite (or insert) the
     // `invalid-display` issue using the canonical "Wrong Display Name 'X' for
     // url#code. ..." text the IG fixtures (display/, language2/, validation/)
@@ -824,34 +964,176 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     // Mirror the same status-check emission for the validated ValueSet on
     // the VS-validate-code path. The IG `deprecated/validate-withdrawn`
     // fixture expects BOTH a deprecated-CS issue AND a withdrawn-VS issue.
+    //
+    // The IG `deprecated/not-withdrawn-validate` fixture additionally
+    // requires walking `compose.include[].valueSet[]` chains: validating a
+    // code via a VS whose compose imports a withdrawn VS yields TWO
+    // status-check issues (one for the validated CS + one for each chained
+    // VS that carries a non-active standards-status).
     if let Some(vs_url) = value_set_url {
-        if let Ok(mut hits) = crate::traits::ValueSetOperations::search(
-            backend,
-            ctx,
-            crate::types::ResourceSearchQuery {
-                url: Some(vs_url.to_string()),
-                count: Some(1),
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            if let Some(vs) = hits.pop() {
-                let vs_version = vs.get("version").and_then(|v| v.as_str());
-                for status in collect_status_check_codes(&vs) {
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut to_visit: Vec<String> = vec![vs_url.to_string()];
+        while let Some(current_url) = to_visit.pop() {
+            // Strip any `|version` suffix for the visited-set so a
+            // versionless and a pinned reference to the same VS aren't
+            // walked twice.
+            let bare = current_url
+                .split('|')
+                .next()
+                .unwrap_or(&current_url)
+                .to_string();
+            if !visited.insert(bare.clone()) {
+                continue;
+            }
+            let (lookup_url, lookup_ver): (String, Option<String>) =
+                match current_url.split_once('|') {
+                    Some((u, v)) => (u.to_string(), Some(v.to_string())),
+                    None => (current_url.clone(), None),
+                };
+            let mut hits = match crate::traits::ValueSetOperations::search(
+                backend,
+                ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(lookup_url.clone()),
+                    version: lookup_ver.clone(),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let Some(vs) = hits.pop() else { continue };
+            let vs_version = vs.get("version").and_then(|v| v.as_str());
+            for status in collect_status_check_codes(&vs) {
+                let vs_uri = match vs_version {
+                    Some(v) => format!("{lookup_url}|{v}"),
+                    None => lookup_url.clone(),
+                };
+                let text = format!("Reference to {status} ValueSet {vs_uri}");
+                // De-dupe across the chain: skip if we already emitted the
+                // exact same status-check text via a different reachable URL.
+                let already = resp
+                    .issues
+                    .iter()
+                    .any(|i| i.text == text && i.tx_code == "status-check");
+                if already {
+                    continue;
+                }
+                resp.issues.push(ValidationIssue {
+                    severity: "information".into(),
+                    fhir_code: "business-rule".into(),
+                    tx_code: "status-check".into(),
+                    text,
+                    expression: None,
+                    location: None,
+                    message_id: Some(status_message_id(&status).into()),
+                });
+            }
+            // Enqueue any nested compose.include[].valueSet[] refs.
+            if let Some(includes) = vs
+                .get("compose")
+                .and_then(|c| c.get("include"))
+                .and_then(|v| v.as_array())
+            {
+                for inc in includes {
+                    if let Some(refs) = inc.get("valueSet").and_then(|v| v.as_array()) {
+                        for r in refs {
+                            if let Some(s) = r.as_str() {
+                                to_visit.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // CONCEPT_DEPRECATED_IN_VALUESET: when a code is validated against a VS
+    // whose `compose.include[].concept[]` entry for that code carries a
+    // `valueset-deprecated` extension OR a `structuredefinition-standards-status`
+    // extension valued `deprecated/withdrawn`, emit a warning. Drives the IG
+    // `deprecated/deprecating-validate*` fixtures.
+    if let (Some(vs_url), Some(cd), Some(sys)) = (value_set_url, code, effective_system) {
+        if resp.result {
+            if let Ok(mut hits) = crate::traits::ValueSetOperations::search(
+                backend,
+                ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(vs_url.to_string()),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                if let Some(vs) = hits.pop() {
+                    let vs_version = vs.get("version").and_then(|v| v.as_str());
                     let vs_uri = match vs_version {
                         Some(v) => format!("{vs_url}|{v}"),
                         None => vs_url.to_string(),
                     };
-                    resp.issues.push(ValidationIssue {
-                        severity: "information".into(),
-                        fhir_code: "business-rule".into(),
-                        tx_code: "status-check".into(),
-                        text: format!("Reference to {status} ValueSet {vs_uri}"),
-                        expression: None,
-                        location: None,
-                        message_id: Some(status_message_id(&status).into()),
-                    });
+                    if let Some(includes) = vs
+                        .get("compose")
+                        .and_then(|c| c.get("include"))
+                        .and_then(|v| v.as_array())
+                    {
+                        'find_marker: for inc in includes {
+                            let inc_sys = inc.get("system").and_then(|s| s.as_str());
+                            if inc_sys != Some(sys) {
+                                continue;
+                            }
+                            let Some(concepts) =
+                                inc.get("concept").and_then(|c| c.as_array())
+                            else {
+                                continue;
+                            };
+                            for c in concepts {
+                                if c.get("code").and_then(|v| v.as_str()) != Some(cd) {
+                                    continue;
+                                }
+                                if !concept_marked_deprecated(c) {
+                                    continue;
+                                }
+                                let already = resp.issues.iter().any(|i| {
+                                    i.message_id.as_deref()
+                                        == Some("CONCEPT_DEPRECATED_IN_VALUESET")
+                                });
+                                if already {
+                                    break 'find_marker;
+                                }
+                                let text = format!(
+                                    "The presence of the concept '{cd}' in the system '{sys}' in the value set {vs_uri} is marked with a status of deprecated and its use should be reviewed"
+                                );
+                                let (loc_path, expr_path) = match request_path {
+                                    RequestPath::BareCode => {
+                                        ("code".to_string(), "code".to_string())
+                                    }
+                                    RequestPath::CodeableConcept => (
+                                        "CodeableConcept.coding[0].code".to_string(),
+                                        "CodeableConcept.coding[0].code".to_string(),
+                                    ),
+                                    _ => {
+                                        ("Coding.code".to_string(), "Coding.code".to_string())
+                                    }
+                                };
+                                resp.issues.push(ValidationIssue {
+                                    severity: "warning".into(),
+                                    fhir_code: "business-rule".into(),
+                                    tx_code: "code-comment".into(),
+                                    text,
+                                    expression: Some(expr_path),
+                                    location: Some(loc_path),
+                                    message_id: Some(
+                                        "CONCEPT_DEPRECATED_IN_VALUESET".into(),
+                                    ),
+                                });
+                                break 'find_marker;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -866,6 +1148,44 @@ async fn build_validate_response_async<B: TerminologyBackend>(
         unknown_system,
         request_path,
     )
+}
+
+/// Detect whether a `compose.include[].concept[]` JSON object is marked as
+/// deprecated via either the `valueset-deprecated` extension (valueCode "true")
+/// or a `structuredefinition-standards-status` extension valued
+/// `deprecated`/`withdrawn`. Drives the IG `deprecated/deprecating-validate*`
+/// fixtures' `CONCEPT_DEPRECATED_IN_VALUESET` warning emission.
+fn concept_marked_deprecated(concept: &Value) -> bool {
+    let Some(exts) = concept.get("extension").and_then(|e| e.as_array()) else {
+        return false;
+    };
+    for ext in exts {
+        let Some(url) = ext.get("url").and_then(|u| u.as_str()) else {
+            continue;
+        };
+        match url {
+            "http://hl7.org/fhir/StructureDefinition/valueset-deprecated" => {
+                let v = ext
+                    .get("valueCode")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| ext.get("valueBoolean").and_then(|v| v.as_str()));
+                let truthy = v.map(|s| s.eq_ignore_ascii_case("true")).unwrap_or(false)
+                    || ext.get("valueBoolean").and_then(|v| v.as_bool()) == Some(true);
+                if truthy {
+                    return true;
+                }
+            }
+            "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status" => {
+                if let Some(code) = ext.get("valueCode").and_then(|v| v.as_str()) {
+                    if matches!(code, "deprecated" | "withdrawn") {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Collect the standards-status codes (deprecated, withdrawn, draft, etc.)
@@ -1016,18 +1336,13 @@ async fn display_matches_supplement<B: TerminologyBackend>(
 /// Append a `used-supplement` parameter to a built validate-code response,
 /// once per applied supplement. The value is the supplement's canonical
 /// (`url|version` when available). Mutates `value` in place.
-fn append_used_supplements(value: &mut Value, supplements: &[SupplementInfo]) {
-    if supplements.is_empty() {
-        return;
-    }
-    if let Some(arr) = value.get_mut("parameter").and_then(|p| p.as_array_mut()) {
-        for info in supplements {
-            arr.push(json!({
-                "name": "used-supplement",
-                "valueCanonical": info.supplement_canonical,
-            }));
-        }
-    }
+///
+/// Note: the IG `parameters/parameters-validate-supplement-*` fixtures do
+/// NOT echo `used-supplement` on validate-code responses (only on $expand
+/// and $lookup). Currently a no-op so we don't pollute validate-code output
+/// with the parameter — kept callable so the call sites compile unchanged.
+fn append_used_supplements(_value: &mut Value, _supplements: &[SupplementInfo]) {
+    // intentionally empty — see doc comment
 }
 
 /// If `resp` reports `result=false` solely because of a display mismatch,
@@ -1406,7 +1721,8 @@ pub async fn validate_code_handler<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let params = extract_parameter_array(&body)?;
+    let mut params = extract_parameter_array(&body)?;
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
         process_validate_code(&state, params).await?,
         format,
@@ -1646,6 +1962,167 @@ async fn suppress_default_versionless_mismatch<B: TerminologyBackend>(
                 if let Some(d) = cs_resp.display {
                     resp.display = Some(d);
                 }
+            }
+        }
+    }
+}
+
+/// Transform the backend's `VALUESET_VALUE_MISMATCH` (and the warning-severity
+/// `VALUESET_VALUE_MISMATCH_DEFAULT`) into the IG-mandated
+/// `VALUESET_VALUE_MISMATCH_CHANGED` (severity=error) when:
+///
+/// 1. The VS include for `system_url` is versionless,
+/// 2. A `system-version` (DEFAULT) pin applied for that system, and
+/// 3. The caller supplied an explicit version that disagrees with the default.
+///
+/// The IG fixtures (`code-vbb-vsnn-default`, `coding-vbb-vsnn-default`,
+/// `codeableconcept-vbb-vsnn-default`) expect the response to reflect the
+/// default-applied version (`<default>`) on the top-level `version` echo, with
+/// the mismatch text reading "...version 'X' resulting from the version '<orig>'
+/// in the ValueSet include is different to the one in the value ('<orig>')"
+/// rather than the legacy "...for the versionless include..." form.
+///
+/// Mutates `resp` in-place. Does nothing when no mismatch issue is present
+/// (e.g. when the caller's version equals the default — the base
+/// `suppress_default_versionless_mismatch` helper already handles that case).
+async fn transform_default_versionless_mismatch_to_changed<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    resp: &mut crate::types::ValidateCodeResponse,
+    system_url: &str,
+    code: &str,
+    default_version: &str,
+    original_version: &str,
+    text_version: &str,
+) {
+    // Find any backend-emitted mismatch issue (error or warning variant).
+    let mismatch_idx = resp
+        .issues
+        .iter()
+        .position(|i| {
+            matches!(
+                i.message_id.as_deref(),
+                Some("VALUESET_VALUE_MISMATCH") | Some("VALUESET_VALUE_MISMATCH_DEFAULT")
+            )
+        });
+    let Some(idx) = mismatch_idx else {
+        return;
+    };
+    // Replace the issue with the IG-canonical CHANGED form. The text format:
+    //   "The code system '<sys>' version '<resolved_or_pattern>' resulting
+    //    from the version '<vs_include_version>' in the ValueSet include is
+    //    different to the one in the value ('<caller_version>')"
+    //
+    // - `text_version` is the resolved CS version for system-version=...|1.0.0
+    //   pins (matches the resolved row), and the wildcard pattern itself for
+    //   check-system-version=...|1.0.x pins (the pattern is preserved in the
+    //   IG fixtures' text even though the matched CS row is 1.0.0).
+    // - The "resulting from the version 'X' in the ValueSet include" piece
+    //   names the include's pinned version. The caller of this helper only
+    //   reaches this branch when the include is *versionless*, so X is `""`.
+    // - The trailing `('Y')` is the caller's actual version.
+    let new_text = format!(
+        "The code system '{system_url}' version '{text_version}' resulting from the version '' in the ValueSet include is different to the one in the value ('{original_version}')"
+    );
+    let original_loc = resp.issues[idx].location.clone();
+    let original_expr = resp.issues[idx].expression.clone();
+    resp.issues[idx] = crate::types::ValidationIssue {
+        severity: "error".into(),
+        fhir_code: "invalid".into(),
+        tx_code: "vs-invalid".into(),
+        text: new_text,
+        expression: original_expr,
+        location: original_loc,
+        message_id: Some("VALUESET_VALUE_MISMATCH_CHANGED".into()),
+    };
+    // The backend echoed the *latest* CS version on this failure path. The
+    // IG fixtures expect the default-applied version instead, so we override
+    // the response's cs_version + re-resolve the display at that version.
+    resp.cs_version = Some(default_version.to_string());
+    let cs_req = ValidateCodeRequest {
+        url: None,
+        value_set_version: None,
+        system: Some(system_url.to_string()),
+        code: code.to_string(),
+        version: Some(default_version.to_string()),
+        display: None,
+        date: None,
+        include_abstract: None,
+        input_form: None,
+        lenient_display_validation: None,
+        default_value_set_versions: std::collections::HashMap::new(),
+    };
+    if let Ok(cs_resp) = CodeSystemOperations::validate_code(backend, ctx, cs_req).await {
+        if cs_resp.result {
+            if let Some(d) = cs_resp.display {
+                resp.display = Some(d);
+            }
+        }
+    }
+    // Recompute the response message from the (possibly transformed) issue
+    // texts so the top-level `message` reflects the new wording.
+    let mut texts: Vec<&str> = resp
+        .issues
+        .iter()
+        .filter(|i| i.severity == "error")
+        .map(|i| i.text.as_str())
+        .collect();
+    texts.sort_unstable();
+    if !texts.is_empty() {
+        resp.message = Some(texts.join("; "));
+    }
+}
+
+/// Override the response's echoed `cs_version` (and re-resolve `display`) to
+/// the default-applied version when:
+///
+/// 1. A `system-version` (DEFAULT) pin applied for `system_url`,
+/// 2. The backend emitted `UNKNOWN_CODESYSTEM_VERSION` because the VS-include
+///    pinned a non-existent version, and
+/// 3. The default version exists in the stored CS rows.
+///
+/// The IG `code-vnn-vs1wb-default` / `coding-vnn-vs1wb-default` fixtures
+/// expect the response to echo the default-applied version (1.0.0) on the
+/// top-level `version` parameter rather than the latest stored CS version
+/// (1.2.0) — the default takes effect even though the include pin itself is
+/// invalid. Mutates `resp` in-place; no-op when no UNKNOWN issue is present
+/// or the existing echo already matches the default.
+async fn apply_default_to_unknown_version_echo<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    resp: &mut crate::types::ValidateCodeResponse,
+    system_url: &str,
+    code: &str,
+    default_version: &str,
+) {
+    let has_unknown = resp
+        .issues
+        .iter()
+        .any(|i| i.message_id.as_deref() == Some("UNKNOWN_CODESYSTEM_VERSION"));
+    if !has_unknown {
+        return;
+    }
+    if resp.cs_version.as_deref() == Some(default_version) {
+        return;
+    }
+    resp.cs_version = Some(default_version.to_string());
+    let cs_req = ValidateCodeRequest {
+        url: None,
+        value_set_version: None,
+        system: Some(system_url.to_string()),
+        code: code.to_string(),
+        version: Some(default_version.to_string()),
+        display: None,
+        date: None,
+        include_abstract: None,
+        input_form: None,
+        lenient_display_validation: None,
+        default_value_set_versions: std::collections::HashMap::new(),
+    };
+    if let Ok(cs_resp) = CodeSystemOperations::validate_code(backend, ctx, cs_req).await {
+        if cs_resp.result {
+            if let Some(d) = cs_resp.display {
+                resp.display = Some(d);
             }
         }
     }
@@ -2324,6 +2801,75 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .await;
             }
         }
+        // When the caller DID supply a version AND a system-version default
+        // is in effect AND the VS include for this system is versionless,
+        // the backend's MISMATCH_DEFAULT (warning) needs to be transformed
+        // into VALUESET_VALUE_MISMATCH_CHANGED (error) — see
+        // `transform_default_versionless_mismatch_to_changed` for rationale.
+        // Skip when the caller's version satisfies the default pattern (e.g.
+        // check-system-version=1.0.x and the caller passed 1.0.0): there's
+        // no actual mismatch to report.
+        if let Some(sys) = system.as_deref() {
+            if let (Some(orig), Some(default_pat)) = (
+                original_version.as_deref(),
+                find_pin_for_system(&effective_defaults, sys),
+            ) {
+                let vs_versionless = source_vs
+                    .as_ref()
+                    .and_then(|vs| vs_include_pin_for_system(vs, sys))
+                    .map(|opt| opt.is_none())
+                    .unwrap_or(false);
+                let no_force = find_pin_for_system(&force_pins, sys).is_none();
+                let satisfies = if default_pat.contains(".x") || default_pat == "x" {
+                    version_satisfies_wildcard(orig, default_pat)
+                } else {
+                    orig == default_pat
+                };
+                if vs_versionless && no_force && !satisfies {
+                    let resolved_default =
+                        resolve_cs_version_pattern(state.backend(), &ctx, sys, default_pat)
+                            .await
+                            .unwrap_or_else(|| default_pat.to_string());
+                    transform_default_versionless_mismatch_to_changed(
+                        state.backend(),
+                        &ctx,
+                        &mut resp,
+                        sys,
+                        &code,
+                        &resolved_default,
+                        orig,
+                        default_pat,
+                    )
+                    .await;
+                }
+            }
+        }
+        // When the caller supplied no version AND a system-version default is
+        // in effect AND the backend emitted UNKNOWN_CODESYSTEM_VERSION (because
+        // the VS-include pinned a non-existent version), override the echoed
+        // CS version with the default so the response reflects the
+        // default-applied semantics rather than the latest stored CS version.
+        if let Some(sys) = system.as_deref() {
+            if original_version.is_none()
+                && find_pin_for_system(&force_pins, sys).is_none()
+            {
+                if let Some(default_pat) = find_pin_for_system(&effective_defaults, sys) {
+                    let resolved_default =
+                        resolve_cs_version_pattern(state.backend(), &ctx, sys, default_pat)
+                            .await
+                            .unwrap_or_else(|| default_pat.to_string());
+                    apply_default_to_unknown_version_echo(
+                        state.backend(),
+                        &ctx,
+                        &mut resp,
+                        sys,
+                        &code,
+                        &resolved_default,
+                    )
+                    .await;
+                }
+            }
+        }
         if let Some(sys) = system.as_deref() {
             rescue_via_supplements(
                 state.backend(),
@@ -2431,7 +2977,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                             tx_code: "not-in-vs".into(),
                             text: not_in_vs_text,
                             expression: Some("Coding.code".into()),
-                            location: None,
+                            location: Some("Coding.code".into()),
                             message_id: Some(
                                 "None_of_the_provided_codes_are_in_the_value_set_one".into(),
                             ),
@@ -2442,7 +2988,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                             tx_code: "invalid-data".into(),
                             text: no_system_text,
                             expression: Some("Coding".into()),
-                            location: None,
+                            location: Some("Coding".into()),
                             message_id: Some("Coding_has_no_system__cannot_validate".into()),
                         },
                     ],
@@ -2530,6 +3076,62 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     &system,
                     &code,
                     default_v,
+                )
+                .await;
+            }
+        }
+        // Caller-supplied version + default-pin + versionless include →
+        // transform backend mismatch into VALUESET_VALUE_MISMATCH_CHANGED.
+        if let (Some(orig), Some(default_pat)) = (
+            original_version.as_deref(),
+            find_pin_for_system(&effective_defaults, &system),
+        ) {
+            let vs_versionless = source_vs
+                .as_ref()
+                .and_then(|vs| vs_include_pin_for_system(vs, &system))
+                .map(|opt| opt.is_none())
+                .unwrap_or(false);
+            let no_force = find_pin_for_system(&force_pins, &system).is_none();
+            let satisfies = if default_pat.contains(".x") || default_pat == "x" {
+                version_satisfies_wildcard(orig, default_pat)
+            } else {
+                orig == default_pat
+            };
+            if vs_versionless && no_force && !satisfies {
+                let resolved_default =
+                    resolve_cs_version_pattern(state.backend(), &ctx, &system, default_pat)
+                        .await
+                        .unwrap_or_else(|| default_pat.to_string());
+                transform_default_versionless_mismatch_to_changed(
+                    state.backend(),
+                    &ctx,
+                    &mut resp,
+                    &system,
+                    &code,
+                    &resolved_default,
+                    orig,
+                    default_pat,
+                )
+                .await;
+            }
+        }
+        // No caller version + default-pin + UNKNOWN_CODESYSTEM_VERSION →
+        // override echoed version with default.
+        if original_version.is_none()
+            && find_pin_for_system(&force_pins, &system).is_none()
+        {
+            if let Some(default_pat) = find_pin_for_system(&effective_defaults, &system) {
+                let resolved_default =
+                    resolve_cs_version_pattern(state.backend(), &ctx, &system, default_pat)
+                        .await
+                        .unwrap_or_else(|| default_pat.to_string());
+                apply_default_to_unknown_version_echo(
+                    state.backend(),
+                    &ctx,
+                    &mut resp,
+                    &system,
+                    &code,
+                    &resolved_default,
                 )
                 .await;
             }
@@ -2695,6 +3297,68 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                         &system,
                         &code,
                         default_v,
+                    )
+                    .await;
+                }
+            }
+            // Per-coding caller-supplied version + default-pin + versionless
+            // include → transform mismatch into VALUESET_VALUE_MISMATCH_CHANGED.
+            if let (Some(orig), Some(default_pat)) = (
+                original_version.as_deref(),
+                find_pin_for_system(&effective_defaults, &system),
+            ) {
+                let vs_versionless = source_vs
+                    .as_ref()
+                    .and_then(|vs| vs_include_pin_for_system(vs, &system))
+                    .map(|opt| opt.is_none())
+                    .unwrap_or(false);
+                let no_force = find_pin_for_system(&force_pins, &system).is_none();
+                let satisfies = if default_pat.contains(".x") || default_pat == "x" {
+                    version_satisfies_wildcard(orig, default_pat)
+                } else {
+                    orig == default_pat
+                };
+                if vs_versionless && no_force && !satisfies {
+                    let resolved_default =
+                        resolve_cs_version_pattern(state.backend(), &ctx, &system, default_pat)
+                            .await
+                            .unwrap_or_else(|| default_pat.to_string());
+                    transform_default_versionless_mismatch_to_changed(
+                        state.backend(),
+                        &ctx,
+                        &mut resp,
+                        &system,
+                        &code,
+                        &resolved_default,
+                        orig,
+                        default_pat,
+                    )
+                    .await;
+                }
+            }
+            // No caller version + default-pin + UNKNOWN_CODESYSTEM_VERSION →
+            // override echoed version with default.
+            if original_version.is_none()
+                && find_pin_for_system(&force_pins, &system).is_none()
+            {
+                if let Some(default_pat) =
+                    find_pin_for_system(&effective_defaults, &system)
+                {
+                    let resolved_default = resolve_cs_version_pattern(
+                        state.backend(),
+                        &ctx,
+                        &system,
+                        default_pat,
+                    )
+                    .await
+                    .unwrap_or_else(|| default_pat.to_string());
+                    apply_default_to_unknown_version_echo(
+                        state.backend(),
+                        &ctx,
+                        &mut resp,
+                        &system,
+                        &code,
+                        &resolved_default,
                     )
                     .await;
                 }
@@ -2900,16 +3564,42 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 // IG fixture (validation/simple-codeableconcept-bad-system),
                 // text quotes the CS URL with single-quotes. Location goes
                 // on .system, expression too.
+                //
+                // When the coding carries a `version` for the unknown system,
+                // the IG `simple-codeableconcept-bad-version2` fixture expects
+                // the version-aware variant `UNKNOWN_CODESYSTEM_VERSION_NONE`
+                // with text "...version 'X' could not be found ... No versions
+                // of this code system are known". The `_NONE` suffix marks the
+                // case where the system itself is unknown (zero stored
+                // versions), distinguishing it from `UNKNOWN_CODESYSTEM_VERSION`
+                // (the system exists but the requested version doesn't).
+                let coding_version = coding_versions
+                    .get(&(system.clone(), code.clone()))
+                    .cloned();
+                let (text, message_id) = match coding_version.as_deref() {
+                    Some(v) => (
+                        format!(
+                            "A definition for CodeSystem '{system}' version '{v}' could not be found, \
+                             so the code cannot be validated. No versions of this code system are known"
+                        ),
+                        "UNKNOWN_CODESYSTEM_VERSION_NONE",
+                    ),
+                    None => (
+                        format!(
+                            "A definition for CodeSystem '{system}' could not be found, so the code cannot be validated"
+                        ),
+                        "UNKNOWN_CODESYSTEM",
+                    ),
+                };
+                let loc = format!("CodeableConcept.coding[{idx}].system");
                 issues.push(ValidationIssue {
                     severity: "error".into(),
                     fhir_code: "not-found".into(),
                     tx_code: "not-found".into(),
-                    text: format!(
-                        "A definition for CodeSystem '{system}' could not be found, so the code cannot be validated"
-                    ),
-                    expression: Some(format!("CodeableConcept.coding[{idx}].system")),
-                    location: None,
-                    message_id: Some("UNKNOWN_CODESYSTEM".into()),
+                    text,
+                    expression: Some(loc.clone()),
+                    location: Some(loc),
+                    message_id: Some(message_id.into()),
                 });
                 // Track first unknown CS for the `x-unknown-system` param.
                 if single_unknown_system.is_none() {
@@ -2920,9 +3610,25 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             // Per-coding "this code wasn't in VS" issue. The IG fixtures expect
             // severity=information and tx_code=this-code-not-in-vs.
             let display = coding_displays.get(&(system.clone(), code.clone()));
-            let qualified = match display {
-                Some(d) => format!("{system}#{code} ('{d}')"),
-                None => format!("{system}#{code}"),
+            // Include the coding's version (when present) in the qualified
+            // form, per the IG `simple-codeableconcept-bad-version2` fixture
+            // which expects `system|version#code` for codings that carry an
+            // explicit version. Versionless codings still use `system#code`.
+            let coding_version_for_qual = coding_versions.get(&(system.clone(), code.clone()));
+            let qualified = match (coding_version_for_qual, display) {
+                (Some(v), Some(d)) => format!("{system}|{v}#{code} ('{d}')"),
+                (Some(v), None) => format!("{system}|{v}#{code}"),
+                (None, Some(d)) => format!("{system}#{code} ('{d}')"),
+                (None, None) => format!("{system}#{code}"),
+            };
+            // For unknown systems, expression also goes to a location[] entry
+            // (matches IG `simple-codeableconcept-bad-version2` which has both
+            // location and expression on the not-in-vs issue).
+            let coding_loc = format!("CodeableConcept.coding[{idx}].code");
+            let location_for_issue = if !cs_exists {
+                Some(coding_loc.clone())
+            } else {
+                None
             };
             issues.push(ValidationIssue {
                 severity: "information".into(),
@@ -2931,8 +3637,8 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 text: format!(
                     "The provided code '{qualified}' was not found in the value set '{url_with_version}'"
                 ),
-                expression: Some(format!("CodeableConcept.coding[{idx}].code")),
-                location: None,
+                expression: Some(coding_loc),
+                location: location_for_issue,
                 message_id: Some(
                     "None_of_the_provided_codes_are_in_the_value_set_one".into(),
                 ),
@@ -2992,7 +3698,8 @@ pub async fn vs_validate_code_handler<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let params = extract_parameter_array(&body)?;
+    let mut params = extract_parameter_array(&body)?;
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
         process_vs_validate_code(&state, params).await?,
         format,

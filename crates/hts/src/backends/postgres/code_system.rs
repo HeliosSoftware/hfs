@@ -360,12 +360,11 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             let flags = out.entry(code).or_default();
             match property.as_str() {
                 "notSelectable" if value == "true" => flags.is_abstract = true,
-                "status"
-                    if matches!(
-                        value.as_str(),
-                        "retired" | "deprecated" | "withdrawn" | "inactive"
-                    ) =>
-                {
+                // `deprecated` is intentionally excluded: per the FHIR
+                // concept-properties IG, deprecated codes are discouraged but
+                // still active (act-class expansion fixtures rely on this —
+                // deprecated codes survive `activeOnly=true` filtering).
+                "status" if matches!(value.as_str(), "retired" | "inactive") => {
                     flags.inactive = true;
                 }
                 _ => {}
