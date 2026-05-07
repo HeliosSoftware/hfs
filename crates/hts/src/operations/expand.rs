@@ -372,6 +372,14 @@ fn populate_properties<'a, B: TerminologyBackend>(
                 .push(c.code.clone());
         }
         let mut map: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+        // `prop_types_by_system` holds the (property_code → FHIR type) mapping
+        // declared on each contributing CodeSystem (and any supplements that
+        // share its URL). We consult it when serialising the property values
+        // so that e.g. a CS-declared `prop1: type=string` surfaces as
+        // `valueString` rather than the default `valueCode`. Drives the
+        // `parameters/parameters-expand-supplement-good` fixture's `prop1`
+        // entry which the IG pins as a `valueString`.
+        let mut prop_types_by_system: HashMap<String, HashMap<String, String>> = HashMap::new();
         for (system, codes) in &by_system {
             if let Ok(props) = backend
                 .concept_property_values(ctx, system, codes, properties)
@@ -381,9 +389,44 @@ fn populate_properties<'a, B: TerminologyBackend>(
                     map.insert(((*system).to_string(), code), list);
                 }
             }
+            // Look up the CodeSystem (and any matching supplements that
+            // re-declare property[]) to harvest property-type declarations.
+            // Best effort — when the search fails or returns nothing we just
+            // fall back to the conservative `Code` default below.
+            if let Ok(hits) = crate::traits::CodeSystemOperations::search(
+                backend,
+                ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some((*system).to_string()),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                let mut type_map: HashMap<String, String> = HashMap::new();
+                for cs in &hits {
+                    if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
+                        for entry in props {
+                            if let (Some(code), Some(ty)) = (
+                                entry.get("code").and_then(|v| v.as_str()),
+                                entry.get("type").and_then(|v| v.as_str()),
+                            ) {
+                                type_map
+                                    .entry(code.to_string())
+                                    .or_insert_with(|| ty.to_string());
+                            }
+                        }
+                    }
+                }
+                if !type_map.is_empty() {
+                    prop_types_by_system.insert((*system).to_string(), type_map);
+                }
+            }
         }
         for c in contains.iter_mut() {
             if let Some(list) = map.remove(&(c.system.clone(), c.code.clone())) {
+                let cs_types = prop_types_by_system.get(&c.system);
                 c.properties = list
                     .into_iter()
                     .filter(|(code, value)| {
@@ -399,15 +442,18 @@ fn populate_properties<'a, B: TerminologyBackend>(
                     })
                     .map(|(code, value)| {
                         // Pick the FHIR `value[x]` shape from the property
-                        // code: `definition` is always a string per FHIR
-                        // (it's the synthesised CS column); everything else
-                        // we treat as a Code primitive — concept property
-                        // values are most commonly Code and tests have not
-                        // flagged false positives for the simple case.
-                        let value_type = if code == "definition" {
-                            "string".to_string()
-                        } else {
-                            "Code".to_string()
+                        // code:
+                        //   - When the CS / supplement declares the property
+                        //     with an explicit `type`, honour that.
+                        //   - `definition` is always a string per FHIR (it's
+                        //     the synthesised CS column).
+                        //   - Everything else defaults to `Code` — concept
+                        //     property values are most commonly Code and
+                        //     tests have not flagged false positives.
+                        let value_type = match cs_types.and_then(|m| m.get(&code)) {
+                            Some(ty) => fhir_property_type_to_value_type(ty),
+                            None if code == "definition" => "string".to_string(),
+                            None => "Code".to_string(),
                         };
                         ExpansionContainsProperty {
                             code,
@@ -422,6 +468,23 @@ fn populate_properties<'a, B: TerminologyBackend>(
             }
         }
     })
+}
+
+/// Translate a FHIR `CodeSystem.property[].type` value (one of `code`,
+/// `Coding`, `string`, `integer`, `boolean`, `dateTime`, `decimal`) into the
+/// internal value-type label used by [`crate::types::ExpansionContainsProperty`]
+/// for serialization. The labels mirror the FHIR `value[x]` field suffix.
+fn fhir_property_type_to_value_type(fhir_type: &str) -> String {
+    match fhir_type {
+        "boolean" | "Boolean" => "Boolean".to_string(),
+        "integer" | "Integer" => "Integer".to_string(),
+        "decimal" | "Decimal" => "Decimal".to_string(),
+        "dateTime" | "DateTime" => "DateTime".to_string(),
+        "code" | "Code" => "Code".to_string(),
+        // string, Coding, and any unrecognised type fall back to a string
+        // serialization so the FHIR `valueString` field carries the value.
+        _ => "string".to_string(),
+    }
 }
 
 /// Parsed `displayLanguage` request parameter.
@@ -2700,6 +2763,12 @@ async fn process_expand<B: TerminologyBackend>(
             // `overload/overload-expand-all-merged` and `expand-exclude-merged`
             // fixtures DEDUPLICATE codes that surface across multiple versions
             // — keep the first occurrence (latest, thanks to the sort above).
+            //
+            // The reverse setting `versionsMatch=false` (IG
+            // `overload/overload-expand-all-versioned`) MUST NOT dedupe — it
+            // explicitly opts in to keeping every (system, version, code)
+            // tuple.  Only treat `merged` as true when both the name AND the
+            // value pair are present and value is the literal string `true`.
             let merged = source_vs
                 .as_ref()
                 .and_then(|vs| vs.get("compose"))
@@ -2707,17 +2776,39 @@ async fn process_expand<B: TerminologyBackend>(
                 .and_then(|e| e.as_array())
                 .map(|exts| {
                     exts.iter().any(|ext| {
-                        ext.get("url").and_then(|u| u.as_str())
-                            == Some(
+                        if ext.get("url").and_then(|u| u.as_str())
+                            != Some(
                                 "http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter",
                             )
-                            && ext.get("extension").and_then(|e| e.as_array()).is_some_and(|inner| {
-                                inner.iter().any(|sub| {
-                                    sub.get("url").and_then(|u| u.as_str()) == Some("name")
-                                        && sub.get("valueCode").and_then(|v| v.as_str())
-                                            == Some("versionsMatch")
-                                })
-                            })
+                        {
+                            return false;
+                        }
+                        let inner = match ext.get("extension").and_then(|e| e.as_array()) {
+                            Some(a) => a,
+                            None => return false,
+                        };
+                        let mut name_is_versions_match = false;
+                        let mut value_is_true = false;
+                        for sub in inner {
+                            match sub.get("url").and_then(|u| u.as_str()) {
+                                Some("name") => {
+                                    if sub.get("valueCode").and_then(|v| v.as_str())
+                                        == Some("versionsMatch")
+                                    {
+                                        name_is_versions_match = true;
+                                    }
+                                }
+                                Some("value") => {
+                                    if sub.get("valueString").and_then(|v| v.as_str())
+                                        == Some("true")
+                                    {
+                                        value_is_true = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        name_is_versions_match && value_is_true
                     })
                 })
                 .unwrap_or(false);
