@@ -1865,10 +1865,13 @@ pub async fn expand_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     inject_accept_language(&headers, &mut params);
-    Ok(expand_bytes_respond(
-        process_expand(&state, params).await?,
-        format,
-    ))
+    match process_expand(&state, params).await {
+        Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
+        Err(e) => match cyclic_reference_response(&e) {
+            Some(resp) => Ok(resp),
+            None => Err(e),
+        },
+    }
 }
 
 /// `GET /ValueSet/$expand?url=<url>`
@@ -1886,10 +1889,50 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let mut params = query_params_to_fhir_params(pairs);
     inject_accept_language(&headers, &mut params);
-    Ok(expand_bytes_respond(
-        process_expand(&state, params).await?,
-        format,
-    ))
+    match process_expand(&state, params).await {
+        Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
+        Err(e) => match cyclic_reference_response(&e) {
+            Some(resp) => Ok(resp),
+            None => Err(e),
+        },
+    }
+}
+
+/// If `err` is a `VsInvalid` produced by the cyclic-reference detector in the
+/// SQLite backend (`expand_vs_reference`), build the FHIR-IG-compliant
+/// OperationOutcome that the `big/expand-circle` test fixture expects:
+/// status 422, issue.code=`processing`, tx-issue-type=`vs-invalid`, plus a
+/// `VALUESET_CIRCULAR_REFERENCE` `operationoutcome-message-id` extension.
+/// Returns `None` when the error is not a cycle so the caller falls through
+/// to the generic [`HtsError`] [`IntoResponse`] path.
+fn cyclic_reference_response(err: &HtsError) -> Option<Response> {
+    use axum::response::IntoResponse;
+    let HtsError::VsInvalid(msg) = err else {
+        return None;
+    };
+    if !msg.starts_with("Cyclic reference detected when excluding ") {
+        return None;
+    }
+    let body = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                "valueString": "VALUESET_CIRCULAR_REFERENCE"
+            }],
+            "severity": "error",
+            "code": "processing",
+            "details": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                    "code": "vs-invalid"
+                }],
+                "text": msg
+            },
+            "diagnostics": msg
+        }]
+    });
+    Some((StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response())
 }
 
 /// If the request carried an `Accept-Language` header and the params don't

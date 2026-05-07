@@ -1921,6 +1921,16 @@ struct InlineResolutionContext<'a> {
     contained: Vec<&'a serde_json::Value>,
     tx_resources: Vec<&'a serde_json::Value>,
     visited: std::collections::BTreeSet<String>,
+    /// State carried while resolving an `exclude.valueSet[]` reference.
+    /// `Some((origin, chain))` once an exclude resolution has started:
+    /// `origin` is the URL the caller asked to exclude (target of the
+    /// outermost `exclude.valueSet[]` ref) and `chain` records the
+    /// in-order list of URLs traversed since then.  When a cycle is
+    /// detected anywhere inside this resolution we surface the failure
+    /// as a `VsInvalid` error matching the FHIR IG `big/expand-circle`
+    /// `VALUESET_CIRCULAR_REFERENCE` outcome instead of swallowing it
+    /// as a warning.  `None` outside any exclude path.
+    exclude_chain: Option<(String, Vec<String>)>,
 }
 
 impl<'a> InlineResolutionContext<'a> {
@@ -1942,6 +1952,7 @@ impl<'a> InlineResolutionContext<'a> {
             contained,
             tx_resources: tx_refs,
             visited: std::collections::BTreeSet::new(),
+            exclude_chain: None,
         }
     }
 
@@ -2022,6 +2033,30 @@ fn expand_vs_reference(
     ctx: &InlineResolutionContext<'_>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     if ctx.visited.contains(ref_url) {
+        // When the cycle is detected while resolving an `exclude.valueSet[]`
+        // reference, the FHIR IG `big/expand-circle` outcome fixture expects a
+        // hard 4xx error (issue.code=processing, message-id
+        // VALUESET_CIRCULAR_REFERENCE) rather than a silent warning. Honour
+        // that contract here and surface a typed error with the chain that
+        // led to the cycle so the operations layer can include it in the
+        // OperationOutcome diagnostics.
+        if let Some((origin, chain)) = ctx.exclude_chain.as_ref() {
+            // Build the chain string: the URLs traversed since the exclude
+            // resolution started, plus the current ref_url that closed the
+            // loop.  Format mirrors the FHIR IG `big/expand-circle` outcome:
+            // "Cyclic reference detected when excluding <origin> via [a, b]".
+            let mut full_chain: Vec<String> = chain.clone();
+            full_chain.push(ref_url.to_owned());
+            let chain_str = full_chain.join(", ");
+            // Use VsInvalid as the carrier error; the operations layer
+            // recognises the "Cyclic reference detected when excluding"
+            // prefix and rebuilds the OperationOutcome with the
+            // FHIR-spec-compliant issue code (`processing`) and the
+            // VALUESET_CIRCULAR_REFERENCE message-id extension.
+            return Err(HtsError::VsInvalid(format!(
+                "Cyclic reference detected when excluding {origin} via [{chain_str}]"
+            )));
+        }
         warnings.push(format!(
             "Cyclic ValueSet reference detected for {ref_url}; excluded from expansion (vs-invalid)"
         ));
@@ -2030,6 +2065,11 @@ fn expand_vs_reference(
 
     let mut child_ctx = ctx.clone();
     child_ctx.visited.insert(ref_url.to_owned());
+    // Extend the exclude chain (if any) so a downstream cycle detected during
+    // a deeper recursion can report the full path it traversed.
+    if let Some((_, chain)) = child_ctx.exclude_chain.as_mut() {
+        chain.push(ref_url.to_owned());
+    }
 
     if let Some(compose_str) = ctx.lookup_compose(ref_url) {
         return compute_expansion_depth_inner(
@@ -2460,7 +2500,16 @@ fn build_exclude_set(
                     Some(u) => u,
                     None => continue,
                 };
-                let resolved = expand_vs_reference(conn, ref_url, warnings, depth, ctx)?;
+                // Start (or extend) the exclude_chain so cycles detected
+                // during this resolution become hard errors with the path
+                // that led to them. `origin` is the URL we're trying to
+                // exclude (the caller's `exclude.valueSet[]` value); the
+                // chain accumulates as we recurse through nested refs.
+                let mut excl_ctx = ctx.clone();
+                if excl_ctx.exclude_chain.is_none() {
+                    excl_ctx.exclude_chain = Some((ref_url.to_owned(), Vec::new()));
+                }
+                let resolved = expand_vs_reference(conn, ref_url, warnings, depth, &excl_ctx)?;
                 let mut set = HashSet::new();
                 for c in resolved {
                     set.insert((c.system, c.code));

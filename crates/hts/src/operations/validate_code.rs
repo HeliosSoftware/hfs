@@ -263,6 +263,39 @@ fn build_validate_response(
     })
 }
 
+/// Look up the `status` property of a concept (e.g. `retired`, `deprecated`,
+/// `withdrawn`, `inactive`). Returns `None` when the concept has no status
+/// property, when the property value is `active` or `inactive` (the generic
+/// status), or when the lookup fails. Used to drive the second
+/// "has a status of <X>" warning for non-`inactive` inactive concepts.
+async fn lookup_concept_status<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system: &str,
+    code: &str,
+) -> Option<String> {
+    let req = crate::types::LookupRequest {
+        system: system.to_string(),
+        code: code.to_string(),
+        version: None,
+        display_language: None,
+        expression: None,
+        properties: vec!["status".to_string()],
+        date: None,
+        use_supplements: vec![],
+    };
+    let resp = CodeSystemOperations::lookup(backend, ctx, req).await.ok()?;
+    for prop in resp.properties {
+        if prop.code == "status" {
+            let status = prop.value;
+            if status != "active" && status != "inactive" && !status.is_empty() {
+                return Some(status);
+            }
+        }
+    }
+    None
+}
+
 /// Build a validate-code response and resolve the system's version via a
 /// backend lookup (so the response can echo `version` per the IG fixtures).
 ///
@@ -283,6 +316,47 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     request_path: RequestPath,
     value_set_url: Option<&str>,
 ) -> Value {
+    // For inactive concepts whose underlying status is more specific than
+    // "inactive" (e.g. `retired`, `deprecated`, `withdrawn`), the IG
+    // `inactive/validate-inactive-3*` fixtures expect TWO warning issues:
+    // one with text "...has a status of inactive..." (the canonical wording
+    // already emitted by the backend) AND a second with text using the
+    // specific status code (e.g. "...has a status of retired..."). Detect
+    // that case here by looking up the concept's `status` property and
+    // appending a second issue when needed.
+    if resp.inactive == Some(true) {
+        let inferred_system = resp.system.clone();
+        let lookup_system: Option<&str> = system.or(inferred_system.as_deref());
+        if let (Some(sys), Some(cd)) = (lookup_system, code) {
+            if let Some(specific_status) = lookup_concept_status(backend, ctx, sys, cd).await {
+                let already_has_specific = resp.issues.iter().any(|i| {
+                    i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
+                        && i.text
+                            .contains(&format!("has a status of {specific_status} and"))
+                });
+                if !already_has_specific {
+                    let inactive_issue = resp.issues.iter().find(|i| {
+                        i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
+                            && i.text.contains("has a status of inactive")
+                    });
+                    if let Some(template) = inactive_issue.cloned() {
+                        let new_text = format!(
+                            "The concept '{cd}' has a status of {specific_status} and its use should be reviewed"
+                        );
+                        resp.issues.push(ValidationIssue {
+                            severity: template.severity,
+                            fhir_code: template.fhir_code,
+                            tx_code: template.tx_code,
+                            text: new_text,
+                            expression: template.expression,
+                            location: template.location,
+                            message_id: template.message_id,
+                        });
+                    }
+                }
+            }
+        }
+    }
     // Prefer the system the caller passed; otherwise fall back to whatever
     // the backend inferred from the VS expansion (e.g. inferSystem=true).
     let inferred_system = resp.system.clone();
