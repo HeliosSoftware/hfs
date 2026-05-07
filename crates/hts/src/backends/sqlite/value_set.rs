@@ -2904,6 +2904,37 @@ fn expand_single_include_local(
                 (id, ver)
             }
             None => {
+                // Distinguish two flavours of "not resolved":
+                //   (a) the system URL itself isn't present in any
+                //       CodeSystem row → silent warning + empty contribution
+                //       (preserves the IG `*-not-found` fixtures).
+                //   (b) the system exists, but the include's pinned version
+                //       didn't match any stored CS version → bubble up as
+                //       UNKNOWN_CODESYSTEM_VERSION_EXP per IG
+                //       `version/vs-expand-v-wb` family.
+                if let Some(inc_ver) = inc_version {
+                    let any_row: bool = conn
+                        .query_row(
+                            "SELECT 1 FROM code_systems WHERE url = ?1 LIMIT 1",
+                            [system_url],
+                            |_| Ok(true),
+                        )
+                        .optional()
+                        .unwrap_or(None)
+                        .unwrap_or(false);
+                    if any_row {
+                        let all_versions = cs_all_stored_versions(conn, system_url);
+                        let valid_str = format_valid_versions_msg(&all_versions);
+                        let text = format!(
+                            "A definition for CodeSystem '{system_url}' version '{inc_ver}' \
+                             could not be found, so the value set cannot be expanded. \
+                             Valid versions: {valid_str}"
+                        );
+                        return Err(HtsError::NotFound(format!(
+                            "__UNKNOWN_CS_VERSION_EXP__:{text}"
+                        )));
+                    }
+                }
                 let msg = format!(
                     "CodeSystem {system_url} was not found and has been excluded from the expansion"
                 );
@@ -5237,8 +5268,15 @@ fn resolve_compose_system_id(
         return Ok(None);
     }
 
+    // Match exactly the same rules as `resolve_ver_against_candidates`
+    // (single-integer "1"/"2" => EXACT, dotted "1.0"/"1.0.0" => prefix/wildcard,
+    // ".x"/"x" => wildcard) so the expand path agrees with $validate-code on
+    // what counts as an unknown version. Otherwise an include pin like
+    // `"version": "1"` would silently expand against `1.2.0`, masking the
+    // UNKNOWN_CODESYSTEM_VERSION_EXP that the IG `version/vs-expand-v-wb`
+    // family expects.
     let chosen = match version {
-        Some(v) if v.contains(".x") || v == "x" || super::code_system_version_is_short(v) => {
+        Some(v) if v.contains(".x") || v == "x" || v.contains('.') => {
             super::code_system_select_version_match(&rows, v)
         }
         Some(v) => rows.into_iter().find(|(_, ver)| ver.as_deref() == Some(v)),

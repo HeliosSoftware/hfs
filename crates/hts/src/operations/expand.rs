@@ -2098,12 +2098,16 @@ async fn process_expand<B: TerminologyBackend>(
     // Normalise version-override params to `valueUri` regardless of whether
     // the request supplied them as `valueCanonical`/`valueUrl`/etc.  The IG
     // `version/parameters-*-version` and `valueset-version/expand-indirect-*-pinned`
-    // fixtures echo them as `valueUri`.
+    // fixtures echo them as `valueUri`.  `check-system-version` follows the
+    // same shape (echoed as `valueUri` per `version/vs-expand-v-n-check`).
     for ep in emitted_params.iter_mut() {
         let name = ep.get("name").and_then(|v| v.as_str()).unwrap_or("");
         if !matches!(
             name,
-            "system-version" | "force-system-version" | "default-valueset-version"
+            "system-version"
+                | "force-system-version"
+                | "check-system-version"
+                | "default-valueset-version"
         ) {
             continue;
         }
@@ -2509,6 +2513,21 @@ async fn process_expand<B: TerminologyBackend>(
                         && !excs.is_empty()
                         && incs.iter().any(|i| !excs.contains(i))
                     {
+                        out.insert(sys.clone());
+                    }
+                    // `force-system-version` collapses multi-version include
+                    // pins to a single forced version — every contains item
+                    // for the system surfaces with the forced version.  When
+                    // the source VS pinned MULTIPLE distinct versions for
+                    // the system, the IG `vs-expand-v-mixed-force` fixture
+                    // expects the (forced) `version` retained on every
+                    // contains item even though the post-force expansion is
+                    // technically single-version. Mark the system pinned so
+                    // `clear_single_version` doesn't strip it.
+                    let distinct_inc_versions: std::collections::HashSet<&str> =
+                        incs.iter().map(|s| s.as_str()).collect();
+                    let force_active = force_system_versions.contains_key(sys);
+                    if distinct_inc_versions.len() >= 2 && force_active {
                         out.insert(sys.clone());
                     }
                 }
@@ -3236,6 +3255,9 @@ pub async fn expand_handler<B: TerminologyBackend>(
             if let Some(resp) = version_check_response(&e) {
                 return Ok(resp);
             }
+            if let Some(resp) = unknown_cs_version_exp_response(&e) {
+                return Ok(resp);
+            }
             match cyclic_reference_response(&e) {
                 Some(resp) => Ok(resp),
                 None => Err(e),
@@ -3264,6 +3286,9 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
             if let Some(resp) = version_check_response(&e) {
+                return Ok(resp);
+            }
+            if let Some(resp) = unknown_cs_version_exp_response(&e) {
                 return Ok(resp);
             }
             match cyclic_reference_response(&e) {
@@ -3337,6 +3362,44 @@ fn version_check_response(err: &HtsError) -> Option<Response> {
                 "coding": [{
                     "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
                     "code": "version-error"
+                }],
+                "text": text,
+            },
+        }]
+    });
+    Some((StatusCode::BAD_REQUEST, Json(body)).into_response())
+}
+
+/// Sentinel marker prepended to a [`HtsError::NotFound`] when an $expand
+/// operation hits a `compose.include[]` whose `system + version` pin doesn't
+/// resolve to any stored CodeSystem version. Picked up by
+/// [`unknown_cs_version_exp_response`] to format the IG-spec OperationOutcome
+/// (status 400, `code=not-found`, `tx-issue-type=not-found`,
+/// `UNKNOWN_CODESYSTEM_VERSION_EXP` message-id).
+const UNKNOWN_CS_VERSION_EXP_PREFIX: &str = "__UNKNOWN_CS_VERSION_EXP__:";
+
+/// If `err` is the sentinel error from the SQLite include-resolver, render the
+/// `UNKNOWN_CODESYSTEM_VERSION_EXP` OperationOutcome shape that the IG
+/// `version/vs-expand-v-wb` family expects.
+fn unknown_cs_version_exp_response(err: &HtsError) -> Option<Response> {
+    use axum::response::IntoResponse;
+    let HtsError::NotFound(msg) = err else {
+        return None;
+    };
+    let text = msg.strip_prefix(UNKNOWN_CS_VERSION_EXP_PREFIX)?;
+    let body = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                "valueString": "UNKNOWN_CODESYSTEM_VERSION_EXP"
+            }],
+            "severity": "error",
+            "code": "not-found",
+            "details": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                    "code": "not-found"
                 }],
                 "text": text,
             },
