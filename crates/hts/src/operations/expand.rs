@@ -1382,14 +1382,13 @@ async fn process_expand<B: TerminologyBackend>(
             ) {
                 return false;
             }
-            // Version-override request parameters.  The FHIR IG
-            // `version/parameters-fixed-version` profile expects
-            // `force-system-version` to be echoed back in
-            // `expansion.parameter[]` (it influences which CS revisions
-            // contributed to the result).  `system-version` /
-            // `check-system-version` remain filtered: they are server-side
-            // defaults and the IG fixtures do not expect those echoed.
-            if matches!(name, "system-version" | "check-system-version") {
+            // `check-system-version` is an instruction knob (verify-only
+            // semantics) that the IG fixtures do NOT echo.  The other
+            // version-override params (`system-version`,
+            // `force-system-version`) ARE echoed per the FHIR IG
+            // `version/parameters-default-version` and
+            // `parameters-fixed-version` profile fixtures.
+            if matches!(name, "check-system-version") {
                 return false;
             }
             // Configuration inputs that the IG validator passes via the
