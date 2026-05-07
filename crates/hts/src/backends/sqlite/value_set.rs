@@ -1009,14 +1009,35 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // — same policy as the $expand path.
                         let has_vs_pin = !req.default_value_set_versions.is_empty();
                         let codes = if cached.is_empty() || has_vs_pin {
-                            let codes = compute_expansion_with_versions(
+                            // validate-code is allowed to expand against a VS
+                            // whose compose.include pins a CS-version that
+                            // doesn't resolve — the validate-code response
+                            // path itself emits the IG-spec
+                            // `UNKNOWN_CODESYSTEM_VERSION` (no `_EXP` suffix)
+                            // issue with location/expression on `system`.
+                            // Convert the `__UNKNOWN_CS_VERSION_EXP__`
+                            // sentinel raised by `expand_single_include_local`
+                            // into an empty include contribution here so the
+                            // sentinel only escapes through the `$expand`
+                            // handler (which renders the 4xx
+                            // `UNKNOWN_CODESYSTEM_VERSION_EXP` shape that the
+                            // IG `version/vs-expand-v-wb` fixtures expect).
+                            let codes = match compute_expansion_with_versions(
                                 &conn,
                                 compose_json.as_deref(),
                                 &mut vec![],
                                 &std::collections::HashMap::new(),
                                 &std::collections::HashMap::new(),
                                 &req.default_value_set_versions,
-                            )?;
+                            ) {
+                                Ok(c) => c,
+                                Err(HtsError::NotFound(msg))
+                                    if msg.starts_with("__UNKNOWN_CS_VERSION_EXP__:") =>
+                                {
+                                    Vec::new()
+                                }
+                                Err(e) => return Err(e),
+                            };
                             if !has_vs_pin && !multi_version {
                                 populate_cache(&conn, &vs_id, &codes)?;
                             }

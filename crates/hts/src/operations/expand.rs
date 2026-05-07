@@ -4139,5 +4139,201 @@ mod tests {
             resp2["expansion"]["contains"]
         );
     }
+
+    // ── Extension-derived properties (codesystem-conceptOrder → order) ─────────
+    //
+    // Mirrors the IG `parameters/parameters-expand-supplement-none` and
+    // `extensions/extensions-echo-all` fixtures: a concept-level
+    // `codesystem-conceptOrder` extension on the base CodeSystem must be
+    // surfaced as a `property[{code:"order", valueDecimal:N}]` entry on the
+    // matching `expansion.contains[]` even when the caller passes no explicit
+    // `property=` request parameter.  Drives `apply_concept_extension_data`
+    // Pass 2 — the fixture comparator fails with "missing property property"
+    // when this regresses.
+    async fn make_app_with_extension_order() -> Router {
+        use crate::import::BundleImportBackend;
+        use helios_persistence::tenant::TenantContext;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                { "resource": {
+                    "resourceType": "CodeSystem",
+                    "id": "ext-cs",
+                    "url": "http://example.org/ext-cs",
+                    "status": "active",
+                    "content": "complete",
+                    "concept": [
+                        {
+                            "code": "code1",
+                            "display": "Display 1",
+                            "extension": [{
+                                "url": "http://hl7.org/fhir/StructureDefinition/codesystem-conceptOrder",
+                                "valueInteger": 6
+                            }]
+                        },
+                        {
+                            "code": "code2",
+                            "display": "Display 2",
+                            "extension": [{
+                                "url": "http://hl7.org/fhir/StructureDefinition/codesystem-conceptOrder",
+                                "valueInteger": 5
+                            }]
+                        }
+                    ]
+                }},
+                { "resource": {
+                    "resourceType": "ValueSet",
+                    "id": "ext-vs",
+                    "url": "http://example.org/ext-vs",
+                    "status": "active",
+                    "compose": {
+                        "include": [{ "system": "http://example.org/ext-cs" }]
+                    }
+                }}
+            ]
+        });
+        backend
+            .import_bundle(&TenantContext::system(), bundle.to_string().as_bytes())
+            .await
+            .unwrap();
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn expand_surfaces_codesystem_conceptorder_as_order_property() {
+        let app = make_app_with_extension_order().await;
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/ext-vs" },
+                { "name": "excludeNested", "valueBoolean": true }
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 2);
+
+        // Each contains entry should carry a property[] with the derived
+        // `order` value (6 for code1, 5 for code2).
+        let by_code: std::collections::HashMap<&str, &Value> = contains
+            .iter()
+            .filter_map(|c| c["code"].as_str().map(|k| (k, c)))
+            .collect();
+
+        let c1 = by_code.get("code1").expect("code1 in expansion");
+        let c1_props = c1["property"].as_array().expect("code1 property[] present");
+        let order = c1_props
+            .iter()
+            .find(|p| p["code"] == "order")
+            .expect("code1 has order property");
+        assert_eq!(order["valueDecimal"], 6, "code1 order should be 6");
+
+        let c2 = by_code.get("code2").expect("code2 in expansion");
+        let c2_props = c2["property"].as_array().expect("code2 property[] present");
+        let order = c2_props
+            .iter()
+            .find(|p| p["code"] == "order")
+            .expect("code2 has order property");
+        assert_eq!(order["valueDecimal"], 5, "code2 order should be 5");
+    }
+
+    /// Variant: caller passes `property=prop` for a concept that has the
+    /// `prop` property declared in the CS.  Verifies `populate_properties`
+    /// (the SQL-backed lookup, distinct from extension synthesis above).
+    #[tokio::test]
+    async fn expand_surfaces_requested_concept_property() {
+        use crate::import::BundleImportBackend;
+        use helios_persistence::tenant::TenantContext;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                { "resource": {
+                    "resourceType": "CodeSystem",
+                    "id": "prop-cs",
+                    "url": "http://example.org/prop-cs",
+                    "status": "active",
+                    "content": "complete",
+                    "property": [{
+                        "code": "prop",
+                        "uri": "http://example.org/prop",
+                        "type": "code"
+                    }],
+                    "concept": [
+                        {
+                            "code": "code1",
+                            "display": "Display 1",
+                            "property": [{ "code": "prop", "valueCode": "old" }]
+                        },
+                        {
+                            "code": "code2",
+                            "display": "Display 2",
+                            "property": [{ "code": "prop", "valueCode": "new" }]
+                        }
+                    ]
+                }},
+                { "resource": {
+                    "resourceType": "ValueSet",
+                    "id": "prop-vs",
+                    "url": "http://example.org/prop-vs",
+                    "status": "active",
+                    "compose": {
+                        "include": [{ "system": "http://example.org/prop-cs" }]
+                    }
+                }}
+            ]
+        });
+        backend
+            .import_bundle(&TenantContext::system(), bundle.to_string().as_bytes())
+            .await
+            .unwrap();
+        let state = AppState::new(backend);
+        let app: Router = Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/prop-vs" },
+                { "name": "excludeNested", "valueBoolean": true },
+                { "name": "property", "valueString": "prop" }
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 2);
+
+        let by_code: std::collections::HashMap<&str, &Value> = contains
+            .iter()
+            .filter_map(|c| c["code"].as_str().map(|k| (k, c)))
+            .collect();
+
+        let c1 = by_code.get("code1").expect("code1 in expansion");
+        let c1_props = c1["property"].as_array().expect("code1 property[] present");
+        let prop = c1_props
+            .iter()
+            .find(|p| p["code"] == "prop")
+            .expect("code1 has prop property");
+        assert_eq!(prop["valueCode"], "old", "code1 prop should be 'old'");
+    }
 }
 // rebuild marker
