@@ -320,8 +320,14 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 // Build the inline-resolution context up front so every nested
                 // `compose.include[].valueSet[]` lookup can find `#contained`
                 // refs in the request body and `tx-resource` shadowed VS bodies.
-                let inline_ctx =
+                let mut inline_ctx =
                     InlineResolutionContext::from_inline(Some(&vs_resource), &req.tx_resources);
+                inline_ctx
+                    .force_system_versions
+                    .clone_from(&req.force_system_versions);
+                inline_ctx
+                    .system_version_defaults
+                    .clone_from(&req.system_version_defaults);
                 let codes = if let Some(filter) = req.filter.as_deref() {
                     let limit_hint = req.count.map(|c| ((c as usize) * 3).max(100));
                     let compose_str = compose.to_string();
@@ -581,10 +587,36 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     });
                                 }
                             }
-                            let codes =
-                                compute_expansion(&conn, compose_json.as_deref(), &mut vec![])?;
-                            populate_cache(&conn, &vs_id, &codes)?;
+                            let codes = compute_expansion_with_versions(
+                                &conn,
+                                compose_json.as_deref(),
+                                &mut vec![],
+                                &req.force_system_versions,
+                                &req.system_version_defaults,
+                            )?;
+                            // Cache only when no version overrides were
+                            // applied — caching with overrides would poison
+                            // subsequent unforced requests with the wrong
+                            // version's codes.
+                            if req.force_system_versions.is_empty()
+                                && req.system_version_defaults.is_empty()
+                            {
+                                populate_cache(&conn, &vs_id, &codes)?;
+                            }
                             codes
+                        } else if !req.force_system_versions.is_empty()
+                            || !req.system_version_defaults.is_empty()
+                        {
+                            // Cached entries reflect the default (unforced)
+                            // expansion; ignore the cache when the request
+                            // pins specific CS versions and recompute.
+                            compute_expansion_with_versions(
+                                &conn,
+                                compose_json.as_deref(),
+                                &mut vec![],
+                                &req.force_system_versions,
+                                &req.system_version_defaults,
+                            )?
                         } else {
                             cached
                         }
@@ -1922,6 +1954,12 @@ struct InlineResolutionContext<'a> {
     contained: Vec<&'a serde_json::Value>,
     tx_resources: Vec<&'a serde_json::Value>,
     visited: std::collections::BTreeSet<String>,
+    /// `force-system-version` overrides (system URL → version pin).  Applied
+    /// even when the include carries an explicit `version` field.
+    force_system_versions: std::collections::HashMap<String, String>,
+    /// `system-version` defaults (system URL → version pin).  Applied only
+    /// when the include omits its own `version`.
+    system_version_defaults: std::collections::HashMap<String, String>,
     /// State carried while resolving an `exclude.valueSet[]` reference.
     /// `Some((origin, chain))` once an exclude resolution has started:
     /// `origin` is the URL the caller asked to exclude (target of the
@@ -1953,9 +1991,12 @@ impl<'a> InlineResolutionContext<'a> {
             contained,
             tx_resources: tx_refs,
             visited: std::collections::BTreeSet::new(),
+            force_system_versions: std::collections::HashMap::new(),
+            system_version_defaults: std::collections::HashMap::new(),
             exclude_chain: None,
         }
     }
+
 
     /// Resolve a `valueSet[]` entry to its compose JSON without touching the DB.
     ///
@@ -2006,6 +2047,23 @@ fn compute_expansion(
         warnings,
         &InlineResolutionContext::default(),
     )
+}
+
+/// Like [`compute_expansion`] but seeds the resolution context with the
+/// request's `force-system-version` / `system-version` overrides so they
+/// apply transitively through any nested `compose.include[].valueSet[]`
+/// references encountered during the expansion.
+fn compute_expansion_with_versions(
+    conn: &Connection,
+    compose_json: Option<&str>,
+    warnings: &mut Vec<String>,
+    force: &std::collections::HashMap<String, String>,
+    defaults: &std::collections::HashMap<String, String>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let mut ctx = InlineResolutionContext::default();
+    ctx.force_system_versions = force.clone();
+    ctx.system_version_defaults = defaults.clone();
+    compute_expansion_with_ctx(conn, compose_json, warnings, &ctx)
 }
 
 /// Variant of [`compute_expansion`] that threads an inline-resolution context
@@ -2130,8 +2188,34 @@ fn compute_expansion_depth_inner(
         return Ok(vec![]);
     };
 
-    let compose: serde_json::Value = serde_json::from_str(raw)
+    let mut compose: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| HtsError::Internal(format!("Failed to parse compose_json: {e}")))?;
+
+    // Apply force-system-version / system-version overrides from the request
+    // by rewriting the include[].version entries before they reach the
+    // per-include expansion path.  The IG `version/parameters-fixed-version`
+    // profile uses these to pin which CodeSystem revision an include resolves
+    // against.  `force-system-version` always wins; `system-version` only
+    // fills in for includes that lack an explicit `version`.
+    if !ctx.force_system_versions.is_empty() || !ctx.system_version_defaults.is_empty() {
+        for arr_key in ["include", "exclude"] {
+            if let Some(arr) = compose.get_mut(arr_key).and_then(|v| v.as_array_mut()) {
+                for inc in arr.iter_mut() {
+                    let sys = inc.get("system").and_then(|v| v.as_str()).map(|s| s.to_owned());
+                    if let Some(sys_url) = sys {
+                        let explicit = inc.get("version").and_then(|v| v.as_str()).map(|s| s.to_owned());
+                        if let Some(forced) = ctx.force_system_versions.get(&sys_url) {
+                            inc["version"] = serde_json::Value::String(forced.clone());
+                        } else if explicit.is_none() {
+                            if let Some(default_v) = ctx.system_version_defaults.get(&sys_url) {
+                                inc["version"] = serde_json::Value::String(default_v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let empty_arr = vec![];
     let includes = compose["include"].as_array().unwrap_or(&empty_arr);

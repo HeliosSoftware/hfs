@@ -635,26 +635,19 @@ async fn expand_hierarchical_returns_nested_tree() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["resourceType"], "ValueSet");
 
-    // Total = flat count (3 codes)
+    // Enumerated composes (every include carries explicit concept[]) are
+    // returned flat regardless of `hierarchical=true`, matching the
+    // tx-ecosystem-ig parameters/parameters-expand-enum-hierarchy fixture
+    // (curated lists are not retrofitted with the underlying CS hierarchy).
     assert_eq!(body["expansion"]["total"], 3);
-
     let contains = body["expansion"]["contains"]
         .as_array()
         .expect("expected expansion.contains array");
-
-    // Only `limb` is a root (arm and leg are nested under it)
-    assert_eq!(contains.len(), 1, "expected 1 root ('limb'), got: {body}");
-    let root = &contains[0];
-    assert_eq!(root["code"], "limb");
-
-    // arm and leg are nested under limb
-    let nested = root["contains"]
-        .as_array()
-        .expect("expected nested contains");
-    assert_eq!(nested.len(), 2, "expected 2 nested children under limb");
-    let nested_codes: Vec<&str> = nested.iter().filter_map(|c| c["code"].as_str()).collect();
-    assert!(nested_codes.contains(&"arm"), "expected arm under limb");
-    assert!(nested_codes.contains(&"leg"), "expected leg under limb");
+    assert_eq!(contains.len(), 3, "enumerated VS should expand flat: {body}");
+    let codes: Vec<&str> = contains.iter().filter_map(|c| c["code"].as_str()).collect();
+    assert!(codes.contains(&"limb"));
+    assert!(codes.contains(&"arm"));
+    assert!(codes.contains(&"leg"));
 }
 
 /// $expand with `hierarchical=false` (or absent) returns the flat list unchanged.

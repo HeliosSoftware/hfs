@@ -895,6 +895,38 @@ async fn process_expand<B: TerminologyBackend>(
     let url_for_neg_cache = url.clone();
     let value_set_for_response = value_set.clone();
 
+    // ── system-version / force-system-version overrides ─────────────────────
+    // Both parameters are repeating canonical (`url|version`) values.  The
+    // FHIR IG `version/parameters-fixed-version` profile applies them as
+    // `force-system-version` (override even when the include pins a version)
+    // and `system-version` (apply only when the include omits version) to
+    // pin which CodeSystem revision contributes to the expansion.
+    fn collect_version_pins(params: &[Value], name: &str) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        for p in params {
+            if p.get("name").and_then(|v| v.as_str()) != Some(name) {
+                continue;
+            }
+            // Accept valueCanonical / valueUri / valueString / valueUrl.
+            let raw = ["valueCanonical", "valueUri", "valueString", "valueUrl"]
+                .iter()
+                .filter_map(|k| p.get(*k).and_then(|v| v.as_str()))
+                .next();
+            if let Some(s) = raw {
+                if let Some(pos) = s.find('|') {
+                    let url = s[..pos].to_string();
+                    let ver = s[pos + 1..].to_string();
+                    if !url.is_empty() && !ver.is_empty() {
+                        out.entry(url).or_insert(ver);
+                    }
+                }
+            }
+        }
+        out
+    }
+    let force_system_versions = collect_version_pins(&params, "force-system-version");
+    let system_version_defaults = collect_version_pins(&params, "system-version");
+
     // ── Cache miss: compute ───────────────────────────────────────────────────
     let req = ExpandRequest {
         url,
@@ -909,6 +941,8 @@ async fn process_expand<B: TerminologyBackend>(
         hierarchical,
         hierarchical_explicit,
         tx_resources,
+        force_system_versions,
+        system_version_defaults,
     };
 
     let ctx = TenantContext::system();
@@ -1348,13 +1382,14 @@ async fn process_expand<B: TerminologyBackend>(
             ) {
                 return false;
             }
-            // Version-override request parameters — these are instruction knobs
-            // to the server, not expansion metadata. The IG fixtures do NOT
-            // expect them echoed back in expansion.parameter[].
-            if matches!(
-                name,
-                "system-version" | "check-system-version" | "force-system-version"
-            ) {
+            // Version-override request parameters.  The FHIR IG
+            // `version/parameters-fixed-version` profile expects
+            // `force-system-version` to be echoed back in
+            // `expansion.parameter[]` (it influences which CS revisions
+            // contributed to the result).  `system-version` /
+            // `check-system-version` remain filtered: they are server-side
+            // defaults and the IG fixtures do not expect those echoed.
+            if matches!(name, "system-version" | "check-system-version") {
                 return false;
             }
             // Configuration inputs that the IG validator passes via the

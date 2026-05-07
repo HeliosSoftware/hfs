@@ -350,6 +350,22 @@ pub struct ExpandRequest {
     /// `tx-resource` map first, then the local store, then NotFound.
     #[serde(default)]
     pub tx_resources: Vec<serde_json::Value>,
+    /// CodeSystem-version overrides forced by the `force-system-version`
+    /// $expand parameter (FHIR R5 §4.9.5 / IG `version/parameters-fixed-version`
+    /// profile).  Maps a CodeSystem canonical URL → version pin (which may be
+    /// a literal `"1.0.0"` or a wildcard like `"1.0.x"` / `"1.x"`).  The
+    /// backend treats these as overrides applied to every
+    /// `compose.include[].system` matching the URL, regardless of any
+    /// explicit `include.version` already on the include.
+    #[serde(default)]
+    pub force_system_versions: std::collections::HashMap<String, String>,
+    /// Default CodeSystem versions from the `system-version` $expand
+    /// parameter.  Same shape as [`Self::force_system_versions`] but only
+    /// applies when the include itself does NOT pin a version.  Resolution
+    /// order: explicit `include.version` > force_system_versions >
+    /// system_version_defaults > latest stored version.
+    #[serde(default)]
+    pub system_version_defaults: std::collections::HashMap<String, String>,
 }
 
 /// Response from `ValueSet/$expand`.
