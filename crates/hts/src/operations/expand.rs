@@ -926,15 +926,16 @@ async fn process_expand<B: TerminologyBackend>(
     }
     let force_system_versions = collect_version_pins(&params, "force-system-version");
     let mut system_version_defaults = collect_version_pins(&params, "system-version");
-    // `check-system-version` pins act as DEFAULTs (same semantics as
-    // `system-version`) for selecting the version, but additionally trigger
-    // a post-expansion verification: if the resolved CS version doesn't
+    // `check-system-version` acts as both a DEFAULT (same shape as
+    // `system-version` — applied only when no other version pin wins) AND
+    // a post-expansion verifier.  When the resolved CS version doesn't
     // satisfy the pattern, the IG fixtures expect a 4xx OperationOutcome
-    // with `version-error` / VALUESET_VERSION_CHECK.
+    // with `version-error` / VALUESET_VERSION_CHECK
+    // (`version/vs-expand-v-w-check`, `vs-expand-all-v-check`).
     let check_system_versions = collect_version_pins(&params, "check-system-version");
     for (sys, pat) in &check_system_versions {
-        // Only inject a default when the caller hasn't already supplied one
-        // (system-version wins over check-system-version).
+        // `system-version` (DEFAULT) wins over `check-system-version` when
+        // both pins target the same system.
         system_version_defaults
             .entry(sys.clone())
             .or_insert_with(|| pat.clone());

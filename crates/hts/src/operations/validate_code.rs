@@ -1035,9 +1035,15 @@ fn find_pin_for_system<'a>(
 /// mismatch issue is incorrect. Removes `VALUESET_VALUE_MISMATCH` and the
 /// paired `UNKNOWN_CODESYSTEM_VERSION` issues, flips `result` back to true
 /// (when the only barriers were those), clears `cs_version` echo to the
-/// forced value, and clears `caused_by_unknown_system`.
-fn suppress_forced_version_mismatch(
+/// forced value, and clears `caused_by_unknown_system`. Also attempts to
+/// repopulate `resp.display` from the forced version when possible (the
+/// expansion may have been computed against a different version).
+async fn suppress_forced_version_mismatch<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
     resp: &mut crate::types::ValidateCodeResponse,
+    system_url: &str,
+    code: &str,
     forced_version: &str,
 ) {
     let had_mismatch = resp
@@ -1061,6 +1067,29 @@ fn suppress_forced_version_mismatch(
         resp.result = true;
         resp.message = None;
         resp.cs_version = Some(forced_version.to_string());
+        // Look up the display at the forced version via a CodeSystem-level
+        // validate-code (cheaper than a generic $lookup) so the response
+        // reflects the canonical display for the forced version, not the
+        // expansion's chosen version.
+        let cs_req = ValidateCodeRequest {
+            url: None,
+            value_set_version: None,
+            system: Some(system_url.to_string()),
+            code: code.to_string(),
+            version: Some(forced_version.to_string()),
+            display: None,
+            date: None,
+            include_abstract: None,
+            input_form: None,
+            lenient_display_validation: None,
+        };
+        if let Ok(cs_resp) = CodeSystemOperations::validate_code(backend, ctx, cs_req).await {
+            if cs_resp.result {
+                if let Some(d) = cs_resp.display {
+                    resp.display = Some(d);
+                }
+            }
+        }
     }
 }
 
@@ -1373,13 +1402,28 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             crate::types::ResourceSearchQuery {
                 url: Some(url.clone()),
                 version: vs_version.clone(),
-                count: Some(1),
+                count: Some(20),
                 ..Default::default()
             },
         )
         .await
         .ok()
-        .and_then(|mut hits| hits.pop())
+        .and_then(|mut hits| {
+            // Pick the same VS row the backend will use:
+            //   - if vs_version was supplied, take the unique match
+            //   - otherwise, pick the highest version (matches
+            //     `resolve_value_set_versioned` ordering).
+            if vs_version.is_some() {
+                hits.into_iter().next()
+            } else {
+                hits.sort_by(|a, b| {
+                    let av = a.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                    let bv = b.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                    av.cmp(bv)
+                });
+                hits.pop()
+            }
+        })
     } else {
         None
     };
@@ -1485,7 +1529,15 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // VS pin entirely.
         if let (Some(sys), Some(forced)) = (system.as_deref(), req_version.as_deref()) {
             if find_pin_for_system(&force_pins, sys).is_some() {
-                suppress_forced_version_mismatch(&mut resp, forced);
+                suppress_forced_version_mismatch(
+                    state.backend(),
+                    &ctx,
+                    &mut resp,
+                    sys,
+                    &code,
+                    forced,
+                )
+                .await;
             }
         }
         if let Some(sys) = system.as_deref() {
@@ -1665,7 +1717,15 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // VS pin entirely.
         if let Some(forced) = req_version.as_deref() {
             if find_pin_for_system(&force_pins, &system).is_some() {
-                suppress_forced_version_mismatch(&mut resp, forced);
+                suppress_forced_version_mismatch(
+                    state.backend(),
+                    &ctx,
+                    &mut resp,
+                    &system,
+                    &code,
+                    forced,
+                )
+                .await;
             }
         }
         rescue_via_supplements(
@@ -1800,7 +1860,15 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             // the backend's VS-pin mismatch issues for this coding.
             if let Some(forced) = per_coding_version.as_deref() {
                 if find_pin_for_system(&force_pins, &system).is_some() {
-                    suppress_forced_version_mismatch(&mut resp, forced);
+                    suppress_forced_version_mismatch(
+                        state.backend(),
+                        &ctx,
+                        &mut resp,
+                        &system,
+                        &code,
+                        forced,
+                    )
+                    .await;
                 }
             }
             if resp.result {
