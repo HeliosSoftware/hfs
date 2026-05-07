@@ -648,12 +648,51 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
         for (code, list) in map {
             by_code.insert(code, list);
         }
+        // Build a property-code → FHIR-type map from the supplement CodeSystems
+        // themselves. The IG `parameters/parameters-expand-supplement-good`
+        // fixture pins `prop1` (declared `type=string` on the supplement CS) as
+        // a `valueString` rather than the default `valueCode`. Without this
+        // type lookup the value silently surfaces under the wrong `value[x]`.
+        let mut supp_prop_types: HashMap<String, String> = HashMap::new();
+        for raw in supplement_urls {
+            let bare = raw.split('|').next().unwrap_or(raw).to_string();
+            if let Ok(hits) = crate::traits::CodeSystemOperations::search(
+                backend,
+                ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(bare),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                for cs in &hits {
+                    if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
+                        for entry in props {
+                            if let (Some(code), Some(ty)) = (
+                                entry.get("code").and_then(|v| v.as_str()),
+                                entry.get("type").and_then(|v| v.as_str()),
+                            ) {
+                                supp_prop_types
+                                    .entry(code.to_string())
+                                    .or_insert_with(|| ty.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for c in contains.iter_mut() {
             if let Some(extra) = by_code.get(&c.code) {
                 for (prop, value) in extra {
+                    let value_type = match supp_prop_types.get(prop) {
+                        Some(ty) => fhir_property_type_to_value_type(ty),
+                        None => "Code".to_string(),
+                    };
                     c.properties.push(ExpansionContainsProperty {
                         code: prop.clone(),
-                        value_type: "Code".to_string(),
+                        value_type,
                         value: value.clone(),
                     });
                 }

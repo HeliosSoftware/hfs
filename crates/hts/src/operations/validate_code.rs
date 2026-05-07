@@ -3975,6 +3975,31 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
             .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
             .unwrap_or(false);
+        // Fall back to the stored VS version when the caller didn't supply
+        // a `valueSetVersion` — keeps the not-in-vs message consistent with
+        // the IG fixture's `<url>|<version>` form (mirrors the Path 2 fix).
+        let effective_vs_version_for_msg: Option<String> =
+            if effective_vs_version.is_some() {
+                effective_vs_version.clone()
+            } else {
+                ValueSetOperations::search(
+                    state.backend(),
+                    &ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(url.clone()),
+                        count: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|mut hits| hits.pop())
+                .and_then(|vs| {
+                    vs.get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+            };
         if let Some(sys) = system.as_deref() {
             apply_active_only_inactive(
                 active_only,
@@ -3982,7 +4007,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 &code,
                 sys,
                 &url,
-                effective_vs_version.as_deref(),
+                effective_vs_version_for_msg.as_deref(),
             );
         }
         // Capture cs_version BEFORE moving resp into build_validate_response_async,
@@ -4291,13 +4316,39 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
             .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
             .unwrap_or(false);
+        // For the not-in-vs message format, fall back to the stored VS's
+        // version when the caller didn't supply one (the IG
+        // `validation/simple-coding-bad-code-inactive` fixture expects the
+        // message to reference `<url>|<stored-version>`, not the bare URL).
+        let effective_vs_version_for_msg: Option<String> =
+            if effective_vs_version.is_some() {
+                effective_vs_version.clone()
+            } else {
+                ValueSetOperations::search(
+                    state.backend(),
+                    &ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(url.clone()),
+                        count: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|mut hits| hits.pop())
+                .and_then(|vs| {
+                    vs.get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+            };
         apply_active_only_inactive(
             active_only,
             &mut resp,
             &code,
             &system,
             &url,
-            effective_vs_version.as_deref(),
+            effective_vs_version_for_msg.as_deref(),
         );
         let resolved_version = resp.cs_version.clone();
         let mut value = build_validate_response_async(
