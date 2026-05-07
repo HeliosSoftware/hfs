@@ -126,12 +126,17 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
         parts.push(json!({"name": "relationship", "valueCode": m.equivalence}));
 
         // `originMap` — canonical ConceptMap reference, with `|version` if known.
-        if let Some(src) = m.source.as_deref() {
-            let canonical = match m.map_version.as_deref() {
-                Some(v) if !v.is_empty() => format!("{src}|{v}"),
-                _ => src.to_owned(),
-            };
-            parts.push(json!({"name": "originMap", "valueCanonical": canonical}));
+        // Only emitted on forward translations: the IG `translate/translate-reverse`
+        // fixture omits originMap on reverse responses because the caller already
+        // knows which CM was queried (they invoked it explicitly).
+        if !is_reverse {
+            if let Some(src) = m.source.as_deref() {
+                let canonical = match m.map_version.as_deref() {
+                    Some(v) if !v.is_empty() => format!("{src}|{v}"),
+                    _ => src.to_owned(),
+                };
+                parts.push(json!({"name": "originMap", "valueCanonical": canonical}));
+            }
         }
 
         // For reverse responses include the source-side Coding of the

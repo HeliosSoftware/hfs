@@ -203,6 +203,13 @@ pub struct ValidateCodeResponse {
     /// cases (e.g. the caller requested version 1.0.0 but only 0.1.0 exists).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caused_by_unknown_system: Option<String>,
+    /// When set, emitted as a top-level `status` parameter on the response —
+    /// surfaces the concept's `structuredefinition-standards-status` extension
+    /// value (e.g. `deprecated`, `withdrawn`). Distinct from the FHIR concept
+    /// `status` property — purely a render-time marker so the IG fixtures
+    /// `extensions/validate-code-inactive` etc. can echo the deprecated state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_status: Option<String>,
 }
 
 // ─── $subsumes ────────────────────────────────────────────────────────────────
@@ -283,6 +290,13 @@ pub struct ExpansionContains {
     /// parameter naming one or more property codes to surface.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub properties: Vec<ExpansionContainsProperty>,
+    /// Concept-level FHIR extensions (e.g. `rendering-style`, `rendering-xhtml`,
+    /// `valueset-deprecated`, `valueset-concept-definition`). Populated
+    /// post-expansion from the base CodeSystem `concept[].extension[]` and
+    /// any applied supplement's matching concept entry. Each value is an
+    /// already-rendered FHIR `Extension` JSON object.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<serde_json::Value>,
     /// Nested contains for hierarchical expansions.
     #[serde(default)]
     pub contains: Vec<ExpansionContains>,
@@ -308,6 +322,11 @@ pub struct ExpansionContainsDesignation {
     pub use_system: Option<String>,
     pub use_code: Option<String>,
     pub value: String,
+    /// Designation-level FHIR extensions (e.g. `coding-sctdescid`,
+    /// `structuredefinition-standards-status`). Populated post-expansion from
+    /// the originating CodeSystem `concept[].designation[].extension[]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<serde_json::Value>,
 }
 
 /// Request for `ValueSet/$expand`.
@@ -621,6 +640,7 @@ mod tests {
             inactive: None,
             designations: vec![],
             properties: vec![],
+            extensions: vec![],
             contains: vec![],
         };
         let parent = ExpansionContains {
@@ -632,6 +652,7 @@ mod tests {
             inactive: None,
             designations: vec![],
             properties: vec![],
+            extensions: vec![],
             contains: vec![child.clone()],
         };
         let json = serde_json::to_string(&parent).unwrap();

@@ -105,8 +105,10 @@ jobs:
         include:
           - label: R4
             utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r4.tgz
+            core_url: https://packages2.fhir.org/packages/hl7.fhir.r4.core/4.0.1
           - label: R5
             utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r5.tgz
+            core_url: https://packages2.fhir.org/packages/hl7.fhir.r5.core/5.0.0
 
     steps:
       - name: Install Java 21 (for validator_cli.jar)
@@ -144,6 +146,27 @@ jobs:
           curl -fsSL --max-time 300 "${{ matrix.utg_url }}" -o utg.tgz
           ls -lh utg.tgz
 
+      # The IG `exclude/*` and friends rely on FHIR-core CodeSystems
+      # (e.g. http://hl7.org/fhir/administrative-gender, publication-status)
+      # that aren't shipped in UTG. Download the matching core NPM package
+      # so the import below loads them. Best-effort: missing core data
+      # only blocks ~6 tests in the long tail.
+      - name: Download FHIR core terminology package (${{ matrix.label }})
+        run: |
+          set +e
+          echo "Downloading ${{ matrix.core_url }}"
+          # -L follows the 302 redirect from packages2.fhir.org/packages/...
+          # to the actual .tgz under /web/.
+          curl -fsSL --max-time 300 "${{ matrix.core_url }}" -o core.tgz
+          CODE=$?
+          if [ "$CODE" -eq 0 ] && [ -s core.tgz ]; then
+            ls -lh core.tgz
+            echo "FHIR_CORE_AVAILABLE=true" >> "$GITHUB_ENV"
+          else
+            echo "FHIR core download failed (exit $CODE) — exclude/* tests may fail"
+            echo "FHIR_CORE_AVAILABLE=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Create data directory
         run: mkdir -p ./data
 
@@ -162,6 +185,18 @@ jobs:
           CODE=$?
           echo "UTG_IMPORT_EXIT=$CODE" >> "$GITHUB_ENV"
           echo "UTG import exit code: $CODE"
+
+      - name: Import FHIR core terminology
+        if: env.FHIR_CORE_AVAILABLE == 'true'
+        run: |
+          set +e
+          ./hts import ./core.tgz \
+            --database-url "./data/hts-${{ matrix.label }}.db" \
+            --batch-size 500 \
+            --verbose
+          CODE=$?
+          echo "CORE_IMPORT_EXIT=$CODE" >> "$GITHUB_ENV"
+          echo "FHIR core import exit code: $CODE"
 
       - name: Zip SNOMED RF2 subset (loose .txt files → .zip)
         run: |

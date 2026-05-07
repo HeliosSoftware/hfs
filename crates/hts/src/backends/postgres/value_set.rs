@@ -162,6 +162,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     inactive: None,
                     issues: vec![],
                     caused_by_unknown_system: None,
+                    concept_status: None,
                 });
             }
             Err(e) => return Err(e),
@@ -201,6 +202,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     inactive: None,
                     issues: vec![],
                     caused_by_unknown_system: None,
+                    concept_status: None,
                 })
             }
             Some(concept) => {
@@ -223,6 +225,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     inactive: None,
                     issues: vec![],
                     caused_by_unknown_system: None,
+                    concept_status: None,
                 })
             }
         }
@@ -378,6 +381,7 @@ async fn fetch_cache(
             designations: vec![],
 
             properties: vec![],
+            extensions: vec![],
             contains: vec![],
         })
         .collect())
@@ -447,6 +451,7 @@ async fn compute_expansion(
                     designations: vec![],
 
                     properties: vec![],
+                    extensions: vec![],
                     contains: vec![],
                 });
             }
@@ -472,6 +477,7 @@ async fn compute_expansion(
                     designations: vec![],
 
                     properties: vec![],
+                    extensions: vec![],
                     contains: vec![],
                 });
             }

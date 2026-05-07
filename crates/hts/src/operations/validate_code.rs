@@ -274,6 +274,7 @@ fn build_validate_response(
                 i.severity == "error"
                     || (i.severity == "warning"
                         && (i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
+                            || i.message_id.as_deref() == Some("DEPRECATED_CONCEPT_FOUND")
                             || i.message_id.as_deref()
                                 == Some("Coding_has_no_system__cannot_validate")
                             || i.tx_code == "invalid-display"))
@@ -344,6 +345,12 @@ fn build_validate_response(
         !issues.iter().any(|i| i.severity == "error")
     };
     parameter.push(json!({"name": "result", "valueBoolean": final_result}));
+    // `status` parameter — surfaces the concept's standards-status extension
+    // (e.g. "deprecated", "withdrawn"). The IG `extensions/validate-code-inactive`
+    // fixture echoes this between `result` and `system`.
+    if let Some(ref status) = resp.concept_status {
+        parameter.push(json!({"name": "status", "valueCode": status}));
+    }
     if let Some(s) = system {
         // Suppress for CC path with UNKNOWN_CODESYSTEM_VERSION
         // (see `suppress_cc_echoes` above for rationale).
@@ -436,6 +443,7 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     cs_resource: &Value,
     display_language: Option<&str>,
     expected_display: Option<&str>,
+    supplements: &[SupplementInfo],
     resp: &mut ValidateCodeResponse,
 ) {
     // CodeSystem.language is the language of the primary `display` field.
@@ -455,6 +463,33 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
         .and_then(|mut m| m.remove(code))
         .unwrap_or_default();
 
+    // Pull in designations contributed by any applied supplements so the
+    // valid-display universe matches what `rescue_via_supplements` accepts.
+    // This is what lets `display="ectenoot"` validate against a base CS with
+    // no Dutch designation when a supplement provides one (IG
+    // `extensions/validate-coding-good-supplement` fixtures).
+    let supplement_designations: Vec<crate::traits::ConceptDesignation> = if supplements.is_empty()
+    {
+        Vec::new()
+    } else {
+        let supp_urls: Vec<String> = supplements
+            .iter()
+            .map(|s| {
+                s.supplement_canonical
+                    .split('|')
+                    .next()
+                    .unwrap_or(&s.supplement_canonical)
+                    .to_string()
+            })
+            .collect();
+        backend
+            .supplement_designations(ctx, &supp_urls, &[code.to_string()])
+            .await
+            .ok()
+            .and_then(|mut m| m.remove(code))
+            .unwrap_or_default()
+    };
+
     let default_display: Option<String> = resp.display.clone();
 
     // Collect (display_value, language_tag_opt) pairs for every valid display:
@@ -466,6 +501,15 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     }
     for desig in &designations {
         if !desig.value.is_empty() {
+            displays_for_lang.push((desig.value.clone(), desig.language.clone()));
+        }
+    }
+    for desig in &supplement_designations {
+        if !desig.value.is_empty()
+            && !displays_for_lang
+                .iter()
+                .any(|(v, _)| v.eq_ignore_ascii_case(&desig.value))
+        {
             displays_for_lang.push((desig.value.clone(), desig.language.clone()));
         }
     }
@@ -690,6 +734,195 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     }
 }
 
+/// Inspect the concept's stored `extension[]` and `designation[].extension[]`
+/// arrays for `structuredefinition-standards-status` markers. When the concept
+/// itself is marked `deprecated`/`withdrawn`, emit a `DEPRECATED_CONCEPT_FOUND`
+/// warning and surface the status as `resp.concept_status` (rendered as the
+/// top-level `status` parameter).  When a designation matching the supplied
+/// `expected_display` is marked deprecated/withdrawn, emit an
+/// `INACTIVE_DISPLAY_FOUND` warning and replace `resp.display` with the
+/// concept's primary display so the response advertises the still-valid name.
+///
+/// Drives the IG `extensions/validate-code-inactive` and
+/// `extensions/validate-code-inactive-display` fixtures.
+async fn apply_concept_extension_status<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system_url: &str,
+    code: &str,
+    request_path: RequestPath,
+    expected_display: Option<&str>,
+    resp: &mut ValidateCodeResponse,
+) {
+    let entry_map = match backend
+        .concept_resource_entries(ctx, system_url, &[code.to_string()])
+        .await
+    {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let Some(entry) = entry_map.get(code) else {
+        return;
+    };
+
+    // (a) Concept-level standards-status extension.
+    if let Some(exts) = entry.get("extension").and_then(|e| e.as_array()) {
+        for ext in exts {
+            if ext.get("url").and_then(|u| u.as_str())
+                != Some(
+                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                )
+            {
+                continue;
+            }
+            let status_code = match ext.get("valueCode").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            if !matches!(status_code, "deprecated" | "withdrawn") {
+                continue;
+            }
+            // Surface as top-level `status` parameter.
+            if resp.concept_status.is_none() {
+                resp.concept_status = Some(status_code.to_string());
+            }
+            // Emit DEPRECATED_CONCEPT_FOUND warning. Skip if already present
+            // (e.g. multiple paths might call this).
+            let already = resp
+                .issues
+                .iter()
+                .any(|i| i.message_id.as_deref() == Some("DEPRECATED_CONCEPT_FOUND"));
+            if !already {
+                let text = format!(
+                    "The concept '{code}' is {status_code} and its use should be reviewed"
+                );
+                let (loc_path, expr_path) = match request_path {
+                    RequestPath::BareCode => {
+                        ("code".to_string(), "code".to_string())
+                    }
+                    RequestPath::CodeableConcept => (
+                        "CodeableConcept.coding[0].code".to_string(),
+                        "CodeableConcept.coding[0].code".to_string(),
+                    ),
+                    _ => ("Coding.code".to_string(), "Coding.code".to_string()),
+                };
+                resp.issues.push(ValidationIssue {
+                    severity: "warning".into(),
+                    fhir_code: "business-rule".into(),
+                    tx_code: "code-comment".into(),
+                    text,
+                    expression: Some(expr_path),
+                    location: Some(loc_path),
+                    message_id: Some("DEPRECATED_CONCEPT_FOUND".into()),
+                });
+            }
+            break;
+        }
+    }
+
+    // (b) Designation-level standards-status: only fires when the caller
+    // supplied a `display` that matches one of the concept's designations,
+    // AND that designation carries a deprecated/withdrawn status. The IG
+    // `validate-code-inactive-display` fixture expects:
+    //   - resp.display = the concept's primary display (rescuing it)
+    //   - INACTIVE_DISPLAY_FOUND warning naming the supplied (now-inactive)
+    //     display and the still-valid display(s).
+    let Some(expected) = expected_display else {
+        return;
+    };
+    if expected.is_empty() {
+        return;
+    }
+    let Some(designations) = entry.get("designation").and_then(|d| d.as_array()) else {
+        return;
+    };
+    let primary_display: Option<String> = entry
+        .get("display")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    for desig in designations {
+        let value = match desig.get("value").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !value.eq_ignore_ascii_case(expected) {
+            continue;
+        }
+        let Some(d_exts) = desig.get("extension").and_then(|e| e.as_array()) else {
+            continue;
+        };
+        let mut desig_status: Option<&str> = None;
+        for d_ext in d_exts {
+            if d_ext.get("url").and_then(|u| u.as_str())
+                != Some(
+                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                )
+            {
+                continue;
+            }
+            if let Some(c) = d_ext.get("valueCode").and_then(|v| v.as_str()) {
+                if matches!(c, "deprecated" | "withdrawn") {
+                    desig_status = Some(c);
+                    break;
+                }
+            }
+        }
+        let Some(_status_code) = desig_status else {
+            continue;
+        };
+        // Replace the response display with the concept's primary display so
+        // the response advertises the canonical (active) name.
+        if let Some(pd) = primary_display.as_deref() {
+            resp.display = Some(pd.to_string());
+        }
+        // Drop any pre-existing display-mismatch issue — the supplied display
+        // matched a known designation, just an inactive one.
+        resp.issues.retain(|i| i.tx_code != "invalid-display");
+        let valid_str = match primary_display.as_deref() {
+            Some(d) => format!("\"{d}\""),
+            None => "(none)".to_string(),
+        };
+        // The IG fixture wording uses "(status = deprecated)" regardless of
+        // whether the designation is marked deprecated or withdrawn — the
+        // concept of "inactive display" subsumes both per the IG.
+        let text = format!(
+            "'{expected}' is no longer considered a correct display for code '{code}' (status = deprecated). The correct display is one of {valid_str}."
+        );
+        let already = resp
+            .issues
+            .iter()
+            .any(|i| i.message_id.as_deref() == Some("INACTIVE_DISPLAY_FOUND"));
+        if !already {
+            let (loc_path, expr_path) = match request_path {
+                RequestPath::BareCode => {
+                    ("display".to_string(), "display".to_string())
+                }
+                RequestPath::CodeableConcept => (
+                    "CodeableConcept.coding[0].display".to_string(),
+                    "CodeableConcept.coding[0].display".to_string(),
+                ),
+                _ => (
+                    "Coding.display".to_string(),
+                    "Coding.display".to_string(),
+                ),
+            };
+            resp.issues.push(ValidationIssue {
+                severity: "warning".into(),
+                fhir_code: "invalid".into(),
+                tx_code: "display-comment".into(),
+                text,
+                expression: Some(expr_path),
+                location: Some(loc_path),
+                message_id: Some("INACTIVE_DISPLAY_FOUND".into()),
+            });
+        }
+        // Mark result=true so the response is "validated with warnings".
+        resp.result = true;
+        resp.message = None;
+        break;
+    }
+}
+
 /// Format the "Valid display is ..." segment of an IG `invalid-display`
 /// message.
 ///
@@ -766,6 +999,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     value_set_url: Option<&str>,
     display_language: Option<&str>,
     expected_display: Option<&str>,
+    supplements: &[SupplementInfo],
 ) -> Value {
     // For inactive concepts whose underlying status is more specific than
     // "inactive" (e.g. `retired`, `deprecated`, `withdrawn`), the IG
@@ -955,6 +1189,24 @@ async fn build_validate_response_async<B: TerminologyBackend>(
             cd,
             cs,
             display_language,
+            expected_display,
+            supplements,
+            &mut resp,
+        )
+        .await;
+    }
+
+    // Concept-level standards-status extension scan: detect
+    // `structuredefinition-standards-status: deprecated/withdrawn` on the
+    // concept itself or on any of its designations, and emit the IG
+    // `extensions/validate-code-inactive` warnings.
+    if let (Some(sys), Some(cd)) = (effective_system, code) {
+        apply_concept_extension_status(
+            backend,
+            ctx,
+            sys,
+            cd,
+            request_path,
             expected_display,
             &mut resp,
         )
@@ -1435,6 +1687,7 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
             inactive: None,
             issues: vec![issue],
             caused_by_unknown_system: None,
+            concept_status: None,
         },
         code,
         Some(system_url),
@@ -1545,6 +1798,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             None,
             display_language.as_deref(),
             display.as_deref(),
+            &supplements,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -1618,6 +1872,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             None,
             display_language.as_deref(),
             display.as_deref(),
+            &supplements,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -1680,6 +1935,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                     None,
                     display_language.as_deref(),
                     None,
+                    &[],
                 )
                 .await);
             }
@@ -1695,6 +1951,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
                 inactive: None,
                 issues: vec![],
                 caused_by_unknown_system: None,
+                concept_status: None,
             },
             None,
             None,
@@ -2411,16 +2668,19 @@ async fn detect_bad_vs_import<B: TerminologyBackend>(
 }
 
 /// Inspect the named ValueSet's `valueset-supplement` extensions and verify
-/// every referenced supplement CodeSystem is loaded. Returns `Err(NotFound)`
-/// when one is missing — matches the IG `extensions/validate-*-bad-supplement`
-/// fixtures which expect a 4xx OperationOutcome whose text mentions both
-/// "supplement" and the missing CS canonical URL.
+/// every referenced supplement CodeSystem is loaded. Returns the resolved
+/// [`SupplementInfo`] list on success so callers can auto-apply the supplements
+/// (matches the IG `extensions/validate-coding-good-supplement` fixtures —
+/// the supplement's designations rescue display mismatches and the
+/// `valueset-deprecated` concept extension surfaces as a warning). Returns
+/// `Err(NotFound)` when any referenced supplement CS is missing — matches
+/// `extensions/validate-*-bad-supplement` 4xx fixtures.
 async fn enforce_vs_supplement_extensions<B: TerminologyBackend>(
     backend: &B,
     ctx: &TenantContext,
     vs_url: &str,
     vs_version: Option<&str>,
-) -> Result<(), HtsError> {
+) -> Result<Vec<SupplementInfo>, HtsError> {
     let mut hits = match ValueSetOperations::search(
         backend,
         ctx,
@@ -2434,16 +2694,17 @@ async fn enforce_vs_supplement_extensions<B: TerminologyBackend>(
     .await
     {
         Ok(h) => h,
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(Vec::new()),
     };
     let vs = match hits.pop() {
         Some(v) => v,
-        None => return Ok(()),
+        None => return Ok(Vec::new()),
     };
     let exts = match vs.get("extension").and_then(|e| e.as_array()) {
         Some(a) => a,
-        None => return Ok(()),
+        None => return Ok(Vec::new()),
     };
+    let mut out: Vec<SupplementInfo> = Vec::new();
     for ext in exts {
         if ext.get("url").and_then(|u| u.as_str())
             != Some("http://hl7.org/fhir/StructureDefinition/valueset-supplement")
@@ -2460,7 +2721,7 @@ async fn enforce_vs_supplement_extensions<B: TerminologyBackend>(
         };
         let bare = raw.split('|').next().unwrap_or(raw);
         match backend.supplement_target(ctx, bare).await? {
-            Some(_) => {}
+            Some(info) => out.push(info),
             None => {
                 return Err(HtsError::NotFound(format!(
                     "Required supplement not found: {bare}"
@@ -2468,7 +2729,7 @@ async fn enforce_vs_supplement_extensions<B: TerminologyBackend>(
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Core validate-code logic for `ValueSet/$validate-code`.
@@ -2503,7 +2764,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // CodeSystem in the VS expansion. We can't (yet) verify the target
     // matches a system in the VS without expanding, so pass `None` for
     // expected_target here — bad-supplement-not-found is still rejected.
-    let supplements = resolve_supplements(state.backend(), &ctx, &params, None).await?;
+    let mut supplements = resolve_supplements(state.backend(), &ctx, &params, None).await?;
     // Used to rewrite "...'url'..." → "...'url|version'..." in NotFound
     // messages so the IG-expected text format is met.
     let vs_version = find_str_param(&params, "valueSetVersion");
@@ -2519,8 +2780,21 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // The VS may pin one or more CS supplements via the `valueset-supplement`
     // extension. Reject the request with 4xx if any of those supplements is
     // not loaded — matches the IG `extensions/validate-*-bad-supplement`
-    // fixtures.
-    enforce_vs_supplement_extensions(state.backend(), &ctx, &url, vs_version.as_deref()).await?;
+    // fixtures. The returned list of resolved SupplementInfo gets merged into
+    // the active `supplements` list so VS-pinned supplements auto-rescue
+    // displays just like an explicit `useSupplement` would (per IG
+    // `extensions/validate-coding-good-supplement`).
+    let vs_ext_supplements =
+        enforce_vs_supplement_extensions(state.backend(), &ctx, &url, vs_version.as_deref())
+            .await?;
+    for s in vs_ext_supplements {
+        if !supplements
+            .iter()
+            .any(|existing| existing.supplement_canonical == s.supplement_canonical)
+        {
+            supplements.push(s);
+        }
+    }
 
     // Detect a ValueSet whose compose.include[*].valueSet imports an
     // unresolvable ValueSet up-front. The IG `validation/simple-*-bad-import`
@@ -2570,6 +2844,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 inactive: None,
                 issues: vec![issue],
                 caused_by_unknown_system: None,
+                concept_status: None,
             },
             None,
             None,
@@ -2896,6 +3171,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             Some(&url),
             display_language.as_deref(),
             display.as_deref(),
+            &supplements,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -2993,6 +3269,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                         },
                     ],
                     caused_by_unknown_system: None,
+                    concept_status: None,
                 },
                 Some(&code),
                 None,
@@ -3158,6 +3435,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             Some(&url),
             display_language.as_deref(),
             display.as_deref(),
+            &supplements,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -3223,7 +3501,24 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // codings in a CodeableConcept all validate, the response echoes the
         // last one). Iterate in reverse so the earliest "yes" we find is the
         // last entry in the input.
+        //
+        // Also track per-coding `unknown-code` failures (codes that don't
+        // exist in their CS) so we can surface them in the response even when
+        // a different coding succeeds. The IG `permutations/simple-bad-cc2-*`
+        // fixtures expect: when a CC has BOTH a bad coding (unknown CS code)
+        // AND a good coding, the response echoes the good coding's metadata
+        // (code/display/system/version) but `result=false` and surfaces the
+        // bad coding's `Unknown_Code_in_Version` error +
+        // `None_of_the_provided_codes_are_in_the_value_set_one` info.
         let cc_req_version = find_str_param(&params, "version").or(system_version.clone());
+        // Map (system, code) → original CC index (preserved through reverse
+        // iteration) so per-coding failure issues reference
+        // `CodeableConcept.coding[N]` with the input order's N.
+        let coding_index: std::collections::HashMap<(String, String), usize> = codings
+            .iter()
+            .enumerate()
+            .map(|(i, (s, c))| ((s.clone(), c.clone()), i))
+            .collect();
         for (system, code) in codings.clone().into_iter().rev() {
             // Prefer the per-coding version (embedded in the CC) over the
             // top-level `version` parameter so that version-mismatch detection
@@ -3242,13 +3537,21 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 source_vs.as_ref(),
             )
             .await;
+            // Plumb the per-coding display down to the backend so it can emit
+            // an `invalid-display` issue when the supplied display doesn't
+            // match any of the concept's display/designation values. The IG
+            // `validation/simple-codeableconcept-bad-display(W)` fixtures
+            // expect this validation to fire just like the bare-Coding path.
+            let coding_display_for_req = coding_displays
+                .get(&(system.clone(), code.clone()))
+                .cloned();
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),
                 value_set_version: effective_vs_version.clone(),
                 system: Some(system.clone()),
                 code: code.clone(),
                 version: per_coding_version.clone(),
-                display: None,
+                display: coding_display_for_req.clone(),
                 date: find_str_param(&params, "date"),
                 include_abstract: params
                     .iter()
@@ -3368,10 +3671,155 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 let coding_display = coding_displays
                     .get(&(system.clone(), code.clone()))
                     .cloned();
+                // ── Walk remaining codings (those we haven't reached yet in
+                // reverse iteration, i.e. earlier in input order) and check
+                // for hard `unknown-code` failures. If any exist, the IG
+                // `permutations/simple-bad-cc2-*` fixtures expect us to echo
+                // THIS coding's metadata but mark result=false and surface
+                // the bad coding's issues.
+                let success_idx = coding_index
+                    .get(&(system.clone(), code.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                let mut accumulated_issues: Vec<ValidationIssue> = Vec::new();
+                let vs_version_owned = crate::traits::ValueSetOperations::search(
+                    state.backend(),
+                    &ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(url.clone()),
+                        version: vs_version.clone(),
+                        count: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|mut hits| {
+                    hits.pop().and_then(|vs| {
+                        vs.get("version")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                });
+                let url_with_version = match vs_version_owned.as_deref() {
+                    Some(v) => format!("{url}|{v}"),
+                    None => url.clone(),
+                };
+                for (other_idx, (other_system, other_code)) in codings.iter().enumerate() {
+                    if other_idx == success_idx {
+                        continue;
+                    }
+                    let cs_exists = crate::traits::CodeSystemOperations::search(
+                        state.backend(),
+                        &ctx,
+                        crate::types::ResourceSearchQuery {
+                            url: Some(other_system.clone()),
+                            count: Some(1),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .ok()
+                    .map(|hits| !hits.is_empty())
+                    .unwrap_or(false);
+                    if !cs_exists {
+                        continue;
+                    }
+                    let cs_version = state
+                        .backend()
+                        .code_system_version_for_url(&ctx, other_system)
+                        .await
+                        .ok()
+                        .flatten();
+                    // Per-coding lookup: does the code exist in the CS at all?
+                    let req = ValidateCodeRequest {
+                        url: None,
+                        value_set_version: None,
+                        system: Some(other_system.clone()),
+                        code: other_code.clone(),
+                        version: None,
+                        display: None,
+                        date: None,
+                        include_abstract: None,
+                        input_form: None,
+                        lenient_display_validation: None,
+                        default_value_set_versions: std::collections::HashMap::new(),
+                    };
+                    let code_in_cs =
+                        CodeSystemOperations::validate_code(state.backend(), &ctx, req)
+                            .await
+                            .map(|r| r.result)
+                            .unwrap_or(false);
+                    if code_in_cs {
+                        continue;
+                    }
+                    // Hard failure: emit `Unknown_Code_in_Version` error +
+                    // `None_of_the_provided_codes_are_in_the_value_set_one` info.
+                    let cs_text = match cs_version.as_deref() {
+                        Some(v) => format!(
+                            "Unknown code '{other_code}' in the CodeSystem \
+                             '{other_system}' version '{v}'"
+                        ),
+                        None => format!(
+                            "Unknown code '{other_code}' in the CodeSystem '{other_system}'"
+                        ),
+                    };
+                    accumulated_issues.push(ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "code-invalid".into(),
+                        tx_code: "invalid-code".into(),
+                        text: cs_text,
+                        expression: Some(format!("CodeableConcept.coding[{other_idx}].code")),
+                        location: None,
+                        message_id: Some("Unknown_Code_in_Version".into()),
+                    });
+                    let other_disp =
+                        coding_displays.get(&(other_system.clone(), other_code.clone()));
+                    let other_ver =
+                        coding_versions.get(&(other_system.clone(), other_code.clone()));
+                    let qualified = match (other_ver, other_disp) {
+                        (Some(v), Some(d)) => {
+                            format!("{other_system}|{v}#{other_code} ('{d}')")
+                        }
+                        (Some(v), None) => format!("{other_system}|{v}#{other_code}"),
+                        (None, Some(d)) => format!("{other_system}#{other_code} ('{d}')"),
+                        (None, None) => format!("{other_system}#{other_code}"),
+                    };
+                    accumulated_issues.push(ValidationIssue {
+                        severity: "information".into(),
+                        fhir_code: "code-invalid".into(),
+                        tx_code: "this-code-not-in-vs".into(),
+                        text: format!(
+                            "The provided code '{qualified}' was not found in the \
+                             value set '{url_with_version}'"
+                        ),
+                        expression: Some(format!(
+                            "CodeableConcept.coding[{other_idx}].code"
+                        )),
+                        location: None,
+                        message_id: Some(
+                            "None_of_the_provided_codes_are_in_the_value_set_one".into(),
+                        ),
+                    });
+                }
+                let has_bad_codings = !accumulated_issues.is_empty();
+                let mut hybrid_resp = resp.clone();
+                if has_bad_codings {
+                    hybrid_resp.result = false;
+                    hybrid_resp.issues.extend(accumulated_issues);
+                    // Promote the first error issue's text to `message`
+                    // (matches IG fixture: top-level `message` echoes the
+                    // unknown-code error text).
+                    if let Some(first_err) =
+                        hybrid_resp.issues.iter().find(|i| i.severity == "error")
+                    {
+                        hybrid_resp.message = Some(first_err.text.clone());
+                    }
+                }
                 let mut value = build_validate_response_async(
                     state.backend(),
                     &ctx,
-                    resp,
+                    hybrid_resp,
                     Some(&code),
                     Some(&system),
                     cc_value.as_ref(),
@@ -3379,6 +3827,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     Some(&url),
                     display_language.as_deref(),
                     coding_display.as_deref(),
+                    &supplements,
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
@@ -3420,6 +3869,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     Some(&url),
                     display_language.as_deref(),
                     coding_display.as_deref(),
+                    &supplements,
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
@@ -3443,6 +3893,51 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                         }
                     }
                 }
+                return Ok(value);
+            }
+            // Display-only failure: the coding's code+system matched the VS
+            // but the supplied display didn't match the concept's known
+            // displays/designations. The IG
+            // `validation/simple-codeableconcept-bad-display(W)` fixtures
+            // (single-coding CC) expect this coding to win — echo its data
+            // with the backend-emitted `invalid-display` issue intact.
+            //
+            // Limited to the single-coding case so multi-coding CCs (e.g.
+            // `complex-codeableconcept-full`) still fall through to the
+            // comprehensive issue-collection path below.
+            //
+            // Detected by: (a) we have an `invalid-display` issue, and
+            // (b) we don't also have a "code not in VS" / "code not in CS"
+            // failure (which would mean the code itself didn't validate).
+            let has_invalid_display = resp
+                .issues
+                .iter()
+                .any(|i| i.tx_code == "invalid-display");
+            let has_real_failure = resp.issues.iter().any(|i| {
+                matches!(
+                    i.tx_code.as_str(),
+                    "not-in-vs" | "this-code-not-in-vs" | "invalid-code" | "not-found"
+                )
+            });
+            if codings.len() == 1 && has_invalid_display && !has_real_failure {
+                let coding_display = coding_displays
+                    .get(&(system.clone(), code.clone()))
+                    .cloned();
+                let mut value = build_validate_response_async(
+                    state.backend(),
+                    &ctx,
+                    resp,
+                    Some(&code),
+                    Some(&system),
+                    cc_value.as_ref(),
+                    RequestPath::CodeableConcept,
+                    Some(&url),
+                    display_language.as_deref(),
+                    coding_display.as_deref(),
+                    &supplements,
+                )
+                .await;
+                append_used_supplements(&mut value, &supplements);
                 return Ok(value);
             }
         }
@@ -3476,6 +3971,18 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             Some(v) => format!("{url}|{v}"),
             None => url.clone(),
         };
+
+        // `valueset-membership-only=true` (IG
+        // `validation/complex-codeableconcept-vsonly`) tells the server to
+        // report only VS-membership issues; per-CodeSystem diagnostics
+        // (`Unknown_Code_in_Version`, `UNKNOWN_CODESYSTEM`) are suppressed.
+        let membership_only = params
+            .iter()
+            .find(|p| {
+                p.get("name").and_then(|v| v.as_str()) == Some("valueset-membership-only")
+            })
+            .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
 
         // TX_GENERAL_CC_ERROR_MESSAGE: top-level "no valid coding" error.
         // The IG fixtures do NOT expect location or expression on this issue.
@@ -3543,7 +4050,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 false
             };
 
-            if cs_exists && !code_in_cs {
+            if cs_exists && !code_in_cs && !membership_only {
                 let cs_text = match cs_version.as_deref() {
                     Some(v) => {
                         format!("Unknown code '{code}' in the CodeSystem '{system}' version '{v}'")
@@ -3559,7 +4066,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     location: None,
                     message_id: Some("Unknown_Code_in_Version".into()),
                 });
-            } else if !cs_exists {
+            } else if !cs_exists && !membership_only {
                 // CS not found: emit per-coding UNKNOWN_CODESYSTEM issue. Per
                 // IG fixture (validation/simple-codeableconcept-bad-system),
                 // text quotes the CS URL with single-quotes. Location goes
@@ -3655,6 +4162,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 inactive: None,
                 issues,
                 caused_by_unknown_system: None,
+                concept_status: None,
             },
             None,
             None,

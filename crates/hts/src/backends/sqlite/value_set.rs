@@ -408,6 +408,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     designations: vec![],
 
                                     properties: vec![],
+                                    extensions: vec![],
                                     contains: vec![],
                                 })
                             })
@@ -1167,12 +1168,31 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     // candidate is from a *different* version and the code
                     // is absent at the pinned version, return None so the
                     // not-in-vs / Unknown_Code_in_Version diagnostics fire.
+                    //
+                    // Exception: when the requested version itself does not
+                    // exist as a stored CS row (e.g. caller pins systemVersion
+                    // 2.4.0 for a CS that only has 1.0.0/1.2.0), the failure is
+                    // UNKNOWN_CODESYSTEM_VERSION rather than
+                    // Unknown_Code_in_Version. In that case the IG fixtures
+                    // (`code-vbb-vs10`, `code-vbb-vsnn`, `simple-code-bad-version1`,
+                    // etc.) expect the response to still echo the lone
+                    // candidate's display so the consumer can see which code's
+                    // metadata is being shown — fall back to the legacy
+                    // behaviour of returning the candidate.
                     let single = candidates.into_iter().next().cloned();
                     let code_at_req = single
                         .as_ref()
                         .map(|c| is_code_in_cs_at_version(&conn, &c.system, req_v, &c.code))
                         .unwrap_or(false);
-                    if code_at_req { single } else { None }
+                    let req_version_exists = single
+                        .as_ref()
+                        .map(|c| cs_version_exists(&conn, &c.system, req_v))
+                        .unwrap_or(false);
+                    if code_at_req || !req_version_exists {
+                        single
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -1277,6 +1297,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     inactive: None,
                     issues,
                     caused_by_unknown_system: caused_by,
+                    concept_status: None,
                 });
             }
 
@@ -1704,6 +1725,7 @@ fn fetch_cache(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionContains>,
             designations: vec![],
 
             properties: vec![],
+            extensions: vec![],
             contains: vec![],
         })
     })
@@ -1735,6 +1757,7 @@ fn fetch_cache_legacy(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionCon
             inactive: None,
             designations: vec![],
             properties: vec![],
+            extensions: vec![],
             contains: vec![],
         })
     })
@@ -1846,6 +1869,7 @@ fn expand_inline_plain_fts(
                 designations: vec![],
 
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             });
         }
@@ -2093,6 +2117,7 @@ fn expand_inline_filtered(
                         designations: vec![],
 
                         properties: vec![],
+                        extensions: vec![],
                         contains: vec![],
                     });
                 }
@@ -2135,6 +2160,7 @@ fn expand_inline_filtered(
                                 designations: vec![],
 
                                 properties: vec![],
+                                extensions: vec![],
                                 contains: vec![],
                             })
                         },
@@ -2170,6 +2196,7 @@ fn expand_inline_filtered(
                                 designations: vec![],
 
                                 properties: vec![],
+                                extensions: vec![],
                                 contains: vec![],
                             })
                         },
@@ -2728,6 +2755,7 @@ fn expand_includes_per_clause(
                     inactive: None,
                     designations: vec![],
                     properties: vec![],
+                    extensions: vec![],
                     contains: vec![],
                 });
             }
@@ -2840,6 +2868,7 @@ fn expand_single_include_local(
                 inactive: None,
                 designations: vec![],
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             });
         }
@@ -2892,6 +2921,7 @@ fn expand_single_include_local(
                         inactive: None,
                         designations: vec![],
                         properties: vec![],
+                        extensions: vec![],
                         contains: vec![],
                     });
                 }
@@ -2917,6 +2947,7 @@ fn expand_single_include_local(
                 inactive: None,
                 designations: vec![],
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             })
         })
@@ -3381,6 +3412,7 @@ fn apply_compose_filters(
                 designations: vec![],
 
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             })
             .collect();
@@ -3617,6 +3649,7 @@ fn try_multi_include_property_only(
                 designations: vec![],
 
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             })
         })
@@ -3673,6 +3706,7 @@ fn query_subtree_with_property(
         designations: vec![],
 
         properties: vec![],
+        extensions: vec![],
         contains: vec![],
     };
 
@@ -3771,6 +3805,7 @@ fn query_property_eq(
             designations: vec![],
 
             properties: vec![],
+            extensions: vec![],
             contains: vec![],
         })
         .collect())
@@ -3899,6 +3934,7 @@ fn query_ancestors_full(
                 designations: vec![],
 
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             })
         })
@@ -3984,6 +4020,7 @@ fn query_regex_match(
                 inactive: None,
                 designations: vec![],
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             })
             .collect())
@@ -4025,6 +4062,7 @@ fn query_regex_match(
                     inactive: None,
                     designations: vec![],
                     properties: vec![],
+                    extensions: vec![],
                     contains: vec![],
                 });
             }
@@ -4064,6 +4102,7 @@ fn query_direct_children(
                 inactive: None,
                 designations: vec![],
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             })
         })
@@ -4141,6 +4180,7 @@ fn fts_candidates_for_system(
                 designations: vec![],
 
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             })
         })
@@ -4628,6 +4668,7 @@ fn compose_page_fast(
             designations: vec![],
 
             properties: vec![],
+            extensions: vec![],
             contains: vec![],
         });
     }
@@ -4753,6 +4794,7 @@ fn bfs_expand_page(
                                     designations: vec![],
 
                                     properties: vec![],
+                                    extensions: vec![],
                                     contains: vec![],
                                 })
                             },
@@ -4787,6 +4829,7 @@ fn bfs_expand_page(
                             designations: vec![],
 
                             properties: vec![],
+                            extensions: vec![],
                             contains: vec![],
                         })
                     },
@@ -4814,6 +4857,7 @@ fn bfs_expand_page(
                         designations: vec![],
 
                         properties: vec![],
+                        extensions: vec![],
                         contains: vec![],
                     })
                 })
@@ -4875,6 +4919,7 @@ fn bfs_isa_page(
             designations: vec![],
 
             properties: vec![],
+            extensions: vec![],
             contains: vec![],
         })
     };
@@ -5378,6 +5423,20 @@ fn is_code_in_cs_at_version(
          WHERE s.url = ?1 AND s.version = ?2 AND c.code = ?3
          LIMIT 1",
         rusqlite::params![system_url, version, code],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Returns true when the (system_url, version) pair is stored as a CS row.
+/// Used to distinguish "version exists but code missing" (drives the
+/// Unknown_Code_in_Version diagnostic) from "version itself doesn't exist"
+/// (drives UNKNOWN_CODESYSTEM_VERSION). The two cases produce different
+/// response shapes per the IG `version/*-vbb-*` fixtures.
+fn cs_version_exists(conn: &Connection, system_url: &str, version: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM code_systems WHERE url = ?1 AND version = ?2 LIMIT 1",
+        rusqlite::params![system_url, version],
         |_| Ok(()),
     )
     .is_ok()
@@ -6114,6 +6173,7 @@ fn finish_validate_code_response(
                             message_id: Some("UNKNOWN_CODE_IN_FRAGMENT".into()),
                         }],
                         caused_by_unknown_system: None,
+                        concept_status: None,
                     });
                 }
             }
@@ -6235,6 +6295,7 @@ fn finish_validate_code_response(
                 },
                 issues,
                 caused_by_unknown_system: None,
+                concept_status: None,
             })
         }
         Some(concept) => {
@@ -6279,6 +6340,7 @@ fn finish_validate_code_response(
                     inactive: None,
                     issues,
                     caused_by_unknown_system: None,
+                    concept_status: None,
                 });
             }
             // Inactive: the IG fixtures expect a warning-severity
@@ -6375,6 +6437,7 @@ fn finish_validate_code_response(
                 inactive: if is_inactive { Some(true) } else { None },
                 issues,
                 caused_by_unknown_system: None,
+                concept_status: None,
             })
         }
     }
@@ -6438,6 +6501,7 @@ fn validate_fhir_vs(
                 designations: vec![],
 
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             }))
         }
@@ -6480,6 +6544,7 @@ fn validate_fhir_vs(
                 designations: vec![],
 
                 properties: vec![],
+                extensions: vec![],
                 contains: vec![],
             }))
         }
@@ -6617,6 +6682,7 @@ fn lookup_in_implicit_cache(
                     designations: vec![],
 
                     properties: vec![],
+                    extensions: vec![],
                     contains: vec![],
                 })
             },
@@ -6641,6 +6707,7 @@ fn lookup_in_implicit_cache(
                     designations: vec![],
 
                     properties: vec![],
+                    extensions: vec![],
                     contains: vec![],
                 })
             },
@@ -6882,6 +6949,7 @@ fn page_in_memory(
         designations: vec![],
 
         properties: vec![],
+        extensions: vec![],
         contains: vec![],
     };
 
@@ -7202,6 +7270,7 @@ fn implicit_cache_page(
                         designations: vec![],
 
                         properties: vec![],
+                        extensions: vec![],
                         contains: vec![],
                     })
                 })
@@ -7238,6 +7307,7 @@ fn implicit_cache_page(
                         designations: vec![],
 
                         properties: vec![],
+                        extensions: vec![],
                         contains: vec![],
                     })
                 })
@@ -7270,6 +7340,7 @@ fn implicit_cache_page(
                     designations: vec![],
 
                     properties: vec![],
+                    extensions: vec![],
                     contains: vec![],
                 })
             })

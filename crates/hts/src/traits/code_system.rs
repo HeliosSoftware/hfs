@@ -162,6 +162,38 @@ pub trait CodeSystemOperations: Send + Sync {
     ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
         Ok(std::collections::HashMap::new())
     }
+
+    /// Fetch the raw `concept[]` JSON entries for a list of codes from the
+    /// base CodeSystem identified by `system_url`. Returns the entries as
+    /// stored in the CodeSystem's `resource_json` so callers can read
+    /// `extension[]`, `designation[].extension[]`, and `property[]` arrays
+    /// that aren't otherwise broken out into the schema.
+    ///
+    /// Default implementation returns an empty map so backends without
+    /// resource_json access degrade silently.
+    async fn concept_resource_entries(
+        &self,
+        _ctx: &TenantContext,
+        _system_url: &str,
+        _codes: &[String],
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>, HtsError> {
+        Ok(std::collections::HashMap::new())
+    }
+
+    /// Same as [`Self::concept_resource_entries`] but for supplement
+    /// CodeSystems. `supplement_urls` are the canonical URLs of stored
+    /// `content=supplement` CodeSystems whose concept entries should be
+    /// surfaced.
+    ///
+    /// Default implementation returns an empty map.
+    async fn supplement_concept_entries(
+        &self,
+        _ctx: &TenantContext,
+        _supplement_urls: &[String],
+        _codes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<serde_json::Value>>, HtsError> {
+        Ok(std::collections::HashMap::new())
+    }
 }
 
 /// Resolved supplement metadata returned by

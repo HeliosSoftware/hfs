@@ -181,6 +181,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             message_id: Some("UNKNOWN_CODESYSTEM".into()),
                         }],
                         caused_by_unknown_system: None,
+                        concept_status: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -244,6 +245,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                                 message_id: Some("UNKNOWN_CODE_IN_FRAGMENT".into()),
                             }],
                             caused_by_unknown_system: None,
+                            concept_status: None,
                         });
                     }
                     let text = match cs_version_str.as_deref() {
@@ -273,6 +275,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             message_id: Some("Unknown_Code_in_Version".into()),
                         }],
                         caused_by_unknown_system: None,
+                        concept_status: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -314,6 +317,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 inactive: None,
                 issues,
                 caused_by_unknown_system: None,
+                concept_status: None,
             })
         })
         .await
@@ -1077,6 +1081,130 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         })
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn concept_resource_entries(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>, HtsError> {
+        if codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let pool = self.pool().clone();
+        let system_url = system_url.to_string();
+        let codes = codes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            // Read the base CodeSystem's resource_json (highest version), then
+            // walk concept[] picking entries whose code is in the requested set.
+            let resource_json: Option<String> = conn
+                .query_row(
+                    "SELECT resource_json FROM code_systems
+                     WHERE url = ?1 AND content != 'supplement'
+                     ORDER BY COALESCE(version, '') DESC LIMIT 1",
+                    rusqlite::params![system_url],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten();
+            let mut out: std::collections::HashMap<String, serde_json::Value> =
+                std::collections::HashMap::new();
+            if let Some(json_str) = resource_json {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    walk_concepts(&v, &codes, &mut out);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn supplement_concept_entries(
+        &self,
+        _ctx: &TenantContext,
+        supplement_urls: &[String],
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<serde_json::Value>>, HtsError> {
+        if supplement_urls.is_empty() || codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let pool = self.pool().clone();
+        let supplement_urls = supplement_urls.to_vec();
+        let codes = codes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            let placeholders = (1..=supplement_urls.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT resource_json FROM code_systems
+                 WHERE url IN ({placeholders}) AND content = 'supplement'",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let mut params: Vec<&dyn rusqlite::ToSql> =
+                Vec::with_capacity(supplement_urls.len());
+            for u in &supplement_urls {
+                params.push(u as &dyn rusqlite::ToSql);
+            }
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let mut out: std::collections::HashMap<String, Vec<serde_json::Value>> =
+                std::collections::HashMap::new();
+            for r in rows {
+                let json_str_opt =
+                    r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let Some(json_str) = json_str_opt else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+                    continue;
+                };
+                let mut local: std::collections::HashMap<String, serde_json::Value> =
+                    std::collections::HashMap::new();
+                walk_concepts(&v, &codes, &mut local);
+                for (code, entry) in local {
+                    out.entry(code).or_default().push(entry);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+}
+
+/// Recursively walk `concept[]` arrays in a CodeSystem JSON value, accumulating
+/// each concept whose `code` matches one of `codes` into `out`. Used to pull
+/// the original concept JSON (with extensions, designations, properties) from
+/// `resource_json` when that data isn't broken out into the SQL schema.
+fn walk_concepts(
+    resource: &serde_json::Value,
+    codes: &[String],
+    out: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    let Some(concepts) = resource.get("concept").and_then(|c| c.as_array()) else {
+        return;
+    };
+    for c in concepts {
+        if let Some(code) = c.get("code").and_then(|v| v.as_str()) {
+            if codes.iter().any(|x| x == code) && !out.contains_key(code) {
+                out.insert(code.to_string(), c.clone());
+            }
+        }
+        walk_concepts(c, codes, out);
     }
 }
 

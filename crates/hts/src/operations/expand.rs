@@ -137,34 +137,68 @@ fn serialize_expansion_contains(
     c: &ExpansionContains,
     multi_version_systems: &std::collections::HashSet<String>,
 ) -> Value {
-    let mut item = json!({
-        "system": c.system,
-        "code": c.code,
-    });
+    let mut item = serde_json::Map::new();
+    // Concept-level extensions appear FIRST in the IG fixtures (the FHIR
+    // canonical ordering puts `extension` ahead of `system` for any element).
+    if !c.extensions.is_empty() {
+        item.insert("extension".into(), json!(c.extensions));
+    }
+    item.insert("system".into(), json!(c.system));
+    item.insert("code".into(), json!(c.code));
     if let Some(display) = &c.display {
-        item["display"] = json!(display);
+        item.insert("display".into(), json!(display));
     }
     // Only emit version when the expansion mixes multiple versions of this
     // system — for single-version CSes the version is implicit (and the IG
     // fixtures don't expect it in the contains items).
     if multi_version_systems.contains(&c.system) {
         if let Some(version) = &c.version {
-            item["version"] = json!(version);
+            item.insert("version".into(), json!(version));
         }
     }
     // FHIR expansion.contains.abstract / .inactive — only emit when true.
-    // Both flags signal that the concept exists in the system but should not
-    // be selected by users (abstract = grouper / placeholder; inactive = the
-    // concept's status is no longer current).
     if c.is_abstract == Some(true) {
-        item["abstract"] = json!(true);
+        item.insert("abstract".into(), json!(true));
     }
     if c.inactive == Some(true) {
-        item["inactive"] = json!(true);
+        item.insert("inactive".into(), json!(true));
+    }
+    if !c.designations.is_empty() {
+        let designations: Vec<Value> = c
+            .designations
+            .iter()
+            .map(|d| {
+                let mut entry = serde_json::Map::new();
+                if !d.extensions.is_empty() {
+                    entry.insert("extension".into(), json!(d.extensions));
+                }
+                if let Some(lang) = &d.language {
+                    entry.insert("language".into(), json!(lang));
+                }
+                if d.use_system.is_some() || d.use_code.is_some() {
+                    let mut us = serde_json::Map::new();
+                    if let Some(s) = &d.use_system {
+                        us.insert("system".into(), json!(s));
+                    }
+                    if let Some(c) = &d.use_code {
+                        us.insert("code".into(), json!(c));
+                    }
+                    entry.insert("use".into(), Value::Object(us));
+                }
+                entry.insert("value".into(), json!(d.value));
+                Value::Object(entry)
+            })
+            .collect();
+        item.insert("designation".into(), json!(designations));
     }
     if !c.properties.is_empty() {
-        let props: Vec<Value> = c
-            .properties
+        // Sort by property code for stable, IG-fixture-matching output. The
+        // fixtures (e.g. extensions/expand-echo-all) emit
+        // `contains[].property[]` in alphabetical-by-code order regardless
+        // of insertion order at the contributor sources.
+        let mut sorted_props = c.properties.clone();
+        sorted_props.sort_by(|a, b| a.code.cmp(&b.code));
+        let props: Vec<Value> = sorted_props
             .iter()
             .map(|p| {
                 // Map our internal type label to a FHIR `value[x]` field.
@@ -180,37 +214,21 @@ fn serialize_expansion_contains(
                     json!(p.value == "true")
                 } else if key == "valueInteger" {
                     json!(p.value.parse::<i64>().unwrap_or(0))
+                } else if key == "valueDecimal" {
+                    if let Ok(i) = p.value.parse::<i64>() {
+                        json!(i)
+                    } else if let Ok(f) = p.value.parse::<f64>() {
+                        json!(f)
+                    } else {
+                        json!(p.value)
+                    }
                 } else {
                     json!(p.value)
                 };
                 json!({ "code": p.code, key: value })
             })
             .collect();
-        item["property"] = json!(props);
-    }
-    if !c.designations.is_empty() {
-        let designations: Vec<Value> = c
-            .designations
-            .iter()
-            .map(|d| {
-                let mut entry = json!({ "value": d.value });
-                if let Some(lang) = &d.language {
-                    entry["language"] = json!(lang);
-                }
-                if d.use_system.is_some() || d.use_code.is_some() {
-                    let mut us = serde_json::Map::new();
-                    if let Some(s) = &d.use_system {
-                        us.insert("system".into(), json!(s));
-                    }
-                    if let Some(c) = &d.use_code {
-                        us.insert("code".into(), json!(c));
-                    }
-                    entry["use"] = Value::Object(us);
-                }
-                entry
-            })
-            .collect();
-        item["designation"] = json!(designations);
+        item.insert("property".into(), json!(props));
     }
     if !c.contains.is_empty() {
         let nested: Vec<Value> = c
@@ -218,9 +236,9 @@ fn serialize_expansion_contains(
             .iter()
             .map(|child| serialize_expansion_contains(child, multi_version_systems))
             .collect();
-        item["contains"] = json!(nested);
+        item.insert("contains".into(), json!(nested));
     }
-    item
+    Value::Object(item)
 }
 
 /// Resolve `is_abstract` / `inactive` flags on each expansion entry via a
@@ -296,6 +314,7 @@ fn populate_designations<'a, B: TerminologyBackend>(
                             use_system: d.use_system,
                             use_code: d.use_code,
                             value: d.value,
+                            extensions: vec![],
                         })
                         .collect();
                     map.insert(((*system).to_string(), code), entries);
@@ -483,6 +502,7 @@ fn apply_supplement_designations<'a, B: TerminologyBackend>(
                     use_system: d.use_system,
                     use_code: d.use_code,
                     value: d.value,
+                    extensions: vec![],
                 })
                 .collect();
             by_code.insert(code, entries);
@@ -558,6 +578,282 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
     })
 }
 
+/// Standards-extension URLs that surface as concept-level FHIR extensions on
+/// `expansion.contains[].extension[]`. Each entry has a corresponding URL
+/// literal in the FHIR-published "rendering" StructureDefinitions. See:
+/// <https://hl7.org/fhir/extensions/StructureDefinition-rendering-style.html>
+/// and <https://hl7.org/fhir/extensions/StructureDefinition-rendering-xhtml.html>.
+const PASSTHROUGH_CONCEPT_EXTENSIONS: &[&str] = &[
+    "http://hl7.org/fhir/StructureDefinition/rendering-style",
+    "http://hl7.org/fhir/StructureDefinition/rendering-xhtml",
+    "http://hl7.org/fhir/StructureDefinition/valueset-concept-definition",
+    "http://hl7.org/fhir/StructureDefinition/valueset-deprecated",
+];
+
+/// Concept-level extension URLs whose value gets synthesised into a
+/// concept-property entry on `expansion.contains[].property[]` rather than
+/// appearing as a literal `extension[]` entry. The mapping (extension URL →
+/// FHIR concept-property code) follows the ordering convention in the IG
+/// `extensions/extensions-all` fixture: each extension's value contributes a
+/// property whose `code` is the FHIR-canonical concept-property name and
+/// whose `uri` is `http://hl7.org/fhir/concept-properties#<code>`.
+fn extension_to_property_code(url: &str) -> Option<&'static str> {
+    match url {
+        "http://hl7.org/fhir/StructureDefinition/codesystem-conceptOrder" => Some("order"),
+        "http://hl7.org/fhir/StructureDefinition/codesystem-label" => Some("label"),
+        "http://hl7.org/fhir/StructureDefinition/itemWeight" => Some("weight"),
+        // The concept-level `structuredefinition-standards-status` extension
+        // synthesises a `status` property when its valueCode is `deprecated`
+        // or `withdrawn` (consistent with the IG extensions/extensions-all
+        // expectation that only deprecated/withdrawn concepts surface a
+        // status row in the expansion).
+        "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status" => {
+            Some("status")
+        }
+        _ => None,
+    }
+}
+
+/// Determine the FHIR `value[x]` field on an extension JSON object. Returns
+/// the type label (e.g. "Decimal", "String", "Code") and a canonical string
+/// representation of the value, matching the convention used by
+/// [`crate::types::ExpansionContainsProperty`].
+fn extension_value_for_property(ext: &Value) -> Option<(&'static str, String)> {
+    if let Some(v) = ext.get("valueDecimal") {
+        if let Some(f) = v.as_f64() {
+            return Some(("Decimal", normalize_decimal(f)));
+        }
+        if let Some(i) = v.as_i64() {
+            return Some(("Decimal", i.to_string()));
+        }
+    }
+    if let Some(v) = ext.get("valueInteger").and_then(|v| v.as_i64()) {
+        return Some(("Decimal", v.to_string()));
+    }
+    if let Some(v) = ext.get("valueString").and_then(|v| v.as_str()) {
+        return Some(("String", v.to_string()));
+    }
+    if let Some(v) = ext.get("valueCode").and_then(|v| v.as_str()) {
+        return Some(("Code", v.to_string()));
+    }
+    if let Some(v) = ext.get("valueBoolean").and_then(|v| v.as_bool()) {
+        return Some(("Boolean", v.to_string()));
+    }
+    None
+}
+
+/// Render a finite f64 as the shortest decimal string that round-trips, to
+/// avoid surfacing artifacts like `1.2000000000000002`. Falls back to the
+/// default Display when the value is integral.
+fn normalize_decimal(f: f64) -> String {
+    if f.fract() == 0.0 {
+        format!("{}", f as i64)
+    } else {
+        // 6 fractional digits is enough precision for the IG fixtures and
+        // strips trailing zeros via the trim_end_matches step.
+        let s = format!("{f:.6}");
+        let trimmed = s.trim_end_matches('0').trim_end_matches('.').to_string();
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            trimmed
+        }
+    }
+}
+
+/// Walk every `contains[]` entry, fetch its concept resource JSON from the
+/// base CodeSystem and any applied supplements, and merge:
+/// - concept-level passthrough extensions (rendering-style, rendering-xhtml,
+///   valueset-concept-definition, valueset-deprecated) into `c.extensions`,
+/// - per-designation extensions (coding-sctdescid,
+///   structuredefinition-standards-status) into the matching designation's
+///   `extensions` field,
+/// - synthesised concept properties (order/label/weight/status) derived from
+///   well-known concept-level extensions, into `c.properties`.
+///
+/// Processed alongside (and after) the existing
+/// [`populate_properties`] / [`apply_supplement_properties`] calls so the
+/// resulting property set is the union of (a) declared concept properties,
+/// (b) well-known extension-derived properties.
+fn apply_concept_extension_data<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+    supplement_urls: &'a [String],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::{ExpansionContainsDesignation, ExpansionContainsProperty};
+        use std::collections::HashMap;
+        // Bucket codes per system for one batched lookup per system.
+        let mut by_system: HashMap<String, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.clone())
+                .or_default()
+                .push(c.code.clone());
+        }
+        // For each system: fetch base concept entries and supplement
+        // concept entries (one map per system).
+        let mut base_entries: HashMap<(String, String), Value> = HashMap::new();
+        let mut supp_entries: HashMap<(String, String), Vec<Value>> = HashMap::new();
+        for (system, codes) in &by_system {
+            if let Ok(map) = backend
+                .concept_resource_entries(ctx, system, codes)
+                .await
+            {
+                for (code, entry) in map {
+                    base_entries.insert((system.clone(), code), entry);
+                }
+            }
+            if !supplement_urls.is_empty() {
+                if let Ok(map) = backend
+                    .supplement_concept_entries(ctx, supplement_urls, codes)
+                    .await
+                {
+                    for (code, entries) in map {
+                        supp_entries.insert((system.clone(), code), entries);
+                    }
+                }
+            }
+        }
+
+        for c in contains.iter_mut() {
+            // Order the contributing entries: base first, then any supplement
+            // overrides (later wins for properties; for extensions the IG
+            // expects supplement values to OVERRIDE the base for the same
+            // URL — see `extensions-enumerated` which expects the supplement
+            // rendering-style/rendering-xhtml on code2 instead of base).
+            let mut sources: Vec<&Value> = Vec::new();
+            if let Some(base) = base_entries.get(&(c.system.clone(), c.code.clone())) {
+                sources.push(base);
+            }
+            if let Some(extras) = supp_entries.get(&(c.system.clone(), c.code.clone())) {
+                for e in extras {
+                    sources.push(e);
+                }
+            }
+
+            // Pass 1: passthrough concept-level extensions. Supplement
+            // entries OVERRIDE the base for the same URL — drop any prior
+            // entry with the same url before pushing.
+            for src in &sources {
+                let Some(exts) = src.get("extension").and_then(|e| e.as_array()) else {
+                    continue;
+                };
+                for ext in exts {
+                    let url = match ext.get("url").and_then(|u| u.as_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if !PASSTHROUGH_CONCEPT_EXTENSIONS.contains(&url) {
+                        continue;
+                    }
+                    c.extensions
+                        .retain(|existing| existing.get("url").and_then(|u| u.as_str()) != Some(url));
+                    c.extensions.push(ext.clone());
+                }
+            }
+
+            // Pass 2: synthesise properties from well-known extensions.
+            // Supplement-provided values override base for the same property
+            // code (so e.g. base codesystem-conceptOrder=6 → order=6, but a
+            // supplement codesystem-conceptOrder would override it).
+            for src in &sources {
+                let Some(exts) = src.get("extension").and_then(|e| e.as_array()) else {
+                    continue;
+                };
+                for ext in exts {
+                    let url = match ext.get("url").and_then(|u| u.as_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let Some(prop_code) = extension_to_property_code(url) else {
+                        continue;
+                    };
+                    let Some((value_type, value)) = extension_value_for_property(ext) else {
+                        continue;
+                    };
+                    // For the standards-status → status mapping, only emit
+                    // when the status is deprecated/withdrawn (matches IG
+                    // extensions-all expectation; an `active` status would
+                    // otherwise add noise to every concept).
+                    if prop_code == "status" && !matches!(value.as_str(), "deprecated" | "withdrawn")
+                    {
+                        continue;
+                    }
+                    // Drop any existing property with the same code so the
+                    // last-seen (supplement-overrides-base) value wins.
+                    c.properties.retain(|p| p.code != prop_code);
+                    c.properties.push(ExpansionContainsProperty {
+                        code: prop_code.to_string(),
+                        value_type: value_type.to_string(),
+                        value,
+                    });
+                }
+            }
+
+            // Pass 3: per-designation extensions. Match each base/supplement
+            // designation against the entry's existing designations by
+            // (language, value) and copy across its extension[].
+            for src in &sources {
+                let Some(desigs) = src.get("designation").and_then(|d| d.as_array()) else {
+                    continue;
+                };
+                for d in desigs {
+                    let value = match d.get("value").and_then(|v| v.as_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let language = d
+                        .get("language")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let Some(d_exts) = d.get("extension").and_then(|e| e.as_array()) else {
+                        continue;
+                    };
+                    if d_exts.is_empty() {
+                        continue;
+                    }
+                    let target = c.designations.iter_mut().find(|existing| {
+                        existing.value.eq_ignore_ascii_case(value)
+                            && existing.language == language
+                    });
+                    if let Some(t) = target {
+                        for d_ext in d_exts {
+                            let url = match d_ext.get("url").and_then(|u| u.as_str()) {
+                                Some(s) => s,
+                                None => continue,
+                            };
+                            t.extensions
+                                .retain(|e| e.get("url").and_then(|u| u.as_str()) != Some(url));
+                            t.extensions.push(d_ext.clone());
+                        }
+                    } else if !c.designations.iter().any(|existing| {
+                        existing.value.eq_ignore_ascii_case(value)
+                            && existing.language == language
+                    }) {
+                        // No matching designation existed yet — add a new one
+                        // (e.g. the supplement contributed a designation that
+                        // the base CS didn't know about).
+                        c.designations.push(ExpansionContainsDesignation {
+                            language,
+                            use_system: None,
+                            use_code: None,
+                            value: value.to_string(),
+                            extensions: d_exts.iter().cloned().collect(),
+                        });
+                    }
+                }
+            }
+
+            if !c.contains.is_empty() {
+                apply_concept_extension_data(backend, ctx, &mut c.contains, supplement_urls)
+                    .await;
+            }
+        }
+    })
+}
+
 /// Replace each contains[] entry's `display` with a designation matching the
 /// requested displayLanguage. Mirrors the `lookup()` language-aware behavior
 /// and walks nested `contains[]` recursively.
@@ -624,6 +920,22 @@ fn apply_display_language<'a, B: TerminologyBackend>(
         for c in contains.iter_mut() {
             let cs_lang = cs_lang_by_url.get(&c.system).cloned().flatten();
             let original_display = c.display.clone();
+            // When the CS's own `language` already matches the requested
+            // displayLanguage exactly, the top-level `display` is already
+            // in the requested language. Don't promote a (broader-match)
+            // designation in that case — doing so would drop the source
+            // designation entry that the IG `language/expand-echo-de-multi-de-*`
+            // fixtures expect to survive (e.g. a `de-CH` designation alongside
+            // a CS with `language=de`).
+            let cs_lang_already_matches = cs_lang.as_deref() == Some(language);
+            if cs_lang_already_matches {
+                // Skip the swap entirely; designations are preserved as-is.
+                if !c.contains.is_empty() {
+                    apply_display_language(backend, ctx, &mut c.contains, spec, cs_lang_by_url)
+                        .await;
+                }
+                continue;
+            }
             if let Some((matched_lang, matched_value)) =
                 match_map.remove(&(c.system.clone(), c.code.clone()))
             {
@@ -653,6 +965,7 @@ fn apply_display_language<'a, B: TerminologyBackend>(
                             use_system: Some(HL7_TERM_MAINT_INFRA_SYSTEM.to_string()),
                             use_code: Some("preferredForLanguage".to_string()),
                             value: orig,
+                            extensions: vec![],
                         });
                     }
                 }
@@ -673,6 +986,7 @@ fn apply_display_language<'a, B: TerminologyBackend>(
                                 use_system: Some(HL7_TERM_MAINT_INFRA_SYSTEM.to_string()),
                                 use_code: Some("preferredForLanguage".to_string()),
                                 value: orig,
+                                extensions: vec![],
                             });
                         }
                     }
@@ -1246,6 +1560,84 @@ async fn process_expand<B: TerminologyBackend>(
         }
     }
 
+    // ── Walk concept-level extensions (base + supplements) ────────────────────
+    // Surfaces well-known concept extensions (rendering-style, rendering-xhtml,
+    // valueset-concept-definition) on contains[].extension[] AND derives
+    // synthetic concept-properties (order/label/weight/status) from the
+    // {codesystem-conceptOrder, codesystem-label, itemWeight,
+    // structuredefinition-standards-status} extensions.  Drives the IG
+    // `extensions/expand-echo-{all,enumerated}` fixtures.
+    apply_concept_extension_data(
+        state.backend(),
+        &ctx,
+        &mut resp.contains,
+        &bare_supplement_urls,
+    )
+    .await;
+
+    // ── Apply VS compose-level concept extensions (valueset-deprecated etc.) ──
+    // The IG `extensions/extensions-enumerated` fixture pins per-include-concept
+    // extensions like `valueset-deprecated: true` and
+    // `valueset-concept-definition: "..."` on the compose entry; expand needs
+    // to surface those on the matching contains[] entry.
+    if let Some(vs) = source_vs.as_ref() {
+        if let Some(includes) = vs
+            .get("compose")
+            .and_then(|c| c.get("include"))
+            .and_then(|i| i.as_array())
+        {
+            for inc in includes {
+                let inc_sys = inc.get("system").and_then(|s| s.as_str());
+                let Some(concepts) = inc.get("concept").and_then(|c| c.as_array()) else {
+                    continue;
+                };
+                for concept in concepts {
+                    let Some(code) = concept.get("code").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let Some(exts) = concept.get("extension").and_then(|e| e.as_array()) else {
+                        continue;
+                    };
+                    fn merge_into_contains(
+                        list: &mut [crate::types::ExpansionContains],
+                        wanted_sys: Option<&str>,
+                        wanted_code: &str,
+                        exts: &[Value],
+                    ) {
+                        for c in list.iter_mut() {
+                            if c.code == wanted_code
+                                && wanted_sys.is_none_or(|s| s == c.system)
+                            {
+                                for ext in exts {
+                                    let url = match ext.get("url").and_then(|u| u.as_str()) {
+                                        Some(s) => s,
+                                        None => continue,
+                                    };
+                                    if !PASSTHROUGH_CONCEPT_EXTENSIONS.contains(&url) {
+                                        continue;
+                                    }
+                                    c.extensions.retain(|existing| {
+                                        existing.get("url").and_then(|u| u.as_str()) != Some(url)
+                                    });
+                                    c.extensions.push(ext.clone());
+                                }
+                            }
+                            if !c.contains.is_empty() {
+                                merge_into_contains(
+                                    &mut c.contains,
+                                    wanted_sys,
+                                    wanted_code,
+                                    exts,
+                                );
+                            }
+                        }
+                    }
+                    merge_into_contains(&mut resp.contains, inc_sys, code, exts);
+                }
+            }
+        }
+    }
+
     // ── Per-system CodeSystem metadata lookup (one search per distinct URL) ──
     // The CS resource is consulted by THREE downstream blocks:
     //   - apply_display_language (for CS.language → preferredForLanguage)
@@ -1740,9 +2132,33 @@ async fn process_expand<B: TerminologyBackend>(
     // pins so every CS that influenced the expansion shape (even ones that
     // contributed only via exclusion, e.g. `overload/overload-expand-exclude`
     // where the v1 include is fully exclude-subsumed) surfaces as a
-    // `used-codesystem` parameter.  Run unconditionally — not just on the
-    // empty-expansion fallback path — because the exclude-only contributors
-    // are missing from `contains[]` even when other includes produced rows.
+    // `used-codesystem` parameter.
+    //
+    // Skip wildcard pins (e.g. `1.x.x`) entirely — the expansion will have
+    // resolved them into concrete contains[] rows whose `(system, version)`
+    // pair already lives in `used_pairs`. Adding the raw pattern would emit
+    // a spurious extra `used-codesystem` parameter (per the IG
+    // `version/vs-expand-v-w` and `vs-expand-v-n` fixtures, which expect
+    // only the resolved concrete pair).
+    //
+    // Skip versionless pins on systems that already produced contains[]
+    // rows — the resolved-from-DB version we'd derive is exactly what's
+    // already in `used_pairs`.
+    //
+    // Skip pins for systems that have a `force-system-version` override
+    // applied — the forced version is what actually contributes; the
+    // include's pinned version becomes irrelevant (per IG
+    // `version/vs-expand-all-v-force` and `vs-expand-all-v2-force`).
+    let force_pinned_systems: std::collections::HashSet<String> = params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("force-system-version"))
+        .filter_map(|p| {
+            ["valueCanonical", "valueUri", "valueString", "valueUrl"]
+                .iter()
+                .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
+                .and_then(|s| s.split_once('|').map(|(u, _)| u.to_string()))
+        })
+        .collect();
     if let Some(vs) = source_vs.as_ref() {
         for key in ["include", "exclude"] {
             if let Some(arr) = vs
@@ -1752,10 +2168,30 @@ async fn process_expand<B: TerminologyBackend>(
             {
                 for inc in arr {
                     if let Some(sys) = inc.get("system").and_then(|s| s.as_str()) {
+                        // Skip when a force-system-version overrides this
+                        // system; the contains[] pair already reflects the
+                        // forced version.
+                        if force_pinned_systems.contains(sys) {
+                            continue;
+                        }
                         let ver = inc
                             .get("version")
                             .and_then(|v| v.as_str())
                             .map(str::to_string);
+                        // Skip wildcard pins — contains[] carries the
+                        // concrete resolution.
+                        if ver
+                            .as_deref()
+                            .is_some_and(|v| v.contains(".x") || v == "x")
+                        {
+                            continue;
+                        }
+                        // Skip versionless pins when contains[] already
+                        // covers this system — they resolve to the same
+                        // concrete (system, version) pair.
+                        if ver.is_none() && used_pairs.iter().any(|(s, _)| s == sys) {
+                            continue;
+                        }
                         // When no version pin, use the single cached CS version.
                         let resolved_ver = ver.or_else(|| {
                             cs_by_url
@@ -2166,51 +2602,24 @@ async fn process_expand<B: TerminologyBackend>(
     }
 
     // ── expansion.property declarations ──────────────────────────────────────
-    // When the caller asked for specific concept properties to surface in
-    // contains[].property, the IG fixtures expect a parallel
-    // expansion.property[] array declaring each property's code (and ideally
-    // its uri). Use a synthetic uri based on the first contributing
-    // CodeSystem when available — close enough for the IG fixture pattern.
-    if !requested_properties.is_empty() {
-        // Look up the URI for each requested property from the source
-        // CodeSystem definition (CodeSystem.property[].uri). Falls back to a
-        // synthesised URI when the CS isn't found or doesn't define a uri.
-        use std::collections::HashMap;
-        let primary_system = resp.contains.first().map(|c| c.system.clone());
-        let mut uri_by_code: HashMap<String, String> = HashMap::new();
-        if let Some(sys) = &primary_system {
-            if let Ok(mut hits) = crate::traits::CodeSystemOperations::search(
-                state.backend(),
-                &ctx,
-                crate::types::ResourceSearchQuery {
-                    url: Some(sys.clone()),
-                    count: Some(1),
-                    ..Default::default()
-                },
-            )
-            .await
-            {
-                if let Some(cs) = hits.pop() {
-                    if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
-                        for entry in props {
-                            if let (Some(code), Some(uri)) = (
-                                entry.get("code").and_then(|v| v.as_str()),
-                                entry.get("uri").and_then(|v| v.as_str()),
-                            ) {
-                                uri_by_code.insert(code.to_string(), uri.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // The IG fixtures expect a parallel `expansion.property[]` array declaring
+    // each property's `code` and (ideally) `uri` whenever ANY contains entry
+    // carries a property — whether driven by an explicit `property` request
+    // param or by an extension-derived synthesis (label/order/weight/status).
+    //
+    // Build the union of (a) caller-requested property codes and (b) every
+    // distinct property code currently surfaced on a contains[] entry. This
+    // means extension-derived properties (from `apply_concept_extension_data`)
+    // also get declared at the expansion level — matches the
+    // `extensions/expand-echo-{all,enumerated}` fixture shape.
+    {
         // FHIR-spec well-known concept-property URIs (
-        // http://hl7.org/fhir/concept-properties).  When a CodeSystem doesn't
-        // declare a `property[].uri` for a code we look up here so the
-        // emitted `expansion.property[].uri` still matches the IG fixtures.
+        // http://hl7.org/fhir/concept-properties).  Used as a fallback when a
+        // stored CodeSystem doesn't declare a matching `property[].uri`.
         // Mapping covers the "infrastructure" properties surfaced by HTS
         // (definition, status, inactive, deprecated, notSelectable, parent,
-        // child, partOf, synonym).
+        // child, partOf, synonym, alternateCode) plus the synthesised
+        // extension-derived properties (label, order, weight).
         fn well_known_property_uri(code: &str) -> Option<&'static str> {
             match code {
                 "definition" => Some("http://hl7.org/fhir/concept-properties#definition"),
@@ -2223,22 +2632,100 @@ async fn process_expand<B: TerminologyBackend>(
                 "partOf" => Some("http://hl7.org/fhir/concept-properties#partOf"),
                 "synonym" => Some("http://hl7.org/fhir/concept-properties#synonym"),
                 "alternateCode" => Some("http://hl7.org/fhir/concept-properties#alternateCode"),
+                "label" => Some("http://hl7.org/fhir/concept-properties#label"),
+                "order" => Some("http://hl7.org/fhir/concept-properties#order"),
+                "weight" => Some("http://hl7.org/fhir/concept-properties#itemWeight"),
                 _ => None,
             }
         }
-        let prop_decls: Vec<Value> = requested_properties
-            .iter()
-            .map(|code| {
-                let mut entry = json!({"code": code});
-                if let Some(uri) = uri_by_code.get(code) {
-                    entry["uri"] = json!(uri);
-                } else if let Some(uri) = well_known_property_uri(code) {
-                    entry["uri"] = json!(uri);
+
+        // Collect distinct property codes appearing on contains[] entries,
+        // walking nested children too. Maintain insertion order via a Vec
+        // (HashSet drops ordering and we want deterministic output).
+        fn collect_property_codes(
+            list: &[crate::types::ExpansionContains],
+            out: &mut Vec<String>,
+        ) {
+            for c in list {
+                for p in &c.properties {
+                    if !out.contains(&p.code) {
+                        out.push(p.code.clone());
+                    }
                 }
-                entry
-            })
-            .collect();
-        expansion["property"] = json!(prop_decls);
+                if !c.contains.is_empty() {
+                    collect_property_codes(&c.contains, out);
+                }
+            }
+        }
+        let mut emitted_codes: Vec<String> = Vec::new();
+        // The IG `extensions/expand-echo-all` fixture orders the property
+        // declarations as: weight, label, order, status (i.e. the extension-
+        // derived ones first in that fixed order, with status last). Mirror
+        // that convention so the fixture comparator matches.
+        let synthetic_order = ["weight", "label", "order", "status"];
+        let mut surfaced: Vec<String> = Vec::new();
+        collect_property_codes(&resp.contains, &mut surfaced);
+        for code in synthetic_order {
+            if surfaced.iter().any(|c| c == code) && !emitted_codes.iter().any(|c| c == code) {
+                emitted_codes.push(code.to_string());
+            }
+        }
+        for code in &requested_properties {
+            if !emitted_codes.contains(code) {
+                emitted_codes.push(code.clone());
+            }
+        }
+        for code in &surfaced {
+            if !emitted_codes.contains(code) {
+                emitted_codes.push(code.clone());
+            }
+        }
+
+        if !emitted_codes.is_empty() {
+            // Look up `property[].uri` from the primary contributing CS.
+            use std::collections::HashMap;
+            let primary_system = resp.contains.first().map(|c| c.system.clone());
+            let mut uri_by_code: HashMap<String, String> = HashMap::new();
+            if let Some(sys) = &primary_system {
+                if let Ok(mut hits) = crate::traits::CodeSystemOperations::search(
+                    state.backend(),
+                    &ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(sys.clone()),
+                        count: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                {
+                    if let Some(cs) = hits.pop() {
+                        if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
+                            for entry in props {
+                                if let (Some(code), Some(uri)) = (
+                                    entry.get("code").and_then(|v| v.as_str()),
+                                    entry.get("uri").and_then(|v| v.as_str()),
+                                ) {
+                                    uri_by_code.insert(code.to_string(), uri.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let prop_decls: Vec<Value> = emitted_codes
+                .iter()
+                .map(|code| {
+                    let mut entry = json!({"code": code});
+                    if let Some(uri) = uri_by_code.get(code) {
+                        entry["uri"] = json!(uri);
+                    } else if let Some(uri) = well_known_property_uri(code) {
+                        entry["uri"] = json!(uri);
+                    }
+                    entry
+                })
+                .collect();
+            expansion["property"] = json!(prop_decls);
+        }
     }
 
     // ── Copy metadata from the source ValueSet ───────────────────────────────
@@ -2253,11 +2740,16 @@ async fn process_expand<B: TerminologyBackend>(
     if let Some(ref vs) = source_vs {
         if let Some(obj) = vs.as_object() {
             // Required-by-fixtures fields plus a few common optionals. Skip
-            // `compose` deliberately: it is never required by any IG fixture
-            // (verified via survey), and our stored ValueSets often carry
+            // `compose` deliberately for stored (URL-based) VSes: IG fixtures
+            // mark `compose` as $optional$ and our stored ValueSets often carry
             // include[] entries with nested `valueSet` references or
             // `inactive` flags that the expected fixture omits — copying
             // verbatim produces "unexpected property" diffs.
+            //
+            // For INLINE VS requests (caller passed `valueSet` resource), copy
+            // `compose` and `contained` verbatim — the IG `simple/expand-
+            // contained` fixture expects them echoed (they describe what was
+            // actually expanded).
             for field in [
                 "id",
                 "language",
@@ -2272,6 +2764,14 @@ async fn process_expand<B: TerminologyBackend>(
             ] {
                 if let Some(v) = obj.get(field) {
                     response[field] = v.clone();
+                }
+            }
+            if value_set_for_response.is_some() {
+                if let Some(c) = obj.get("compose") {
+                    response["compose"] = c.clone();
+                }
+                if let Some(c) = obj.get("contained") {
+                    response["contained"] = c.clone();
                 }
             }
         }
