@@ -925,7 +925,20 @@ async fn process_expand<B: TerminologyBackend>(
         out
     }
     let force_system_versions = collect_version_pins(&params, "force-system-version");
-    let system_version_defaults = collect_version_pins(&params, "system-version");
+    let mut system_version_defaults = collect_version_pins(&params, "system-version");
+    // `check-system-version` pins act as DEFAULTs (same semantics as
+    // `system-version`) for selecting the version, but additionally trigger
+    // a post-expansion verification: if the resolved CS version doesn't
+    // satisfy the pattern, the IG fixtures expect a 4xx OperationOutcome
+    // with `version-error` / VALUESET_VERSION_CHECK.
+    let check_system_versions = collect_version_pins(&params, "check-system-version");
+    for (sys, pat) in &check_system_versions {
+        // Only inject a default when the caller hasn't already supplied one
+        // (system-version wins over check-system-version).
+        system_version_defaults
+            .entry(sys.clone())
+            .or_insert_with(|| pat.clone());
+    }
 
     // ── Cache miss: compute ───────────────────────────────────────────────────
     let req = ExpandRequest {
@@ -1552,6 +1565,59 @@ async fn process_expand<B: TerminologyBackend>(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // ── check-system-version post-expansion verification ────────────────────
+    // For every `check-system-version` pin, find the version actually used
+    // for that system in the expansion. If it doesn't satisfy the pattern,
+    // emit a 4xx OperationOutcome with VALUESET_VERSION_CHECK / version-error
+    // — matches the IG `version/vs-expand-v-w-check` fixture family.
+    if !check_system_versions.is_empty() {
+        for (chk_sys, chk_pat) in &check_system_versions {
+            // Pick any used version for this system; if multiple versions
+            // contributed (a multi-version expansion), we report on the
+            // first violator we see (matches the IG fixtures, which only
+            // exercise single-violator scenarios).
+            let mut violator: Option<String> = None;
+            for (sys, ver) in &used_pairs {
+                if sys != chk_sys {
+                    continue;
+                }
+                let v = match ver.as_deref() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if !version_satisfies_wildcard_local(v, chk_pat) {
+                    violator = Some(v.to_string());
+                    break;
+                }
+            }
+            if let Some(v) = violator {
+                let text = format!(
+                    "The version '{v}' is not allowed for system '{chk_sys}': required to be \
+                     '{chk_pat}' by a version-check parameter"
+                );
+                let body = json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [{
+                        "extension": [{
+                            "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                            "valueString": "VALUESET_VERSION_CHECK"
+                        }],
+                        "severity": "error",
+                        "code": "exception",
+                        "details": {
+                            "coding": [{
+                                "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                                "code": "version-error"
+                            }],
+                            "text": text,
+                        },
+                    }]
+                });
+                return Ok((axum::http::StatusCode::BAD_REQUEST, axum::Json(body)).into_response());
             }
         }
     }

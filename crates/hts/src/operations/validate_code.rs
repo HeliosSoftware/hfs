@@ -1711,10 +1711,20 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             // Prefer the per-coding version (embedded in the CC) over the
             // top-level `version` parameter so that version-mismatch detection
             // fires correctly for each coding.
-            let per_coding_version = coding_versions
+            let original_version = coding_versions
                 .get(&(system.clone(), code.clone()))
                 .cloned()
                 .or(cc_req_version.clone());
+            let per_coding_version = resolve_version_for_system(
+                state.backend(),
+                &ctx,
+                &system,
+                original_version.clone(),
+                &force_pins,
+                &effective_defaults,
+                source_vs.as_ref(),
+            )
+            .await;
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),
                 value_set_version: vs_version.clone(),
@@ -1734,6 +1744,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .await
                 .map_err(&rewrite)?;
             if resp.result {
+                let resolved_version = resp.cs_version.clone();
                 let mut value = build_validate_response_async(
                     state.backend(),
                     &ctx,
@@ -1746,6 +1757,23 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
+                // Apply check-system-version post-check.
+                if let Some(pat) = find_pin_for_system(&check_pins, &system) {
+                    let actual = resolved_version
+                        .clone()
+                        .or_else(|| extract_response_version(&value));
+                    if let Some(v) = actual.as_deref() {
+                        if !version_satisfies_wildcard(v, pat) {
+                            apply_check_version_failure(
+                                &mut value,
+                                &system,
+                                v,
+                                pat,
+                                RequestPath::CodeableConcept,
+                            );
+                        }
+                    }
+                }
                 return Ok(value);
             }
             // Propagate version-mismatch failures — they carry the correct
