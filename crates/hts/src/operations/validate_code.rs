@@ -3226,10 +3226,13 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
 ) -> Result<Value, HtsError> {
     let ctx = TenantContext::system();
 
-    // Extract the input coding/code (priority: coding → code).
+    // Extract the input coding/code (priority: coding → code). For the
+    // `coding` form, an empty `system` (Coding without a system field)
+    // collapses to None per FHIR spec semantics.
     let (in_system, in_code, in_display) =
         if let Some((sys, cd, disp, _ver)) = extract_coding_full(&params, "coding") {
-            (Some(sys), cd, disp)
+            let sys_opt = if sys.is_empty() { None } else { Some(sys) };
+            (sys_opt, cd, disp)
         } else if let Some(cd) = find_str_param(&params, "code") {
             (find_str_param(&params, "system"), cd, find_str_param(&params, "display"))
         } else {
@@ -3420,12 +3423,21 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
         location: None,
         message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
     };
+    // Look up the CS version for the `version` echo so the IG fixture can
+    // confirm which CS row was checked even though the code wasn't found.
+    let cs_version_lookup = match resolved_system.as_deref() {
+        Some(s) => CodeSystemOperations::code_system_version_for_url(state.backend(), &ctx, s)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
     let resp = ValidateCodeResponse {
         result: false,
         message: None,
         display: in_display.clone(),
         system: resolved_system.clone(),
-        cs_version: None,
+        cs_version: cs_version_lookup,
         inactive: None,
         issues: vec![issue],
         caused_by_unknown_system: None,
