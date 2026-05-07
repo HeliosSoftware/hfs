@@ -328,6 +328,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 inline_ctx
                     .system_version_defaults
                     .clone_from(&req.system_version_defaults);
+                inline_ctx
+                    .default_value_set_versions
+                    .clone_from(&req.default_value_set_versions);
                 let codes = if let Some(filter) = req.filter.as_deref() {
                     let limit_hint = req.count.map(|c| ((c as usize) * 3).max(100));
                     let compose_str = compose.to_string();
@@ -593,6 +596,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 &mut vec![],
                                 &req.force_system_versions,
                                 &req.system_version_defaults,
+                                &req.default_value_set_versions,
                             )?;
                             // Cache only when no version overrides were
                             // applied — caching with overrides would poison
@@ -600,22 +604,25 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             // version's codes.
                             if req.force_system_versions.is_empty()
                                 && req.system_version_defaults.is_empty()
+                                && req.default_value_set_versions.is_empty()
                             {
                                 populate_cache(&conn, &vs_id, &codes)?;
                             }
                             codes
                         } else if !req.force_system_versions.is_empty()
                             || !req.system_version_defaults.is_empty()
+                            || !req.default_value_set_versions.is_empty()
                         {
                             // Cached entries reflect the default (unforced)
                             // expansion; ignore the cache when the request
-                            // pins specific CS versions and recompute.
+                            // pins specific CS / VS versions and recompute.
                             compute_expansion_with_versions(
                                 &conn,
                                 compose_json.as_deref(),
                                 &mut vec![],
                                 &req.force_system_versions,
                                 &req.system_version_defaults,
+                                &req.default_value_set_versions,
                             )?
                         } else {
                             cached
@@ -924,10 +931,24 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     Ok((vs_id, compose_json)) => {
                         let saved = compose_json.clone();
                         let cached = fetch_cache(&conn, &vs_id)?;
-                        let codes = if cached.is_empty() {
-                            let codes =
-                                compute_expansion(&conn, compose_json.as_deref(), &mut vec![])?;
-                            populate_cache(&conn, &vs_id, &codes)?;
+                        // When a `default-valueset-version` pin is in effect the
+                        // cached entry (which reflects the unpinned expansion)
+                        // would resolve nested `valueSet[]` refs to the latest
+                        // version, so recompute fresh and skip the cache write
+                        // — same policy as the $expand path.
+                        let has_vs_pin = !req.default_value_set_versions.is_empty();
+                        let codes = if cached.is_empty() || has_vs_pin {
+                            let codes = compute_expansion_with_versions(
+                                &conn,
+                                compose_json.as_deref(),
+                                &mut vec![],
+                                &std::collections::HashMap::new(),
+                                &std::collections::HashMap::new(),
+                                &req.default_value_set_versions,
+                            )?;
+                            if !has_vs_pin {
+                                populate_cache(&conn, &vs_id, &codes)?;
+                            }
                             codes
                         } else {
                             cached
@@ -1051,14 +1072,91 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             // Search the expansion for the requested code.
             // When `system` is provided, match on both system + code.
-            // When `system` is absent, match on code alone (first hit).
-            let found = if let Some(system) = req.system.as_deref() {
+            // When `system` is absent, match on code alone.
+            //
+            // "Overload" handling: when the VS includes the same system at
+            // multiple pinned versions, the same `(system, code)` may appear
+            // more than once with different versions. To pick the right
+            // candidate:
+            //   1. If the caller pinned a version (`req.version` exact, not
+            //      a wildcard), prefer the candidate at exactly that version.
+            //   2. Otherwise, prefer the candidate with the highest version
+            //      string (latest). The IG fixtures expect the latest-version
+            //      coding to win when no caller version is supplied.
+            //   3. Fall back to display-match if multiple candidates remain.
+            //   4. Finally, fall back to the first hit.
+            let req_ver_exact: Option<&str> = req
+                .version
+                .as_deref()
+                .filter(|v| !v.contains(".x") && *v != "x");
+            let candidates: Vec<&ExpansionContains> = if let Some(system) = req.system.as_deref()
+            {
                 all_codes
                     .iter()
-                    .find(|c| c.system == system && c.code == req.code)
-                    .cloned()
+                    .filter(|c| c.system == system && c.code == req.code)
+                    .collect()
             } else {
-                all_codes.iter().find(|c| c.code == req.code).cloned()
+                all_codes.iter().filter(|c| c.code == req.code).collect()
+            };
+            let found: Option<ExpansionContains> = if candidates.is_empty() {
+                None
+            } else if let Some(req_v) = req_ver_exact {
+                // (1) Explicit version pin: take the matching version when
+                // possible. When no candidate has that exact version we
+                // still need to decide:
+                //   - In the "overload" pattern (multiple candidates from
+                //     different versions), returning None lets the
+                //     version-mismatch diagnostic surface the right error
+                //     (the IG `validate-bad-v1code4` / `validate-bad-v2code3`
+                //     fixtures expect a not-in-vs + Unknown_Code_in_Version
+                //     pair, not a phantom display match).
+                //   - In the single-include case there *is* a candidate but
+                //     the version differs; returning that candidate keeps
+                //     the legacy display echo + mismatch diagnostic the
+                //     existing tests rely on.
+                let exact = candidates
+                    .iter()
+                    .find(|c| c.version.as_deref() == Some(req_v))
+                    .copied();
+                if let Some(c) = exact {
+                    Some(c.clone())
+                } else if candidates.len() == 1 {
+                    candidates.into_iter().next().cloned()
+                } else {
+                    None
+                }
+            } else if candidates.len() == 1 {
+                candidates.into_iter().next().cloned()
+            } else {
+                // (2)+(3) No version pin and multiple candidates. Prefer a
+                // display match when the caller supplied a display, else the
+                // candidate with the highest version.
+                let display_match: Option<&ExpansionContains> = req
+                    .display
+                    .as_deref()
+                    .and_then(|d| {
+                        candidates
+                            .iter()
+                            .find(|c| {
+                                c.display
+                                    .as_deref()
+                                    .map(|cd| cd.eq_ignore_ascii_case(d))
+                                    .unwrap_or(false)
+                            })
+                            .copied()
+                    });
+                if let Some(c) = display_match {
+                    Some(c.clone())
+                } else {
+                    let mut sorted = candidates.clone();
+                    sorted.sort_by(|a, b| {
+                        b.version
+                            .as_deref()
+                            .unwrap_or("")
+                            .cmp(a.version.as_deref().unwrap_or(""))
+                    });
+                    sorted.into_iter().next().cloned()
+                }
             };
 
             // Effective system: prefer the caller's explicit system, fall back
@@ -1182,24 +1280,62 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .as_deref()
                     .map(|s| is_concept_inactive(&conn, s, &req.code))
                     .unwrap_or(false);
+            // The bare URL-level check: is the code anywhere in the CS, any
+            // version? Used as a first cut. A version-pinned caller may still
+            // see an "Unknown code in CodeSystem 'url' version 'X'" issue
+            // even when the code exists at a different version — handled by
+            // the version-scoped check below.
             let code_unknown_in_cs = found.is_none()
                 && req
                     .system
                     .as_deref()
                     .map(|s| !is_code_in_cs(&conn, s, &req.code))
                     .unwrap_or(false);
-            // cs_version priority: (1) req.version when exact, (2) VS compose pin when
-            // exact, (3) latest from DB. Wildcards are resolved/skipped since raw
-            // wildcard strings must not appear in the response.
+            // Version-scoped: when the caller pinned an exact version, the
+            // code is "unknown in this version" if it's not present at that
+            // version even if it exists at another version. The IG fixtures
+            // (validate-bad-v1code4, validate-bad-v2code3) require the
+            // Unknown_Code_in_Version issue in this case.
+            let code_unknown_in_cs_at_version = found.is_none()
+                && match (req.system.as_deref(), req.version.as_deref()) {
+                    (Some(s), Some(v)) if !v.contains(".x") && v != "x" => {
+                        !is_code_in_cs_at_version(&conn, s, v, &req.code)
+                    }
+                    _ => false,
+                };
+            let code_unknown_in_cs = code_unknown_in_cs || code_unknown_in_cs_at_version;
+            // cs_version priority for response/messaging:
+            //   (1) req.version when exact
+            //   (2) the matched concept's version (when found)
+            //   (3) VS compose pin when there is a single pin for this system
+            //   (4) latest from DB
+            // Wildcards are resolved/skipped since raw wildcard strings must
+            // not appear in the response.
+            //
+            // Rule (3) used to win unconditionally over (4), but when the VS
+            // includes the same system at multiple pinned versions
+            // ("overload" pattern), the first include is no longer a
+            // meaningful default — the IG fixtures expect the latest stored
+            // version in messages such as "Unknown code in CodeSystem 'url'
+            // version 'X'" (X = latest, not first include).
             let cs_version = req.system.as_deref().and_then(|s| {
                 let from_req = req
                     .version
                     .as_deref()
                     .filter(|v| !v.contains(".x") && *v != "x")
                     .map(str::to_string);
-                let from_compose = cs_version_from_compose(compose_json_for_version.as_deref(), s)
-                    .filter(|v| !v.contains(".x") && v.as_str() != "x");
+                let from_found = found.as_ref().and_then(|c| c.version.clone());
+                let pins = compose_json_for_version
+                    .as_deref()
+                    .and_then(|cj| vs_all_pinned_include_versions(cj, s));
+                let from_compose = match pins.as_deref() {
+                    Some([Some(v)]) if !v.contains(".x") && v.as_str() != "x" => {
+                        Some(v.clone())
+                    }
+                    _ => None,
+                };
                 from_req
+                    .or(from_found)
                     .or(from_compose)
                     .or_else(|| cs_version_for_msg(&conn, s))
             });
@@ -1958,6 +2094,11 @@ struct InlineResolutionContext<'a> {
     /// `system-version` defaults (system URL → version pin).  Applied only
     /// when the include omits its own `version`.
     system_version_defaults: std::collections::HashMap<String, String>,
+    /// `default-valueset-version` pins (VS canonical URL → version pin).
+    /// Applied to a `compose.include[].valueSet[]` reference (and the
+    /// top-level `url`) when it does not already carry a `|version` suffix.
+    /// FHIR R5 §$expand `default-valueset-version` parameter.
+    default_value_set_versions: std::collections::HashMap<String, String>,
     /// State carried while resolving an `exclude.valueSet[]` reference.
     /// `Some((origin, chain))` once an exclude resolution has started:
     /// `origin` is the URL the caller asked to exclude (target of the
@@ -1991,6 +2132,7 @@ impl<'a> InlineResolutionContext<'a> {
             visited: std::collections::BTreeSet::new(),
             force_system_versions: std::collections::HashMap::new(),
             system_version_defaults: std::collections::HashMap::new(),
+            default_value_set_versions: std::collections::HashMap::new(),
             exclude_chain: None,
         }
     }
@@ -2056,10 +2198,12 @@ fn compute_expansion_with_versions(
     warnings: &mut Vec<String>,
     force: &std::collections::HashMap<String, String>,
     defaults: &std::collections::HashMap<String, String>,
+    default_vs_versions: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let mut ctx = InlineResolutionContext::default();
     ctx.force_system_versions = force.clone();
     ctx.system_version_defaults = defaults.clone();
+    ctx.default_value_set_versions = default_vs_versions.clone();
     compute_expansion_with_ctx(conn, compose_json, warnings, &ctx)
 }
 
@@ -2146,10 +2290,22 @@ fn expand_vs_reference(
         return Ok(vec![]);
     }
 
-    // Strip an optional `|version` suffix before the DB lookup; the
-    // `value_sets` table is keyed only on `url`.
-    let bare_url = ref_url.split('|').next().unwrap_or(ref_url);
-    match resolve_value_set(conn, bare_url, None) {
+    // Honour an explicit `|version` suffix on the ref, falling back to a
+    // `default-valueset-version` request-level pin when the ref is bare.
+    // Without this, multiple VS revisions sharing a canonical URL all
+    // resolve to the latest, breaking the IG `valueset-version/expand-*-pinned`
+    // and `*-two`/`*-one` fixtures that expect the include to honour the pin.
+    let (bare_url, ref_version) = match ref_url.split_once('|') {
+        Some((u, v)) => (u, Some(v.to_string())),
+        None => (ref_url, None),
+    };
+    let effective_version: Option<String> = ref_version.clone().or_else(|| {
+        ctx.default_value_set_versions
+            .get(bare_url)
+            .map(|s| s.to_owned())
+    });
+    let pin_was_explicit = ref_version.is_some() || effective_version.is_some();
+    match resolve_value_set_versioned(conn, bare_url, effective_version.as_deref(), None) {
         Ok((ref_vs_id, ref_compose)) => {
             let cached = fetch_cache(conn, &ref_vs_id)?;
             if !cached.is_empty() {
@@ -2165,7 +2321,15 @@ fn expand_vs_reference(
                 &child_ctx,
             )
         }
-        Err(_) => {
+        Err(e) => {
+            // When a version pin was explicitly requested (either via the
+            // ref's own `|version` suffix or a `default-valueset-version`
+            // map entry) but no matching row exists, the IG
+            // `valueset-version/expand-indirect-expand-zero-pinned-wrong`
+            // fixture expects a hard NotFound rather than a silent warning.
+            if pin_was_explicit && matches!(e, HtsError::NotFound(_)) {
+                return Err(e);
+            }
             warnings.push(format!(
                 "Referenced ValueSet {ref_url} not found; excluded from expansion"
             ));
@@ -2243,11 +2407,92 @@ fn compute_expansion_depth_inner(
     // Apply excludes — each clause may carry concept[], filter[], and/or
     // valueSet[] references. See `build_exclude_set` for the intersection
     // semantics applied within a single exclude clause.
+    //
+    // Default behaviour (matches IG `overload-expand-exclude` etc.): exclude
+    // is *version-blind* — a `(system, code)` pair listed in any exclude
+    // removes every matching code regardless of which include version
+    // contributed it.
+    //
+    // Override: when the VS sets the tx-ecosystem `versionsMatch=false`
+    // expansion-parameter extension on `compose`, exclude clauses that pin
+    // a specific `version` only remove codes from *that* version. The
+    // IG `overload-expand-exclude-versioned` fixture depends on this.
+    let versions_match_false = compose
+        .get("extension")
+        .and_then(|e| e.as_array())
+        .map(|exts| {
+            exts.iter().any(|ext| {
+                let url_match = ext.get("url").and_then(|u| u.as_str())
+                    == Some(
+                        "http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter",
+                    );
+                if !url_match {
+                    return false;
+                }
+                let inner = ext.get("extension").and_then(|e| e.as_array());
+                let mut name = None;
+                let mut value = None;
+                if let Some(arr) = inner {
+                    for sub in arr {
+                        match sub.get("url").and_then(|u| u.as_str()) {
+                            Some("name") => {
+                                name = sub.get("valueCode").and_then(|v| v.as_str());
+                            }
+                            Some("value") => {
+                                value = sub.get("valueString").and_then(|v| v.as_str());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                name == Some("versionsMatch") && value == Some("false")
+            })
+        })
+        .unwrap_or(false);
+
     let excludes = compose["exclude"].as_array().unwrap_or(&empty_arr);
     if !excludes.is_empty() {
-        let denied = build_exclude_set(conn, excludes, warnings, depth, ctx)?;
-        if !denied.is_empty() {
-            included.retain(|c| !denied.contains(&(c.system.clone(), c.code.clone())));
+        let (mut denied, denied_concept_versioned, denied_whole_versioned) =
+            build_exclude_sets(conn, excludes, warnings, depth, ctx)?;
+
+        // `denied_concept_versioned` (from `exclude[].concept[]` listings
+        // with a `version` pin) is *always* version-aware — keep it on the
+        // side. `denied_whole_versioned` (from `exclude[]` clauses with no
+        // `concept[]` but a `version` pin) is version-aware only when the
+        // VS carries `versionsMatch=false`; otherwise collapse it into the
+        // version-blind `denied` set.
+        if !versions_match_false {
+            for (sys, _ver, code) in &denied_whole_versioned {
+                denied.insert((sys.clone(), code.clone()));
+            }
+        }
+        let any_versioned = !denied_concept_versioned.is_empty()
+            || (versions_match_false && !denied_whole_versioned.is_empty());
+        if !denied.is_empty() || any_versioned {
+            included.retain(|c| {
+                if denied.contains(&(c.system.clone(), c.code.clone())) {
+                    return false;
+                }
+                if let Some(ver) = c.version.as_deref() {
+                    if denied_concept_versioned.contains(&(
+                        c.system.clone(),
+                        ver.to_owned(),
+                        c.code.clone(),
+                    )) {
+                        return false;
+                    }
+                    if versions_match_false
+                        && denied_whole_versioned.contains(&(
+                            c.system.clone(),
+                            ver.to_owned(),
+                            c.code.clone(),
+                        ))
+                    {
+                        return false;
+                    }
+                }
+                true
+            });
         }
     }
 
@@ -2561,14 +2806,46 @@ fn expand_single_include_local(
 /// `valueSet[]` is present its expansion is intersected with the local
 /// system/concept/filter to determine which codes to deny — matching the
 /// FHIR semantics that "the codes match if they meet ALL of the conditions".
-fn build_exclude_set(
+/// Builds the union of `exclude` clauses on a `compose`, partitioning the
+/// results by how the IG fixtures expect them to be applied at retain time.
+/// See [`compute_expansion_depth_inner`] for the version-aware retain logic
+/// that consumes these sets.
+///
+/// # Return value
+///
+/// `(version_blind, concept_enum_versioned, whole_system_versioned)`
+///
+/// - `version_blind` — `(system, code)` pairs from versionless clauses
+///   (or clauses that aren't version-aware like `valueSet[]` refs). Always
+///   removes every match.
+/// - `concept_enum_versioned` — `(system, version, code)` triples
+///   harvested from `exclude[].concept[]` clauses that pin a `version`.
+///   Per the IG `overload-expand-exclude-enum` fixture, these are
+///   *always* applied version-aware regardless of the
+///   `versionsMatch` extension.
+/// - `whole_system_versioned` — `(system, version, code)` triples
+///   harvested from `exclude` clauses that pin a `version` but list no
+///   `concept[]` (i.e. "remove all of CS@v"). The IG default behaviour
+///   is to collapse these to `(system, code)` pairs (version-blind);
+///   only when the VS carries the `versionsMatch=false` expansion-parameter
+///   extension does the caller keep them version-aware.
+fn build_exclude_sets(
     conn: &Connection,
     excludes: &[serde_json::Value],
     warnings: &mut Vec<String>,
     depth: u8,
     ctx: &InlineResolutionContext<'_>,
-) -> Result<HashSet<(String, String)>, HtsError> {
+) -> Result<
+    (
+        HashSet<(String, String)>,
+        HashSet<(String, String, String)>,
+        HashSet<(String, String, String)>,
+    ),
+    HtsError,
+> {
     let mut denied: HashSet<(String, String)> = HashSet::new();
+    let mut denied_versioned: HashSet<(String, String, String)> = HashSet::new();
+    let mut denied_whole_system_versioned: HashSet<(String, String, String)> = HashSet::new();
     let mut system_id_cache: HashMap<String, (String, Option<String>)> = HashMap::new();
 
     for exc in excludes {
@@ -2638,13 +2915,38 @@ fn build_exclude_set(
         }
 
         let exc_system = exc["system"].as_str().unwrap_or("").to_owned();
+        // Version pin on the exclude clause: when present, the clause only
+        // removes codes from that specific version of the system (the IG
+        // `overload-expand-exclude*` fixtures rely on this). When absent
+        // (versionless exclude), behaviour is unchanged — fall back to the
+        // version-blind `(system, code)` denial.
+        let exc_version = exc["version"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
 
         if exc["concept"].as_array().is_some_and(|a| !a.is_empty()) {
             // Explicit codes: deny each (system, code) pair without consulting the DB.
+            // Per the IG `overload-expand-exclude-enum` fixture, an explicit
+            // `concept[]` listing with a `version` pin is *always*
+            // version-aware (it removes only the v-pinned codes), even when
+            // the VS doesn't carry the `versionsMatch=false` extension that
+            // turns whole-system version-aware exclude on.
             if let Some(codes) = exc["concept"].as_array() {
                 for entry in codes {
                     if let Some(code) = entry["code"].as_str() {
-                        denied.insert((exc_system.clone(), code.to_owned()));
+                        match &exc_version {
+                            Some(v) => {
+                                denied_versioned.insert((
+                                    exc_system.clone(),
+                                    v.clone(),
+                                    code.to_owned(),
+                                ));
+                            }
+                            None => {
+                                denied.insert((exc_system.clone(), code.to_owned()));
+                            }
+                        }
                     }
                 }
             }
@@ -2653,13 +2955,24 @@ fn build_exclude_set(
 
         // No concept[], no valueSet[] — fall back to the same per-include
         // expansion path (covers exclude.filter[], full-system exclude, etc.).
+        // For whole-system excludes the version pin behaves as a "include
+        // these codes that exist in v" rather than "remove only this code at
+        // this version" — collapsed to version-blind by the caller unless
+        // the VS sets versionsMatch=false.
         let local = expand_single_include_local(conn, exc, warnings, &mut system_id_cache, depth)?;
         for c in local {
-            denied.insert((c.system, c.code));
+            match &exc_version {
+                Some(v) => {
+                    denied_whole_system_versioned.insert((c.system, v.clone(), c.code));
+                }
+                None => {
+                    denied.insert((c.system, c.code));
+                }
+            }
         }
     }
 
-    Ok(denied)
+    Ok((denied, denied_versioned, denied_whole_system_versioned))
 }
 
 /// Evaluate any ECL or `is-a` filters declared on a compose include clause.
@@ -4888,6 +5201,29 @@ fn is_code_in_cs(conn: &Connection, system_url: &str, code: &str) -> bool {
     .is_ok()
 }
 
+/// Like [`is_code_in_cs`] but scoped to a specific stored CS version.  Used
+/// by the version-pinned validate-code path to distinguish "code exists in
+/// the system at another version" from "code exists at the requested
+/// version" — the IG fixtures expect different message shapes for the two
+/// cases.
+fn is_code_in_cs_at_version(
+    conn: &Connection,
+    system_url: &str,
+    version: &str,
+    code: &str,
+) -> bool {
+    conn.query_row(
+        "SELECT 1
+         FROM concepts c
+         JOIN code_systems s ON s.id = c.system_id
+         WHERE s.url = ?1 AND s.version = ?2 AND c.code = ?3
+         LIMIT 1",
+        rusqlite::params![system_url, version, code],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
 /// Returns the highest stored version for a CodeSystem URL, used to format
 /// the IG-expected "Unknown code in CodeSystem 'url' version 'X'" message.
 fn cs_version_for_msg(conn: &Connection, system_url: &str) -> Option<String> {
@@ -4966,6 +5302,33 @@ fn vs_pinned_include_version(compose_json: &str, system_url: &str) -> Option<Opt
         }
     }
     None
+}
+
+/// Returns *all* `compose.include[].version` entries that target `system_url`.
+/// Used to detect the "overload" pattern where one VS includes multiple
+/// versions of the same CodeSystem — in that case a request whose version
+/// matches *any* included pin is acceptable, not just the first one.
+///
+/// Returns `Some(vec)` with one entry per matching include (`Some(version)` for
+/// pinned includes, `None` for versionless includes). Returns `None` when no
+/// include targets the given system at all.
+fn vs_all_pinned_include_versions(
+    compose_json: &str,
+    system_url: &str,
+) -> Option<Vec<Option<String>>> {
+    let compose: serde_json::Value = serde_json::from_str(compose_json).ok()?;
+    let includes = compose.get("include")?.as_array()?;
+    let mut hits: Vec<Option<String>> = Vec::new();
+    for inc in includes {
+        if inc.get("system").and_then(|v| v.as_str()) == Some(system_url) {
+            let ver = inc
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            hits.push(ver);
+        }
+    }
+    if hits.is_empty() { None } else { Some(hits) }
 }
 
 /// Resolve a version string against a set of `(id, version)` candidate pairs.
@@ -5095,7 +5458,11 @@ fn detect_cs_version_mismatch(
     // Resolve req_ver (handles short-forms like "1.0" → "1.0.0")
     let resolved_req = resolve_ver_against_candidates(&candidates, req_ver);
 
-    // Parse compose to find include pin for this system
+    // Parse compose to find include pin for this system. A VS may pin the
+    // same system to multiple versions (the "overload" pattern). When the
+    // requested version matches *any* of those pins, there is no mismatch.
+    let all_include_pins: Option<Vec<Option<String>>> =
+        compose_json.and_then(|cj| vs_all_pinned_include_versions(cj, system_url));
     let include_pin: Option<Option<String>> =
         compose_json.and_then(|cj| vs_pinned_include_version(cj, system_url));
 
@@ -5196,6 +5563,33 @@ fn detect_cs_version_mismatch(
     }
 
     let req_full = resolved_req.as_deref().unwrap_or(req_ver);
+
+    // "Overload" pattern: when the VS pins the same system to multiple
+    // versions, accept the request if it matches *any* of those pins. Without
+    // this short-circuit, the legacy single-pin code below picks the first
+    // include and emits a spurious VALUESET_VALUE_MISMATCH for callers whose
+    // version matches a later include.
+    if let Some(pins) = all_include_pins.as_ref() {
+        if pins.len() > 1 {
+            let any_match = pins.iter().any(|p| match p {
+                Some(v) if v.contains(".x") || v == "x" => {
+                    version_satisfies_wildcard(req_full, v)
+                }
+                Some(v) => {
+                    resolve_ver_against_candidates(&candidates, v)
+                        .map(|rv| rv == req_full)
+                        .unwrap_or_else(|| v == req_full)
+                }
+                // Versionless include: the effective version is the latest
+                // stored, which we'll have already accepted as `req_full`
+                // when it matches; otherwise flag below.
+                None => actual_ver.as_deref() == Some(req_full),
+            });
+            if any_match {
+                return None;
+            }
+        }
+    }
 
     // req_ver exists in the CS. Check if the VS include pins a conflicting version.
     match include_pin {
@@ -5429,14 +5823,28 @@ fn finish_validate_code_response(
     req_version_hint: Option<&str>,
     lenient_display: bool,
 ) -> Result<ValidateCodeResponse, HtsError> {
-    let qualified = match system_for_msg {
-        Some(s) => format!("{s}#{code}"),
-        None => code.to_string(),
+    // When the caller pinned an exact version (req_version_hint) and the
+    // code wasn't found, the IG fixtures qualify the code as
+    // `system|version#code` so it's clear *which* version's view was checked.
+    // Only include the version qualifier when found is None (we're in the
+    // not-found branch); on success the version goes into a separate
+    // parameter, not into the qualified string.
+    let qualifier_version: Option<&str> = if found.is_none() {
+        req_version_hint
+            .filter(|v| !v.is_empty() && !v.contains(".x") && *v != "x")
+    } else {
+        None
+    };
+    let qualified = match (system_for_msg, qualifier_version) {
+        (Some(s), Some(v)) => format!("{s}|{v}#{code}"),
+        (Some(s), None) => format!("{s}#{code}"),
+        (None, _) => code.to_string(),
     };
     // When the caller provided a display for the code (e.g. Coding.display),
     // the IG fixtures include it in the not-found text as `#code ('Display')`.
-    let qualified_with_display = match (system_for_msg, expected_display) {
-        (Some(s), Some(d)) => format!("{s}#{code} ('{d}')"),
+    let qualified_with_display = match (system_for_msg, expected_display, qualifier_version) {
+        (Some(s), Some(d), Some(v)) => format!("{s}|{v}#{code} ('{d}')"),
+        (Some(s), Some(d), None) => format!("{s}#{code} ('{d}')"),
         _ => qualified.clone(),
     };
     let url_with_version = match vs_version {
@@ -5619,8 +6027,19 @@ fn finish_validate_code_response(
             if let Some(expected) = expected_display {
                 if let Some(actual) = concept.display.as_deref() {
                     if !actual.eq_ignore_ascii_case(expected) {
+                        // IG canonical format (matches messages-tx.fhir.org.json):
+                        //   "Wrong Display Name 'X' for system#code. Valid
+                        //    display is 'Y' (en) (for the language(s) '--')"
+                        // The trailing "(en) (for the language(s) '--')" is
+                        // boilerplate the IG fixtures always include — no
+                        // language negotiation is performed here, so the
+                        // suffix is literal.
+                        let qualified = match system_for_msg {
+                            Some(s) => format!("{s}#{code}"),
+                            None => code.to_string(),
+                        };
                         let text = format!(
-                            "Provided display '{expected}' does not match stored display '{actual}'"
+                            "Wrong Display Name '{expected}' for {qualified}. Valid display is '{actual}' (en) (for the language(s) '--')"
                         );
                         display_message = Some(text.clone());
                         // With lenient-display-validation the mismatch is a

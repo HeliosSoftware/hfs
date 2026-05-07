@@ -124,6 +124,13 @@ pub struct ValidateCodeRequest {
     /// `lenient-display-validation` parameter.
     #[serde(default)]
     pub lenient_display_validation: Option<bool>,
+    /// `default-valueset-version` request param: per-canonical-URL version
+    /// pins applied when a `compose.include[].valueSet[]` reference (or the
+    /// top-level `url`) does not carry an explicit `|version`. The keys are
+    /// bare canonical URLs (no `|version` suffix); the values are the
+    /// pinned versions. Mirrors `force-system-version` for value sets.
+    #[serde(default)]
+    pub default_value_set_versions: std::collections::HashMap<String, String>,
 }
 
 /// One discrete concern detected during `$validate-code`. Multiple issues are
@@ -366,6 +373,13 @@ pub struct ExpandRequest {
     /// system_version_defaults > latest stored version.
     #[serde(default)]
     pub system_version_defaults: std::collections::HashMap<String, String>,
+    /// `default-valueset-version` request param: per-canonical-URL version
+    /// pins applied when a `compose.include[].valueSet[]` reference (or the
+    /// top-level `url`) does not carry an explicit `|version`. The keys are
+    /// bare canonical URLs (no `|version` suffix); the values are the
+    /// pinned versions.
+    #[serde(default)]
+    pub default_value_set_versions: std::collections::HashMap<String, String>,
 }
 
 /// Response from `ValueSet/$expand`.

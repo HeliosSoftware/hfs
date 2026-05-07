@@ -929,6 +929,11 @@ async fn process_expand<B: TerminologyBackend>(
     }
     let force_system_versions = collect_version_pins(&params, "force-system-version");
     let mut system_version_defaults = collect_version_pins(&params, "system-version");
+    // `default-valueset-version` request param (FHIR R5 §$expand): per-VS
+    // version pins applied when a `compose.include[].valueSet[]` reference
+    // lacks a `|version` suffix. Same `<url>|<version>` shape as the
+    // `*-system-version` pins; collected via the same helper.
+    let default_value_set_versions = collect_version_pins(&params, "default-valueset-version");
     // `check-system-version` acts as both a DEFAULT (same shape as
     // `system-version` — applied only when no other version pin wins) AND
     // a post-expansion verifier.  When the resolved CS version doesn't
@@ -945,10 +950,20 @@ async fn process_expand<B: TerminologyBackend>(
     }
 
     // ── Cache miss: compute ───────────────────────────────────────────────────
+    // Resolve the effective `valueSetVersion` for the top-level url:
+    // explicit `valueSetVersion` param > pipe-parsed > `default-valueset-version`
+    // pin matching the bare url (when no other version was supplied).
+    let explicit_vs_version = find_str_param(&params, "valueSetVersion").or(pipe_version.clone());
+    let effective_vs_version = explicit_vs_version.clone().or_else(|| {
+        url.as_deref()
+            .and_then(|u| default_value_set_versions.get(u).cloned())
+    });
+    // Cloned for downstream `used-valueset` echo logic which needs to apply
+    // the same default-version pins to refs lacking a `|version` suffix.
+    let default_value_set_versions_for_echo = default_value_set_versions.clone();
     let req = ExpandRequest {
         url,
-        // Explicit `valueSetVersion` param wins; fall back to pipe-parsed version.
-        value_set_version: find_str_param(&params, "valueSetVersion").or(pipe_version),
+        value_set_version: effective_vs_version,
         value_set,
         filter: filter.clone(),
         count,
@@ -960,6 +975,7 @@ async fn process_expand<B: TerminologyBackend>(
         tx_resources,
         force_system_versions,
         system_version_defaults,
+        default_value_set_versions,
     };
 
     let ctx = TenantContext::system();
@@ -968,10 +984,23 @@ async fn process_expand<B: TerminologyBackend>(
         Err(HtsError::NotFound(msg)) => {
             // Populate the negative cache so future requests for this URL
             // are resolved in O(1) without touching the database.
+            //
+            // Skip the cache when the failure originated from a nested
+            // `compose.include[].valueSet[]` reference (signalled by the
+            // message naming a different URL than the top-level request).
+            // Caching the top-level URL there would be wrong: the parent VS
+            // exists, only an inner pinned ref was missing — used by the IG
+            // `valueset-version/expand-indirect-expand-zero-pinned-wrong`
+            // fixture which pins `default-valueset-version` to a non-existent
+            // version of an imported ValueSet.
             if let Some(ref url_str) = url_for_neg_cache {
-                if let Ok(mut neg) = state.not_found_urls.write() {
-                    if neg.len() < NOT_FOUND_CACHE_MAX {
-                        neg.insert(url_str.clone());
+                let msg_names_top = msg.contains(&format!("'{url_str}'"))
+                    || msg.contains(&format!("'{url_str}|"));
+                if msg_names_top {
+                    if let Ok(mut neg) = state.not_found_urls.write() {
+                        if neg.len() < NOT_FOUND_CACHE_MAX {
+                            neg.insert(url_str.clone());
+                        }
                     }
                 }
             }
@@ -1006,7 +1035,22 @@ async fn process_expand<B: TerminologyBackend>(
     // ValueSet that was actually used for expansion. With multiple VSes
     // sharing a canonical URL, a URL-only search would otherwise pick
     // whichever row came first in created_at order.
-    let req_vs_version = find_str_param(&params, "valueSetVersion");
+    //
+    // The "effective" version used for the source VS lookup includes:
+    //   1. an explicit `valueSetVersion` request param;
+    //   2. the version side of a piped url (`<url>|<version>`);
+    //   3. a `default-valueset-version` pin matching the bare url.
+    // This must agree with the version the backend used in
+    // `resolve_value_set_versioned` so the metadata copied back into the
+    // response (top-level `id`, `version`, `name`, …) reflects the same row
+    // the codes came from.
+    let req_vs_version = find_str_param(&params, "valueSetVersion")
+        .or_else(|| pipe_version.clone())
+        .or_else(|| {
+            url_for_neg_cache
+                .as_deref()
+                .and_then(|u| default_value_set_versions_for_echo.get(u).cloned())
+        });
     let source_vs: Option<Value> = if let Some(ref u) = url_for_neg_cache {
         ValueSetOperations::search(
             state.backend(),
@@ -1443,10 +1487,14 @@ async fn process_expand<B: TerminologyBackend>(
 
     // Normalise version-override params to `valueUri` regardless of whether
     // the request supplied them as `valueCanonical`/`valueUrl`/etc.  The IG
-    // `version/parameters-*-version` fixtures echo them as `valueUri`.
+    // `version/parameters-*-version` and `valueset-version/expand-indirect-*-pinned`
+    // fixtures echo them as `valueUri`.
     for ep in emitted_params.iter_mut() {
         let name = ep.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        if !matches!(name, "system-version" | "force-system-version") {
+        if !matches!(
+            name,
+            "system-version" | "force-system-version" | "default-valueset-version"
+        ) {
             continue;
         }
         let raw = ["valueCanonical", "valueUri", "valueString", "valueUrl"]
@@ -1645,16 +1693,51 @@ async fn process_expand<B: TerminologyBackend>(
 
     // Clear `version` on contains items for single-version systems — FHIR only
     // requires it when a system appears with multiple different versions.
+    //
+    // Exception ("overload" pattern): when the source VS explicitly pins a
+    // version for the system in any compose.include[] *or* compose.exclude[]
+    // entry, keep the version even if the post-exclude expansion happens to
+    // contain only one version. The IG fixtures
+    // (overload-expand-exclude*) require this so the consumer can see which
+    // version of the CS the surviving codes came from.
     {
+        let pinned_systems: std::collections::HashSet<String> = source_vs
+            .as_ref()
+            .and_then(|vs| vs.get("compose"))
+            .map(|compose| {
+                let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for key in ["include", "exclude"] {
+                    if let Some(arr) = compose.get(key).and_then(|v| v.as_array()) {
+                        for inc in arr {
+                            let has_version = inc
+                                .get("version")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .is_some();
+                            if has_version {
+                                if let Some(sys) = inc.get("system").and_then(|v| v.as_str()) {
+                                    out.insert(sys.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                out
+            })
+            .unwrap_or_default();
+
         fn clear_single_version(
             items: &mut Vec<crate::types::ExpansionContains>,
             multi_version_systems: &std::collections::HashSet<String>,
+            pinned_systems: &std::collections::HashSet<String>,
         ) {
             for item in items {
-                if !multi_version_systems.contains(&item.system) {
+                if !multi_version_systems.contains(&item.system)
+                    && !pinned_systems.contains(&item.system)
+                {
                     item.version = None;
                 }
-                clear_single_version(&mut item.contains, multi_version_systems);
+                clear_single_version(&mut item.contains, multi_version_systems, pinned_systems);
             }
         }
         let multi_version_systems: std::collections::HashSet<String> = versions_per_system
@@ -1662,7 +1745,91 @@ async fn process_expand<B: TerminologyBackend>(
             .filter(|(_, vers)| vers.len() > 1)
             .map(|(sys, _)| sys.to_string())
             .collect();
-        clear_single_version(&mut resp.contains, &multi_version_systems);
+        clear_single_version(&mut resp.contains, &multi_version_systems, &pinned_systems);
+
+        // Compute the set of systems whose includes are *all* explicitly
+        // version-pinned. The IG `overload/overload-expand-all*` fixtures
+        // sort duplicates of a code latest-version-first when every include
+        // for the system carries a pinned version.  When any include is
+        // versionless (`overload-expand-mixed`), the original include-order
+        // is preserved so the user can see how the unversioned reference
+        // resolved.
+        let fully_pinned_systems: std::collections::HashSet<String> = source_vs
+            .as_ref()
+            .and_then(|vs| vs.get("compose"))
+            .and_then(|c| c.get("include"))
+            .and_then(|i| i.as_array())
+            .map(|includes| {
+                let mut by_system: std::collections::HashMap<String, (usize, usize)> =
+                    std::collections::HashMap::new();
+                for inc in includes {
+                    if let Some(sys) = inc.get("system").and_then(|s| s.as_str()) {
+                        let entry = by_system.entry(sys.to_string()).or_insert((0, 0));
+                        entry.0 += 1;
+                        let pinned = inc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .is_some();
+                        if pinned {
+                            entry.1 += 1;
+                        }
+                    }
+                }
+                by_system
+                    .into_iter()
+                    .filter(|(_, (total, pinned))| *total >= 2 && total == pinned)
+                    .map(|(sys, _)| sys)
+                    .collect::<std::collections::HashSet<String>>()
+            })
+            .unwrap_or_default();
+
+        // For systems that contribute multiple versions and have all
+        // includes pinned, the IG fixtures (overload/overload-expand-all*)
+        // expect the latest version of each code to appear *before* its
+        // older counterparts. Sort stably so the relative order of distinct
+        // codes is preserved while duplicates of the same code surface
+        // latest-first.
+        let sortable_systems: std::collections::HashSet<String> = multi_version_systems
+            .intersection(&fully_pinned_systems)
+            .cloned()
+            .collect();
+        if !sortable_systems.is_empty() {
+            let mut indexed: Vec<(usize, crate::types::ExpansionContains)> = resp
+                .contains
+                .drain(..)
+                .enumerate()
+                .collect();
+            // Group by (system, code), sort each group by version DESC,
+            // then re-emit in original first-occurrence order of (system, code).
+            let mut first_idx: std::collections::HashMap<(String, String), usize> =
+                std::collections::HashMap::new();
+            for (i, item) in indexed.iter() {
+                let key = (item.system.clone(), item.code.clone());
+                first_idx.entry(key).or_insert(*i);
+            }
+            // Stable sort by: original group position, then version DESC
+            // (only for systems in `sortable_systems`).
+            indexed.sort_by(|a, b| {
+                let ka = (a.1.system.clone(), a.1.code.clone());
+                let kb = (b.1.system.clone(), b.1.code.clone());
+                let ga = first_idx.get(&ka).copied().unwrap_or(a.0);
+                let gb = first_idx.get(&kb).copied().unwrap_or(b.0);
+                ga.cmp(&gb).then_with(|| {
+                    if sortable_systems.contains(&a.1.system)
+                        && sortable_systems.contains(&b.1.system)
+                    {
+                        b.1.version
+                            .as_deref()
+                            .unwrap_or("")
+                            .cmp(a.1.version.as_deref().unwrap_or(""))
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+            });
+            resp.contains = indexed.into_iter().map(|(_, c)| c).collect();
+        }
     }
 
     let mut warning_params: Vec<Value> = Vec::new();
@@ -1745,10 +1912,17 @@ async fn process_expand<B: TerminologyBackend>(
             }
         }
         for raw_ref in &vs_refs {
-            let (bare_url, pinned_version) = match raw_ref.split_once('|') {
+            let (bare_url, mut pinned_version) = match raw_ref.split_once('|') {
                 Some((u, v)) => (u.to_string(), Some(v.to_string())),
                 None => (raw_ref.clone(), None),
             };
+            // Honour `default-valueset-version` pin when the ref itself
+            // doesn't carry an explicit `|version` (FHIR R5 §$expand).
+            if pinned_version.is_none() {
+                if let Some(default_v) = default_value_set_versions_for_echo.get(&bare_url) {
+                    pinned_version = Some(default_v.clone());
+                }
+            }
             let referenced_vs: Option<Value> = ValueSetOperations::search(
                 state.backend(),
                 &ctx,
