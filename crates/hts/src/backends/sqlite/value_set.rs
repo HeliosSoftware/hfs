@@ -1152,9 +1152,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // (e.g., wildcard "1.x" resolved to "1.2.0"), but the caller wants
             // the canonical display for their requested version "1.0.0".
             let found = match (found, req.version.as_deref(), effective_system.as_deref()) {
-                (Some(mut concept), Some(ver), Some(sys))
-                    if !ver.contains(".x") && ver != "x" =>
-                {
+                (Some(mut concept), Some(ver), Some(sys)) if !ver.contains(".x") && ver != "x" => {
                     if let Some(disp) = lookup_display_at_version(&conn, sys, ver, &req.code) {
                         concept.display = Some(disp);
                     }
@@ -1997,7 +1995,6 @@ impl<'a> InlineResolutionContext<'a> {
         }
     }
 
-
     /// Resolve a `valueSet[]` entry to its compose JSON without touching the DB.
     ///
     /// `#fragment` refs search the inline body's `contained[]`; canonical URLs
@@ -2201,9 +2198,15 @@ fn compute_expansion_depth_inner(
         for arr_key in ["include", "exclude"] {
             if let Some(arr) = compose.get_mut(arr_key).and_then(|v| v.as_array_mut()) {
                 for inc in arr.iter_mut() {
-                    let sys = inc.get("system").and_then(|v| v.as_str()).map(|s| s.to_owned());
+                    let sys = inc
+                        .get("system")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_owned());
                     if let Some(sys_url) = sys {
-                        let explicit = inc.get("version").and_then(|v| v.as_str()).map(|s| s.to_owned());
+                        let explicit = inc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_owned());
                         if let Some(forced) = ctx.force_system_versions.get(&sys_url) {
                             inc["version"] = serde_json::Value::String(forced.clone());
                         } else if explicit.is_none() {
@@ -4910,9 +4913,7 @@ fn cs_version_from_compose(compose_json: Option<&str>, system_url: &str) -> Opti
                 .and_then(|includes| {
                     includes
                         .iter()
-                        .find(|inc| {
-                            inc.get("system").and_then(|s| s.as_str()) == Some(system_url)
-                        })
+                        .find(|inc| inc.get("system").and_then(|s| s.as_str()) == Some(system_url))
                         .and_then(|inc| inc.get("version").and_then(|v| v.as_str()))
                         .map(str::to_string)
                 })
@@ -5065,7 +5066,11 @@ fn detect_cs_version_mismatch(
     vs_version: Option<&str>,
     version_loc: &str,
     system_loc: &str,
-) -> Option<(Vec<crate::types::ValidationIssue>, Option<String>, Option<String>)> {
+) -> Option<(
+    Vec<crate::types::ValidationIssue>,
+    Option<String>,
+    Option<String>,
+)> {
     // Build (id, version) candidate list sorted desc so the first entry is the
     // highest version — used for both resolution and picking the "actual" ver.
     let mut stmt = conn
@@ -5138,8 +5143,9 @@ fn detect_cs_version_mismatch(
         // Echo version: use the VS-pinned resolved version when available,
         // otherwise use the highest stored version.
         let echo_version: Option<String> = match include_pin.as_ref() {
-            Some(Some(inc_ver)) => resolve_ver_against_candidates(&candidates, inc_ver)
-                .or_else(|| actual_ver.clone()),
+            Some(Some(inc_ver)) => {
+                resolve_ver_against_candidates(&candidates, inc_ver).or_else(|| actual_ver.clone())
+            }
             _ => actual_ver.clone(),
         };
 
@@ -5307,7 +5313,11 @@ fn detect_vs_pin_unknown(
     system_url: &str,
     compose_json: Option<&str>,
     system_loc: &str,
-) -> Option<(Vec<crate::types::ValidationIssue>, Option<String>, Option<String>)> {
+) -> Option<(
+    Vec<crate::types::ValidationIssue>,
+    Option<String>,
+    Option<String>,
+)> {
     let inc_ver = compose_json
         .and_then(|cj| vs_pinned_include_version(cj, system_url))
         .and_then(|pin| pin)?; // only when the include has an explicit version

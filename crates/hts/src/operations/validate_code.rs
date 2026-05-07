@@ -728,7 +728,9 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             input_form: Some("code".into()),
             lenient_display_validation: params
                 .iter()
-                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
+                .find(|p| {
+                    p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation")
+                })
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
         let mut resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
@@ -784,7 +786,9 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             input_form: Some("coding".into()),
             lenient_display_validation: params
                 .iter()
-                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
+                .find(|p| {
+                    p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation")
+                })
                 .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
         };
         let mut resp = CodeSystemOperations::validate_code(state.backend(), &ctx, req).await?;
@@ -1009,7 +1013,11 @@ async fn resolve_cs_version_pattern<B: TerminologyBackend>(
     .ok()?;
     let mut versions: Vec<String> = hits
         .iter()
-        .filter_map(|cs| cs.get("version").and_then(|v| v.as_str()).map(str::to_string))
+        .filter_map(|cs| {
+            cs.get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
         .filter(|v| version_satisfies_wildcard(v, pattern))
         .collect();
     versions.sort();
@@ -1018,10 +1026,7 @@ async fn resolve_cs_version_pattern<B: TerminologyBackend>(
 
 /// Find the first `(system, version_pattern)` pair matching `target_system`
 /// in a list collected via [`collect_canonical_params`].
-fn find_pin_for_system<'a>(
-    pins: &'a [(String, String)],
-    target_system: &str,
-) -> Option<&'a str> {
+fn find_pin_for_system<'a>(pins: &'a [(String, String)], target_system: &str) -> Option<&'a str> {
     pins.iter()
         .find(|(s, _)| s == target_system)
         .map(|(_, v)| v.as_str())
@@ -1331,9 +1336,8 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         } else {
             RequestPath::BareCode
         };
-        let text = format!(
-            "A definition for the value Set '{unresolved_vs_url}' could not be found"
-        );
+        let text =
+            format!("A definition for the value Set '{unresolved_vs_url}' could not be found");
         let issue = ValidationIssue {
             severity: "error".into(),
             fhir_code: "not-found".into(),
@@ -1382,9 +1386,11 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     //   - `check-system-version`  (CHECK): same DEFAULT semantics as
     //     system-version PLUS a post-check that emits VALUESET_VERSION_CHECK
     //     when the resolved CS version doesn't satisfy the pattern.
-    let force_pins: Vec<(String, String)> = collect_canonical_params(&params, "force-system-version");
+    let force_pins: Vec<(String, String)> =
+        collect_canonical_params(&params, "force-system-version");
     let default_pins: Vec<(String, String)> = collect_canonical_params(&params, "system-version");
-    let check_pins: Vec<(String, String)> = collect_canonical_params(&params, "check-system-version");
+    let check_pins: Vec<(String, String)> =
+        collect_canonical_params(&params, "check-system-version");
     // `check` also acts as a DEFAULT — merge for the default lookup.
     let mut effective_defaults: Vec<(String, String)> = default_pins.clone();
     effective_defaults.extend(check_pins.iter().cloned());
@@ -1393,9 +1399,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // is pinned in any include (drives the "default applies only if VS
     // doesn't pin" rule). Only worth doing when there are version-pin
     // parameters to apply.
-    let source_vs: Option<Value> = if !force_pins.is_empty()
-        || !effective_defaults.is_empty()
-    {
+    let source_vs: Option<Value> = if !force_pins.is_empty() || !effective_defaults.is_empty() {
         ValueSetOperations::search(
             state.backend(),
             &ctx,
@@ -1577,13 +1581,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                     .or_else(|| extract_response_version(&value));
                 if let Some(v) = actual.as_deref() {
                     if !version_satisfies_wildcard(v, pat) {
-                        apply_check_version_failure(
-                            &mut value,
-                            sys,
-                            v,
-                            pat,
-                            RequestPath::BareCode,
-                        );
+                        apply_check_version_failure(&mut value, sys, v, pat, RequestPath::BareCode);
                     }
                 }
             }
@@ -1758,13 +1756,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 .or_else(|| extract_response_version(&value));
             if let Some(v) = actual.as_deref() {
                 if !version_satisfies_wildcard(v, pat) {
-                    apply_check_version_failure(
-                        &mut value,
-                        &system,
-                        v,
-                        pat,
-                        RequestPath::Coding,
-                    );
+                    apply_check_version_failure(&mut value, &system, v, pat, RequestPath::Coding);
                 }
             }
         }

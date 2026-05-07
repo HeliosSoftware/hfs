@@ -643,7 +643,11 @@ async fn expand_hierarchical_returns_nested_tree() {
     let contains = body["expansion"]["contains"]
         .as_array()
         .expect("expected expansion.contains array");
-    assert_eq!(contains.len(), 3, "enumerated VS should expand flat: {body}");
+    assert_eq!(
+        contains.len(),
+        3,
+        "enumerated VS should expand flat: {body}"
+    );
     let codes: Vec<&str> = contains.iter().filter_map(|c| c["code"].as_str()).collect();
     assert!(codes.contains(&"limb"));
     assert!(codes.contains(&"arm"));

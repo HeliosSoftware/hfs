@@ -901,7 +901,10 @@ async fn process_expand<B: TerminologyBackend>(
     // `force-system-version` (override even when the include pins a version)
     // and `system-version` (apply only when the include omits version) to
     // pin which CodeSystem revision contributes to the expansion.
-    fn collect_version_pins(params: &[Value], name: &str) -> std::collections::HashMap<String, String> {
+    fn collect_version_pins(
+        params: &[Value],
+        name: &str,
+    ) -> std::collections::HashMap<String, String> {
         let mut out = std::collections::HashMap::new();
         for p in params {
             if p.get("name").and_then(|v| v.as_str()) != Some(name) {
@@ -1186,16 +1189,15 @@ async fn process_expand<B: TerminologyBackend>(
     let mut cs_by_url: HashMap<String, Option<Value>> = HashMap::new();
     {
         // Collect systems from expansion items first.
-        let mut systems: Vec<String> = resp
-            .contains
-            .iter()
-            .map(|c| c.system.clone())
-            .fold(Vec::<String>::new(), |mut acc, s| {
+        let mut systems: Vec<String> = resp.contains.iter().map(|c| c.system.clone()).fold(
+            Vec::<String>::new(),
+            |mut acc, s| {
                 if !acc.contains(&s) {
                     acc.push(s);
                 }
                 acc
-            });
+            },
+        );
         // Also add systems from compose.include[] so that empty expansions
         // (e.g. count=0 or filter matched nothing) still populate cs_by_url,
         // enabling used-codesystem to carry the |version suffix.
@@ -1331,8 +1333,12 @@ async fn process_expand<B: TerminologyBackend>(
         for c in &resp.contains {
             let ver = c.version.as_deref();
             match sys_versions.get(c.system.as_str()) {
-                None => { sys_versions.insert(&c.system, ver); }
-                Some(&prev) if prev != ver => { multi.insert(c.system.clone()); }
+                None => {
+                    sys_versions.insert(&c.system, ver);
+                }
+                Some(&prev) if prev != ver => {
+                    multi.insert(c.system.clone());
+                }
                 _ => {}
             }
         }
@@ -1435,7 +1441,11 @@ async fn process_expand<B: TerminologyBackend>(
         }
         let raw = ["valueCanonical", "valueUri", "valueString", "valueUrl"]
             .iter()
-            .filter_map(|k| ep.get(*k).and_then(|v| v.as_str()).map(|s| (*k, s.to_owned())))
+            .filter_map(|k| {
+                ep.get(*k)
+                    .and_then(|v| v.as_str())
+                    .map(|s| (*k, s.to_owned()))
+            })
             .next();
         if let Some((had_key, val)) = raw {
             if had_key != "valueUri" {
