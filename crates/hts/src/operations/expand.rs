@@ -386,6 +386,17 @@ fn populate_properties<'a, B: TerminologyBackend>(
             if let Some(list) = map.remove(&(c.system.clone(), c.code.clone())) {
                 c.properties = list
                     .into_iter()
+                    .filter(|(code, value)| {
+                        // The `status` property is auto-included in the
+                        // population lookup so retired/deprecated/withdrawn
+                        // concepts get a per-concept marker without the
+                        // caller asking. Active codes carry no marker — the
+                        // IG `tho/expand-vs-act-class`, `fragment/fragment-expand`,
+                        // and `parameters/parameters-expand-supplement-good`
+                        // fixtures all omit `status:active` from contains[].
+                        // Only emit when the status is non-active.
+                        !(code == "status" && value == "active")
+                    })
                     .map(|(code, value)| {
                         // Pick the FHIR `value[x]` shape from the property
                         // code: `definition` is always a string per FHIR
@@ -3200,6 +3211,36 @@ async fn process_expand<B: TerminologyBackend>(
     }
     response["expansion"] = expansion;
 
+    // ── R4 / R4B downconversion ──────────────────────────────────────────────
+    // R4 and R4B `ValueSet.expansion` lack `property[]`, both at the
+    // expansion level and on `contains[]`. The HL7 tx-ecosystem test runner
+    // converts the server's response through the R4 model when
+    // `CapabilityStatement.fhirVersion` is 4.x — that conversion DROPS our
+    // typed `property[]` fields and the validator then reports
+    // "missing property property" for every contains[] entry that should
+    // carry properties (parameters-expand-{all,enum,isa}-{property,
+    // definitions2}, parameters-expand-supplement-{none,good},
+    // extensions-echo-{all,enumerated}, …).
+    //
+    // The IG documents the cross-version extension shape that round-trips
+    // through the R4↔R5 converter (see tx-ecosystem-ig /tests/r4.md):
+    //   * `expansion.property[]`         → `expansion.extension[]` with URL
+    //     `http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property`
+    //     and inner extensions `code` (valueCode) / `uri` (valueUri).
+    //   * `contains[].property[]`        → `contains[].extension[]` with URL
+    //     `http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property`
+    //     and inner extensions `code` (valueCode) / `value` (value[x],
+    //     keeping the primitive type from the original property entry).
+    //
+    // Only applied on R4-class builds (R4 or R4B; neither R5 nor R6
+    // enabled). R5/R6 builds emit the typed fields as-is.
+    if (cfg!(feature = "R4") || cfg!(feature = "R4B"))
+        && !cfg!(feature = "R5")
+        && !cfg!(feature = "R6")
+    {
+        downconvert_property_to_r4_extension(&mut response);
+    }
+
     // ── Serialize once, cache, return ─────────────────────────────────────────
     // `serde_json::to_vec` writes directly into a Vec<u8>; wrapping in
     // `Bytes::from` transfers ownership without copying.
@@ -3217,6 +3258,131 @@ async fn process_expand<B: TerminologyBackend>(
     }
 
     Ok(bytes)
+}
+
+/// Rewrite R5-typed `expansion.property[]` and `expansion.contains[].property[]`
+/// into the cross-version extensions documented at tx-ecosystem-ig
+/// `/tests/r4.md`. Only invoked on R4 / R4B builds — R5 / R6 leave the typed
+/// fields in place. Walks nested `contains[]` recursively.
+///
+/// Mapping:
+/// * `expansion.property[]` → extension on `expansion` with URL
+///   `http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property`,
+///   inner `code` (valueCode) and optional `uri` (valueUri).
+/// * `expansion.contains[].property[]` → extension on each contains entry
+///   with URL `http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property`,
+///   inner `code` (valueCode) plus `value` carrying the original primitive
+///   typed value (`valueCode`, `valueString`, `valueInteger`,
+///   `valueDecimal`, `valueBoolean`, `valueDateTime`).
+///
+/// Existing extensions on the target object are preserved; the new entries
+/// are appended.
+fn downconvert_property_to_r4_extension(response: &mut Value) {
+    /// Find the `value[x]` field inside a serialized property entry and
+    /// mirror it under the extension's `value` slot. Returns the inner
+    /// extension object `{ "url": "value", "value<Type>": <v> }` when a
+    /// `value*` key exists.
+    fn property_value_extension(prop: &Value) -> Option<Value> {
+        // Property entries always have a single `value*` key besides `code`.
+        let obj = prop.as_object()?;
+        for (k, v) in obj {
+            if let Some(suffix) = k.strip_prefix("value") {
+                if !suffix.is_empty() {
+                    let mut sub = serde_json::Map::new();
+                    sub.insert("url".into(), Value::String("value".into()));
+                    sub.insert(k.clone(), v.clone());
+                    return Some(Value::Object(sub));
+                }
+            }
+        }
+        None
+    }
+
+    /// Convert a `property[]` array on `target` (a JSON object) into
+    /// `extension[]` entries appended in place. The original `property`
+    /// field is removed.
+    fn convert(target: &mut Value, ext_url: &'static str, contains: bool) {
+        let Some(obj) = target.as_object_mut() else {
+            return;
+        };
+        let Some(props) = obj.remove("property") else {
+            return;
+        };
+        let Some(props) = props.as_array() else {
+            return;
+        };
+
+        let mut new_exts: Vec<Value> = Vec::with_capacity(props.len());
+        for prop in props {
+            let Some(prop_obj) = prop.as_object() else {
+                continue;
+            };
+            let mut sub: Vec<Value> = Vec::new();
+            if let Some(code) = prop_obj.get("code").and_then(|v| v.as_str()) {
+                sub.push(json!({ "url": "code", "valueCode": code }));
+            }
+            if contains {
+                if let Some(value_ext) = property_value_extension(prop) {
+                    sub.push(value_ext);
+                }
+            } else {
+                // Top-level expansion.property: declares `code` + `uri`.
+                if let Some(uri) = prop_obj.get("uri").and_then(|v| v.as_str()) {
+                    sub.push(json!({ "url": "uri", "valueUri": uri }));
+                }
+            }
+            if sub.is_empty() {
+                continue;
+            }
+            new_exts.push(json!({ "extension": sub, "url": ext_url }));
+        }
+
+        if new_exts.is_empty() {
+            return;
+        }
+
+        // Append after any pre-existing extension[] entries so test fixtures
+        // that emit `extension` first (rendering-style etc.) keep their
+        // ordering.
+        match obj.get_mut("extension") {
+            Some(Value::Array(arr)) => arr.extend(new_exts),
+            _ => {
+                obj.insert("extension".into(), Value::Array(new_exts));
+            }
+        }
+    }
+
+    /// Walk `contains[]` recursively, applying the contains-level
+    /// rewrite to each entry.
+    fn walk_contains(arr: &mut Value) {
+        let Some(items) = arr.as_array_mut() else {
+            return;
+        };
+        for item in items {
+            convert(
+                item,
+                "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property",
+                true,
+            );
+            if let Some(nested) = item.get_mut("contains") {
+                walk_contains(nested);
+            }
+        }
+    }
+
+    let Some(expansion) = response.get_mut("expansion") else {
+        return;
+    };
+
+    convert(
+        expansion,
+        "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property",
+        false,
+    );
+
+    if let Some(contains) = expansion.get_mut("contains") {
+        walk_contains(contains);
+    }
 }
 
 /// Turn pre-serialized JSON bytes into an HTTP response.
@@ -3630,7 +3796,96 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        // On R4 / R4B builds the response handler rewrites `property[]` into
+        // cross-version extensions. Reverse the transform here so tests can
+        // assert on a uniform `property[]` shape regardless of the active
+        // FHIR feature.
+        if (cfg!(feature = "R4") || cfg!(feature = "R4B"))
+            && !cfg!(feature = "R5")
+            && !cfg!(feature = "R6")
+        {
+            lift_property_extension_for_tests(&mut value);
+        }
+        value
+    }
+
+    /// Test-only inverse of [`downconvert_property_to_r4_extension`]: walks
+    /// `expansion` + `expansion.contains[]` (recursively) and reconstructs
+    /// `property[]` arrays from the cross-version extensions, dropping the
+    /// extension entries it consumed.
+    fn lift_property_extension_for_tests(response: &mut Value) {
+        const EXP_PROP_URL: &str = "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property";
+        const CONTAINS_PROP_URL: &str = "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property";
+
+        fn lift(target: &mut Value, ext_url: &str, contains: bool) {
+            let Some(obj) = target.as_object_mut() else {
+                return;
+            };
+            let mut props: Vec<Value> = Vec::new();
+            let exts_empty: bool;
+            {
+                let Some(exts) = obj.get_mut("extension").and_then(|e| e.as_array_mut()) else {
+                    return;
+                };
+                exts.retain(|e| {
+                    if e.get("url").and_then(|u| u.as_str()) != Some(ext_url) {
+                        return true;
+                    }
+                    let Some(inner) = e.get("extension").and_then(|i| i.as_array()) else {
+                        return true;
+                    };
+                    let mut prop = serde_json::Map::new();
+                    for sub in inner {
+                        let url = sub.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                        let sub_obj = match sub.as_object() {
+                            Some(o) => o,
+                            None => continue,
+                        };
+                        if url == "code" {
+                            if let Some(c) = sub_obj.get("valueCode") {
+                                prop.insert("code".into(), c.clone());
+                            }
+                        } else if url == "uri" && !contains {
+                            if let Some(u) = sub_obj.get("valueUri") {
+                                prop.insert("uri".into(), u.clone());
+                            }
+                        } else if url == "value" && contains {
+                            for (k, v) in sub_obj {
+                                if k.starts_with("value") && k != "value" {
+                                    prop.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                    props.push(Value::Object(prop));
+                    false
+                });
+                exts_empty = exts.is_empty();
+            }
+            if exts_empty {
+                obj.remove("extension");
+            }
+            if !props.is_empty() {
+                obj.insert("property".into(), Value::Array(props));
+            }
+        }
+
+        fn walk_contains(arr: &mut Value) {
+            let Some(items) = arr.as_array_mut() else { return };
+            for item in items {
+                lift(item, CONTAINS_PROP_URL, true);
+                if let Some(nested) = item.get_mut("contains") {
+                    walk_contains(nested);
+                }
+            }
+        }
+
+        let Some(expansion) = response.get_mut("expansion") else { return };
+        lift(expansion, EXP_PROP_URL, false);
+        if let Some(contains) = expansion.get_mut("contains") {
+            walk_contains(contains);
+        }
     }
 
     // ── Happy path ─────────────────────────────────────────────────────────────
@@ -4334,6 +4589,142 @@ mod tests {
             .find(|p| p["code"] == "prop")
             .expect("code1 has prop property");
         assert_eq!(prop["valueCode"], "old", "code1 prop should be 'old'");
+    }
+
+    /// `downconvert_property_to_r4_extension` rewrites typed `property[]`
+    /// arrays on `expansion` and `expansion.contains[]` (recursively) into
+    /// the cross-version extensions documented at tx-ecosystem-ig
+    /// `/tests/r4.md`. Used on R4 / R4B builds where the FHIR ValueSet model
+    /// does not have native property fields and the test runner's R5→R4
+    /// conversion would otherwise drop them.
+    #[test]
+    fn downconvert_emits_cross_version_extensions_for_property() {
+        let mut response = json!({
+            "resourceType": "ValueSet",
+            "expansion": {
+                "property": [
+                    { "code": "order", "uri": "http://hl7.org/fhir/concept-properties#order" }
+                ],
+                "contains": [
+                    {
+                        "extension": [
+                            { "url": "http://hl7.org/fhir/StructureDefinition/rendering-style",
+                              "valueString": "font-weight: bold" }
+                        ],
+                        "system": "http://hl7.org/fhir/test/CodeSystem/extensions",
+                        "code": "code1",
+                        "display": "Display 1",
+                        "property": [
+                            { "code": "order", "valueDecimal": 6 },
+                            { "code": "label", "valueString": "a." }
+                        ]
+                    },
+                    {
+                        "system": "http://hl7.org/fhir/test/CodeSystem/extensions",
+                        "code": "parent",
+                        "display": "Parent",
+                        "contains": [
+                            {
+                                "system": "http://hl7.org/fhir/test/CodeSystem/extensions",
+                                "code": "child",
+                                "display": "Child",
+                                "property": [
+                                    { "code": "status", "valueCode": "deprecated" }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        downconvert_property_to_r4_extension(&mut response);
+
+        let expansion = &response["expansion"];
+
+        // Top-level `property[]` was removed and converted into the
+        // expansion-level extension URL.
+        assert!(
+            expansion.get("property").is_none(),
+            "expansion.property[] should have been removed",
+        );
+        let exp_exts = expansion["extension"]
+            .as_array()
+            .expect("expansion.extension[] present");
+        let prop_decl = exp_exts
+            .iter()
+            .find(|e| {
+                e["url"]
+                    == "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property"
+            })
+            .expect("expansion property cross-version extension");
+        let inner = prop_decl["extension"].as_array().expect("inner extensions");
+        assert!(
+            inner.iter().any(|e| e["url"] == "code" && e["valueCode"] == "order"),
+            "code sub-extension"
+        );
+        assert!(
+            inner.iter().any(|e| e["url"] == "uri"
+                && e["valueUri"] == "http://hl7.org/fhir/concept-properties#order"),
+            "uri sub-extension"
+        );
+
+        // contains[0]: original extension preserved, property converted,
+        // typed values mapped to value[x] inside the cross-version extension.
+        let c1 = &expansion["contains"][0];
+        assert!(c1.get("property").is_none(), "contains[0].property removed");
+        let c1_exts = c1["extension"].as_array().expect("contains[0].extension[]");
+        assert!(
+            c1_exts.iter().any(|e| e["url"]
+                == "http://hl7.org/fhir/StructureDefinition/rendering-style"),
+            "rendering-style extension preserved",
+        );
+        let order_prop = c1_exts
+            .iter()
+            .find(|e| {
+                if e["url"]
+                    != "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property"
+                {
+                    return false;
+                }
+                e["extension"]
+                    .as_array()
+                    .map(|inner| {
+                        inner
+                            .iter()
+                            .any(|s| s["url"] == "code" && s["valueCode"] == "order")
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("order property cross-version extension");
+        let order_inner = order_prop["extension"].as_array().unwrap();
+        let value_ext = order_inner
+            .iter()
+            .find(|s| s["url"] == "value")
+            .expect("value sub-extension");
+        assert_eq!(
+            value_ext["valueDecimal"], 6,
+            "valueDecimal preserved on contains property"
+        );
+
+        // Recursive: nested contains[].property[] converted too.
+        let nested = &expansion["contains"][1]["contains"][0];
+        assert!(nested.get("property").is_none(), "nested property removed");
+        let nested_exts = nested["extension"].as_array().expect("nested extension[]");
+        let status_ext = nested_exts
+            .iter()
+            .find(|e| {
+                e["url"]
+                    == "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property"
+            })
+            .expect("nested cross-version extension");
+        let status_inner = status_ext["extension"].as_array().unwrap();
+        assert!(
+            status_inner
+                .iter()
+                .any(|s| s["url"] == "value" && s["valueCode"] == "deprecated"),
+            "valueCode preserved for status property"
+        );
     }
 }
 // rebuild marker
