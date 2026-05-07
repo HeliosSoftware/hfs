@@ -1395,13 +1395,11 @@ async fn process_expand<B: TerminologyBackend>(
             ) {
                 return false;
             }
-            // `check-system-version` is an instruction knob (verify-only
-            // semantics) that the IG fixtures do NOT echo.  The other
-            // version-override params (`system-version`,
-            // `force-system-version`) ARE echoed per the FHIR IG
-            // `version/parameters-default-version` and
-            // `parameters-fixed-version` profile fixtures.
-            if matches!(name, "check-system-version") {
+            // `system-version` and `check-system-version` are instruction
+            // knobs (default / verify-only semantics) that the IG fixtures
+            // do NOT echo. Only `force-system-version` is echoed per the
+            // FHIR IG `version/parameters-fixed-version` profile fixtures.
+            if matches!(name, "system-version" | "check-system-version") {
                 return false;
             }
             // Configuration inputs that the IG validator passes via the
@@ -1573,13 +1571,13 @@ async fn process_expand<B: TerminologyBackend>(
     // For every `check-system-version` pin, find the version actually used
     // for that system in the expansion. If it doesn't satisfy the pattern,
     // emit a 4xx OperationOutcome with VALUESET_VERSION_CHECK / version-error
-    // — matches the IG `version/vs-expand-v-w-check` fixture family.
+    // — matches the IG `version/vs-expand-v-w-check` fixture family. We
+    // surface this through `HtsError::VsInvalid` with a sentinel prefix that
+    // [`version_check_response`] (registered alongside
+    // [`cyclic_reference_response`]) detects to format the FHIR-spec response
+    // shape.
     if !check_system_versions.is_empty() {
         for (chk_sys, chk_pat) in &check_system_versions {
-            // Pick any used version for this system; if multiple versions
-            // contributed (a multi-version expansion), we report on the
-            // first violator we see (matches the IG fixtures, which only
-            // exercise single-violator scenarios).
             let mut violator: Option<String> = None;
             for (sys, ver) in &used_pairs {
                 if sys != chk_sys {
@@ -1589,7 +1587,7 @@ async fn process_expand<B: TerminologyBackend>(
                     Some(v) => v,
                     None => continue,
                 };
-                if !version_satisfies_wildcard_local(v, chk_pat) {
+                if !expand_version_satisfies_wildcard(v, chk_pat) {
                     violator = Some(v.to_string());
                     break;
                 }
@@ -1599,25 +1597,9 @@ async fn process_expand<B: TerminologyBackend>(
                     "The version '{v}' is not allowed for system '{chk_sys}': required to be \
                      '{chk_pat}' by a version-check parameter"
                 );
-                let body = json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{
-                        "extension": [{
-                            "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
-                            "valueString": "VALUESET_VERSION_CHECK"
-                        }],
-                        "severity": "error",
-                        "code": "exception",
-                        "details": {
-                            "coding": [{
-                                "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
-                                "code": "version-error"
-                            }],
-                            "text": text,
-                        },
-                    }]
-                });
-                return Ok((axum::http::StatusCode::BAD_REQUEST, axum::Json(body)).into_response());
+                return Err(HtsError::VsInvalid(format!(
+                    "{VERSION_CHECK_ERR_PREFIX}{text}"
+                )));
             }
         }
     }
