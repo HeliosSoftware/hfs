@@ -3421,19 +3421,37 @@ async fn process_expand<B: TerminologyBackend>(
             // `deprecated/expand-withdrawn-response-valueSet` drops the
             // top-level `structuredefinition-standards-status` because that
             // extension is what triggered the warning emission upstream.
+            // Echo extension[] only when the source has at least one
+            // extension that ISN'T fully "consumed" by the expansion pipeline.
+            // valueset-supplement is consumed (it auto-applies a supplement
+            // CS — extensions/extensions-all expects no top-level extension
+            // when the source carries supplement alone). When the source
+            // ALSO carries a non-consumed extension (e.g. the unknown
+            // extension on extensions-enumerated, used by enum-definitions3),
+            // echo all extensions as-is — including supplement.
             if let Some(exts) = obj.get("extension").and_then(|e| e.as_array()) {
-                let filtered: Vec<Value> = exts
-                    .iter()
-                    .filter(|ext| {
-                        ext.get("url").and_then(|u| u.as_str())
-                            != Some(
-                                "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
-                            )
-                    })
-                    .cloned()
-                    .collect();
-                if !filtered.is_empty() {
-                    response["extension"] = Value::Array(filtered);
+                let consumed_urls: &[&str] = &[
+                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                    "http://hl7.org/fhir/StructureDefinition/valueset-supplement",
+                ];
+                let has_non_consumed = exts.iter().any(|ext| {
+                    let url = ext.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                    !consumed_urls.contains(&url)
+                });
+                if has_non_consumed {
+                    let filtered: Vec<Value> = exts
+                        .iter()
+                        .filter(|ext| {
+                            ext.get("url").and_then(|u| u.as_str())
+                                != Some(
+                                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                                )
+                        })
+                        .cloned()
+                        .collect();
+                    if !filtered.is_empty() {
+                        response["extension"] = Value::Array(filtered);
+                    }
                 }
             }
             // We deliberately do NOT echo `compose` on $expand responses.
