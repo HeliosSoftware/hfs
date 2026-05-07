@@ -10796,6 +10796,88 @@ mod tests {
         );
     }
 
+    /// R4 cross-version filter.op encoding — when the validator's R5→R4
+    /// converter sees an R5-only filter operator (CHILDOF / DESCENDENTLEAF),
+    /// it clears `op` and stashes the original code in a cross-version
+    /// extension `EXT_VALUESET_FILTER_OP`. Servers running R4 see the empty
+    /// op + extension and must recover the original op so the IG
+    /// `simple/simple-expand-child-of` (described as "R5/R4 transformation"
+    /// test) hits the same hierarchy path as the R5 case.
+    #[tokio::test]
+    async fn expand_recovers_child_of_op_from_r4_cross_version_extension() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [
+            { "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-r4xv",
+              "url": "http://example.org/cs-r4xv",
+              "status": "active", "content": "complete",
+              "hierarchyMeaning": "is-a",
+              "concept": [
+                { "code": "code1", "display": "Display 1" },
+                { "code": "code2", "display": "Display 2",
+                  "concept": [
+                    { "code": "code2a", "display": "Display 2a",
+                      "concept": [
+                        { "code": "code2aI", "display": "Display 2aI" }
+                      ]
+                    },
+                    { "code": "code2b", "display": "Display 2b" }
+                  ]
+                }
+              ]
+            }}
+          ]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        // Inline VS with R4-encoded filter: op cleared, original code in the
+        // cross-version extension. The validator's R5→R4 converter produces
+        // exactly this shape for `op: child-of`.
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-r4xv",
+                    "filter": [{
+                        "extension": [{
+                            "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.compose.include.filter.op",
+                            "valueCode": "child-of"
+                        }],
+                        "property": "concept",
+                        "value": "code2"
+                    }]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec!["code2a", "code2b"],
+            "R4 cross-version-extension child-of must resolve to direct children"
+        );
+        assert!(
+            !codes.contains(&"code2aI"),
+            "child-of must exclude grandchildren even when recovered from extension"
+        );
+    }
+
     /// Validate that `is-a` correctly returns the full transitive-closure
     /// expansion when the value has both children and grandchildren.  The
     /// tx-ecosystem `simple-expand-isa` test sets `value=code2`, expecting all
