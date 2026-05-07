@@ -1413,6 +1413,28 @@ async fn process_expand<B: TerminologyBackend>(
         emitted_params.push(json!({"name": "filter", "valueString": f}));
     }
 
+    // Normalise version-override params to `valueUri` regardless of whether
+    // the request supplied them as `valueCanonical`/`valueUrl`/etc.  The IG
+    // `version/parameters-*-version` fixtures echo them as `valueUri`.
+    for ep in emitted_params.iter_mut() {
+        let name = ep.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(name, "system-version" | "force-system-version") {
+            continue;
+        }
+        let raw = ["valueCanonical", "valueUri", "valueString", "valueUrl"]
+            .iter()
+            .filter_map(|k| ep.get(*k).and_then(|v| v.as_str()).map(|s| (*k, s.to_owned())))
+            .next();
+        if let Some((had_key, val)) = raw {
+            if had_key != "valueUri" {
+                if let Some(obj) = ep.as_object_mut() {
+                    obj.remove(had_key);
+                    obj.insert("valueUri".into(), json!(val));
+                }
+            }
+        }
+    }
+
     // Pull additional default expansion parameters from the source ValueSet's
     // `compose.extension[].valueset-expansion-parameter` entries. The IG fixtures
     // use this to pin defaults like displayLanguage="en" without forcing every
