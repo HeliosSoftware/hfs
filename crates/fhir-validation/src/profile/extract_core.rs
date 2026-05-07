@@ -1,6 +1,25 @@
-//! JSON-based [`StructureDefinition`](https://hl7.org/fhir/structuredefinition.html) extraction.
+//! JSON-based [`StructureDefinition`](https://hl7.org/fhir/structuredefinition.html) extraction
+//! into [`ExtractedProfile`].
 //!
-//! See [`super::extract`](crate::profile::extract) for differential vs snapshot behavior.
+//! This is the **central implementation**: version-specific entry points in [`crate::profile::extract`]
+//! serialize typed resources to JSON and call [`extract_structure_definition_profile_from_json`].
+//!
+//! # Processing overview
+//!
+//! - Validates top-level shape (`resourceType`, `url`, `kind`, `derivation`, `type`, …).
+//! - Chooses **snapshot** `element` rows when present and non-empty; otherwise **differential**
+//!   rows (see [`crate::profile::extract`] for malformed snapshot handling).
+//! - Normalizes each [`ElementDefinition`](https://hl7.org/fhir/elementdefinition.html) row through
+//!   [`super::structure_definition_extract`] helpers into [`ExtractedElementRule`] and friends:
+//!   bindings, invariants, type constraints (including profiles), slicing metadata, fixed/pattern
+//!   values, value-domain bounds.
+//! - Merges differential `id` hints with snapshot paths where applicable so authoring-oriented
+//!   `id` strings remain available on rules.
+//!
+//! # Misc utilities
+//!
+//! [`prune_json_nulls`] strips null entries recursively so optional FHIR fields omitted vs null
+//! behave consistently during extraction tests and ad hoc JSON repair.
 
 use crate::ValidationError;
 use crate::issue_code::FHIR_JSON_VALUE;
@@ -19,7 +38,11 @@ use fhir_validation_types::{
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-/// Remove JSON `null` entries recursively (objects and arrays).
+/// Remove JSON `null` entries recursively from objects and arrays.
+///
+/// Optional FHIR properties omitted in JSON are equivalent to absent; explicit `null` can confuse
+/// downstream checks. This helper keeps fixture and ad hoc SD JSON aligned with typical
+/// serialization output.
 pub fn prune_json_nulls(value: Value) -> Value {
     match value {
         Value::Null => Value::Null,
@@ -38,7 +61,11 @@ pub fn prune_json_nulls(value: Value) -> Value {
     }
 }
 
-/// Extract [`ExtractedProfile`] from raw `StructureDefinition` JSON.
+/// Parse a `StructureDefinition` JSON value into an [`ExtractedProfile`].
+///
+/// Prefer typed extractors in [`crate::profile::extract`] when you already have a versioned
+/// `helios_fhir` model. This entry point accepts raw JSON (file/HTTP body) and performs the same
+/// extraction pipeline described in the [module docs](crate::profile::extract_core).
 pub fn extract_structure_definition_profile_from_json(
     value: &Value,
 ) -> Result<ExtractedProfile, ValidationError> {

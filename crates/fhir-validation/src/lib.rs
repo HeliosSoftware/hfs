@@ -137,7 +137,11 @@ pub use error::{
 pub use evaluators::*;
 pub use issue_to_op_outcome::VALIDATION_SOURCE_INVARIANT_KEY_URL;
 pub use profile_manifest::{
-    ProfileManifest, load_profile_registry_from_manifest, load_profile_registry_from_manifest_file,
+    ProfileManifest, ProfileManifestPathStyle, ScannedIgResources,
+    build_and_write_profile_manifest_for_ig, load_profile_registry_from_manifest,
+    load_profile_registry_from_manifest_file, profile_manifest_from_scan,
+    profile_manifest_from_scan_with_style, scan_ig_package_for_fhir_json,
+    write_profile_manifest_to_file,
 };
 #[cfg(feature = "R5")]
 pub use questionnaire::validate_questionnaire_response_against_questionnaire;

@@ -1,5 +1,10 @@
 //! Rewrite canonical `StructureDefinition.baseDefinition` URLs to **static JSON** paths where
 //! publishers follow predictable conventions (NDHM `…-Type.json`, HL7 `…/R4/patient.profile.json`).
+//!
+//! FHIR canonical URLs for core types often resolve to **HTML** or negotiation-sensitive content.
+//! Before HTTP download, [`structure_definition_json_fetch_url`] produces a best-effort raw JSON URL.
+//! The snapshot-base version string (from IG tooling extension or caller hints) selects the HL7
+//! **package segment** (`R4` vs `R5`, …) for core resource profiles.
 
 const SNAPSHOT_BASE_VERSION_EXT: &str =
     "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version";
@@ -26,7 +31,8 @@ pub fn hl7_web_package_segment_from_snapshot_base(version: &str) -> &'static str
     "R4"
 }
 
-/// If `sd` has `snapshot.extension` with [`SNAPSHOT_BASE_VERSION_EXT`], return its `valueString`.
+/// If `sd` has `snapshot.extension` with the tooling extension
+/// `http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version`, return its `valueString`.
 pub fn parse_snapshot_base_version_from_sd_json(
     sd: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {

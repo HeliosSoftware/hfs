@@ -1,9 +1,40 @@
+//! Min / max cardinality and **mustSupport** checks against instance JSON.
+//!
+//! All three validators serialize the resource once to [`serde_json::Value`] and count
+//! or test paths **relative to the resource type** (e.g. `Patient` → `identifier`, not
+//! `Patient.identifier`). Rules come from [`ExtractedElementRule`]
+//! rows the extractor already merged (snapshot-first).
+//!
+//! # Slice names in reported paths
+//!
+//! When [`ExtractedElementRule::slice_name`] is set (FHIR `ElementDefinition.sliceName`),
+//! issue [`crate::ValidationIssue::fhir_path`] / `instance_path` and diagnostics use
+//! `{path}:{sliceName}` (e.g. `Patient.extension:birthPlace`), consistent with
+//! [`crate::profile::slicing`].
+//!
+//! # Limitation: counting vs slice semantics
+//!
+//! For **unsliced** paths, `min` / `max` / mustSupport checks count JSON nodes along the dotted
+//! path (descending into arrays). For a rule whose [`ExtractedElementRule::path`] is still the
+//! **base** path (e.g. `Patient.extension`) but `slice_name` identifies a **slice**, counting
+//! is currently **not** slice-aware: it may count *all* `extension` entries rather than only
+//! instances that match that slice’s profile/discriminator. Messages still name the slice for
+//! clarity; tighter slice-specific population checks are handled in [`crate::profile::slicing`]
+//! where discriminators are evaluated.
+//!
+//! # Optional parents
+//!
+//! `skip_when_optional_parent_absent` ensures child minimums (e.g. `communication.language`) do
+//! not fire when the parent repeat (`communication`) is absent—matching common IG expectations.
+
 use crate::issue_code;
 use crate::profile::types::ExtractedElementRule;
 use crate::{Severity, ValidationConfig, ValidationIssue, ValidationIssueDetailCode};
 use serde::Serialize;
 use serde_json::Value;
 
+/// Emit **required** (minimum cardinality) issues for rules where `min > 0` and the instance has
+/// fewer matching values than required.
 pub fn validate_min_cardinality<T: Serialize>(
     resource: &T,
     resource_type: &str,
@@ -35,6 +66,7 @@ pub fn validate_min_cardinality<T: Serialize>(
     validate_min_cardinality_from_json(&root, resource_type, rules)
 }
 
+/// Emit issues when repeated elements exceed `ElementDefinition.max` (non-`*`) for a rule.
 pub fn validate_max_cardinality<T: Serialize>(
     resource: &T,
     resource_type: &str,
@@ -66,8 +98,11 @@ pub fn validate_max_cardinality<T: Serialize>(
     validate_max_cardinality_from_json(&root, resource_type, rules)
 }
 
-/// Warn or error when `ElementDefinition.mustSupport` is true but the instance has
-/// no values at the rule path (same path resolution as cardinality).
+/// When [`crate::ValidationConfig::validate_must_support`] is enabled, warn or error if
+/// `ElementDefinition.mustSupport` is true but the rule’s path has no values in the instance
+/// (same JSON traversal as [`validate_min_cardinality`]).
+///
+/// Severity is [`crate::ValidationConfig::must_support_missing_severity`].
 pub fn validate_must_support<T: Serialize>(
     resource: &T,
     resource_type: &str,
@@ -258,6 +293,9 @@ fn validate_max_cardinality_from_json(
     issues
 }
 
+/// Strip the `{ResourceType}.` prefix from an `ElementDefinition.path`, yielding the **relative**
+/// dotted path used when walking JSON (e.g. `Patient.identifier` → `identifier`). Returns `""` for
+/// the resource root path equal to `resource_type`.
 pub fn relative_profile_path<'a>(resource_type: &str, absolute_path: &'a str) -> Option<&'a str> {
     if absolute_path == resource_type {
         return Some("");

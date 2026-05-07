@@ -202,6 +202,8 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket cargo run --bin hfs --features s3
 HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 ```
 
+Optional **`.env`** (local development only): before configuration is parsed, **`hfs`** loads environment entries from **`DOTENV_PATH`** (if set) or from **`.env`** in the process current working directory. Variables already set in the shell are **not** overridden. Prefer systemd / Docker env in production. Root **`.gitignore`** excludes `.env`.
+
 ### Environment Variables
 
 #### Server
@@ -509,6 +511,8 @@ cargo run --bin hts
 # Custom database path and port
 HTS_DATABASE_URL=./my-terminology.db HTS_SERVER_PORT=9090 cargo run --bin hts
 ```
+
+Optional **`.env`**: **`hts`** uses the same rules as **`hfs`** (`DOTENV_PATH` or `./.env`, no override of existing vars). See **HFS Server Configuration → Running the Server** above.
 
 ### Environment Variables
 

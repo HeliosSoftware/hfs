@@ -1,7 +1,7 @@
 //! Slicing validation for extracted profile rules.
 //!
 //! Current scope:
-//! - validates slicing on repeating elements described by [`ExtractedSlicing`]
+//! - validates slicing on repeating elements described by [`ExtractedSlicing`](crate::profile::types::ExtractedSlicing)
 //! - supports discriminator kinds: `value`, `type`, `exists`, `position`, and
 //!   `profile` (v1, without `.resolve()`)
 //! - supports multi-discriminator matching using logical AND semantics
@@ -75,6 +75,11 @@ pub fn validate_slicing<T: Serialize>(
     validate_slicing_with_context(None, &mut state, resource, resource_type, profile)
 }
 
+/// Like [`validate_slicing`] but shares [`ValidationState`] with surrounding validation (recursion
+/// / [`ValidationContext`] when provided).
+///
+/// The optional [`ValidationContext`] is forwarded where nested slice validation may recursively
+/// invoke profile checks (e.g. profile discriminators delegating into `validate_profile_with_depth`).
 pub fn validate_slicing_with_context<T: Serialize>(
     ctx: Option<&ValidationContext<'_>>,
     state: &mut ValidationState,

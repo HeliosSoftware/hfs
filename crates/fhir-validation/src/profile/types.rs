@@ -1,3 +1,16 @@
+//! Extracted **runtime model** for a single `StructureDefinition` and its element rows.
+//!
+//! These types are **not** a full faithful mirror of FHIR `ElementDefinition`—only fields needed
+//! for validation in this crate are retained. Construction is always via
+//! [`crate::profile::extract`] / [`crate::profile::extract_core::extract_structure_definition_profile_from_json`].
+//!
+//! # Rule list semantics
+//!
+//! [`ExtractedProfile::element_rules`] is a flat list of [`ExtractedElementRule`] records keyed by
+//! [`ExtractedElementRule::path`] (and slice identity via [`ExtractedElementRule::slice_name`]).
+//! Slicing **base** rows carry [`ExtractedElementRule::slicing`]; individual slices are separate
+//! rules sharing the same path with distinct slice names.
+
 use fhir_validation_types::{
     BindingDef, InvariantDef, StructureDefinitionKind, TypeDerivationRule,
 };
@@ -11,26 +24,35 @@ use fhir_validation_types::{
 /// differential fallback when snapshot is absent. See `extract` module docs for
 /// details.
 ///
-/// [`kind`] and [`derivation`] mirror `StructureDefinition.kind` and
+/// [`ExtractedProfile::kind`] and [`ExtractedProfile::derivation`] mirror `StructureDefinition.kind` and
 /// `StructureDefinition.derivation` (FHIR ValueSets, aligned with
 /// `helios-fhir` R5 terminology code systems).
 #[derive(Debug, Clone, Default)]
 pub struct ExtractedProfile {
+    /// Canonical `StructureDefinition.url` (globally unique profile identifier).
     pub url: String,
+    /// `StructureDefinition.version` when present.
     pub version: Option<String>,
+    /// Short machine name from the SD (`name`).
     pub name: Option<String>,
+    /// Human title (`title`).
     pub title: Option<String>,
     /// The `StructureDefinition.type` code (root path / type name); e.g. `Patient` or `Address`.
     pub resource_type: String,
+    /// `StructureDefinition.baseDefinition` canonical when the profile derives from another SD.
     pub base_definition: Option<String>,
     /// `StructureDefinition.snapshot.extension` `snapshot-base-version` `valueString`, when
     /// present (FHIR IG tooling); used to pick HL7 web package paths for `baseDefinition` fetch.
     pub snapshot_base_version: Option<String>,
 
+    /// `kind` — `resource`, `logical`, `complex-type`, or `primitive-type`.
     pub kind: StructureDefinitionKind,
+    /// `derivation` — `specialization` vs `constraint` for this SD.
     pub derivation: TypeDerivationRule,
 
+    /// Resource-level (`Patient`-path) `ElementDefinition.constraint` invariants from extraction.
     pub invariants: Vec<InvariantDef>,
+    /// All extracted element rows (root and nested), including slice rows.
     pub element_rules: Vec<ExtractedElementRule>,
 }
 
@@ -71,15 +93,25 @@ pub enum ExtractedValueConstraint {
 /// in context, which is deferred to future work.
 #[derive(Debug, Clone, Default)]
 pub struct ExtractedElementRule {
+    /// Element `id` from the SD (differential `id` preferred when merged with snapshot paths).
     pub id: String,
+    /// `ElementDefinition.path` — dotted logical path, with `[x]` for true polymorphic elements.
     pub path: String,
+    /// `min` cardinality when constrained in this row.
     pub min: Option<u32>,
+    /// `max` as in FHIR (`"*"`, `"1"`, `"0"`, …).
     pub max: Option<String>,
+    /// Terminology binding when declared (`ValueSet` / `CodeSystem`).
     pub binding: Option<BindingDef>,
+    /// `ElementDefinition.constraint` rows (FHIRPath invariants) attached to this path.
     pub constraints: Vec<InvariantDef>,
+    /// `fixed[x]` / `pattern[x]` normalized to JSON for this element, when present.
     pub value_constraint: Option<ExtractedValueConstraint>,
+    /// `ElementDefinition.type` entries (code + optional `profile` / `targetProfile` URLs).
     pub type_constraints: Vec<ExtractedTypeConstraint>,
+    /// Present on the **introducer** row for a sliced repeating element (`ElementDefinition.slicing`).
     pub slicing: Option<ExtractedSlicing>,
+    /// `sliceName` for slice rows; distinguishes slices sharing the same `path`.
     pub slice_name: Option<String>,
     /// `ElementDefinition.maxLength` (string-like primitives).
     pub max_length: Option<u32>,
@@ -133,8 +165,11 @@ pub struct ExtractedElementRule {
 /// absent when the profile does not declare them.
 #[derive(Debug, Clone, Default)]
 pub struct ExtractedTypeConstraint {
+    /// Primary `ElementDefinition.type.code` (e.g. `string`, `CodeableConcept`, `Reference`).
     pub code: String,
+    /// `type.profile` canonical URLs constraining the datatype / profile.
     pub profiles: Vec<String>,
+    /// `type.targetProfile` URLs for reference targets, when declared.
     pub target_profiles: Vec<String>,
     /// Resource aggregation mode codes (`contained`, `referenced`, `bundled`), when present.
     pub aggregation: Vec<String>,
@@ -148,8 +183,11 @@ pub struct ExtractedTypeConstraint {
 /// discriminators, whether slice order matters, and the slicing openness rules.
 #[derive(Debug, Clone)]
 pub struct ExtractedSlicing {
+    /// Ordered discriminator specifications (`type`, `value`, …) evaluated for slice matching.
     pub discriminators: Vec<ExtractedSliceDiscriminator>,
+    /// When true, instance array order must follow slice declaration order for `position` rules.
     pub ordered: bool,
+    /// Whether slices are closed, open, or open-at-end relative to undiscriminated repeats.
     pub rules: ExtractedSlicingRules,
 }
 
@@ -159,7 +197,9 @@ pub struct ExtractedSlicing {
 /// `path` identifies the nominated element relative to the sliced element.
 #[derive(Debug, Clone)]
 pub struct ExtractedSliceDiscriminator {
+    /// Discriminator kind from the profile (FHIR `discriminator.type`).
     pub discriminator_type: ExtractedDiscriminatorType,
+    /// Element path relative to the sliced node (FHIR `discriminator.path`).
     pub path: String,
 }
 

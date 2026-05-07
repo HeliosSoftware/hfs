@@ -51,6 +51,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.0", features = ["derive", "env"] }
+dotenvy = "0.15.7"
 uuid = { version = "1", features = ["v4"] }
 
 # SQLite (default)

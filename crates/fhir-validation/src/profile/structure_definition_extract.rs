@@ -1,9 +1,18 @@
-//! Messages for [`crate::ValidationError::InvalidStructureDefinition`] when parsing
-//! `StructureDefinition` JSON for profile validation.
+//! Errors surfaced as [`crate::ValidationError::InvalidStructureDefinition`] when converting
+//! arbitrary JSON into [`crate::profile::types::ExtractedProfile`].
+//!
+//! Each variant corresponds to a **specific structural expectation** at extraction time (arrays
+//! that must be non-empty, required string fields, unknown code literals, malformed binding, …).
+//! Callers parsing published IGs should treat these as **authoring or tooling problems** in the
+//! `StructureDefinition` (or as version skew if the JSON is not the expected FHIR version).
 
 use std::fmt;
 
 /// Structured reason for a failed StructureDefinition extraction.
+///
+/// Each variant maps to a user-facing validation error (`InvalidStructureDefinition`) and is
+/// meant for diagnostics when a bundle or IG package yields **malformed** `StructureDefinition`
+/// JSON (missing required fields, wrong array shapes, unknown vocabularies, …).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StructureDefinitionExtractMessage {
     JsonMustBeObject,

@@ -1,19 +1,22 @@
 //! `ElementDefinition.maxLength` and `minValue` / `maxValue` checks against instance JSON.
 //!
 //! Temporal comparisons use the generated FHIR library’s precision types
-//! ([`PrecisionDate`](helios_fhir::PrecisionDate),
-//! [`PrecisionDateTime`](helios_fhir::PrecisionDateTime),
-//! [`PrecisionInstant`](helios_fhir::PrecisionInstant),
-//! [`PrecisionTime`](helios_fhir::PrecisionTime)) and their [`compare`](helios_fhir::PrecisionDate::compare) /
-//! [`PrecisionDateTime::compare`](helios_fhir::PrecisionDateTime::compare) logic so ordering follows
+//! ([`PrecisionDate`],
+//! [`PrecisionDateTime`],
+//! [`PrecisionInstant`],
+//! [`PrecisionTime`]) and their [`PrecisionDate::compare`] /
+//! [`PrecisionDateTime::compare`] logic so ordering follows
 //! partial date/datetime/time rules instead of naive string ordering.
 //!
 //! Numeric bounds align with the same primitives as generated resources:
-//! - **decimal** — [`PreciseDecimal`](helios_fhir::PreciseDecimal) / [`DecimalElement`](helios_fhir::DecimalElement)
+//! - **decimal** — [`PreciseDecimal`] / [`DecimalElement`](helios_fhir::DecimalElement)
 //!   (scientific notation, nested `value`, same ordering as the FHIR model).
-//! - **integer**, **positiveInt**, **unsignedInt** (stored as [`Element<i32, _>`](helios_fhir::Element) in
-//!   generated R5), **integer64** — [`Element<i64, _>`](helios_fhir::Element): JSON may be a bare number
+//! - **integer**, **positiveInt**, **unsignedInt** (stored as `Element<i32, _>` in
+//!   generated R5), **integer64** — `Element<i64, _>`: JSON may be a bare number
 //!   or `{"value": …}`; we deserialize accordingly.
+//!
+//! Rules are evaluated for every JSON value matching the element’s relative path(s), including each
+//! array element, with [`crate::ValidationIssue::instance_path`] pointing at the offending leaf.
 
 use crate::issue_code;
 use crate::profile::cardinality::relative_profile_path;
@@ -30,6 +33,11 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::str::FromStr;
 
+/// Validate `maxLength` and numeric / date / time min/max bounds declared on
+/// [`ExtractedElementRule`] rows against serialized instance JSON.
+///
+/// Skips rules with no bound fields; otherwise walks every value at the rule path (same path
+/// traversal strategy as other profile validators: repeated array indices, choice `[x]` keys).
 pub fn validate_element_bounds<T: Serialize>(
     resource: &T,
     resource_type: &str,

@@ -17,6 +17,9 @@
 //!
 //! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`,
 //! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
+//!
+//! Optional: a **`.env`** file (or **`DOTENV_PATH`**) may be loaded at startup before CLI/config parsing
+//! — see workspace `CLAUDE.md` (HFS Server Configuration).
 
 use std::sync::Arc;
 
@@ -636,8 +639,37 @@ async fn init_audit(
     Ok((sink, audit_state))
 }
 
+/// Optional `.env` for local development (loaded before CLI / config).
+///
+/// - If `DOTENV_PATH` is set to a file path, that file is loaded.
+/// - Otherwise `.env` in the process current directory is loaded (if present).
+/// - Variables **already** set in the process environment are **not** overridden.
+fn bootstrap_dotenv() {
+    use std::io::ErrorKind;
+    use std::path::Path;
+
+    let result = match std::env::var("DOTENV_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(p) => dotenvy::from_path(Path::new(p.trim())),
+        None => dotenvy::dotenv().map(|_| ()),
+    };
+
+    match result {
+        Ok(_) => {}
+        Err(dotenvy::Error::Io(e)) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!(
+                "warning: could not load dotenv file ({e}). Check DOTENV_PATH or `.env` syntax."
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    bootstrap_dotenv();
     let config = ServerConfig::parse();
     init_logging(&config.log_level);
 

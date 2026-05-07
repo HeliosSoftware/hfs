@@ -6,19 +6,19 @@
 //! evaluated so that, where applicable, FHIRPath runs in the **same context as the
 //! specification** (the value at the element’s path).
 //!
-//! ## [`ExtractedProfile::invariants`] (profile / root row only)
+//! ## [`ExtractedProfile::invariants`](crate::profile::types::ExtractedProfile::invariants) (profile / root row only)
 //!
 //! The extractor only fills this from differential elements whose `path` equals the resource
 //! type (e.g. `Patient`, `Organization`). These are **resource-level** rules.
 //!
-//! They are evaluated with [`Validator::apply_invariants`], which serializes the full resource
+//! They are evaluated with [`crate::Validator::apply_invariants`], which serializes the full resource
 //! once and uses bulk [`FhirPathEvaluator::eval_invariants_on`]. That matches expressions written
 //! for the resource root (e.g. “at least one name or identifier”, or
 //! `active = true implies name.exists()`).
 //!
-//! ## [`ExtractedElementRule::constraints`] (per-element rules)
+//! ## [`ExtractedElementRule::constraints`](crate::profile::types::ExtractedElementRule::constraints) (per-element rules)
 //!
-//! For a rule whose [`ExtractedElementRule::path`] is **deeper than the resource type** (e.g.
+//! For a rule whose [`ExtractedElementRule::path`](crate::profile::types::ExtractedElementRule::path) is **deeper than the resource type** (e.g.
 //! `Patient.identifier`, `CapabilityStatement.rest.resource`), each
 //! [`InvariantDef::expression`] is evaluated via [`FhirPathEvaluator::eval_invariant`], which
 //! resolves the declared path to the correct focus (including each repeated node) and sets
@@ -26,14 +26,51 @@
 //! `searchParam.select(name).isDistinct()`, or `value.exists()` on an identifier slice).
 //!
 //! If a rule path is classified as **root-only** (resource type and nothing else), we still use
-//! [`Validator::apply_invariants`] for backward compatibility with expressions that assume the
-//! whole resource as focus. See [`apply_profile_element_rule_invariants`] and
+//! [`crate::Validator::apply_invariants`] for backward compatibility with expressions that assume the
+//! whole resource as focus. See `apply_profile_element_rule_invariants` and
 //! [`crate::profile::cardinality::is_root_profile_element_path`].
 //!
 //! **Note:** Generated resource validators (outside this module) pass a **nested** `self` into
-//! [`Validator::apply_invariants`]; that is unchanged and remains correct for datatype-local
+//! [`crate::Validator::apply_invariants`]; that is unchanged and remains correct for datatype-local
 //! rules such as `ele-1` on nested structures.
-
+//!
+//! # Full profile pipeline (`validate_profile`)
+//!
+//! The synchronous [`validate_profile`] / async [`validate_profile_async`] entry points delegate to
+//! the internal `validate_profile_with_depth` (and `_async`), which applies **extracted** constraints in a
+//! fixed order:
+//!
+//! 1. Profile-level invariants ([`ExtractedProfile::invariants`](crate::profile::types::ExtractedProfile::invariants)) — always evaluated at the
+//!    resource root.
+//! 2. Element invariants ([`ExtractedElementRule::constraints`](crate::profile::types::ExtractedElementRule::constraints)) — root vs nested focus per
+//!    `apply_profile_element_rule_invariants`.
+//! 3. Minimum cardinality, then mustSupport (if enabled), then maximum cardinality.
+//! 4. [`crate::profile::slicing::validate_slicing`] — slice membership and per-slice cardinality.
+//! 5. Fixed and pattern value constraints.
+//! 6. `maxLength` and `minValue` / `maxValue` via [`crate::profile::element_bounds`].
+//! 7. Narrowed choice types (`type.code` constraints on `[x]` elements).
+//! 8. Reference and canonical metadata (`aggregation`, `versioning`, target profiles).
+//! 9. `ElementDefinition.type.profile` — declared profile matching and optional **recursive**
+//!    profile validation (guarded by [`crate::ValidationConfig::max_profile_recursion_depth`]
+//!    and active-profile cycle detection in [`ValidationState`]).
+//! 10. Terminology bindings (`ValueSet`/`CodeSystem`).
+//!
+//! When the high-level API merges **base structural** validation with **profile** validation,
+//! duplicate issues (same severity, code, paths, diagnostics) may be removed by `dedupe_exact_issues`
+//! to avoid noisy duplicates (e.g. shared invariants).
+//!
+//! # Declared profiles (`meta.profile`)
+//!
+//! [`validate_declared_profiles`] and [`validate_declared_profiles_async`] read `meta.profile`
+//! canonical URLs, resolve each through [`ValidationContext::runtime_profile_registry`](crate::validation_context::ValidationContext::runtime_profile_registry)
+//! / [`AsyncValidationContext::runtime_profile_registry`](crate::validation_context::AsyncValidationContext::runtime_profile_registry), and run [`validate_profile`] per URL.
+//! Missing registry entries produce `not-found` issues at `Resource.meta.profile`.
+//!
+//! # Base definition lookup
+//!
+//! For profiles with `StructureDefinition.baseDefinition`, optional HTTP fetch (when enabled and
+//! allowlisted) uses [`crate::profile::base_definition_fetch_url::structure_definition_json_fetch_url`]
+//! to turn canonical pages into static JSON URLs, with in-memory caching.
 use crate::issue_code;
 use crate::profile::base_definition_fetch_url::structure_definition_json_fetch_url;
 use crate::profile::cardinality::{
@@ -88,7 +125,7 @@ fn dedupe_exact_issues(issues: Vec<ValidationIssue>) -> Vec<ValidationIssue> {
 /// Validate a resource instance against a single extracted profile.
 ///
 /// This is the public entry point for profile-based validation. It initializes
-/// recursion-cycle tracking and then delegates to [`validate_profile_with_depth`]
+/// recursion-cycle tracking and then delegates to the internal `validate_profile_with_depth`
 /// for the actual validation pipeline.
 ///
 /// **Invariants:** Profile-level and element-level FHIRPath constraints are applied as
@@ -1559,8 +1596,13 @@ fn parse_reference_resource_type(reference: &str) -> Option<&str> {
 
 /// Best-effort mapping from a target profile URL to its implied resource type.
 ///
-/// This is used as a fallback when a concrete extracted profile is not available
-/// in the runtime profile registry.
+/// Used when validating nested content under `type.profile` / `targetProfile` but the runtime
+/// [`ProfileRegistry`] does not contain an entry for that canonical URL—so we
+/// cannot read [`ExtractedProfile::resource_type`] directly.
+///
+/// The heuristic recognizes common HL7 core tail segments (`Patient`, `Observation`, …) and
+/// several `…-{lowercaseresource}` naming patterns from published IGs. Unknown shapes return
+/// [`None`] and callers may skip type-based fallbacks.
 pub fn target_profile_resource_type(url: &str) -> Option<String> {
     let tail = url.rsplit('/').next()?;
 
@@ -2368,9 +2410,11 @@ fn profile_resource_type(url: &str, profile_registry: Option<&ProfileRegistry>) 
     target_profile_resource_type(url)
 }
 
-/// Validate a resource instance against every profile declared in `meta.profile`.
+/// Validate every canonical URL in `meta.profile` using the async profile pipeline.
 ///
-/// Missing declared profiles are reported as `not-found` issues.
+/// Each URL resolved via [`crate::validation_context::AsyncValidationContext::runtime_profile_registry`]
+/// is validated with [`validate_profile_async`]. Missing registry entries produce `not-found`
+/// [`ValidationIssue`]s at `{resourceType}.meta.profile`.
 pub async fn validate_declared_profiles_async<T: Serialize>(
     ctx: &AsyncValidationContext<'_>,
     state: &mut ValidationState,
@@ -2415,6 +2459,12 @@ pub async fn validate_declared_profiles_async<T: Serialize>(
 
     issues
 }
+
+/// Validate every canonical URL in `meta.profile` using the synchronous profile pipeline.
+///
+/// Each URL resolved via [`crate::validation_context::ValidationContext::runtime_profile_registry`]
+/// is validated with [`validate_profile`]. Missing registry entries produce `not-found`
+/// [`ValidationIssue`]s at `{resourceType}.meta.profile`.
 pub fn validate_declared_profiles<T: Serialize>(
     ctx: &ValidationContext<'_>,
     state: &mut ValidationState,

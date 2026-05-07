@@ -178,7 +178,7 @@ fn extension_object_keys_valid(map: &Map<String, Value>) -> bool {
     }
     true
 }
-
+#[allow(clippy::too_many_arguments)]
 fn validate_object_keys(
     obj: &Map<String, Value>,
     logical_parent: &str,
@@ -345,7 +345,7 @@ fn validate_object_keys(
         );
     }
 }
-
+#[allow(clippy::too_many_arguments)]
 fn walk_value(
     val: &Value,
     logical_parent: &str,

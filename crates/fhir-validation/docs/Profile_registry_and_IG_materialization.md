@@ -89,21 +89,35 @@ IG packaging includes **Composition**, **Bundle**, and narrative artifacts. Only
 
 ### Manifest loading helper
 
-`fhir-validation` includes a simple startup helper for curated IG materialization:
+`fhir-validation` includes helpers for curated IG materialization:
 
-- [`ProfileManifest`](../src/profile_manifest.rs): JSON with `structure_definition_files: []`
-- [`load_profile_registry_from_manifest_file`](../src/profile_manifest.rs): loads/merges SD files (single `StructureDefinition` or `Bundle` entries)
+- [`ProfileManifest`](../src/profile_manifest.rs): JSON with `structure_definition_files` (required for registry load). Optional `code_system_files` and `value_set_files` are **written by the scanner** for HTS import / ops; they are **not** read by [`load_profile_registry_from_manifest`].
+- [`load_profile_registry_from_manifest_file`](../src/profile_manifest.rs): loads/merges SD files (single `StructureDefinition` or `Bundle` entries).
+- [`ProfileManifestPathStyle`](../src/profile_manifest.rs): **`Absolute`** (default) writes canonical paths independent of loader CWD; **`RelativeToManifestParent`** writes paths relative to the manifest file’s parent (portable beside the IG; resolving entries still depends on the process working directory unless paths are absolute).
+- [`build_and_write_profile_manifest_for_ig`](../src/profile_manifest.rs) / [`scan_ig_package_for_fhir_json`](../src/profile_manifest.rs): walk an expanded NPM `package/` tree, classify JSON by `resourceType` (including mixed Bundles), and emit a manifest using the chosen path style.
 
-Example:
+Example (hand-authored **or** generated). Use **absolute** paths for machine-local manifests, or **relative** entries (or `--relative` from the example) when the manifest lives next to the IG tree in source control.
 
 ```json
 {
   "structure_definition_files": [
-    "./ig/atrius/StructureDefinition-Patient.json",
-    "./ig/ndhm/profiles.bundle.json"
-  ]
+    "/data/ig/atrius/StructureDefinition-Patient.json"
+  ],
+  "code_system_files": ["/data/ig/ndhm/package/CodeSystem/foo.json"],
+  "value_set_files": ["/data/ig/ndhm/package/ValueSet/bar.json"]
 }
 ```
+
+Generate from disk:
+
+```text
+cargo run -p fhir-validation --example build_ig_profile_manifest -- \
+  /path/to/unpacked/package /path/to/profile-manifest.json
+
+# optional: --absolute (default) or --relative
+```
+
+**Terminology vs `atrius-fhir-valueset-gen`:** The value-set generator builds **Rust** terminology modules from HL7’s core `valuesets.json` bundle for `helios-fhir`. **IG-published** `CodeSystem` / `ValueSet` JSON from NDHM (or any npm IG) should be used **as FHIR resources**—import into HTS `$import`, etc.—not passed through `fhir-valueset-gen` unless you are extending the codegen pipeline for a new purpose.
 
 HFS startup supports optional environment variable `HFS_PROFILE_MANIFEST`:
 

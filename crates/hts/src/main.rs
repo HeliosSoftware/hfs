@@ -1,4 +1,8 @@
 //! Entry point for the `hts` binary.
+//!
+//! Optional **`.env`** / **`DOTENV_PATH`** is loaded before CLI parsing (same as `hfs`); see `CLAUDE.md`.
+
+use std::path::Path;
 
 use clap::Parser;
 use helios_hts::config::{Cli, Command, HtsConfig, ImportArgs, ImportFormat, detect_format};
@@ -22,8 +26,35 @@ fn init_logging(log_level: &str) {
     fmt().with_env_filter(filter).with_target(false).init();
 }
 
+/// Optional `.env` for local development (loaded before CLI / config parsing).
+///
+/// If `DOTENV_PATH` is set, that file is loaded; otherwise `./.env` relative to the process current
+/// directory. Existing environment variables are never overwritten.
+fn bootstrap_dotenv() {
+    use std::io::ErrorKind;
+
+    let result = match std::env::var("DOTENV_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(p) => dotenvy::from_path(Path::new(p.trim())),
+        None => dotenvy::dotenv().map(|_| ()),
+    };
+
+    match result {
+        Ok(_) => {}
+        Err(dotenvy::Error::Io(e)) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!(
+                "warning: could not load dotenv file ({e}). Check DOTENV_PATH or `.env` syntax."
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    bootstrap_dotenv();
     let cli = Cli::parse();
     match cli
         .command

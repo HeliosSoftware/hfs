@@ -1,4 +1,4 @@
-//! [`StructureDefinition`] → [`ExtractedProfile`] conversion.
+//! [`StructureDefinition`](https://hl7.org/fhir/structuredefinition.html) → [`ExtractedProfile`] conversion.
 //!
 //! # Differential vs snapshot
 //!
@@ -7,7 +7,7 @@
 //!   `StructureDefinition.base_definition`. Omitted fields mean “unchanged from
 //!   base,” not “absent.”
 //! - **Snapshot** — the full merged element tree (base + profile), suitable for
-//!   operational use; each row is a complete [`ElementDefinition`] for that path.
+//!   operational use; each row is a complete [`ElementDefinition`](https://hl7.org/fhir/elementdefinition.html) for that path.
 //!
 //! Extraction is **snapshot-first**:
 //! - When `snapshot.element` is present, extraction walks the snapshot rows.
@@ -21,7 +21,7 @@
 //! profile view (base chain + local deltas), which is required for profile-on-
 //! profile validation scenarios.
 //!
-//! [`ExtractedElementRule`]'s `id` prefers the **differential** row for authoring
+//! [`ExtractedElementRule`](crate::profile::types::ExtractedElementRule)'s `id` prefers the **differential** row for authoring
 //! alignment when a matching path exists; otherwise snapshot `id` (or `path`) is
 //! used.
 //!
@@ -55,6 +55,13 @@
 //! [`crate::profile::extract_core::extract_structure_definition_profile_from_json`];
 //! version-specific entry points serialize typed resources to JSON and delegate to
 //! that function.
+//!
+//! # Version entry points
+//!
+//! Use `extract_r4_structure_definition_profile`, `extract_r5_structure_definition_profile`, etc.
+//! (`cfg` per crate features) when you already have a typed `helios_fhir` `StructureDefinition`.
+//! For JSON from disk or unknown version, call [`extract_structure_definition_profile_from_json`]
+//! directly.
 
 use crate::ValidationError;
 use crate::profile::structure_definition_extract::StructureDefinitionExtractMessage as SdMsg;
@@ -64,6 +71,9 @@ pub use crate::profile::extract_core::extract_structure_definition_profile_from_
 pub use crate::profile::extract_core::prune_json_nulls;
 
 /// Extract normalized validation metadata from an R4 `StructureDefinition`.
+///
+/// See the [module-level overview](crate::profile::extract) for differential vs snapshot behavior.
+/// The result is an [`ExtractedProfile`] for [`crate::profile::validate::validate_profile`].
 #[cfg(feature = "R4")]
 pub fn extract_r4_structure_definition_profile(
     sd: &helios_fhir::r4::StructureDefinition,
@@ -77,6 +87,9 @@ pub fn extract_r4_structure_definition_profile(
 }
 
 /// Extract normalized validation metadata from an R4B `StructureDefinition`.
+///
+/// See the [module-level overview](crate::profile::extract). Output is an [`ExtractedProfile`]
+/// for [`crate::profile::validate::validate_profile`].
 #[cfg(feature = "R4B")]
 pub fn extract_r4b_structure_definition_profile(
     sd: &helios_fhir::r4b::StructureDefinition,
@@ -95,7 +108,7 @@ pub fn extract_r4b_structure_definition_profile(
 /// snapshot behavior.
 ///
 /// The extracted result is an [`ExtractedProfile`] consumed by the runtime
-/// validator.
+/// validator ([`crate::profile::validate::validate_profile`]).
 #[cfg(feature = "R5")]
 pub fn extract_r5_structure_definition_profile(
     sd: &helios_fhir::r5::StructureDefinition,
@@ -108,6 +121,10 @@ pub fn extract_r5_structure_definition_profile(
     extract_structure_definition_profile_from_json(&v)
 }
 
+/// Extract normalized validation metadata from an R6 `StructureDefinition`.
+///
+/// See the [module-level overview](crate::profile::extract). Output is an [`ExtractedProfile`]
+/// for [`crate::profile::validate::validate_profile`].
 #[cfg(feature = "R6")]
 pub fn extract_r6_structure_definition_profile(
     sd: &helios_fhir::r6::StructureDefinition,

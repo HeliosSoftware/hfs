@@ -1,5 +1,27 @@
+//! Shared JSON path utilities for profile validation.
+//!
+//! Profile rules use FHIR **`ElementDefinition.path`** strings (dotted, with optional `[x]` for
+//! choices). Instance data is **serde JSON**: repeating FHIR elements become JSON arrays, and
+//! polymorphic `…[x]` definitions become the union of concrete property names (`valueString`,
+//! `valueCode`, …). These helpers unify traversal for:
+//!
+//! - [`crate::profile::cardinality`] (counts along relative paths),
+//! - [`crate::profile::slicing`] (discriminator paths under repeated parents),
+//! - [`crate::profile::element_bounds`] (scoped bound checks with human-readable `instance_path`s).
+//!
+//! # Choice elements (`[x]`)
+//!
+//! When a path segment ends with `[x]`, all object keys that **start with** the same prefix before
+//! `[x]` are considered matches (e.g. path `value[x]` matches JSON keys `valueString`, `valueBoolean`).
+//!
+//! # Arrays
+//!
+//! Arrays are flattened: each index is visited and contributes separately to cardinality and to
+//! slicing classification.
+
 use serde_json::Value;
 
+/// Parse `ElementDefinition.max` for slice rules: `*` → unbounded ([`None`]), else parse as `usize`.
 pub(crate) fn parse_slice_max(max: &str) -> Option<usize> {
     if max == "*" {
         return None;
@@ -132,6 +154,13 @@ fn choice_segment_prefix(segment: &str) -> Option<&str> {
     segment.strip_suffix("[x]")
 }
 
+/// Infer **FHIR type code candidates** from a runtime JSON value for **type** slicing.
+///
+/// JSON is ambiguous: a string could be `string`, `code`, `uri`, etc.; a number may satisfy
+/// `integer`, `decimal`, … This returns **all plausible** primitive type names that might
+/// match `ElementDefinition.type.code` for discriminator matching in
+/// [`crate::profile::slicing`]. Objects add `resourceType` when present and heuristics for
+/// `Reference` / `CodeableReference` shapes.
 pub(crate) fn json_type_codes(value: &Value) -> Vec<String> {
     match value {
         Value::String(_) => vec![
