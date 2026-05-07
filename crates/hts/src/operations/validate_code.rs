@@ -1027,6 +1027,43 @@ fn find_pin_for_system<'a>(
         .map(|(_, v)| v.as_str())
 }
 
+/// Strip VS-pin-mismatch issues from a backend response when a
+/// `force-system-version` parameter overrode the version selection. The
+/// backend's mismatch detector looks at the request's version vs the VS
+/// compose pin; when the operations layer has *forced* a different version
+/// for that system (potentially making the VS pin moot), the resulting
+/// mismatch issue is incorrect. Removes `VALUESET_VALUE_MISMATCH` and the
+/// paired `UNKNOWN_CODESYSTEM_VERSION` issues, flips `result` back to true
+/// (when the only barriers were those), clears `cs_version` echo to the
+/// forced value, and clears `caused_by_unknown_system`.
+fn suppress_forced_version_mismatch(
+    resp: &mut crate::types::ValidateCodeResponse,
+    forced_version: &str,
+) {
+    let had_mismatch = resp
+        .issues
+        .iter()
+        .any(|i| i.message_id.as_deref() == Some("VALUESET_VALUE_MISMATCH"));
+    if !had_mismatch {
+        return;
+    }
+    resp.issues.retain(|i| {
+        let mid = i.message_id.as_deref();
+        !matches!(
+            mid,
+            Some("VALUESET_VALUE_MISMATCH") | Some("UNKNOWN_CODESYSTEM_VERSION")
+        )
+    });
+    resp.caused_by_unknown_system = None;
+    // If no error-severity issues remain, treat the validation as a pass.
+    let any_error = resp.issues.iter().any(|i| i.severity == "error");
+    if !any_error {
+        resp.result = true;
+        resp.message = None;
+        resp.cs_version = Some(forced_version.to_string());
+    }
+}
+
 /// Pull the `version` valueString out of an already-built validate-code
 /// response (FHIR Parameters resource). Used as a fallback when the backend
 /// did not populate `resp.cs_version` directly.
@@ -1443,6 +1480,14 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
             .await
             .map_err(&rewrite)?;
+        // When force-system-version was active for this system, suppress the
+        // backend's VS-pin mismatch issues — the forced version overrides the
+        // VS pin entirely.
+        if let (Some(sys), Some(forced)) = (system.as_deref(), req_version.as_deref()) {
+            if find_pin_for_system(&force_pins, sys).is_some() {
+                suppress_forced_version_mismatch(&mut resp, forced);
+            }
+        }
         if let Some(sys) = system.as_deref() {
             rescue_via_supplements(
                 state.backend(),
@@ -1615,6 +1660,14 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
             .await
             .map_err(&rewrite)?;
+        // When force-system-version was active for this system, suppress the
+        // backend's VS-pin mismatch issues — the forced version overrides the
+        // VS pin entirely.
+        if let Some(forced) = req_version.as_deref() {
+            if find_pin_for_system(&force_pins, &system).is_some() {
+                suppress_forced_version_mismatch(&mut resp, forced);
+            }
+        }
         rescue_via_supplements(
             state.backend(),
             &ctx,
@@ -1730,7 +1783,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 value_set_version: vs_version.clone(),
                 system: Some(system.clone()),
                 code: code.clone(),
-                version: per_coding_version,
+                version: per_coding_version.clone(),
                 display: None,
                 date: find_str_param(&params, "date"),
                 include_abstract: params
@@ -1740,9 +1793,16 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
                 input_form: Some("codeableConcept".into()),
                 lenient_display_validation: lenient_display,
             };
-            let resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
+            let mut resp = ValueSetOperations::validate_code(state.backend(), &ctx, req)
                 .await
                 .map_err(&rewrite)?;
+            // When force-system-version was active for this system, suppress
+            // the backend's VS-pin mismatch issues for this coding.
+            if let Some(forced) = per_coding_version.as_deref() {
+                if find_pin_for_system(&force_pins, &system).is_some() {
+                    suppress_forced_version_mismatch(&mut resp, forced);
+                }
+            }
             if resp.result {
                 let resolved_version = resp.cs_version.clone();
                 let mut value = build_validate_response_async(
