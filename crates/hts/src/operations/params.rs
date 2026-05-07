@@ -51,6 +51,38 @@ pub fn collect_str_params(params: &[Value], name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Collect canonical `url|version` parameters by name into `(system_url,
+/// version_pattern)` pairs. Used by the IG-style version-pin parameters
+/// (`system-version`, `force-system-version`, `check-system-version`) which
+/// each carry a `valueCanonical` of the form `"http://...|1.0.x"`.
+///
+/// Accepts `valueCanonical` / `valueUri` / `valueString` / `valueUrl` so
+/// any reasonable encoding from the IG test fixtures is honoured. Entries
+/// without a `|` separator (or with empty url/version sides) are skipped.
+pub fn collect_canonical_params(params: &[Value], name: &str) -> Vec<(String, String)> {
+    params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+        .filter_map(|p| {
+            for key in ["valueCanonical", "valueUri", "valueString", "valueUrl"] {
+                if let Some(s) = p.get(key).and_then(|v| v.as_str()) {
+                    return Some(s.to_string());
+                }
+            }
+            None
+        })
+        .filter_map(|c| {
+            c.split_once('|').and_then(|(u, v)| {
+                if u.is_empty() || v.is_empty() {
+                    None
+                } else {
+                    Some((u.to_string(), v.to_string()))
+                }
+            })
+        })
+        .collect()
+}
+
 /// Extract a string-typed value from a FHIR parameter object, checking the
 /// most common `valueXxx` fields.
 fn extract_any_string_value(param: &Value) -> Option<String> {

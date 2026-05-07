@@ -31,8 +31,8 @@ use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    extract_codeable_concept, extract_coding_full, extract_parameter_array, find_str_param,
-    parse_query_string, query_params_to_fhir_params,
+    collect_canonical_params, extract_codeable_concept, extract_coding_full,
+    extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
 };
 
 /// Identifies which FHIR `$validate-code` input form the operations layer is
@@ -932,6 +932,219 @@ pub async fn get_validate_code_handler<B: TerminologyBackend>(
 
 // ── ValueSet/$validate-code ────────────────────────────────────────────────────
 
+/// Returns true if `version` satisfies the wildcard `pattern`.
+/// "1.x" matches "1.0.0", "1.2.0", etc. "1.0.x" matches "1.0.0", "1.0.1".
+/// "1.x.x" matches "1.0.0", "1.2.3" (segment-wise: each "x" is any segment).
+/// Mirrors the helper in `backends/sqlite/value_set.rs`.
+fn version_satisfies_wildcard(version: &str, pattern: &str) -> bool {
+    if pattern == "x" {
+        return true;
+    }
+    let pat_segs: Vec<&str> = pattern.split('.').collect();
+    let ver_segs: Vec<&str> = version.split('.').collect();
+
+    let ends_with_x = pat_segs.last().is_some_and(|s| *s == "x");
+    if !ends_with_x && pat_segs.len() != ver_segs.len() {
+        return false;
+    }
+    if ends_with_x && ver_segs.len() < pat_segs.len() - 1 {
+        return false;
+    }
+    for (i, ps) in pat_segs.iter().enumerate() {
+        if *ps == "x" {
+            continue;
+        }
+        match ver_segs.get(i) {
+            Some(vs) if vs == ps => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Pull the include-pinned version for `system_url` out of a ValueSet
+/// resource. Returns `Some(Some(v))` when an include for that system pins a
+/// specific version, `Some(None)` for a versionless include match, and
+/// `None` when no include matches the system at all. Used by the IG-style
+/// version-param resolver to skip applying a default when the VS already
+/// pins the include.
+fn vs_include_pin_for_system(vs: &Value, system_url: &str) -> Option<Option<String>> {
+    let includes = vs.get("compose")?.get("include")?.as_array()?;
+    for inc in includes {
+        if inc.get("system").and_then(|v| v.as_str()) == Some(system_url) {
+            let ver = inc
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            return Some(ver);
+        }
+    }
+    None
+}
+
+/// Resolve a (possibly wildcard) version pattern against the set of stored
+/// versions for a CodeSystem URL. Picks the highest matching version.
+/// Returns `None` when no stored version matches (or the CS is unknown).
+async fn resolve_cs_version_pattern<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system_url: &str,
+    pattern: &str,
+) -> Option<String> {
+    // Exact (non-wildcard) version: just return it as-is. The backend will
+    // detect mismatches against stored data when relevant.
+    if !pattern.contains(".x") && pattern != "x" {
+        return Some(pattern.to_string());
+    }
+    let hits = CodeSystemOperations::search(
+        backend,
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(system_url.to_string()),
+            count: Some(50),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?;
+    let mut versions: Vec<String> = hits
+        .iter()
+        .filter_map(|cs| cs.get("version").and_then(|v| v.as_str()).map(str::to_string))
+        .filter(|v| version_satisfies_wildcard(v, pattern))
+        .collect();
+    versions.sort();
+    versions.pop()
+}
+
+/// Find the first `(system, version_pattern)` pair matching `target_system`
+/// in a list collected via [`collect_canonical_params`].
+fn find_pin_for_system<'a>(
+    pins: &'a [(String, String)],
+    target_system: &str,
+) -> Option<&'a str> {
+    pins.iter()
+        .find(|(s, _)| s == target_system)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Pull the `version` valueString out of an already-built validate-code
+/// response (FHIR Parameters resource). Used as a fallback when the backend
+/// did not populate `resp.cs_version` directly.
+fn extract_response_version(response: &Value) -> Option<String> {
+    response
+        .get("parameter")
+        .and_then(|v| v.as_array())?
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("version"))
+        .and_then(|p| p.get("valueString").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+/// Append the IG-mandated VALUESET_VERSION_CHECK error issue to a built
+/// validate-code response when the resolved CS version doesn't satisfy the
+/// `check-system-version` pattern. Mutates `response` in-place: appends an
+/// issue to the OperationOutcome (creating it if absent), flips `result` to
+/// false, sets `message`, and adjusts the displayed `version` echo when
+/// needed. The location/expression varies with the request shape.
+fn apply_check_version_failure(
+    response: &mut Value,
+    system_url: &str,
+    resolved_version: &str,
+    pattern: &str,
+    request_path: RequestPath,
+) {
+    let location = match request_path {
+        RequestPath::BareCode => "version",
+        RequestPath::CodeableConcept => "CodeableConcept.coding[0].version",
+        RequestPath::Coding => "Coding.version",
+    };
+    let text = format!(
+        "The version '{resolved_version}' is not allowed for system '{system_url}': required \
+         to be '{pattern}' by a version-check parameter"
+    );
+    let issue = json!({
+        "extension": [{
+            "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+            "valueString": "VALUESET_VERSION_CHECK"
+        }],
+        "severity": "error",
+        "code": "exception",
+        "details": {
+            "coding": [{
+                "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                "code": "version-error"
+            }],
+            "text": text,
+        },
+        "location": [location],
+        "expression": [location],
+    });
+
+    let params = match response.get_mut("parameter").and_then(|v| v.as_array_mut()) {
+        Some(a) => a,
+        None => return,
+    };
+
+    // Locate (or create) the `issues` parameter and push our new issue.
+    let mut found_issues = false;
+    for p in params.iter_mut() {
+        if p.get("name").and_then(|v| v.as_str()) == Some("issues") {
+            if let Some(oo) = p.get_mut("resource") {
+                if let Some(arr) = oo.get_mut("issue").and_then(|v| v.as_array_mut()) {
+                    arr.push(issue.clone());
+                } else {
+                    oo["issue"] = json!([issue.clone()]);
+                }
+                found_issues = true;
+                break;
+            }
+        }
+    }
+    if !found_issues {
+        params.push(json!({
+            "name": "issues",
+            "resource": {
+                "resourceType": "OperationOutcome",
+                "issue": [issue],
+            }
+        }));
+    }
+
+    // Flip `result` to false and set/replace `message` with the version-check
+    // text (matches the IG fixtures: when check fires, `message` is the
+    // check-error text alone).
+    for p in params.iter_mut() {
+        match p.get("name").and_then(|v| v.as_str()) {
+            Some("result") => {
+                if let Some(obj) = p.as_object_mut() {
+                    obj.insert("valueBoolean".into(), Value::Bool(false));
+                }
+            }
+            Some("message") => {
+                if let Some(obj) = p.as_object_mut() {
+                    obj.insert("valueString".into(), Value::String(text.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    // If `message` was absent, append it just after `issues`.
+    let has_message = params
+        .iter()
+        .any(|p| p.get("name").and_then(|v| v.as_str()) == Some("message"));
+    if !has_message {
+        // Insert message right before `result` to preserve spec ordering.
+        let result_idx = params
+            .iter()
+            .position(|p| p.get("name").and_then(|v| v.as_str()) == Some("result"));
+        let entry = json!({"name": "message", "valueString": text});
+        match result_idx {
+            Some(i) => params.insert(i, entry),
+            None => params.push(entry),
+        }
+    }
+}
+
 /// Inspect the compose.include[*].valueSet entries of the named ValueSet and
 /// return the first canonical URL that does not resolve to a stored
 /// ValueSet (after stripping any `|version` suffix). Returns `None` when the
@@ -1092,6 +1305,96 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         .iter()
         .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
         .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()));
+
+    // ── IG-style version pin parameters ─────────────────────────────────────
+    // The FHIR R5 IG `version/parameters-*-version.json` profiles inject these
+    // into the request body to steer CodeSystem version selection:
+    //   - `force-system-version` (FORCE): override Coding.version / version /
+    //     systemVersion / VS-pinned version.
+    //   - `system-version`        (DEFAULT): apply only when neither the
+    //     request nor the VS pins a version for the matching system.
+    //   - `check-system-version`  (CHECK): same DEFAULT semantics as
+    //     system-version PLUS a post-check that emits VALUESET_VERSION_CHECK
+    //     when the resolved CS version doesn't satisfy the pattern.
+    let force_pins: Vec<(String, String)> = collect_canonical_params(&params, "force-system-version");
+    let default_pins: Vec<(String, String)> = collect_canonical_params(&params, "system-version");
+    let check_pins: Vec<(String, String)> = collect_canonical_params(&params, "check-system-version");
+    // `check` also acts as a DEFAULT — merge for the default lookup.
+    let mut effective_defaults: Vec<(String, String)> = default_pins.clone();
+    effective_defaults.extend(check_pins.iter().cloned());
+
+    // Look up the source ValueSet once so we can ask whether a given system
+    // is pinned in any include (drives the "default applies only if VS
+    // doesn't pin" rule). Only worth doing when there are version-pin
+    // parameters to apply.
+    let source_vs: Option<Value> = if !force_pins.is_empty()
+        || !effective_defaults.is_empty()
+    {
+        ValueSetOperations::search(
+            state.backend(),
+            &ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some(url.clone()),
+                version: vs_version.clone(),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()
+        .and_then(|mut hits| hits.pop())
+    } else {
+        None
+    };
+
+    // Helper: resolve the effective `version` for a given system based on the
+    // priority order:  force > explicit (Coding.version / version /
+    // systemVersion) > VS-pin > default (system-version / check-system-version)
+    // > (None, backend will fall back to latest).
+    //
+    // Wildcards are resolved to a concrete stored version where possible to
+    // avoid the backend's mismatch detector flagging the wildcard against a
+    // VS pin.  Inlined per call site (cannot use a closure here because the
+    // body needs `.await` and would require `futures::BoxFuture`).
+    async fn resolve_version_for_system<B: TerminologyBackend>(
+        backend: &B,
+        ctx: &TenantContext,
+        system: &str,
+        original: Option<String>,
+        force_pins: &[(String, String)],
+        effective_defaults: &[(String, String)],
+        source_vs: Option<&Value>,
+    ) -> Option<String> {
+        // 1. Force always wins.
+        if let Some(pat) = find_pin_for_system(force_pins, system) {
+            return Some(
+                resolve_cs_version_pattern(backend, ctx, system, pat)
+                    .await
+                    .unwrap_or_else(|| pat.to_string()),
+            );
+        }
+        // 2. Explicit caller-supplied version.
+        if original.is_some() {
+            return original;
+        }
+        // 3. VS-pinned include version (handled by backend).
+        let vs_has_pin = source_vs
+            .and_then(|vs| vs_include_pin_for_system(vs, system))
+            .map(|opt_v| opt_v.is_some())
+            .unwrap_or(false);
+        if vs_has_pin {
+            return None;
+        }
+        // 4. Default from system-version / check-system-version.
+        if let Some(pat) = find_pin_for_system(effective_defaults, system) {
+            return Some(
+                resolve_cs_version_pattern(backend, ctx, system, pat)
+                    .await
+                    .unwrap_or_else(|| pat.to_string()),
+            );
+        }
+        None
+    }
     let rewrite = |e: HtsError| -> HtsError {
         match (e, vs_version.as_deref()) {
             (HtsError::NotFound(msg), Some(v)) => {
@@ -1107,7 +1410,21 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     if let Some(code) = find_str_param(&params, "code") {
         let system = find_str_param(&params, "system");
         let display = find_str_param(&params, "display");
-        let req_version = find_str_param(&params, "version").or(system_version.clone());
+        let original_version = find_str_param(&params, "version").or(system_version.clone());
+        let req_version = if let Some(sys) = system.as_deref() {
+            resolve_version_for_system(
+                state.backend(),
+                &ctx,
+                sys,
+                original_version.clone(),
+                &force_pins,
+                &effective_defaults,
+                source_vs.as_ref(),
+            )
+            .await
+        } else {
+            original_version.clone()
+        };
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
             value_set_version: vs_version.clone(),
@@ -1138,6 +1455,9 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             )
             .await;
         }
+        // Capture cs_version BEFORE moving resp into build_validate_response_async,
+        // so we can post-validate against the check pattern.
+        let resolved_version = resp.cs_version.clone();
         let mut value = build_validate_response_async(
             state.backend(),
             &ctx,
@@ -1150,6 +1470,27 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         )
         .await;
         append_used_supplements(&mut value, &supplements);
+        // Apply check-system-version post-check (only when no other error
+        // already invalidated the result; the IG fixtures show that the
+        // version-check error is the dominant issue when present).
+        if let Some(sys) = system.as_deref() {
+            if let Some(pat) = find_pin_for_system(&check_pins, sys) {
+                let actual = resolved_version
+                    .clone()
+                    .or_else(|| extract_response_version(&value));
+                if let Some(v) = actual.as_deref() {
+                    if !version_satisfies_wildcard(v, pat) {
+                        apply_check_version_failure(
+                            &mut value,
+                            sys,
+                            v,
+                            pat,
+                            RequestPath::BareCode,
+                        );
+                    }
+                }
+            }
+        }
         return Ok(value);
     }
 
@@ -1243,9 +1584,19 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         // report a mismatch.
         let display = coding_display.or_else(|| find_str_param(&params, "display"));
         // Coding.version > explicit `version` param > systemVersion pin.
-        let req_version = coding_version
+        let original_version = coding_version
             .or_else(|| find_str_param(&params, "version"))
             .or(system_version.clone());
+        let req_version = resolve_version_for_system(
+            state.backend(),
+            &ctx,
+            &system,
+            original_version.clone(),
+            &force_pins,
+            &effective_defaults,
+            source_vs.as_ref(),
+        )
+        .await;
         let req = ValidateCodeRequest {
             url: Some(url.clone()),
             value_set_version: vs_version.clone(),
@@ -1274,6 +1625,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             &mut resp,
         )
         .await;
+        let resolved_version = resp.cs_version.clone();
         let mut value = build_validate_response_async(
             state.backend(),
             &ctx,
@@ -1286,6 +1638,23 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         )
         .await;
         append_used_supplements(&mut value, &supplements);
+        // Apply check-system-version post-check.
+        if let Some(pat) = find_pin_for_system(&check_pins, &system) {
+            let actual = resolved_version
+                .clone()
+                .or_else(|| extract_response_version(&value));
+            if let Some(v) = actual.as_deref() {
+                if !version_satisfies_wildcard(v, pat) {
+                    apply_check_version_failure(
+                        &mut value,
+                        &system,
+                        v,
+                        pat,
+                        RequestPath::Coding,
+                    );
+                }
+            }
+        }
         return Ok(value);
     }
 
