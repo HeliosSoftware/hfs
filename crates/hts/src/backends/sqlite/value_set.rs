@@ -3489,6 +3489,25 @@ fn apply_compose_filters(
     // op from the extension before partitioning so the IG `simple-expand-
     // child-of` "R5/R4 transformation" test resolves to the same hierarchy
     // path as the R5 case.
+    //
+    // The HAPI converter calls `tgt.addExtension(EXT_VALUESET_FILTER_OP, …)`
+    // on the `op` Enumeration itself, which in FHIR JSON serialises as the
+    // `_op` sibling primitive-extension object (NOT as an entry in
+    // `filter.extension[]`). Check both placements: `_op.extension[]` is
+    // what the converter actually emits today, while `filter.extension[]`
+    // is what some older / hand-rolled clients use for the same purpose.
+    const EXT_FILTER_OP_URL: &str =
+        "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.compose.include.filter.op";
+    fn find_filter_op_extension(exts: &serde_json::Value) -> Option<&str> {
+        exts.as_array()?.iter().find_map(|ext| {
+            let url = ext.get("url").and_then(|v| v.as_str())?;
+            if url == EXT_FILTER_OP_URL {
+                ext.get("valueCode").and_then(|v| v.as_str())
+            } else {
+                None
+            }
+        })
+    }
     let filters_owned: Vec<serde_json::Value> = filters_raw
         .iter()
         .map(|f| {
@@ -3499,20 +3518,22 @@ fn apply_compose_filters(
                 .map(str::is_empty)
                 .unwrap_or(true);
             if needs_recovery {
-                if let Some(exts) = f.get("extension").and_then(|e| e.as_array()) {
-                    for ext in exts {
-                        let url = ext.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                        if url
-                            == "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.compose.include.filter.op"
-                        {
-                            if let Some(code) =
-                                ext.get("valueCode").and_then(|v| v.as_str())
-                            {
-                                f["op"] = serde_json::Value::String(code.to_owned());
-                                break;
-                            }
-                        }
-                    }
+                // First check `_op.extension[]` (the HAPI converter's
+                // canonical placement: extension on the `op` primitive).
+                let recovered = f
+                    .get("_op")
+                    .and_then(|primitive| primitive.get("extension"))
+                    .and_then(find_filter_op_extension)
+                    .map(str::to_owned)
+                    // Fallback: `filter.extension[]` (some clients place the
+                    // cross-version extension on the parent BackboneElement).
+                    .or_else(|| {
+                        f.get("extension")
+                            .and_then(find_filter_op_extension)
+                            .map(str::to_owned)
+                    });
+                if let Some(code) = recovered {
+                    f["op"] = serde_json::Value::String(code);
                 }
             }
             f
@@ -10875,6 +10896,90 @@ mod tests {
         assert!(
             !codes.contains(&"code2aI"),
             "child-of must exclude grandchildren even when recovered from extension"
+        );
+    }
+
+    /// HAPI's actual R5→R4 converter places the cross-version extension on
+    /// the `op` Enumeration itself, which serialises in FHIR JSON as the
+    /// sibling primitive-extension `_op` object — NOT as an entry on
+    /// `filter.extension[]`. The IG `simple/simple-expand-child-of` fixture
+    /// hits this exact shape when targeting an R4 server, so the recovery
+    /// must read `_op.extension[]` to resolve the original op code.
+    #[tokio::test]
+    async fn expand_recovers_child_of_op_from_r4_underscore_op_primitive_extension() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [
+            { "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-r4xv-uop",
+              "url": "http://example.org/cs-r4xv-uop",
+              "status": "active", "content": "complete",
+              "hierarchyMeaning": "is-a",
+              "concept": [
+                { "code": "code1", "display": "Display 1" },
+                { "code": "code2", "display": "Display 2",
+                  "concept": [
+                    { "code": "code2a", "display": "Display 2a",
+                      "concept": [
+                        { "code": "code2aI", "display": "Display 2aI" }
+                      ]
+                    },
+                    { "code": "code2b", "display": "Display 2b" }
+                  ]
+                }
+              ]
+            }}
+          ]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        // R4-encoded filter using the HAPI converter's actual output shape:
+        // `op` absent (the converter emits no value for CHILDOF since it has
+        // no R4 enum), with the original code on the `_op.extension[]`
+        // primitive-extension object.
+        let inline_vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "compose": {
+                "include": [{
+                    "system": "http://example.org/cs-r4xv-uop",
+                    "filter": [{
+                        "property": "concept",
+                        "_op": {
+                            "extension": [{
+                                "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.compose.include.filter.op",
+                                "valueCode": "child-of"
+                            }]
+                        },
+                        "value": "code2"
+                    }]
+                }]
+            }
+        });
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(inline_vs),
+                    count: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec!["code2a", "code2b"],
+            "child-of recovered from `_op.extension[]` must resolve to direct children"
+        );
+        assert!(
+            !codes.contains(&"code2aI"),
+            "child-of must exclude grandchildren even when recovered from `_op` primitive extension"
         );
     }
 
