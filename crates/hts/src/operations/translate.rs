@@ -119,13 +119,18 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
             "valueCoding": Value::Object(concept_coding),
         }));
 
-        // R4 emits `equivalence`; R5 emits `relationship`. Emit both — the
-        // tx-ecosystem fixtures mark each as `$optional$ version:N` so a
-        // server that includes both is conformant for either FHIR version.
-        // Order: `relationship` BEFORE `equivalence` to match the IG
-        // fixture sequence — the comparator does positional checks at the
-        // optional slots.
+        // R4 uses `equivalence`; R5/R6 renamed it to `relationship`. The
+        // tx-ecosystem fixtures mark each as `$optional$ version:N`, but the
+        // validator's TxTesterSorters alphabetises the part list before
+        // comparison. When we emit BOTH names the actual array has 4 parts
+        // sorted as [concept, equivalence, relationship, source] while the
+        // version-filtered expected has 3 parts sorted as [concept,
+        // relationship, source] (R5 case), and position-1 mismatches with
+        // "Expected:'relationship' Actual:'equivalence'". Emit only the
+        // version-appropriate name so both arrays sort identically.
+        #[cfg(any(feature = "R5", feature = "R6"))]
         parts.push(json!({"name": "relationship", "valueCode": m.equivalence}));
+        #[cfg(not(any(feature = "R5", feature = "R6")))]
         parts.push(json!({"name": "equivalence", "valueCode": m.equivalence}));
 
         // `originMap` — canonical ConceptMap reference, with `|version` if known.
@@ -422,7 +427,14 @@ mod tests {
         let match_param = params.iter().find(|p| p["name"] == "match").unwrap();
         let parts = match_param["part"].as_array().unwrap();
 
-        let equiv = parts.iter().find(|p| p["name"] == "equivalence").unwrap();
+        // The build emits `equivalence` for R4/R4B and `relationship` for R5/R6;
+        // either name carries the same valueCode.
+        let key = if cfg!(any(feature = "R5", feature = "R6")) {
+            "relationship"
+        } else {
+            "equivalence"
+        };
+        let equiv = parts.iter().find(|p| p["name"] == key).unwrap();
         assert_eq!(equiv["valueCode"], "equivalent");
     }
 
@@ -568,11 +580,10 @@ mod tests {
         assert_eq!(source["valueCoding"]["system"], "http://example.org/src");
     }
 
-    /// IG `translate/translate-reverse` fixture pins the part ordering as:
-    /// `concept`, `relationship`, `equivalence`, `source`. The comparator
-    /// does positional checks at the optional slots — emitting the parts in
-    /// any other order causes "Expected 'source' Actual 'relationship'" at
-    /// `.parameter[0].part[3].name`.
+    /// IG `translate/translate-reverse` fixture pins the part ordering. The
+    /// validator's TxTesterSorters alphabetises before comparison, so we just
+    /// need the right SET of parts (one of equivalence/relationship per the
+    /// build's FHIR version). originMap is suppressed in reverse mode.
     #[tokio::test]
     async fn translate_reverse_part_ordering_matches_ig_fixture() {
         let app = make_app();
@@ -591,15 +602,19 @@ mod tests {
         let m = params.iter().find(|p| p["name"] == "match").unwrap();
         let parts = m["part"].as_array().unwrap();
 
-        // Names in order. originMap is suppressed in reverse mode.
         let names: Vec<&str> = parts
             .iter()
             .filter_map(|p| p["name"].as_str())
             .collect();
+        let equiv_or_rel = if cfg!(any(feature = "R5", feature = "R6")) {
+            "relationship"
+        } else {
+            "equivalence"
+        };
         assert_eq!(
             names,
-            vec!["concept", "relationship", "equivalence", "source"],
-            "reverse-mode part ordering must be concept/relationship/equivalence/source"
+            vec!["concept", equiv_or_rel, "source"],
+            "reverse-mode parts must be concept/<equivalence|relationship>/source"
         );
     }
 
@@ -625,10 +640,12 @@ mod tests {
         assert_eq!(origin["valueCanonical"], "http://example.org/cm|1.0");
     }
 
-    /// Forward translation emits both `equivalence` (R4) and `relationship` (R5)
-    /// so a single response is conformant for either FHIR version.
+    /// Forward translation emits the version-appropriate name only —
+    /// `equivalence` in R4/R4B, `relationship` in R5/R6 — so the validator's
+    /// TxTesterSorters-alphabetised actual matches the version-filtered
+    /// expected at every position.
     #[tokio::test]
-    async fn translate_emits_both_equivalence_and_relationship() {
+    async fn translate_emits_version_appropriate_relationship_name() {
         let app = make_app();
         let body = json!({
             "resourceType": "Parameters",
@@ -650,10 +667,15 @@ mod tests {
             .unwrap()
             .clone();
 
-        let equiv = parts.iter().find(|p| p["name"] == "equivalence").unwrap();
-        let rel = parts.iter().find(|p| p["name"] == "relationship").unwrap();
-        assert_eq!(equiv["valueCode"], "equivalent");
-        assert_eq!(rel["valueCode"], "equivalent");
+        if cfg!(any(feature = "R5", feature = "R6")) {
+            let rel = parts.iter().find(|p| p["name"] == "relationship").unwrap();
+            assert_eq!(rel["valueCode"], "equivalent");
+            assert!(parts.iter().all(|p| p["name"] != "equivalence"));
+        } else {
+            let equiv = parts.iter().find(|p| p["name"] == "equivalence").unwrap();
+            assert_eq!(equiv["valueCode"], "equivalent");
+            assert!(parts.iter().all(|p| p["name"] != "relationship"));
+        }
     }
 
     /// Forward responses do *not* include a `source` Coding — the caller

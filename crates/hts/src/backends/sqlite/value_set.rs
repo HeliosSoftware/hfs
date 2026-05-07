@@ -3220,9 +3220,14 @@ fn expand_single_include_local(
     }
 
     // No explicit codes and no filters: include ALL concepts from the
-    // referenced system.
+    // referenced system. ORDER BY id preserves CodeSystem-defined insertion
+    // order, which is what FHIR expansion semantics require and what the IG
+    // `exclude/exclude-gender2` fixture pins (`male` first, not `female`).
+    // Concepts are inserted in the order they appear in the source
+    // CodeSystem.concept[] array, so the autoincrement INTEGER PRIMARY KEY
+    // doubles as a stable definition-order column.
     let mut stmt = conn
-        .prepare_cached("SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code")
+        .prepare_cached("SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY id")
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     let rows = stmt
@@ -3469,10 +3474,51 @@ fn apply_compose_filters(
     inc: &serde_json::Value,
     text_filter: Option<&str>,
 ) -> Result<Option<Vec<ExpansionContains>>, HtsError> {
-    let filters = match inc["filter"].as_array() {
+    let filters_raw = match inc["filter"].as_array() {
         Some(f) if !f.is_empty() => f,
         _ => return Ok(None),
     };
+
+    // Normalise R4-encoded filter ops. The R5→R4 ValueSet converter in
+    // org.hl7.fhir.convertors clears `op` when the operator has no R4 enum
+    // value (CHILDOF, DESCENDENTLEAF) and stashes the original code in a
+    // cross-version extension `EXT_VALUESET_FILTER_OP`. The tx-ecosystem
+    // validator round-trips every fixture through this converter when the
+    // server reports `fhirVersion=4.x` (`/metadata`), so requests targeting
+    // an R4 build arrive with `op=null` for any R5-only operator. Restore the
+    // op from the extension before partitioning so the IG `simple-expand-
+    // child-of` "R5/R4 transformation" test resolves to the same hierarchy
+    // path as the R5 case.
+    let filters_owned: Vec<serde_json::Value> = filters_raw
+        .iter()
+        .map(|f| {
+            let mut f = f.clone();
+            let needs_recovery = f
+                .get("op")
+                .and_then(|v| v.as_str())
+                .map(str::is_empty)
+                .unwrap_or(true);
+            if needs_recovery {
+                if let Some(exts) = f.get("extension").and_then(|e| e.as_array()) {
+                    for ext in exts {
+                        let url = ext.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                        if url
+                            == "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.compose.include.filter.op"
+                        {
+                            if let Some(code) =
+                                ext.get("valueCode").and_then(|v| v.as_str())
+                            {
+                                f["op"] = serde_json::Value::String(code.to_owned());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            f
+        })
+        .collect();
+    let filters: &[serde_json::Value] = &filters_owned;
 
     // Validate every filter carries a non-empty `value`. ValueSet.compose.
     // include.filter.value is mandatory per the FHIR spec; the HL7 IG
