@@ -804,12 +804,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // return without pagination (total = flat count, no offset/count).
             // The IG `parameters/parameters-expand-enum-*` fixtures want
             // enumerated expansions FLAT (children of abstract parents
-            // surfaced as siblings) when the trigger was excludeNested=false
-            // (FHIR R5 convention), but the legacy `hierarchical=true`
-            // (HL7-tx convention) still asks for an explicit tree even on
-            // enumerated composes.
-            let want_tree = req.hierarchical == Some(true)
-                && (!compose_is_enumerated || req.hierarchical_explicit);
+            // surfaced as siblings) regardless of how tree-mode was
+            // requested. An enumerated compose (every include carries an
+            // explicit concept[]) is by definition a curated flat list, so
+            // we suppress tree-building outright in that case.  The legacy
+            // HL7-tx `hierarchical=true` convention still asks for an
+            // explicit tree on non-enumerated VSes.
+            let want_tree = req.hierarchical == Some(true) && !compose_is_enumerated;
             if want_tree {
                 let total = filtered.len() as u32;
                 let tree = build_hierarchical_expansion(&conn, filtered)?;

@@ -1754,11 +1754,35 @@ async fn process_expand<B: TerminologyBackend>(
                 }
             }
         }
+        // FHIR-spec well-known concept-property URIs (
+        // http://hl7.org/fhir/concept-properties).  When a CodeSystem doesn't
+        // declare a `property[].uri` for a code we look up here so the
+        // emitted `expansion.property[].uri` still matches the IG fixtures.
+        // Mapping covers the "infrastructure" properties surfaced by HTS
+        // (definition, status, inactive, deprecated, notSelectable, parent,
+        // child, partOf, synonym).
+        fn well_known_property_uri(code: &str) -> Option<&'static str> {
+            match code {
+                "definition" => Some("http://hl7.org/fhir/concept-properties#definition"),
+                "status" => Some("http://hl7.org/fhir/concept-properties#status"),
+                "inactive" => Some("http://hl7.org/fhir/concept-properties#inactive"),
+                "deprecated" => Some("http://hl7.org/fhir/concept-properties#deprecated"),
+                "notSelectable" => Some("http://hl7.org/fhir/concept-properties#notSelectable"),
+                "parent" => Some("http://hl7.org/fhir/concept-properties#parent"),
+                "child" => Some("http://hl7.org/fhir/concept-properties#child"),
+                "partOf" => Some("http://hl7.org/fhir/concept-properties#partOf"),
+                "synonym" => Some("http://hl7.org/fhir/concept-properties#synonym"),
+                "alternateCode" => Some("http://hl7.org/fhir/concept-properties#alternateCode"),
+                _ => None,
+            }
+        }
         let prop_decls: Vec<Value> = requested_properties
             .iter()
             .map(|code| {
                 let mut entry = json!({"code": code});
                 if let Some(uri) = uri_by_code.get(code) {
+                    entry["uri"] = json!(uri);
+                } else if let Some(uri) = well_known_property_uri(code) {
                     entry["uri"] = json!(uri);
                 }
                 entry

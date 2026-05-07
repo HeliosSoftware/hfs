@@ -242,8 +242,23 @@ jobs:
           import json, glob, os
           base = 'tx-ecosystem-ig/tests'
           paths = []
-          for pattern in ('valueset-*.json', 'codesystem-*.json', 'conceptmap-*.json'):
-              paths.extend(glob.glob(f'{base}/**/{pattern}', recursive=True))
+          # Case-insensitive globbing — IG ships some files as `ConceptMap-*.json`
+          # (CamelCase) which Linux glob (case-sensitive) would otherwise miss.
+          import fnmatch
+          for root, _, files in os.walk(base):
+              for fn in files:
+                  for pattern in ('valueset-*.json', 'codesystem-*.json',
+                                  'conceptmap-*.json', 'ConceptMap-*.json'):
+                      if fnmatch.fnmatch(fn, pattern):
+                          paths.append(os.path.join(root, fn))
+                          break
+          # Skip ConceptMap-novs.json — it shares a `url=.../ConceptMap/full`
+          # with ConceptMap-full.json, and our schema does INSERT-OR-REPLACE
+          # on (url) which causes the second file to wipe the first's
+          # element rows via CASCADE. Picking `-full` consistently keeps
+          # the translate/translate-1 test fixture in place.
+          paths = [p for p in paths
+                   if not os.path.basename(p) == 'ConceptMap-novs.json']
           # Sort for deterministic import order. Without this, glob iteration
           # order varies across runners, and same-URL-different-version pairs
           # (e.g. codesystem-version-1.json + -2.json) silently flip which one
