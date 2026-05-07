@@ -682,7 +682,7 @@ fn apply_concept_extension_data<'a, B: TerminologyBackend>(
     supplement_urls: &'a [String],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        use crate::types::{ExpansionContainsDesignation, ExpansionContainsProperty};
+        use crate::types::ExpansionContainsProperty;
         use std::collections::HashMap;
         // Bucket codes per system for one batched lookup per system.
         let mut by_system: HashMap<String, Vec<String>> = HashMap::new();
@@ -795,6 +795,16 @@ fn apply_concept_extension_data<'a, B: TerminologyBackend>(
             // Pass 3: per-designation extensions. Match each base/supplement
             // designation against the entry's existing designations by
             // (language, value) and copy across its extension[].
+            //
+            // Only annotate ALREADY-PRESENT designations — never invent new
+            // ones here.  Pre-Pass 3 the only path that populates
+            // `c.designations` is `populate_designations` (gated on
+            // `includeDesignations=true`) and `apply_supplement_designations`
+            // (gated on `includeDesignations` AND a supplement being applied).
+            // Adding designations here unconditionally surfaces base CS
+            // designations on every expansion, breaking
+            // `parameters/parameters-expand-supplement-none` which expects
+            // a designation-free response.
             for src in &sources {
                 let Some(desigs) = src.get("designation").and_then(|d| d.as_array()) else {
                     continue;
@@ -828,21 +838,8 @@ fn apply_concept_extension_data<'a, B: TerminologyBackend>(
                                 .retain(|e| e.get("url").and_then(|u| u.as_str()) != Some(url));
                             t.extensions.push(d_ext.clone());
                         }
-                    } else if !c.designations.iter().any(|existing| {
-                        existing.value.eq_ignore_ascii_case(value)
-                            && existing.language == language
-                    }) {
-                        // No matching designation existed yet — add a new one
-                        // (e.g. the supplement contributed a designation that
-                        // the base CS didn't know about).
-                        c.designations.push(ExpansionContainsDesignation {
-                            language,
-                            use_system: None,
-                            use_code: None,
-                            value: value.to_string(),
-                            extensions: d_exts.iter().cloned().collect(),
-                        });
                     }
+                    // (No `else` branch — see comment above.)
                 }
             }
 
@@ -1297,7 +1294,14 @@ async fn process_expand<B: TerminologyBackend>(
         filter: filter.clone(),
         count,
         offset,
-        max_expansion_size: Some(state.max_expansion_size),
+        max_expansion_size: Some(
+            params
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("__max_expansion_size__"))
+                .and_then(|p| p.get("valueInteger").and_then(|v| v.as_u64()))
+                .map(|v| v as u32)
+                .unwrap_or(state.max_expansion_size),
+        ),
         date: find_str_param(&params, "date"),
         hierarchical,
         hierarchical_explicit,
@@ -1394,10 +1398,22 @@ async fn process_expand<B: TerminologyBackend>(
         .await
         .ok()
         .and_then(|mut v| {
-            // If a specific version was requested, return only that row.
-            // Otherwise pick the highest version (matches resolve_value_set_versioned).
-            if req_vs_version.is_some() {
-                v.into_iter().next()
+            // If a specific version was requested, return the row whose
+            // `version` matches exactly. Defensive post-filter: the search
+            // SQL already filters by version, but multiple rows can leak in
+            // (e.g. when the search predicate gets lost downstream in a
+            // composite backend) — picking by exact match here keeps the
+            // top-level metadata aligned with the version the backend
+            // actually expanded against (`vs-expand-v2` / `vs-expand-v2-default`
+            // / `vs-expand-v2-force` regress without this check).
+            //
+            // When no version is pinned, pick the highest version (matches
+            // `resolve_value_set_versioned`).
+            if let Some(ref want) = req_vs_version {
+                v.iter()
+                    .find(|r| r.get("version").and_then(|x| x.as_str()) == Some(want.as_str()))
+                    .cloned()
+                    .or_else(|| v.into_iter().next())
             } else {
                 v.sort_by(|a, b| {
                     let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
@@ -1787,6 +1803,37 @@ async fn process_expand<B: TerminologyBackend>(
     // this expansion. Only for those systems do we emit the version field on
     // individual contains items (so multi-version expansions are unambiguous
     // while single-version expansions stay compact).
+    //
+    // ALSO retain `version` on contains items whose source ValueSet
+    // explicitly version-pins the system in any compose.include[] or
+    // compose.exclude[] entry. The IG `overload/overload-expand-exclude*`
+    // fixtures pin both include (`v2`) and exclude (`v1`) of the same system
+    // and expect the surviving codes to surface their resolved version even
+    // though the post-exclude expansion ends up single-version.
+    let pinned_systems_for_version_echo: std::collections::HashSet<String> = source_vs
+        .as_ref()
+        .and_then(|vs| vs.get("compose"))
+        .map(|compose| {
+            let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for key in ["include", "exclude"] {
+                if let Some(arr) = compose.get(key).and_then(|v| v.as_array()) {
+                    for inc in arr {
+                        let has_version = inc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .is_some();
+                        if has_version {
+                            if let Some(sys) = inc.get("system").and_then(|v| v.as_str()) {
+                                out.insert(sys.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
     let multi_version_systems: std::collections::HashSet<String> = {
         use std::collections::HashMap;
         let mut sys_versions: HashMap<&str, Option<&str>> = HashMap::new();
@@ -1802,6 +1849,10 @@ async fn process_expand<B: TerminologyBackend>(
                 }
                 _ => {}
             }
+        }
+        // Promote pinned single-version systems too — see comment above.
+        for sys in &pinned_systems_for_version_echo {
+            multi.insert(sys.clone());
         }
         multi
     };
@@ -1882,6 +1933,12 @@ async fn process_expand<B: TerminologyBackend>(
             // in expansion.parameter[]. Echoing produces "Unexpected Node
             // found in array" diffs against every fixture.
             if matches!(name, "uuid" | "binding-style") {
+                return false;
+            }
+            // Synthetic internal-only params injected by handlers — never
+            // echo (e.g. `__max_expansion_size__` set by the
+            // X-TOO-COSTLY-THRESHOLD header injector).
+            if name.starts_with("__") && name.ends_with("__") {
                 return false;
             }
             // Must carry a primitive value[x] to be valid in expansion.parameter.
@@ -2405,6 +2462,43 @@ async fn process_expand<B: TerminologyBackend>(
             });
             resp.contains = indexed.into_iter().map(|(_, c)| c).collect();
 
+            // When the source ValueSet declares `versionsMatch=true` (via
+            // `compose.extension.valueset-expansion-parameter`), the IG
+            // `overload/overload-expand-all-merged` and `expand-exclude-merged`
+            // fixtures DEDUPLICATE codes that surface across multiple versions
+            // — keep the first occurrence (latest, thanks to the sort above).
+            let merged = source_vs
+                .as_ref()
+                .and_then(|vs| vs.get("compose"))
+                .and_then(|c| c.get("extension"))
+                .and_then(|e| e.as_array())
+                .map(|exts| {
+                    exts.iter().any(|ext| {
+                        ext.get("url").and_then(|u| u.as_str())
+                            == Some(
+                                "http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter",
+                            )
+                            && ext.get("extension").and_then(|e| e.as_array()).is_some_and(|inner| {
+                                inner.iter().any(|sub| {
+                                    sub.get("url").and_then(|u| u.as_str()) == Some("name")
+                                        && sub.get("valueCode").and_then(|v| v.as_str())
+                                            == Some("versionsMatch")
+                                })
+                            })
+                    })
+                })
+                .unwrap_or(false);
+            if merged {
+                let mut seen: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                resp.contains.retain(|c| {
+                    seen.insert((c.system.clone(), c.code.clone()))
+                });
+                if let Some(t) = resp.total.as_mut() {
+                    *t = resp.contains.len() as u32;
+                }
+            }
+
             // The serialized `contains` array (built earlier at the start of
             // the response-build phase) was produced from the pre-sort order
             // — re-serialize from `resp.contains` so the expansion reflects
@@ -2416,6 +2510,9 @@ async fn process_expand<B: TerminologyBackend>(
                 .map(|c| serialize_expansion_contains(c, &multi_version_systems))
                 .collect();
             expansion["contains"] = json!(resorted);
+            if merged {
+                expansion["total"] = json!(resp.contains.len());
+            }
         }
     }
 
@@ -2444,6 +2541,19 @@ async fn process_expand<B: TerminologyBackend>(
             "name": "used-codesystem",
             "valueUri": value_uri,
         }));
+        // The IG `fragment/fragment-expansion` fixture expects an additional
+        // `used-fragment` parameter (mirroring `used-codesystem`'s value) when
+        // the contributing CodeSystem declares `content: "fragment"`. Plus an
+        // `expansion.extension` pair (`valueset-unclosed` + `valueset-unclosed-
+        // reason`) flagging the partial coverage.
+        if let Some(cs) = cs_by_url.get(system_url).and_then(|c| c.as_ref()) {
+            if cs.get("content").and_then(|v| v.as_str()) == Some("fragment") {
+                emitted_params.push(json!({
+                    "name": "used-fragment",
+                    "valueUri": value_uri,
+                }));
+            }
+        }
         // Emit `warning-<status>` only once per system URL (first pair wins).
         if warned_systems.insert(system_url.clone()) {
             let cs = cs_by_url.get(system_url).and_then(|c| c.as_ref());
@@ -2456,6 +2566,43 @@ async fn process_expand<B: TerminologyBackend>(
                 }
             }
         }
+    }
+
+    // ── expansion.extension: valueset-unclosed (fragment CSes) ───────────────
+    // Per the IG `fragment/fragment-expansion` fixture, when ANY contributing
+    // CodeSystem has `content: "fragment"`, the response's `expansion` element
+    // gains two extensions advertising that the expansion is partial:
+    //   * `valueset-unclosed` (boolean true)
+    //   * `valueset-unclosed-reason` (string explaining which CS is partial)
+    let fragment_systems: Vec<&String> = used_pairs
+        .iter()
+        .map(|(s, _)| s)
+        .filter(|s| {
+            cs_by_url
+                .get(s.as_str())
+                .and_then(|c| c.as_ref())
+                .and_then(|c| c.get("content"))
+                .and_then(|v| v.as_str())
+                == Some("fragment")
+        })
+        .collect();
+    if !fragment_systems.is_empty() {
+        // Match the IG fixture wording verbatim — txTests compares the string
+        // (no $external$ wildcard for the reason text).
+        let reason = format!(
+            "This extension is based on a fragment of the code system {}",
+            fragment_systems[0]
+        );
+        expansion["extension"] = json!([
+            {
+                "url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed",
+                "valueBoolean": true
+            },
+            {
+                "url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed-reason",
+                "valueString": reason
+            }
+        ]);
     }
 
     // ── used-valueset entries ────────────────────────────────────────────────
@@ -2683,15 +2830,33 @@ async fn process_expand<B: TerminologyBackend>(
 
         if !emitted_codes.is_empty() {
             // Look up `property[].uri` from the primary contributing CS.
+            // Also walk applied supplement CodeSystems — the IG
+            // `parameters/parameters-expand-supplement-good` fixture pins
+            // `prop1` (a supplement-declared property) with the URI from
+            // the supplement, not the base CS.
             use std::collections::HashMap;
             let primary_system = resp.contains.first().map(|c| c.system.clone());
             let mut uri_by_code: HashMap<String, String> = HashMap::new();
+            let mut lookup_urls: Vec<String> = Vec::new();
             if let Some(sys) = &primary_system {
+                lookup_urls.push(sys.clone());
+            }
+            for s in &applied_supplements {
+                let bare = s
+                    .supplement_canonical
+                    .split_once('|')
+                    .map(|(u, _)| u.to_string())
+                    .unwrap_or_else(|| s.supplement_canonical.clone());
+                if !lookup_urls.contains(&bare) {
+                    lookup_urls.push(bare);
+                }
+            }
+            for url in &lookup_urls {
                 if let Ok(mut hits) = crate::traits::CodeSystemOperations::search(
                     state.backend(),
                     &ctx,
                     crate::types::ResourceSearchQuery {
-                        url: Some(sys.clone()),
+                        url: Some(url.clone()),
                         count: Some(1),
                         ..Default::default()
                     },
@@ -2705,7 +2870,12 @@ async fn process_expand<B: TerminologyBackend>(
                                     entry.get("code").and_then(|v| v.as_str()),
                                     entry.get("uri").and_then(|v| v.as_str()),
                                 ) {
-                                    uri_by_code.insert(code.to_string(), uri.to_string());
+                                    // First-writer-wins so primary CS values
+                                    // dominate when a supplement re-declares
+                                    // an existing property code.
+                                    uri_by_code
+                                        .entry(code.to_string())
+                                        .or_insert_with(|| uri.to_string());
                                 }
                             }
                         }
@@ -2739,17 +2909,22 @@ async fn process_expand<B: TerminologyBackend>(
     let mut response = json!({ "resourceType": "ValueSet" });
     if let Some(ref vs) = source_vs {
         if let Some(obj) = vs.as_object() {
-            // Required-by-fixtures fields plus a few common optionals. Skip
-            // `compose` deliberately for stored (URL-based) VSes: IG fixtures
-            // mark `compose` as $optional$ and our stored ValueSets often carry
-            // include[] entries with nested `valueSet` references or
-            // `inactive` flags that the expected fixture omits — copying
-            // verbatim produces "unexpected property" diffs.
+            // Copy required-by-fixtures fields plus a few common optionals.
             //
-            // For INLINE VS requests (caller passed `valueSet` resource), copy
-            // `compose` and `contained` verbatim — the IG `simple/expand-
-            // contained` fixture expects them echoed (they describe what was
-            // actually expanded).
+            // For URL-based requests, do NOT copy `compose` / `contained` —
+            // every IG `expand-*-response*` fixture lists them under
+            // `$optional-properties$` and echoing the stored shape produces
+            // "unexpected property" diffs (extra `inactive`, wrong `system`,
+            // extra `valueSet` ref, …).
+            //
+            // For INLINE VS requests (`valueSet` body parameter) the caller
+            // supplied the document, and the IG `simple/expand-contained`
+            // fixture EXPECTS it echoed back — so we must copy it.  Apply
+            // small R4→R5 normalisations on the way out:
+            //   * `filter[].op = "child-of"` becomes `"is-a"` (semantically
+            //     identical; R4 spelling is deprecated in R5).
+            //   * `compose.inactive: false` is dropped (canonical R5 form
+            //     omits the property when its value is the default).
             for field in [
                 "id",
                 "language",
@@ -2768,7 +2943,35 @@ async fn process_expand<B: TerminologyBackend>(
             }
             if value_set_for_response.is_some() {
                 if let Some(c) = obj.get("compose") {
-                    response["compose"] = c.clone();
+                    let mut composed = c.clone();
+                    fn normalise_filter_ops(v: &mut Value) {
+                        let Some(arr) = v.as_array_mut() else { return };
+                        for inc in arr {
+                            if let Some(filters) =
+                                inc.get_mut("filter").and_then(|f| f.as_array_mut())
+                            {
+                                for f in filters {
+                                    if f.get("op").and_then(|o| o.as_str()) == Some("child-of") {
+                                        if let Some(obj) = f.as_object_mut() {
+                                            obj.insert("op".into(), json!("is-a"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(includes) = composed.get_mut("include") {
+                        normalise_filter_ops(includes);
+                    }
+                    if let Some(excludes) = composed.get_mut("exclude") {
+                        normalise_filter_ops(excludes);
+                    }
+                    if composed.get("inactive").and_then(|v| v.as_bool()) == Some(false) {
+                        if let Some(obj_mut) = composed.as_object_mut() {
+                            obj_mut.remove("inactive");
+                        }
+                    }
+                    response["compose"] = composed;
                 }
                 if let Some(c) = obj.get("contained") {
                     response["contained"] = c.clone();
@@ -2839,6 +3042,7 @@ pub async fn expand_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     inject_accept_language(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params);
     match process_expand(&state, params).await {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
@@ -2868,6 +3072,7 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let mut params = query_params_to_fhir_params(pairs);
     inject_accept_language(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params);
     match process_expand(&state, params).await {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
@@ -2983,6 +3188,26 @@ fn cyclic_reference_response(err: &HtsError) -> Option<Response> {
     Some((StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response())
 }
 
+/// Honour the `X-TOO-COSTLY-THRESHOLD` request header from the IG
+/// `big/big-echo-no-limit` test (and the wider HL7 tx-ecosystem fixtures).
+/// The header carries a per-request maximum expansion size — when set, the
+/// server must return an `OperationOutcome` with `code=too-costly` if the
+/// expansion would exceed it, regardless of the configured global limit.
+/// We surface the value as a synthetic `__max_expansion_size__` parameter so
+/// `process_expand` can override `state.max_expansion_size` for this request.
+fn inject_too_costly_threshold(headers: &HeaderMap, params: &mut Vec<Value>) {
+    if let Some(v) = headers
+        .get("x-too-costly-threshold")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        params.retain(|p| {
+            p.get("name").and_then(|x| x.as_str()) != Some("__max_expansion_size__")
+        });
+        params.push(json!({"name": "__max_expansion_size__", "valueInteger": v}));
+    }
+}
+
 /// If the request carried an `Accept-Language` header and the params don't
 /// already pin a `displayLanguage`, inject one synthesised from the header.
 /// This is what the IG validator uses to express the language it wants
@@ -3041,6 +3266,7 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
         .unwrap_or_default();
     let mut params = inject_url(raw_params, url);
     inject_accept_language(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params);
     Ok(expand_bytes_respond(
         process_expand(&state, params).await?,
         format,
@@ -3071,6 +3297,7 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
     let params = query_params_to_fhir_params(pairs);
     let mut params = inject_url(params, url);
     inject_accept_language(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params);
     Ok(expand_bytes_respond(
         process_expand(&state, params).await?,
         format,

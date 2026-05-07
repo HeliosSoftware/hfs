@@ -560,11 +560,6 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     })
                             })
                             .unwrap_or(false);
-                        eprintln!(
-                            "tx-debug url={url} compose_is_enumerated={compose_is_enumerated} \
-                             hierarchical={:?} hierarchical_explicit={}",
-                            req.hierarchical, req.hierarchical_explicit
-                        );
 
                         // Normal path: try the expansion cache first.
                         // For multi-version overload composes, bypass the

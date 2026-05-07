@@ -18,7 +18,7 @@
 use axum::{
     Json,
     extract::{Path, RawQuery, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     response::Response,
 };
 use helios_persistence::tenant::TenantContext;
@@ -207,21 +207,17 @@ fn build_validate_response(
         }
     }
     if let Some(unknown) = unknown_system {
-        // Absolute URLs (http://, https://, urn:) are quoted bare in the IG
-        // text. Relative/local references are wrapped in single quotes per
-        // `validation/simple-coding-bad-system-local`.
+        // The IG fixtures (regex-bad, errors/unknown-system1) consistently
+        // wrap the unknown CodeSystem URL in single quotes regardless of
+        // whether it's absolute (http://, urn:) or relative.  Relative
+        // references additionally trigger the Terminology_TX_System_Relative
+        // companion issue below.
         let is_absolute = unknown.starts_with("http://")
             || unknown.starts_with("https://")
             || unknown.starts_with("urn:");
-        let text = if is_absolute {
-            format!(
-                "A definition for CodeSystem {unknown} could not be found, so the code cannot be validated"
-            )
-        } else {
-            format!(
-                "A definition for CodeSystem '{unknown}' could not be found, so the code cannot be validated"
-            )
-        };
+        let text = format!(
+            "A definition for CodeSystem '{unknown}' could not be found, so the code cannot be validated"
+        );
         let expression = match request_path {
             RequestPath::BareCode => "system".to_string(),
             _ => "Coding.system".to_string(),
@@ -1728,6 +1724,19 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     // forms (code / coding / codeableConcept) can pass it to the post-build
     // language-aware display validator.
     let display_language: Option<String> = find_str_param(&params, "displayLanguage");
+    // Reject malformed BCP-47 `displayLanguage` early — IG
+    // `display/validation-wrong-de-en-bad` and the language2 group expect a
+    // 4xx OperationOutcome with `code=processing` and the
+    // INVALID_DISPLAY_NAME message-id.  We use a sentinel-prefixed
+    // `VsInvalid` error so the handler can render the correct shape.
+    if let Some(ref lang) = display_language {
+        if !is_well_formed_display_language(lang) {
+            return Err(HtsError::VsInvalid(format!(
+                "{}{lang}",
+                INVALID_DISPLAY_LANGUAGE_PREFIX
+            )));
+        }
+    }
     // ── Path 1: bare `code` parameter (requires `url` = CodeSystem canonical URL) ──
     if let Some(code) = find_str_param(&params, "code") {
         let system = find_str_param(&params, "url").ok_or_else(|| {
@@ -1980,10 +1989,13 @@ pub async fn validate_code_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    Ok(fhir_respond(
-        process_validate_code(&state, params).await?,
-        format,
-    ))
+    match process_validate_code(&state, params).await {
+        Ok(v) => Ok(fhir_respond(v, format)),
+        Err(e) => match invalid_display_language_response(&e) {
+            Some(resp) => Ok(resp),
+            None => Err(e),
+        },
+    }
 }
 
 /// GET /CodeSystem/$validate-code?url=...&code=...
@@ -1996,10 +2008,13 @@ pub async fn get_validate_code_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    Ok(fhir_respond(
-        process_validate_code(&state, params).await?,
-        format,
-    ))
+    match process_validate_code(&state, params).await {
+        Ok(v) => Ok(fhir_respond(v, format)),
+        Err(e) => match invalid_display_language_response(&e) {
+            Some(resp) => Ok(resp),
+            None => Err(e),
+        },
+    }
 }
 
 // ── ValueSet/$validate-code ────────────────────────────────────────────────────
@@ -2760,6 +2775,16 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     // forms (code / coding / codeableConcept) can pass it to the post-build
     // language-aware display validator.
     let display_language: Option<String> = find_str_param(&params, "displayLanguage");
+    // Reject malformed BCP-47 displayLanguage early — IG
+    // `display/validation-wrong-de-en-bad` expects 4xx + INVALID_DISPLAY_NAME.
+    if let Some(ref lang) = display_language {
+        if !is_well_formed_display_language(lang) {
+            return Err(HtsError::VsInvalid(format!(
+                "{}{lang}",
+                INVALID_DISPLAY_LANGUAGE_PREFIX
+            )));
+        }
+    }
     // ValueSet validate-code can carry useSupplement that targets ANY
     // CodeSystem in the VS expansion. We can't (yet) verify the target
     // matches a system in the VS without expanding, so pass `None` for
@@ -3853,7 +3878,25 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             // Propagate version-mismatch failures — they carry the correct
             // VALUESET_VALUE_MISMATCH / UNKNOWN_CODESYSTEM_VERSION issues and
             // must not be replaced by the generic "no valid coding" fallback.
-            if resp.issues.iter().any(|i| i.tx_code == "vs-invalid") {
+            //
+            // Two trigger conditions:
+            //   1. tx_code == "vs-invalid"  → the original mismatch path
+            //      (multi-version overload, regex-bad VS pin, …).
+            //   2. message_id == "UNKNOWN_CODESYSTEM_VERSION"  → fired by
+            //      `detect_vs_pin_unknown` in the SQLite backend when the VS
+            //      include pins a CS version that doesn't exist (e.g. the
+            //      `version-w-bad` fixture pins `version="1"` against a CS
+            //      that only has `1.0.0` / `1.2.0`). Without this, the CC
+            //      path drops the diagnostic and emits the generic
+            //      `TX_GENERAL_CC_ERROR_MESSAGE` instead — the IG
+            //      `codeableconcept-vnn-vs1wb` family expects the
+            //      `UNKNOWN_CODESYSTEM_VERSION` issue + `x-caused-by-unknown-system`
+            //      parameter.
+            let has_unknown_cs_version = resp
+                .issues
+                .iter()
+                .any(|i| i.message_id.as_deref() == Some("UNKNOWN_CODESYSTEM_VERSION"));
+            if resp.issues.iter().any(|i| i.tx_code == "vs-invalid") || has_unknown_cs_version {
                 let resolved_version = resp.cs_version.clone();
                 let coding_display = coding_displays
                     .get(&(system.clone(), code.clone()))
@@ -4197,6 +4240,100 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     ))
 }
 
+/// Sentinel marker prepended to a [`HtsError::VsInvalid`] when a
+/// validate-code request fails because `displayLanguage` is not a
+/// well-formed BCP-47 language tag. Picked up by
+/// [`invalid_display_language_response`] to format the IG-spec
+/// OperationOutcome shape (`code=processing`, `INVALID_DISPLAY_NAME`).
+const INVALID_DISPLAY_LANGUAGE_PREFIX: &str = "__INVALID_DISPLAY_LANGUAGE__:";
+
+/// Returns `true` when `lang` is a syntactically plausible BCP-47 tag.
+/// We reject the tag forms that the IG `display/validation-wrong-de-en-bad`
+/// fixture expects to fail: empty, leading hyphen, trailing hyphen, double
+/// hyphen, or non-ASCII letters in the primary subtag. This is intentionally
+/// loose — we don't validate against the IANA registry — so any reasonable
+/// language code (e.g. `de`, `en-US`, `zh-Hans-CN`) still passes.
+fn is_well_formed_display_language(lang: &str) -> bool {
+    if lang.is_empty()
+        || lang.starts_with('-')
+        || lang.ends_with('-')
+        || lang.contains("--")
+    {
+        return false;
+    }
+    // Primary subtag (before first hyphen) must be 2-3 ASCII letters.
+    let primary = lang.split('-').next().unwrap_or("");
+    let primary_ok = (2..=3).contains(&primary.len())
+        && primary.chars().all(|c| c.is_ascii_alphabetic());
+    primary_ok
+}
+
+/// If `err` carries the `__INVALID_DISPLAY_LANGUAGE__` sentinel, format the
+/// 4xx OperationOutcome the IG `display/validation-wrong-de-en-bad` and
+/// language2 fixtures expect.  Returns `None` when `err` is unrelated.
+fn invalid_display_language_response(err: &HtsError) -> Option<Response> {
+    use axum::response::IntoResponse;
+    let HtsError::VsInvalid(msg) = err else {
+        return None;
+    };
+    let lang = msg.strip_prefix(INVALID_DISPLAY_LANGUAGE_PREFIX)?;
+    let body = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                "valueString": "INVALID_DISPLAY_NAME"
+            }],
+            "severity": "error",
+            "code": "processing",
+            "details": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                    "code": "invalid-display"
+                }],
+                "text": format!("Invalid displayLanguage: '{lang}'"),
+            }
+        }]
+    });
+    Some((StatusCode::BAD_REQUEST, Json(body)).into_response())
+}
+
+/// Build a `code: "processing"` cycle-detection OperationOutcome for
+/// validate-code paths so they match the IG `big/big-circle-validate` shape
+/// (the same fixture used by `$expand`'s cyclic_reference_response, but
+/// reachable via VS-validate-code as well).  Returns `None` when `err` is
+/// not a cycle so the caller falls through to the generic [`HtsError`]
+/// [`IntoResponse`] path.
+fn vs_cyclic_validate_response(err: &HtsError) -> Option<Response> {
+    use axum::response::IntoResponse;
+    let HtsError::VsInvalid(msg) = err else {
+        return None;
+    };
+    if !msg.starts_with("Cyclic reference detected when excluding ") {
+        return None;
+    }
+    let body = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                "valueString": "VALUESET_CIRCULAR_REFERENCE"
+            }],
+            "severity": "error",
+            "code": "processing",
+            "details": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                    "code": "vs-invalid"
+                }],
+                "text": msg
+            },
+            "diagnostics": msg
+        }]
+    });
+    Some((StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response())
+}
+
 /// POST /ValueSet/$validate-code
 pub async fn vs_validate_code_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
@@ -4208,10 +4345,18 @@ pub async fn vs_validate_code_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    Ok(fhir_respond(
-        process_vs_validate_code(&state, params).await?,
-        format,
-    ))
+    match process_vs_validate_code(&state, params).await {
+        Ok(v) => Ok(fhir_respond(v, format)),
+        Err(e) => {
+            if let Some(resp) = invalid_display_language_response(&e) {
+                return Ok(resp);
+            }
+            match vs_cyclic_validate_response(&e) {
+                Some(resp) => Ok(resp),
+                None => Err(e),
+            }
+        }
+    }
 }
 
 /// GET /ValueSet/$validate-code?url=...&code=...
@@ -4224,10 +4369,18 @@ pub async fn get_vs_validate_code_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    Ok(fhir_respond(
-        process_vs_validate_code(&state, params).await?,
-        format,
-    ))
+    match process_vs_validate_code(&state, params).await {
+        Ok(v) => Ok(fhir_respond(v, format)),
+        Err(e) => {
+            if let Some(resp) = invalid_display_language_response(&e) {
+                return Ok(resp);
+            }
+            match vs_cyclic_validate_response(&e) {
+                Some(resp) => Ok(resp),
+                None => Err(e),
+            }
+        }
+    }
 }
 
 // ── Instance-level: /ValueSet/{id}/$validate-code ─────────────────────────────

@@ -122,8 +122,11 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
         // R4 emits `equivalence`; R5 emits `relationship`. Emit both — the
         // tx-ecosystem fixtures mark each as `$optional$ version:N` so a
         // server that includes both is conformant for either FHIR version.
-        parts.push(json!({"name": "equivalence", "valueCode": m.equivalence}));
+        // Order: `relationship` BEFORE `equivalence` to match the IG
+        // fixture sequence — the comparator does positional checks at the
+        // optional slots.
         parts.push(json!({"name": "relationship", "valueCode": m.equivalence}));
+        parts.push(json!({"name": "equivalence", "valueCode": m.equivalence}));
 
         // `originMap` — canonical ConceptMap reference, with `|version` if known.
         // Only emitted on forward translations: the IG `translate/translate-reverse`
