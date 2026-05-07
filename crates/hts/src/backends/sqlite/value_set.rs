@@ -10488,6 +10488,79 @@ mod tests {
         );
     }
 
+    /// URL-based child-of variant — the IG `simple/simple-expand-child-of`
+    /// fixture uses `url=...simple-filter-child-of` (a bundled VS with a
+    /// `filter[op=child-of]` compose).  Confirms the URL-resolved compose
+    /// path hits the same hierarchy logic as the inline variant above
+    /// (which currently passes).  IG fixture comparator reports
+    /// `Expected:"2" Actual:"0"` at `.expansion.total` when this regresses.
+    #[tokio::test]
+    async fn expand_url_based_child_of_filter_returns_direct_children_only() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [
+            { "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-childof-url",
+              "url": "http://example.org/cs-childof-url",
+              "status": "active", "content": "complete",
+              "hierarchyMeaning": "is-a",
+              "concept": [
+                { "code": "code1", "display": "Display 1" },
+                { "code": "code2", "display": "Display 2",
+                  "concept": [
+                    { "code": "code2a", "display": "Display 2a",
+                      "concept": [
+                        { "code": "code2aI", "display": "Display 2aI" }
+                      ]
+                    },
+                    { "code": "code2b", "display": "Display 2b" }
+                  ]
+                }
+              ]
+            }},
+            { "resource": {
+              "resourceType": "ValueSet",
+              "id": "vs-childof-url",
+              "url": "http://example.org/vs-childof-url",
+              "status": "active",
+              "compose": {
+                "include": [{
+                  "system": "http://example.org/cs-childof-url",
+                  "filter": [{
+                    "property": "concept",
+                    "op": "child-of",
+                    "value": "code2"
+                  }]
+                }]
+              }
+            }}
+          ]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some("http://example.org/vs-childof-url".to_owned()),
+                    count: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec!["code2a", "code2b"],
+            "URL-based child-of returns direct children only"
+        );
+    }
+
     /// Validate that `is-a` correctly returns the full transitive-closure
     /// expansion when the value has both children and grandchildren.  The
     /// tx-ecosystem `simple-expand-isa` test sets `value=code2`, expecting all

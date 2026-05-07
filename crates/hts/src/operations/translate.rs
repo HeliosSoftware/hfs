@@ -568,6 +568,41 @@ mod tests {
         assert_eq!(source["valueCoding"]["system"], "http://example.org/src");
     }
 
+    /// IG `translate/translate-reverse` fixture pins the part ordering as:
+    /// `concept`, `relationship`, `equivalence`, `source`. The comparator
+    /// does positional checks at the optional slots — emitting the parts in
+    /// any other order causes "Expected 'source' Actual 'relationship'" at
+    /// `.parameter[0].part[3].name`.
+    #[tokio::test]
+    async fn translate_reverse_part_ordering_matches_ig_fixture() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "sourceSystem", "valueUri": "http://example.org/src"},
+                {"name": "targetCode",   "valueCode": "X"},
+                {"name": "targetSystem", "valueUri": "http://example.org/tgt"}
+            ]
+        });
+        let resp = post_json(app, "/ConceptMap/$translate", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let m = params.iter().find(|p| p["name"] == "match").unwrap();
+        let parts = m["part"].as_array().unwrap();
+
+        // Names in order. originMap is suppressed in reverse mode.
+        let names: Vec<&str> = parts
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["concept", "relationship", "equivalence", "source"],
+            "reverse-mode part ordering must be concept/relationship/equivalence/source"
+        );
+    }
+
     /// `originMap` is emitted as `url|version` when the ConceptMap has a version.
     #[tokio::test]
     async fn translate_emits_origin_map_canonical_with_version() {
