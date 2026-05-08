@@ -2015,7 +2015,10 @@ fn expand_inline_plain_fts(
         let system_url = inc["system"].as_str().unwrap_or("");
         match conn
             .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1",
+                "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
+                 ORDER BY (CASE WHEN EXISTS \
+                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
                 [system_url],
                 |r| r.get::<_, String>(0),
             )
@@ -2199,7 +2202,10 @@ fn expand_inline_filtered(
 
         let system_id: Option<String> = conn
             .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1",
+                "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
+                 ORDER BY (CASE WHEN EXISTS \
+                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
                 [system_url],
                 |row| row.get(0),
             )
@@ -3998,7 +4004,10 @@ fn try_multi_include_property_only(
 
     let system_id: Option<String> = conn
         .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
+            "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
+                 ORDER BY (CASE WHEN EXISTS \
+                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
             [first_system],
             |row| row.get(0),
         )
@@ -5120,7 +5129,10 @@ fn compose_page_fast(
                 .entry(system_url.clone())
                 .or_insert_with(|| {
                     conn.query_row(
-                        "SELECT id FROM code_systems WHERE url = ?1",
+                        "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
+                 ORDER BY (CASE WHEN EXISTS \
+                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
                         [system_url.as_str()],
                         |r| r.get(0),
                     )
@@ -7164,7 +7176,10 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
 
     let system_id: Option<String> = conn
         .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
+            "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
+                 ORDER BY (CASE WHEN EXISTS \
+                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
             [&cs_url],
             |r| r.get(0),
         )
@@ -8330,7 +8345,10 @@ fn load_plain_corpus_and_cache(
         let system_url = inc["system"].as_str().unwrap_or("");
         match conn
             .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1",
+                "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
+                 ORDER BY (CASE WHEN EXISTS \
+                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
                 [system_url],
                 |r| r.get::<_, String>(0),
             )
