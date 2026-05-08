@@ -601,17 +601,33 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     // Collect (display_value, language_tag_opt) pairs for every valid display:
     // the default display tagged with the CS language, plus every designation
     // that has a language attached.
+    // A designation only counts as a "valid display" alternative when it
+    // either has no `use.code` (default = display) or carries the FHIR-standard
+    // `display` use. Designations with a non-display use (e.g.
+    // `olde-english`, `consumer-name`) are alternative-purpose terms, not
+    // displays — including them in the "Valid display is …" message
+    // misrepresents what counts as a correct display, and the IG
+    // `batch/batch-validate-bad` fixture expects them excluded.
+    fn is_display_alternative(use_code: Option<&str>) -> bool {
+        match use_code {
+            None => true,
+            Some(c) if c.eq_ignore_ascii_case("display") => true,
+            _ => false,
+        }
+    }
+
     let mut displays_for_lang: Vec<(String, Option<String>)> = Vec::new();
     if let Some(d) = default_display.as_deref() {
         displays_for_lang.push((d.to_string(), cs_language.clone()));
     }
     for desig in &designations {
-        if !desig.value.is_empty() {
+        if !desig.value.is_empty() && is_display_alternative(desig.use_code.as_deref()) {
             displays_for_lang.push((desig.value.clone(), desig.language.clone()));
         }
     }
     for desig in &supplement_designations {
         if !desig.value.is_empty()
+            && is_display_alternative(desig.use_code.as_deref())
             && !displays_for_lang
                 .iter()
                 .any(|(v, _)| v.eq_ignore_ascii_case(&desig.value))
@@ -1120,6 +1136,13 @@ async fn build_validate_response_async<B: TerminologyBackend>(
         let lookup_system: Option<&str> = system.or(inferred_system.as_deref());
         if let (Some(sys), Some(cd)) = (lookup_system, code) {
             if let Some(specific_status) = lookup_concept_status(backend, ctx, sys, cd).await {
+                // Surface as top-level `status` parameter (e.g. "retired",
+                // "deprecated", "withdrawn"). The IG `batch/batch-validate`
+                // fixture expects this when the underlying CS concept has a
+                // `status` property set to a non-active value.
+                if resp.concept_status.is_none() {
+                    resp.concept_status = Some(specific_status.clone());
+                }
                 let already_has_specific = resp.issues.iter().any(|i| {
                     i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
                         && i.text
