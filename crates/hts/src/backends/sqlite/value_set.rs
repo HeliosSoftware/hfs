@@ -5522,11 +5522,18 @@ fn resolve_compose_system_id(
     url: &str,
     version: Option<&str>,
 ) -> Result<Option<(String, Option<String>)>, HtsError> {
+    // Prefer a `code_systems` row that actually has concepts, then highest
+    // version. Multiple rows can share the same canonical URL (e.g. an empty
+    // stub from `hl7.terminology` plus a real RF2 import); without this
+    // ordering we would silently pick the empty stub and return no concepts.
     let mut stmt = conn
         .prepare(
             "SELECT id, version FROM code_systems \
              WHERE url = ?1 \
-             ORDER BY COALESCE(version, '') DESC",
+             ORDER BY (CASE WHEN EXISTS \
+                 (SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id) \
+                 THEN 0 ELSE 1 END), \
+                 COALESCE(version, '') DESC",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
