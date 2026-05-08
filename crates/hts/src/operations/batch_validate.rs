@@ -9,17 +9,25 @@
 //! * one or more `validation` parameters, each whose value is a Parameters
 //!   resource describing a single coding to validate.
 //!
-//! It returns a Parameters resource with one `validation` output per input
-//! `validation`, each carrying at minimum `code`, `result`, and `system` —
-//! the same per-coding shape produced by the standard
-//! `ValueSet/$validate-code` operation.
+//! The response is a Parameters resource with one output entry per input
+//! `validation` parameter, in the same order. Each output entry is either:
 //!
-//! This handler is deliberately scoped to "stop the validator NPE": the
-//! validator's `EFhirClientException.getServerError()` returns null when the
-//! response body is not a parseable FHIR resource (e.g. our previous 404 plain
-//! text), so it suffices to return a well-formed Parameters envelope. Richer
-//! conformance details (`issues`, `inactive`, `status`, `version`) are left
-//! for follow-up iterations.
+//! * a Parameters resource carrying the per-coding `$validate-code` result —
+//!   identical in shape to what `POST /ValueSet/$validate-code` produces (so
+//!   `code`, `display`, `inactive`, `issues`, `message`, `result`, `status`,
+//!   `system`, `version` are all surfaced when applicable, in alphabetical
+//!   order); or
+//! * an OperationOutcome carrying an `invalid` issue when the input
+//!   validation Parameters did not name a coding/code/codeableConcept.
+//!
+//! Implementation strategy: this handler does NOT reimplement validation. It
+//! merges batch-level inheritable parameters (`lenient-display-validation`,
+//! `displayLanguage`, `valueSetVersion`, `default-valueset-version`,
+//! `useSupplement`) with each per-validation Parameters and delegates to
+//! `process_vs_validate_code` (the same code path used by
+//! `POST /ValueSet/$validate-code`). The principal `tx-resource` ValueSet is
+//! injected as `valueSet` so the inline-validation path is taken — that way
+//! the principal VS does not need to be persistently stored.
 
 use axum::{
     Json,
@@ -27,117 +35,166 @@ use axum::{
     http::{HeaderMap, header},
     response::Response,
 };
-use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
 use crate::error::HtsError;
 use crate::state::AppState;
-use crate::traits::{CodeSystemOperations, TerminologyBackend};
-use crate::types::ValidateCodeRequest;
+use crate::traits::TerminologyBackend;
 
 use super::format::{fhir_respond, negotiate_format};
-use super::params::{extract_coding, extract_parameter_array};
+use super::params::{
+    extract_codeable_concept, extract_coding_full, extract_parameter_array, find_str_param,
+};
+use super::validate_code::process_vs_validate_code;
 
-/// Returns true if the transient ValueSet's `compose.include` admits the given
-/// (system, code) pair. Recognises bare `system` includes (which admit all
-/// codes from that system) and `concept`-listed includes.
+/// Per-validation Parameters keys that, when present at the batch level, are
+/// forwarded into each delegated `$validate-code` call. Per-validation params
+/// take precedence (the per-validation entry is forwarded first; `find_str_param`
+/// returns the first match).
 ///
-/// Filter-based includes are conservatively treated as non-matching here —
-/// the test fixtures used by tx-ecosystem use `concept`-listed includes, so
-/// this is sufficient for the current cluster.
-fn value_set_contains(vs: &Value, system: &str, code: &str) -> bool {
-    let Some(includes) = vs.pointer("/compose/include").and_then(|v| v.as_array()) else {
-        return false;
-    };
+/// `useSupplement` is a repeated parameter — handled specially below so all
+/// occurrences propagate, not just the first.
+const BATCH_INHERITED_KEYS: &[&str] = &[
+    "lenient-display-validation",
+    "displayLanguage",
+    "valueSetVersion",
+    "default-valueset-version",
+    "abstract",
+    "system-version",
+    "force-system-version",
+    "check-system-version",
+    "date",
+];
 
-    for inc in includes {
-        let inc_system = inc.get("system").and_then(|v| v.as_str());
-        if inc_system != Some(system) {
+/// IG-pinned text for the "no coding/code/codeableConcept supplied" error.
+/// Matches the reference tx.fhir.org behaviour and the IG
+/// `batch/batch-validate-bad-response-bundle.json` fixture (which deliberately
+/// includes a validation entry with the parameter name `codingX` to exercise
+/// this path).
+const NO_CODE_TO_VALIDATE_TEXT: &str = "Unable to find code to validate \
+     (looked for coding | codeableConcept | code+system | code+inferSystem in parameters";
+
+/// Pick the principal `tx-resource` ValueSet to validate against.
+///
+/// Strategy:
+///  1. If the batch supplies a top-level `url` parameter, return the
+///     tx-resource VS whose `url` matches it.
+///  2. Otherwise, return the first ValueSet tx-resource.
+fn principal_value_set(params: &[Value]) -> Option<Value> {
+    let target_url = find_str_param(params, "url");
+    let mut first_vs: Option<Value> = None;
+
+    for p in params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("tx-resource"))
+    {
+        let Some(res) = p.get("resource") else {
+            continue;
+        };
+        if res.get("resourceType").and_then(|v| v.as_str()) != Some("ValueSet") {
             continue;
         }
-
-        let concepts = inc.get("concept").and_then(|v| v.as_array());
-        let has_filter = inc.get("filter").is_some();
-
-        match concepts {
-            Some(arr) if !arr.is_empty() => {
-                if arr
-                    .iter()
-                    .any(|c| c.get("code").and_then(|v| v.as_str()) == Some(code))
-                {
-                    return true;
-                }
+        if first_vs.is_none() {
+            first_vs = Some(res.clone());
+        }
+        if let Some(ref u) = target_url {
+            if res.get("url").and_then(|v| v.as_str()) == Some(u.as_str()) {
+                return Some(res.clone());
             }
-            _ if !has_filter => {
-                return true;
-            }
-            _ => {}
         }
     }
 
+    first_vs
+}
+
+/// Returns true if the per-validation Parameters carries a usable code input —
+/// `coding`, `codeableConcept`, or bare `code` (with or without `system`).
+/// Mirrors the discovery rules in `process_inline_vs_validate_code`.
+fn has_validatable_input(v_params: &[Value]) -> bool {
+    if extract_coding_full(v_params, "coding").is_some() {
+        return true;
+    }
+    if extract_codeable_concept(v_params, "codeableConcept").is_some() {
+        return true;
+    }
+    if find_str_param(v_params, "code").is_some() {
+        return true;
+    }
     false
 }
 
-/// Look up a code in the persistent CodeSystem store and return its display
-/// when found. Errors and missing codes are absorbed (returning `None`).
-async fn lookup_display<B: TerminologyBackend>(
-    state: &AppState<B>,
-    system: &str,
-    code: &str,
-) -> Option<String> {
-    let req = ValidateCodeRequest {
-        url: None,
-        value_set_version: None,
-        system: Some(system.to_string()),
-        code: code.to_string(),
-        version: None,
-        display: None,
-        include_abstract: None,
-        date: None,
-        input_form: None,
-        lenient_display_validation: None,
-        default_value_set_versions: Default::default(),
-    };
-    let ctx = TenantContext::system();
-    CodeSystemOperations::validate_code(state.backend(), &ctx, req)
-        .await
-        .ok()
-        .filter(|r| r.result)
-        .and_then(|r| r.display)
+/// Build the IG-pinned OperationOutcome for the "no validatable input" path.
+fn no_code_to_validate_outcome() -> Value {
+    json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "invalid",
+            "details": { "text": NO_CODE_TO_VALIDATE_TEXT }
+        }]
+    })
 }
 
-/// Build a single per-coding result Parameters resource.
-async fn build_validation_result<B: TerminologyBackend>(
-    state: &AppState<B>,
-    tx_value_sets: &[&Value],
-    val_params: &[Value],
-) -> Value {
-    let mut parts: Vec<Value> = Vec::new();
+/// Convert an `HtsError` into an OperationOutcome resource for embedding in a
+/// per-validation slot. Keeps the diagnostic text in the `details.text` field
+/// (where the IG fixtures compare it).
+fn err_to_outcome(err: &HtsError) -> Value {
+    let (severity, code, text) = match err {
+        HtsError::InvalidRequest(m) => ("error", "invalid", m.clone()),
+        HtsError::NotFound(m) => ("error", "not-found", m.clone()),
+        HtsError::VsInvalid(m) => ("error", "invalid", m.clone()),
+        other => ("error", "exception", other.to_string()),
+    };
+    json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": severity,
+            "code": code,
+            "details": { "text": text }
+        }]
+    })
+}
 
-    if let Some((system, code, _input_display)) = extract_coding(val_params, "coding") {
-        let in_vs = tx_value_sets
-            .iter()
-            .any(|vs| value_set_contains(vs, &system, &code));
-        let display = lookup_display(state, &system, &code).await;
+/// Forward batch-level inheritable parameters into a per-validation params
+/// vector, then append the per-validation params themselves and finally the
+/// `valueSet` (inline) reference. Per-validation params come FIRST so they
+/// override batch-level defaults via `find_str_param`'s first-match semantics.
+fn build_delegated_params(
+    batch_params: &[Value],
+    v_params: &[Value],
+    principal_vs: Option<&Value>,
+) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(v_params.len() + BATCH_INHERITED_KEYS.len() + 1);
 
-        parts.push(json!({"name": "code", "valueCode": code}));
-        if let Some(d) = display {
-            parts.push(json!({"name": "display", "valueString": d}));
-        }
-        parts.push(json!({"name": "result", "valueBoolean": in_vs}));
-        parts.push(json!({"name": "system", "valueUri": system}));
-    } else {
-        parts.push(json!({"name": "result", "valueBoolean": false}));
-        parts.push(json!({
-            "name": "message",
-            "valueString": "No coding parameter provided in validation"
-        }));
+    // Per-validation first — overrides batch defaults.
+    for p in v_params {
+        out.push(p.clone());
     }
 
-    json!({
-        "resourceType": "Parameters",
-        "parameter": parts
-    })
+    // Batch-level inheritable single-valued params.
+    for key in BATCH_INHERITED_KEYS {
+        for p in batch_params {
+            if p.get("name").and_then(|v| v.as_str()) == Some(*key) {
+                out.push(p.clone());
+            }
+        }
+    }
+
+    // Repeated param `useSupplement` — propagate every occurrence.
+    for p in batch_params {
+        if p.get("name").and_then(|v| v.as_str()) == Some("useSupplement") {
+            out.push(p.clone());
+        }
+    }
+
+    // Principal VS as inline `valueSet` so the inline path is taken in
+    // process_vs_validate_code (avoids needing the principal VS to be
+    // persistently stored).
+    if let Some(vs) = principal_vs {
+        out.push(json!({ "name": "valueSet", "resource": vs }));
+    }
+
+    out
 }
 
 /// Process a `$batch-validate-code` request body.
@@ -145,12 +202,7 @@ pub(crate) async fn process_vs_batch_validate<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
-    let tx_value_sets: Vec<&Value> = params
-        .iter()
-        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("tx-resource"))
-        .filter_map(|p| p.get("resource"))
-        .filter(|r| r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet"))
-        .collect();
+    let principal_vs = principal_value_set(&params);
 
     let mut output_validations: Vec<Value> = Vec::new();
 
@@ -158,14 +210,30 @@ pub(crate) async fn process_vs_batch_validate<B: TerminologyBackend>(
         .iter()
         .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("validation"))
     {
-        let v_params = v
+        let v_params: Vec<Value> = v
             .get("resource")
             .and_then(|r| r.get("parameter"))
             .and_then(|p| p.as_array())
             .cloned()
             .unwrap_or_default();
 
-        let result_resource = build_validation_result(state, &tx_value_sets, &v_params).await;
+        // Pre-detect "no usable code input" — emit the IG-pinned
+        // OperationOutcome rather than delegating (the delegated path's
+        // error text differs from the IG fixture).
+        if !has_validatable_input(&v_params) {
+            output_validations.push(json!({
+                "name": "validation",
+                "resource": no_code_to_validate_outcome()
+            }));
+            continue;
+        }
+
+        let delegated_params = build_delegated_params(&params, &v_params, principal_vs.as_ref());
+
+        let result_resource = match process_vs_validate_code(state, delegated_params).await {
+            Ok(value) => value,
+            Err(err) => err_to_outcome(&err),
+        };
 
         output_validations.push(json!({
             "name": "validation",
@@ -291,7 +359,7 @@ mod tests {
         json!({"resourceType": "Parameters", "parameter": params})
     }
 
-    fn validation_resource<'a>(out: &'a Value, idx: usize) -> &'a Value {
+    fn validation_resource(out: &Value, idx: usize) -> &Value {
         &out["parameter"][idx]["resource"]
     }
 
@@ -315,7 +383,6 @@ mod tests {
         assert_eq!(outer.len(), 3, "one validation output per input");
         for v in outer {
             assert_eq!(v["name"], "validation");
-            assert_eq!(v["resource"]["resourceType"], "Parameters");
         }
     }
 
@@ -326,8 +393,9 @@ mod tests {
         let body = body_json(resp).await;
 
         let r = validation_resource(&body, 0);
+        // Delegated path returns a Parameters resource.
+        assert_eq!(r["resourceType"], "Parameters");
         assert_eq!(find_named(r, "result").unwrap()["valueBoolean"], true);
-        assert_eq!(find_named(r, "code").unwrap()["valueCode"], "code1");
         assert_eq!(
             find_named(r, "display").unwrap()["valueString"],
             "Display 1"
@@ -341,12 +409,15 @@ mod tests {
         let body = body_json(resp).await;
 
         let r = validation_resource(&body, 0);
+        assert_eq!(r["resourceType"], "Parameters");
         assert_eq!(find_named(r, "result").unwrap()["valueBoolean"], false);
-        assert_eq!(find_named(r, "code").unwrap()["valueCode"], "code3");
     }
 
     #[tokio::test]
-    async fn validation_without_coding_falls_back_to_message() {
+    async fn validation_without_coding_returns_operation_outcome() {
+        // Mirrors the IG `batch-validate-bad` fixture: a validation entry that
+        // names `codingX` (typo) instead of `coding` must come back as an
+        // OperationOutcome carrying the IG-pinned "Unable to find code …" text.
         let app = make_app();
         let body = json!({
             "resourceType": "Parameters",
@@ -384,8 +455,15 @@ mod tests {
 
         let body = body_json(resp).await;
         let r = validation_resource(&body, 0);
-        assert_eq!(find_named(r, "result").unwrap()["valueBoolean"], false);
-        assert!(find_named(r, "message").is_some());
+        assert_eq!(r["resourceType"], "OperationOutcome");
+        let issue = &r["issue"][0];
+        assert_eq!(issue["severity"], "error");
+        assert_eq!(issue["code"], "invalid");
+        let text = issue["details"]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("Unable to find code to validate"),
+            "expected IG 'Unable to find code…' text, got: {text}"
+        );
     }
 
     #[tokio::test]
@@ -409,33 +487,112 @@ mod tests {
     }
 
     #[test]
-    fn value_set_contains_concept_listed_include() {
-        let vs = json!({
-            "compose": {"include": [{
-                "system": "http://x/cs",
-                "concept": [{"code": "A"}, {"code": "B"}]
-            }]}
-        });
-        assert!(value_set_contains(&vs, "http://x/cs", "A"));
-        assert!(value_set_contains(&vs, "http://x/cs", "B"));
-        assert!(!value_set_contains(&vs, "http://x/cs", "C"));
-        assert!(!value_set_contains(&vs, "http://other/cs", "A"));
+    fn principal_value_set_matches_url_when_supplied() {
+        let params = vec![
+            json!({"name": "tx-resource", "resource": {
+                "resourceType": "ValueSet", "url": "urn:other"
+            }}),
+            json!({"name": "tx-resource", "resource": {
+                "resourceType": "ValueSet", "url": "urn:wanted"
+            }}),
+            json!({"name": "url", "valueUri": "urn:wanted"}),
+        ];
+        let chosen = principal_value_set(&params).unwrap();
+        assert_eq!(chosen["url"], "urn:wanted");
     }
 
     #[test]
-    fn value_set_contains_bare_system_include_admits_any_code() {
-        let vs = json!({"compose": {"include": [{"system": "http://x/cs"}]}});
-        assert!(value_set_contains(&vs, "http://x/cs", "anything"));
+    fn principal_value_set_falls_back_to_first_vs_when_no_url_match() {
+        let params = vec![json!({"name": "tx-resource", "resource": {
+            "resourceType": "ValueSet", "url": "urn:only"
+        }})];
+        let chosen = principal_value_set(&params).unwrap();
+        assert_eq!(chosen["url"], "urn:only");
     }
 
     #[test]
-    fn value_set_contains_filter_based_include_is_not_matched() {
-        let vs = json!({
-            "compose": {"include": [{
-                "system": "http://x/cs",
-                "filter": [{"property": "concept", "op": "is-a", "value": "X"}]
-            }]}
-        });
-        assert!(!value_set_contains(&vs, "http://x/cs", "anything"));
+    fn principal_value_set_skips_non_value_set_tx_resources() {
+        let params = vec![
+            json!({"name": "tx-resource", "resource": {
+                "resourceType": "CodeSystem", "url": "urn:cs"
+            }}),
+            json!({"name": "tx-resource", "resource": {
+                "resourceType": "ValueSet", "url": "urn:vs"
+            }}),
+        ];
+        let chosen = principal_value_set(&params).unwrap();
+        assert_eq!(chosen["url"], "urn:vs");
+    }
+
+    #[test]
+    fn has_validatable_input_finds_coding() {
+        let params = vec![json!({
+            "name": "coding",
+            "valueCoding": {"system": "http://x", "code": "A"}
+        })];
+        assert!(has_validatable_input(&params));
+    }
+
+    #[test]
+    fn has_validatable_input_finds_bare_code() {
+        let params = vec![json!({"name": "code", "valueCode": "A"})];
+        assert!(has_validatable_input(&params));
+    }
+
+    #[test]
+    fn has_validatable_input_finds_codeable_concept() {
+        let params = vec![json!({
+            "name": "codeableConcept",
+            "valueCodeableConcept": {"coding": [{"system": "http://x", "code": "A"}]}
+        })];
+        assert!(has_validatable_input(&params));
+    }
+
+    #[test]
+    fn has_validatable_input_rejects_typo_param_name() {
+        let params = vec![json!({
+            "name": "codingX",
+            "valueCoding": {"system": "http://x", "code": "A"}
+        })];
+        assert!(!has_validatable_input(&params));
+    }
+
+    #[test]
+    fn build_delegated_params_per_validation_overrides_batch() {
+        // Batch lenient='true', per-validation lenient='false' — per-validation
+        // appears first in the merged list so find_str_param picks it up.
+        let batch = vec![
+            json!({"name": "lenient-display-validation", "valueBoolean": "true"}),
+            json!({"name": "useSupplement", "valueCanonical": "http://s|1"}),
+        ];
+        let v = vec![
+            json!({"name": "coding", "valueCoding": {"system": "http://x", "code": "A"}}),
+            json!({"name": "lenient-display-validation", "valueBoolean": "false"}),
+        ];
+        let merged = build_delegated_params(&batch, &v, None);
+        // Per-validation params copied first.
+        assert_eq!(merged[0]["name"], "coding");
+        assert_eq!(merged[1]["name"], "lenient-display-validation");
+        assert_eq!(merged[1]["valueBoolean"], "false");
+        // Batch lenient appended after per-validation.
+        let lenient_indices: Vec<usize> = merged
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p["name"] == "lenient-display-validation")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(lenient_indices.len(), 2, "both copies present");
+        assert!(lenient_indices[0] < lenient_indices[1], "per-val first");
+        // useSupplement propagated.
+        assert!(merged.iter().any(|p| p["name"] == "useSupplement"));
+    }
+
+    #[test]
+    fn build_delegated_params_includes_principal_value_set() {
+        let vs = json!({"resourceType": "ValueSet", "url": "urn:vs"});
+        let merged = build_delegated_params(&[], &[], Some(&vs));
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["name"], "valueSet");
+        assert_eq!(merged[0]["resource"]["url"], "urn:vs");
     }
 }
