@@ -566,12 +566,25 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 let url = req.url.as_deref().unwrap();
                 // Resolve expansion codes — either from an explicit ValueSet or from an
                 // implicit one defined by `CodeSystem.valueSet`.
-                match resolve_value_set_versioned(
-                    &conn,
-                    url,
-                    req.value_set_version.as_deref(),
-                    req.date.as_deref(),
-                ) {
+                //
+                // Short-circuit `?fhir_vs` URLs to the implicit-VS path: if any
+                // imported package ships a stored stub ValueSet with one of those
+                // canonical URLs (e.g. `http://snomed.info/sct?fhir_vs`), letting
+                // `resolve_value_set_versioned` win would expand its empty/skeleton
+                // compose and silently return zero codes for SNOMED — masking the
+                // working `bfs_isa_page`/implicit-cache traversal below.
+                let implicit_short_circuit = parse_fhir_vs_url(url).is_some();
+                let resolution = if implicit_short_circuit {
+                    Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
+                } else {
+                    resolve_value_set_versioned(
+                        &conn,
+                        url,
+                        req.value_set_version.as_deref(),
+                        req.date.as_deref(),
+                    )
+                };
+                match resolution {
                     Ok((vs_id, compose_json)) => {
                         // Detect "every include uses explicit concept[]
                         // enumeration" so we can skip tree-building below —
@@ -981,13 +994,26 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // Resolve the expansion — try explicit ValueSet first, then the two
             // implicit-ValueSet fallbacks used by $expand.
             // Tuple: (expansion codes, compose_json saved for version-mismatch check).
-            let (all_codes, compose_json_for_version): (Vec<ExpansionContains>, Option<String>) =
-                match resolve_value_set_versioned(
+            //
+            // Short-circuit `?fhir_vs` URLs to the implicit-VS path: if any
+            // imported package ships a stored stub ValueSet with one of those
+            // canonical URLs (e.g. `http://snomed.info/sct?fhir_vs`), letting
+            // `resolve_value_set_versioned` win would expand its empty/skeleton
+            // compose to zero codes and force `result=false` for every input —
+            // masking the targeted `validate_fhir_vs` lookup below.
+            let implicit_short_circuit = parse_fhir_vs_url(&url).is_some();
+            let resolution = if implicit_short_circuit {
+                Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
+            } else {
+                resolve_value_set_versioned(
                     &conn,
                     &url,
                     req.value_set_version.as_deref(),
                     req.date.as_deref(),
-                ) {
+                )
+            };
+            let (all_codes, compose_json_for_version): (Vec<ExpansionContains>, Option<String>) =
+                match resolution {
                     Ok((vs_id, compose_json)) => {
                         let saved = compose_json.clone();
                         // Bypass the `value_set_expansions` cache when the
