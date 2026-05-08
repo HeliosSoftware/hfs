@@ -39,6 +39,7 @@
 //! [`validate_code`]: self::validate_code
 
 pub mod batch;
+pub mod batch_validate;
 pub mod closure;
 pub mod crud;
 pub mod expand;
