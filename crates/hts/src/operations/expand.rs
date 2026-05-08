@@ -1488,7 +1488,8 @@ async fn process_expand<B: TerminologyBackend>(
     // EX_PROBE: measure the backend expand call only (excludes parse + later
     // post-processing). Captures the dominant cost on cold paths.
     let probe_t_backend = Instant::now();
-    let probe_url_short: String = url
+    let probe_url_short: String = req
+        .url
         .as_deref()
         .map(|u| {
             // Truncate long URLs for log readability; keep enough to identify scenario.
