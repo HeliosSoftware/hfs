@@ -838,29 +838,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                         // point the async hot-path serves all requests without
                                         // touching the pool.
                                         // bg_index_pending prevents duplicate threads when
-                                        // many VUs hit the same uncached URL concurrently,
-                                        // AND bounds total concurrent bg-population threads:
-                                        // without the cap, a benchmark loop that touches 100+
-                                        // distinct `?fhir_vs=isa/<X>` URLs (EX01) spawns 100
-                                        // native threads each running a multi-second
-                                        // `INSERT … SELECT` against concept_closure. They
-                                        // contend on SQLite's single writer lock and on the
-                                        // r2d2 pool (max_size=20), which leaves tail benchmark
-                                        // tests (EX04 etc.) waiting tens of seconds for a pool
-                                        // connection AND for the writer lock to drain. The
-                                        // BFS hot path above already serves the request
-                                        // synchronously — when we're already at the bg cap,
-                                        // skipping the spawn is safe (the next request to that
-                                        // URL also takes the BFS path and may itself spawn
-                                        // when a slot frees).
-                                        const MAX_BG_POPULATE: usize = 2;
+                                        // many VUs hit the same uncached URL concurrently.
                                         let url_owned = url.to_string();
                                         let should_spawn = bg_index_pending
                                             .lock()
                                             .map(|mut p| {
-                                                if p.contains(&url_owned)
-                                                    || p.len() >= MAX_BG_POPULATE
-                                                {
+                                                if p.contains(&url_owned) {
                                                     false
                                                 } else {
                                                     p.insert(url_owned.clone());
