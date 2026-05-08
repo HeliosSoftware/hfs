@@ -17,6 +17,8 @@ mod code_system;
 mod concept_map;
 mod value_set;
 
+pub(crate) use value_set::invalidate_cs_id_cache;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
