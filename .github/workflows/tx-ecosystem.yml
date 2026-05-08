@@ -559,16 +559,23 @@ jobs:
       - name: Assert all tx-ecosystem tests passed
         run: |
           set -e
-          if [ "${TXTESTS_EXIT:-1}" != "0" ]; then
-            echo "Validator exited with code ${TXTESTS_EXIT:-?} — failing job"
+          # Count true failures (actions with result != "pass" AND result != "skip")
+          # from the validator's TestReport. Skips are tx.fhir.org-only fixtures
+          # that the validator correctly declines to run against any other server
+          # — they are not failures.
+          REPORT="tx-test-output/report.json"
+          if [ ! -s "$REPORT" ]; then
+            echo "tx-test-output/report.json missing or empty — failing job"
             exit 1
           fi
-          FAILED=$(find tx-test-output -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+          FAILED=$(jq -r '[.test[]? | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip")))] | length' "$REPORT")
           if [ "$FAILED" -gt 0 ]; then
             echo "$FAILED tx-ecosystem tests failed — failing job"
             exit 1
           fi
-          echo "All tx-ecosystem tests passed"
+          # Validator exit codes: 0 = all pass; non-zero = something didn't pass.
+          # We tolerate non-zero IFF the only non-passes are skips (handled above).
+          echo "All applicable tx-ecosystem tests passed (validator exit ${TXTESTS_EXIT:-?}; skips ignored)"
 
       - name: Dump server log on failure
         if: failure()
