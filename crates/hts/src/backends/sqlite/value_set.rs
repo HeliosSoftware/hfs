@@ -729,9 +729,18 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 };
 
                                 if let Some((cs_url, pattern)) = cs_pat {
+                                    // Multiple `code_systems` rows may share the same URL —
+                                    // e.g. a stub from `hl7.terminology` plus the real RF2
+                                    // import. Prefer a row that actually has concepts so
+                                    // expansion doesn't pick the empty stub.
                                     let system_id: Option<String> = conn
                                         .query_row(
-                                            "SELECT id FROM code_systems WHERE url = ?1",
+                                            "SELECT cs.id FROM code_systems cs \
+                                             WHERE cs.url = ?1 \
+                                             ORDER BY (CASE WHEN EXISTS \
+                                                 (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                                                 THEN 0 ELSE 1 END), cs.id \
+                                             LIMIT 1",
                                             [&cs_url],
                                             |r| r.get(0),
                                         )
@@ -4872,9 +4881,15 @@ fn try_multiinclude_hierarchy_page(
             _ => return Ok(None),
         };
 
+        // Prefer a `code_systems` row that has concepts over an empty stub.
         let system_id: Option<String> = conn
             .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1",
+                "SELECT cs.id FROM code_systems cs \
+                 WHERE cs.url = ?1 \
+                 ORDER BY (CASE WHEN EXISTS \
+                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                     THEN 0 ELSE 1 END), cs.id \
+                 LIMIT 1",
                 [system_url],
                 |r| r.get(0),
             )
@@ -5192,9 +5207,15 @@ fn extract_simple_hierarchy_compose(
         _ => return Ok(None),
     };
 
+    // Prefer a `code_systems` row that has concepts over an empty stub.
     let system_id: Option<String> = conn
         .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
+            "SELECT cs.id FROM code_systems cs \
+             WHERE cs.url = ?1 \
+             ORDER BY (CASE WHEN EXISTS \
+                 (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                 THEN 0 ELSE 1 END), cs.id \
+             LIMIT 1",
             [system_url],
             |r| r.get(0),
         )
