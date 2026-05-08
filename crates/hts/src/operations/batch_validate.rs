@@ -87,11 +87,16 @@ async fn lookup_display<B: TerminologyBackend>(
 ) -> Option<String> {
     let req = ValidateCodeRequest {
         url: None,
+        value_set_version: None,
         system: Some(system.to_string()),
         code: code.to_string(),
         version: None,
         display: None,
+        include_abstract: None,
         date: None,
+        input_form: None,
+        lenient_display_validation: None,
+        default_value_set_versions: Default::default(),
     };
     let ctx = TenantContext::system();
     CodeSystemOperations::validate_code(state.backend(), &ctx, req)
