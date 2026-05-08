@@ -151,16 +151,8 @@ impl SqliteTerminologyBackend {
         // suffer from cold reads and WAL traversal).
         //   cache_size=-200000        — 200 MB per connection (was 32 MB)
         //   mmap_size=2 GiB           — read paths bypass syscalls (was 256 MB)
-        //   wal_autocheckpoint=500    — keep WAL small so cold readers (EX04
-        //                               after EX01-03's heavy bg-populate writes)
-        //                               don't pay a long WAL-traversal cost on
-        //                               every page miss. Iter8 raised this to
-        //                               5000 to defer checkpoint contention,
-        //                               but that hurt sequential-test cold
-        //                               reads more than it helped. 500 frames
-        //                               (~2 MB at 4 KiB pages) is half the
-        //                               SQLite default of 1000 — bias toward
-        //                               keeping the journal tight.
+        //   wal_autocheckpoint=5000   — let WAL grow before checkpoint, reducing
+        //                               reader/writer contention during bg writes
         let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
             conn.execute_batch(
                 "PRAGMA foreign_keys=ON;
@@ -169,7 +161,7 @@ impl SqliteTerminologyBackend {
                  PRAGMA busy_timeout=30000;
                  PRAGMA synchronous=NORMAL;
                  PRAGMA mmap_size=2147483648;
-                 PRAGMA wal_autocheckpoint=500;",
+                 PRAGMA wal_autocheckpoint=5000;",
             )
         });
 
