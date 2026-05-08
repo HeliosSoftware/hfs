@@ -3460,14 +3460,78 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
             .flatten(),
         None => None,
     };
+
+    // When the code is not in the VS BUT the user supplied a `display` AND the
+    // code IS known in the underlying CodeSystem, additionally check the
+    // display against that CS's canonical display. If they diverge, emit a
+    // SECOND warning-severity issue ("Wrong Display Name 'X' for ...") so the
+    // tx-ecosystem `batch/batch-validate-bad` fixture sees both signals.
+    //
+    // The display-mismatch is severity=warning (not error) because the primary
+    // failure is membership; the wrong display is informational on top of
+    // that. validation[0] of the same fixture (code IS in VS, display wrong)
+    // continues to emit its display-mismatch as severity=error via the
+    // membership-hit branch above — that path is untouched.
+    let mut issues = vec![issue];
+    let mut canonical_display: Option<String> = None;
+    if let (Some(sys), Some(disp)) = (resolved_system.as_deref(), in_display.as_deref()) {
+        let cs_req = ValidateCodeRequest {
+            url: None,
+            value_set_version: None,
+            system: Some(sys.to_string()),
+            code: in_code.clone(),
+            version: None,
+            display: Some(disp.to_string()),
+            date: None,
+            include_abstract: None,
+            input_form: Some(match req_path {
+                RequestPath::BareCode => "code".into(),
+                RequestPath::Coding => "coding".into(),
+                RequestPath::CodeableConcept => "codeableConcept".into(),
+            }),
+            lenient_display_validation: params
+                .iter()
+                .find(|p| {
+                    p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation")
+                })
+                .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool())),
+            default_value_set_versions: std::collections::HashMap::new(),
+        };
+        if let Ok(cs_resp) =
+            CodeSystemOperations::validate_code(state.backend(), &ctx, cs_req).await
+        {
+            // Pick up the canonical display so the response's `display` echo
+            // is the CS-known value rather than the user's wrong input. The
+            // IG fixture marks `display` as `$optional$:true` with the
+            // canonical value — the validator tolerates either presence
+            // (with that value) or absence, but rejects a divergent value.
+            canonical_display = cs_resp.display.clone();
+            // Take any display-mismatch issues (tx_code = "invalid-display")
+            // and append a warning-severity copy. The membership-miss
+            // demotes severity from error to warning.
+            for iss in cs_resp.issues {
+                if iss.tx_code == "invalid-display" && iss.severity == "error" {
+                    issues.push(ValidationIssue {
+                        severity: "warning".into(),
+                        ..iss
+                    });
+                } else if iss.tx_code == "invalid-display" {
+                    // Already warning/info (e.g. lenient-display-validation
+                    // already downgraded it). Pass through as-is.
+                    issues.push(iss);
+                }
+            }
+        }
+    }
+
     let resp = ValidateCodeResponse {
         result: false,
         message: None,
-        display: in_display.clone(),
+        display: canonical_display.or_else(|| in_display.clone()),
         system: resolved_system.clone(),
         cs_version: cs_version_lookup,
         inactive: None,
-        issues: vec![issue],
+        issues,
         caused_by_unknown_system: None,
         concept_status: None,
         normalized_code: None,
