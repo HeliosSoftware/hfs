@@ -390,6 +390,7 @@ jobs:
           # fall back to log parsing for older validator releases.
           TOTAL="unknown"
           PASSED="unknown"
+          SKIPPED=0
           PASS_RATE="unknown"
           SERVER_VERSION="unknown"
           if [ -s "$REPORT_JSON" ] && command -v jq >/dev/null 2>&1; then
@@ -398,14 +399,17 @@ jobs:
             TC=$(jq -r '(.test // []) | length' "$REPORT_JSON" 2>/dev/null)
             if [ -n "$TC" ] && [ "$TC" -gt 0 ] 2>/dev/null; then
               TOTAL="$TC"
-              # The actual per-test result lives at .test[].action[].operation.result,
-              # not on .test[] itself. A test is a failure when any of its actions
-              # has a non-"pass" operation result (fail / error / skip).
-              JFAIL=$(jq -r '[.test[]? | select(any(.action[]?; .operation.result != "pass"))] | length' "$REPORT_JSON" 2>/dev/null)
+              # Per-test result lives at .test[].action[].operation.result.
+              # `skip` is the validator's own decision to not run a test
+              # (e.g. tests with `mode: tx.fhir.org` are gated to that server only)
+              # — it is NOT a server failure and must not be counted as one.
+              JFAIL=$(jq -r '[.test[]? | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip")))] | length' "$REPORT_JSON" 2>/dev/null)
+              JSKIP=$(jq -r '[.test[]? | select(all(.action[]?; .operation.result == "skip" or .operation.result == "pass")) | select(any(.action[]?; .operation.result == "skip"))] | length' "$REPORT_JSON" 2>/dev/null)
               # Prefer the report's own pass/fail count; fall back to the file count.
               if [ -n "$JFAIL" ] && [ "$JFAIL" -ge "$FAILED" ] 2>/dev/null; then
                 FAILED="$JFAIL"
               fi
+              [ -n "$JSKIP" ] && SKIPPED="$JSKIP"
             fi
           fi
           if [ "$TOTAL" = "unknown" ]; then
@@ -414,8 +418,13 @@ jobs:
             [ -n "$TOTAL_GUESS" ] && TOTAL="$TOTAL_GUESS"
           fi
           if [ "$TOTAL" != "unknown" ] && [ "$TOTAL" -gt 0 ] 2>/dev/null; then
-            PASSED=$((TOTAL - FAILED))
-            PASS_RATE=$(awk -v p="$PASSED" -v t="$TOTAL" 'BEGIN{ printf "%.1f%%", (p*100)/t }')
+            PASSED=$((TOTAL - FAILED - SKIPPED))
+            # Pass rate is computed against the applicable population
+            # (excludes skipped tests that the validator gated to other servers).
+            APPLICABLE=$((TOTAL - SKIPPED))
+            if [ "$APPLICABLE" -gt 0 ] 2>/dev/null; then
+              PASS_RATE=$(awk -v p="$PASSED" -v t="$APPLICABLE" 'BEGIN{ printf "%.1f%%", (p*100)/t }')
+            fi
           fi
 
           # Validator + Java versions for the metadata table.
@@ -460,9 +469,13 @@ jobs:
             echo ""
             echo "### Results"
             echo ""
-            echo "| Total | Passed | Failed | Pass rate | Validator exit |"
-            echo "|------:|-------:|-------:|----------:|---------------:|"
-            echo "| ${TOTAL} | ${PASSED} | ${FAILED} | ${PASS_RATE} | ${TXTESTS_EXIT:-?} |"
+            echo "| Total | Passed | Failed | Skipped | Pass rate | Validator exit |"
+            echo "|------:|-------:|-------:|--------:|----------:|---------------:|"
+            echo "| ${TOTAL} | ${PASSED} | ${FAILED} | ${SKIPPED} | ${PASS_RATE} | ${TXTESTS_EXIT:-?} |"
+            if [ "${SKIPPED:-0}" -gt 0 ] 2>/dev/null; then
+              echo ""
+              echo "_Skipped tests are gated by the validator (e.g. \`mode: tx.fhir.org\` tests are run only against tx.fhir.org). Pass rate is computed against the applicable population._"
+            fi
             echo ""
 
             if [ -n "$VALIDATOR_ERROR" ]; then
