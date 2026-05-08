@@ -146,14 +146,22 @@ impl SqliteTerminologyBackend {
         // at bootstrap below) and avoids an fsync on every commit — a
         // meaningful speed-up for bulk imports that commit one transaction
         // per batch of ~500 concepts.
+        // PRAGMAs tuned for the benchmark sequence (EX01-03 populate large
+        // implicit-cache rows that thrash the page cache; EX04/EX07/EX08 then
+        // suffer from cold reads and WAL traversal).
+        //   cache_size=-200000        — 200 MB per connection (was 32 MB)
+        //   mmap_size=2 GiB           — read paths bypass syscalls (was 256 MB)
+        //   wal_autocheckpoint=5000   — let WAL grow before checkpoint, reducing
+        //                               reader/writer contention during bg writes
         let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
             conn.execute_batch(
                 "PRAGMA foreign_keys=ON;
-                 PRAGMA cache_size=-32768;
+                 PRAGMA cache_size=-200000;
                  PRAGMA temp_store=MEMORY;
                  PRAGMA busy_timeout=30000;
                  PRAGMA synchronous=NORMAL;
-                 PRAGMA mmap_size=268435456;",
+                 PRAGMA mmap_size=2147483648;
+                 PRAGMA wal_autocheckpoint=5000;",
             )
         });
 
