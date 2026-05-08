@@ -165,8 +165,15 @@ impl SqliteTerminologyBackend {
             )
         });
 
+        // Pool size sized for the benchmark's 50-VU sustained load plus
+        // background implicit-cache populate threads (uncapped fan-out across
+        // ~100 distinct `?fhir_vs=isa/<X>` URLs in EX01). At max_size=20,
+        // tokio request tasks block on `pool.get()` once the bg writers are
+        // active, which dominates EX04/EX07/EX08 latency in sequential
+        // benchmarks. WAL handles concurrent readers fine; only one writer
+        // at a time is enforced by SQLite, so adding read slack is safe.
         let pool = Pool::builder()
-            .max_size(20)
+            .max_size(64)
             .build(manager)
             .map_err(|e| HtsError::StorageError(format!("Failed to create SQLite pool: {e}")))?;
 
