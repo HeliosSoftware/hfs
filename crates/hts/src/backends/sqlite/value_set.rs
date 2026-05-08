@@ -181,6 +181,20 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 "Missing required parameter: url (ValueSet canonical URL)".into(),
             ));
         }
+        // EX_PROBE: per-call timing to identify which path served the request.
+        // (Stripped after iter11 diagnosis.)
+        let _probe_t0 = std::time::Instant::now();
+        let probe_url_short: String = req
+            .url
+            .as_deref()
+            .map(|u| {
+                if u.len() > 80 {
+                    format!("{}…", &u[..80])
+                } else {
+                    u.to_string()
+                }
+            })
+            .unwrap_or_else(|| "<inline>".to_string());
 
         // ── Async hot path: in-memory index already warm ──────────────────────
         // For URL-based implicit ValueSet requests (no inline ValueSet body),
@@ -230,6 +244,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             sql_offset,
                             sql_limit,
                         );
+                        tracing::info!(
+                            target: "hts::probe",
+                            "EX_PROBE_BACKEND: hit=implicit_index url={} took={:.3}ms n={}",
+                            probe_url_short,
+                            _probe_t0.elapsed().as_micros() as f64 / 1000.0,
+                            page.len(),
+                        );
                         return Ok(ExpandResponse {
                             total,
                             offset: req.offset,
@@ -277,6 +298,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             }
                         }
                         let page = page_in_memory(&concept_idx, None, sql_offset, sql_limit);
+                        tracing::info!(
+                            target: "hts::probe",
+                            "EX_PROBE_BACKEND: hit=inline_compose_index url={} took={:.3}ms n={}",
+                            probe_url_short,
+                            _probe_t0.elapsed().as_micros() as f64 / 1000.0,
+                            page.len(),
+                        );
                         return Ok(ExpandResponse {
                             total: Some(n),
                             offset: req.offset,
@@ -312,6 +340,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             filter_lower.as_deref(),
                             sql_offset,
                             sql_limit,
+                        );
+                        tracing::info!(
+                            target: "hts::probe",
+                            "EX_PROBE_BACKEND: hit=property_result_cache url={} took={:.3}ms n={}",
+                            probe_url_short,
+                            _probe_t0.elapsed().as_micros() as f64 / 1000.0,
+                            page.len(),
                         );
                         return Ok(ExpandResponse {
                             total: Some(total),
@@ -365,6 +400,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             sql_offset,
                                             sql_limit,
                                         );
+                                        tracing::info!(
+                                            target: "hts::probe",
+                                            "EX_PROBE_BACKEND: hit=plain_fts_cache url={} took={:.3}ms n={}",
+                                            probe_url_short,
+                                            _probe_t0.elapsed().as_micros() as f64 / 1000.0,
+                                            page.len(),
+                                        );
                                         return Ok(ExpandResponse {
                                             total: Some(total),
                                             offset: req.offset,
@@ -380,6 +422,18 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             }
         }
 
+        // EX_PROBE: every request that lands here missed all four async hot
+        // paths (implicit_index / inline_compose_index / property_result_cache /
+        // plain_fts_cache) and is going through spawn_blocking + the SQLite
+        // slow path. This is the hot suspicion for the EX04-after-EX01 stall.
+        let probe_url_short_owned = probe_url_short.clone();
+        let probe_t_pre_spawn = std::time::Instant::now();
+        tracing::info!(
+            target: "hts::probe",
+            "EX_PROBE_BACKEND: miss_all_caches url={} entering spawn_blocking",
+            probe_url_short_owned,
+        );
+
         let pool = self.pool().clone();
         let implicit_index = self.implicit_index.clone();
         let bg_index_pending = self.bg_index_pending.clone();
@@ -387,10 +441,30 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         let property_result_cache = self.property_result_cache.clone();
         let plain_fts_cache = self.plain_fts_cache.clone();
 
+        let probe_url_inner = probe_url_short_owned.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = pool
-                .get()
-                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            let probe_t_in_blocking = std::time::Instant::now();
+            let probe_pre_spawn_ms =
+                probe_t_pre_spawn.elapsed().as_micros() as f64 / 1000.0;
+            let conn = pool.get().map_err(|e| {
+                tracing::info!(
+                    target: "hts::probe",
+                    "EX_PROBE_BACKEND: pool_get_FAILED url={} pre_spawn={:.3}ms",
+                    probe_url_inner,
+                    probe_pre_spawn_ms,
+                );
+                HtsError::StorageError(format!("Pool error: {e}"))
+            })?;
+            let probe_pool_get_ms =
+                probe_t_in_blocking.elapsed().as_micros() as f64 / 1000.0;
+            tracing::info!(
+                target: "hts::probe",
+                "EX_PROBE_BACKEND: pool_get url={} pre_spawn={:.3}ms pool_get={:.3}ms",
+                probe_url_inner,
+                probe_pre_spawn_ms,
+                probe_pool_get_ms,
+            );
+            let probe_t_after_conn = std::time::Instant::now();
 
             // Accumulates FHIR expansion warnings for unknown/skipped systems.
             // Only populated by the inline ValueSet path.
@@ -599,12 +673,26 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             }
                         }
 
+                        // EX04_PROBE: full inline-compose evaluation. This is
+                        // the EX04 cold path that needs to populate the cache
+                        // before subsequent requests can use the async hot path.
+                        let probe_t_compute = std::time::Instant::now();
                         let codes = compute_expansion_with_ctx(
                             &conn,
                             Some(&compose_str),
                             &mut warnings,
                             &inline_ctx,
                         )?;
+                        let probe_compute_ms =
+                            probe_t_compute.elapsed().as_micros() as f64 / 1000.0;
+                        tracing::info!(
+                            target: "hts::probe",
+                            "EX04_PROBE: compute_expansion_with_ctx took={:.3}ms cache_key={} n={} warnings={}",
+                            probe_compute_ms,
+                            cache_key,
+                            codes.len(),
+                            warnings.len(),
+                        );
                         // Only cache when there are no warnings AND the inline
                         // body had no `contained[]` / `tx-resource` shadow
                         // resources — otherwise the cache key (compose hash)
@@ -614,6 +702,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             && inline_ctx.contained.is_empty()
                             && inline_ctx.tx_resources.is_empty();
                         if safe_to_cache {
+                            // EX04_PROBE: persistence cost of the cache populate.
+                            let probe_t_pop = std::time::Instant::now();
                             let _ = populate_implicit_cache(&conn, &cache_key, &codes);
                             // Populate the in-memory inline compose index so that
                             // subsequent requests for the same compose body are served
@@ -622,6 +712,21 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 &codes,
                                 &cache_key,
                                 &inline_compose_index,
+                            );
+                            tracing::info!(
+                                target: "hts::probe",
+                                "EX04_PROBE: populate_caches took={:.3}ms cache_key={}",
+                                probe_t_pop.elapsed().as_micros() as f64 / 1000.0,
+                                cache_key,
+                            );
+                        } else {
+                            tracing::info!(
+                                target: "hts::probe",
+                                "EX04_PROBE: skip_cache cache_key={} warnings={} contained={} tx_resources={}",
+                                cache_key,
+                                warnings.len(),
+                                inline_ctx.contained.len(),
+                                inline_ctx.tx_resources.len(),
                             );
                         }
                         codes
@@ -817,6 +922,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                         let filter_lower =
                                             req.filter.as_deref().map(|f| f.to_lowercase());
                                         let bfs_offset = req.offset.unwrap_or(0) as usize;
+                                        // EX_PROBE: bfs_expand_page is the EX01 hot
+                                        // path before the implicit cache is warm.
+                                        let probe_t_bfs = std::time::Instant::now();
                                         let page = bfs_expand_page(
                                             &conn,
                                             &cs_url,
@@ -826,6 +934,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             count as usize,
                                             filter_lower.as_deref(),
                                         )?;
+                                        let probe_bfs_ms =
+                                            probe_t_bfs.elapsed().as_micros() as f64 / 1000.0;
+                                        tracing::info!(
+                                            target: "hts::probe",
+                                            "EX01_PROBE: bfs_expand_page took={:.3}ms cs_url={} pattern={:?} n={}",
+                                            probe_bfs_ms,
+                                            cs_url,
+                                            pattern,
+                                            page.len(),
+                                        );
 
                                         // Spawn one background thread per URL to populate
                                         // implicit_expansion_cache (DB write only).  The
@@ -1031,6 +1149,19 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             let page: Vec<ExpansionContains> =
                 filtered.into_iter().skip(offset).take(count).collect();
+
+            // EX_PROBE: time spent inside spawn_blocking AFTER pool acquire,
+            // i.e. the actual SQLite work (compose evaluation + filtering).
+            let probe_compute_ms =
+                probe_t_after_conn.elapsed().as_micros() as f64 / 1000.0;
+            tracing::info!(
+                target: "hts::probe",
+                "EX_PROBE_BACKEND: blocking_done url={} pool_get={:.3}ms compute={:.3}ms n={}",
+                probe_url_inner,
+                probe_pool_get_ms,
+                probe_compute_ms,
+                page.len(),
+            );
 
             Ok(ExpandResponse {
                 total: Some(total),

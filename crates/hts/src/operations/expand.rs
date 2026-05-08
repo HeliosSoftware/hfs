@@ -31,6 +31,8 @@
 //!
 //! <https://hl7.org/fhir/valueset-operation-expand.html>
 
+use std::time::Instant;
+
 use axum::{
     Json,
     extract::{Path, RawQuery, State},
@@ -1141,6 +1143,9 @@ async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
+    // EX_PROBE: total wall time for the request, plus per-stage breakdown.
+    // Stripped after the iter11 diagnosis lands.
+    let probe_t0 = Instant::now();
     // Parse the `url` parameter. FHIR supports pipe-separated canonical URLs
     // (`http://example.org/vs|1.0.0`) — split and promote the version to
     // `valueSetVersion` when no explicit `valueSetVersion` param is present.
@@ -1480,8 +1485,38 @@ async fn process_expand<B: TerminologyBackend>(
     };
 
     let ctx = TenantContext::system();
+    // EX_PROBE: measure the backend expand call only (excludes parse + later
+    // post-processing). Captures the dominant cost on cold paths.
+    let probe_t_backend = Instant::now();
+    let probe_url_short: String = url
+        .as_deref()
+        .map(|u| {
+            // Truncate long URLs for log readability; keep enough to identify scenario.
+            if u.len() > 80 {
+                format!("{}…", &u[..80])
+            } else {
+                u.to_string()
+            }
+        })
+        .unwrap_or_else(|| "<inline>".to_string());
+    let probe_has_inline = req.value_set.is_some();
+    let probe_has_filter = req.filter.is_some();
+    let probe_count = req.count;
     let mut resp = match ValueSetOperations::expand(state.backend(), &ctx, req).await {
-        Ok(r) => r,
+        Ok(r) => {
+            let backend_ms = probe_t_backend.elapsed().as_micros() as f64 / 1000.0;
+            tracing::info!(
+                target: "hts::probe",
+                "EX_PROBE: backend_expand took {:.3}ms url={} inline={} filter={} count={:?} contains_n={}",
+                backend_ms,
+                probe_url_short,
+                probe_has_inline,
+                probe_has_filter,
+                probe_count,
+                r.contains.len(),
+            );
+            r
+        }
         Err(HtsError::NotFound(msg)) => {
             // Populate the negative cache so future requests for this URL
             // are resolved in O(1) without touching the database.
@@ -3517,6 +3552,16 @@ async fn process_expand<B: TerminologyBackend>(
             cache.insert(cache_key, bytes.clone());
         }
     }
+
+    // EX_PROBE: total wall time for the whole request including parse + post-
+    // processing + serialization.
+    let total_ms = probe_t0.elapsed().as_micros() as f64 / 1000.0;
+    tracing::info!(
+        target: "hts::probe",
+        "EX_PROBE: total request took {:.3}ms bytes={}",
+        total_ms,
+        bytes.len(),
+    );
 
     Ok(bytes)
 }

@@ -220,7 +220,7 @@ jobs:
         run: |
           HTS_SERVER_PORT="${{ env.HTS_PORT }}" \
           HTS_DATABASE_URL="$HTS_DB" \
-          HTS_LOG_LEVEL="warn" \
+          HTS_LOG_LEVEL="info" \
             ./hts > /tmp/hts-bench.log 2>&1 &
 
           echo "HTS_PID=$!" >> "$GITHUB_ENV"
@@ -390,12 +390,13 @@ jobs:
           retention-days: 90
 
       - name: Upload server log
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: hts-bench-server-log-${{ github.run_id }}
           path: /tmp/hts-bench.log
           retention-days: 7
+          if-no-files-found: ignore
 
       # ── Cleanup ──────────────────────────────────────────────────────────
 
