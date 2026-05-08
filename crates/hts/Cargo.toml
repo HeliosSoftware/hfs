@@ -34,6 +34,7 @@ helios-persistence = { path = "../persistence", version = "0.1.47", default-feat
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "query"] }
+futures = "0.3"
 bytes = "1"
 tower = { version = "0.5" }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }

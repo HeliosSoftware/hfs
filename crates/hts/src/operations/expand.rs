@@ -282,12 +282,30 @@ fn populate_concept_flags<'a, B: TerminologyBackend>(
                 .or_default()
                 .push(c.code.clone());
         }
+        // Issue per-system queries concurrently — ValueSets often span 5+
+        // systems (e.g. EX04 VSAC extensional pulls from SNOMED/LOINC/RxNorm
+        // simultaneously) and serialising the awaits makes the post-expand
+        // step the dominant cost of every request. The HashMap insert order
+        // is irrelevant: keys are (system, code) tuples and values overwrite
+        // last-wins.
+        let queries = by_system.iter().map(|(system, codes)| {
+            let system_owned: String = (*system).to_string();
+            let codes = codes.clone();
+            async move {
+                let res = backend
+                    .concept_expansion_flags(ctx, &system_owned, &codes)
+                    .await
+                    .ok();
+                (system_owned, res)
+            }
+        });
+        let results = futures::future::join_all(queries).await;
         let mut flag_map: HashMap<(String, String), crate::traits::ConceptExpansionFlags> =
             HashMap::new();
-        for (system, codes) in &by_system {
-            if let Ok(flags) = backend.concept_expansion_flags(ctx, system, codes).await {
+        for (system, flags_opt) in results {
+            if let Some(flags) = flags_opt {
                 for (code, f) in flags {
-                    flag_map.insert(((*system).to_string(), code), f);
+                    flag_map.insert((system.clone(), code), f);
                 }
             }
         }
@@ -325,9 +343,24 @@ fn populate_designations<'a, B: TerminologyBackend>(
                 .or_default()
                 .push(c.code.clone());
         }
+        // Per-system designation queries fan out concurrently for the same
+        // reason as `populate_concept_flags`: VSAC-style multi-system
+        // expansions otherwise pay N×spawn_blocking + r2d2 round-trips.
+        let queries = by_system.iter().map(|(system, codes)| {
+            let system_owned: String = (*system).to_string();
+            let codes = codes.clone();
+            async move {
+                let res = backend
+                    .concept_designations(ctx, &system_owned, &codes)
+                    .await
+                    .ok();
+                (system_owned, res)
+            }
+        });
+        let results = futures::future::join_all(queries).await;
         let mut map: HashMap<(String, String), Vec<ExpansionContainsDesignation>> = HashMap::new();
-        for (system, codes) in &by_system {
-            if let Ok(ds) = backend.concept_designations(ctx, system, codes).await {
+        for (system, ds_opt) in results {
+            if let Some(ds) = ds_opt {
                 for (code, list) in ds {
                     let entries = list
                         .into_iter()
@@ -339,7 +372,7 @@ fn populate_designations<'a, B: TerminologyBackend>(
                             extensions: vec![],
                         })
                         .collect();
-                    map.insert(((*system).to_string(), code), entries);
+                    map.insert((system.clone(), code), entries);
                 }
             }
         }
@@ -382,30 +415,37 @@ fn populate_properties<'a, B: TerminologyBackend>(
         // `parameters/parameters-expand-supplement-good` fixture's `prop1`
         // entry which the IG pins as a `valueString`.
         let mut prop_types_by_system: HashMap<String, HashMap<String, String>> = HashMap::new();
-        for (system, codes) in &by_system {
-            if let Ok(props) = backend
-                .concept_property_values(ctx, system, codes, properties)
-                .await
-            {
+        // Per-system: issue (property-values, CS-search) concurrently inside
+        // each task via `tokio::join!`, and fan all per-system tasks out via
+        // `join_all` so multi-system VS expansions don't pay N×serialised
+        // round-trips. Same correctness: the order of insertion into the
+        // shared HashMaps is irrelevant — keys uniquely identify each entry.
+        let queries = by_system.iter().map(|(system, codes)| {
+            let system_owned: String = (*system).to_string();
+            let codes = codes.clone();
+            async move {
+                let pv_fut = backend.concept_property_values(ctx, &system_owned, &codes, properties);
+                let cs_fut = crate::traits::CodeSystemOperations::search(
+                    backend,
+                    ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(system_owned.clone()),
+                        count: Some(20),
+                        ..Default::default()
+                    },
+                );
+                let (pv_res, cs_res) = tokio::join!(pv_fut, cs_fut);
+                (system_owned, pv_res.ok(), cs_res.ok())
+            }
+        });
+        let results = futures::future::join_all(queries).await;
+        for (system, pv_opt, cs_opt) in results {
+            if let Some(props) = pv_opt {
                 for (code, list) in props {
-                    map.insert(((*system).to_string(), code), list);
+                    map.insert((system.clone(), code), list);
                 }
             }
-            // Look up the CodeSystem (and any matching supplements that
-            // re-declare property[]) to harvest property-type declarations.
-            // Best effort — when the search fails or returns nothing we just
-            // fall back to the conservative `Code` default below.
-            if let Ok(hits) = crate::traits::CodeSystemOperations::search(
-                backend,
-                ctx,
-                crate::types::ResourceSearchQuery {
-                    url: Some((*system).to_string()),
-                    count: Some(20),
-                    ..Default::default()
-                },
-            )
-            .await
-            {
+            if let Some(hits) = cs_opt {
                 let mut type_map: HashMap<String, String> = HashMap::new();
                 for cs in &hits {
                     if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
@@ -422,7 +462,7 @@ fn populate_properties<'a, B: TerminologyBackend>(
                     }
                 }
                 if !type_map.is_empty() {
-                    prop_types_by_system.insert((*system).to_string(), type_map);
+                    prop_types_by_system.insert(system, type_map);
                 }
             }
         }
@@ -1562,11 +1602,16 @@ async fn process_expand<B: TerminologyBackend>(
     // ── Populate abstract / inactive flags ───────────────────────────────────
     // Backends construct ExpansionContains with both flags as None; resolve
     // them here in a per-system batch so the per-concept SQL stays cold-path.
-    populate_concept_flags(state.backend(), &ctx, &mut resp.contains).await;
-
-    // ── Look up source ValueSet (used for parameter extension, metadata copy,
-    // and to discover the `valueset-supplement` extension that auto-applies a
-    // supplement without needing an explicit `useSupplement` request param). ──
+    //
+    // The source-ValueSet metadata lookup below is independent of
+    // populate_concept_flags (it touches a different table and doesn't share
+    // the `resp.contains` borrow), so we issue both concurrently via
+    // `tokio::join!`. For VSAC-style multi-system expansions this halves the
+    // serialised post-expand cost.
+    //
+    // Source ValueSet is used for parameter extension, metadata copy, and to
+    // discover the `valueset-supplement` extension that auto-applies a
+    // supplement without needing an explicit `useSupplement` request param.
     // Honour the requested valueSetVersion (when present) so the metadata
     // we echo back — including the top-level `version` field — matches the
     // ValueSet that was actually used for expansion. With multiple VSes
@@ -1588,20 +1633,28 @@ async fn process_expand<B: TerminologyBackend>(
                 .as_deref()
                 .and_then(|u| default_value_set_versions_for_echo.get(u).cloned())
         });
-    let source_vs: Option<Value> = if let Some(ref u) = url_for_neg_cache {
-        ValueSetOperations::search(
-            state.backend(),
-            &ctx,
-            crate::types::ResourceSearchQuery {
-                url: Some(u.clone()),
-                version: req_vs_version.clone(),
-                count: Some(20),
-                ..Default::default()
-            },
-        )
-        .await
-        .ok()
-        .and_then(|mut v| {
+    let flags_fut = populate_concept_flags(state.backend(), &ctx, &mut resp.contains);
+    let source_vs_fut = async {
+        if let Some(ref u) = url_for_neg_cache {
+            ValueSetOperations::search(
+                state.backend(),
+                &ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(u.clone()),
+                    version: req_vs_version.clone(),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+        } else {
+            None
+        }
+    };
+    let (_, source_vs_search) = tokio::join!(flags_fut, source_vs_fut);
+    let source_vs: Option<Value> = if url_for_neg_cache.is_some() {
+        source_vs_search.and_then(|mut v| {
             // If a specific version was requested, return the row whose
             // `version` matches exactly. Defensive post-filter: the search
             // SQL already filters by version, but multiple rows can leak in
