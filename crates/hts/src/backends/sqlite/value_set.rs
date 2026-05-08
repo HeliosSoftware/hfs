@@ -42,7 +42,7 @@ use helios_persistence::tenant::TenantContext;
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::ecl;
 use crate::error::HtsError;
@@ -53,6 +53,88 @@ use crate::types::{
 };
 
 use super::SqliteTerminologyBackend;
+
+// ─── Process-wide CodeSystem URL → (system_id, version) cache ───────────────
+//
+// Many `code_systems` rows can share the same canonical URL — e.g. an empty
+// stub from `hl7.terminology` plus a full RF2 import of SNOMED. Iter5 fixed
+// the correctness bug by adding an `EXISTS(SELECT 1 FROM concepts ...)`
+// priority subquery to the resolver SQL so the row with concepts is preferred,
+// but that subquery runs on EVERY hot-path lookup (validate-code, expand
+// per-include, etc.) and dominates wRPS at high concurrency.
+//
+// This cache memoises the resolved `(system_id, version)` per URL across
+// requests. Cache invalidation is coarse: any code_systems write (import,
+// CRUD) calls `invalidate_cs_id_cache()`, which clears the whole map. In
+// typical operation imports happen at startup and the cache is then stable
+// for the life of the process, so the cost amortises over millions of
+// subsequent requests.
+static SYSTEM_ID_CACHE: OnceLock<RwLock<HashMap<String, (String, Option<String>)>>> =
+    OnceLock::new();
+
+fn cs_id_cache() -> &'static RwLock<HashMap<String, (String, Option<String>)>> {
+    SYSTEM_ID_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Clear the process-wide URL→system_id cache. Called by code paths that
+/// write to the `code_systems` table (CRUD + bulk import).
+pub(crate) fn invalidate_cs_id_cache() {
+    if let Some(cache) = SYSTEM_ID_CACHE.get() {
+        if let Ok(mut w) = cache.write() {
+            w.clear();
+        }
+    }
+}
+
+/// Resolve `system_id` for a CodeSystem canonical URL, preferring rows that
+/// actually have concepts (skipping empty stubs imported by terminology
+/// packages). Uses a process-wide cache to avoid the EXISTS subquery on every
+/// request.
+fn resolve_system_id_cached(
+    conn: &Connection,
+    url: &str,
+) -> Result<Option<String>, HtsError> {
+    if let Some(rec) = resolve_system_id_with_version_cached(conn, url)? {
+        Ok(Some(rec.0))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Same as [`resolve_system_id_cached`] but also returns the chosen row's
+/// version. Used by the compose-include path which wants to populate
+/// `ExpansionContains.version`.
+fn resolve_system_id_with_version_cached(
+    conn: &Connection,
+    url: &str,
+) -> Result<Option<(String, Option<String>)>, HtsError> {
+    if let Ok(read) = cs_id_cache().read() {
+        if let Some(rec) = read.get(url) {
+            return Ok(Some(rec.clone()));
+        }
+    }
+
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT cs.id, cs.version FROM code_systems cs WHERE cs.url = ?1 \
+             ORDER BY (CASE WHEN EXISTS \
+                 (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                 THEN 0 ELSE 1 END), \
+                 COALESCE(cs.version, '') DESC, cs.id LIMIT 1",
+            [url],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    if let Some(ref rec) = row {
+        if let Ok(mut w) = cs_id_cache().write() {
+            w.insert(url.to_owned(), rec.clone());
+        }
+    }
+
+    Ok(row)
+}
 
 /// A concept entry in the process-local in-memory implicit expansion index.
 ///
@@ -729,23 +811,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 };
 
                                 if let Some((cs_url, pattern)) = cs_pat {
-                                    // Multiple `code_systems` rows may share the same URL —
-                                    // e.g. a stub from `hl7.terminology` plus the real RF2
-                                    // import. Prefer a row that actually has concepts so
-                                    // expansion doesn't pick the empty stub.
-                                    let system_id: Option<String> = conn
-                                        .query_row(
-                                            "SELECT cs.id FROM code_systems cs \
-                                             WHERE cs.url = ?1 \
-                                             ORDER BY (CASE WHEN EXISTS \
-                                                 (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                                                 THEN 0 ELSE 1 END), cs.id \
-                                             LIMIT 1",
-                                            [&cs_url],
-                                            |r| r.get(0),
-                                        )
-                                        .optional()
-                                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                                    let system_id = resolve_system_id_cached(&conn, &cs_url)?;
 
                                     if let Some(system_id) = system_id {
                                         let filter_lower =
@@ -2013,18 +2079,7 @@ fn expand_inline_plain_fts(
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(includes.len());
     for inc in includes {
         let system_url = inc["system"].as_str().unwrap_or("");
-        match conn
-            .query_row(
-                "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
-                 ORDER BY (CASE WHEN EXISTS \
-                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
-                [system_url],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-        {
+        match resolve_system_id_cached(conn, system_url)? {
             Some(id) => pairs.push((system_url.to_owned(), id)),
             None => {
                 let msg = format!(
@@ -2200,18 +2255,7 @@ fn expand_inline_filtered(
             _ => continue,
         };
 
-        let system_id: Option<String> = conn
-            .query_row(
-                "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
-                 ORDER BY (CASE WHEN EXISTS \
-                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
-                [system_url],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        let system_id = match system_id {
+        let system_id = match resolve_system_id_cached(conn, system_url)? {
             Some(id) => id,
             None => {
                 let msg = format!(
@@ -4002,19 +4046,7 @@ fn try_multi_include_property_only(
         return Ok(None);
     }
 
-    let system_id: Option<String> = conn
-        .query_row(
-            "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
-                 ORDER BY (CASE WHEN EXISTS \
-                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
-            [first_system],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    let system_id = match system_id {
+    let system_id = match resolve_system_id_cached(conn, first_system)? {
         Some(id) => id,
         None => {
             let msg = format!(
@@ -4890,22 +4922,7 @@ fn try_multiinclude_hierarchy_page(
             _ => return Ok(None),
         };
 
-        // Prefer a `code_systems` row that has concepts over an empty stub.
-        let system_id: Option<String> = conn
-            .query_row(
-                "SELECT cs.id FROM code_systems cs \
-                 WHERE cs.url = ?1 \
-                 ORDER BY (CASE WHEN EXISTS \
-                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                     THEN 0 ELSE 1 END), cs.id \
-                 LIMIT 1",
-                [system_url],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-        match system_id {
+        match resolve_system_id_cached(conn, system_url)? {
             Some(id) => entries.push(Entry {
                 sys_url: system_url.to_owned(),
                 sys_id: id,
@@ -5127,19 +5144,7 @@ fn compose_page_fast(
         } else {
             let system_id: Option<String> = system_cache
                 .entry(system_url.clone())
-                .or_insert_with(|| {
-                    conn.query_row(
-                        "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
-                 ORDER BY (CASE WHEN EXISTS \
-                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
-                        [system_url.as_str()],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten()
-                })
+                .or_insert_with(|| resolve_system_id_cached(conn, system_url).ok().flatten())
                 .clone();
 
             if let Some(sid) = system_id {
@@ -5219,22 +5224,7 @@ fn extract_simple_hierarchy_compose(
         _ => return Ok(None),
     };
 
-    // Prefer a `code_systems` row that has concepts over an empty stub.
-    let system_id: Option<String> = conn
-        .query_row(
-            "SELECT cs.id FROM code_systems cs \
-             WHERE cs.url = ?1 \
-             ORDER BY (CASE WHEN EXISTS \
-                 (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                 THEN 0 ELSE 1 END), cs.id \
-             LIMIT 1",
-            [system_url],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    let system_id = match system_id {
+    let system_id = match resolve_system_id_cached(conn, system_url)? {
         Some(id) => id,
         None => {
             warnings.push(format!(
@@ -5534,10 +5524,15 @@ fn resolve_compose_system_id(
     url: &str,
     version: Option<&str>,
 ) -> Result<Option<(String, Option<String>)>, HtsError> {
-    // Prefer a `code_systems` row that actually has concepts, then highest
-    // version. Multiple rows can share the same canonical URL (e.g. an empty
-    // stub from `hl7.terminology` plus a real RF2 import); without this
-    // ordering we would silently pick the empty stub and return no concepts.
+    // Hot-path fast lane: when the include doesn't pin a version, the cached
+    // (id, version) tuple is exactly what we want, no SQL needed.
+    if version.is_none() {
+        return resolve_system_id_with_version_cached(conn, url);
+    }
+
+    // Version-pinned: must enumerate all candidate rows to find the matching
+    // one. This path is rarely hit (most includes don't pin a version), so
+    // skipping the cache here is fine.
     let mut stmt = conn
         .prepare(
             "SELECT id, version FROM code_systems \
@@ -7036,39 +7031,21 @@ fn validate_fhir_vs(
         }
     }
 
-    // A single canonical URL like `http://snomed.info/sct` may resolve to
-    // MULTIPLE rows in `code_systems` — e.g. a stub shipped by
-    // `hl7.terminology` plus the real RF2 import — and the membership lookup
-    // below must consider every one of them. Picking a single `system_id` via
-    // `SELECT id FROM code_systems WHERE url = ?1 LIMIT 1` (the previous
-    // implementation) silently picks an arbitrary row; if SQLite returns the
-    // empty stub first, every concept lookup against the universe ValueSet
-    // fails even when the same code is found by `$lookup` (which already
-    // handles the multi-row case).
-    //
-    // We JOIN through `code_systems` so the lookup matches if ANY row with
-    // this URL contains the concept.
-    let cs_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = ?1)",
-            [cs_url],
-            |r| r.get(0),
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-    if !cs_exists {
-        return Err(HtsError::NotFound(format!("CodeSystem not found: {cs_url}")));
-    }
+    // Multiple `code_systems` rows can share the same canonical URL — e.g. a
+    // stub from `hl7.terminology` plus the real RF2 import. The cached
+    // resolver picks the row that actually has concepts.
+    let system_id = match resolve_system_id_cached(conn, cs_url)? {
+        Some(id) => id,
+        None => return Err(HtsError::NotFound(format!("CodeSystem not found: {cs_url}"))),
+    };
 
     match pattern {
         FhirVsPattern::AllConcepts => {
             let row = conn
                 .query_row(
-                    "SELECT c.code, c.display \
-                     FROM concepts c \
-                     JOIN code_systems cs ON c.system_id = cs.id \
-                     WHERE cs.url = ?1 AND c.code = ?2 \
-                     LIMIT 1",
-                    rusqlite::params![cs_url, code],
+                    "SELECT code, display FROM concepts \
+                     WHERE system_id = ?1 AND code = ?2",
+                    rusqlite::params![system_id, code],
                     |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
                 )
                 .optional()
@@ -7092,15 +7069,13 @@ fn validate_fhir_vs(
         }
         FhirVsPattern::IsA(root_code) => {
             // O(1) closure lookup: is root_code an ancestor-or-self of code?
-            // Join through code_systems so we accept any matching system row.
             let is_member: bool = conn
                 .query_row(
                     "SELECT EXISTS(
-                         SELECT 1 FROM concept_closure cc
-                         JOIN code_systems cs ON cc.system_id = cs.id
-                         WHERE cs.url = ?1 AND cc.ancestor_code = ?2 AND cc.descendant_code = ?3
+                         SELECT 1 FROM concept_closure
+                         WHERE system_id = ?1 AND ancestor_code = ?2 AND descendant_code = ?3
                      )",
-                    rusqlite::params![cs_url, root_code, code],
+                    rusqlite::params![system_id, root_code, code],
                     |r| r.get(0),
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -7111,12 +7086,8 @@ fn validate_fhir_vs(
 
             let display: Option<String> = conn
                 .query_row(
-                    "SELECT c.display \
-                     FROM concepts c \
-                     JOIN code_systems cs ON c.system_id = cs.id \
-                     WHERE cs.url = ?1 AND c.code = ?2 \
-                     LIMIT 1",
-                    rusqlite::params![cs_url, code],
+                    "SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2",
+                    rusqlite::params![system_id, code],
                     |r| r.get(0),
                 )
                 .optional()
@@ -7174,19 +7145,8 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
         )));
     };
 
-    let system_id: Option<String> = conn
-        .query_row(
-            "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
-                 ORDER BY (CASE WHEN EXISTS \
-                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
-            [&cs_url],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-    let system_id =
-        system_id.ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {cs_url}")))?;
+    let system_id = resolve_system_id_cached(conn, &cs_url)?
+        .ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {cs_url}")))?;
 
     // BEGIN IMMEDIATE acquires the write lock upfront so concurrent callers
     // cannot both see an empty cache and then duplicate-write the expansion.
@@ -8343,17 +8303,7 @@ fn load_plain_corpus_and_cache(
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(includes.len());
     for inc in includes {
         let system_url = inc["system"].as_str().unwrap_or("");
-        match conn
-            .query_row(
-                "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1 \
-                 ORDER BY (CASE WHEN EXISTS \
-                     (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                     THEN 0 ELSE 1 END), cs.id LIMIT 1",
-                [system_url],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-        {
+        match resolve_system_id_cached(conn, system_url) {
             Ok(Some(id)) => pairs.push((system_url.to_owned(), id)),
             Ok(None) => {
                 let msg = format!(
