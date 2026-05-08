@@ -6996,24 +6996,39 @@ fn validate_fhir_vs(
         }
     }
 
-    let system_id: Option<String> = conn
+    // A single canonical URL like `http://snomed.info/sct` may resolve to
+    // MULTIPLE rows in `code_systems` — e.g. a stub shipped by
+    // `hl7.terminology` plus the real RF2 import — and the membership lookup
+    // below must consider every one of them. Picking a single `system_id` via
+    // `SELECT id FROM code_systems WHERE url = ?1 LIMIT 1` (the previous
+    // implementation) silently picks an arbitrary row; if SQLite returns the
+    // empty stub first, every concept lookup against the universe ValueSet
+    // fails even when the same code is found by `$lookup` (which already
+    // handles the multi-row case).
+    //
+    // We JOIN through `code_systems` so the lookup matches if ANY row with
+    // this URL contains the concept.
+    let cs_exists: bool = conn
         .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
+            "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = ?1)",
             [cs_url],
-            |row| row.get(0),
+            |r| r.get(0),
         )
-        .optional()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    let system_id =
-        system_id.ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {cs_url}")))?;
+    if !cs_exists {
+        return Err(HtsError::NotFound(format!("CodeSystem not found: {cs_url}")));
+    }
 
     match pattern {
         FhirVsPattern::AllConcepts => {
             let row = conn
                 .query_row(
-                    "SELECT code, display FROM concepts WHERE system_id = ?1 AND code = ?2",
-                    rusqlite::params![system_id, code],
+                    "SELECT c.code, c.display \
+                     FROM concepts c \
+                     JOIN code_systems cs ON c.system_id = cs.id \
+                     WHERE cs.url = ?1 AND c.code = ?2 \
+                     LIMIT 1",
+                    rusqlite::params![cs_url, code],
                     |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
                 )
                 .optional()
@@ -7037,13 +7052,15 @@ fn validate_fhir_vs(
         }
         FhirVsPattern::IsA(root_code) => {
             // O(1) closure lookup: is root_code an ancestor-or-self of code?
+            // Join through code_systems so we accept any matching system row.
             let is_member: bool = conn
                 .query_row(
                     "SELECT EXISTS(
-                         SELECT 1 FROM concept_closure
-                         WHERE system_id = ?1 AND ancestor_code = ?3 AND descendant_code = ?2
+                         SELECT 1 FROM concept_closure cc
+                         JOIN code_systems cs ON cc.system_id = cs.id
+                         WHERE cs.url = ?1 AND cc.ancestor_code = ?2 AND cc.descendant_code = ?3
                      )",
-                    rusqlite::params![system_id, code, root_code],
+                    rusqlite::params![cs_url, root_code, code],
                     |r| r.get(0),
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -7054,8 +7071,12 @@ fn validate_fhir_vs(
 
             let display: Option<String> = conn
                 .query_row(
-                    "SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2",
-                    rusqlite::params![system_id, code],
+                    "SELECT c.display \
+                     FROM concepts c \
+                     JOIN code_systems cs ON c.system_id = cs.id \
+                     WHERE cs.url = ?1 AND c.code = ?2 \
+                     LIMIT 1",
+                    rusqlite::params![cs_url, code],
                     |r| r.get(0),
                 )
                 .optional()
