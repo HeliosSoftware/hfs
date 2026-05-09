@@ -2148,7 +2148,7 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
         }
     }
     let result = process_validate_code_inner(state, params).await;
-    if let (Ok(ref value), Some(key)) = (&result, cache_key) {
+    if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
             &state.cs_validate_code_handler_cache,
             key,
@@ -3708,7 +3708,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         }
     }
     let result = process_vs_validate_code_inner(state, params).await;
-    if let (Ok(ref value), Some(key)) = (&result, cache_key) {
+    if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
             &state.vs_validate_code_handler_cache,
             key,
