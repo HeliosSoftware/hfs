@@ -95,7 +95,7 @@ pub type ValidateCodeHandlerCache = Arc<RwLock<HashMap<String, Arc<serde_json::V
 
 /// Maximum number of cached `$validate-code` handler responses (per direction —
 /// CS path and VS path each have their own map).
-pub const VALIDATE_CODE_HANDLER_CACHE_MAX: usize = 4096;
+pub const VALIDATE_CODE_HANDLER_CACHE_MAX: usize = 16384;
 
 /// Thread-safe per-AppState cache for fully-assembled `$expand` JSON bytes,
 /// keyed at the *handler* layer above every `process_expand` pre-flight step
@@ -114,7 +114,7 @@ pub const VALIDATE_CODE_HANDLER_CACHE_MAX: usize = 4096;
 pub type ExpandHandlerCache = Arc<RwLock<HashMap<String, Bytes>>>;
 
 /// Maximum number of cached `$expand` handler responses.
-pub const EXPAND_HANDLER_CACHE_MAX: usize = 4096;
+pub const EXPAND_HANDLER_CACHE_MAX: usize = 16384;
 
 /// Shared application state injected into every Axum handler.
 ///

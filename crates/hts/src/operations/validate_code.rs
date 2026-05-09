@@ -2165,8 +2165,27 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.cs_validate_code_handler_cache, key) {
+            let key_short: String = key.chars().take(100).collect();
+            tracing::info!(
+                target: "hts::probe",
+                "VC_CACHE: path=cs hit=true cache_key={}",
+                key_short,
+            );
             return Ok((*cached).clone());
         }
+    }
+    {
+        let (skip, key_short, key_len) = match cache_key.as_ref() {
+            Some(k) => (false, k.chars().take(100).collect::<String>(), k.len()),
+            None => (true, String::new(), 0usize),
+        };
+        tracing::info!(
+            target: "hts::probe",
+            "VC_CACHE: path=cs hit=false skip={} key_len={} cache_key={}",
+            skip,
+            key_len,
+            key_short,
+        );
     }
     let result = process_validate_code_inner(state, params).await;
     if let (Ok(value), Some(key)) = (&result, cache_key) {
@@ -3725,8 +3744,29 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.vs_validate_code_handler_cache, key) {
+            // Probe: cache hit on VS path.
+            let key_short: String = key.chars().take(100).collect();
+            tracing::info!(
+                target: "hts::probe",
+                "VC_CACHE: path=vs hit=true cache_key={}",
+                key_short,
+            );
             return Ok((*cached).clone());
         }
+    }
+    // Probe: cache miss (or skipped) on VS path. Capture key length / shape.
+    {
+        let (skip, key_short, key_len) = match cache_key.as_ref() {
+            Some(k) => (false, k.chars().take(100).collect::<String>(), k.len()),
+            None => (true, String::new(), 0usize),
+        };
+        tracing::info!(
+            target: "hts::probe",
+            "VC_CACHE: path=vs hit=false skip={} key_len={} cache_key={}",
+            skip,
+            key_len,
+            key_short,
+        );
     }
     let result = process_vs_validate_code_inner(state, params).await;
     if let (Ok(value), Some(key)) = (&result, cache_key) {
