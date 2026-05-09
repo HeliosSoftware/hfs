@@ -25,7 +25,9 @@ use crate::types::{
     ValidateCodeResponse,
 };
 
-use super::SqliteTerminologyBackend;
+use super::{
+    LookupResponseMap, PropCodesMap, ResolvedMetaMap, SqliteTerminologyBackend, StringOptionMap,
+};
 
 // ─── Process-wide CodeSystem URL → language cache ──────────────────────────
 //
@@ -47,86 +49,21 @@ fn cs_language_cache() -> &'static RwLock<HashMap<String, Option<String>>> {
     CS_LANGUAGE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-// ─── Process-wide CodeSystem property-code caches ──────────────────────────
+// ─── Per-instance CodeSystem property-code caches ──────────────────────────
 //
-// `is_concept_abstract` and `is_concept_inactive` (in `value_set.rs`) call
-// `abstract_property_codes(system_url)` / `inactive_property_codes(system_url)`
-// on every $validate-code request. Without caching, each call runs a SELECT
-// on `code_systems.resource_json` (multi-MB for SNOMED/LOINC) and JSON-parses
-// the entire blob just to discover which local property names alias the
-// canonical FHIR `notSelectable` / `inactive` URIs. At 50 VUs against SNOMED
-// VC01-03 this dominates per-request cost (~98% regression vs baseline).
-//
-// Cache shape: URL → Arc<Vec<String>> of property local-codes. Bounded by the
-// number of distinct CodeSystem URLs in the process (typically ≤ 100). Cleared
-// alongside the language/id caches whenever code_systems is written.
-type PropCodesMap = HashMap<String, Arc<Vec<String>>>;
-static CS_ABSTRACT_PROP_CACHE: OnceLock<RwLock<PropCodesMap>> = OnceLock::new();
-static CS_INACTIVE_PROP_CACHE: OnceLock<RwLock<PropCodesMap>> = OnceLock::new();
+// See [`SqliteTerminologyBackend::cs_abstract_prop_cache`] for the rationale.
+// `lookup_property_codes` is a free helper that accepts any of the per-instance
+// cache Arcs, so the implementation is shared between the abstract / inactive
+// callers.
 
-fn cs_abstract_prop_cache() -> &'static RwLock<PropCodesMap> {
-    CS_ABSTRACT_PROP_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-fn cs_inactive_prop_cache() -> &'static RwLock<PropCodesMap> {
-    CS_INACTIVE_PROP_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-// ─── Process-wide concept-flag caches ───────────────────────────────────────
-//
-// `is_concept_abstract(system_url, code)` and `is_concept_inactive(system_url,
-// code)` each run a 3-table JOIN on every $validate-code request even after
-// the property-codes cache is hit. The result is a single boolean per
-// (system, code) pair that is effectively immutable — the only way it can
-// change is via a re-import of the CodeSystem, which clears the caches anyway.
-//
-// Cache shape: (system_url, code) → bool. Bounded by `CONCEPT_FLAG_CACHE_MAX`
-// to avoid unbounded growth across many distinct codes; once full, new
-// entries are silently dropped. SNOMED VC01-03 hot-path under k6 only ever
-// visits ~50 distinct codes, so the bound is conservative.
 const CONCEPT_FLAG_CACHE_MAX: usize = 65_536;
-type ConceptFlagMap = HashMap<(String, String), bool>;
-static CS_CONCEPT_ABSTRACT_CACHE: OnceLock<RwLock<ConceptFlagMap>> = OnceLock::new();
-static CS_CONCEPT_INACTIVE_CACHE: OnceLock<RwLock<ConceptFlagMap>> = OnceLock::new();
-
-pub(super) fn cs_concept_abstract_cache() -> &'static RwLock<ConceptFlagMap> {
-    CS_CONCEPT_ABSTRACT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-pub(super) fn cs_concept_inactive_cache() -> &'static RwLock<ConceptFlagMap> {
-    CS_CONCEPT_INACTIVE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
 
 pub(super) fn concept_flag_cache_max() -> usize {
     CONCEPT_FLAG_CACHE_MAX
 }
 
-// ─── Process-wide CS-metadata caches (cs_version_for_msg / cs_content) ─────
-//
-// `cs_version_for_msg(system_url)` and `cs_content_for_url(system_url)` are
-// each called on every successful VC implicit-VS path. They translate a URL
-// to a small string and are stable until a re-import. Cached identically to
-// the language cache.
-static CS_VERSION_FOR_MSG_CACHE: OnceLock<RwLock<HashMap<String, Option<String>>>> =
-    OnceLock::new();
-static CS_CONTENT_CACHE: OnceLock<RwLock<HashMap<String, Option<String>>>> = OnceLock::new();
-static VS_VERSION_FOR_MSG_CACHE: OnceLock<RwLock<HashMap<String, Option<String>>>> =
-    OnceLock::new();
-
-pub(super) fn cs_version_for_msg_cache() -> &'static RwLock<HashMap<String, Option<String>>> {
-    CS_VERSION_FOR_MSG_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-pub(super) fn cs_content_cache() -> &'static RwLock<HashMap<String, Option<String>>> {
-    CS_CONTENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-pub(super) fn vs_version_for_msg_cache() -> &'static RwLock<HashMap<String, Option<String>>> {
-    VS_VERSION_FOR_MSG_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
 pub(super) fn lookup_property_codes(
-    cache: &'static RwLock<PropCodesMap>,
+    cache: &Arc<RwLock<PropCodesMap>>,
     conn: &rusqlite::Connection,
     system_url: &str,
     canonical: &str,
@@ -144,116 +81,89 @@ pub(super) fn lookup_property_codes(
 }
 
 pub(super) fn cached_abstract_property_codes(
+    backend: &SqliteTerminologyBackend,
     conn: &rusqlite::Connection,
     system_url: &str,
 ) -> Arc<Vec<String>> {
-    lookup_property_codes(cs_abstract_prop_cache(), conn, system_url, "notSelectable")
+    lookup_property_codes(
+        &backend.cs_abstract_prop_cache,
+        conn,
+        system_url,
+        "notSelectable",
+    )
 }
 
 pub(super) fn cached_inactive_property_codes(
+    backend: &SqliteTerminologyBackend,
     conn: &rusqlite::Connection,
     system_url: &str,
 ) -> Arc<Vec<String>> {
-    lookup_property_codes(cs_inactive_prop_cache(), conn, system_url, "inactive")
+    lookup_property_codes(
+        &backend.cs_inactive_prop_cache,
+        conn,
+        system_url,
+        "inactive",
+    )
 }
 
 /// Clear the process-wide URL→language cache. Called by code paths that
 /// write to the `code_systems` table (CRUD + bulk import) — paired with
 /// `invalidate_cs_id_cache()`.
+///
+/// Only the two pre-iter3 caches (`CS_LANGUAGE_CACHE` here and
+/// `SYSTEM_ID_CACHE` in `value_set.rs`) remain global statics; the iter3
+/// caches were converted to per-instance fields on `SqliteTerminologyBackend`
+/// to fix test-isolation regressions when cargo runs tests in parallel.
 pub(crate) fn invalidate_cs_language_cache() {
     if let Some(cache) = CS_LANGUAGE_CACHE.get() {
         if let Ok(mut w) = cache.write() {
             w.clear();
         }
     }
-    // The caches below all key on CodeSystem URL or (URL, code) — when the
-    // underlying CodeSystem is re-imported any of them may be stale.  Coarse
-    // invalidation here keeps the call sites in sync without each importer
-    // having to know the cache list.
-    if let Some(c) = CS_ABSTRACT_PROP_CACHE.get() {
-        if let Ok(mut w) = c.write() {
-            w.clear();
-        }
-    }
-    if let Some(c) = CS_INACTIVE_PROP_CACHE.get() {
-        if let Ok(mut w) = c.write() {
-            w.clear();
-        }
-    }
-    if let Some(c) = CS_CONCEPT_ABSTRACT_CACHE.get() {
-        if let Ok(mut w) = c.write() {
-            w.clear();
-        }
-    }
-    if let Some(c) = CS_CONCEPT_INACTIVE_CACHE.get() {
-        if let Ok(mut w) = c.write() {
-            w.clear();
-        }
-    }
-    if let Some(c) = CS_VERSION_FOR_MSG_CACHE.get() {
-        if let Ok(mut w) = c.write() {
-            w.clear();
-        }
-    }
-    if let Some(c) = CS_CONTENT_CACHE.get() {
-        if let Ok(mut w) = c.write() {
-            w.clear();
-        }
-    }
-    if let Some(c) = VS_VERSION_FOR_MSG_CACHE.get() {
-        if let Ok(mut w) = c.write() {
-            w.clear();
-        }
-    }
-    if let Some(c) = CS_RESOLVED_META_CACHE.get() {
-        if let Ok(mut w) = c.write() {
-            w.clear();
-        }
-    }
-    if let Some(c) = LOOKUP_RESPONSE_CACHE.get() {
-        if let Ok(mut w) = c.write() {
-            w.clear();
-        }
-    }
 }
 
-// ─── Process-wide $lookup response cache ────────────────────────────────────
+// ─── Per-instance $lookup response cache ────────────────────────────────────
 //
-// LK01-04 repeat the same (system, code) request across all 50 VUs. Caching
-// the assembled `LookupResponse` (display, properties, designations) lets the
-// hot path bypass three SQLite round-trips: `find_concept`,
-// `fetch_properties`, `fetch_synthesised_properties`, plus
-// `fetch_designations`. The response is keyed by all caller inputs that
-// affect output: (system, code, version, date, displayLanguage, sorted
-// property filter, sorted useSupplement filter).
-//
-// Bounded to LOOKUP_RESPONSE_CACHE_MAX entries; cleared alongside cs_id_cache.
+// See [`SqliteTerminologyBackend::lookup_response_cache`] for shape/eviction
+// policy. Only the bound is global; the data lives on the backend instance.
 const LOOKUP_RESPONSE_CACHE_MAX: usize = 4096;
-static LOOKUP_RESPONSE_CACHE: OnceLock<RwLock<HashMap<String, Arc<LookupResponse>>>> =
-    OnceLock::new();
-
-pub(super) fn lookup_response_cache() -> &'static RwLock<HashMap<String, Arc<LookupResponse>>> {
-    LOOKUP_RESPONSE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
 
 pub(super) fn lookup_response_cache_max() -> usize {
     LOOKUP_RESPONSE_CACHE_MAX
 }
 
-// ─── Cached resolve_code_system result ──────────────────────────────────────
+// ─── Per-instance accessors for code_system / value_set caches ─────────────
 //
-// `resolve_code_system(url, version, date)` returns (system_id, name, version).
-// This runs at the start of every $lookup and re-parses `code_systems` rows
-// to filter by version/date.  When `date` is None and `version` is None or
-// exact, the result is stable across requests — keying on (url, version) is
-// sufficient.
-type ResolvedMeta = (String, String, Option<String>);
-static CS_RESOLVED_META_CACHE: OnceLock<RwLock<HashMap<(String, Option<String>), ResolvedMeta>>> =
-    OnceLock::new();
+// These give the helpers in `value_set.rs` a single named-method entry point
+// without having to reach into the struct fields directly.
+impl SqliteTerminologyBackend {
+    pub(super) fn cs_concept_abstract_cache(&self) -> &Arc<RwLock<super::ConceptFlagMap>> {
+        &self.cs_concept_abstract_cache
+    }
 
-pub(super) fn cs_resolved_meta_cache()
--> &'static RwLock<HashMap<(String, Option<String>), ResolvedMeta>> {
-    CS_RESOLVED_META_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+    pub(super) fn cs_concept_inactive_cache(&self) -> &Arc<RwLock<super::ConceptFlagMap>> {
+        &self.cs_concept_inactive_cache
+    }
+
+    pub(super) fn cs_version_for_msg_cache(&self) -> &Arc<RwLock<StringOptionMap>> {
+        &self.cs_version_for_msg_cache
+    }
+
+    pub(super) fn cs_content_cache(&self) -> &Arc<RwLock<StringOptionMap>> {
+        &self.cs_content_cache
+    }
+
+    pub(super) fn vs_version_for_msg_cache(&self) -> &Arc<RwLock<StringOptionMap>> {
+        &self.vs_version_for_msg_cache
+    }
+
+    pub(super) fn cs_resolved_meta_cache(&self) -> &Arc<RwLock<ResolvedMetaMap>> {
+        &self.cs_resolved_meta_cache
+    }
+
+    pub(super) fn lookup_response_cache(&self) -> &Arc<RwLock<LookupResponseMap>> {
+        &self.lookup_response_cache
+    }
 }
 
 #[async_trait]
@@ -300,7 +210,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             None
         };
         if let Some(ref k) = cache_key {
-            if let Ok(read) = lookup_response_cache().read() {
+            if let Ok(read) = self.lookup_response_cache().read() {
                 if let Some(arc) = read.get(k) {
                     return Ok((**arc).clone());
                 }
@@ -309,6 +219,8 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
 
         let pool = self.pool().clone();
         let cache_key_owned = cache_key.clone();
+        let lookup_cache = self.lookup_response_cache().clone();
+        let resolved_cache = self.cs_resolved_meta_cache().clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -317,6 +229,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
 
             let (system_id, cs_name, cs_version) = resolve_code_system(
                 &conn,
+                &resolved_cache,
                 &req.system,
                 req.version.as_deref(),
                 req.date.as_deref(),
@@ -407,7 +320,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             // contract stays untouched.
             if let Some(k) = cache_key_owned {
                 let arc = std::sync::Arc::new(response.clone());
-                if let Ok(mut w) = lookup_response_cache().write() {
+                if let Ok(mut w) = lookup_cache.write() {
                     if w.len() < lookup_response_cache_max() {
                         w.insert(k, arc);
                     }
@@ -436,6 +349,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         })?;
 
         let pool = self.pool().clone();
+        let resolved_cache = self.cs_resolved_meta_cache().clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -445,6 +359,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             // Unknown code system is not an error — just a "false" result.
             let (system_id, resolved_cs_version) = match resolve_code_system(
                 &conn,
+                &resolved_cache,
                 &system,
                 req.version.as_deref(),
                 req.date.as_deref(),
@@ -635,6 +550,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         req: SubsumesRequest,
     ) -> Result<SubsumesResponse, HtsError> {
         let pool = self.pool().clone();
+        let resolved_cache = self.cs_resolved_meta_cache().clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -642,7 +558,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
             let (system_id, _, _) =
-                resolve_code_system(&conn, &req.system, req.version.as_deref(), None)?;
+                resolve_code_system(&conn, &resolved_cache, &req.system, req.version.as_deref(), None)?;
 
             // Both codes must exist in this system.
             find_concept(&conn, &system_id, &req.code_a)?;
@@ -958,6 +874,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         let pool = self.pool().clone();
         let system_url = system_url.to_string();
         let codes = codes.to_vec();
+        let backend = self.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -975,8 +892,8 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             // local-code mapping when available; always fall back to the
             // canonical names so a CS that never declares property[] still
             // reports correctly.
-            let abstract_codes = abstract_property_codes(&conn, &system_url);
-            let inactive_codes = inactive_property_codes(&conn, &system_url);
+            let abstract_codes = abstract_property_codes(&backend, &conn, &system_url);
+            let inactive_codes = inactive_property_codes(&backend, &conn, &system_url);
             let abstract_in = abstract_codes
                 .iter()
                 .map(|c| format!("'{}'", c.replace('\'', "''")))
@@ -1570,10 +1487,13 @@ fn walk_concepts(
 /// CS encode the abstract flag. Always includes the canonical names as a safety
 /// net for systems that didn't declare property[].
 pub(super) fn abstract_property_codes(
+    backend: &SqliteTerminologyBackend,
     conn: &rusqlite::Connection,
     system_url: &str,
 ) -> Vec<String> {
-    cached_abstract_property_codes(conn, system_url).as_ref().clone()
+    cached_abstract_property_codes(backend, conn, system_url)
+        .as_ref()
+        .clone()
 }
 
 /// Same idea as [`abstract_property_codes`] but for the FHIR
@@ -1581,10 +1501,13 @@ pub(super) fn abstract_property_codes(
 /// $expand to populate `contains[].inactive` and by $validate-code to
 /// flag inactive codes. Always includes the canonical `inactive` name.
 pub(super) fn inactive_property_codes(
+    backend: &SqliteTerminologyBackend,
     conn: &rusqlite::Connection,
     system_url: &str,
 ) -> Vec<String> {
-    cached_inactive_property_codes(conn, system_url).as_ref().clone()
+    cached_inactive_property_codes(backend, conn, system_url)
+        .as_ref()
+        .clone()
 }
 
 /// Resolve the local property code(s) on `system_url`'s CodeSystem that
@@ -1667,6 +1590,7 @@ fn check_ancestor(
 /// `resource_json`) is ≤ the requested date are considered.
 fn resolve_code_system(
     conn: &rusqlite::Connection,
+    cache: &Arc<RwLock<ResolvedMetaMap>>,
     url: &str,
     version: Option<&str>,
     date: Option<&str>,
@@ -1677,7 +1601,6 @@ fn resolve_code_system(
     // $lookup call (LK01-04 hot path).
     if date.is_none() {
         let key = (url.to_string(), version.map(|s| s.to_string()));
-        let cache = cs_resolved_meta_cache();
         if let Ok(read) = cache.read() {
             if let Some(v) = read.get(&key) {
                 return Ok(v.clone());

@@ -465,6 +465,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         let inline_compose_index = self.inline_compose_index.clone();
         let property_result_cache = self.property_result_cache.clone();
         let plain_fts_cache = self.plain_fts_cache.clone();
+        let backend = self.clone();
 
         let probe_url_inner = probe_url_short_owned.clone();
         tokio::task::spawn_blocking(move || {
@@ -703,6 +704,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // before subsequent requests can use the async hot path.
                         let probe_t_compute = std::time::Instant::now();
                         let codes = compute_expansion_with_ctx(
+                            &backend,
                             &conn,
                             Some(&compose_str),
                             &mut warnings,
@@ -874,6 +876,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 }
                             }
                             let codes = compute_expansion_with_versions(
+                                &backend,
                                 &conn,
                                 compose_json.as_deref(),
                                 &mut vec![],
@@ -902,6 +905,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             // expansion; ignore the cache when the request
                             // pins specific CS / VS versions and recompute.
                             compute_expansion_with_versions(
+                                &backend,
                                 &conn,
                                 compose_json.as_deref(),
                                 &mut vec![],
@@ -1216,6 +1220,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         })?;
 
         let pool = self.pool().clone();
+        let backend = self.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = pool
@@ -1280,6 +1285,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             // `UNKNOWN_CODESYSTEM_VERSION_EXP` shape that the
                             // IG `version/vs-expand-v-wb` fixtures expect).
                             let codes = match compute_expansion_with_versions(
+                                &backend,
                                 &conn,
                                 compose_json.as_deref(),
                                 &mut vec![],
@@ -1319,11 +1325,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             let abstract_for_msg = req.include_abstract == Some(false)
                                 && found
                                     .as_ref()
-                                    .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
+                                    .map(|c| is_concept_abstract(&backend, &conn,&c.system, &c.code))
                                     .unwrap_or(false);
                             let inactive_for_msg = found
                                 .as_ref()
-                                .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
+                                .map(|c| is_concept_inactive(&backend, &conn,&c.system, &c.code))
                                 .unwrap_or(false);
                             // For the not-found-in-VS branch: check if the
                             // code IS in the underlying CodeSystem but
@@ -1334,7 +1340,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 && req
                                     .system
                                     .as_deref()
-                                    .map(|s| is_concept_inactive(&conn, s, &req.code))
+                                    .map(|s| is_concept_inactive(&backend, &conn,s, &req.code))
                                     .unwrap_or(false);
                             let code_unknown_in_cs = found.is_none()
                                 && req
@@ -1345,13 +1351,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             let cs_version = req
                                 .system
                                 .as_deref()
-                                .and_then(|s| cs_version_for_msg(&conn, s));
+                                .and_then(|s| cs_version_for_msg(&backend, &conn,s));
                             let cs_is_fragment = req
                                 .system
                                 .as_deref()
-                                .map(|s| cs_content_for_url(&conn, s).as_deref() == Some("fragment"))
+                                .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
                                 .unwrap_or(false);
-                            let vs_version_owned = lookup_value_set_version(&conn, &url);
+                            let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
                             return finish_validate_code_response(
                                 found,
                                 &req.code,
@@ -1386,17 +1392,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
                         let abstract_for_msg = found
                             .as_ref()
-                            .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
+                            .map(|c| is_concept_abstract(&backend, &conn,&c.system, &c.code))
                             .unwrap_or(false);
                         let inactive_for_msg = found
                             .as_ref()
-                            .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
+                            .map(|c| is_concept_inactive(&backend, &conn,&c.system, &c.code))
                             .unwrap_or(false);
                         let inactive_in_cs = found.is_none()
                             && req
                                 .system
                                 .as_deref()
-                                .map(|s| is_concept_inactive(&conn, s, &req.code))
+                                .map(|s| is_concept_inactive(&backend, &conn,s, &req.code))
                                 .unwrap_or(false);
                         let code_unknown_in_cs = found.is_none()
                             && req
@@ -1407,13 +1413,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         let cs_version = req
                             .system
                             .as_deref()
-                            .and_then(|s| cs_version_for_msg(&conn, s));
+                            .and_then(|s| cs_version_for_msg(&backend, &conn,s));
                         let cs_is_fragment = req
                             .system
                             .as_deref()
-                            .map(|s| cs_content_for_url(&conn, s).as_deref() == Some("fragment"))
+                            .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
                             .unwrap_or(false);
-                        let vs_version_owned = lookup_value_set_version(&conn, &url);
+                        let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
                         return finish_validate_code_response(
                             found,
                             &req.code,
@@ -1528,7 +1534,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .collect();
                 if distinct_systems.len() >= 2 {
                     distinct_systems.sort();
-                    let vs_v = lookup_value_set_version(&conn, &url);
+                    let vs_v = lookup_value_set_version(&backend, &conn,&url);
                     let vs_canonical = match vs_v.as_deref() {
                         Some(v) if !v.is_empty() => format!("{url}|{v}"),
                         _ => url.clone(),
@@ -1700,7 +1706,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // supplied) against stored CS versions and the VS include pin.
             // Also fires when the caller supplies no version but the VS pins
             // a version that doesn't exist in the DB.
-            let vs_version_for_mismatch = lookup_value_set_version(&conn, &url);
+            let vs_version_for_mismatch = lookup_value_set_version(&backend, &conn,&url);
             let mismatch = if let (Some(req_ver), Some(system)) =
                 (req.version.as_deref(), effective_system.as_deref())
             {
@@ -1759,7 +1765,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .and_then(|v| v.get("inactive").and_then(|b| b.as_bool()))
                 == Some(false);
             let found = if compose_inactive_false {
-                found.filter(|c| !is_concept_inactive(&conn, &c.system, &c.code))
+                found.filter(|c| !is_concept_inactive(&backend, &conn,&c.system, &c.code))
             } else {
                 found
             };
@@ -1788,17 +1794,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             let abstract_for_msg = req.include_abstract == Some(false)
                 && found
                     .as_ref()
-                    .map(|c| is_concept_abstract(&conn, &c.system, &c.code))
+                    .map(|c| is_concept_abstract(&backend, &conn,&c.system, &c.code))
                     .unwrap_or(false);
             let inactive_for_msg = found
                 .as_ref()
-                .map(|c| is_concept_inactive(&conn, &c.system, &c.code))
+                .map(|c| is_concept_inactive(&backend, &conn,&c.system, &c.code))
                 .unwrap_or(false);
             let inactive_in_cs = found.is_none()
                 && req
                     .system
                     .as_deref()
-                    .map(|s| is_concept_inactive(&conn, s, &req.code))
+                    .map(|s| is_concept_inactive(&backend, &conn,s, &req.code))
                     .unwrap_or(false);
             // The bare URL-level check: is the code anywhere in the CS, any
             // version? Used as a first cut. A version-pinned caller may still
@@ -1863,12 +1869,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 from_req
                     .or(from_found)
                     .or(from_compose)
-                    .or_else(|| cs_version_for_msg(&conn, s))
+                    .or_else(|| cs_version_for_msg(&backend, &conn,s))
             });
-            let vs_version_owned = lookup_value_set_version(&conn, &url);
+            let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
             let cs_is_fragment = system_for_msg
                 .as_deref()
-                .map(|s| cs_content_for_url(&conn, s).as_deref() == Some("fragment"))
+                .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
                 .unwrap_or(false);
             // When the caller didn't supply a display and we still need to
             // echo one (the code is in the underlying CS, just not in this
@@ -2814,11 +2820,13 @@ impl<'a> InlineResolutionContext<'a> {
 /// - `compose.exclude[]` — removes the (system, code) pairs that match the
 ///   same conditions, including `valueSet[]` references.
 fn compute_expansion(
+    backend: &SqliteTerminologyBackend,
     conn: &Connection,
     compose_json: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     compute_expansion_with_ctx(
+        backend,
         conn,
         compose_json,
         warnings,
@@ -2831,6 +2839,7 @@ fn compute_expansion(
 /// apply transitively through any nested `compose.include[].valueSet[]`
 /// references encountered during the expansion.
 fn compute_expansion_with_versions(
+    backend: &SqliteTerminologyBackend,
     conn: &Connection,
     compose_json: Option<&str>,
     warnings: &mut Vec<String>,
@@ -2842,18 +2851,19 @@ fn compute_expansion_with_versions(
     ctx.force_system_versions = force.clone();
     ctx.system_version_defaults = defaults.clone();
     ctx.default_value_set_versions = default_vs_versions.clone();
-    compute_expansion_with_ctx(conn, compose_json, warnings, &ctx)
+    compute_expansion_with_ctx(backend, conn, compose_json, warnings, &ctx)
 }
 
 /// Variant of [`compute_expansion`] that threads an inline-resolution context
 /// through nested `compose.include[].valueSet[]` lookups.
 fn compute_expansion_with_ctx(
+    backend: &SqliteTerminologyBackend,
     conn: &Connection,
     compose_json: Option<&str>,
     warnings: &mut Vec<String>,
     ctx: &InlineResolutionContext<'_>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
-    compute_expansion_depth_inner(conn, compose_json, warnings, 0, ctx)
+    compute_expansion_depth_inner(backend, conn, compose_json, warnings, 0, ctx)
 }
 
 /// Resolve a single `compose.include[].valueSet[]` reference to a flat code
@@ -2864,6 +2874,7 @@ fn compute_expansion_with_ctx(
 /// which references `vsA`); a re-entry pushes a `vs-invalid` warning instead
 /// of recursing.
 fn expand_vs_reference(
+    backend: &SqliteTerminologyBackend,
     conn: &Connection,
     ref_url: &str,
     warnings: &mut Vec<String>,
@@ -2911,6 +2922,7 @@ fn expand_vs_reference(
 
     if let Some(compose_str) = ctx.lookup_compose(ref_url) {
         return compute_expansion_depth_inner(
+            backend,
             conn,
             Some(&compose_str),
             warnings,
@@ -2952,6 +2964,7 @@ fn expand_vs_reference(
             // Recurse with the child context so further refs inside the
             // referenced ValueSet still see contained / tx-resource shadows.
             compute_expansion_depth_inner(
+                backend,
                 conn,
                 ref_compose.as_deref(),
                 warnings,
@@ -2977,6 +2990,7 @@ fn expand_vs_reference(
 }
 
 fn compute_expansion_depth_inner(
+    backend: &SqliteTerminologyBackend,
     conn: &Connection,
     compose_json: Option<&str>,
     warnings: &mut Vec<String>,
@@ -3036,10 +3050,10 @@ fn compute_expansion_depth_inner(
         if let Some(result) = try_multi_include_property_only(conn, includes, warnings)? {
             result
         } else {
-            expand_includes_per_clause(conn, includes, warnings, depth, ctx)?
+            expand_includes_per_clause(backend, conn, includes, warnings, depth, ctx)?
         }
     } else {
-        expand_includes_per_clause(conn, includes, warnings, depth, ctx)?
+        expand_includes_per_clause(backend, conn, includes, warnings, depth, ctx)?
     };
 
     // Apply excludes — each clause may carry concept[], filter[], and/or
@@ -3091,7 +3105,7 @@ fn compute_expansion_depth_inner(
     let excludes = compose["exclude"].as_array().unwrap_or(&empty_arr);
     if !excludes.is_empty() {
         let (mut denied, denied_concept_versioned, denied_whole_versioned) =
-            build_exclude_sets(conn, excludes, warnings, depth, ctx)?;
+            build_exclude_sets(backend, conn, excludes, warnings, depth, ctx)?;
 
         // `denied_concept_versioned` (from `exclude[].concept[]` listings
         // with a `version` pin) is *always* version-aware — keep it on the
@@ -3139,6 +3153,7 @@ fn compute_expansion_depth_inner(
 
 #[allow(clippy::too_many_arguments)]
 fn expand_includes_per_clause(
+    backend: &SqliteTerminologyBackend,
     conn: &Connection,
     includes: &[serde_json::Value],
     warnings: &mut Vec<String>,
@@ -3185,7 +3200,7 @@ fn expand_includes_per_clause(
                     Some(u) => u,
                     None => continue,
                 };
-                let codes = expand_vs_reference(conn, ref_url, warnings, depth, ctx)?;
+                let codes = expand_vs_reference(backend, conn, ref_url, warnings, depth, ctx)?;
                 let mut set: HashSet<(String, String)> = HashSet::new();
                 for c in codes {
                     let key = (c.system.clone(), c.code.clone());
@@ -3219,6 +3234,7 @@ fn expand_includes_per_clause(
                     obj.remove("valueSet");
                 }
                 let base_codes = expand_single_include_local(
+                    backend,
                     conn,
                     &single_inc,
                     warnings,
@@ -3264,7 +3280,8 @@ fn expand_includes_per_clause(
 
         // No `valueSet[]` reference on this include — fall through to the
         // local single-include expansion (system + concept + filter).
-        let local = expand_single_include_local(conn, inc, warnings, &mut system_id_cache, depth)?;
+        let local =
+            expand_single_include_local(backend, conn, inc, warnings, &mut system_id_cache, depth)?;
         included.extend(local);
     }
 
@@ -3278,6 +3295,7 @@ fn expand_includes_per_clause(
 /// include carries both local conditions and `valueSet[]` references that need
 /// to be intersected together.
 fn expand_single_include_local(
+    backend: &SqliteTerminologyBackend,
     conn: &Connection,
     inc: &serde_json::Value,
     warnings: &mut Vec<String>,
@@ -3417,7 +3435,7 @@ fn expand_single_include_local(
         // bolted on) so the intersection is well-defined.
         let abstract_codes_in_set: Vec<String> = if depth == 0 {
             out.iter()
-                .filter(|c| is_concept_abstract(conn, &c.system, &c.code))
+                .filter(|c| is_concept_abstract(backend, conn, &c.system, &c.code))
                 .map(|c| c.code.clone())
                 .collect()
         } else {
@@ -3524,6 +3542,7 @@ fn expand_single_include_local(
 ///   only when the VS carries the `versionsMatch=false` expansion-parameter
 ///   extension does the caller keep them version-aware.
 fn build_exclude_sets(
+    backend: &SqliteTerminologyBackend,
     conn: &Connection,
     excludes: &[serde_json::Value],
     warnings: &mut Vec<String>,
@@ -3568,7 +3587,8 @@ fn build_exclude_sets(
                 if excl_ctx.exclude_chain.is_none() {
                     excl_ctx.exclude_chain = Some((ref_url.to_owned(), Vec::new()));
                 }
-                let resolved = expand_vs_reference(conn, ref_url, warnings, depth, &excl_ctx)?;
+                let resolved =
+                    expand_vs_reference(backend, conn, ref_url, warnings, depth, &excl_ctx)?;
                 let mut set = HashSet::new();
                 for c in resolved {
                     set.insert((c.system, c.code));
@@ -3591,6 +3611,7 @@ fn build_exclude_sets(
                     obj.remove("valueSet");
                 }
                 let local = expand_single_include_local(
+                    backend,
                     conn,
                     &single_exc,
                     warnings,
@@ -3653,7 +3674,8 @@ fn build_exclude_sets(
         // these codes that exist in v" rather than "remove only this code at
         // this version" — collapsed to version-blind by the caller unless
         // the VS sets versionsMatch=false.
-        let local = expand_single_include_local(conn, exc, warnings, &mut system_id_cache, depth)?;
+        let local =
+            expand_single_include_local(backend, conn, exc, warnings, &mut system_id_cache, depth)?;
         for c in local {
             match &exc_version {
                 Some(v) => {
@@ -6017,10 +6039,15 @@ fn populate_cache(
 /// validating an abstract code against a VS that contains it must still
 /// produce result=false with an "abstract, and not allowed in this context"
 /// message.
-fn is_concept_abstract(conn: &Connection, system_url: &str, code: &str) -> bool {
-    // Process-wide cache: VC01-03 hammer the same (system, code) pairs across
+fn is_concept_abstract(
+    backend: &SqliteTerminologyBackend,
+    conn: &Connection,
+    system_url: &str,
+    code: &str,
+) -> bool {
+    // Per-instance cache: VC01-03 hammer the same (system, code) pairs across
     // 50 VUs. Skipping the JOIN below saves three table lookups per request.
-    let cache = super::code_system::cs_concept_abstract_cache();
+    let cache = backend.cs_concept_abstract_cache();
     if let Ok(read) = cache.read() {
         if let Some(&v) = read.get(&(system_url.to_string(), code.to_string())) {
             return v;
@@ -6031,7 +6058,7 @@ fn is_concept_abstract(conn: &Connection, system_url: &str, code: &str) -> bool 
     // concept-properties#notSelectable URI in this CodeSystem. Tx-ecosystem
     // fixtures rename the property locally (e.g. `not-selectable` with a
     // hyphen), so a query hardcoded to `notSelectable` would miss them.
-    let abstract_codes = super::code_system::cached_abstract_property_codes(conn, system_url);
+    let abstract_codes = super::code_system::cached_abstract_property_codes(backend, conn, system_url);
     let placeholders = (3..=abstract_codes.len() + 2)
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
@@ -6066,10 +6093,14 @@ fn is_concept_abstract(conn: &Connection, system_url: &str, code: &str) -> bool 
 /// Returns the stored version for a ValueSet URL (None if unknown). Used to
 /// format `url|version` in $validate-code "code not found" messages, which
 /// is what the IG fixtures expect.
-fn lookup_value_set_version(conn: &Connection, url: &str) -> Option<String> {
-    // Process-wide cache: stable until the next re-import. Same invalidation
+fn lookup_value_set_version(
+    backend: &SqliteTerminologyBackend,
+    conn: &Connection,
+    url: &str,
+) -> Option<String> {
+    // Per-instance cache: stable until the next re-import. Same invalidation
     // hook as cs_id_cache (clear all on bundle write).
-    let cache = super::code_system::vs_version_for_msg_cache();
+    let cache = backend.vs_version_for_msg_cache();
     if let Ok(read) = cache.read() {
         if let Some(v) = read.get(url) {
             return v.clone();
@@ -6155,11 +6186,15 @@ fn cs_version_exists(conn: &Connection, system_url: &str, version: &str) -> bool
 
 /// Returns the highest stored version for a CodeSystem URL, used to format
 /// the IG-expected "Unknown code in CodeSystem 'url' version 'X'" message.
-fn cs_version_for_msg(conn: &Connection, system_url: &str) -> Option<String> {
-    // Process-wide cache: this query runs on every successful VC implicit-VS
+fn cs_version_for_msg(
+    backend: &SqliteTerminologyBackend,
+    conn: &Connection,
+    system_url: &str,
+) -> Option<String> {
+    // Per-instance cache: this query runs on every successful VC implicit-VS
     // call (just to pretty-print the message text). The result is stable
     // until a re-import, and re-imports clear the cache.
-    let cache = super::code_system::cs_version_for_msg_cache();
+    let cache = backend.cs_version_for_msg_cache();
     if let Ok(read) = cache.read() {
         if let Some(v) = read.get(system_url) {
             return v.clone();
@@ -6185,9 +6220,13 @@ fn cs_version_for_msg(conn: &Connection, system_url: &str) -> Option<String> {
 /// `Some("fragment")` when the CodeSystem is loaded as a fragment of the
 /// larger system, which downstream callers use to soften unknown-code
 /// diagnostics into the IG `UNKNOWN_CODE_IN_FRAGMENT` warning.
-fn cs_content_for_url(conn: &Connection, system_url: &str) -> Option<String> {
-    // Process-wide cache: stable until the next re-import.
-    let cache = super::code_system::cs_content_cache();
+fn cs_content_for_url(
+    backend: &SqliteTerminologyBackend,
+    conn: &Connection,
+    system_url: &str,
+) -> Option<String> {
+    // Per-instance cache: stable until the next re-import.
+    let cache = backend.cs_content_cache();
     if let Ok(read) = cache.read() {
         if let Some(v) = read.get(system_url) {
             return v.clone();
@@ -6792,8 +6831,13 @@ fn detect_vs_pin_unknown(
     Some((issues, caused_by, echo_version))
 }
 
-fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool {
-    let cache = super::code_system::cs_concept_inactive_cache();
+fn is_concept_inactive(
+    backend: &SqliteTerminologyBackend,
+    conn: &Connection,
+    system_url: &str,
+    code: &str,
+) -> bool {
+    let cache = backend.cs_concept_inactive_cache();
     if let Ok(read) = cache.read() {
         if let Some(&v) = read.get(&(system_url.to_string(), code.to_string())) {
             return v;
@@ -6809,7 +6853,7 @@ fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool 
     // IG, deprecated codes are discouraged but still active (act-class
     // expansion and the `deprecated/` test group both rely on this — deprecated
     // codes survive `activeOnly=true` filtering).
-    let inactive_codes = super::code_system::cached_inactive_property_codes(conn, system_url);
+    let inactive_codes = super::code_system::cached_inactive_property_codes(backend, conn, system_url);
     let placeholders = (3..=inactive_codes.len() + 2)
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()

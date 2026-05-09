@@ -31,7 +31,16 @@ use tracing::info;
 use crate::error::HtsError;
 use crate::import::{BundleImportBackend, ImportStats};
 use crate::traits::TerminologyMetadata;
+use crate::types::LookupResponse;
 use helios_persistence::tenant::TenantContext;
+
+// ─── Per-instance cache type aliases (see field docs on SqliteTerminologyBackend) ──
+pub(crate) type PropCodesMap = HashMap<String, Arc<Vec<String>>>;
+pub(crate) type ConceptFlagMap = HashMap<(String, String), bool>;
+pub(crate) type ResolvedMeta = (String, String, Option<String>);
+pub(crate) type ResolvedMetaMap = HashMap<(String, Option<String>), ResolvedMeta>;
+pub(crate) type StringOptionMap = HashMap<String, Option<String>>;
+pub(crate) type LookupResponseMap = HashMap<String, Arc<LookupResponse>>;
 
 /// Shared in-memory index for text-filtered implicit ValueSet expansions.
 ///
@@ -127,6 +136,34 @@ pub struct SqliteTerminologyBackend {
     /// is served entirely from process memory via the trigram index, bypassing
     /// `spawn_blocking` and r2d2 pool contention.
     pub(crate) plain_fts_cache: PlainFtsCache,
+
+    // ── Per-instance perf caches (iter3) ─────────────────────────────────────
+    //
+    // These were originally global `OnceLock<RwLock<HashMap<...>>>` statics,
+    // but cargo runs tests in parallel across threads in the same binary;
+    // distinct in-memory backends sharing the globals leaked entries across
+    // tests (e.g. `is_concept_abstract` for `(http://example.org/cs, A)`
+    // returning a stale `true` from another test). Per-instance caches make
+    // every backend self-contained.
+
+    /// CodeSystem URL → local property codes mapping for `notSelectable`.
+    pub(crate) cs_abstract_prop_cache: Arc<RwLock<PropCodesMap>>,
+    /// CodeSystem URL → local property codes mapping for `inactive`.
+    pub(crate) cs_inactive_prop_cache: Arc<RwLock<PropCodesMap>>,
+    /// `(system_url, code) → bool` result of `is_concept_abstract`.
+    pub(crate) cs_concept_abstract_cache: Arc<RwLock<ConceptFlagMap>>,
+    /// `(system_url, code) → bool` result of `is_concept_inactive`.
+    pub(crate) cs_concept_inactive_cache: Arc<RwLock<ConceptFlagMap>>,
+    /// CodeSystem URL → highest stored version (used in error messages).
+    pub(crate) cs_version_for_msg_cache: Arc<RwLock<StringOptionMap>>,
+    /// CodeSystem URL → `content` column value (e.g. `Some("fragment")`).
+    pub(crate) cs_content_cache: Arc<RwLock<StringOptionMap>>,
+    /// ValueSet URL → highest stored version (used in error messages).
+    pub(crate) vs_version_for_msg_cache: Arc<RwLock<StringOptionMap>>,
+    /// `(url, version) → resolved meta` for `resolve_code_system`.
+    pub(crate) cs_resolved_meta_cache: Arc<RwLock<ResolvedMetaMap>>,
+    /// Cache key → assembled `LookupResponse` for `$lookup`.
+    pub(crate) lookup_response_cache: Arc<RwLock<LookupResponseMap>>,
 }
 
 impl SqliteTerminologyBackend {
@@ -177,19 +214,6 @@ impl SqliteTerminologyBackend {
             .max_size(64)
             .build(manager)
             .map_err(|e| HtsError::StorageError(format!("Failed to create SQLite pool: {e}")))?;
-
-        // Process-wide caches added for VC/LK perf (invalidate_cs_id_cache,
-        // invalidate_cs_language_cache, and the property/concept-flag caches
-        // they fan out to) are global statics. Tests open multiple distinct
-        // SQLite databases in the same test binary; without clearing on
-        // backend creation, a key written by an earlier test (e.g.
-        // is_concept_abstract for `http://example.org/cs#A`) leaks into the
-        // next test's fresh DB and produces wrong answers. Calling the
-        // top-level invalidator here clears every global cache the import
-        // path knows about. In production the caches are empty at startup
-        // anyway, so this is a no-op there.
-        invalidate_cs_id_cache();
-        invalidate_cs_language_cache();
 
         // Declare early so the init block can pre-warm the in-memory indexes.
         let implicit_index: ImplicitIndex = Arc::new(RwLock::new(HashMap::new()));
@@ -278,6 +302,15 @@ impl SqliteTerminologyBackend {
             inline_compose_index,
             property_result_cache,
             plain_fts_cache,
+            cs_abstract_prop_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_inactive_prop_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_concept_abstract_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_concept_inactive_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_version_for_msg_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_content_cache: Arc::new(RwLock::new(HashMap::new())),
+            vs_version_for_msg_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
+            lookup_response_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -331,6 +364,15 @@ impl SqliteTerminologyBackend {
             inline_compose_index: Arc::new(RwLock::new(HashMap::new())),
             property_result_cache: Arc::new(RwLock::new(HashMap::new())),
             plain_fts_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_abstract_prop_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_inactive_prop_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_concept_abstract_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_concept_inactive_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_version_for_msg_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_content_cache: Arc::new(RwLock::new(HashMap::new())),
+            vs_version_for_msg_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
+            lookup_response_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
