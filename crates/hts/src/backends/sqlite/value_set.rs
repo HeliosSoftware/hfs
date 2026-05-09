@@ -1219,10 +1219,64 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             )
         })?;
 
+        // ── Per-instance $validate-code response cache ─────────────────────
+        // VC01-03 hammer the same (url, system, code) tuples across 50 VUs.
+        // Serving the cached ValidateCodeResponse skips spawn_blocking, pool
+        // acquisition, implicit-cache lookup, and finish_validate_code_response
+        // entirely. Bounded to validate_code_response_cache_max() entries; the
+        // cache is per-instance and naturally invalidated when a new backend
+        // is constructed (e.g. on server restart after import).
+        //
+        // The cache key folds in every request field that affects output:
+        //   url, value_set_version, system, code, version, display,
+        //   include_abstract, date, input_form, lenient_display_validation
+        //
+        // Skip the cache entirely when `default_value_set_versions` is set —
+        // those pins force the slow-path recompute branch (`has_vs_pin = true`)
+        // and the version override changes which CodeSystem version resolves
+        // for any nested `valueSet[]` reference. Folding it into the key would
+        // require a stable serialisation; punting is simpler and the pin is
+        // rare on the hot path.
+        let cache_key: Option<String> = if req.default_value_set_versions.is_empty() {
+            Some(format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                url,
+                req.value_set_version.as_deref().unwrap_or(""),
+                req.system.as_deref().unwrap_or(""),
+                req.code,
+                req.version.as_deref().unwrap_or(""),
+                req.display.as_deref().unwrap_or(""),
+                req.include_abstract
+                    .map(|b| if b { "1" } else { "0" })
+                    .unwrap_or(""),
+                req.date.as_deref().unwrap_or(""),
+                req.input_form.as_deref().unwrap_or(""),
+                req.lenient_display_validation
+                    .map(|b| if b { "1" } else { "0" })
+                    .unwrap_or(""),
+            ))
+        } else {
+            None
+        };
+        if let Some(ref k) = cache_key {
+            if let Ok(read) = self.validate_code_response_cache().read() {
+                if let Some(arc) = read.get(k) {
+                    return Ok((**arc).clone());
+                }
+            }
+        }
+
         let pool = self.pool().clone();
         let backend = self.clone();
+        let cache_key_owned = cache_key.clone();
+        let validate_cache = self.validate_code_response_cache().clone();
 
         tokio::task::spawn_blocking(move || {
+            // Inner closure so we can capture the assembled response on every
+            // success path (there are five `return ...` sites below) and write
+            // it into `validate_cache` once after the work completes. Errors
+            // are never cached.
+            let compute = |req: ValidateCodeRequest| -> Result<ValidateCodeResponse, HtsError> {
             let conn = pool
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
@@ -1915,6 +1969,21 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 echo_display_lookup.as_deref(),
                 normalized_code.as_deref(),
             )
+            };
+            let response = compute(req)?;
+            // Populate the response cache (bounded). We clone the assembled
+            // response into an Arc once; subsequent hits clone the Arc cheaply
+            // and `.clone()` the inner value on return so the trait contract
+            // (returns owned ValidateCodeResponse) stays untouched.
+            if let Some(k) = cache_key_owned {
+                let arc = std::sync::Arc::new(response.clone());
+                if let Ok(mut w) = validate_cache.write() {
+                    if w.len() < super::code_system::validate_code_response_cache_max() {
+                        w.insert(k, arc);
+                    }
+                }
+            }
+            Ok(response)
         })
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?

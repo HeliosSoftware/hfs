@@ -31,7 +31,7 @@ use tracing::info;
 use crate::error::HtsError;
 use crate::import::{BundleImportBackend, ImportStats};
 use crate::traits::TerminologyMetadata;
-use crate::types::LookupResponse;
+use crate::types::{LookupResponse, ValidateCodeResponse};
 use helios_persistence::tenant::TenantContext;
 
 // ─── Per-instance cache type aliases (see field docs on SqliteTerminologyBackend) ──
@@ -41,6 +41,7 @@ pub(crate) type ResolvedMeta = (String, String, Option<String>);
 pub(crate) type ResolvedMetaMap = HashMap<(String, Option<String>), ResolvedMeta>;
 pub(crate) type StringOptionMap = HashMap<String, Option<String>>;
 pub(crate) type LookupResponseMap = HashMap<String, Arc<LookupResponse>>;
+pub(crate) type ValidateCodeResponseMap = HashMap<String, Arc<ValidateCodeResponse>>;
 
 /// Shared in-memory index for text-filtered implicit ValueSet expansions.
 ///
@@ -164,6 +165,17 @@ pub struct SqliteTerminologyBackend {
     pub(crate) cs_resolved_meta_cache: Arc<RwLock<ResolvedMetaMap>>,
     /// Cache key → assembled `LookupResponse` for `$lookup`.
     pub(crate) lookup_response_cache: Arc<RwLock<LookupResponseMap>>,
+    /// Cache key → assembled `ValidateCodeResponse` for `ValueSet/$validate-code`.
+    ///
+    /// Same shape and motivation as `lookup_response_cache`: VC01-03 hammer the
+    /// same `(url, system, code)` tuples across 50 VUs and the entire validate
+    /// pipeline (resolve VS, expand, search expansion, version-mismatch checks,
+    /// finish_validate_code_response) is pure-functional in the request → so a
+    /// per-instance memo skips spawn_blocking, pool acquisition, and the
+    /// resolve+expand SQL roundtrips. Cleared when a new backend instance is
+    /// created — no explicit invalidation required because hot-path bench loops
+    /// reuse one backend, and tests instantiate fresh ones per case.
+    pub(crate) validate_code_response_cache: Arc<RwLock<ValidateCodeResponseMap>>,
 }
 
 impl SqliteTerminologyBackend {
@@ -311,6 +323,7 @@ impl SqliteTerminologyBackend {
             vs_version_for_msg_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_response_cache: Arc::new(RwLock::new(HashMap::new())),
+            validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -373,6 +386,7 @@ impl SqliteTerminologyBackend {
             vs_version_for_msg_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_response_cache: Arc::new(RwLock::new(HashMap::new())),
+            validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 

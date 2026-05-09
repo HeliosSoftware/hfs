@@ -27,6 +27,7 @@ use crate::types::{
 
 use super::{
     LookupResponseMap, PropCodesMap, ResolvedMetaMap, SqliteTerminologyBackend, StringOptionMap,
+    ValidateCodeResponseMap,
 };
 
 // ─── Process-wide CodeSystem URL → language cache ──────────────────────────
@@ -132,6 +133,19 @@ pub(super) fn lookup_response_cache_max() -> usize {
     LOOKUP_RESPONSE_CACHE_MAX
 }
 
+// ─── Per-instance ValueSet/$validate-code response cache ────────────────────
+//
+// See [`SqliteTerminologyBackend::validate_code_response_cache`] for shape /
+// eviction policy. VC01-03 repeat the same `(url, system, code)` request
+// across 50 VUs against `?fhir_vs` URLs, so memoising the assembled
+// `ValidateCodeResponse` skips spawn_blocking, pool acquisition, the implicit
+// expansion lookup, and `finish_validate_code_response` entirely on a hit.
+const VALIDATE_CODE_RESPONSE_CACHE_MAX: usize = 4096;
+
+pub(super) fn validate_code_response_cache_max() -> usize {
+    VALIDATE_CODE_RESPONSE_CACHE_MAX
+}
+
 // ─── Per-instance accessors for code_system / value_set caches ─────────────
 //
 // These give the helpers in `value_set.rs` a single named-method entry point
@@ -163,6 +177,12 @@ impl SqliteTerminologyBackend {
 
     pub(super) fn lookup_response_cache(&self) -> &Arc<RwLock<LookupResponseMap>> {
         &self.lookup_response_cache
+    }
+
+    pub(super) fn validate_code_response_cache(
+        &self,
+    ) -> &Arc<RwLock<ValidateCodeResponseMap>> {
+        &self.validate_code_response_cache
     }
 }
 
