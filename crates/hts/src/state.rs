@@ -74,6 +74,29 @@ pub const NOT_FOUND_CACHE_MAX: usize = 10_000;
 /// [`ExpandCache`] after every successful bundle import.
 pub type NotFoundCache = Arc<RwLock<HashSet<String>>>;
 
+/// Thread-safe per-AppState cache for fully-assembled `$validate-code` JSON
+/// responses (both `CodeSystem/$validate-code` and `ValueSet/$validate-code`).
+///
+/// The cache lives at the *handler* layer — above every supplement / VS-import
+/// pre-flight helper — so a warm hit on these endpoints skips ALL of:
+/// `enforce_vs_supplement_extensions`, `detect_bad_vs_import`,
+/// `resolve_supplements`, `supplement_url_in_coding_error`, and the per-system
+/// `validate_code` backend call.
+///
+/// Keyed on a canonical, name-sorted serialisation of every input parameter
+/// that influences the response.  Values are stored as `Arc<Value>` so warm
+/// hits clone an Arc rather than re-serialising the whole tree.
+///
+/// Bounded to [`VALIDATE_CODE_HANDLER_CACHE_MAX`] entries — once full new
+/// entries are dropped silently (the benchmark never exceeds a few hundred
+/// distinct keys per cache).  Cleared alongside [`ExpandCache`] on bundle
+/// import / CRUD writes via [`AppState::clear_expand_cache`].
+pub type ValidateCodeHandlerCache = Arc<RwLock<HashMap<String, Arc<serde_json::Value>>>>;
+
+/// Maximum number of cached `$validate-code` handler responses (per direction —
+/// CS path and VS path each have their own map).
+pub const VALIDATE_CODE_HANDLER_CACHE_MAX: usize = 4096;
+
 /// Shared application state injected into every Axum handler.
 ///
 /// `B` is the concrete terminology backend (e.g., `SqliteTerminologyBackend`).
@@ -135,6 +158,15 @@ pub struct AppState<B: TerminologyBackend> {
     /// costs for each uncached URL.  Cleared together with `expand_cache`
     /// after every successful bundle import.
     pub not_found_urls: NotFoundCache,
+
+    /// Handler-level response cache for `POST /CodeSystem/$validate-code` (both
+    /// the `_handler` and `get_*_handler` entry points share `process_validate_code`).
+    /// See [`ValidateCodeHandlerCache`].
+    pub cs_validate_code_handler_cache: ValidateCodeHandlerCache,
+
+    /// Handler-level response cache for `POST /ValueSet/$validate-code`.
+    /// See [`ValidateCodeHandlerCache`].
+    pub vs_validate_code_handler_cache: ValidateCodeHandlerCache,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -152,19 +184,29 @@ impl<B: TerminologyBackend> AppState<B> {
             max_expansion_size: 10_000,
             expand_cache: Arc::new(RwLock::new(HashMap::new())),
             not_found_urls: Arc::new(RwLock::new(HashSet::new())),
+            cs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
+            vs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Evict all cached `$expand` results and negative-cache entries.
+    /// Evict all cached `$expand` results and negative-cache entries, plus the
+    /// per-AppState `$validate-code` handler-response caches (CS and VS).
     ///
-    /// Call this after a successful bundle import so that expansions reflecting
-    /// the new terminology data are recomputed on the next request.
+    /// Call this after a successful bundle import so that expansions and
+    /// validations reflecting the new terminology data are recomputed on the
+    /// next request.
     pub fn clear_expand_cache(&self) {
         if let Ok(mut cache) = self.expand_cache.write() {
             cache.clear();
         }
         if let Ok(mut neg) = self.not_found_urls.write() {
             neg.clear();
+        }
+        if let Ok(mut cache) = self.cs_validate_code_handler_cache.write() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.vs_validate_code_handler_cache.write() {
+            cache.clear();
         }
     }
 

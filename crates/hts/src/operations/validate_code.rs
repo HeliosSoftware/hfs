@@ -24,8 +24,10 @@ use axum::{
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
+use std::sync::Arc;
+
 use crate::error::HtsError;
-use crate::state::AppState;
+use crate::state::{AppState, VALIDATE_CODE_HANDLER_CACHE_MAX, ValidateCodeHandlerCache};
 use crate::traits::{CodeSystemOperations, SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
@@ -2015,6 +2017,102 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
     ))
 }
 
+/// Build a canonical cache key for the `$validate-code` handler-response cache.
+///
+/// Returns `None` when caching MUST be skipped because the response is
+/// effectively unique-per-request:
+///
+/// * any parameter carries an inline `resource` body (`valueSet`, `tx-resource`,
+///   `system`, …) — those vary on every distinct compose / supplement payload
+///   and would pollute the cache;
+/// * the request includes `default-valueset-version`, `force-system-version`,
+///   `system-version`, `check-system-version`, or `useSupplement` — these
+///   force slow paths whose outcome depends on global terminology state in
+///   ways that the simple per-params key cannot fully capture safely.
+///
+/// Otherwise every `(name, valueXxx)` pair is serialised as a compact JSON
+/// fragment and the fragments are sorted by name (stable for repeated
+/// parameter names: their relative order is preserved as a secondary key
+/// because we rely on `sort_by_key` for the primary axis).  The resulting
+/// string is the cache key.
+fn build_validate_code_cache_key(params: &[Value]) -> Option<String> {
+    // Reject params that depend on inline FHIR resources or on session-scoped
+    // version pins / supplements — caching those would be either wasteful or
+    // outright unsafe (the response can vary even for the same params if the
+    // backend's supplement state shifts mid-run).
+    const SKIP_NAMES: &[&str] = &[
+        "useSupplement",
+        "default-valueset-version",
+        "force-system-version",
+        "system-version",
+        "check-system-version",
+    ];
+    let mut frags: Vec<(String, String)> = Vec::with_capacity(params.len());
+    for p in params {
+        // FHIR Parameters entry MUST have a `name` — defensively skip any that
+        // don't (caching of malformed input is irrelevant; the slow path will
+        // produce the same error response either way).
+        let name = match p.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return None,
+        };
+        // Inline resources: bail.  Even a single `resource` field on any param
+        // means we can't cheaply build a stable, compact key.
+        if p.get("resource").is_some() {
+            return None;
+        }
+        if SKIP_NAMES.contains(&name) {
+            return None;
+        }
+        // Compact JSON of the whole entry — captures every `valueXxx`,
+        // `valueCoding{system,code,version,display}`, `valueCodeableConcept`,
+        // including booleans like `lenient-display-validation`.  The
+        // serialiser preserves field order from the input map — this is fine
+        // here because the k6 driver and tx-ecosystem fixtures send identical
+        // bytes per request.  In the unlikely event of a key collision the
+        // worst case is a cache miss, never an incorrect response: identical
+        // canonical params => identical handler output by construction.
+        let frag = match serde_json::to_string(p) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        frags.push((name.to_string(), frag));
+    }
+    frags.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::with_capacity(frags.iter().map(|(_, f)| f.len() + 1).sum());
+    for (i, (_, f)) in frags.iter().enumerate() {
+        if i > 0 {
+            out.push('|');
+        }
+        out.push_str(f);
+    }
+    Some(out)
+}
+
+/// Fetch a cached `$validate-code` response by canonical key.
+fn validate_code_cache_get(
+    cache: &ValidateCodeHandlerCache,
+    key: &str,
+) -> Option<Arc<Value>> {
+    cache.read().ok()?.get(key).cloned()
+}
+
+/// Insert a successfully-built `$validate-code` response into the per-AppState
+/// cache.  Drops new entries silently once the cache reaches
+/// [`VALIDATE_CODE_HANDLER_CACHE_MAX`].
+fn validate_code_cache_put(
+    cache: &ValidateCodeHandlerCache,
+    key: String,
+    value: Arc<Value>,
+) {
+    if let Ok(mut guard) = cache.write() {
+        if guard.len() >= VALIDATE_CODE_HANDLER_CACHE_MAX {
+            return;
+        }
+        guard.insert(key, value);
+    }
+}
+
 /// Core validate-code logic for `CodeSystem/$validate-code`.
 ///
 /// Accepts three input forms (checked in priority order):
@@ -2035,6 +2133,32 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
 /// Returns [`HtsError::InvalidRequest`] when none of the three input forms are
 /// present, or when `url` is absent for the bare-code form.
 pub(crate) async fn process_validate_code<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Value, HtsError> {
+    // ── Handler-level response cache (CS path) ───────────────────────────────
+    // Skips ALL pre-call helpers (resolve_supplements, supplement_url_in_coding_error,
+    // CodeSystemOperations::validate_code) when the same canonical params have
+    // produced a response earlier in this AppState's lifetime.  Cleared on
+    // every bundle import / CRUD write via `clear_expand_cache`.
+    let cache_key = build_validate_code_cache_key(&params);
+    if let Some(ref key) = cache_key {
+        if let Some(cached) = validate_code_cache_get(&state.cs_validate_code_handler_cache, key) {
+            return Ok((*cached).clone());
+        }
+    }
+    let result = process_validate_code_inner(state, params).await;
+    if let (Ok(ref value), Some(key)) = (&result, cache_key) {
+        validate_code_cache_put(
+            &state.cs_validate_code_handler_cache,
+            key,
+            Arc::new(value.clone()),
+        );
+    }
+    result
+}
+
+async fn process_validate_code_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
@@ -3566,6 +3690,35 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
 /// returns `result = false` (not an error), consistent with the FHIR spec's
 /// intent to treat absence of a value set as a negative match.
 pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Value, HtsError> {
+    // ── Handler-level response cache (VS path) ───────────────────────────────
+    // The VS validate-code handler is dominated by pre-call helpers that hit
+    // the DB even when no work is needed:
+    //   * `enforce_vs_supplement_extensions` (always runs ValueSetOperations::search)
+    //   * `detect_bad_vs_import` (additional DB calls)
+    //   * `resolve_supplements` / `supplement_url_in_coding_error`
+    // A warm hit here returns the previously-built JSON response directly,
+    // skipping all of those.  Cleared on every bundle import / CRUD write.
+    let cache_key = build_validate_code_cache_key(&params);
+    if let Some(ref key) = cache_key {
+        if let Some(cached) = validate_code_cache_get(&state.vs_validate_code_handler_cache, key) {
+            return Ok((*cached).clone());
+        }
+    }
+    let result = process_vs_validate_code_inner(state, params).await;
+    if let (Ok(ref value), Some(key)) = (&result, cache_key) {
+        validate_code_cache_put(
+            &state.vs_validate_code_handler_cache,
+            key,
+            Arc::new(value.clone()),
+        );
+    }
+    result
+}
+
+async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
