@@ -2104,20 +2104,31 @@ async fn process_expand<B: TerminologyBackend>(
             }
         }
         systems.sort();
-        for system_url in &systems {
-            let cs = crate::traits::CodeSystemOperations::search(
-                state.backend(),
-                &ctx,
-                crate::types::ResourceSearchQuery {
-                    url: Some(system_url.clone()),
-                    count: Some(1),
-                    ..Default::default()
-                },
-            )
-            .await
-            .ok()
-            .and_then(|mut v| v.pop());
-            cs_by_url.insert(system_url.clone(), cs);
+        // Fan out per-system CS searches concurrently so total latency is
+        // O(1) round-trip instead of O(N). For VSAC's typical 5+ systems
+        // this collapses ~50ms of serialised waits into ~10ms.
+        let cs_searches = systems.iter().map(|system_url| {
+            let url = system_url.clone();
+            let backend = state.backend();
+            let ctx = &ctx;
+            async move {
+                let cs = crate::traits::CodeSystemOperations::search(
+                    backend,
+                    ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(url.clone()),
+                        count: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|mut v| v.pop());
+                (url, cs)
+            }
+        });
+        for (url, cs) in futures::future::join_all(cs_searches).await {
+            cs_by_url.insert(url, cs);
         }
     }
     let cs_lang_by_url: HashMap<String, Option<String>> = cs_by_url
