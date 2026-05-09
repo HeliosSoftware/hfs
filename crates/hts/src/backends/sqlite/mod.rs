@@ -40,6 +40,7 @@ pub(crate) type ConceptFlagMap = HashMap<(String, String), bool>;
 pub(crate) type ResolvedMeta = (String, String, Option<String>);
 pub(crate) type ResolvedMetaMap = HashMap<(String, Option<String>), ResolvedMeta>;
 pub(crate) type StringOptionMap = HashMap<String, Option<String>>;
+pub(crate) type BoolMap = HashMap<String, bool>;
 pub(crate) type LookupResponseMap = HashMap<String, Arc<LookupResponse>>;
 pub(crate) type ValidateCodeResponseMap = HashMap<String, Arc<ValidateCodeResponse>>;
 
@@ -176,6 +177,18 @@ pub struct SqliteTerminologyBackend {
     /// created — no explicit invalidation required because hot-path bench loops
     /// reuse one backend, and tests instantiate fresh ones per case.
     pub(crate) validate_code_response_cache: Arc<RwLock<ValidateCodeResponseMap>>,
+    /// CodeSystem URL → highest stored version, used by `$validate-code` for
+    /// `x-unknown-system` detection (`build_validate_response_async`). Same
+    /// shape as `cs_language_cache` but per-instance to keep tests isolated.
+    /// Invalidated alongside the in-memory implicit/inline indexes when
+    /// `import_bundle` succeeds.
+    pub(crate) cs_version_for_url_cache: Arc<RwLock<StringOptionMap>>,
+    /// CodeSystem URL → existence flag, used by the per-coding existence checks
+    /// in `process_vs_validate_code_inner` (VC03 hot path).  Replaces a
+    /// `search(url=Some(sys), count=Some(1))` round-trip that loaded
+    /// `resource_json` only to discard everything except `is_empty()`.
+    /// Invalidated alongside the other per-instance caches on `import_bundle`.
+    pub(crate) cs_exists_cache: Arc<RwLock<BoolMap>>,
 }
 
 impl SqliteTerminologyBackend {
@@ -324,6 +337,8 @@ impl SqliteTerminologyBackend {
             cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_response_cache: Arc::new(RwLock::new(HashMap::new())),
             validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_version_for_url_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_exists_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -387,6 +402,8 @@ impl SqliteTerminologyBackend {
             cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_response_cache: Arc::new(RwLock::new(HashMap::new())),
             validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_version_for_url_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_exists_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -548,6 +565,8 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         let inline_compose_index = self.inline_compose_index.clone();
         let property_result_cache = self.property_result_cache.clone();
         let plain_fts_cache = self.plain_fts_cache.clone();
+        let cs_version_for_url_cache = self.cs_version_for_url_cache.clone();
+        let cs_exists_cache = self.cs_exists_cache.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             crate::import::fhir_bundle::import_bundle_sync(&pool, &data_vec)
@@ -567,6 +586,16 @@ impl BundleImportBackend for SqliteTerminologyBackend {
                 guard.clear();
             }
             if let Ok(mut guard) = plain_fts_cache.write() {
+                guard.clear();
+            }
+            // Per-instance CS metadata caches: highest stored version and
+            // existence flags both flip when a new CS row is imported.  Flush
+            // alongside the global `cs_language_cache` invalidation that the
+            // sync writer already triggers.
+            if let Ok(mut guard) = cs_version_for_url_cache.write() {
+                guard.clear();
+            }
+            if let Ok(mut guard) = cs_exists_cache.write() {
                 guard.clear();
             }
         }

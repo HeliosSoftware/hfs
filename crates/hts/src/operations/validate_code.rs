@@ -4983,19 +4983,11 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     if other_idx == success_idx {
                         continue;
                     }
-                    let cs_exists = crate::traits::CodeSystemOperations::search(
-                        state.backend(),
-                        &ctx,
-                        crate::types::ResourceSearchQuery {
-                            url: Some(other_system.clone()),
-                            count: Some(1),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .ok()
-                    .map(|hits| !hits.is_empty())
-                    .unwrap_or(false);
+                    let cs_exists = state
+                        .backend()
+                        .code_system_exists(&ctx, other_system)
+                        .await
+                        .unwrap_or(false);
                     if !cs_exists {
                         continue;
                     }
@@ -5298,22 +5290,14 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         // referenced CS isn't stored.
         let mut single_unknown_system: Option<String> = None;
         for (idx, (system, code)) in codings.iter().enumerate() {
-            // Use a real existence check (search by URL) rather than relying
-            // on `code_system_version_for_url` — a stored CS that has no
-            // `version` field would otherwise look "unknown" here.
-            let cs_exists = crate::traits::CodeSystemOperations::search(
-                state.backend(),
-                &ctx,
-                crate::types::ResourceSearchQuery {
-                    url: Some(system.clone()),
-                    count: Some(1),
-                    ..Default::default()
-                },
-            )
-            .await
-            .ok()
-            .map(|hits| !hits.is_empty())
-            .unwrap_or(false);
+            // Use a real existence check (cached `SELECT EXISTS(...)`) rather
+            // than relying on `code_system_version_for_url` — a stored CS that
+            // has no `version` field would otherwise look "unknown" here.
+            let cs_exists = state
+                .backend()
+                .code_system_exists(&ctx, system)
+                .await
+                .unwrap_or(false);
             // Look up the CS version for messaging (best-effort; may be None
             // even when cs_exists=true if the CS has no `version` field).
             let cs_version = state

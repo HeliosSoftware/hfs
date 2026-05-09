@@ -72,6 +72,34 @@ pub trait CodeSystemOperations: Send + Sync {
         url: &str,
     ) -> Result<Option<String>, HtsError>;
 
+    /// Cheap existence check for a CodeSystem by canonical URL.
+    ///
+    /// Hot-path helper for `$validate-code`: previously this fact was
+    /// derived from a `search(url=Some(url), count=Some(1))` call which
+    /// pulls the entire `resource_json` blob (multi-MB for SNOMED/LOINC)
+    /// just to read `.is_empty()`. The default implementation preserves
+    /// that legacy behaviour so backends that do not override the method
+    /// keep working; high-throughput backends should override with a
+    /// `SELECT EXISTS(...)` query and a per-instance cache (see the SQLite
+    /// implementation).
+    async fn code_system_exists(
+        &self,
+        ctx: &TenantContext,
+        url: &str,
+    ) -> Result<bool, HtsError> {
+        let hits = self
+            .search(
+                ctx,
+                ResourceSearchQuery {
+                    url: Some(url.to_string()),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(!hits.is_empty())
+    }
+
     /// Return the stored `language` value for the CodeSystem with the given URL.
     ///
     /// Hot-path helper for `$lookup`: previously this fact was extracted via a

@@ -26,8 +26,8 @@ use crate::types::{
 };
 
 use super::{
-    LookupResponseMap, PropCodesMap, ResolvedMetaMap, SqliteTerminologyBackend, StringOptionMap,
-    ValidateCodeResponseMap,
+    BoolMap, LookupResponseMap, PropCodesMap, ResolvedMetaMap, SqliteTerminologyBackend,
+    StringOptionMap, ValidateCodeResponseMap,
 };
 
 // ─── Process-wide CodeSystem URL → language cache ──────────────────────────
@@ -183,6 +183,14 @@ impl SqliteTerminologyBackend {
         &self,
     ) -> &Arc<RwLock<ValidateCodeResponseMap>> {
         &self.validate_code_response_cache
+    }
+
+    pub(super) fn cs_version_for_url_cache(&self) -> &Arc<RwLock<StringOptionMap>> {
+        &self.cs_version_for_url_cache
+    }
+
+    pub(super) fn cs_exists_cache(&self) -> &Arc<RwLock<BoolMap>> {
+        &self.cs_exists_cache
     }
 }
 
@@ -618,28 +626,86 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         _ctx: &TenantContext,
         url: &str,
     ) -> Result<Option<String>, HtsError> {
-        let pool = self.pool().clone();
-        let url = url.to_string();
+        // Fast path: serve the highest-stored-version answer from the
+        // per-instance cache without entering spawn_blocking or the r2d2 pool.
+        // The cache is invalidated alongside the in-memory expansion indexes
+        // when `import_bundle` succeeds (see `mod.rs::import_bundle`).
+        if let Ok(read) = self.cs_version_for_url_cache().read() {
+            if let Some(cached) = read.get(url) {
+                return Ok(cached.clone());
+            }
+        }
 
-        tokio::task::spawn_blocking(move || {
+        let pool = self.pool().clone();
+        let url_owned = url.to_string();
+
+        let version =
+            tokio::task::spawn_blocking(move || -> Result<Option<String>, HtsError> {
+                let conn = pool
+                    .get()
+                    .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+                let version: Option<String> = conn
+                    .query_row(
+                        "SELECT version FROM code_systems \
+                         WHERE url = ?1 \
+                         ORDER BY COALESCE(version, '') DESC LIMIT 1",
+                        rusqlite::params![url_owned],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .flatten();
+                Ok(version)
+            })
+            .await
+            .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+
+        if let Ok(mut w) = self.cs_version_for_url_cache().write() {
+            w.insert(url.to_string(), version.clone());
+        }
+        Ok(version)
+    }
+
+    /// Cached existence check: `SELECT EXISTS(SELECT 1 FROM code_systems
+    /// WHERE url = ?)`. Replaces the `search(url=…, count=1).is_empty()`
+    /// pattern in `process_vs_validate_code_inner` (VC03 hot path) — the
+    /// stored row's `resource_json` is no longer pulled and parsed just to
+    /// drop everything except the boolean. Cache is per-instance and
+    /// flushed by `import_bundle` (see `mod.rs::import_bundle`).
+    async fn code_system_exists(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<bool, HtsError> {
+        if let Ok(read) = self.cs_exists_cache().read() {
+            if let Some(&cached) = read.get(url) {
+                return Ok(cached);
+            }
+        }
+
+        let pool = self.pool().clone();
+        let url_owned = url.to_string();
+
+        let exists = tokio::task::spawn_blocking(move || -> Result<bool, HtsError> {
             let conn = pool
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
-            let version: Option<String> = conn
+            let exists: i64 = conn
                 .query_row(
-                    "SELECT version FROM code_systems \
-                     WHERE url = ?1 \
-                     ORDER BY COALESCE(version, '') DESC LIMIT 1",
-                    rusqlite::params![url],
+                    "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = ?1)",
+                    rusqlite::params![url_owned],
                     |row| row.get(0),
                 )
-                .optional()
-                .map_err(|e| HtsError::StorageError(e.to_string()))?
-                .flatten();
-            Ok(version)
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            Ok(exists != 0)
         })
         .await
-        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+
+        if let Ok(mut w) = self.cs_exists_cache().write() {
+            w.insert(url.to_string(), exists);
+        }
+        Ok(exists)
     }
 
     async fn code_system_language(
