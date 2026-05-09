@@ -178,6 +178,19 @@ impl SqliteTerminologyBackend {
             .build(manager)
             .map_err(|e| HtsError::StorageError(format!("Failed to create SQLite pool: {e}")))?;
 
+        // Process-wide caches added for VC/LK perf (invalidate_cs_id_cache,
+        // invalidate_cs_language_cache, and the property/concept-flag caches
+        // they fan out to) are global statics. Tests open multiple distinct
+        // SQLite databases in the same test binary; without clearing on
+        // backend creation, a key written by an earlier test (e.g.
+        // is_concept_abstract for `http://example.org/cs#A`) leaks into the
+        // next test's fresh DB and produces wrong answers. Calling the
+        // top-level invalidator here clears every global cache the import
+        // path knows about. In production the caches are empty at startup
+        // anyway, so this is a no-op there.
+        invalidate_cs_id_cache();
+        invalidate_cs_language_cache();
+
         // Declare early so the init block can pre-warm the in-memory indexes.
         let implicit_index: ImplicitIndex = Arc::new(RwLock::new(HashMap::new()));
         let inline_compose_index: InlineComposeIndex = Arc::new(RwLock::new(HashMap::new()));
