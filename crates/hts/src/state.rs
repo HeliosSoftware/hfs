@@ -193,6 +193,17 @@ pub struct AppState<B: TerminologyBackend> {
     /// `tx-resource` collection, and the inner `expand_cache` rebuild.
     /// See [`ExpandHandlerCache`].
     pub expand_handler_cache: ExpandHandlerCache,
+
+    /// Handler-level response cache for `POST /ValueSet/$expand` requests that
+    /// carry an inline `valueSet` body (and possibly `tx-resource` fixture
+    /// resources).  These requests are skipped by `expand_handler_cache`
+    /// because its key serialiser bails on any param with a `resource` field
+    /// (the bodies blow up the key length).  This cache uses a hashed digest
+    /// of every inline resource body instead, so identical compose / fixture
+    /// payloads collide on the same key across thousands of repeated k6
+    /// iterations.  Same bound (`EXPAND_HANDLER_CACHE_MAX`) and same
+    /// invalidation hook as the URL-keyed cache.
+    pub inline_compose_handler_cache: ExpandHandlerCache,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -213,6 +224,7 @@ impl<B: TerminologyBackend> AppState<B> {
             cs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             vs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             expand_handler_cache: Arc::new(RwLock::new(HashMap::new())),
+            inline_compose_handler_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -236,6 +248,9 @@ impl<B: TerminologyBackend> AppState<B> {
             cache.clear();
         }
         if let Ok(mut cache) = self.expand_handler_cache.write() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.inline_compose_handler_cache.write() {
             cache.clear();
         }
     }

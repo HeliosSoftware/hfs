@@ -31,6 +31,8 @@
 //!
 //! <https://hl7.org/fhir/valueset-operation-expand.html>
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 use axum::{
@@ -1246,6 +1248,90 @@ fn build_expand_cache_key(params: &[Value]) -> Option<String> {
     Some(out)
 }
 
+/// Build a compose-keyed cache key for `$expand` requests that carry an inline
+/// `valueSet` body (and possibly `tx-resource` fixture resources) — the case
+/// `build_expand_cache_key` bails on.
+///
+/// Returns `None` when caching MUST be skipped:
+///
+/// * No `valueSet` resource param is present (this builder only handles
+///   inline-VS requests; URL-only requests go through
+///   `build_expand_cache_key`).
+/// * Any param has the same skip-list names as `build_expand_cache_key`
+///   (`useSupplement`, `default-valueset-version`, `force-system-version`,
+///   `system-version`, `check-system-version`).
+/// * A param has neither a `name` nor anything we can serialise.
+///
+/// Otherwise builds a key shaped as:
+/// `"inline:" + hex(combined hash of every `resource` body, sorted) + "|" +
+/// JSON of every non-resource param sorted by name`.
+///
+/// Uses [`DefaultHasher`] (SipHash) — a fast non-cryptographic hash that's
+/// already in `std`.  Resource bodies are serialised to canonical JSON via
+/// `serde_json::to_string` before hashing; serde's default field-order
+/// preservation makes the digest stable for any given fixture (k6 sends
+/// identical bytes per iteration).
+fn build_inline_compose_cache_key(params: &[Value]) -> Option<String> {
+    const SKIP_NAMES: &[&str] = &[
+        "useSupplement",
+        "default-valueset-version",
+        "force-system-version",
+        "system-version",
+        "check-system-version",
+    ];
+    let mut has_inline_vs = false;
+    let mut resource_hashes: Vec<u64> = Vec::new();
+    let mut non_resource_frags: Vec<(String, String)> = Vec::new();
+    for p in params {
+        let name = p.get("name").and_then(|v| v.as_str())?;
+        if SKIP_NAMES.contains(&name) {
+            return None;
+        }
+        if let Some(resource) = p.get("resource") {
+            if name == "valueSet" {
+                has_inline_vs = true;
+            }
+            // Hash the (name, body) pair so two different resource params
+            // can't be transposed without changing the key.
+            let serialised = serde_json::to_string(resource).ok()?;
+            let mut hasher = DefaultHasher::new();
+            name.hash(&mut hasher);
+            serialised.hash(&mut hasher);
+            resource_hashes.push(hasher.finish());
+        } else {
+            // Compact JSON of the whole entry — captures every `valueXxx`
+            // (Uri / String / Boolean / Integer / …).
+            let frag = serde_json::to_string(p).ok()?;
+            non_resource_frags.push((name.to_string(), frag));
+        }
+    }
+    if !has_inline_vs {
+        return None;
+    }
+    // Sort hashes so that tx-resource ordering doesn't fragment the key.
+    // The (name, body) pairing prevents semantic confusion across param types.
+    resource_hashes.sort_unstable();
+    let mut combined = DefaultHasher::new();
+    for h in &resource_hashes {
+        h.hash(&mut combined);
+    }
+    let resource_digest = combined.finish();
+
+    non_resource_frags.sort_by(|a, b| a.0.cmp(&b.0));
+    let extras_len: usize = non_resource_frags.iter().map(|(_, f)| f.len() + 1).sum();
+    let mut out = String::with_capacity(8 + 16 + 1 + extras_len);
+    out.push_str("inline:");
+    out.push_str(&format!("{resource_digest:016x}"));
+    out.push('|');
+    for (i, (_, f)) in non_resource_frags.iter().enumerate() {
+        if i > 0 {
+            out.push('|');
+        }
+        out.push_str(f);
+    }
+    Some(out)
+}
+
 /// Fetch a cached `$expand` response by canonical key.
 fn expand_handler_cache_get(cache: &ExpandHandlerCache, key: &str) -> Option<Bytes> {
     cache.read().ok()?.get(key).cloned()
@@ -1286,17 +1372,32 @@ async fn process_expand<B: TerminologyBackend>(
     // Skips ALL pre-call helpers when the same canonical params have produced
     // a response earlier in this AppState's lifetime.  Cleared on every
     // bundle import / CRUD write via `clear_expand_cache`.
-    let cache_key = build_expand_cache_key(&params);
-    if let Some(ref key) = cache_key {
-        if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, key) {
+    //
+    // Two key strategies:
+    // 1. URL-only requests → `build_expand_cache_key` (compact, no resource bodies).
+    // 2. Inline-`valueSet` requests → `build_inline_compose_cache_key`
+    //    (hashes resource bodies so the key stays small).
+    //
+    // Either path is short-circuited on a hit.  Falling through both means
+    // the request has a `tx-resource` *without* an inline `valueSet`, or
+    // carries a skip-listed slow-path knob — bail and call inner directly.
+    if let Some(key) = build_expand_cache_key(&params) {
+        if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {
             return Ok(cached);
         }
-    }
-    let result = process_expand_inner(state, params).await;
-    if let (Ok(value), Some(key)) = (&result, cache_key) {
+        let value = process_expand_inner(state, params).await?;
         expand_handler_cache_put(&state.expand_handler_cache, key, value.clone());
+        return Ok(value);
     }
-    result
+    if let Some(key) = build_inline_compose_cache_key(&params) {
+        if let Some(cached) = expand_handler_cache_get(&state.inline_compose_handler_cache, &key) {
+            return Ok(cached);
+        }
+        let value = process_expand_inner(state, params).await?;
+        expand_handler_cache_put(&state.inline_compose_handler_cache, key, value.clone());
+        return Ok(value);
+    }
+    process_expand_inner(state, params).await
 }
 
 async fn process_expand_inner<B: TerminologyBackend>(
