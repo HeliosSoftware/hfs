@@ -44,7 +44,10 @@ use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
 use crate::error::HtsError;
-use crate::state::{AppState, EXPAND_CACHE_MAX, ExpandCacheKey, NOT_FOUND_CACHE_MAX};
+use crate::state::{
+    AppState, EXPAND_CACHE_MAX, EXPAND_HANDLER_CACHE_MAX, ExpandCacheKey, ExpandHandlerCache,
+    NOT_FOUND_CACHE_MAX,
+};
 use crate::traits::{SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ExpandRequest, ExpansionContains};
 
@@ -1173,13 +1176,130 @@ fn apply_display_language<'a, B: TerminologyBackend>(
     })
 }
 
+/// Build a canonical cache key for the `$expand` handler-response cache.
+///
+/// Returns `None` when caching MUST be skipped because the response is
+/// effectively unique-per-request:
+///
+/// * any parameter carries an inline `resource` body (`valueSet`,
+///   `tx-resource`, `system`, …) — those vary on every distinct compose /
+///   supplement payload and would pollute the cache;
+/// * the request includes `force-system-version`, `system-version`,
+///   `check-system-version`, `default-valueset-version`, or `useSupplement`
+///   — these force slow paths whose outcome depends on global terminology
+///   state in ways that the simple per-params key cannot fully capture
+///   safely.  The IG `version/*` and `supplement/*` fixtures rely on these
+///   bypassing any cache so the post-expand version-check / supplement-merge
+///   logic always runs.
+///
+/// Otherwise every `(name, valueXxx)` pair is serialised as a compact JSON
+/// fragment and the fragments are sorted by name (stable for repeated
+/// parameter names: their relative order is preserved as a secondary key
+/// because we rely on `sort_by` on the primary axis).  The resulting string
+/// is the cache key.
+fn build_expand_cache_key(params: &[Value]) -> Option<String> {
+    const SKIP_NAMES: &[&str] = &[
+        "useSupplement",
+        "default-valueset-version",
+        "force-system-version",
+        "system-version",
+        "check-system-version",
+    ];
+    let mut frags: Vec<(String, String)> = Vec::with_capacity(params.len());
+    for p in params {
+        let name = match p.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return None,
+        };
+        // Inline resources (`valueSet`, `tx-resource`, …): bail.  Even one
+        // `resource` field on any param means we can't cheaply build a stable,
+        // compact key — and `tx-resource` carries fixture-specific bodies that
+        // must NOT be conflated across requests.
+        if p.get("resource").is_some() {
+            return None;
+        }
+        if SKIP_NAMES.contains(&name) {
+            return None;
+        }
+        // Compact JSON of the whole entry — captures every `valueXxx`,
+        // including `valueUri`, `valueString`, `valueBoolean`, `valueInteger`.
+        // The serialiser preserves field order from the input map; for a
+        // given fixture the wire bytes are identical per request, so two
+        // semantically-equal payloads that differ only in field order would
+        // miss the cache (worst case = a cold miss, never an incorrect
+        // response: identical canonical params always produce identical
+        // handler output by construction).
+        let frag = match serde_json::to_string(p) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        frags.push((name.to_string(), frag));
+    }
+    frags.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::with_capacity(frags.iter().map(|(_, f)| f.len() + 1).sum());
+    for (i, (_, f)) in frags.iter().enumerate() {
+        if i > 0 {
+            out.push('|');
+        }
+        out.push_str(f);
+    }
+    Some(out)
+}
+
+/// Fetch a cached `$expand` response by canonical key.
+fn expand_handler_cache_get(cache: &ExpandHandlerCache, key: &str) -> Option<Bytes> {
+    cache.read().ok()?.get(key).cloned()
+}
+
+/// Insert a successfully-built `$expand` response into the per-AppState cache.
+/// Drops new entries silently once the cache reaches
+/// [`EXPAND_HANDLER_CACHE_MAX`].
+fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Bytes) {
+    if let Ok(mut guard) = cache.write() {
+        if guard.len() >= EXPAND_HANDLER_CACHE_MAX {
+            return;
+        }
+        guard.insert(key, value);
+    }
+}
+
 /// Expand a ValueSet and return the result as pre-serialized JSON bytes.
 ///
 /// Bytes are cached keyed on request parameters.  On a cache hit the stored
 /// [`Bytes`] handle is cloned in O(1) (reference-count bump only — no heap
 /// allocation or JSON re-serialization).  On a cache miss the result is
 /// serialized once, stored, and returned.
+///
+/// The handler-level cache here sits *above* every pre-flight step
+/// (`useSupplement` resolution, URL parse, `tx-resource` shortcut detection,
+/// the inner `expand_cache` lookup, …) so warm hits return immediately.
+/// The inner [`process_expand_inner`] still maintains the pre-existing
+/// `state.expand_cache`, which catches misses on this outer cache that
+/// nonetheless map to the same canonical URL+params bucket (e.g. when the
+/// caller adds `valueSet` / `tx-resource` inline payloads that force this
+/// outer cache to skip but otherwise produce the same expansion).
 async fn process_expand<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Bytes, HtsError> {
+    // ── Handler-level response cache ─────────────────────────────────────────
+    // Skips ALL pre-call helpers when the same canonical params have produced
+    // a response earlier in this AppState's lifetime.  Cleared on every
+    // bundle import / CRUD write via `clear_expand_cache`.
+    let cache_key = build_expand_cache_key(&params);
+    if let Some(ref key) = cache_key {
+        if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, key) {
+            return Ok(cached);
+        }
+    }
+    let result = process_expand_inner(state, params).await;
+    if let (Ok(value), Some(key)) = (&result, cache_key) {
+        expand_handler_cache_put(&state.expand_handler_cache, key, value.clone());
+    }
+    result
+}
+
+async fn process_expand_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {

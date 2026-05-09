@@ -97,6 +97,25 @@ pub type ValidateCodeHandlerCache = Arc<RwLock<HashMap<String, Arc<serde_json::V
 /// CS path and VS path each have their own map).
 pub const VALIDATE_CODE_HANDLER_CACHE_MAX: usize = 4096;
 
+/// Thread-safe per-AppState cache for fully-assembled `$expand` JSON bytes,
+/// keyed at the *handler* layer above every `process_expand` pre-flight step
+/// (URL parse, `useSupplement` resolution, `tx-resource` shortcut, the inner
+/// `expand_cache` build, …).  A warm hit returns the previously-serialised
+/// `Bytes` directly via O(1) Arc clone — no `serde_json::to_vec` call,
+/// no backend round-trip, no helper overhead.
+///
+/// Keyed on a canonical, name-sorted serialisation of every input parameter
+/// that influences the response.  Values are stored as [`Bytes`] which already
+/// share their backing buffer reference-counted style.
+///
+/// Bounded to [`EXPAND_HANDLER_CACHE_MAX`] entries — once full new entries are
+/// dropped silently.  Cleared alongside [`ExpandCache`] on bundle import /
+/// CRUD writes via [`AppState::clear_expand_cache`].
+pub type ExpandHandlerCache = Arc<RwLock<HashMap<String, Bytes>>>;
+
+/// Maximum number of cached `$expand` handler responses.
+pub const EXPAND_HANDLER_CACHE_MAX: usize = 4096;
+
 /// Shared application state injected into every Axum handler.
 ///
 /// `B` is the concrete terminology backend (e.g., `SqliteTerminologyBackend`).
@@ -167,6 +186,13 @@ pub struct AppState<B: TerminologyBackend> {
     /// Handler-level response cache for `POST /ValueSet/$validate-code`.
     /// See [`ValidateCodeHandlerCache`].
     pub vs_validate_code_handler_cache: ValidateCodeHandlerCache,
+
+    /// Handler-level response cache for `POST /ValueSet/$expand` (and the
+    /// matching GET handler) — sits above every `process_expand` pre-flight
+    /// step so warm hits skip URL parse, `useSupplement` resolution,
+    /// `tx-resource` collection, and the inner `expand_cache` rebuild.
+    /// See [`ExpandHandlerCache`].
+    pub expand_handler_cache: ExpandHandlerCache,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -186,6 +212,7 @@ impl<B: TerminologyBackend> AppState<B> {
             not_found_urls: Arc::new(RwLock::new(HashSet::new())),
             cs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             vs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
+            expand_handler_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -206,6 +233,9 @@ impl<B: TerminologyBackend> AppState<B> {
             cache.clear();
         }
         if let Ok(mut cache) = self.vs_validate_code_handler_cache.write() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.expand_handler_cache.write() {
             cache.clear();
         }
     }

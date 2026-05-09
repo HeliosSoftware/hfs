@@ -2017,6 +2017,27 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
     ))
 }
 
+/// True when `url` is a synthesized `?fhir_vs` implicit ValueSet URL (e.g.
+/// `http://snomed.info/sct?fhir_vs` or `http://snomed.info/sct?fhir_vs=isa/X`).
+///
+/// These URLs are computed dynamically from the underlying CodeSystem and
+/// never appear as rows in the `value_sets` table, so the per-request
+/// helpers that look them up via `ValueSetOperations::search`
+/// (`vs_for_lang`, `enforce_vs_supplement_extensions`, `detect_bad_vs_import`,
+/// `effective_vs_version_for_msg`) ALWAYS return empty for them. Skipping
+/// those helpers entirely on the cold path takes ~5 unnecessary
+/// `spawn_blocking` + pool-acquire + SQL prepare round-trips off the
+/// VC03 / VC01-02 hot path. iter6 fix — VC01/02 already benefit from the
+/// iter5 handler cache; VC03's broader (url, code) key space wasn't
+/// warming fast enough within the 30 s bench window because the cold
+/// path's overhead dominated.
+fn is_implicit_fhir_vs_url(url: &str) -> bool {
+    match url.split_once('?') {
+        Some((_, query)) => query == "fhir_vs" || query.starts_with("fhir_vs="),
+        None => false,
+    }
+}
+
 /// Build a canonical cache key for the `$validate-code` handler-response cache.
 ///
 /// Returns `None` when caching MUST be skipped because the response is
@@ -3765,7 +3786,12 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // if the caller didn't supply `displayLanguage`, adopt the VS-pinned one
     // so the language-aware display validator (`apply_language_display_validation`)
     // rejects displays that don't match the VS's pinned language.
-    if display_language.is_none() {
+    //
+    // Skip the lookup for synthesised `?fhir_vs` URLs — those are computed
+    // implicit ValueSets that never carry a stored row, so the search would
+    // always return empty (iter6 VC03 fast path).
+    let url_is_implicit_fhir_vs = is_implicit_fhir_vs_url(&url);
+    if display_language.is_none() && !url_is_implicit_fhir_vs {
         let vs_for_lang = ValueSetOperations::search(
             state.backend(),
             &ctx,
@@ -3809,15 +3835,22 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // the active `supplements` list so VS-pinned supplements auto-rescue
     // displays just like an explicit `useSupplement` would (per IG
     // `extensions/validate-coding-good-supplement`).
-    let vs_ext_supplements =
-        enforce_vs_supplement_extensions(state.backend(), &ctx, &url, vs_version.as_deref())
-            .await?;
-    for s in vs_ext_supplements {
-        if !supplements
-            .iter()
-            .any(|existing| existing.supplement_canonical == s.supplement_canonical)
-        {
-            supplements.push(s);
+    //
+    // Synthesised `?fhir_vs` URLs never carry a stored ValueSet row (and
+    // therefore no `valueset-supplement` extension), so this enforcement
+    // is a no-op for them — skip the search round-trip entirely (iter6
+    // VC03 fast path).
+    if !url_is_implicit_fhir_vs {
+        let vs_ext_supplements =
+            enforce_vs_supplement_extensions(state.backend(), &ctx, &url, vs_version.as_deref())
+                .await?;
+        for s in vs_ext_supplements {
+            if !supplements
+                .iter()
+                .any(|existing| existing.supplement_canonical == s.supplement_canonical)
+            {
+                supplements.push(s);
+            }
         }
     }
 
@@ -3827,15 +3860,23 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // issue with text "A definition for the value Set 'X' could not be
     // found" — not the cascade of TX_GENERAL_CC_ERROR_MESSAGE/this-code-not-in-vs
     // that the regular CC fallback emits.
-    if let Some(unresolved_vs_url) = detect_bad_vs_import(
-        state.backend(),
-        &ctx,
-        &url,
-        vs_version.as_deref(),
-        &default_value_set_versions_early,
-    )
-    .await
-    {
+    //
+    // Synthesised `?fhir_vs` URLs have no stored compose at all (they're
+    // built from the CodeSystem at validate time), so `detect_bad_vs_import`
+    // is a no-op for them — skip the search (iter6 VC03 fast path).
+    let bad_vs_import: Option<String> = if url_is_implicit_fhir_vs {
+        None
+    } else {
+        detect_bad_vs_import(
+            state.backend(),
+            &ctx,
+            &url,
+            vs_version.as_deref(),
+            &default_value_set_versions_early,
+        )
+        .await
+    };
+    if let Some(unresolved_vs_url) = bad_vs_import {
         let cc_value = params
             .iter()
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
@@ -4223,9 +4264,15 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         // Fall back to the stored VS version when the caller didn't supply
         // a `valueSetVersion` — keeps the not-in-vs message consistent with
         // the IG fixture's `<url>|<version>` form (mirrors the Path 2 fix).
+        //
+        // Synthesised `?fhir_vs` URLs are computed implicit ValueSets with no
+        // stored row — the search would always return empty, so skip it
+        // (iter6 VC03 fast path).
         let effective_vs_version_for_msg: Option<String> =
             if effective_vs_version.is_some() {
                 effective_vs_version.clone()
+            } else if url_is_implicit_fhir_vs {
+                None
             } else {
                 ValueSetOperations::search(
                     state.backend(),
@@ -4565,9 +4612,14 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         // version when the caller didn't supply one (the IG
         // `validation/simple-coding-bad-code-inactive` fixture expects the
         // message to reference `<url>|<stored-version>`, not the bare URL).
+        //
+        // Synthesised `?fhir_vs` URLs are computed implicit ValueSets with
+        // no stored row — skip the search (iter6 fast path).
         let effective_vs_version_for_msg: Option<String> =
             if effective_vs_version.is_some() {
                 effective_vs_version.clone()
+            } else if url_is_implicit_fhir_vs {
+                None
             } else {
                 ValueSetOperations::search(
                     state.backend(),
