@@ -6018,11 +6018,20 @@ fn populate_cache(
 /// produce result=false with an "abstract, and not allowed in this context"
 /// message.
 fn is_concept_abstract(conn: &Connection, system_url: &str, code: &str) -> bool {
+    // Process-wide cache: VC01-03 hammer the same (system, code) pairs across
+    // 50 VUs. Skipping the JOIN below saves three table lookups per request.
+    let cache = super::code_system::cs_concept_abstract_cache();
+    if let Ok(read) = cache.read() {
+        if let Some(&v) = read.get(&(system_url.to_string(), code.to_string())) {
+            return v;
+        }
+    }
+
     // Match against every local property code that maps to the FHIR
     // concept-properties#notSelectable URI in this CodeSystem. Tx-ecosystem
     // fixtures rename the property locally (e.g. `not-selectable` with a
     // hyphen), so a query hardcoded to `notSelectable` would miss them.
-    let abstract_codes = super::code_system::abstract_property_codes(conn, system_url);
+    let abstract_codes = super::code_system::cached_abstract_property_codes(conn, system_url);
     let placeholders = (3..=abstract_codes.len() + 2)
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
@@ -6041,28 +6050,48 @@ fn is_concept_abstract(conn: &Connection, system_url: &str, code: &str) -> bool 
     let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(abstract_codes.len() + 2);
     params.push(&system_url);
     params.push(&code);
-    for c in &abstract_codes {
+    for c in abstract_codes.iter() {
         params.push(c as &dyn rusqlite::ToSql);
     }
-    conn.query_row(&sql, params.as_slice(), |_| Ok(())).is_ok()
+    let result = conn.query_row(&sql, params.as_slice(), |_| Ok(())).is_ok();
+
+    if let Ok(mut w) = cache.write() {
+        if w.len() < super::code_system::concept_flag_cache_max() {
+            w.insert((system_url.to_string(), code.to_string()), result);
+        }
+    }
+    result
 }
 
 /// Returns the stored version for a ValueSet URL (None if unknown). Used to
 /// format `url|version` in $validate-code "code not found" messages, which
 /// is what the IG fixtures expect.
 fn lookup_value_set_version(conn: &Connection, url: &str) -> Option<String> {
+    // Process-wide cache: stable until the next re-import. Same invalidation
+    // hook as cs_id_cache (clear all on bundle write).
+    let cache = super::code_system::vs_version_for_msg_cache();
+    if let Ok(read) = cache.read() {
+        if let Some(v) = read.get(url) {
+            return v.clone();
+        }
+    }
     // Pick the highest stored version for this URL — matches the
     // resolve_value_set_versioned default-when-no-pin behaviour, so $expand
     // and $validate-code echoes converge on the same row.
-    conn.query_row(
-        "SELECT version FROM value_sets \
-         WHERE url = ?1 \
-         ORDER BY COALESCE(version, '') DESC LIMIT 1",
-        rusqlite::params![url],
-        |row| row.get::<_, Option<String>>(0),
-    )
-    .ok()
-    .flatten()
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT version FROM value_sets \
+             WHERE url = ?1 \
+             ORDER BY COALESCE(version, '') DESC LIMIT 1",
+            rusqlite::params![url],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    if let Ok(mut w) = cache.write() {
+        w.insert(url.to_string(), v.clone());
+    }
+    v
 }
 
 /// Returns true when the concept has a status property in the inactive set
@@ -6127,15 +6156,29 @@ fn cs_version_exists(conn: &Connection, system_url: &str, version: &str) -> bool
 /// Returns the highest stored version for a CodeSystem URL, used to format
 /// the IG-expected "Unknown code in CodeSystem 'url' version 'X'" message.
 fn cs_version_for_msg(conn: &Connection, system_url: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT version FROM code_systems \
-         WHERE url = ?1 \
-         ORDER BY COALESCE(version, '') DESC LIMIT 1",
-        rusqlite::params![system_url],
-        |row| row.get::<_, Option<String>>(0),
-    )
-    .ok()
-    .flatten()
+    // Process-wide cache: this query runs on every successful VC implicit-VS
+    // call (just to pretty-print the message text). The result is stable
+    // until a re-import, and re-imports clear the cache.
+    let cache = super::code_system::cs_version_for_msg_cache();
+    if let Ok(read) = cache.read() {
+        if let Some(v) = read.get(system_url) {
+            return v.clone();
+        }
+    }
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT version FROM code_systems \
+             WHERE url = ?1 \
+             ORDER BY COALESCE(version, '') DESC LIMIT 1",
+            rusqlite::params![system_url],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    if let Ok(mut w) = cache.write() {
+        w.insert(system_url.to_string(), v.clone());
+    }
+    v
 }
 
 /// Look up the `content` column for a stored CodeSystem URL.  Returns
@@ -6143,15 +6186,27 @@ fn cs_version_for_msg(conn: &Connection, system_url: &str) -> Option<String> {
 /// larger system, which downstream callers use to soften unknown-code
 /// diagnostics into the IG `UNKNOWN_CODE_IN_FRAGMENT` warning.
 fn cs_content_for_url(conn: &Connection, system_url: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT content FROM code_systems \
-         WHERE url = ?1 \
-         ORDER BY COALESCE(version, '') DESC LIMIT 1",
-        rusqlite::params![system_url],
-        |row| row.get::<_, Option<String>>(0),
-    )
-    .ok()
-    .flatten()
+    // Process-wide cache: stable until the next re-import.
+    let cache = super::code_system::cs_content_cache();
+    if let Ok(read) = cache.read() {
+        if let Some(v) = read.get(system_url) {
+            return v.clone();
+        }
+    }
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT content FROM code_systems \
+             WHERE url = ?1 \
+             ORDER BY COALESCE(version, '') DESC LIMIT 1",
+            rusqlite::params![system_url],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    if let Ok(mut w) = cache.write() {
+        w.insert(system_url.to_string(), v.clone());
+    }
+    v
 }
 
 /// Returns `true` when the CodeSystem at `system_url` has `caseSensitive: false`
@@ -6738,6 +6793,13 @@ fn detect_vs_pin_unknown(
 }
 
 fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool {
+    let cache = super::code_system::cs_concept_inactive_cache();
+    if let Ok(read) = cache.read() {
+        if let Some(&v) = read.get(&(system_url.to_string(), code.to_string())) {
+            return v;
+        }
+    }
+
     // Honour both the legacy `status` property convention (value in
     // {retired, inactive}) AND the FHIR `inactive` boolean property —
     // including locally-renamed variants that the CodeSystem.property[]
@@ -6747,7 +6809,7 @@ fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool 
     // IG, deprecated codes are discouraged but still active (act-class
     // expansion and the `deprecated/` test group both rely on this — deprecated
     // codes survive `activeOnly=true` filtering).
-    let inactive_codes = super::code_system::inactive_property_codes(conn, system_url);
+    let inactive_codes = super::code_system::cached_inactive_property_codes(conn, system_url);
     let placeholders = (3..=inactive_codes.len() + 2)
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
@@ -6769,10 +6831,17 @@ fn is_concept_inactive(conn: &Connection, system_url: &str, code: &str) -> bool 
     let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(inactive_codes.len() + 2);
     params.push(&system_url);
     params.push(&code);
-    for c in &inactive_codes {
+    for c in inactive_codes.iter() {
         params.push(c as &dyn rusqlite::ToSql);
     }
-    conn.query_row(&sql, params.as_slice(), |_| Ok(())).is_ok()
+    let result = conn.query_row(&sql, params.as_slice(), |_| Ok(())).is_ok();
+
+    if let Ok(mut w) = cache.write() {
+        if w.len() < super::code_system::concept_flag_cache_max() {
+            w.insert((system_url.to_string(), code.to_string()), result);
+        }
+    }
+    result
 }
 
 // Keep all message-format inputs explicit so the IG-fixture text strings are
