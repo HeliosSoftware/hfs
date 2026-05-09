@@ -107,23 +107,18 @@ async fn process_lookup<B: TerminologyBackend>(
     // designation tagged with the CodeSystem's primary language. The IG
     // `parameters/parameters-lookup-supplement-*` fixtures expect this row,
     // and `simple/simple-lookup*` accepts it as optional.
-    let cs_language: Option<String> = crate::traits::CodeSystemOperations::search(
-        state.backend(),
-        &ctx,
-        crate::types::ResourceSearchQuery {
-            url: Some(system.clone()),
-            count: Some(1),
-            ..Default::default()
-        },
-    )
-    .await
-    .ok()
-    .and_then(|mut hits| hits.pop())
-    .and_then(|v| {
-        v.get("language")
-            .and_then(|l| l.as_str())
-            .map(str::to_string)
-    });
+    //
+    // This used to call `CodeSystemOperations::search(...)` which selected
+    // and parsed the entire `resource_json` blob just to read `.language` —
+    // the dominant cost on the LK01-04 hot path under 50-VU load. The
+    // dedicated trait method runs ONE `json_extract` query and is memoised
+    // in a process-wide cache.
+    let cs_language: Option<String> = state
+        .backend()
+        .code_system_language(&ctx, &system)
+        .await
+        .ok()
+        .flatten();
     if let (Some(lang), Some(disp)) = (cs_language.as_deref(), resp.display.clone()) {
         let already = resp.designations.iter().any(|d| {
             d.language.as_deref() == Some(lang) && d.value == disp

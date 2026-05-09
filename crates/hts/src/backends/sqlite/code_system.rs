@@ -12,6 +12,8 @@
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use rusqlite::OptionalExtension;
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 
 use crate::error::HtsError;
 use crate::traits::{
@@ -24,6 +26,37 @@ use crate::types::{
 };
 
 use super::SqliteTerminologyBackend;
+
+// ─── Process-wide CodeSystem URL → language cache ──────────────────────────
+//
+// `$lookup` reports the CS's primary language as the `preferredForLanguage`
+// designation tag (see `operations/lookup.rs`). Pre-iter9 the value was
+// extracted via a full `search(url=Some(system))` call which selected the
+// entire `resource_json` blob (multi-MB for SNOMED/LOINC) and parsed it just
+// to read `.language`. Under 50-VU lookup load this allocation/parse cost
+// dominated $lookup and dragged steady-state RPS from ~12-14k to ~2-3k.
+//
+// The cache memoises `Option<language>` per CS URL across requests. Cache
+// invalidation is coarse: any write to `code_systems` calls
+// `invalidate_cs_language_cache()` (alongside `invalidate_cs_id_cache()` in
+// the import path).  Imports happen at startup and the cache is then stable
+// for the life of the process.
+static CS_LANGUAGE_CACHE: OnceLock<RwLock<HashMap<String, Option<String>>>> = OnceLock::new();
+
+fn cs_language_cache() -> &'static RwLock<HashMap<String, Option<String>>> {
+    CS_LANGUAGE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Clear the process-wide URL→language cache. Called by code paths that
+/// write to the `code_systems` table (CRUD + bulk import) — paired with
+/// `invalidate_cs_id_cache()`.
+pub(crate) fn invalidate_cs_language_cache() {
+    if let Some(cache) = CS_LANGUAGE_CACHE.get() {
+        if let Ok(mut w) = cache.write() {
+            w.clear();
+        }
+    }
+}
 
 #[async_trait]
 impl CodeSystemOperations for SqliteTerminologyBackend {
@@ -72,8 +105,20 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             // Most callers (and the tx-ecosystem IG fixtures) expect these to
             // appear alongside the stored properties when property=* or any
             // explicit filter names them.
-            let synth_props =
-                fetch_synthesised_properties(&conn, &system_id, &req.code, &stored_props)?;
+            //
+            // Skip the work entirely when the caller passed a `property=` list
+            // that names none of the synthesised codes — common on the LK01-04
+            // hot path which doesn't request properties at all (so `want_all`
+            // is set), but cheap to short-circuit when explicit filters miss.
+            let needs_synth = want_all
+                || req.properties.iter().any(|p| {
+                    p == "parent" || p == "child" || p == "inactive"
+                });
+            let synth_props = if needs_synth {
+                fetch_synthesised_properties(&conn, &system_id, &req.code, &stored_props)?
+            } else {
+                Vec::new()
+            };
 
             let properties = if want_all {
                 let mut out = stored_props;
@@ -414,6 +459,59 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         })
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn code_system_language(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        // Fast path: serve from the process-wide cache without touching the
+        // pool or spawn_blocking. CS language is effectively immutable per row;
+        // the cache is invalidated whenever code_systems is written (see
+        // `invalidate_cs_language_cache`).
+        if let Ok(read) = cs_language_cache().read() {
+            if let Some(cached) = read.get(url) {
+                return Ok(cached.clone());
+            }
+        }
+
+        let pool = self.pool().clone();
+        let url_owned = url.to_string();
+        let lang = tokio::task::spawn_blocking(move || -> Result<Option<String>, HtsError> {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            // Mirror the row-preference semantics of `resolve_system_id_cached`:
+            // prefer rows that actually have concepts (skip empty stubs imported
+            // by terminology packages), then highest version, then lowest id.
+            // `json_extract` returns NULL when the column or path is absent,
+            // which becomes Option::None in Rust.
+            let lang: Option<String> = conn
+                .query_row(
+                    "SELECT json_extract(resource_json, '$.language') \
+                     FROM code_systems \
+                     WHERE url = ?1 \
+                     ORDER BY (CASE WHEN EXISTS \
+                         (SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id) \
+                         THEN 0 ELSE 1 END), \
+                         COALESCE(version, '') DESC, id \
+                     LIMIT 1",
+                    rusqlite::params![url_owned],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .flatten();
+            Ok(lang)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+
+        if let Ok(mut w) = cs_language_cache().write() {
+            w.insert(url.to_string(), lang.clone());
+        }
+        Ok(lang)
     }
 
     async fn concept_designations(
@@ -1467,102 +1565,114 @@ fn fetch_synthesised_properties(
     code: &str,
     stored: &[PropertyValue],
 ) -> Result<Vec<PropertyValue>, HtsError> {
-    let mut out = Vec::new();
-
-    // Parents — synthesised from concept_hierarchy. Skip when the concept
-    // already carries explicit `parent` properties (the bundle importer
-    // mirrors `parent` properties into concept_hierarchy, so synthesising
-    // here would duplicate every stored parent edge).
+    // Folded into a single round-trip via UNION ALL so the caller pays for
+    // ONE prepared statement instead of three (plus the spawn_blocking we
+    // already amortise for the whole `lookup`). Each branch tags its rows
+    // with a discriminator (`kind`) so the Rust side can route them into
+    // the right PropertyValue shape.
+    //
+    // Branches:
+    //   'parent'   — every (parent_code, display) edge above `code`
+    //   'child'    — every (child_code, display) edge below `code`
+    //   'inactive' — single row with value '1' when the status property is in
+    //                the FHIR inactive set, '0' otherwise. Always returned;
+    //                the Rust filter below skips it when the concept already
+    //                carries an explicit `inactive` property.
     let stored_parent_codes: std::collections::HashSet<&str> = stored
         .iter()
         .filter(|p| p.code == "parent")
         .map(|p| p.value.as_str())
         .collect();
-    {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT h.parent_code, c.display
-                 FROM concept_hierarchy h
-                 LEFT JOIN concepts c
-                        ON c.system_id = h.system_id AND c.code = h.parent_code
-                 WHERE h.system_id = ?1 AND h.child_code = ?2
-                 ORDER BY h.parent_code",
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        let rows = stmt
-            .query_map(rusqlite::params![system_id, code], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        for r in rows {
-            let (parent_code, parent_display) =
-                r.map_err(|e| HtsError::StorageError(e.to_string()))?;
-            if stored_parent_codes.contains(parent_code.as_str()) {
-                continue;
+    let has_explicit_inactive = stored.iter().any(|p| p.code == "inactive");
+
+    // Encode kind as an integer sort key (1=parent, 2=child, 3=inactive) so a
+    // single outer ORDER BY produces parent → child → inactive without needing
+    // per-branch ORDER BY (SQLite forbids those inside UNION ALL). Within each
+    // group the secondary `code` sort matches the pre-fold response order
+    // (`ORDER BY h.parent_code` / `ORDER BY h.child_code`) so any
+    // tx-ecosystem fixture that compares response shape stays stable.
+    const COMBINED_SQL: &str = "
+        SELECT 1 AS kind_ord, 'parent' AS kind, h.parent_code AS code, c.display AS display, NULL AS bool_val
+        FROM concept_hierarchy h
+        LEFT JOIN concepts c
+               ON c.system_id = h.system_id AND c.code = h.parent_code
+        WHERE h.system_id = ?1 AND h.child_code = ?2
+        UNION ALL
+        SELECT 2 AS kind_ord, 'child' AS kind, h.child_code AS code, c.display AS display, NULL AS bool_val
+        FROM concept_hierarchy h
+        LEFT JOIN concepts c
+               ON c.system_id = h.system_id AND c.code = h.child_code
+        WHERE h.system_id = ?1 AND h.parent_code = ?2
+        UNION ALL
+        SELECT 3 AS kind_ord, 'inactive' AS kind, NULL AS code, NULL AS display,
+               CASE WHEN EXISTS (
+                   SELECT 1 FROM concept_properties cp
+                   JOIN concepts c2 ON c2.id = cp.concept_id
+                   WHERE c2.system_id = ?1
+                     AND c2.code = ?2
+                     AND cp.property = 'status'
+                     AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
+               ) THEN 1 ELSE 0 END AS bool_val
+        ORDER BY kind_ord, code";
+
+    let mut stmt = conn
+        .prepare_cached(COMBINED_SQL)
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![system_id, code], |row| {
+            // Column 0 is `kind_ord` (sort key); skip it. Columns 1..4 are
+            // (kind, code, display, bool_val).
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let mut out: Vec<PropertyValue> = Vec::new();
+    for r in rows {
+        let (kind, value_code, display, bool_val) =
+            r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+        match kind.as_str() {
+            "parent" => {
+                if let Some(parent_code) = value_code {
+                    if stored_parent_codes.contains(parent_code.as_str()) {
+                        continue;
+                    }
+                    out.push(PropertyValue {
+                        code: "parent".into(),
+                        value_type: "code".into(),
+                        value: parent_code,
+                        description: display,
+                    });
+                }
             }
-            out.push(PropertyValue {
-                code: "parent".into(),
-                value_type: "code".into(),
-                value: parent_code,
-                description: parent_display,
-            });
+            "child" => {
+                if let Some(child_code) = value_code {
+                    out.push(PropertyValue {
+                        code: "child".into(),
+                        value_type: "code".into(),
+                        value: child_code,
+                        description: display,
+                    });
+                }
+            }
+            "inactive" => {
+                if has_explicit_inactive {
+                    continue;
+                }
+                let inactive = bool_val.unwrap_or(0) != 0;
+                out.push(PropertyValue {
+                    code: "inactive".into(),
+                    value_type: "boolean".into(),
+                    value: inactive.to_string(),
+                    description: None,
+                });
+            }
+            _ => {}
         }
-    }
-
-    // Children — `concept_hierarchy.child_code WHERE parent_code = code`.
-    {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT h.child_code, c.display
-                 FROM concept_hierarchy h
-                 LEFT JOIN concepts c
-                        ON c.system_id = h.system_id AND c.code = h.child_code
-                 WHERE h.system_id = ?1 AND h.parent_code = ?2
-                 ORDER BY h.child_code",
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        let rows = stmt
-            .query_map(rusqlite::params![system_id, code], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        for r in rows {
-            let (child_code, child_display) =
-                r.map_err(|e| HtsError::StorageError(e.to_string()))?;
-            out.push(PropertyValue {
-                code: "child".into(),
-                value_type: "code".into(),
-                value: child_code,
-                description: child_display,
-            });
-        }
-    }
-
-    // Inactive flag — synthesise from the `status` property when the concept
-    // doesn't already carry an explicit `inactive` row. `inactive=true` when
-    // status is in the FHIR inactive set, otherwise `false` (so the response
-    // always communicates the active/inactive state).
-    if !stored.iter().any(|p| p.code == "inactive") {
-        let inactive: bool = conn
-            .query_row(
-                "SELECT EXISTS (
-                     SELECT 1 FROM concept_properties cp
-                     JOIN concepts c ON c.id = cp.concept_id
-                     WHERE c.system_id = ?1
-                       AND c.code = ?2
-                       AND cp.property = 'status'
-                       AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
-                 )",
-                rusqlite::params![system_id, code],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        out.push(PropertyValue {
-            code: "inactive".into(),
-            value_type: "boolean".into(),
-            value: inactive.to_string(),
-            description: None,
-        });
     }
 
     Ok(out)

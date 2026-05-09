@@ -248,6 +248,26 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
 
+    async fn code_system_language(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let row = client
+            .query_opt(
+                "SELECT resource_json->>'language' FROM code_systems WHERE url = $1 LIMIT 1",
+                &[&url],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+    }
+
     async fn concept_designations(
         &self,
         _ctx: &TenantContext,

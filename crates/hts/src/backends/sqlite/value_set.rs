@@ -114,13 +114,38 @@ fn resolve_system_id_with_version_cached(
         }
     }
 
+    // Multiple `code_systems` rows can share the same canonical URL — e.g. a
+    // stub from `hl7.fhir.r4.core` (content=not-present, no concepts) plus the
+    // real RF2 import (content=complete, ~350K concepts).
+    //
+    // Multi-tier ordering, evaluated in priority order:
+    //   1. Prefer rows whose `content` is `complete` or `supplement` over
+    //      `not-present` / `fragment` / `example`. The FHIR convention is that
+    //      a `not-present` row is a placeholder published by an IG that does
+    //      NOT carry the codes — picking it would silently lose the lookup
+    //      even when a fully-loaded row exists alongside.
+    //   2. Prefer rows with at least one concept (EXISTS subquery; constant
+    //      time, short-circuited on first match).
+    //   3. Highest version DESC.
+    //   4. id ASC.
+    // Tier 1 alone fixes the `r4.core stub + RF2 import` case observed in the
+    // benchmark. Tier 2 is kept as a safety net for IGs that omit `content`.
+    // The cache memoises the resolved `(id, version)` so the SQL runs once
+    // per URL per process.
     let row: Option<(String, Option<String>)> = conn
         .query_row(
             "SELECT cs.id, cs.version FROM code_systems cs WHERE cs.url = ?1 \
-             ORDER BY (CASE WHEN EXISTS \
-                 (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                 THEN 0 ELSE 1 END), \
-                 COALESCE(cs.version, '') DESC, cs.id LIMIT 1",
+             ORDER BY (CASE COALESCE(cs.content, 'complete') \
+                            WHEN 'complete'   THEN 0 \
+                            WHEN 'supplement' THEN 0 \
+                            WHEN 'fragment'   THEN 1 \
+                            WHEN 'example'    THEN 1 \
+                            WHEN 'not-present' THEN 2 \
+                            ELSE 1 END), \
+                      (CASE WHEN EXISTS \
+                          (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
+                          THEN 0 ELSE 1 END), \
+                      COALESCE(cs.version, '') DESC, cs.id LIMIT 1",
             [url],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
         )
@@ -5395,19 +5420,29 @@ fn bfs_expand_page(
             let sql_offset = offset as i64;
             if let Some(f) = filter_lower {
                 if f.len() >= 3 {
-                    // Build FTS5 index lazily (no-op if already populated).
-                    ensure_concepts_fts(conn, system_id)?;
+                    // Build FTS5 index lazily for EVERY code_systems row with
+                    // this URL — the resolver may have given us the empty
+                    // stub's id, in which case ensure_concepts_fts on that id
+                    // alone would leave the real row's FTS empty. The
+                    // JOIN-through-`code_systems.url` query below relies on
+                    // FTS rows existing for the row that actually has
+                    // concepts.
+                    ensure_concepts_fts_for_url(conn, cs_url)?;
+                    let _ = system_id;
                     let match_expr = fts5_quote(f);
+                    // JOIN concepts_fts → code_systems so we match any
+                    // matching row, not just the resolver-chosen system_id.
                     let mut stmt = conn
                         .prepare_cached(
-                            "SELECT code, display FROM concepts_fts \
-                             WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
+                            "SELECT cf.code, cf.display FROM concepts_fts cf \
+                             JOIN code_systems cs ON cs.id = cf.system_id \
+                             WHERE cs.url = ?2 AND concepts_fts MATCH ?1 \
                              LIMIT ?3 OFFSET ?4",
                         )
                         .map_err(|e| HtsError::StorageError(e.to_string()))?;
                     return stmt
                         .query_map(
-                            rusqlite::params![match_expr, system_id, sql_limit, sql_offset],
+                            rusqlite::params![match_expr, cs_url, sql_limit, sql_offset],
                             |r| {
                                 Ok(ExpansionContains {
                                     system: cs_url.to_owned(),
@@ -5432,17 +5467,18 @@ fn bfs_expand_page(
                 }
                 // Short filter (1–2 chars): use word-prefix FTS so `a*` matches any
                 // token starting with 'a' — O(log N) vs O(N) LIKE scan.
-                ensure_concepts_fts(conn, system_id)?;
+                ensure_concepts_fts_for_url(conn, cs_url)?;
                 let prefix_expr = fts5_word_prefix(f);
                 let mut stmt = conn
                     .prepare_cached(
-                        "SELECT code, display FROM concepts_word_fts \
-                         WHERE concepts_word_fts MATCH ?1 AND system_id = ?2 \
+                        "SELECT cwf.code, cwf.display FROM concepts_word_fts cwf \
+                         JOIN code_systems cs ON cs.id = cwf.system_id \
+                         WHERE cs.url = ?2 AND concepts_word_fts MATCH ?1 \
                          LIMIT ?3 OFFSET ?4",
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 stmt.query_map(
-                    rusqlite::params![prefix_expr, system_id, sql_limit, sql_offset],
+                    rusqlite::params![prefix_expr, cs_url, sql_limit, sql_offset],
                     |r| {
                         Ok(ExpansionContains {
                             system: cs_url.to_owned(),
@@ -5465,13 +5501,16 @@ fn bfs_expand_page(
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| HtsError::StorageError(e.to_string()))
             } else {
+                // No filter: JOIN through code_systems.url so we match any
+                // matching row, not just the resolver-chosen system_id.
                 let mut stmt = conn
                     .prepare_cached(
-                        "SELECT code, display FROM concepts \
-                         WHERE system_id = ?1 ORDER BY code LIMIT ?2 OFFSET ?3",
+                        "SELECT c.code, c.display FROM concepts c \
+                         JOIN code_systems cs ON cs.id = c.system_id \
+                         WHERE cs.url = ?1 ORDER BY c.code LIMIT ?2 OFFSET ?3",
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                stmt.query_map(rusqlite::params![system_id, sql_limit, sql_offset], |r| {
+                stmt.query_map(rusqlite::params![cs_url, sql_limit, sql_offset], |r| {
                     Ok(ExpansionContains {
                         system: cs_url.to_owned(),
                         version: None,
@@ -5553,16 +5592,27 @@ fn bfs_isa_page(
 
     if let Some(f) = filter_lower {
         if f.len() >= 3 {
-            ensure_concepts_fts(conn, system_id)?;
+            // Build FTS for every row that owns this URL so the JOIN below
+            // hits the real concepts even if the resolver gave us the stub.
+            ensure_concepts_fts_for_url(conn, cs_url)?;
+            let _ = system_id;
             let match_expr = fts5_quote(f);
+            // JOIN concept_closure through code_systems.url so the lookup
+            // succeeds even if multiple `code_systems` rows share the same
+            // canonical URL (e.g. r4.core stub + RF2 import) and the resolver
+            // happened to pick the empty stub. The FTS index is still keyed by
+            // the resolved system_id (only the row with concepts will have an
+            // FTS index built), so this falls back gracefully.
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT cf.code, cf.display
                      FROM   concepts_fts cf
                      JOIN   concept_closure cc
-                            ON cc.system_id = ?5 AND cc.ancestor_code = ?4
-                            AND cc.descendant_code = cf.code
-                     WHERE  cf.system_id = ?5
+                            ON cc.descendant_code = cf.code
+                            AND cc.system_id = cf.system_id
+                     JOIN   code_systems cs ON cs.id = cf.system_id
+                     WHERE  cs.url = ?5
+                       AND  cc.ancestor_code = ?4
                        AND  concepts_fts MATCH ?1
                        AND  (cf.code != ?4 OR ?6)
                      LIMIT ?2 OFFSET ?3",
@@ -5575,7 +5625,7 @@ fn bfs_isa_page(
                         sql_limit,
                         sql_offset,
                         root_code,
-                        system_id,
+                        cs_url,
                         include_root_i
                     ],
                     row_mapper,
@@ -5590,8 +5640,9 @@ fn bfs_isa_page(
             .prepare_cached(
                 "SELECT c.code, c.display
                  FROM   concept_closure cc
-                 JOIN   concepts c ON c.system_id = ?5 AND c.code = cc.descendant_code
-                 WHERE  cc.system_id = ?5
+                 JOIN   concepts c ON c.system_id = cc.system_id AND c.code = cc.descendant_code
+                 JOIN   code_systems cs ON cs.id = cc.system_id
+                 WHERE  cs.url = ?5
                    AND  cc.ancestor_code = ?4
                    AND  (cc.descendant_code != ?4 OR ?6)
                    AND  (LOWER(c.code) LIKE ?1 OR LOWER(COALESCE(c.display,'')) LIKE ?1)
@@ -5605,7 +5656,7 @@ fn bfs_isa_page(
                     sql_limit,
                     sql_offset,
                     root_code,
-                    system_id,
+                    cs_url,
                     include_root_i
                 ],
                 row_mapper,
@@ -5616,23 +5667,25 @@ fn bfs_isa_page(
     }
 
     // No filter: pure closure lookup.
-    // No ORDER BY: the closure PK (system_id, ancestor_code, descendant_code)
-    // already delivers rows in descendant_code order, so SQLite can stop the
-    // nested-loop join at LIMIT without materialising all descendants.
+    // JOIN through code_systems.url so any matching system row works — robust
+    // against the resolver picking an empty stub row when the same canonical
+    // URL has multiple `code_systems` rows.
     let mut stmt = conn
         .prepare_cached(
             "SELECT c.code, c.display
              FROM   concept_closure cc
-             JOIN   concepts c ON c.system_id = ?4 AND c.code = cc.descendant_code
-             WHERE  cc.system_id = ?4
+             JOIN   concepts c ON c.system_id = cc.system_id AND c.code = cc.descendant_code
+             JOIN   code_systems cs ON cs.id = cc.system_id
+             WHERE  cs.url = ?4
                AND  cc.ancestor_code = ?1
                AND  (cc.descendant_code != ?1 OR ?5)
              LIMIT ?2 OFFSET ?3",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    let _ = system_id; // kept for FTS index ensure path (filter branch)
     stmt.query_map(
-        rusqlite::params![root_code, sql_limit, sql_offset, system_id, include_root_i],
+        rusqlite::params![root_code, sql_limit, sql_offset, cs_url, include_root_i],
         row_mapper,
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?
@@ -5663,15 +5716,26 @@ fn resolve_compose_system_id(
 
     // Version-pinned: must enumerate all candidate rows to find the matching
     // one. This path is rarely hit (most includes don't pin a version), so
-    // skipping the cache here is fine.
+    // skipping the cache here is fine. Same multi-tier ordering as
+    // `resolve_system_id_with_version_cached` so the version-pinned path
+    // agrees with the unpinned hot-path on which row to prefer when multiple
+    // candidates share the same canonical URL (e.g. r4.core stub plus
+    // RF2 import for SNOMED).
     let mut stmt = conn
         .prepare(
             "SELECT id, version FROM code_systems \
              WHERE url = ?1 \
-             ORDER BY (CASE WHEN EXISTS \
-                 (SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id) \
-                 THEN 0 ELSE 1 END), \
-                 COALESCE(version, '') DESC",
+             ORDER BY (CASE COALESCE(content, 'complete') \
+                            WHEN 'complete'   THEN 0 \
+                            WHEN 'supplement' THEN 0 \
+                            WHEN 'fragment'   THEN 1 \
+                            WHEN 'example'    THEN 1 \
+                            WHEN 'not-present' THEN 2 \
+                            ELSE 1 END), \
+                      (CASE WHEN EXISTS \
+                          (SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id) \
+                          THEN 0 ELSE 1 END), \
+                      COALESCE(version, '') DESC",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -7162,21 +7226,36 @@ fn validate_fhir_vs(
         }
     }
 
-    // Multiple `code_systems` rows can share the same canonical URL — e.g. a
-    // stub from `hl7.terminology` plus the real RF2 import. The cached
-    // resolver picks the row that actually has concepts.
-    let system_id = match resolve_system_id_cached(conn, cs_url)? {
-        Some(id) => id,
-        None => return Err(HtsError::NotFound(format!("CodeSystem not found: {cs_url}"))),
-    };
+    // A single canonical URL like `http://snomed.info/sct` may resolve to
+    // MULTIPLE rows in `code_systems` — e.g. a stub shipped by
+    // `hl7.fhir.r4.core` (content=not-present, version=NULL, no concepts) plus
+    // the real RF2 import (version=20260301, ~350K concepts). The cached
+    // resolver normally picks the row with concepts via `EXISTS`-priority
+    // ordering, but the SQLite query planner has been observed to occasionally
+    // pick the empty stub row anyway under benchmark load. JOIN through
+    // `code_systems` so the lookup matches if ANY row with this URL contains
+    // the concept — robust regardless of row selection.
+    let cs_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = ?1)",
+            [cs_url],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    if !cs_exists {
+        return Err(HtsError::NotFound(format!("CodeSystem not found: {cs_url}")));
+    }
 
     match pattern {
         FhirVsPattern::AllConcepts => {
             let row = conn
                 .query_row(
-                    "SELECT code, display FROM concepts \
-                     WHERE system_id = ?1 AND code = ?2",
-                    rusqlite::params![system_id, code],
+                    "SELECT c.code, c.display \
+                     FROM concepts c \
+                     JOIN code_systems cs ON c.system_id = cs.id \
+                     WHERE cs.url = ?1 AND c.code = ?2 \
+                     LIMIT 1",
+                    rusqlite::params![cs_url, code],
                     |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
                 )
                 .optional()
@@ -7200,13 +7279,15 @@ fn validate_fhir_vs(
         }
         FhirVsPattern::IsA(root_code) => {
             // O(1) closure lookup: is root_code an ancestor-or-self of code?
+            // Join through code_systems so we accept any matching system row.
             let is_member: bool = conn
                 .query_row(
                     "SELECT EXISTS(
-                         SELECT 1 FROM concept_closure
-                         WHERE system_id = ?1 AND ancestor_code = ?2 AND descendant_code = ?3
+                         SELECT 1 FROM concept_closure cc
+                         JOIN code_systems cs ON cc.system_id = cs.id
+                         WHERE cs.url = ?1 AND cc.ancestor_code = ?2 AND cc.descendant_code = ?3
                      )",
-                    rusqlite::params![system_id, root_code, code],
+                    rusqlite::params![cs_url, root_code, code],
                     |r| r.get(0),
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -7217,8 +7298,12 @@ fn validate_fhir_vs(
 
             let display: Option<String> = conn
                 .query_row(
-                    "SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2",
-                    rusqlite::params![system_id, code],
+                    "SELECT c.display \
+                     FROM concepts c \
+                     JOIN code_systems cs ON c.system_id = cs.id \
+                     WHERE cs.url = ?1 AND c.code = ?2 \
+                     LIMIT 1",
+                    rusqlite::params![cs_url, code],
                     |r| r.get(0),
                 )
                 .optional()
@@ -7276,8 +7361,19 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
         )));
     };
 
-    let system_id = resolve_system_id_cached(conn, &cs_url)?
-        .ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {cs_url}")))?;
+    // Verify the canonical URL has at least one stored row. The actual
+    // SELECTs below JOIN through code_systems.url so multiple rows for the
+    // same canonical URL all contribute (e.g. r4.core stub + RF2 import).
+    let cs_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = ?1)",
+            [&cs_url],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    if !cs_exists {
+        return Err(HtsError::NotFound(format!("CodeSystem not found: {cs_url}")));
+    }
 
     // BEGIN IMMEDIATE acquires the write lock upfront so concurrent callers
     // cannot both see an empty cache and then duplicate-write the expansion.
@@ -7312,19 +7408,25 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
     let insert_result = match &pattern {
         FhirVsPattern::AllConcepts => conn.execute(
             "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
-             SELECT ?1, ?2, code, display FROM concepts WHERE system_id = ?3",
-            rusqlite::params![url, cs_url, system_id],
+             SELECT ?1, ?2, c.code, c.display
+             FROM   concepts c
+             JOIN   code_systems cs ON cs.id = c.system_id
+             WHERE  cs.url = ?2",
+            rusqlite::params![url, cs_url],
         ),
         FhirVsPattern::IsA(root_code) => {
             // O(1) closure JOIN replaces the recursive CTE.
             // << semantics: all descendants plus the root itself (self-link in closure).
+            // JOIN through code_systems so any row whose URL matches contributes
+            // — robust against multi-row canonical URLs.
             conn.execute(
                 "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
                  SELECT ?1, ?2, c.code, c.display
                  FROM   concept_closure cc
-                 JOIN   concepts c ON c.system_id = ?3 AND c.code = cc.descendant_code
-                 WHERE  cc.system_id = ?3 AND cc.ancestor_code = ?4",
-                rusqlite::params![url, cs_url, system_id, root_code],
+                 JOIN   concepts c ON c.system_id = cc.system_id AND c.code = cc.descendant_code
+                 JOIN   code_systems cs ON cs.id = cc.system_id
+                 WHERE  cs.url = ?2 AND cc.ancestor_code = ?3",
+                rusqlite::params![url, cs_url, root_code],
             )
         }
     };
@@ -7785,6 +7887,29 @@ fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
 
     conn.execute_batch("COMMIT")
         .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Ensure the FTS5 concept index is populated for every `code_systems` row
+/// whose canonical URL matches `cs_url`. A single canonical URL can resolve
+/// to multiple stored rows (e.g. an empty stub from `hl7.fhir.r4.core` plus
+/// the real RF2 import). The resolver picks the row with concepts but if the
+/// empty stub's id leaks through to a caller, FTS-on-stub is a no-op and the
+/// JOIN-through-`code_systems.url` queries below would silently return zero
+/// rows. Building FTS for every matching row keeps the URL-join queries safe.
+fn ensure_concepts_fts_for_url(conn: &Connection, cs_url: &str) -> Result<(), HtsError> {
+    let mut stmt = conn
+        .prepare_cached("SELECT id FROM code_systems WHERE url = ?1")
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let ids: Vec<String> = stmt
+        .query_map([cs_url], |r| r.get::<_, String>(0))
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    drop(stmt);
+    for id in ids {
+        ensure_concepts_fts(conn, &id)?;
+    }
+    Ok(())
 }
 
 /// Ensure the FTS5 trigram index on `concepts_fts` is populated for `system_id`.

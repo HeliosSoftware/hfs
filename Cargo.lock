@@ -3078,6 +3078,7 @@ dependencies = [
  "deadpool-postgres",
  "flate2",
  "form_urlencoded",
+ "futures",
  "helios-fhir",
  "helios-persistence",
  "r2d2",
