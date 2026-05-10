@@ -69,10 +69,10 @@ use super::SqliteTerminologyBackend;
 // typical operation imports happen at startup and the cache is then stable
 // for the life of the process, so the cost amortises over millions of
 // subsequent requests.
-static SYSTEM_ID_CACHE: OnceLock<RwLock<HashMap<String, (String, Option<String>)>>> =
-    OnceLock::new();
+type SystemIdCacheMap = HashMap<String, (String, Option<String>)>;
+static SYSTEM_ID_CACHE: OnceLock<RwLock<SystemIdCacheMap>> = OnceLock::new();
 
-fn cs_id_cache() -> &'static RwLock<HashMap<String, (String, Option<String>)>> {
+fn cs_id_cache() -> &'static RwLock<SystemIdCacheMap> {
     SYSTEM_ID_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -90,10 +90,7 @@ pub(crate) fn invalidate_cs_id_cache() {
 /// actually have concepts (skipping empty stubs imported by terminology
 /// packages). Uses a process-wide cache to avoid the EXISTS subquery on every
 /// request.
-fn resolve_system_id_cached(
-    conn: &Connection,
-    url: &str,
-) -> Result<Option<String>, HtsError> {
+fn resolve_system_id_cached(conn: &Connection, url: &str) -> Result<Option<String>, HtsError> {
     if let Some(rec) = resolve_system_id_with_version_cached(conn, url)? {
         Ok(Some(rec.0))
     } else {
@@ -502,7 +499,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // and the URL-based path below; used to skip tree-building when
             // the IG enum-* fixtures want a flat expansion even with
             // excludeNested=false.
-            let mut compose_is_enumerated = false;
+            let compose_is_enumerated: bool;
 
             let all_codes = if let Some(vs_resource) = req.value_set {
                 // Inline ValueSet: extract compose and expand directly.
@@ -2143,6 +2140,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 ///
 /// When `date` is provided, only value sets whose `$.date` (from `resource_json`)
 /// is ≤ the requested date are matched.
+#[allow(dead_code)]
 fn resolve_value_set(
     conn: &Connection,
     url: &str,
@@ -2888,6 +2886,7 @@ impl<'a> InlineResolutionContext<'a> {
 ///   the include's local conditions; multiple entries are intersected.
 /// - `compose.exclude[]` — removes the (system, code) pairs that match the
 ///   same conditions, including `valueSet[]` references.
+#[allow(dead_code)]
 fn compute_expansion(
     backend: &SqliteTerminologyBackend,
     conn: &Connection,
@@ -3144,9 +3143,7 @@ fn compute_expansion_depth_inner(
         .map(|exts| {
             exts.iter().any(|ext| {
                 let url_match = ext.get("url").and_then(|u| u.as_str())
-                    == Some(
-                        "http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter",
-                    );
+                    == Some("http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter");
                 if !url_match {
                     return false;
                 }
@@ -3610,6 +3607,7 @@ fn expand_single_include_local(
 ///   is to collapse these to `(system, code)` pairs (version-blind);
 ///   only when the VS carries the `versionsMatch=false` expansion-parameter
 ///   extension does the caller keep them version-aware.
+#[allow(clippy::type_complexity)]
 fn build_exclude_sets(
     backend: &SqliteTerminologyBackend,
     conn: &Connection,
@@ -6127,7 +6125,8 @@ fn is_concept_abstract(
     // concept-properties#notSelectable URI in this CodeSystem. Tx-ecosystem
     // fixtures rename the property locally (e.g. `not-selectable` with a
     // hyphen), so a query hardcoded to `notSelectable` would miss them.
-    let abstract_codes = super::code_system::cached_abstract_property_codes(backend, conn, system_url);
+    let abstract_codes =
+        super::code_system::cached_abstract_property_codes(backend, conn, system_url);
     let placeholders = (3..=abstract_codes.len() + 2)
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
@@ -6341,6 +6340,7 @@ fn cs_is_case_insensitive(conn: &Connection, system_url: &str) -> bool {
 
 /// Extract the pinned CS version from a VS compose JSON for a given system URL.
 /// Returns `Some(version)` when `compose.include[].version` is set for that system.
+#[allow(dead_code)]
 fn cs_version_from_compose(compose_json: Option<&str>, system_url: &str) -> Option<String> {
     compose_json
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
@@ -6709,14 +6709,10 @@ fn detect_cs_version_mismatch(
     if let Some(pins) = all_include_pins.as_ref() {
         if pins.len() > 1 {
             let any_match = pins.iter().any(|p| match p {
-                Some(v) if v.contains(".x") || v == "x" => {
-                    version_satisfies_wildcard(req_full, v)
-                }
-                Some(v) => {
-                    resolve_ver_against_candidates(&candidates, v)
-                        .map(|rv| rv == req_full)
-                        .unwrap_or_else(|| v == req_full)
-                }
+                Some(v) if v.contains(".x") || v == "x" => version_satisfies_wildcard(req_full, v),
+                Some(v) => resolve_ver_against_candidates(&candidates, v)
+                    .map(|rv| rv == req_full)
+                    .unwrap_or_else(|| v == req_full),
                 // Versionless include: the effective version is the latest
                 // stored, which we'll have already accepted as `req_full`
                 // when it matches; otherwise flag below.
@@ -6922,7 +6918,8 @@ fn is_concept_inactive(
     // IG, deprecated codes are discouraged but still active (act-class
     // expansion and the `deprecated/` test group both rely on this — deprecated
     // codes survive `activeOnly=true` filtering).
-    let inactive_codes = super::code_system::cached_inactive_property_codes(backend, conn, system_url);
+    let inactive_codes =
+        super::code_system::cached_inactive_property_codes(backend, conn, system_url);
     let placeholders = (3..=inactive_codes.len() + 2)
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
@@ -7003,8 +7000,7 @@ fn finish_validate_code_response(
     // not-found branch); on success the version goes into a separate
     // parameter, not into the qualified string.
     let qualifier_version: Option<&str> = if found.is_none() {
-        req_version_hint
-            .filter(|v| !v.is_empty() && !v.contains(".x") && *v != "x")
+        req_version_hint.filter(|v| !v.is_empty() && !v.contains(".x") && *v != "x")
     } else {
         None
     };
@@ -7385,7 +7381,11 @@ fn validate_fhir_vs(
     // resolver picks the row that actually has concepts.
     let system_id = match resolve_system_id_cached(conn, cs_url)? {
         Some(id) => id,
-        None => return Err(HtsError::NotFound(format!("CodeSystem not found: {cs_url}"))),
+        None => {
+            return Err(HtsError::NotFound(format!(
+                "CodeSystem not found: {cs_url}"
+            )));
+        }
     };
 
     match pattern {

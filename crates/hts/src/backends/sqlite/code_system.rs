@@ -76,7 +76,8 @@ pub(super) fn lookup_property_codes(
     }
     let codes = Arc::new(cs_property_local_codes(conn, system_url, canonical));
     if let Ok(mut w) = cache.write() {
-        w.entry(system_url.to_owned()).or_insert_with(|| codes.clone());
+        w.entry(system_url.to_owned())
+            .or_insert_with(|| codes.clone());
     }
     codes
 }
@@ -179,9 +180,7 @@ impl SqliteTerminologyBackend {
         &self.lookup_response_cache
     }
 
-    pub(super) fn validate_code_response_cache(
-        &self,
-    ) -> &Arc<RwLock<ValidateCodeResponseMap>> {
+    pub(super) fn validate_code_response_cache(&self) -> &Arc<RwLock<ValidateCodeResponseMap>> {
         &self.validate_code_response_cache
     }
 
@@ -282,9 +281,10 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             // hot path which doesn't request properties at all (so `want_all`
             // is set), but cheap to short-circuit when explicit filters miss.
             let needs_synth = want_all
-                || req.properties.iter().any(|p| {
-                    p == "parent" || p == "child" || p == "inactive"
-                });
+                || req
+                    .properties
+                    .iter()
+                    .any(|p| p == "parent" || p == "child" || p == "inactive");
             let synth_props = if needs_synth {
                 fetch_synthesised_properties(&conn, &system_id, &req.code, &stored_props)?
             } else {
@@ -585,8 +585,13 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-            let (system_id, _, _) =
-                resolve_code_system(&conn, &resolved_cache, &req.system, req.version.as_deref(), None)?;
+            let (system_id, _, _) = resolve_code_system(
+                &conn,
+                &resolved_cache,
+                &req.system,
+                req.version.as_deref(),
+                None,
+            )?;
 
             // Both codes must exist in this system.
             find_concept(&conn, &system_id, &req.code_a)?;
@@ -639,26 +644,25 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         let pool = self.pool().clone();
         let url_owned = url.to_string();
 
-        let version =
-            tokio::task::spawn_blocking(move || -> Result<Option<String>, HtsError> {
-                let conn = pool
-                    .get()
-                    .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
-                let version: Option<String> = conn
-                    .query_row(
-                        "SELECT version FROM code_systems \
+        let version = tokio::task::spawn_blocking(move || -> Result<Option<String>, HtsError> {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            let version: Option<String> = conn
+                .query_row(
+                    "SELECT version FROM code_systems \
                          WHERE url = ?1 \
                          ORDER BY COALESCE(version, '') DESC LIMIT 1",
-                        rusqlite::params![url_owned],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?
-                    .flatten();
-                Ok(version)
-            })
-            .await
-            .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+                    rusqlite::params![url_owned],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .flatten();
+            Ok(version)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
 
         if let Ok(mut w) = self.cs_version_for_url_cache().write() {
             w.insert(url.to_string(), version.clone());
@@ -672,11 +676,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
     /// stored row's `resource_json` is no longer pulled and parsed just to
     /// drop everything except the boolean. Cache is per-instance and
     /// flushed by `import_bundle` (see `mod.rs::import_bundle`).
-    async fn code_system_exists(
-        &self,
-        _ctx: &TenantContext,
-        url: &str,
-    ) -> Result<bool, HtsError> {
+    async fn code_system_exists(&self, _ctx: &TenantContext, url: &str) -> Result<bool, HtsError> {
         if let Ok(read) = self.cs_exists_cache().read() {
             if let Some(&cached) = read.get(url) {
                 return Ok(cached);
@@ -1501,21 +1501,17 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            let mut params: Vec<&dyn rusqlite::ToSql> =
-                Vec::with_capacity(supplement_urls.len());
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(supplement_urls.len());
             for u in &supplement_urls {
                 params.push(u as &dyn rusqlite::ToSql);
             }
             let rows = stmt
-                .query_map(params.as_slice(), |row| {
-                    row.get::<_, Option<String>>(0)
-                })
+                .query_map(params.as_slice(), |row| row.get::<_, Option<String>>(0))
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             let mut out: std::collections::HashMap<String, Vec<serde_json::Value>> =
                 std::collections::HashMap::new();
             for r in rows {
-                let json_str_opt =
-                    r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let json_str_opt = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let Some(json_str) = json_str_opt else {
                     continue;
                 };

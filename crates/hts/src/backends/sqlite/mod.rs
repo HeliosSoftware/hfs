@@ -147,7 +147,6 @@ pub struct SqliteTerminologyBackend {
     // tests (e.g. `is_concept_abstract` for `(http://example.org/cs, A)`
     // returning a stale `true` from another test). Per-instance caches make
     // every backend self-contained.
-
     /// CodeSystem URL → local property codes mapping for `notSelectable`.
     pub(crate) cs_abstract_prop_cache: Arc<RwLock<PropCodesMap>>,
     /// CodeSystem URL → local property codes mapping for `inactive`.

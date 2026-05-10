@@ -82,11 +82,7 @@ pub trait CodeSystemOperations: Send + Sync {
     /// keep working; high-throughput backends should override with a
     /// `SELECT EXISTS(...)` query and a per-instance cache (see the SQLite
     /// implementation).
-    async fn code_system_exists(
-        &self,
-        ctx: &TenantContext,
-        url: &str,
-    ) -> Result<bool, HtsError> {
+    async fn code_system_exists(&self, ctx: &TenantContext, url: &str) -> Result<bool, HtsError> {
         let hits = self
             .search(
                 ctx,

@@ -120,9 +120,10 @@ async fn process_lookup<B: TerminologyBackend>(
         .ok()
         .flatten();
     if let (Some(lang), Some(disp)) = (cs_language.as_deref(), resp.display.clone()) {
-        let already = resp.designations.iter().any(|d| {
-            d.language.as_deref() == Some(lang) && d.value == disp
-        });
+        let already = resp
+            .designations
+            .iter()
+            .any(|d| d.language.as_deref() == Some(lang) && d.value == disp);
         if !already {
             resp.designations.push(DesignationValue {
                 language: Some(lang.to_string()),

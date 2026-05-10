@@ -68,11 +68,10 @@ use super::params::{
 /// `exclude/exclude-gender*` and `exclude/{include,exclude}-combo`
 /// fixtures (which reference FHIR-core `administrative-gender` and
 /// `publication-status` — both shipped with `standards-status=normative`).
-const WARNING_STANDARDS_STATUSES: &[&str] =
-    &["deprecated", "draft", "experimental", "withdrawn"];
+const WARNING_STANDARDS_STATUSES: &[&str] = &["deprecated", "draft", "experimental", "withdrawn"];
 
 fn is_warning_status(code: &str) -> bool {
-    WARNING_STANDARDS_STATUSES.iter().any(|s| *s == code)
+    WARNING_STANDARDS_STATUSES.contains(&code)
 }
 
 /// Collect the standards-status codes that should fire `warning-<status>`
@@ -140,9 +139,7 @@ fn vs_extension_statuses(resource: &Value) -> Vec<String> {
                 )
             {
                 if let Some(code) = ext.get("valueCode").and_then(|v| v.as_str()) {
-                    if !code.is_empty()
-                        && is_warning_status(code)
-                        && !out.iter().any(|c| c == code)
+                    if !code.is_empty() && is_warning_status(code) && !out.iter().any(|c| c == code)
                     {
                         out.push(code.to_string());
                     }
@@ -429,7 +426,8 @@ fn populate_properties<'a, B: TerminologyBackend>(
             let system_owned: String = (*system).to_string();
             let codes = codes.clone();
             async move {
-                let pv_fut = backend.concept_property_values(ctx, &system_owned, &codes, properties);
+                let pv_fut =
+                    backend.concept_property_values(ctx, &system_owned, &codes, properties);
                 let cs_fut = crate::traits::CodeSystemOperations::search(
                     backend,
                     ctx,
@@ -877,10 +875,7 @@ fn apply_concept_extension_data<'a, B: TerminologyBackend>(
         let mut base_entries: HashMap<(String, String), Value> = HashMap::new();
         let mut supp_entries: HashMap<(String, String), Vec<Value>> = HashMap::new();
         for (system, codes) in &by_system {
-            if let Ok(map) = backend
-                .concept_resource_entries(ctx, system, codes)
-                .await
-            {
+            if let Ok(map) = backend.concept_resource_entries(ctx, system, codes).await {
                 for (code, entry) in map {
                     base_entries.insert((system.clone(), code), entry);
                 }
@@ -928,8 +923,9 @@ fn apply_concept_extension_data<'a, B: TerminologyBackend>(
                     if !PASSTHROUGH_CONCEPT_EXTENSIONS.contains(&url) {
                         continue;
                     }
-                    c.extensions
-                        .retain(|existing| existing.get("url").and_then(|u| u.as_str()) != Some(url));
+                    c.extensions.retain(|existing| {
+                        existing.get("url").and_then(|u| u.as_str()) != Some(url)
+                    });
                     c.extensions.push(ext.clone());
                 }
             }
@@ -957,7 +953,8 @@ fn apply_concept_extension_data<'a, B: TerminologyBackend>(
                     // when the status is deprecated/withdrawn (matches IG
                     // extensions-all expectation; an `active` status would
                     // otherwise add noise to every concept).
-                    if prop_code == "status" && !matches!(value.as_str(), "deprecated" | "withdrawn")
+                    if prop_code == "status"
+                        && !matches!(value.as_str(), "deprecated" | "withdrawn")
                     {
                         continue;
                     }
@@ -1005,8 +1002,7 @@ fn apply_concept_extension_data<'a, B: TerminologyBackend>(
                         continue;
                     }
                     let target = c.designations.iter_mut().find(|existing| {
-                        existing.value.eq_ignore_ascii_case(value)
-                            && existing.language == language
+                        existing.value.eq_ignore_ascii_case(value) && existing.language == language
                     });
                     if let Some(t) = target {
                         for d_ext in d_exts {
@@ -1024,8 +1020,7 @@ fn apply_concept_extension_data<'a, B: TerminologyBackend>(
             }
 
             if !c.contains.is_empty() {
-                apply_concept_extension_data(backend, ctx, &mut c.contains, supplement_urls)
-                    .await;
+                apply_concept_extension_data(backend, ctx, &mut c.contains, supplement_urls).await;
             }
         }
     })
@@ -1631,9 +1626,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     return false;
                 }
                 match want_version {
-                    Some(want) => {
-                        r.get("version").and_then(|v| v.as_str()) == Some(want)
-                    }
+                    Some(want) => r.get("version").and_then(|v| v.as_str()) == Some(want),
                     None => true,
                 }
             });
@@ -1792,8 +1785,8 @@ async fn process_expand_inner<B: TerminologyBackend>(
             // fixture which pins `default-valueset-version` to a non-existent
             // version of an imported ValueSet.
             if let Some(ref url_str) = url_for_neg_cache {
-                let msg_names_top = msg.contains(&format!("'{url_str}'"))
-                    || msg.contains(&format!("'{url_str}|"));
+                let msg_names_top =
+                    msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"));
                 if msg_names_top {
                     if let Ok(mut neg) = state.not_found_urls.write() {
                         if neg.len() < NOT_FOUND_CACHE_MAX {
@@ -2115,9 +2108,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     // compose `code2` concept that must surface on the
                     // expansion's contains entry — without this merge the
                     // server only emits the supplement-contributed designation.
-                    if let Some(desigs) =
-                        concept.get("designation").and_then(|d| d.as_array())
-                    {
+                    if let Some(desigs) = concept.get("designation").and_then(|d| d.as_array()) {
                         fn merge_designations_into_contains(
                             list: &mut [crate::types::ExpansionContains],
                             wanted_sys: Option<&str>,
@@ -2126,12 +2117,10 @@ async fn process_expand_inner<B: TerminologyBackend>(
                         ) {
                             use crate::types::ExpansionContainsDesignation;
                             for c in list.iter_mut() {
-                                if c.code == wanted_code
-                                    && wanted_sys.is_none_or(|s| s == c.system)
+                                if c.code == wanted_code && wanted_sys.is_none_or(|s| s == c.system)
                                 {
                                     for d in desigs {
-                                        let Some(value) =
-                                            d.get("value").and_then(|v| v.as_str())
+                                        let Some(value) = d.get("value").and_then(|v| v.as_str())
                                         else {
                                             continue;
                                         };
@@ -2141,8 +2130,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                                             .map(str::to_string);
                                         // De-dupe by (language, value).
                                         let dup = c.designations.iter().any(|existing| {
-                                            existing.value == value
-                                                && existing.language == language
+                                            existing.value == value && existing.language == language
                                         });
                                         if dup {
                                             continue;
@@ -2188,12 +2176,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                                 }
                             }
                         }
-                        merge_designations_into_contains(
-                            &mut resp.contains,
-                            inc_sys,
-                            code,
-                            desigs,
-                        );
+                        merge_designations_into_contains(&mut resp.contains, inc_sys, code, desigs);
                     }
                     let Some(exts) = concept.get("extension").and_then(|e| e.as_array()) else {
                         continue;
@@ -2223,8 +2206,12 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     /// 2,…` over a CS-level `codesystem-conceptOrder=6,5,4,…`.
                     fn vs_compose_property_code(url: &str) -> Option<&'static str> {
                         match url {
-                            "http://hl7.org/fhir/StructureDefinition/valueset-conceptOrder" => Some("order"),
-                            "http://hl7.org/fhir/StructureDefinition/valueset-label" => Some("label"),
+                            "http://hl7.org/fhir/StructureDefinition/valueset-conceptOrder" => {
+                                Some("order")
+                            }
+                            "http://hl7.org/fhir/StructureDefinition/valueset-label" => {
+                                Some("label")
+                            }
                             "http://hl7.org/fhir/StructureDefinition/itemWeight" => Some("weight"),
                             _ => None,
                         }
@@ -2237,9 +2224,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     ) {
                         use crate::types::ExpansionContainsProperty;
                         for c in list.iter_mut() {
-                            if c.code == wanted_code
-                                && wanted_sys.is_none_or(|s| s == c.system)
-                            {
+                            if c.code == wanted_code && wanted_sys.is_none_or(|s| s == c.system) {
                                 for ext in exts {
                                     let url = match ext.get("url").and_then(|u| u.as_str()) {
                                         Some(s) => s,
@@ -2247,7 +2232,8 @@ async fn process_expand_inner<B: TerminologyBackend>(
                                     };
                                     if vs_compose_passthrough(url) {
                                         c.extensions.retain(|existing| {
-                                            existing.get("url").and_then(|u| u.as_str()) != Some(url)
+                                            existing.get("url").and_then(|u| u.as_str())
+                                                != Some(url)
                                         });
                                         c.extensions.push(ext.clone());
                                     }
@@ -2269,12 +2255,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                                 }
                             }
                             if !c.contains.is_empty() {
-                                merge_into_contains(
-                                    &mut c.contains,
-                                    wanted_sys,
-                                    wanted_code,
-                                    exts,
-                                );
+                                merge_into_contains(&mut c.contains, wanted_sys, wanted_code, exts);
                             }
                         }
                     }
@@ -2468,10 +2449,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
                             .map(str::to_string);
-                        if let (Some(sys), Some(ver)) = (
-                            inc.get("system").and_then(|s| s.as_str()),
-                            v,
-                        ) {
+                        if let (Some(sys), Some(ver)) =
+                            (inc.get("system").and_then(|s| s.as_str()), v)
+                        {
                             let entry = by_system.entry(sys.to_string()).or_default();
                             if key == "include" {
                                 entry.0.push(ver);
@@ -2485,10 +2465,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
             for (sys, (incs, excs)) in &by_system {
                 // Only echo per-contains version when both include AND exclude
                 // pin a version for this system AND those version sets differ.
-                if !incs.is_empty()
-                    && !excs.is_empty()
-                    && incs.iter().any(|i| !excs.contains(i))
-                {
+                if !incs.is_empty() && !excs.is_empty() && incs.iter().any(|i| !excs.contains(i)) {
                     out.insert(sys.clone());
                 }
                 // `force-system-version` collapses multi-version include pins
@@ -2499,9 +2476,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 // versions for this system AND a force pin is in effect.
                 let distinct_inc_versions: std::collections::HashSet<&str> =
                     incs.iter().map(|s| s.as_str()).collect();
-                if distinct_inc_versions.len() >= 2
-                    && force_system_versions.contains_key(sys)
-                {
+                if distinct_inc_versions.len() >= 2 && force_system_versions.contains_key(sys) {
                     out.insert(sys.clone());
                 }
             }
@@ -2611,8 +2586,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                         .and_then(|i| i.as_array())
                         .map(|incs| {
                             incs.iter().any(|inc| {
-                                inc.get("system").and_then(|s| s.as_str())
-                                    == Some(sys.as_str())
+                                inc.get("system").and_then(|s| s.as_str()) == Some(sys.as_str())
                                     && inc
                                         .get("version")
                                         .and_then(|v| v.as_str())
@@ -2803,9 +2777,13 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 })
                 .unwrap_or(false);
             if !has_versions_match_ext {
-                let mut include_versions: std::collections::HashMap<String, std::collections::HashSet<String>> =
-                    std::collections::HashMap::new();
-                if let Some(arr) = compose.and_then(|c| c.get("include")).and_then(|i| i.as_array())
+                let mut include_versions: std::collections::HashMap<
+                    String,
+                    std::collections::HashSet<String>,
+                > = std::collections::HashMap::new();
+                if let Some(arr) = compose
+                    .and_then(|c| c.get("include"))
+                    .and_then(|i| i.as_array())
                 {
                     for inc in arr {
                         let sys = match inc.get("system").and_then(|v| v.as_str()) {
@@ -2821,7 +2799,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     }
                 }
                 let mut whole_system_cross_version_exclude = false;
-                if let Some(arr) = compose.and_then(|c| c.get("exclude")).and_then(|i| i.as_array())
+                if let Some(arr) = compose
+                    .and_then(|c| c.get("exclude"))
+                    .and_then(|i| i.as_array())
                 {
                     for exc in arr {
                         let has_concept = exc
@@ -2947,10 +2927,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                             .map(str::to_string);
                         // Skip wildcard pins — contains[] carries the
                         // concrete resolution.
-                        if ver
-                            .as_deref()
-                            .is_some_and(|v| v.contains(".x") || v == "x")
-                        {
+                        if ver.as_deref().is_some_and(|v| v.contains(".x") || v == "x") {
                             continue;
                         }
                         // Skip versionless pins when contains[] already
@@ -3049,10 +3026,8 @@ async fn process_expand_inner<B: TerminologyBackend>(
             .and_then(|vs| vs.get("compose"))
             .map(|compose| {
                 let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
-                let mut by_system: std::collections::HashMap<
-                    String,
-                    (Vec<String>, Vec<String>),
-                > = std::collections::HashMap::new();
+                let mut by_system: std::collections::HashMap<String, (Vec<String>, Vec<String>)> =
+                    std::collections::HashMap::new();
                 for key in ["include", "exclude"] {
                     if let Some(arr) = compose.get(key).and_then(|v| v.as_array()) {
                         for inc in arr {
@@ -3170,11 +3145,8 @@ async fn process_expand_inner<B: TerminologyBackend>(
             .cloned()
             .collect();
         if !sortable_systems.is_empty() {
-            let mut indexed: Vec<(usize, crate::types::ExpansionContains)> = resp
-                .contains
-                .drain(..)
-                .enumerate()
-                .collect();
+            let mut indexed: Vec<(usize, crate::types::ExpansionContains)> =
+                resp.contains.drain(..).enumerate().collect();
             // Group by (system, code), sort each group by version DESC,
             // then re-emit in original first-occurrence order of (system, code).
             let mut first_idx: std::collections::HashMap<(String, String), usize> =
@@ -3262,9 +3234,8 @@ async fn process_expand_inner<B: TerminologyBackend>(
             if merged {
                 let mut seen: std::collections::HashSet<(String, String)> =
                     std::collections::HashSet::new();
-                resp.contains.retain(|c| {
-                    seen.insert((c.system.clone(), c.code.clone()))
-                });
+                resp.contains
+                    .retain(|c| seen.insert((c.system.clone(), c.code.clone())));
                 if let Some(t) = resp.total.as_mut() {
                     *t = resp.contains.len() as u32;
                 }
@@ -3580,10 +3551,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
         // Collect distinct property codes appearing on contains[] entries,
         // walking nested children too. Maintain insertion order via a Vec
         // (HashSet drops ordering and we want deterministic output).
-        fn collect_property_codes(
-            list: &[crate::types::ExpansionContains],
-            out: &mut Vec<String>,
-        ) {
+        fn collect_property_codes(list: &[crate::types::ExpansionContains], out: &mut Vec<String>) {
             for c in list {
                 for p in &c.properties {
                     if !out.contains(&p.code) {
@@ -4222,9 +4190,7 @@ fn inject_too_costly_threshold(headers: &HeaderMap, params: &mut Vec<Value>) {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u32>().ok())
     {
-        params.retain(|p| {
-            p.get("name").and_then(|x| x.as_str()) != Some("__max_expansion_size__")
-        });
+        params.retain(|p| p.get("name").and_then(|x| x.as_str()) != Some("__max_expansion_size__"));
         params.push(json!({"name": "__max_expansion_size__", "valueInteger": v}));
     }
 }
@@ -4407,7 +4373,8 @@ mod tests {
     /// `property[]` arrays from the cross-version extensions, dropping the
     /// extension entries it consumed.
     fn lift_property_extension_for_tests(response: &mut Value) {
-        const EXP_PROP_URL: &str = "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property";
+        const EXP_PROP_URL: &str =
+            "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property";
         const CONTAINS_PROP_URL: &str = "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property";
 
         fn lift(target: &mut Value, ext_url: &str, contains: bool) {
@@ -4464,7 +4431,9 @@ mod tests {
         }
 
         fn walk_contains(arr: &mut Value) {
-            let Some(items) = arr.as_array_mut() else { return };
+            let Some(items) = arr.as_array_mut() else {
+                return;
+            };
             for item in items {
                 lift(item, CONTAINS_PROP_URL, true);
                 if let Some(nested) = item.get_mut("contains") {
@@ -4473,7 +4442,9 @@ mod tests {
             }
         }
 
-        let Some(expansion) = response.get_mut("expansion") else { return };
+        let Some(expansion) = response.get_mut("expansion") else {
+            return;
+        };
         lift(expansion, EXP_PROP_URL, false);
         if let Some(contains) = expansion.get_mut("contains") {
             walk_contains(contains);
@@ -5252,7 +5223,9 @@ mod tests {
             .expect("expansion property cross-version extension");
         let inner = prop_decl["extension"].as_array().expect("inner extensions");
         assert!(
-            inner.iter().any(|e| e["url"] == "code" && e["valueCode"] == "order"),
+            inner
+                .iter()
+                .any(|e| e["url"] == "code" && e["valueCode"] == "order"),
             "code sub-extension"
         );
         assert!(
@@ -5267,8 +5240,9 @@ mod tests {
         assert!(c1.get("property").is_none(), "contains[0].property removed");
         let c1_exts = c1["extension"].as_array().expect("contains[0].extension[]");
         assert!(
-            c1_exts.iter().any(|e| e["url"]
-                == "http://hl7.org/fhir/StructureDefinition/rendering-style"),
+            c1_exts
+                .iter()
+                .any(|e| e["url"] == "http://hl7.org/fhir/StructureDefinition/rendering-style"),
             "rendering-style extension preserved",
         );
         let order_prop = c1_exts

@@ -602,10 +602,7 @@ mod tests {
         let m = params.iter().find(|p| p["name"] == "match").unwrap();
         let parts = m["part"].as_array().unwrap();
 
-        let names: Vec<&str> = parts
-            .iter()
-            .filter_map(|p| p["name"].as_str())
-            .collect();
+        let names: Vec<&str> = parts.iter().filter_map(|p| p["name"].as_str()).collect();
         let equiv_or_rel = if cfg!(any(feature = "R5", feature = "R6")) {
             "relationship"
         } else {
