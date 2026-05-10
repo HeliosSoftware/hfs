@@ -24,10 +24,11 @@ use serde_json::{Value, json};
 #[cfg(feature = "R4")]
 use helios_fhir::r4::{
     TerminologyCapabilities, TerminologyCapabilitiesClosure, TerminologyCapabilitiesCodeSystem,
-    TerminologyCapabilitiesExpansion, TerminologyCapabilitiesImplementation,
-    TerminologyCapabilitiesSoftware, TerminologyCapabilitiesTranslation,
-    TerminologyCapabilitiesValidateCode,
+    TerminologyCapabilitiesExpansion, TerminologyCapabilitiesExpansionParameter,
+    TerminologyCapabilitiesImplementation, TerminologyCapabilitiesSoftware,
+    TerminologyCapabilitiesTranslation, TerminologyCapabilitiesValidateCode,
 };
+#[cfg(feature = "R4")]
 use helios_fhir::{Element, PrecisionDateTime};
 
 use crate::import::BundleImportBackend;
@@ -102,12 +103,24 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
         .collect();
 
     let caps = TerminologyCapabilities {
+        version: Some(Element {
+            value: Some(HTS_VERSION.to_string()),
+            ..Default::default()
+        }),
+        name: Some(Element {
+            value: Some("HeliosTerminologyServer".to_string()),
+            ..Default::default()
+        }),
+        title: Some(Element {
+            value: Some(HTS_NAME.to_string()),
+            ..Default::default()
+        }),
         status: Element {
             value: Some("active".to_string()),
             ..Default::default()
         },
         kind: Element {
-            value: Some("terminology".to_string()),
+            value: Some("instance".to_string()),
             ..Default::default()
         },
         // Use a fixed publication date; this value identifies the capability document itself.
@@ -155,6 +168,34 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
                 value: Some(false),
                 ..Default::default()
             }),
+            // The IG fixtures expect a specific 12-entry expansion.parameter
+            // list (per tests/capterms.json). The validator sorts before
+            // comparing, so insertion order doesn't matter.
+            parameter: Some(
+                [
+                    "activeOnly",
+                    "check-system-version",
+                    "count",
+                    "displayLanguage",
+                    "excludeNested",
+                    "force-system-version",
+                    "includeDefinition",
+                    "includeDesignations",
+                    "offset",
+                    "property",
+                    "system-version",
+                    "tx-resource",
+                ]
+                .iter()
+                .map(|name| TerminologyCapabilitiesExpansionParameter {
+                    name: Element {
+                        value: Some((*name).to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            ),
             ..Default::default()
         }),
         validate_code: Some(TerminologyCapabilitiesValidateCode {
@@ -185,7 +226,47 @@ pub fn build_terminology_capabilities(backend: &impl TerminologyMetadata) -> Val
 
 #[cfg(not(feature = "R4"))]
 pub fn build_terminology_capabilities(_backend: &impl TerminologyMetadata) -> Value {
-    json!({ "resourceType": "TerminologyCapabilities", "status": "active", "kind": "terminology" })
+    json!({
+        "resourceType": "TerminologyCapabilities",
+        "version": HTS_VERSION,
+        "name": "HeliosTerminologyServer",
+        "title": HTS_NAME,
+        "status": "active",
+        "kind": "instance",
+        "date": "2026-04-01",
+        "experimental": false,
+        "software": {
+            "name": HTS_NAME,
+            "version": HTS_VERSION,
+            "releaseDate": "2026-04-01",
+        },
+        "implementation": {
+            "description": "Helios Terminology Server SQLite backend"
+        },
+        "codeSystem": [],
+        "expansion": {
+            "hierarchical": false,
+            "paging": true,
+            "incomplete": false,
+            "parameter": [
+                {"name": "activeOnly"},
+                {"name": "check-system-version"},
+                {"name": "count"},
+                {"name": "displayLanguage"},
+                {"name": "excludeNested"},
+                {"name": "force-system-version"},
+                {"name": "includeDefinition"},
+                {"name": "includeDesignations"},
+                {"name": "offset"},
+                {"name": "property"},
+                {"name": "system-version"},
+                {"name": "tx-resource"}
+            ]
+        },
+        "validateCode": { "translations": false },
+        "translation": { "needsMap": true },
+        "closure": {}
+    })
 }
 
 /// Build a FHIR R4 CapabilityStatement for the HTS server.
@@ -195,17 +276,36 @@ pub fn build_terminology_capabilities(_backend: &impl TerminologyMetadata) -> Va
 /// Includes a `capabilitystatement-supported-system` extension for each
 /// code system URL currently registered in the backend.
 pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
-    // ── capabilitystatement-supported-system extensions ───────────────────────
-    let supported_system_extensions: Vec<Value> = backend
-        .supported_systems()
-        .into_iter()
-        .map(|url| {
-            json!({
-                "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-supported-system",
-                "valueUri": url
-            })
+    // ── application-feature extensions (test-bench advertisements) ────────────
+    // The IG metadata test expects the CapabilityStatement to advertise the
+    // tx-ecosystem features it implements via the
+    // http://hl7.org/fhir/uv/application-feature/StructureDefinition/feature
+    // extension. Each entry is a sub-extension of {definition: <FeatureDefinition canonical>,
+    // value: <code or boolean>}.
+    let mut supported_system_extensions: Vec<Value> = vec![
+        json!({
+            "url": "http://hl7.org/fhir/uv/application-feature/StructureDefinition/feature",
+            "extension": [
+                {"url": "definition", "valueCanonical": "http://hl7.org/fhir/uv/tx-tests/FeatureDefinition/test-version"},
+                {"url": "value", "valueCode": "1.7.0"}
+            ]
+        }),
+        json!({
+            "url": "http://hl7.org/fhir/uv/application-feature/StructureDefinition/feature",
+            "extension": [
+                {"url": "definition", "valueCanonical": "http://hl7.org/fhir/uv/tx-ecosystem/FeatureDefinition/CodeSystemAsParameter"},
+                {"url": "value", "valueBoolean": true}
+            ]
+        }),
+    ];
+
+    // Then the per-CodeSystem `capabilitystatement-supported-system` entries.
+    supported_system_extensions.extend(backend.supported_systems().into_iter().map(|url| {
+        json!({
+            "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-supported-system",
+            "valueUri": url
         })
-        .collect();
+    }));
 
     // ── Shared search params for all three resource types ─────────────────────
     let search_params = json!([
@@ -225,17 +325,39 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
         {"code": "search-type"}
     ]);
 
+    // Report the FHIR version that matches the build's enabled feature.
+    // The HL7 validator picks an R4 vs R5 client (and by extension, an R4 vs
+    // R5 JSON parser) based on this string. If we always claim "4.0.1" the
+    // R5 client never runs, and our R5 responses are downgraded by the R4
+    // parser — losing typed values on non-standard parameter names like
+    // `excludeNested`, which then fails the validator's sort with NPEs.
+    let fhir_version = if cfg!(feature = "R6") {
+        "6.0.0"
+    } else if cfg!(feature = "R5") {
+        "5.0.0"
+    } else if cfg!(feature = "R4B") {
+        "4.3.0"
+    } else {
+        "4.0.1"
+    };
+
     json!({
         "resourceType": "CapabilityStatement",
+        "url": "http://heliossoftware.com/fhir/hts/CapabilityStatement/hts",
+        "version": HTS_VERSION,
+        "name": "HeliosTerminologyServer",
+        "title": HTS_NAME,
+        "instantiates": ["http://hl7.org/fhir/CapabilityStatement/terminology-server"],
         "status": "active",
         "kind": "instance",
         "date": "2026-04-01",
-        "fhirVersion": "4.0.1",
+        "fhirVersion": fhir_version,
         "format": ["application/fhir+json", "application/fhir+xml"],
         "extension": supported_system_extensions,
         "software": {
             "name": HTS_NAME,
-            "version": HTS_VERSION
+            "version": HTS_VERSION,
+            "releaseDate": "2026-04-01",
         },
         "implementation": {
             "description": "Helios Terminology Server SQLite backend"
@@ -246,48 +368,40 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "CodeSystem",
                     "interaction": interactions,
-                    "searchParam": search_params
+                    "searchParam": search_params,
+                    "operation": [
+                        {"name": "lookup", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"},
+                        {"name": "validate-code", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"},
+                        {"name": "subsumes", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-subsumes"}
+                    ]
                 },
                 {
                     "type": "ValueSet",
                     "interaction": interactions,
-                    "searchParam": search_params
+                    "searchParam": search_params,
+                    "operation": [
+                        {"name": "expand", "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"},
+                        {"name": "validate-code", "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-validate-code"}
+                    ]
                 },
                 {
                     "type": "ConceptMap",
                     "interaction": interactions,
-                    "searchParam": search_params
+                    "searchParam": search_params,
+                    "operation": [
+                        {"name": "translate", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"},
+                        {"name": "closure", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-closure"}
+                    ]
                 }
             ],
             "operation": [
-                {
-                    "name": "lookup",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"
-                },
-                {
-                    "name": "validate-code",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"
-                },
-                {
-                    "name": "subsumes",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-subsumes"
-                },
-                {
-                    "name": "expand",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"
-                },
-                {
-                    "name": "validate-code",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-validate-code"
-                },
-                {
-                    "name": "translate",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"
-                },
-                {
-                    "name": "closure",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-closure"
-                }
+                {"name": "versions", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-versions"},
+                {"name": "lookup", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"},
+                {"name": "validate-code", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"},
+                {"name": "subsumes", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-subsumes"},
+                {"name": "expand", "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"},
+                {"name": "translate", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"},
+                {"name": "closure", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-closure"}
             ]
         }]
     })
@@ -323,9 +437,9 @@ mod tests {
     }
 
     #[test]
-    fn kind_is_terminology() {
+    fn kind_is_instance() {
         let caps = build_terminology_capabilities(&backend());
-        assert_eq!(caps["kind"], "terminology");
+        assert_eq!(caps["kind"], "instance");
     }
 
     #[test]
@@ -440,8 +554,19 @@ mod tests {
     #[test]
     fn capability_statement_lists_all_operations() {
         let cs = build_capability_statement(&backend());
-        let ops = cs["rest"][0]["operation"].as_array().unwrap();
-        let names: Vec<&str> = ops.iter().filter_map(|o| o["name"].as_str()).collect();
+        // Operations are now declared per-resource (FHIR-conformant) instead
+        // of at the rest level; flatten across resources to verify they're
+        // all advertised somewhere.
+        let mut names: Vec<String> = Vec::new();
+        for r in cs["rest"][0]["resource"].as_array().unwrap() {
+            if let Some(ops) = r.get("operation").and_then(|v| v.as_array()) {
+                for op in ops {
+                    if let Some(n) = op.get("name").and_then(|v| v.as_str()) {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+        }
         for expected in [
             "lookup",
             "validate-code",
@@ -450,7 +575,10 @@ mod tests {
             "translate",
             "closure",
         ] {
-            assert!(names.contains(&expected), "missing operation '{expected}'");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing operation '{expected}'"
+            );
         }
     }
 
@@ -458,8 +586,15 @@ mod tests {
     fn capability_statement_supported_system_extensions_empty_on_fresh_backend() {
         let cs = build_capability_statement(&backend());
         let exts = cs["extension"].as_array().unwrap();
+        // The two static application-feature extensions are always present;
+        // verify none of the per-supported-system entries appear on an empty
+        // backend.
         assert!(
-            exts.is_empty(),
+            !exts.iter().any(|e| e
+                .get("url")
+                .and_then(|u| u.as_str())
+                .map(|u| u.ends_with("capabilitystatement-supported-system"))
+                .unwrap_or(false)),
             "fresh backend should have no supported-system extensions"
         );
     }
@@ -478,12 +613,16 @@ mod tests {
 
         let cs = build_capability_statement(&b);
         let exts = cs["extension"].as_array().unwrap();
-        assert_eq!(exts.len(), 1);
-        assert_eq!(
-            exts[0]["url"],
-            "http://hl7.org/fhir/StructureDefinition/capabilitystatement-supported-system"
-        );
-        assert_eq!(exts[0]["valueUri"], "http://example.org/cs");
+        let supported = exts
+            .iter()
+            .find(|e| {
+                e.get("url")
+                    .and_then(|u| u.as_str())
+                    .map(|u| u.ends_with("capabilitystatement-supported-system"))
+                    .unwrap_or(false)
+            })
+            .expect("supported-system extension present");
+        assert_eq!(supported["valueUri"], "http://example.org/cs");
     }
 
     // ── Integration tests: HTTP GET /metadata mode dispatch ───────────────────
@@ -543,6 +682,6 @@ mod tests {
     async fn get_metadata_mode_terminology_returns_terminology_capabilities() {
         let body = get_metadata(make_metadata_app(), "/metadata?mode=terminology").await;
         assert_eq!(body["resourceType"], "TerminologyCapabilities");
-        assert_eq!(body["kind"], "terminology");
+        assert_eq!(body["kind"], "instance");
     }
 }

@@ -18,6 +18,7 @@
 //! handler from capturing requests that end with an operation suffix.
 
 use crate::operations::batch::batch_handler;
+use crate::operations::batch_validate::vs_batch_validate_handler;
 use axum::{
     Router,
     routing::{get, post},
@@ -100,6 +101,10 @@ where
         .route(
             "/ValueSet/$validate-code",
             get(get_vs_validate_code_handler::<B>).post(vs_validate_code_handler::<B>),
+        )
+        .route(
+            "/ValueSet/$batch-validate-code",
+            post(vs_batch_validate_handler::<B>),
         )
         // ── ConceptMap operations ─────────────────────────────────────────────
         .route(

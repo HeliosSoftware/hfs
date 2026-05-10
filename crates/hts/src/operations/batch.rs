@@ -42,7 +42,7 @@ fn error_status(e: &HtsError) -> &'static str {
     match e {
         HtsError::NotFound(_) => "404",
         HtsError::NotSupported(_) => "501",
-        HtsError::InvalidRequest(_) => "400",
+        HtsError::InvalidRequest(_) | HtsError::VsInvalid(_) => "400",
         HtsError::Internal(_) | HtsError::StorageError(_) => "500",
         HtsError::PreconditionFailed(_) => "412",
         HtsError::TooCostly(_) => "422",
@@ -54,7 +54,12 @@ fn error_to_outcome(e: &HtsError) -> Value {
     let (code, diagnostics) = match e {
         HtsError::NotFound(msg) => ("not-found", msg.as_str()),
         HtsError::NotSupported(msg) => ("not-supported", msg.as_str()),
-        HtsError::InvalidRequest(msg) => ("invalid", msg.as_str()),
+        // VsInvalid maps to FHIR issue code `invalid` (same as InvalidRequest)
+        // but carries a distinct `tx-issue-type=vs-invalid` coding in the
+        // top-level error response (see `HtsError::into_response`). Inside a
+        // batch entry the fine-grained tx-issue-type is not surfaced; the
+        // entry-level `invalid` code is sufficient for batch reporting.
+        HtsError::InvalidRequest(msg) | HtsError::VsInvalid(msg) => ("invalid", msg.as_str()),
         HtsError::Internal(msg) => ("exception", msg.as_str()),
         HtsError::StorageError(msg) => ("exception", msg.as_str()),
         HtsError::PreconditionFailed(msg) => ("conflict", msg.as_str()),

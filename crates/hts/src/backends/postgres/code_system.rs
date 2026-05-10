@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 
 use crate::error::HtsError;
-use crate::traits::CodeSystemOperations;
+use crate::traits::{CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags};
 use crate::types::{
     DesignationValue, LookupRequest, LookupResponse, PropertyValue, ResourceSearchQuery,
     SubsumesRequest, SubsumesResponse, SubsumptionOutcome, ValidateCodeRequest,
@@ -43,17 +43,30 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         )
         .await?;
 
-        let (concept_id, display, _definition) =
+        let (concept_id, display, definition) =
             find_concept(&client, &system_id, &req.code).await?;
 
-        let all_props = fetch_properties(&client, concept_id).await?;
-        let properties = if req.properties.is_empty() {
-            all_props
+        let stored_props = fetch_properties(&client, concept_id).await?;
+        // Per FHIR spec, property="*" is the wildcard meaning "include
+        // every property the concept has".
+        let want_all = req.properties.is_empty() || req.properties.iter().any(|p| p == "*");
+        let synth_props =
+            fetch_synthesised_properties(&client, &system_id, &req.code, &stored_props).await?;
+        let properties = if want_all {
+            let mut out = stored_props;
+            out.extend(synth_props);
+            out
         } else {
-            all_props
+            let mut out: Vec<PropertyValue> = stored_props
                 .into_iter()
                 .filter(|p| req.properties.contains(&p.code))
-                .collect()
+                .collect();
+            out.extend(
+                synth_props
+                    .into_iter()
+                    .filter(|p| req.properties.contains(&p.code)),
+            );
+            out
         };
 
         let all_designations = fetch_designations(&client, concept_id).await?;
@@ -81,6 +94,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             name: cs_name,
             version: cs_version,
             display,
+            definition,
             properties,
             designations,
         })
@@ -117,6 +131,13 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     result: false,
                     message: Some(format!("Unknown code system: {system}")),
                     display: None,
+                    system: None,
+                    cs_version: None,
+                    inactive: None,
+                    issues: vec![],
+                    caused_by_unknown_system: None,
+                    concept_status: None,
+                    normalized_code: None,
                 });
             }
             Err(e) => return Err(e),
@@ -129,6 +150,13 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     result: false,
                     message: Some(format!("Unknown code: {}", req.code)),
                     display: None,
+                    system: None,
+                    cs_version: None,
+                    inactive: None,
+                    issues: vec![],
+                    caused_by_unknown_system: None,
+                    concept_status: None,
+                    normalized_code: None,
                 });
             }
             Err(e) => return Err(e),
@@ -150,6 +178,13 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             result: message.is_none(),
             message,
             display,
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues: vec![],
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
         })
     }
 
@@ -191,6 +226,177 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         Ok(SubsumesResponse {
             outcome: SubsumptionOutcome::NotSubsumed,
         })
+    }
+
+    async fn code_system_version_for_url(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let row = client
+            .query_opt(
+                "SELECT version FROM code_systems WHERE url = $1 LIMIT 1",
+                &[&url],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+    }
+
+    async fn code_system_language(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let row = client
+            .query_opt(
+                "SELECT resource_json->>'language' FROM code_systems WHERE url = $1 LIMIT 1",
+                &[&url],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+    }
+
+    async fn concept_designations(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<ConceptDesignation>>, HtsError> {
+        if codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT c.code, cd.language, cd.use_system, cd.use_code, cd.value
+                 FROM concept_designations cd
+                 JOIN concepts c ON c.id = cd.concept_id
+                 JOIN code_systems s ON s.id = c.system_id
+                 WHERE s.url = $1
+                   AND c.code = ANY($2)",
+                &[&system_url, &codes],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let mut out: std::collections::HashMap<String, Vec<ConceptDesignation>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let code: String = row.get(0);
+            out.entry(code).or_default().push(ConceptDesignation {
+                language: row.get(1),
+                use_system: row.get(2),
+                use_code: row.get(3),
+                value: row.get(4),
+                source: None,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn concept_property_values(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+        properties: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+        if codes.is_empty() || properties.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT c.code, cp.property, cp.value
+                 FROM concept_properties cp
+                 JOIN concepts c ON c.id = cp.concept_id
+                 JOIN code_systems s ON s.id = c.system_id
+                 WHERE s.url = $1
+                   AND c.code = ANY($2)
+                   AND cp.property = ANY($3)",
+                &[&system_url, &codes, &properties],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let code: String = row.get(0);
+            let prop: String = row.get(1);
+            let value: String = row.get(2);
+            out.entry(code).or_default().push((prop, value));
+        }
+        Ok(out)
+    }
+
+    async fn concept_expansion_flags(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, ConceptExpansionFlags>, HtsError> {
+        if codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+        let rows = client
+            .query(
+                "SELECT c.code, cp.property, cp.value
+                 FROM concept_properties cp
+                 JOIN concepts c ON c.id = cp.concept_id
+                 JOIN code_systems s ON s.id = c.system_id
+                 WHERE s.url = $1
+                   AND c.code = ANY($2)
+                   AND cp.property IN ('notSelectable', 'status')",
+                &[&system_url, &codes],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        let mut out: std::collections::HashMap<String, ConceptExpansionFlags> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let code: String = row.get(0);
+            let property: String = row.get(1);
+            let value: String = row.get(2);
+            let flags = out.entry(code).or_default();
+            match property.as_str() {
+                "notSelectable" if value == "true" => flags.is_abstract = true,
+                // `deprecated` is intentionally excluded: per the FHIR
+                // concept-properties IG, deprecated codes are discouraged but
+                // still active (act-class expansion fixtures rely on this —
+                // deprecated codes survive `activeOnly=true` filtering).
+                "status" if matches!(value.as_str(), "retired" | "inactive") => {
+                    flags.inactive = true;
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
     }
 
     async fn search(
@@ -268,42 +474,81 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
 /// Resolve a code system by URL, optional version, and optional date.
 ///
 /// Returns `(id, name_or_url, version)`.
+///
+/// Mirrors the SQLite implementation: an unspecified version defaults to the
+/// most recent (textual COALESCE-DESC), an explicit version with `.x` segments
+/// (or a bare numeric prefix like `"1"`) matches the highest version that
+/// shares the literal segments, and an exact version requires an exact match.
 async fn resolve_code_system(
     client: &tokio_postgres::Client,
     url: &str,
     version: Option<&str>,
     date: Option<&str>,
 ) -> Result<(String, String, Option<String>), HtsError> {
-    let rows = if let Some(ver) = version {
-        client
-            .query(
-                "SELECT id, COALESCE(name, url), version
-                 FROM code_systems
-                 WHERE url = $1 AND version = $2
-                   AND ($3::text IS NULL OR (resource_json->>'date') <= $3)",
-                &[&url, &ver, &date],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-    } else {
-        client
-            .query(
-                "SELECT id, COALESCE(name, url), version
-                 FROM code_systems
-                 WHERE url = $1
-                   AND ($2::text IS NULL OR (resource_json->>'date') <= $2)",
-                &[&url, &date],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-    };
+    let rows = client
+        .query(
+            "SELECT id, COALESCE(name, url), version
+             FROM code_systems
+             WHERE url = $1
+               AND ($2::text IS NULL OR (resource_json->>'date') <= $2)
+             ORDER BY COALESCE(version, '') DESC",
+            &[&url, &date],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    let row = rows
+    if rows.is_empty() {
+        return Err(HtsError::NotFound(format!("CodeSystem not found: {url}")));
+    }
+    let candidates: Vec<(String, String, Option<String>)> = rows
         .into_iter()
-        .next()
-        .ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {url}")))?;
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
 
-    Ok((row.get(0), row.get(1), row.get(2)))
+    match version {
+        Some(ver) if ver.contains(".x") || ver == "x" || is_short_version(ver) => {
+            select_best_version_match(&candidates, ver).ok_or_else(|| {
+                HtsError::NotFound(format!("CodeSystem not found: {url} (version {ver})"))
+            })
+        }
+        Some(ver) => candidates
+            .into_iter()
+            .find(|(_, _, v)| v.as_deref() == Some(ver))
+            .ok_or_else(|| {
+                HtsError::NotFound(format!("CodeSystem not found: {url} (version {ver})"))
+            }),
+        None => Ok(candidates.into_iter().next().expect("non-empty checked")),
+    }
+}
+
+fn is_short_version(ver: &str) -> bool {
+    !ver.contains('.') && ver.chars().all(|c| c.is_ascii_digit())
+}
+
+fn select_best_version_match(
+    candidates: &[(String, String, Option<String>)],
+    pattern: &str,
+) -> Option<(String, String, Option<String>)> {
+    let pattern_segments: Vec<&str> = pattern.split('.').collect();
+    candidates
+        .iter()
+        .filter(|(_, _, v)| match v {
+            Some(actual) => version_matches(actual, &pattern_segments),
+            None => false,
+        })
+        .max_by(|a, b| a.2.cmp(&b.2))
+        .cloned()
+}
+
+fn version_matches(actual: &str, pattern_segments: &[&str]) -> bool {
+    let actual_segments: Vec<&str> = actual.split('.').collect();
+    if pattern_segments.len() > actual_segments.len() {
+        return false;
+    }
+    pattern_segments
+        .iter()
+        .zip(actual_segments.iter())
+        .all(|(p, a)| *p == "x" || *p == *a)
 }
 
 /// Look up a concept row by `(system_id, code)`.
@@ -356,6 +601,103 @@ async fn fetch_properties(
         .collect())
 }
 
+/// Synthesise hierarchy- and status-derived properties for `$lookup`.
+///
+/// Mirrors the SQLite backend implementation — see
+/// [`super::super::sqlite::code_system::fetch_synthesised_properties`] for
+/// rationale.
+async fn fetch_synthesised_properties(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    code: &str,
+    stored: &[PropertyValue],
+) -> Result<Vec<PropertyValue>, HtsError> {
+    let mut out = Vec::new();
+
+    // Parents — synthesised from concept_hierarchy. Skip when the concept
+    // already carries explicit `parent` properties (the bundle importer
+    // mirrors `parent` properties into concept_hierarchy, so synthesising
+    // here would duplicate every stored parent edge).
+    let stored_parent_codes: std::collections::HashSet<&str> = stored
+        .iter()
+        .filter(|p| p.code == "parent")
+        .map(|p| p.value.as_str())
+        .collect();
+    let parent_rows = client
+        .query(
+            "SELECT h.parent_code, c.display
+             FROM concept_hierarchy h
+             LEFT JOIN concepts c
+                    ON c.system_id = h.system_id AND c.code = h.parent_code
+             WHERE h.system_id = $1 AND h.child_code = $2
+             ORDER BY h.parent_code",
+            &[&system_id, &code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    for row in parent_rows {
+        let parent_code: String = row.get(0);
+        if stored_parent_codes.contains(parent_code.as_str()) {
+            continue;
+        }
+        out.push(PropertyValue {
+            code: "parent".into(),
+            value_type: "code".into(),
+            value: parent_code,
+            description: row.get(1),
+        });
+    }
+
+    // Children.
+    let child_rows = client
+        .query(
+            "SELECT h.child_code, c.display
+             FROM concept_hierarchy h
+             LEFT JOIN concepts c
+                    ON c.system_id = h.system_id AND c.code = h.child_code
+             WHERE h.system_id = $1 AND h.parent_code = $2
+             ORDER BY h.child_code",
+            &[&system_id, &code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    for row in child_rows {
+        out.push(PropertyValue {
+            code: "child".into(),
+            value_type: "code".into(),
+            value: row.get(0),
+            description: row.get(1),
+        });
+    }
+
+    // Inactive flag (only when not already stored explicitly).
+    if !stored.iter().any(|p| p.code == "inactive") {
+        let row = client
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM concept_properties cp
+                     JOIN concepts c ON c.id = cp.concept_id
+                     WHERE c.system_id = $1
+                       AND c.code = $2
+                       AND cp.property = 'status'
+                       AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
+                 )",
+                &[&system_id, &code],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let inactive: bool = row.get(0);
+        out.push(PropertyValue {
+            code: "inactive".into(),
+            value_type: "boolean".into(),
+            value: inactive.to_string(),
+            description: None,
+        });
+    }
+
+    Ok(out)
+}
+
 /// Fetch all designations for a concept.
 async fn fetch_designations(
     client: &tokio_postgres::Client,
@@ -377,6 +719,7 @@ async fn fetch_designations(
             use_system: row.get(1),
             use_code: row.get(2),
             value: row.get(3),
+            source: None,
         })
         .collect())
 }

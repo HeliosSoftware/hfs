@@ -10,7 +10,7 @@ It can also be used standalone as a general-purpose FHIR terminology service, in
 
 An open test server will soon be available at https://hts.heliossoftware.com/ for experimentation and evaluation.
 
-HTS supports both SQLite and PostgreSQL as database backends - see [Storage Backends](#storage-backends) for details.
+HTS currently uses SQLite as its database backend. PostgreSQL support is planned for a future release - see [Storage Backends](#storage-backends) for details.
 
 ### Terminology Data
 
@@ -140,7 +140,7 @@ See [Environment Variables](#environment-variables) for all available configurat
 
     Windows:
 
-      Download a pre-build binary from [llvm-project's GitHub page](https://github.com/llvm/llvm-project/releases).
+      Download a pre-built binary from [llvm-project's GitHub page](https://github.com/llvm/llvm-project/releases).
 
     macOS:
 
@@ -402,8 +402,10 @@ The `value_set_expansions` table acts as a write-through cache: the first `$expa
 
 ### PostgreSQL
 
+PostgreSQL backend support is planned for a future release. The schema, query patterns, and persistence trait surface have been designed with multi-backend portability in mind, and the integration is being staged behind feature work tracked separately. Until it lands, all production deployments should use the SQLite backend documented above.
+
 ```bash
-hts run --storage-backend postgres --database-url "postgresql://user:pass@localhost/hts"
+# Coming soon
 ```
 
 ## API Endpoints

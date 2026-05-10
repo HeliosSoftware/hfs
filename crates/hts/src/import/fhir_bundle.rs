@@ -8,17 +8,18 @@
 //! the order guaranteed by [`bundle_parser::parse_bundle`].
 
 #[cfg(feature = "sqlite")]
-use r2d2::Pool;
-#[cfg(feature = "sqlite")]
-use r2d2_sqlite::SqliteConnectionManager;
-#[cfg(feature = "sqlite")]
-use rusqlite::Connection;
-
+use crate::backends::sqlite::schema;
 use crate::error::HtsError;
 use crate::import::ImportStats;
 use crate::import::bundle_parser::{
     self, ParsedBundle, ParsedCodeSystem, ParsedConceptMap, ParsedValueSet,
 };
+#[cfg(feature = "sqlite")]
+use r2d2::Pool;
+#[cfg(feature = "sqlite")]
+use r2d2_sqlite::SqliteConnectionManager;
+#[cfg(feature = "sqlite")]
+use rusqlite::{Connection, OptionalExtension};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -32,11 +33,80 @@ pub(crate) fn import_bundle_sync(
     data: &[u8],
 ) -> Result<ImportStats, HtsError> {
     let parsed = bundle_parser::parse_bundle(data)?;
-    let conn = pool
+    let mut conn = pool
         .get()
         .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
     let mut stats = ImportStats::default();
-    write_parsed_bundle(&conn, &parsed, &mut stats)?;
+
+    // Before the transaction: record which code systems currently have zero
+    // concepts in the DB. After the transaction commits, only these systems
+    // get an immediate closure rebuild — they are either brand-new systems or
+    // empty stubs, so the build is fast (at most a few thousand pairs).
+    //
+    // Systems that already have concepts are being updated in a batch (e.g.
+    // SNOMED RF2 chunks). Building the closure after every batch is O(n²) for
+    // SNOMED CT (~640K concepts, ~1 280 batches = hours). Skipping per-batch
+    // rebuilds is safe: write_code_system deletes the stale closure, and
+    // migrate_concept_closure at server startup rebuilds it exactly once.
+    let systems_needing_closure: Vec<String> = parsed
+        .code_systems
+        .iter()
+        .filter_map(|cs| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM concepts c
+                     JOIN code_systems s ON c.system_id = s.id
+                     WHERE s.url = ?1",
+                    rusqlite::params![cs.url],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if count == 0 {
+                Some(cs.url.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Wrap the whole bundle in a single transaction so that the thousands of
+    // per-concept / per-property / per-designation inserts that a bulk
+    // terminology load produces commit once, not once per row. Combined with
+    // `prepare_cached` inside the `write_*` helpers, this is the dominant
+    // speed-up for `hts import`.
+    let tx = conn
+        .transaction()
+        .map_err(|e| HtsError::StorageError(format!("Begin transaction: {e}")))?;
+    write_parsed_bundle(&tx, &parsed, &mut stats)?;
+    tx.commit()
+        .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
+
+    // Rebuild concept closure for newly imported (previously empty) code systems.
+    // Skipped for batch imports of existing systems (see comment above).
+    for url in &systems_needing_closure {
+        let system_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = ?1",
+                rusqlite::params![url],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(sid) = system_id {
+            let has_hierarchy: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = ?1 LIMIT 1)",
+                    rusqlite::params![sid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_hierarchy {
+                if let Err(e) = schema::build_concept_closure(&conn, &sid) {
+                    tracing::warn!(system_id = %sid, error = %e, "Failed to build concept closure after import");
+                }
+            }
+        }
+    }
+
     Ok(stats)
 }
 
@@ -104,16 +174,56 @@ fn write_code_system(
     let resource_json = serde_json::to_string(&cs.resource_json).ok();
     let now = utc_now();
 
-    // Non-destructive upsert: if a row with the same `url` already exists (e.g.
-    // from a prior chunk of a large CodeSystem), keep it and its concepts
-    // intact. Re-inserts with a different `id` are ignored rather than firing
-    // the `ON DELETE CASCADE` on the `concepts.system_id` FK.
+    // Synthetic storage id: `<fhir-id>|<version>` (or `<fhir-id>` when version
+    // is absent). This guarantees distinct rows per (url, version) even when
+    // the upstream resource ships the same FHIR `id` for multiple versions
+    // (e.g. tx-ecosystem `version/codesystem-version-1.json` + `-2.json` both
+    // declare `"id":"version"`). The pipe character is reserved in canonical
+    // URLs so it cannot collide with a legitimate FHIR id.
+    //
+    // When two distinct CodeSystems share both fhir-id AND version (e.g. two
+    // unrelated CSes ship `id`="status" with no version), reuse the existing
+    // row for the matching (url, version) or mint a fresh UUID rather than
+    // letting the second import collide on the primary key and silently get
+    // dropped by INSERT OR IGNORE.
+    let preferred_id = storage_id_for(&cs.id, cs.version.as_deref());
+    let existing_for_url_version: Option<String> = conn
+        .query_row(
+            "SELECT id FROM code_systems \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![cs.url, cs.version],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let storage_id = if let Some(id) = existing_for_url_version {
+        id
+    } else {
+        let preferred_taken: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_systems WHERE id = ?1",
+                rusqlite::params![preferred_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            > 0;
+        if preferred_taken {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            preferred_id
+        }
+    };
+
+    // Upsert keyed on (url, version): a re-import of the same version updates
+    // the existing row rather than creating a new one or wiping sibling
+    // versions. The composite UNIQUE index on (url, COALESCE(version,''))
+    // guarantees each (url, version) maps to at most one storage row.
     conn.execute(
         "INSERT OR IGNORE INTO code_systems
          (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         rusqlite::params![
-            cs.id,
+            storage_id,
             cs.url,
             cs.version,
             cs.name,
@@ -126,18 +236,19 @@ fn write_code_system(
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    // INSERT OR IGNORE skips the update path on conflict; force-update the
+    // metadata for this (url, version) row so re-imports refresh title/status
+    // /resource_json without disturbing sibling versions.
     conn.execute(
         "UPDATE code_systems SET
-           version       = ?1,
-           name          = ?2,
-           title         = ?3,
-           status        = ?4,
-           content       = ?5,
-           resource_json = ?6,
-           updated_at    = ?7
-         WHERE url = ?8",
+           name          = ?1,
+           title         = ?2,
+           status        = ?3,
+           content       = ?4,
+           resource_json = ?5,
+           updated_at    = ?6
+         WHERE url = ?7 AND COALESCE(version, '') = COALESCE(?8, '')",
         rusqlite::params![
-            cs.version,
             cs.name,
             cs.title,
             cs.status,
@@ -145,29 +256,50 @@ fn write_code_system(
             resource_json,
             now,
             cs.url,
+            cs.version,
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    // Concepts reference the authoritative `id` resolved by URL, which may
-    // differ from `cs.id` if a prior chunk created the row.
+    // Resolve the authoritative storage id for this (url, version) pair.
+    // A prior import that used a different synthesised FHIR id still wins,
+    // so we always look it up via the composite index rather than trusting
+    // `storage_id` directly.
     let system_id: String = conn
         .query_row(
-            "SELECT id FROM code_systems WHERE url = ?1",
-            rusqlite::params![cs.url],
+            "SELECT id FROM code_systems \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![cs.url, cs.version],
             |row| row.get(0),
         )
         .map_err(|e| HtsError::StorageError(format!("Failed to resolve CodeSystem id: {e}")))?;
 
-    for concept in &cs.concepts {
-        conn.execute(
-            "INSERT OR REPLACE INTO concepts (system_id, code, display, definition)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![system_id, concept.code, concept.display, concept.definition],
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // Upsert each concept with `RETURNING id` to avoid a second round-trip per
+    // row.  ON CONFLICT preserves child rows (no cascade-delete) so reimports
+    // refresh display/definition without losing properties or designations.
+    const UPSERT_CONCEPT_SQL: &str = "INSERT INTO concepts (system_id, code, display, definition)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(system_id, code) DO UPDATE SET
+             display    = excluded.display,
+             definition = excluded.definition
+         RETURNING id";
+    const INSERT_PROPERTY_SQL: &str =
+        "INSERT INTO concept_properties (concept_id, property, value_type, value)
+         VALUES (?1, ?2, ?3, ?4)";
+    const INSERT_DESIGNATION_SQL: &str = "INSERT INTO concept_designations
+         (concept_id, language, use_system, use_code, value)
+         VALUES (?1, ?2, ?3, ?4, ?5)";
 
-        let concept_id = conn.last_insert_rowid();
+    for concept in &cs.concepts {
+        let concept_id: i64 = conn
+            .prepare_cached(UPSERT_CONCEPT_SQL)
+            .and_then(|mut s| {
+                s.query_row(
+                    rusqlite::params![system_id, concept.code, concept.display, concept.definition],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
         // Hierarchy from nesting or "parent" property.
         if let Some(ref parent) = concept.parent_code {
@@ -175,16 +307,32 @@ fn write_code_system(
         }
 
         // Properties.
+        // Delete existing rows first so reimports stay idempotent.  We only do
+        // this when the incoming concept carries at least one non-empty property
+        // so that stub "content=not-present" re-imports don't wipe RF2/LOINC
+        // properties that were loaded separately.
+        let has_props = concept.properties.iter().any(|p| !p.value.is_empty());
+        if has_props {
+            conn.execute(
+                "DELETE FROM concept_properties WHERE concept_id = ?1",
+                rusqlite::params![concept_id],
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        }
         for prop in &concept.properties {
             if prop.value.is_empty() {
                 continue;
             }
-            conn.execute(
-                "INSERT INTO concept_properties (concept_id, property, value_type, value)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![concept_id, prop.code, prop.value_type, prop.value],
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            conn.prepare_cached(INSERT_PROPERTY_SQL)
+                .and_then(|mut s| {
+                    s.execute(rusqlite::params![
+                        concept_id,
+                        prop.code,
+                        prop.value_type,
+                        prop.value
+                    ])
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
             // Extra hierarchy edge from a "parent" property.
             if prop.is_parent_edge {
@@ -194,25 +342,60 @@ fn write_code_system(
             }
         }
 
-        // Designations.
-        for desig in &concept.designations {
+        // Designations — same idempotency guard.
+        let has_desigs = !concept.designations.is_empty();
+        if has_desigs {
             conn.execute(
-                "INSERT INTO concept_designations
-                 (concept_id, language, use_system, use_code, value)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    concept_id,
-                    desig.language,
-                    desig.use_system,
-                    desig.use_code,
-                    desig.value
-                ],
+                "DELETE FROM concept_designations WHERE concept_id = ?1",
+                rusqlite::params![concept_id],
             )
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        }
+        for desig in &concept.designations {
+            conn.prepare_cached(INSERT_DESIGNATION_SQL)
+                .and_then(|mut s| {
+                    s.execute(rusqlite::params![
+                        concept_id,
+                        desig.language,
+                        desig.use_system,
+                        desig.use_code,
+                        desig.value
+                    ])
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
         }
 
         stats.concepts += 1;
     }
+
+    // Invalidate stale closure rows so that migrate_concept_closure at server
+    // startup knows to (re)build the full closure once all batches are loaded.
+    // Without this, a previous partial closure (from a re-import or an earlier
+    // batch in the same session) would be mistakenly treated as complete.
+    let _ = conn.execute(
+        "DELETE FROM concept_closure WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    );
+
+    // Invalidate any cached implicit-ValueSet expansions for this code system.
+    // The implicit_expansion_cache is otherwise persistent across restarts; stale
+    // entries from a previous version of this system must be evicted on re-import.
+    let _ = conn.execute(
+        "DELETE FROM implicit_expansion_cache WHERE system_url = ?1",
+        rusqlite::params![cs.url],
+    );
+    let _ = conn.execute(
+        "DELETE FROM implicit_expansion_fts WHERE system_url = ?1",
+        rusqlite::params![cs.url],
+    );
+
+    // The process-wide URL→system_id cache may have memoised a now-stale row
+    // (e.g. an empty stub that this import is about to replace, or a
+    // re-imported system whose preferred row changed). Drop everything; the
+    // cache will repopulate lazily on the next request. The parallel
+    // URL→language cache is invalidated alongside.
+    crate::backends::sqlite::invalidate_cs_id_cache();
+    crate::backends::sqlite::invalidate_cs_language_cache();
 
     stats.code_systems += 1;
     Ok(())
@@ -225,11 +408,11 @@ fn insert_hierarchy(
     parent_code: &str,
     child_code: &str,
 ) -> Result<(), HtsError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code)
          VALUES (?1, ?2, ?3)",
-        rusqlite::params![system_id, parent_code, child_code],
     )
+    .and_then(|mut s| s.execute(rusqlite::params![system_id, parent_code, child_code]))
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
     Ok(())
 }
@@ -258,12 +441,52 @@ fn write_value_set(
     let resource_json = serde_json::to_string(&vs.resource_json).ok();
     let now = utc_now();
 
+    // Synthetic storage id: `<fhir-id>|<version>` (or `<fhir-id>` when version
+    // is absent). Mirrors the code_systems strategy so multiple ValueSets that
+    // share a canonical URL but differ in version don't collide on either the
+    // primary key or the composite UNIQUE index. When two distinct VSes share
+    // both a fhir-id AND a version (e.g. tx-ecosystem ships several VSes
+    // whose `id` is "version-all" but whose canonical URLs differ), reuse the
+    // existing row for the matching (url, version) or mint a fresh UUID so
+    // the second import doesn't silently get dropped by INSERT OR IGNORE.
+    let preferred_id = storage_id_for(&vs.id, vs.version.as_deref());
+    let existing_for_url_version: Option<String> = conn
+        .query_row(
+            "SELECT id FROM value_sets \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![vs.url, vs.version],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let storage_id = if let Some(id) = existing_for_url_version {
+        id
+    } else {
+        let preferred_taken: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM value_sets WHERE id = ?1",
+                rusqlite::params![preferred_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            > 0;
+        if preferred_taken {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            preferred_id
+        }
+    };
+
+    // Upsert keyed on (url, version): a re-import refreshes the existing row
+    // for the same version without disturbing sibling versions. The composite
+    // UNIQUE index on (url, COALESCE(version,'')) guarantees one storage row
+    // per (url, version).
     conn.execute(
-        "INSERT OR REPLACE INTO value_sets
+        "INSERT OR IGNORE INTO value_sets
          (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         rusqlite::params![
-            vs.id,
+            storage_id,
             vs.url,
             vs.version,
             vs.name,
@@ -272,6 +495,31 @@ fn write_value_set(
             vs.compose_json,
             resource_json,
             now
+        ],
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    // INSERT OR IGNORE skipped the metadata refresh on conflict — apply it
+    // explicitly so re-imports of the same (url, version) get the latest
+    // name/title/status/compose without disturbing siblings.
+    conn.execute(
+        "UPDATE value_sets SET
+           name          = ?1,
+           title         = ?2,
+           status        = ?3,
+           compose_json  = ?4,
+           resource_json = ?5,
+           updated_at    = ?6
+         WHERE url = ?7 AND COALESCE(version, '') = COALESCE(?8, '')",
+        rusqlite::params![
+            vs.name,
+            vs.title,
+            vs.status,
+            vs.compose_json,
+            resource_json,
+            now,
+            vs.url,
+            vs.version,
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -306,11 +554,13 @@ fn write_concept_map(
     let resource_json = serde_json::to_string(&cm.resource_json).ok();
     let now = utc_now();
 
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR REPLACE INTO concept_maps
          (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        rusqlite::params![
+    )
+    .and_then(|mut s| {
+        s.execute(rusqlite::params![
             cm.id,
             cm.url,
             cm.version,
@@ -321,25 +571,26 @@ fn write_concept_map(
             cm.status,
             resource_json,
             now
-        ],
-    )
+        ])
+    })
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    const INSERT_ELEMENT_SQL: &str = "INSERT OR IGNORE INTO concept_map_elements
+         (map_id, source_system, source_code, target_system, target_code, equivalence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
     for el in &cm.elements {
-        conn.execute(
-            "INSERT OR IGNORE INTO concept_map_elements
-             (map_id, source_system, source_code, target_system, target_code, equivalence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                cm.id,
-                el.source_system,
-                el.source_code,
-                el.target_system,
-                el.target_code,
-                el.equivalence
-            ],
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        conn.prepare_cached(INSERT_ELEMENT_SQL)
+            .and_then(|mut s| {
+                s.execute(rusqlite::params![
+                    cm.id,
+                    el.source_system,
+                    el.source_code,
+                    el.target_system,
+                    el.target_code,
+                    el.equivalence
+                ])
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
     }
 
     stats.concept_maps += 1;
@@ -350,12 +601,32 @@ fn write_concept_map(
 
 /// Look up a CodeSystem's canonical URL by its FHIR resource `id`.
 ///
+/// Falls back to matching the original FHIR id stored inside `resource_json`
+/// when the synthetic storage id (`<id>|<version>`) doesn't directly match —
+/// this is what CRUD callers see in URL paths like `/CodeSystem/version`.
+/// When several versions share the same FHIR id we return the latest version
+/// (sorted descending as text) so the caller has a defined target.
+///
 /// Returns `Ok(None)` when no code system with that `id` exists.
 #[cfg(feature = "sqlite")]
 pub(crate) fn get_code_system_url(conn: &Connection, id: &str) -> Result<Option<String>, HtsError> {
     use rusqlite::OptionalExtension;
+    if let Some(url) = conn
+        .query_row(
+            "SELECT url FROM code_systems WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+    {
+        return Ok(Some(url));
+    }
     conn.query_row(
-        "SELECT url FROM code_systems WHERE id = ?1",
+        "SELECT url FROM code_systems \
+         WHERE json_extract(resource_json, '$.id') = ?1 \
+         ORDER BY COALESCE(version, '') DESC \
+         LIMIT 1",
         rusqlite::params![id],
         |row| row.get::<_, String>(0),
     )
@@ -382,13 +653,20 @@ pub(crate) fn invalidate_expansion_cache_for_system(
 }
 
 /// Delete a CodeSystem and all its normalized data by its FHIR resource `id`.
+///
+/// Multi-version: matches both the synthetic storage id (`<id>|<version>`)
+/// and the original FHIR id captured in `resource_json.id`, so a CRUD DELETE
+/// `/CodeSystem/version` removes every stored version of that resource.
 #[cfg(feature = "sqlite")]
 pub(crate) fn delete_code_system(conn: &Connection, id: &str) -> Result<(), HtsError> {
     conn.execute(
-        "DELETE FROM code_systems WHERE id = ?1",
+        "DELETE FROM code_systems \
+         WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
         rusqlite::params![id],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    crate::backends::sqlite::invalidate_cs_id_cache();
+    crate::backends::sqlite::invalidate_cs_language_cache();
     Ok(())
 }
 
@@ -418,6 +696,21 @@ pub(crate) fn delete_concept_map(conn: &Connection, id: &str) -> Result<(), HtsE
 
 fn utc_now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// Build a multi-version-safe storage id for a CodeSystem.
+///
+/// The HTS schema permits multiple `code_systems` rows that share a canonical
+/// `url` provided each row has a distinct `version`. Tx-ecosystem fixtures
+/// frequently ship the same FHIR `id` (e.g. `"version"`) for every version of
+/// a CodeSystem, so a 1:1 use of `id` would collide on the PK. Suffixing the
+/// version makes the storage id deterministic per (url, version) without
+/// forcing callers to thread the URL through.
+pub(crate) fn storage_id_for(fhir_id: &str, version: Option<&str>) -> String {
+    match version {
+        Some(v) if !v.is_empty() => format!("{fhir_id}|{v}"),
+        _ => fhir_id.to_owned(),
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -557,6 +850,89 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Two CodeSystems sharing a canonical URL but declaring distinct
+    /// `version` values (and the same FHIR `id`) must coexist.
+    ///
+    /// Mirrors `tx-ecosystem/tests/version/codesystem-version-{1,2}.json`,
+    /// which both ship `"id":"version"` + the same `url`. The legacy
+    /// `UNIQUE(url)` constraint dropped one of them; the new composite
+    /// `(url, version)` index lets both survive.
+    #[tokio::test]
+    async fn import_two_versions_same_url_keeps_both() {
+        let b = backend();
+        let ctx = ctx();
+
+        let bundle = r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "version",
+                "url": "http://example.org/cs/multi",
+                "version": "1.0.0",
+                "status": "active",
+                "content": "complete",
+                "concept": [{ "code": "code1", "display": "Display 1 (1.0)" }]
+              }
+            },
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "version",
+                "url": "http://example.org/cs/multi",
+                "version": "1.2.0",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  { "code": "code1", "display": "Display 1 (1.2)" },
+                  { "code": "code3", "display": "Display 3 (1.2)" }
+                ]
+              }
+            }
+          ]
+        }"#;
+
+        let stats = b.import_bundle(&ctx, bundle.as_bytes()).await.unwrap();
+        assert_eq!(stats.code_systems, 2);
+        assert!(
+            stats.errors.is_empty(),
+            "no errors expected, got: {:?}",
+            stats.errors
+        );
+
+        let conn = b.pool().get().unwrap();
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_systems WHERE url = 'http://example.org/cs/multi'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 2, "both versions must coexist");
+
+        // Each version owns its own concept set.
+        let v1_concepts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concepts c JOIN code_systems s ON c.system_id = s.id \
+                 WHERE s.url = 'http://example.org/cs/multi' AND s.version = '1.0.0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v2_concepts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concepts c JOIN code_systems s ON c.system_id = s.id \
+                 WHERE s.url = 'http://example.org/cs/multi' AND s.version = '1.2.0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v1_concepts, 1);
+        assert_eq!(v2_concepts, 2);
+    }
+
     #[tokio::test]
     async fn hierarchy_materialized_from_nesting() {
         let b = backend();
@@ -565,11 +941,19 @@ mod tests {
             .await
             .unwrap();
 
+        // Multi-version storage_id is opaque, so resolve it via URL first.
         let conn = b.pool().get().unwrap();
+        let system_id: String = conn
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = 'http://example.org/cs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM concept_hierarchy WHERE system_id='cs-test'",
-                [],
+                "SELECT COUNT(*) FROM concept_hierarchy WHERE system_id = ?1",
+                [&system_id],
                 |r| r.get(0),
             )
             .unwrap();

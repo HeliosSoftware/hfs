@@ -30,12 +30,27 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
+        // Reverse mode is set explicitly via `reverse=true`, *or* implicitly
+        // when the caller supplied `targetCode` instead of `sourceCode` (R5).
+        let reverse = req.reverse || req.target_code.is_some();
+        let lookup_code: &str = if req.target_code.is_some() {
+            req.target_code.as_deref().unwrap_or("")
+        } else {
+            req.code.as_str()
+        };
+        let (search_sys, other_side_sys) = if req.target_code.is_some() {
+            (req.target_system.as_deref(), req.system.as_deref())
+        } else {
+            (req.system.as_deref(), req.target_system.as_deref())
+        };
+
         let rows = query_translate_elements(
             &client,
-            &req.code,
-            req.system.as_deref(),
+            lookup_code,
+            search_sys,
+            other_side_sys,
             req.url.as_deref(),
-            req.reverse,
+            reverse,
             req.date.as_deref(),
         )
         .await?;
@@ -48,6 +63,9 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
                 concept_code: r.concept_code,
                 concept_display: r.display,
                 source: Some(r.map_url),
+                map_version: r.map_version,
+                source_system: r.input_system,
+                source_code: r.input_code,
             })
             .collect();
 
@@ -100,7 +118,11 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
 
         for (system_url, codes) in &by_system {
             let id_rows = client
-                .query("SELECT id FROM code_systems WHERE url = $1", &[system_url])
+                .query(
+                    "SELECT id FROM code_systems WHERE url = $1 \
+                     ORDER BY COALESCE(version, '') DESC LIMIT 1",
+                    &[system_url],
+                )
                 .await
                 .map_err(|e| HtsError::StorageError(format!("DB error: {e}")))?;
 
@@ -236,45 +258,56 @@ struct TranslateRow {
     concept_code: String,
     equivalence: String,
     map_url: String,
+    map_version: Option<String>,
     display: Option<String>,
+    input_system: Option<String>,
+    input_code: Option<String>,
 }
 
 /// Query `concept_map_elements` for matching translations.
 ///
 /// `reverse = false` (default): search source_code, return target.
 /// `reverse = true`: search target_code, return source.
+///
+/// `other_side_sys` restricts the result-side system (target side in forward
+/// mode, source side in reverse mode).
 async fn query_translate_elements(
     client: &tokio_postgres::Client,
     code: &str,
     system: Option<&str>,
+    other_side_sys: Option<&str>,
     map_url: Option<&str>,
     reverse: bool,
     date: Option<&str>,
 ) -> Result<Vec<TranslateRow>, HtsError> {
     let sql = if !reverse {
-        "SELECT cme.target_system, cme.target_code, cme.equivalence, cm.url, c.display
+        "SELECT cme.target_system, cme.target_code, cme.equivalence, cm.url, cm.version,
+                c.display, cme.source_system, cme.source_code
          FROM concept_map_elements cme
          JOIN concept_maps cm ON cm.id = cme.map_id
          LEFT JOIN code_systems cs_disp ON cs_disp.url = cme.target_system
          LEFT JOIN concepts c ON c.system_id = cs_disp.id AND c.code = cme.target_code
          WHERE cme.source_code = $1
            AND ($2::text IS NULL OR cme.source_system = $2)
-           AND ($3::text IS NULL OR cm.url = $3)
-           AND ($4::text IS NULL OR (cm.resource_json->>'date') <= $4)"
+           AND ($3::text IS NULL OR cme.target_system = $3)
+           AND ($4::text IS NULL OR cm.url = $4)
+           AND ($5::text IS NULL OR (cm.resource_json->>'date') <= $5)"
     } else {
-        "SELECT cme.source_system, cme.source_code, cme.equivalence, cm.url, c.display
+        "SELECT cme.source_system, cme.source_code, cme.equivalence, cm.url, cm.version,
+                c.display, cme.target_system, cme.target_code
          FROM concept_map_elements cme
          JOIN concept_maps cm ON cm.id = cme.map_id
          LEFT JOIN code_systems cs_disp ON cs_disp.url = cme.source_system
          LEFT JOIN concepts c ON c.system_id = cs_disp.id AND c.code = cme.source_code
          WHERE cme.target_code = $1
            AND ($2::text IS NULL OR cme.target_system = $2)
-           AND ($3::text IS NULL OR cm.url = $3)
-           AND ($4::text IS NULL OR (cm.resource_json->>'date') <= $4)"
+           AND ($3::text IS NULL OR cme.source_system = $3)
+           AND ($4::text IS NULL OR cm.url = $4)
+           AND ($5::text IS NULL OR (cm.resource_json->>'date') <= $5)"
     };
 
     let rows = client
-        .query(sql, &[&code, &system, &map_url, &date])
+        .query(sql, &[&code, &system, &other_side_sys, &map_url, &date])
         .await
         .map_err(|e| HtsError::StorageError(format!("Query error: {e}")))?;
 
@@ -285,7 +318,10 @@ async fn query_translate_elements(
             concept_code: row.get(1),
             equivalence: row.get(2),
             map_url: row.get(3),
-            display: row.get(4),
+            map_version: row.get(4),
+            display: row.get(5),
+            input_system: row.get(6),
+            input_code: row.get(7),
         })
         .collect())
 }

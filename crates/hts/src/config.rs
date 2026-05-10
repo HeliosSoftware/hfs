@@ -155,6 +155,9 @@ pub enum ImportFormat {
     /// FDA National Drug Code Directory (`product.txt` or `ndctext.zip`) — public domain
     #[value(name = "ndc")]
     Ndc,
+    /// Plain FHIR Bundle JSON file (.json) containing CodeSystem/ValueSet/ConceptMap resources
+    #[value(name = "fhir-bundle")]
+    FhirBundle,
 }
 
 impl fmt::Display for ImportFormat {
@@ -173,6 +176,7 @@ impl fmt::Display for ImportFormat {
             ImportFormat::Hl7V2Tables => write!(f, "hl7-v2-tables"),
             ImportFormat::Nucc => write!(f, "nucc"),
             ImportFormat::Ndc => write!(f, "ndc"),
+            ImportFormat::FhirBundle => write!(f, "fhir-bundle"),
         }
     }
 }
@@ -185,6 +189,7 @@ impl fmt::Display for ImportFormat {
 /// - `.rrf` (case-insensitive) → [`ImportFormat::Rxnorm`]
 /// - directory → [`ImportFormat::Rxnorm`]
 /// - `.zip` → peeks into the archive to distinguish formats
+/// - `.json` → peeks to check for `"resourceType":"Bundle"` → [`ImportFormat::FhirBundle`]
 /// - anything else → `None` (user must pass `--format`)
 pub fn detect_format(path: &Path) -> Option<ImportFormat> {
     let name = path
@@ -230,6 +235,9 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
     if name.ends_with(".zip") {
         return detect_zip_format(path);
     }
+    if name.ends_with(".json") {
+        return detect_json_format(path);
+    }
     None
 }
 
@@ -246,13 +254,27 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
     let mut zip = zip::ZipArchive::new(file).ok()?;
 
     for i in 0..zip.len() {
-        let entry = zip.by_index(i).ok()?;
+        let Ok(entry) = zip.by_index(i) else {
+            continue; // skip unreadable entries (zip64, encoding issues, etc.)
+        };
         let entry_name = entry.name().to_lowercase();
         if entry_name.contains("concept_full") || entry_name.contains("description_full") {
             return Some(ImportFormat::SnomedRf2);
         }
-        if entry_name.ends_with("loinctable.csv") {
-            return Some(ImportFormat::Loinc);
+        // Match the LOINC main table however it is named inside the ZIP.
+        // Official LOINC ZIPs use various layouts:
+        //   - Flat:  LoincTable.csv  (older releases)
+        //   - Flat:  Loinc.csv       (some releases)
+        //   - Nested: Loinc_2.77/LoincTable.csv
+        //   - Nested: Loinc_2.77/Loinc.csv
+        // The importer's find_loinc_paths() accepts any file whose filename
+        // starts with "loinc" and does not contain "panel" (to exclude panel
+        // supplements). Mirror that logic here so detection and parsing agree.
+        {
+            let fname = entry_name.rsplit('/').next().unwrap_or(&entry_name);
+            if fname.ends_with(".csv") && fname.starts_with("loinc") && !fname.contains("panel") {
+                return Some(ImportFormat::Loinc);
+            }
         }
         if entry_name.ends_with("rxnconso.rrf") {
             return Some(ImportFormat::Rxnorm);
@@ -293,6 +315,22 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
         if entry_name == "product.txt" || entry_name.ends_with("/product.txt") {
             return Some(ImportFormat::Ndc);
         }
+    }
+    None
+}
+
+/// Peek into a JSON file to detect whether it is a FHIR Bundle.
+///
+/// Reads the first 256 bytes and looks for `"resourceType"` + `"Bundle"`.
+/// Returns `None` when the file is not a FHIR Bundle or cannot be read.
+fn detect_json_format(path: &Path) -> Option<ImportFormat> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 256];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let preview = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    if preview.contains("\"resourceType\"") && preview.contains("\"Bundle\"") {
+        return Some(ImportFormat::FhirBundle);
     }
     None
 }
@@ -427,6 +465,37 @@ mod tests {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
             let opts = zip::write::FileOptions::default();
             zip.start_file("LoincTable.csv", opts).unwrap();
+            zip.write_all(b"dummy").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Loinc));
+    }
+
+    #[test]
+    fn detect_zip_loinc_plain_name() {
+        // Some LOINC releases ship as Loinc.csv (without "Table").
+        // detect_zip_format must still detect these as LOINC.
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("Loinc_2.80/Loinc.csv", opts).unwrap();
+            zip.write_all(b"dummy").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Loinc));
+    }
+
+    #[test]
+    fn detect_zip_loinc_nested_table() {
+        // LOINC ≥ 2.77 ships as Loinc_<ver>/LoincTable.csv (nested layout).
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("Loinc_2.77/LoincTable.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
         }

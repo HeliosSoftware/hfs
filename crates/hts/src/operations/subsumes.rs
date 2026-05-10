@@ -186,10 +186,15 @@ mod tests {
                         (3, 'cs1', 'C', 'Concept C'),
                         (4, 'cs1', 'D', 'Concept D');
 
-                 -- A → B → C  (direct edges only; recursive CTE traverses transitively)
+                 -- A → B → C  (direct edges only)
                  INSERT INTO concept_hierarchy (system_id, parent_code, child_code)
                  VALUES ('cs1', 'A', 'B'),
                         ('cs1', 'B', 'C');",
+            )
+            .unwrap();
+            crate::backends::sqlite::schema::build_concept_closure(
+                &backend.pool().get().unwrap(),
+                "cs1",
             )
             .unwrap();
         }

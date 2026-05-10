@@ -349,7 +349,7 @@ jobs:
           fetch-depth: 0 # Need full history for change detection
 
       - name: Download FhirPath Validator
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -395,7 +395,7 @@ jobs:
           ref: master
 
       - name: Extract and Setup FhirPath Validator
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -498,7 +498,7 @@ jobs:
         run: if not exist fhirpath-results mkdir fhirpath-results
 
       - name: Run FhirPath Validation with FHIR Test Cases
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const { execSync } = require('child_process');
@@ -782,7 +782,7 @@ jobs:
           merge-multiple: true
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: './book/book/'
 
@@ -1069,7 +1069,7 @@ jobs:
           - hts
     steps:
       - name: Download release binary
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');

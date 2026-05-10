@@ -72,7 +72,7 @@ jobs:
         run: cargo build -p helios-hts
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hts-bench-binary-${{ github.run_id }}
           path: target/debug/hts
@@ -102,7 +102,7 @@ jobs:
           path: tx-benchmark
 
       - name: Download HTS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: hts-bench-binary-${{ github.run_id }}
           path: .
@@ -180,6 +180,17 @@ jobs:
               --database-url "$DB_PATH" --batch-size 500 || true
           done
 
+          # ── Supplement: VSAC ValueSets not covered by us.nlm.vsac@0.17.0
+          # (EX04 pool entries for OIDs 2.16.840.1.113762.1.4.1267.17,
+          #  2.16.840.1.114222.24.7.14, 2.16.840.1.113762.1.4.1260.230,
+          #  2.16.840.1.113762.1.4.1078.781)
+          SUPPLEMENT="$GITHUB_WORKSPACE/crates/hts/terminology-data/vsac-supplement.bundle.json"
+          if [ -f "$SUPPLEMENT" ]; then
+            echo "Importing VSAC supplement..."
+            ./hts import "$SUPPLEMENT" \
+              --database-url "$DB_PATH" --batch-size 500 || true
+          fi
+
           # ── Source 2: licensed distributions from S3 (SNOMED, LOINC, ...)
           LICENSED_DIR="$GITHUB_WORKSPACE/licensed-terminology"
           rm -rf "$LICENSED_DIR"
@@ -209,7 +220,7 @@ jobs:
         run: |
           HTS_SERVER_PORT="${{ env.HTS_PORT }}" \
           HTS_DATABASE_URL="$HTS_DB" \
-          HTS_LOG_LEVEL="warn" \
+          HTS_LOG_LEVEL="info" \
             ./hts > /tmp/hts-bench.log 2>&1 &
 
           echo "HTS_PID=$!" >> "$GITHUB_ENV"
@@ -227,6 +238,11 @@ jobs:
             fi
             sleep 2
           done
+
+      # ── Tools (k6) ───────────────────────────────────────────────────────
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
 
       # ── Preflight ────────────────────────────────────────────────────────
 
@@ -253,7 +269,7 @@ jobs:
             echo "Passing tests: $PASSING"
           else
             # Preflight JSON was not written (path collision with colons on some runners)
-            PASSING="FS01,LK01,LK02,LK03,LK05,SS01,CM02"
+            PASSING="FS01,LK01,LK02,LK03,LK05,VC01,VC02,VC03,EX01,EX02,EX03,EX04,EX05,EX07,EX08,SS01,CM01,CM02"
             echo "passing_tests=$PASSING" >> "$GITHUB_OUTPUT"
             echo "Warning: preflight.json not found — using fallback test list: $PASSING"
           fi
@@ -280,6 +296,9 @@ jobs:
           echo "Running ${#TESTS[@]} test(s) × ${#VUS_LIST[@]} VU level(s) × $DURATION each"
           echo ""
 
+          # handleSummary() in k6/lib/runner.js writes to results/${RUN_ID}/${server}/benchmark/
+          mkdir -p "results/${{ github.run_id }}/hts/benchmark"
+
           for TEST in "${TESTS[@]}"; do
             TEST="${TEST// /}"
             [ -z "$TEST" ] && continue
@@ -292,6 +311,9 @@ jobs:
               k6 run \
                 --env BASE_URL="http://localhost:${{ env.HTS_PORT }}" \
                 --env SERVER_NAME=hts \
+                --env RUN_ID="${{ github.run_id }}" \
+                --env TEST_ID="$TEST" \
+                --env VUS="$VU" \
                 --duration "$DURATION" \
                 --vus "$VU" \
                 --summary-export "results/${{ github.run_id }}/hts/${TEST}_vu${VU}.json" \
@@ -361,19 +383,20 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hts-benchmark-${{ github.run_id }}
           path: tx-benchmark/results/
           retention-days: 90
 
       - name: Upload server log
-        if: failure()
-        uses: actions/upload-artifact@v4
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: hts-bench-server-log-${{ github.run_id }}
           path: /tmp/hts-bench.log
           retention-days: 7
+          if-no-files-found: ignore
 
       # ── Cleanup ──────────────────────────────────────────────────────────
 

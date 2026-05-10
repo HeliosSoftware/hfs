@@ -425,27 +425,41 @@ fn parse_concept_map(cm: &Value) -> Option<ParsedConceptMap> {
         let group_elements = group["element"].as_array().unwrap_or(&empty);
 
         for element in group_elements {
-            let source_code = element["code"].as_str().unwrap_or("").to_owned();
+            let raw_source_code = element["code"].as_str().unwrap_or("").to_owned();
             let targets = element["target"].as_array().unwrap_or(&empty);
+
+            // HL7 terminology package sometimes encodes multiple source codes as a
+            // comma-separated string (e.g. "unconfirmed, provisional"). Split them
+            // so each code gets its own row in concept_map_elements.
+            let source_codes: Vec<String> = raw_source_code
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
 
             for target in targets {
                 let target_code = target["code"].as_str().unwrap_or("").to_owned();
+                // R4 uses `equivalence`; R5 uses `relationship`. Accept either so
+                // ConceptMap fixtures from either FHIR version import correctly.
                 let equivalence = target["equivalence"]
                     .as_str()
+                    .or_else(|| target["relationship"].as_str())
                     .unwrap_or("equivalent")
                     .to_owned();
 
-                if source_code.is_empty() || target_code.is_empty() {
+                if raw_source_code.is_empty() || target_code.is_empty() {
                     continue;
                 }
 
-                elements.push(ParsedMapElement {
-                    source_system: source_system.clone(),
-                    source_code: source_code.clone(),
-                    target_system: target_system.clone(),
-                    target_code,
-                    equivalence,
-                });
+                for source_code in &source_codes {
+                    elements.push(ParsedMapElement {
+                        source_system: source_system.clone(),
+                        source_code: source_code.clone(),
+                        target_system: target_system.clone(),
+                        target_code: target_code.clone(),
+                        equivalence: equivalence.clone(),
+                    });
+                }
             }
         }
     }
@@ -566,6 +580,47 @@ mod tests {
         assert_eq!(cm.elements[0].source_code, "A");
         assert_eq!(cm.elements[0].target_code, "X");
         assert_eq!(cm.elements[0].equivalence, "equivalent");
+    }
+
+    /// R5 ConceptMap targets use `relationship` instead of R4's `equivalence`.
+    /// The parser should accept either form so tx-ecosystem fixtures import
+    /// regardless of which FHIR version they were authored against.
+    #[test]
+    fn concept_map_relationship_field_imports_as_equivalence() {
+        let bundle = br#"{
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "ConceptMap",
+                        "url": "http://example.org/cm-r5",
+                        "status": "active",
+                        "group": [
+                            {
+                                "source": "http://example.org/src",
+                                "target": "http://example.org/tgt",
+                                "element": [
+                                    {
+                                        "code": "code-1",
+                                        "target": [{
+                                            "code": "code1",
+                                            "relationship": "source-is-narrower-than-target"
+                                        }]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ]
+        }"#;
+        let parsed = parse_bundle(bundle).unwrap();
+        assert_eq!(parsed.concept_maps.len(), 1);
+        let elem = &parsed.concept_maps[0].elements[0];
+        assert_eq!(elem.source_code, "code-1");
+        assert_eq!(elem.target_code, "code1");
+        assert_eq!(elem.equivalence, "source-is-narrower-than-target");
     }
 
     #[test]

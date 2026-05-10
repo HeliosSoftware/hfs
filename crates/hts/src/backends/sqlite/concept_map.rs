@@ -79,7 +79,7 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
             let offset = i64::from(query.offset.unwrap_or(0));
 
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, url, version, name, title, status, resource_json
                      FROM concept_maps
                      WHERE (?1 IS NULL OR url = ?1)
@@ -150,14 +150,86 @@ fn translate_sync(
     conn: &Connection,
     req: &TranslateRequest,
 ) -> Result<TranslateResponse, HtsError> {
-    let rows = query_translate_elements(
+    // When a specific ConceptMap URL is requested, verify it exists first.
+    // A missing URL → 404 (not supported / not loaded), distinct from "no match found".
+    // Using EXISTS short-circuits on the first matching row (faster than COUNT(*)).
+    if let Some(url) = req.url.as_deref() {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM concept_maps WHERE url = ?1)",
+                [url],
+                |row| row.get(0),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        if !exists {
+            return Err(HtsError::NotFound(format!("ConceptMap not found: {url}")));
+        }
+    }
+
+    // Reverse mode is set explicitly via `reverse=true`, *or* implicitly when
+    // the caller supplied `targetCode` instead of `sourceCode` (R5 form).
+    let reverse = req.reverse || req.target_code.is_some();
+
+    // Pick the lookup code: in reverse-via-targetCode mode use `target_code`;
+    // otherwise use `code`.
+    let lookup_code: &str = if req.target_code.is_some() {
+        req.target_code.as_deref().unwrap_or("")
+    } else {
+        req.code.as_str()
+    };
+
+    // Pick the system that goes with the lookup code, and the "other side"
+    // restriction that applies to the result.
+    //   - Forward (default): search `req.system` (sourceSystem); restrict
+    //     result side to `req.target_system`.
+    //   - Reverse via `reverse=true`: callers historically pass the
+    //     target-side system in `req.system`; restrict result (source side)
+    //     to `req.target_system`.
+    //   - Reverse via `targetCode` (R5): search `req.target_system`;
+    //     restrict result (source side) to `req.system` (sourceSystem of
+    //     the request).
+    let (search_sys, other_side_sys) = if req.target_code.is_some() {
+        (req.target_system.as_deref(), req.system.as_deref())
+    } else {
+        (req.system.as_deref(), req.target_system.as_deref())
+    };
+
+    let mut rows = query_translate_elements(
         conn,
-        &req.code,
-        req.system.as_deref(),
+        lookup_code,
+        search_sys,
+        other_side_sys,
         req.url.as_deref(),
-        req.reverse,
+        reverse,
         req.date.as_deref(),
     )?;
+
+    // Some terminology packages encode multiple source codes as a comma-separated
+    // string (e.g. "unconfirmed, provisional"). After import those are stored as
+    // individual rows, but clients may still send the original compound string.
+    // When no exact match is found and the code contains a comma, try each
+    // individual token so compound-code queries still resolve.
+    if rows.is_empty() && lookup_code.contains(',') {
+        for token in lookup_code.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let token_rows = query_translate_elements(
+                conn,
+                token,
+                search_sys,
+                other_side_sys,
+                req.url.as_deref(),
+                reverse,
+                req.date.as_deref(),
+            )?;
+            if !token_rows.is_empty() {
+                rows = token_rows;
+                break;
+            }
+        }
+    }
 
     let matches: Vec<TranslationMatch> = rows
         .into_iter()
@@ -167,6 +239,9 @@ fn translate_sync(
             concept_code: r.concept_code,
             concept_display: r.display,
             source: Some(r.map_url),
+            map_version: r.map_version,
+            source_system: r.source_system,
+            source_code: r.source_code,
         })
         .collect();
 
@@ -184,84 +259,104 @@ fn translate_sync(
 }
 
 /// Internal row type for translate queries.
+///
+/// `concept_*` always carries the *target side* of the matched ConceptMap
+/// element (becomes `match.concept` in the response). `source_*` always
+/// carries the *source side* (becomes `match.source` in reverse responses).
+/// This shape is independent of forward vs reverse direction — see
+/// [`query_translate_elements`] for why.
 struct TranslateRow {
     concept_system: String,
     concept_code: String,
     equivalence: String,
     map_url: String,
+    map_version: Option<String>,
+    /// Reserved for future use. Currently always `None` because the IG
+    /// fixtures expect bare {system,code} Codings without `display`.
     display: Option<String>,
+    /// Source-side system (cme.source_system).
+    source_system: Option<String>,
+    /// Source-side code (cme.source_code).
+    source_code: Option<String>,
 }
 
 /// Query `concept_map_elements` for matching translations.
 ///
 /// Uses NULL-safe parameter binding so a single prepared statement handles
-/// all combinations of optional `system` and `map_url` filters:
+/// all combinations of optional system / target-system / map_url filters.
 ///
-/// ```sql
-/// WHERE search_code_col = ?1
-///   AND (?2 IS NULL OR search_sys_col = ?2)
-///   AND (?3 IS NULL OR cm.url = ?3)
-/// ```
+/// `reverse = false` (default): match by `source_code` = `code` and filter
+/// `source_system` by `system`. Result rows expose the *target* Coding as
+/// the "concept" output (`concept_system/code`) and the *source* Coding as
+/// the "source" output.
 ///
-/// `reverse = false` (default): search source_code, return target.
-/// `reverse = true`: search target_code, return source.
+/// `reverse = true`: match by `target_code` = `code` and filter `target_system`
+/// by `system`. Output columns still come from the same sides — `concept`
+/// from the target column pair, `source` from the source column pair —
+/// because the FHIR `$translate` response always emits the ConceptMap
+/// element's *target* Coding as `concept` and (when reversed) the
+/// element's *source* Coding as `source`.
+///
+/// `other_side_sys` restricts the *opposite* side: in forward mode it
+/// filters `target_system` (so callers can say "translate from source-CS
+/// into target-CS"); in reverse mode it filters `source_system` (so
+/// callers can say "what code in source-CS maps to this target-CS code?").
 fn query_translate_elements(
     conn: &Connection,
     code: &str,
     system: Option<&str>,
+    other_side_sys: Option<&str>,
     map_url: Option<&str>,
     reverse: bool,
     date: Option<&str>,
 ) -> Result<Vec<TranslateRow>, HtsError> {
-    // Column names depend on direction.
-    let (search_code_col, search_sys_col, disp_sys_col, disp_code_col, res_sys_col, res_code_col) =
-        if !reverse {
-            (
-                "cme.source_code",
-                "cme.source_system",
-                "cme.target_system",
-                "cme.target_code",
-                "cme.target_system",
-                "cme.target_code",
-            )
-        } else {
-            (
-                "cme.target_code",
-                "cme.target_system",
-                "cme.source_system",
-                "cme.source_code",
-                "cme.source_system",
-                "cme.source_code",
-            )
-        };
+    // The query matches against the *lookup* side (source for forward,
+    // target for reverse). The result columns are independent of direction:
+    // `concept` = always the target-side Coding of the ConceptMap element,
+    // `source` = always the source-side Coding. This matches the FHIR
+    // `$translate` semantics — see fhir-tx-ecosystem-ig translate-reverse
+    // fixture, which expects `concept` to carry the supplied `targetCode`
+    // (target side) and `source` to carry the resolved source code.
+    let (lookup_code_col, lookup_sys_col, other_sys_col) = if !reverse {
+        ("cme.source_code", "cme.source_system", "cme.target_system")
+    } else {
+        ("cme.target_code", "cme.target_system", "cme.source_system")
+    };
 
     // Inline the column names into the query string (no user input touches this).
     let sql = format!(
-        "SELECT {res_sys_col}, {res_code_col}, cme.equivalence, cm.url, c.display
+        "SELECT cme.target_system, cme.target_code, cme.equivalence,
+                cm.url, cm.version, NULL,
+                cme.source_system, cme.source_code
          FROM concept_map_elements cme
          JOIN concept_maps cm ON cm.id = cme.map_id
-         LEFT JOIN code_systems cs_disp ON cs_disp.url = {disp_sys_col}
-         LEFT JOIN concepts c ON c.system_id = cs_disp.id AND c.code = {disp_code_col}
-         WHERE {search_code_col} = ?1
-           AND (?2 IS NULL OR {search_sys_col} = ?2)
-           AND (?3 IS NULL OR cm.url = ?3)
-           AND (?4 IS NULL OR json_extract(cm.resource_json, '$.date') <= ?4)"
+         WHERE {lookup_code_col} = ?1
+           AND (?2 IS NULL OR {lookup_sys_col} = ?2)
+           AND (?3 IS NULL OR {other_sys_col} = ?3)
+           AND (?4 IS NULL OR cm.url = ?4)
+           AND (?5 IS NULL OR json_extract(cm.resource_json, '$.date') <= ?5)"
     );
 
     let mut stmt = conn
-        .prepare(&sql)
+        .prepare_cached(&sql)
         .map_err(|e| HtsError::StorageError(format!("Prepare error: {e}")))?;
 
     let rows = stmt
-        .query_map(rusqlite::params![code, system, map_url, date], |row| {
-            Ok(TranslateRow {
-                concept_system: row.get(0)?,
-                concept_code: row.get(1)?,
-                equivalence: row.get(2)?,
-                map_url: row.get(3)?,
-                display: row.get(4)?,
-            })
-        })
+        .query_map(
+            rusqlite::params![code, system, other_side_sys, map_url, date],
+            |row| {
+                Ok(TranslateRow {
+                    concept_system: row.get(0)?,
+                    concept_code: row.get(1)?,
+                    equivalence: row.get(2)?,
+                    map_url: row.get(3)?,
+                    map_version: row.get(4)?,
+                    display: row.get(5)?,
+                    source_system: row.get(6)?,
+                    source_code: row.get(7)?,
+                })
+            },
+        )
         .map_err(|e| HtsError::StorageError(format!("Query error: {e}")))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| HtsError::StorageError(format!("Row error: {e}")))?;
@@ -298,10 +393,12 @@ fn closure_sync(conn: &Connection, req: &ClosureRequest) -> Result<ClosureRespon
     let mut groups: Vec<serde_json::Value> = Vec::new();
 
     for (system_url, codes) in &by_system {
-        // Look up the internal code_system.id.
+        // Look up the internal code_system.id, picking the latest version when
+        // a URL has multiple stored revisions.
         let system_id_opt: Option<String> = conn
             .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1",
+                "SELECT id FROM code_systems WHERE url = ?1 \
+                 ORDER BY COALESCE(version, '') DESC LIMIT 1",
                 rusqlite::params![system_url],
                 |row| row.get(0),
             )
@@ -480,10 +577,9 @@ mod tests {
         assert_eq!(resp.matches.len(), 1);
         assert_eq!(resp.matches[0].concept_code, "X");
         assert_eq!(resp.matches[0].equivalence, "equivalent");
-        assert_eq!(
-            resp.matches[0].concept_display.as_deref(),
-            Some("X Display")
-        );
+        // The translate query no longer joins the `concepts` table for
+        // display lookups — IG fixtures expect bare {system, code} Codings.
+        assert_eq!(resp.matches[0].concept_display, None);
         assert_eq!(
             resp.matches[0].source.as_deref(),
             Some("http://example.org/cm")
@@ -550,15 +646,15 @@ mod tests {
         assert!(resp.result);
         assert_eq!(resp.matches[0].concept_code, "X");
 
-        // Filter by a non-existent map URL — should return no results.
+        // Filter by a non-existent map URL — should return NotFound.
         let req_bad = TranslateRequest {
             url: Some("http://unknown.org/cm".into()),
             system: Some("http://example.org/src".into()),
             code: "A".into(),
             ..Default::default()
         };
-        let resp_bad = backend.translate(&ctx, req_bad).await.unwrap();
-        assert!(!resp_bad.result);
+        let err = backend.translate(&ctx, req_bad).await.unwrap_err();
+        assert!(matches!(err, crate::error::HtsError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -578,8 +674,16 @@ mod tests {
         let resp = backend.translate(&ctx, req).await.unwrap();
         assert!(resp.result);
         assert_eq!(resp.matches.len(), 1);
-        assert_eq!(resp.matches[0].concept_code, "A");
-        assert_eq!(resp.matches[0].concept_system, "http://example.org/src");
+        // `concept_*` reflects the target side of the matched element
+        // (the supplied target code), `source_*` reflects the source side
+        // (the resolved source code) — see TranslateRow doc comment.
+        assert_eq!(resp.matches[0].concept_code, "X");
+        assert_eq!(resp.matches[0].concept_system, "http://example.org/tgt");
+        assert_eq!(resp.matches[0].source_code.as_deref(), Some("A"));
+        assert_eq!(
+            resp.matches[0].source_system.as_deref(),
+            Some("http://example.org/src")
+        );
     }
 
     #[tokio::test]
@@ -597,6 +701,62 @@ mod tests {
         let resp = backend.translate(&ctx, req).await.unwrap();
         assert!(resp.result);
         assert_eq!(resp.matches[0].concept_code, "X");
+    }
+
+    /// `target_system` filter restricts the result side, not just the request.
+    /// Without a candidate map matching the requested target system, no
+    /// matches should be returned.
+    #[tokio::test]
+    async fn translate_filtered_by_target_system_no_match() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        seed_db(&backend);
+
+        let ctx = TenantContext::system();
+        let req = TranslateRequest {
+            system: Some("http://example.org/src".into()),
+            target_system: Some("http://nope.example.org/cs".into()),
+            code: "A".into(),
+            ..Default::default()
+        };
+
+        let resp = backend.translate(&ctx, req).await.unwrap();
+        assert!(!resp.result);
+    }
+
+    /// Reverse via R5 `target_code` returns the source-side Coding fields and
+    /// uses `target_system` as the lookup-side restriction.
+    #[tokio::test]
+    async fn translate_reverse_via_target_code_returns_source_fields() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        seed_db(&backend);
+
+        let ctx = TenantContext::system();
+        let req = TranslateRequest {
+            // R5-style: sourceSystem narrows source side; targetCode/system
+            // identify the code being reverse-translated.
+            system: Some("http://example.org/src".into()),
+            target_system: Some("http://example.org/tgt".into()),
+            target_code: Some("X".into()),
+            // `code` left empty intentionally (driven by `target_code`).
+            code: String::new(),
+            ..Default::default()
+        };
+
+        let resp = backend.translate(&ctx, req).await.unwrap();
+        assert!(resp.result);
+        assert_eq!(resp.matches.len(), 1);
+        // `concept_*` is the target side (X in tgt CS) — matches the supplied
+        // targetCode. `source_*` is the source side (A in src CS) — the
+        // resolved code from the reverse lookup.
+        assert_eq!(resp.matches[0].concept_code, "X");
+        assert_eq!(resp.matches[0].concept_system, "http://example.org/tgt");
+        assert_eq!(resp.matches[0].source_code.as_deref(), Some("A"));
+        assert_eq!(
+            resp.matches[0].source_system.as_deref(),
+            Some("http://example.org/src")
+        );
+        // Map version is included so handlers can build originMap canonicals.
+        assert_eq!(resp.matches[0].map_version.as_deref(), Some("1.0"));
     }
 
     // ── $closure ───────────────────────────────────────────────────────────────

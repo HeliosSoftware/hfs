@@ -35,7 +35,14 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-        let all_codes = match resolve_value_set(&client, &url, req.date.as_deref()).await {
+        let all_codes = match resolve_value_set_versioned(
+            &client,
+            &url,
+            req.value_set_version.as_deref(),
+            req.date.as_deref(),
+        )
+        .await
+        {
             Ok((vs_id, compose_json)) => {
                 let cached = fetch_cache(&client, &vs_id).await?;
                 if cached.is_empty() {
@@ -101,6 +108,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 total: Some(total),
                 offset: None,
                 contains: tree,
+                warnings: vec![],
             });
         }
 
@@ -114,6 +122,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             total: Some(total),
             offset: req.offset,
             contains: page,
+            warnings: vec![],
         })
     }
 
@@ -134,18 +143,31 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-        let (vs_id, compose_json) =
-            match resolve_value_set(&client, &url, req.date.as_deref()).await {
-                Ok(vs) => vs,
-                Err(HtsError::NotFound(_)) => {
-                    return Ok(ValidateCodeResponse {
-                        result: false,
-                        message: Some(format!("Unknown value set: {url}")),
-                        display: None,
-                    });
-                }
-                Err(e) => return Err(e),
-            };
+        let (vs_id, compose_json) = match resolve_value_set_versioned(
+            &client,
+            &url,
+            req.value_set_version.as_deref(),
+            req.date.as_deref(),
+        )
+        .await
+        {
+            Ok(vs) => vs,
+            Err(HtsError::NotFound(_)) => {
+                return Ok(ValidateCodeResponse {
+                    result: false,
+                    message: Some(format!("Unknown value set: {url}")),
+                    display: None,
+                    system: None,
+                    cs_version: None,
+                    inactive: None,
+                    issues: vec![],
+                    caused_by_unknown_system: None,
+                    concept_status: None,
+                    normalized_code: None,
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         let cached = fetch_cache(&client, &vs_id).await?;
         let all_codes = if cached.is_empty() {
@@ -165,11 +187,26 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         };
 
         match found {
-            None => Ok(ValidateCodeResponse {
-                result: false,
-                message: Some(format!("Code '{}' is not in value set '{url}'", req.code)),
-                display: None,
-            }),
+            None => {
+                let qualified = match req.system.as_deref() {
+                    Some(s) => format!("{s}#{}", req.code),
+                    None => req.code.clone(),
+                };
+                Ok(ValidateCodeResponse {
+                    result: false,
+                    message: Some(format!(
+                        "The provided code '{qualified}' was not found in the value set '{url}'"
+                    )),
+                    display: None,
+                    system: None,
+                    cs_version: None,
+                    inactive: None,
+                    issues: vec![],
+                    caused_by_unknown_system: None,
+                    concept_status: None,
+                    normalized_code: None,
+                })
+            }
             Some(concept) => {
                 let mut message = None;
                 if let Some(expected) = req.display.as_deref() {
@@ -185,6 +222,13 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     result: message.is_none(),
                     message,
                     display: concept.display.clone(),
+                    system: None,
+                    cs_version: None,
+                    inactive: None,
+                    issues: vec![],
+                    caused_by_unknown_system: None,
+                    concept_status: None,
+                    normalized_code: None,
                 })
             }
         }
@@ -262,28 +306,50 @@ impl ValueSetOperations for PostgresTerminologyBackend {
 
 // ── Private helpers ────────────────────────────────────────────────────────────
 
-/// Resolve a value set by canonical URL and optional point-in-time date.
+/// Look up a ValueSet by canonical URL with an optional version pin.
 ///
-/// Returns `(id, compose_json)`.
-async fn resolve_value_set(
+/// Mirrors `sqlite::value_set::resolve_value_set_versioned`: when `version`
+/// is `Some`, only the matching `(url, version)` row is returned (or
+/// NotFound). When `version` is `None`, the highest-versioned row sharing
+/// the URL wins.
+async fn resolve_value_set_versioned(
     client: &tokio_postgres::Client,
     url: &str,
+    version: Option<&str>,
     date: Option<&str>,
 ) -> Result<(String, Option<String>), HtsError> {
     let rows = client
         .query(
-            "SELECT id, compose_json FROM value_sets
+            "SELECT id, compose_json, version FROM value_sets
              WHERE url = $1
-               AND ($2::text IS NULL OR (resource_json->>'date') <= $2)",
+               AND ($2::text IS NULL OR (resource_json->>'date') <= $2)
+             ORDER BY COALESCE(version, '') DESC",
             &[&url, &date],
         )
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| HtsError::NotFound(format!("ValueSet not found: {url}")))?;
+    if rows.is_empty() {
+        let qualified = match version {
+            Some(v) => format!("{url}|{v}"),
+            None => url.to_string(),
+        };
+        return Err(HtsError::NotFound(format!(
+            "A definition for the value Set \'{qualified}\' could not be found"
+        )));
+    }
+
+    let row = match version {
+        Some(v) => rows
+            .into_iter()
+            .find(|r| r.get::<_, Option<String>>(2).as_deref() == Some(v))
+            .ok_or_else(|| {
+                HtsError::NotFound(format!(
+                    "A definition for the value Set \'{url}|{v}\' could not be found"
+                ))
+            })?,
+        None => rows.into_iter().next().expect("non-empty"),
+    };
 
     Ok((row.get(0), row.get(1)))
 }
@@ -308,9 +374,17 @@ async fn fetch_cache(
         .into_iter()
         .map(|row| ExpansionContains {
             system: row.get(0),
+            version: None,
             code: row.get(1),
             display: row.get(2),
+            is_abstract: None,
+
             inactive: None,
+
+            designations: vec![],
+
+            properties: vec![],
+            extensions: vec![],
             contains: vec![],
         })
         .collect())
@@ -337,17 +411,14 @@ async fn compute_expansion(
             Some(s) if !s.is_empty() => s,
             _ => continue,
         };
+        let inc_version = inc["version"].as_str();
 
-        let rows = client
-            .query("SELECT id FROM code_systems WHERE url = $1", &[&system_url])
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-        let system_id: String = match rows.into_iter().next() {
-            Some(r) => r.get(0),
+        let system_id = match resolve_compose_system_id(client, system_url, inc_version).await? {
+            Some(id) => id,
             None => {
                 tracing::warn!(
                     system_url,
+                    inc_version,
                     "Skipping unknown code system in ValueSet compose"
                 );
                 continue;
@@ -373,9 +444,17 @@ async fn compute_expansion(
 
                 included.push(ExpansionContains {
                     system: system_url.to_owned(),
+                    version: None,
                     code,
                     display,
+                    is_abstract: None,
+
                     inactive: None,
+
+                    designations: vec![],
+
+                    properties: vec![],
+                    extensions: vec![],
                     contains: vec![],
                 });
             }
@@ -391,9 +470,17 @@ async fn compute_expansion(
             for row in code_rows {
                 included.push(ExpansionContains {
                     system: system_url.to_owned(),
+                    version: None,
                     code: row.get(0),
                     display: row.get(1),
+                    is_abstract: None,
+
                     inactive: None,
+
+                    designations: vec![],
+
+                    properties: vec![],
+                    extensions: vec![],
                     contains: vec![],
                 });
             }
@@ -422,6 +509,77 @@ async fn compute_expansion(
     Ok(included)
 }
 
+/// Resolve the storage id of the `code_systems` row matching the (url,
+/// optional version) pair declared on a `compose.include[]` entry.
+///
+/// Mirrors the SQLite helper: `1.x.x`-style patterns match the highest
+/// version sharing the literal segments, an exact version requires a literal
+/// match, and `None` falls back to the latest revision.
+async fn resolve_compose_system_id(
+    client: &tokio_postgres::Client,
+    url: &str,
+    version: Option<&str>,
+) -> Result<Option<String>, HtsError> {
+    let rows = client
+        .query(
+            "SELECT id, version FROM code_systems \
+             WHERE url = $1 \
+             ORDER BY COALESCE(version, '') DESC",
+            &[&url],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let candidates: Vec<(String, Option<String>)> = rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let chosen = match version {
+        Some(v) if v.contains(".x") || v == "x" || compose_short_version(v) => {
+            compose_select_version(&candidates, v)
+        }
+        Some(v) => candidates
+            .into_iter()
+            .find(|(_, ver)| ver.as_deref() == Some(v)),
+        None => candidates.into_iter().next(),
+    };
+    Ok(chosen.map(|(id, _)| id))
+}
+
+fn compose_short_version(ver: &str) -> bool {
+    !ver.contains('.') && ver.chars().all(|c| c.is_ascii_digit())
+}
+
+fn compose_select_version(
+    candidates: &[(String, Option<String>)],
+    pattern: &str,
+) -> Option<(String, Option<String>)> {
+    let segments: Vec<&str> = pattern.split('.').collect();
+    candidates
+        .iter()
+        .filter(|(_, v)| match v {
+            Some(actual) => compose_version_matches(actual, &segments),
+            None => false,
+        })
+        .max_by(|a, b| a.1.cmp(&b.1))
+        .cloned()
+}
+
+fn compose_version_matches(actual: &str, pattern_segments: &[&str]) -> bool {
+    let actual_segments: Vec<&str> = actual.split('.').collect();
+    if pattern_segments.len() > actual_segments.len() {
+        return false;
+    }
+    pattern_segments
+        .iter()
+        .zip(actual_segments.iter())
+        .all(|(p, a)| *p == "x" || *p == *a)
+}
+
 /// Find the canonical URL of a CodeSystem whose `valueSet` property equals `vs_url`.
 async fn find_cs_for_implicit_vs(
     client: &tokio_postgres::Client,
@@ -441,7 +599,11 @@ async fn find_cs_for_implicit_vs(
     rows.into_iter()
         .next()
         .map(|r| r.get::<_, String>(0))
-        .ok_or_else(|| HtsError::NotFound(format!("ValueSet not found: {vs_url}")))
+        .ok_or_else(|| {
+            HtsError::NotFound(format!(
+                "A definition for the value Set \'{vs_url}\' could not be found"
+            ))
+        })
 }
 
 /// Build a tree-structured expansion from a flat list of concepts.
@@ -468,7 +630,11 @@ async fn build_hierarchical_expansion(
     let mut system_id_map: HashMap<String, String> = HashMap::new();
     for sys_url in &system_urls {
         let rows = client
-            .query("SELECT id FROM code_systems WHERE url = $1", &[sys_url])
+            .query(
+                "SELECT id FROM code_systems WHERE url = $1 \
+                 ORDER BY COALESCE(version, '') DESC LIMIT 1",
+                &[sys_url],
+            )
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
         if let Some(row) = rows.into_iter().next() {
