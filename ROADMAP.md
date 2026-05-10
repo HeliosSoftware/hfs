@@ -37,6 +37,14 @@ These capabilities are available today in the current release.
 
 - [Audit logging (AuditEvent resource support)](crates/audit/README.md) — REST, auth, and lifecycle audit events with IHE BALP profiles
 
+**Terminology**
+
+- [Terminology service (HTS) — SQLite backend](crates/hts/README.md) — Standalone FHIR Terminology Server with `$lookup`, `$expand`, `$validate-code`, `$subsumes`, `$translate`, `$closure`, and bulk import for HL7 NPM packages, SNOMED CT RF2, LOINC, ICD-10-CM, and RxNorm
+
+**Messaging**
+
+- [FHIR Subscriptions](crates/subscriptions/README.md) — Topic-based notification support (R5 backport)
+
 **Analytics & Tooling**
 
 - [SQL on FHIR](crates/sof/README.md) — CLI and HTTP server
@@ -51,9 +59,9 @@ Work that is currently underway or planned for the near term.
 
 | Area | Item | Status |
 |------|------|--------|
-| **Standards** | [Terminology](https://github.com/HeliosSoftware/hfs/discussions/54) | 🟡 In progress |
+| **Standards** | [Terminology — PostgreSQL backend](https://github.com/HeliosSoftware/hfs/discussions/54) | 🟡 In progress |
 | **Standards** | FHIR Validation engine | 🔵 Design |
-| **Standards** | [FHIR Subscriptions — Topic-based notification support](https://github.com/HeliosSoftware/hfs/discussions/59) | 🟡 In progress |
+| **Standards** | Bulk Data API — Import and export (`$export` / `$import` operations) | 🔵 Design |
 | **Analytics** | [SQL on FHIR](https://sql-on-fhir.org/ig/latest/) — HFS integration and operations update | 🟡 In progress |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
@@ -61,10 +69,8 @@ Work that is currently underway or planned for the near term.
 
 We are actively developing community discussion documents on the following topics to gather feedback before implementation begins. These will be published as GitHub Discussions:
 
-- **[Terminology](https://github.com/HeliosSoftware/hfs/discussions/54)** — Defining how code systems, value sets, and concept maps will be managed
 - **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
-- **[Subscriptions](https://github.com/HeliosSoftware/hfs/discussions/59)** — Defining the approach for topic-based notification support
-- **SQL on FHIR** — Standalone `sof-cli` and `sof-server` already ship today; this effort integrates SQL on FHIR directly into HFS and brings all [SQL on FHIR operations](https://sql-on-fhir.org/ig/latest/operations.html) up to date with current spec progress
+- **Bulk Data API** — Defining the approach for `$export` / `$import` operations across HFS storage backends
 
 ---
 
@@ -74,7 +80,6 @@ These items are well-understood and will be picked up once current work complete
 
 ### FHIR Server Capabilities
 
-- **Bulk Data API** — Import and export (`$export` / `$import` operations)
 - **Persistence-layer audit events** — Wire audit logging for bulk export, purge, and reindex operations (audit functions exist, pending REST endpoints)
 
 ### Developer Experience
