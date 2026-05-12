@@ -910,6 +910,23 @@ async fn compute_expansion(
             }
         };
 
+        // Look up the resolved CS row's actual version, so each
+        // ExpansionContains can carry it. The compose-pin (`inc_version`)
+        // may be a wildcard pattern like "1.x" that resolved to the
+        // concrete `1.0.0` — we want the concrete value to land on items
+        // and feed `used-codesystem` deduplication in `operations/expand.rs`.
+        // Mirrors the SQLite `cs_version.clone()` writes in
+        // `sqlite/value_set.rs:compute_expansion_with_versions`.
+        let cs_version: Option<String> = client
+            .query_opt(
+                "SELECT version FROM code_systems WHERE id = $1",
+                &[&system_id],
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.get::<_, Option<String>>(0));
+
         // Phase A: collect the candidate concepts dictated by `concept[]` or
         // by enumerating the whole CodeSystem.
         let mut candidates: Vec<ExpansionContains> =
@@ -934,7 +951,7 @@ async fn compute_expansion(
 
                     out.push(ExpansionContains {
                         system: system_url.to_owned(),
-                        version: None,
+                        version: cs_version.clone(),
                         code,
                         display,
                         is_abstract: None,
@@ -958,7 +975,7 @@ async fn compute_expansion(
                     .into_iter()
                     .map(|row| ExpansionContains {
                         system: system_url.to_owned(),
-                        version: None,
+                        version: cs_version.clone(),
                         code: row.get(0),
                         display: row.get(1),
                         is_abstract: None,
