@@ -910,69 +910,82 @@ async fn compute_expansion(
             }
         };
 
-        if let Some(explicit_codes) = inc["concept"].as_array() {
-            for entry in explicit_codes {
-                let code = match entry["code"].as_str() {
-                    Some(c) => c.to_owned(),
-                    None => continue,
-                };
+        // Phase A: collect the candidate concepts dictated by `concept[]` or
+        // by enumerating the whole CodeSystem.
+        let mut candidates: Vec<ExpansionContains> =
+            if let Some(explicit_codes) = inc["concept"].as_array() {
+                let mut out = Vec::with_capacity(explicit_codes.len());
+                for entry in explicit_codes {
+                    let code = match entry["code"].as_str() {
+                        Some(c) => c.to_owned(),
+                        None => continue,
+                    };
 
-                let disp_rows = client
+                    let disp_rows = client
+                        .query(
+                            "SELECT display FROM concepts WHERE system_id = $1 AND code = $2",
+                            &[&system_id, &code],
+                        )
+                        .await
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                    let display: Option<String> =
+                        disp_rows.into_iter().next().and_then(|r| r.get(0));
+
+                    out.push(ExpansionContains {
+                        system: system_url.to_owned(),
+                        version: None,
+                        code,
+                        display,
+                        is_abstract: None,
+                        inactive: None,
+                        designations: vec![],
+                        properties: vec![],
+                        extensions: vec![],
+                        contains: vec![],
+                    });
+                }
+                out
+            } else {
+                let code_rows = client
                     .query(
-                        "SELECT display FROM concepts WHERE system_id = $1 AND code = $2",
-                        &[&system_id, &code],
+                        "SELECT code, display FROM concepts WHERE system_id = $1 ORDER BY code",
+                        &[&system_id],
                     )
                     .await
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                code_rows
+                    .into_iter()
+                    .map(|row| ExpansionContains {
+                        system: system_url.to_owned(),
+                        version: None,
+                        code: row.get(0),
+                        display: row.get(1),
+                        is_abstract: None,
+                        inactive: None,
+                        designations: vec![],
+                        properties: vec![],
+                        extensions: vec![],
+                        contains: vec![],
+                    })
+                    .collect()
+            };
 
-                let display: Option<String> = disp_rows.into_iter().next().and_then(|r| r.get(0));
-
-                included.push(ExpansionContains {
-                    system: system_url.to_owned(),
-                    version: None,
-                    code,
-                    display,
-                    is_abstract: None,
-
-                    inactive: None,
-
-                    designations: vec![],
-
-                    properties: vec![],
-                    extensions: vec![],
-                    contains: vec![],
-                });
-            }
-        } else {
-            let code_rows = client
-                .query(
-                    "SELECT code, display FROM concepts WHERE system_id = $1 ORDER BY code",
-                    &[&system_id],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-            for row in code_rows {
-                included.push(ExpansionContains {
-                    system: system_url.to_owned(),
-                    version: None,
-                    code: row.get(0),
-                    display: row.get(1),
-                    is_abstract: None,
-
-                    inactive: None,
-
-                    designations: vec![],
-
-                    properties: vec![],
-                    extensions: vec![],
-                    contains: vec![],
-                });
-            }
+        // Phase B: narrow by `compose.include[].filter[]` (ANDed). Filters
+        // operate on the underlying CodeSystem; we intersect each filter's
+        // matching code set against `candidates`.
+        if let Some(filtered) =
+            apply_compose_filters_pg(client, system_url, &system_id, inc).await?
+        {
+            let keep: HashSet<String> = filtered.into_iter().map(|c| c.code).collect();
+            candidates.retain(|c| keep.contains(&c.code));
         }
+
+        included.extend(candidates);
     }
 
-    // Apply excludes.
+    // Apply excludes — both explicit `concept[]` entries AND `filter[]`
+    // entries (filters appear on exclude blocks too; same semantics).
     let excludes = compose["exclude"].as_array().unwrap_or(&empty_arr);
     let mut denied: HashSet<(String, String)> = HashSet::new();
 
@@ -985,6 +998,25 @@ async fn compute_expansion(
                 }
             }
         }
+
+        // Filter-based excludes: resolve system_id and apply the same filter
+        // helper, then add the resulting codes to the denied set.
+        if exc["filter"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+            && !exc_system.is_empty()
+        {
+            let exc_version = exc["version"].as_str();
+            if let Some(exc_system_id) =
+                resolve_compose_system_id(client, &exc_system, exc_version).await?
+                && let Some(filtered) =
+                    apply_compose_filters_pg(client, &exc_system, &exc_system_id, exc).await?
+            {
+                for item in filtered {
+                    denied.insert((exc_system.clone(), item.code));
+                }
+            }
+        }
     }
 
     if !denied.is_empty() {
@@ -992,6 +1024,255 @@ async fn compute_expansion(
     }
 
     Ok(included)
+}
+
+/// Apply `compose.include[].filter[]` (or `compose.exclude[].filter[]`) to
+/// produce the set of concepts the filter chain matches in the underlying
+/// CodeSystem identified by (`system_url`, `system_id`).
+///
+/// Returns:
+/// - `Ok(None)` when the block carries no filters.
+/// - `Ok(Some(vec))` with the AND-intersection of every filter's match set.
+///
+/// Supported ops:
+/// - `=` (and single-value `in`): property-equality on `concept_properties`,
+///   with boolean-style "absence means false" for the `= false` case.
+/// - `is-a`: a recursive CTE walking `concept_hierarchy` downward from the
+///   root (including the root itself).
+/// - `regex`: POSIX ERE match against `code` or `display` via PG's `~`.
+///
+/// Unsupported ops (`descendent-of`, `descendant-of`, `generalizes`, `in`
+/// multi-value, `not-in`, `exists`, `child-of`, …) currently emit a
+/// `tracing::warn!` and contribute an empty set to the AND, which collapses
+/// the include. TODO: parity — these are handled in SQLite via
+/// [`crates::hts::backends::sqlite::value_set::apply_compose_filters`].
+async fn apply_compose_filters_pg(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    inc: &serde_json::Value,
+) -> Result<Option<Vec<ExpansionContains>>, HtsError> {
+    let filters = match inc["filter"].as_array() {
+        Some(f) if !f.is_empty() => f,
+        _ => return Ok(None),
+    };
+
+    let mut result: Option<HashSet<String>> = None;
+    let mut display_map: HashMap<String, Option<String>> = HashMap::new();
+
+    for f in filters {
+        let property = f["property"].as_str().unwrap_or("");
+        let op = f["op"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+
+        let matches: Vec<(String, Option<String>)> = match op {
+            "=" => {
+                pg_filter_property_eq(client, system_url, system_id, property, value).await?
+            }
+            // Single-value `in` reduces to equality. Multi-value (comma-
+            // separated) `in` is a TODO: parity gap.
+            "in" if !value.contains(',') => {
+                pg_filter_property_eq(client, system_url, system_id, property, value).await?
+            }
+            "is-a" => pg_filter_is_a(client, system_url, system_id, value).await?,
+            "regex" => pg_filter_regex(client, system_id, property, value).await?,
+            other => {
+                // TODO: parity — SQLite handles descendent-of/generalizes/
+                // child-of/not-in/!=/exists/multi-value-in. Treat them as
+                // empty set so the include collapses (rather than panicking
+                // or accidentally returning every concept).
+                tracing::warn!(
+                    system_url,
+                    property,
+                    op = other,
+                    value,
+                    "PG compose filter op not yet supported — treating as empty set"
+                );
+                Vec::new()
+            }
+        };
+
+        let code_set: HashSet<String> = matches
+            .iter()
+            .map(|(code, display)| {
+                // First-seen display wins; tolerates duplicates from the
+                // intersection of property and hierarchy filters.
+                display_map
+                    .entry(code.clone())
+                    .or_insert_with(|| display.clone());
+                code.clone()
+            })
+            .collect();
+
+        match result.as_mut() {
+            Some(prev) => prev.retain(|c| code_set.contains(c)),
+            None => result = Some(code_set),
+        }
+    }
+
+    let codes = result.unwrap_or_default();
+    let mut out: Vec<ExpansionContains> = codes
+        .into_iter()
+        .map(|code| {
+            let display = display_map.get(&code).cloned().unwrap_or(None);
+            ExpansionContains {
+                system: system_url.to_owned(),
+                version: None,
+                code,
+                display,
+                is_abstract: None,
+                inactive: None,
+                designations: vec![],
+                properties: vec![],
+                extensions: vec![],
+                contains: vec![],
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.code.cmp(&b.code));
+    Ok(Some(out))
+}
+
+/// Resolve every concept in `system_id` matching the FHIR property/value
+/// equality, honouring locally-renamed property aliases. Treats the literal
+/// string value `"false"` for boolean properties (e.g. `notSelectable`,
+/// `inactive`) as "property value != 'true' OR property absent" — matching
+/// the FHIR rule that boolean concept properties default to false when
+/// omitted, and mirroring SQLite's behaviour for the
+/// `notSelectable/expand-noprop-false` IG fixtures.
+async fn pg_filter_property_eq(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    let property_aliases = cs_property_local_codes(client, system_url, property).await;
+    // Heuristic: the literal lower-case "false" inverts the match for
+    // boolean properties (notSelectable/inactive). Any other value (incl.
+    // "true", "FALSE", "0", arbitrary strings) is a positive match.
+    let is_boolean_false = value.eq_ignore_ascii_case("false") && !value.eq_ignore_ascii_case("true");
+
+    let rows = if is_boolean_false {
+        // "= false" → concepts that do NOT have any (property=alias, value='true').
+        client
+            .query(
+                "SELECT c.code, c.display
+                   FROM concepts c
+                  WHERE c.system_id = $1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM concept_properties cp
+                         WHERE cp.concept_id = c.id
+                           AND cp.property = ANY($2::text[])
+                           AND cp.value = 'true'
+                    )",
+                &[&system_id, &property_aliases],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+    } else {
+        // Standard equality: concept has a property row matching the value.
+        client
+            .query(
+                "SELECT c.code, c.display
+                   FROM concepts c
+                  WHERE c.system_id = $1
+                    AND EXISTS (
+                        SELECT 1 FROM concept_properties cp
+                         WHERE cp.concept_id = c.id
+                           AND cp.property = ANY($2::text[])
+                           AND cp.value = $3
+                    )",
+                &[&system_id, &property_aliases, &value],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// Resolve `is-a` filter: the root code itself plus every descendant via
+/// `concept_hierarchy`. PG has no closure table yet (SQLite uses one for
+/// O(1) lookup) so we walk the hierarchy with a recursive CTE.
+async fn pg_filter_is_a(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    root_code: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    if root_code.is_empty() {
+        return Err(HtsError::VsInvalid(format!(
+            "The system {system_url} filter with property = concept, op = is-a has no value"
+        )));
+    }
+
+    let rows = client
+        .query(
+            "WITH RECURSIVE descendants AS (
+                 SELECT $2::text AS code
+                 UNION
+                 SELECT ch.child_code FROM concept_hierarchy ch
+                  JOIN descendants d ON ch.parent_code = d.code
+                  WHERE ch.system_id = $1
+             )
+             SELECT c.code, c.display
+               FROM concepts c
+              WHERE c.system_id = $1
+                AND c.code IN (SELECT code FROM descendants)",
+            &[&system_id, &root_code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// Regex match against the named property using PG's POSIX `~` operator.
+/// `property` must be `code` or `display`; other properties (matching a
+/// regex against a `concept_properties` value) is currently TODO: parity.
+async fn pg_filter_regex(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    let sql = match property {
+        "code" | "" => {
+            "SELECT c.code, c.display FROM concepts c
+              WHERE c.system_id = $1 AND c.code ~ $2"
+        }
+        "display" => {
+            "SELECT c.code, c.display FROM concepts c
+              WHERE c.system_id = $1 AND c.display ~ $2"
+        }
+        _ => {
+            // TODO: parity — regex against an arbitrary concept_properties
+            // value (SQLite materialises rows and matches in Rust).
+            tracing::warn!(
+                property,
+                value,
+                "PG regex filter on non-code/display property not yet supported"
+            );
+            return Ok(Vec::new());
+        }
+    };
+
+    let rows = client
+        .query(sql, &[&system_id, &value])
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
 }
 
 /// Resolve the storage id of the `code_systems` row matching the (url,
