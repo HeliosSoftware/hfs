@@ -347,12 +347,19 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         // that doesn't exist in the DB. Skipped on the `?fhir_vs` short-circuit
         // paths above (those already `return`ed).
         //
-        // The `version_loc` / `system_loc` arguments default to `Coding.*`
-        // here — the SQLite backend additionally varies them by `input_form`
-        // ("code", "codeableConcept", or unspecified). Ported as the default
-        // arm for parity with the most common case.
-        let version_loc = "Coding.version";
-        let system_loc = "Coding.system";
+        // Location strings depend on which FHIR input form was used (mirrors
+        // `sqlite/value_set.rs:1747-1754`). Tx-ecosystem fixtures pin the
+        // location/expression to "system" / "version" for bare `code` input,
+        // "CodeableConcept.coding[0].*" for CodeableConcept, and "Coding.*"
+        // otherwise.
+        let (version_loc, system_loc) = match req.input_form.as_deref() {
+            Some("code") => ("version", "system"),
+            Some("codeableConcept") => (
+                "CodeableConcept.coding[0].version",
+                "CodeableConcept.coding[0].system",
+            ),
+            _ => ("Coding.version", "Coding.system"),
+        };
         let vs_version_for_mismatch = lookup_value_set_version(&client, &url).await;
         let mismatch = if let Some(system) = req.system.as_deref() {
             // Short-circuit when the system itself isn't loaded — caller-facing
