@@ -406,11 +406,28 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 .collect();
             texts.sort_unstable();
             let message = texts.join("; ");
+            // Echo the code's display from the underlying CS even when the
+            // requested version is wrong — tx-ecosystem fixtures expect the
+            // \`display\` parameter on mismatch responses (the concept itself
+            // is still discoverable, only the version is unknown).
+            let system_unwrapped = req.system.clone().unwrap();
+            let display = client
+                .query_opt(
+                    "SELECT c.display FROM concepts c
+                     JOIN code_systems s ON s.id = c.system_id
+                     WHERE s.url = $1 AND c.code = $2
+                     ORDER BY COALESCE(s.version, '') DESC LIMIT 1",
+                    &[&system_unwrapped, &req.code],
+                )
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.get::<_, Option<String>>(0));
             return Ok(ValidateCodeResponse {
                 result: false,
                 message: Some(message),
-                display: None,
-                system: Some(req.system.clone().unwrap()),
+                display,
+                system: Some(system_unwrapped),
                 cs_version: echo_version,
                 inactive: None,
                 issues,
