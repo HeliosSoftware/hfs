@@ -166,7 +166,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .await
         };
 
-        let (all_codes, _compose_json_for_version): (Vec<ExpansionContains>, Option<String>) =
+        let (all_codes, compose_json_for_version): (Vec<ExpansionContains>, Option<String>) =
             match resolution {
                 Ok((vs_id, compose_json)) => {
                     let saved = compose_json.clone();
@@ -341,11 +341,82 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 Err(e) => return Err(e),
             };
 
+        // Version mismatch detection: verify the caller's version (when
+        // supplied) against stored CS versions and the VS include pin. Also
+        // fires when the caller supplies no version but the VS pins a version
+        // that doesn't exist in the DB. Skipped on the `?fhir_vs` short-circuit
+        // paths above (those already `return`ed).
+        //
+        // The `version_loc` / `system_loc` arguments default to `Coding.*`
+        // here — the SQLite backend additionally varies them by `input_form`
+        // ("code", "codeableConcept", or unspecified). Ported as the default
+        // arm for parity with the most common case.
+        let version_loc = "Coding.version";
+        let system_loc = "Coding.system";
+        let vs_version_for_mismatch = lookup_value_set_version(&client, &url).await;
+        let mismatch = if let Some(system) = req.system.as_deref() {
+            // Short-circuit when the system itself isn't loaded — caller-facing
+            // unknown-system messaging is handled elsewhere.
+            if !code_system_exists_inline(&client, system).await {
+                None
+            } else if let Some(req_ver) = req
+                .version
+                .as_deref()
+                .filter(|v| !v.is_empty() && !v.contains(".x") && *v != "x")
+            {
+                detect_cs_version_mismatch(
+                    &client,
+                    system,
+                    req_ver,
+                    compose_json_for_version.as_deref(),
+                    vs_version_for_mismatch.as_deref(),
+                    version_loc,
+                    system_loc,
+                )
+                .await
+            } else if req.version.is_none() {
+                // Caller supplied no version → check whether the VS include
+                // pins a version that doesn't exist in the DB.
+                detect_vs_pin_unknown(
+                    &client,
+                    system,
+                    compose_json_for_version.as_deref(),
+                    system_loc,
+                )
+                .await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((issues, caused_by, echo_version)) = mismatch {
+            let mut texts: Vec<&str> = issues
+                .iter()
+                .filter(|i| i.severity == "error")
+                .map(|i| i.text.as_str())
+                .collect();
+            texts.sort_unstable();
+            let message = texts.join("; ");
+            return Ok(ValidateCodeResponse {
+                result: false,
+                message: Some(message),
+                display: None,
+                system: Some(req.system.clone().unwrap()),
+                cs_version: echo_version,
+                inactive: None,
+                issues,
+                caused_by_unknown_system: caused_by,
+                concept_status: None,
+                normalized_code: None,
+            });
+        }
+
         // Search the expansion for the requested code.
         // TODO: parity — overload pattern (same (system, code) at multiple
         // pinned versions), version-pin candidate selection, inferSystem
-        // ambiguity branch, compose.inactive=false filter,
-        // detect_cs_version_mismatch / detect_vs_pin_unknown all skipped.
+        // ambiguity branch, compose.inactive=false filter all still skipped.
         let req_ver_exact: Option<&str> = req
             .version
             .as_deref()
@@ -1425,6 +1496,515 @@ async fn is_concept_abstract(
         .await
         .map(|r| r.get::<_, bool>(0))
         .unwrap_or(false)
+}
+
+// ── Version-mismatch detection ────────────────────────────────────────────────
+//
+// Ported from `crates/hts/src/backends/sqlite/value_set.rs` lines 6362–6896.
+// The two entry points are [`detect_cs_version_mismatch`] (caller pinned a
+// version) and [`detect_vs_pin_unknown`] (caller did not pin a version but the
+// VS compose did). IG fixtures match the message text byte-for-byte, so the
+// strings and message_ids here must stay aligned with the SQLite source.
+
+/// Inline `code_systems` existence check. The trait method
+/// `code_system_exists` takes `&self` and a `TenantContext`, which we don't
+/// have at the helper boundary — this just runs the same EXISTS query.
+async fn code_system_exists_inline(client: &tokio_postgres::Client, url: &str) -> bool {
+    client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1)",
+            &[&url],
+        )
+        .await
+        .map(|r| r.get::<_, bool>(0))
+        .unwrap_or(false)
+}
+
+/// Returns all non-null stored versions for a CS URL, sorted ascending for
+/// display in "Valid versions: X or Y" messages.
+async fn cs_all_stored_versions(client: &tokio_postgres::Client, system_url: &str) -> Vec<String> {
+    let rows = match client
+        .query(
+            "SELECT version FROM code_systems \
+             WHERE url = $1 AND version IS NOT NULL \
+             ORDER BY COALESCE(version, '') ASC",
+            &[&system_url],
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+    rows.into_iter()
+        .filter_map(|r| r.get::<_, Option<String>>(0))
+        .collect()
+}
+
+/// Format a list of versions as "X", "X or Y", or "X, Y or Z".
+fn format_valid_versions_msg(versions: &[String]) -> String {
+    match versions {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} or {second}"),
+        _ => {
+            let (last, rest) = versions.split_last().unwrap();
+            format!("{} or {}", rest.join(", "), last)
+        }
+    }
+}
+
+/// Return `Some(pin)` where `pin` is the version string (or `None` for a
+/// versionless include) when `system_url` appears in `compose.include[]`.
+/// Returns `None` when the system is not found in any include.
+fn vs_pinned_include_version(compose_json: &str, system_url: &str) -> Option<Option<String>> {
+    let compose: serde_json::Value = serde_json::from_str(compose_json).ok()?;
+    let includes = compose.get("include")?.as_array()?;
+    for inc in includes {
+        if inc.get("system").and_then(|v| v.as_str()) == Some(system_url) {
+            let ver = inc
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            return Some(ver);
+        }
+    }
+    None
+}
+
+/// Returns *all* `compose.include[].version` entries that target `system_url`.
+/// Used to detect the "overload" pattern where one VS includes multiple
+/// versions of the same CodeSystem — in that case a request whose version
+/// matches *any* included pin is acceptable, not just the first one.
+///
+/// Returns `Some(vec)` with one entry per matching include (`Some(version)` for
+/// pinned includes, `None` for versionless includes). Returns `None` when no
+/// include targets the given system at all.
+fn vs_all_pinned_include_versions(
+    compose_json: &str,
+    system_url: &str,
+) -> Option<Vec<Option<String>>> {
+    let compose: serde_json::Value = serde_json::from_str(compose_json).ok()?;
+    let includes = compose.get("include")?.as_array()?;
+    let mut hits: Vec<Option<String>> = Vec::new();
+    for inc in includes {
+        if inc.get("system").and_then(|v| v.as_str()) == Some(system_url) {
+            let ver = inc
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            hits.push(ver);
+        }
+    }
+    if hits.is_empty() { None } else { Some(hits) }
+}
+
+/// Resolve a version string against a set of `(id, version)` candidate pairs.
+/// Returns the matched full version string, or `None` when no candidate matches.
+///
+/// Rules:
+/// - Explicit `.x` wildcards or bare "x" → pattern matching.
+/// - Dot-containing versions ("1.0", "1.0.0") → prefix/pattern matching so
+///   "1.0" resolves to the best "1.0.x" stored version.
+/// - Single-integer versions ("1", "2") with no dot → EXACT match only.
+///   These are not resolved via prefix expansion because the IG test fixtures
+///   treat bare "1" as a distinct unrecognised version (producing
+///   UNKNOWN_CODESYSTEM_VERSION), not as an alias for "1.x.x".
+fn resolve_ver_against_candidates(
+    candidates: &[(String, Option<String>)],
+    ver: &str,
+) -> Option<String> {
+    if ver.contains(".x") || ver == "x" || ver.contains('.') {
+        // Pattern/prefix matching: "1.0" → highest "1.0.x", "1.x" → highest "1.y.z".
+        // Reuses the same matcher the compose-resolution helper above uses.
+        compose_select_version(candidates, ver).and_then(|(_, v)| v)
+    } else {
+        // Single-segment or non-semver: EXACT match only
+        candidates
+            .iter()
+            .find(|(_, v)| v.as_deref() == Some(ver))
+            .and_then(|(_, v)| v.clone())
+    }
+}
+
+/// Returns true if `version` satisfies the wildcard `pattern`.
+/// "1.x" matches "1.0.0", "1.2.0", etc. "1.0.x" matches "1.0.0", "1.0.1".
+/// "1.x.x" matches "1.0.0", "1.2.3", etc. (segment-wise: each "x" is any segment).
+fn version_satisfies_wildcard(version: &str, pattern: &str) -> bool {
+    if pattern == "x" {
+        return true;
+    }
+    // Segment-wise comparison: each pattern segment of "x" matches any version segment.
+    // A trailing "x" segment also matches "any number of remaining segments" (greedy).
+    let pat_segs: Vec<&str> = pattern.split('.').collect();
+    let ver_segs: Vec<&str> = version.split('.').collect();
+
+    // If the pattern ends in "x", it can absorb extra version segments.
+    // Otherwise segment counts must match exactly.
+    let ends_with_x = pat_segs.last().is_some_and(|s| *s == "x");
+    if !ends_with_x && pat_segs.len() != ver_segs.len() {
+        return false;
+    }
+    if ends_with_x && ver_segs.len() < pat_segs.len() - 1 {
+        return false;
+    }
+
+    for (i, ps) in pat_segs.iter().enumerate() {
+        if *ps == "x" {
+            // matches any version segment (or "absorbs" trailing if last)
+            continue;
+        }
+        match ver_segs.get(i) {
+            Some(vs) if vs == ps => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Check whether `req_ver` (caller-supplied CS version) conflicts with what is
+/// stored in the DB or pinned in the VS compose.
+///
+/// Returns `Some((issues, caused_by, echo_version))` when a mismatch is detected:
+/// - issues: validation issues to report
+/// - caused_by: `Some(url|ver)` canonical for the `x-caused-by-unknown-system`
+///   parameter (only when the requested version is missing from the DB).
+/// - echo_version: the CS version to echo in the response `version` parameter.
+///
+/// Returns `None` when there is no mismatch (caller should proceed normally).
+async fn detect_cs_version_mismatch(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    req_ver: &str,
+    compose_json: Option<&str>,
+    vs_version: Option<&str>,
+    version_loc: &str,
+    system_loc: &str,
+) -> Option<(
+    Vec<crate::types::ValidationIssue>,
+    Option<String>,
+    Option<String>,
+)> {
+    // Build (id, version) candidate list sorted desc so the first entry is the
+    // highest version — used for both resolution and picking the "actual" ver.
+    let rows = client
+        .query(
+            "SELECT id, version FROM code_systems \
+             WHERE url = $1 \
+             ORDER BY COALESCE(version, '') DESC",
+            &[&system_url],
+        )
+        .await
+        .ok()?;
+    let candidates: Vec<(String, Option<String>)> = rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect();
+
+    if candidates.is_empty() {
+        return None; // CS not in DB — handled by the not-found path elsewhere
+    }
+
+    // Resolve req_ver (handles short-forms like "1.0" → "1.0.0")
+    let resolved_req = resolve_ver_against_candidates(&candidates, req_ver);
+
+    // Parse compose to find include pin for this system. A VS may pin the
+    // same system to multiple versions (the "overload" pattern). When the
+    // requested version matches *any* of those pins, there is no mismatch.
+    let all_include_pins: Option<Vec<Option<String>>> =
+        compose_json.and_then(|cj| vs_all_pinned_include_versions(cj, system_url));
+    let include_pin: Option<Option<String>> =
+        compose_json.and_then(|cj| vs_pinned_include_version(cj, system_url));
+
+    // Highest stored version (for use in warning text when req_ver is missing)
+    let actual_ver: Option<String> = candidates.iter().find_map(|(_, v)| v.clone());
+
+    if resolved_req.is_none() {
+        // req_ver does not match any stored CS version → UNKNOWN_CODESYSTEM_VERSION
+        let all_versions = cs_all_stored_versions(client, system_url).await;
+        let valid_str = format_valid_versions_msg(&all_versions);
+        let error_text = format!(
+            "A definition for CodeSystem '{system_url}' version '{req_ver}' could not be found, \
+             so the code cannot be validated. Valid versions: {valid_str}"
+        );
+
+        // Optionally supplement with a VALUESET_VALUE_MISMATCH when a VS include
+        // provides context about which version was expected.
+        // - VS pins a specific (known) version that differs → VALUESET_VALUE_MISMATCH (error)
+        // - VS is versionless (effective = latest) and latest differs → VALUESET_VALUE_MISMATCH_DEFAULT (warning)
+        // - No VS context → no supplement
+        let extra: Option<(String, &str, &str)> = match include_pin.as_ref() {
+            Some(Some(inc_ver)) => Some((
+                format!(
+                    "The code system '{system_url}' version '{inc_ver}' in the ValueSet include \
+                     is different to the one in the value ('{req_ver}')"
+                ),
+                "VALUESET_VALUE_MISMATCH",
+                "error",
+            )),
+            Some(None) => {
+                let latest = actual_ver.as_deref().unwrap_or(req_ver);
+                Some((
+                    format!(
+                        "The code system '{system_url}' version '{latest}' for the versionless \
+                         include in the ValueSet include is different to the one in the value ('{req_ver}')"
+                    ),
+                    "VALUESET_VALUE_MISMATCH_DEFAULT",
+                    "warning",
+                ))
+            }
+            // No VS context — just UNKNOWN_CODESYSTEM_VERSION, no mismatch supplement.
+            None => None,
+        };
+
+        // Echo version: use the VS-pinned resolved version when available,
+        // otherwise use the highest stored version.
+        let echo_version: Option<String> = match include_pin.as_ref() {
+            Some(Some(inc_ver)) => {
+                resolve_ver_against_candidates(&candidates, inc_ver).or_else(|| actual_ver.clone())
+            }
+            _ => actual_ver.clone(),
+        };
+
+        let unknown_issue = crate::types::ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "not-found".into(),
+            tx_code: "not-found".into(),
+            text: error_text,
+            expression: Some(system_loc.into()),
+            location: Some(system_loc.into()),
+            message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
+        };
+        // Order: VALUESET_VALUE_MISMATCH (error) before UNKNOWN when present as error;
+        //        UNKNOWN before VALUESET_VALUE_MISMATCH_DEFAULT (warning).
+        let issues = match extra {
+            Some((mismatch_text, mismatch_id, "error")) => {
+                vec![
+                    crate::types::ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "invalid".into(),
+                        tx_code: "vs-invalid".into(),
+                        text: mismatch_text,
+                        expression: Some(version_loc.into()),
+                        location: Some(version_loc.into()),
+                        message_id: Some(mismatch_id.into()),
+                    },
+                    unknown_issue,
+                ]
+            }
+            Some((warn_text, warn_id, warn_sev)) => {
+                vec![
+                    unknown_issue,
+                    crate::types::ValidationIssue {
+                        severity: warn_sev.into(),
+                        fhir_code: "invalid".into(),
+                        tx_code: "vs-invalid".into(),
+                        text: warn_text,
+                        expression: Some(version_loc.into()),
+                        location: Some(version_loc.into()),
+                        message_id: Some(warn_id.into()),
+                    },
+                ]
+            }
+            None => vec![unknown_issue],
+        };
+        let caused_by = Some(format!("{system_url}|{req_ver}"));
+        return Some((issues, caused_by, echo_version));
+    }
+
+    let req_full = resolved_req.as_deref().unwrap_or(req_ver);
+
+    // "Overload" pattern: when the VS pins the same system to multiple
+    // versions, accept the request if it matches *any* of those pins. Without
+    // this short-circuit, the legacy single-pin code below picks the first
+    // include and emits a spurious VALUESET_VALUE_MISMATCH for callers whose
+    // version matches a later include.
+    if let Some(pins) = all_include_pins.as_ref() {
+        if pins.len() > 1 {
+            let any_match = pins.iter().any(|p| match p {
+                Some(v) if v.contains(".x") || v == "x" => version_satisfies_wildcard(req_full, v),
+                Some(v) => resolve_ver_against_candidates(&candidates, v)
+                    .map(|rv| rv == req_full)
+                    .unwrap_or_else(|| v == req_full),
+                // Versionless include: the effective version is the latest
+                // stored, which we'll have already accepted as `req_full`
+                // when it matches; otherwise flag below.
+                None => actual_ver.as_deref() == Some(req_full),
+            });
+            if any_match {
+                return None;
+            }
+        }
+    }
+
+    // req_ver exists in the CS. Check if the VS include pins a conflicting version.
+    match include_pin {
+        Some(Some(ref inc_ver)) => {
+            // When inc_ver is a wildcard pattern (e.g. "1.x"), check whether
+            // req_full satisfies it. If so, no mismatch — "1.0.0" matches "1.x".
+            if inc_ver.contains(".x") || inc_ver.as_str() == "x" {
+                if version_satisfies_wildcard(req_full, inc_ver.as_str()) {
+                    return None;
+                }
+            }
+
+            let resolved_inc = resolve_ver_against_candidates(&candidates, inc_ver);
+            let inc_full = resolved_inc.as_deref().unwrap_or(inc_ver.as_str());
+            if inc_full != req_full {
+                let mismatch_text = format!(
+                    "The code system '{system_url}' version '{inc_full}' in the ValueSet include \
+                     is different to the one in the value ('{req_full}')"
+                );
+                // When the VS pin itself doesn't exist in the DB, add UNKNOWN for
+                // the pin version (e.g. VS include has version "1" but only "1.0.0"
+                // and "1.2.0" are stored).
+                if resolved_inc.is_none() {
+                    let all_versions = cs_all_stored_versions(client, system_url).await;
+                    let valid_str = format_valid_versions_msg(&all_versions);
+                    let unknown_text = format!(
+                        "A definition for CodeSystem '{system_url}' version '{inc_ver}' could not \
+                         be found, so the code cannot be validated. Valid versions: {valid_str}"
+                    );
+                    let issues = vec![
+                        crate::types::ValidationIssue {
+                            severity: "error".into(),
+                            fhir_code: "invalid".into(),
+                            tx_code: "vs-invalid".into(),
+                            text: mismatch_text,
+                            expression: Some(version_loc.into()),
+                            location: Some(version_loc.into()),
+                            message_id: Some("VALUESET_VALUE_MISMATCH".into()),
+                        },
+                        crate::types::ValidationIssue {
+                            severity: "error".into(),
+                            fhir_code: "not-found".into(),
+                            tx_code: "not-found".into(),
+                            text: unknown_text,
+                            expression: Some(system_loc.into()),
+                            location: Some(system_loc.into()),
+                            message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
+                        },
+                    ];
+                    let caused_by = Some(format!("{system_url}|{inc_ver}"));
+                    // Echo req_full (the code's existing version) when pin doesn't exist.
+                    return Some((issues, caused_by, Some(req_full.to_string())));
+                }
+                // Both versions exist but differ → VALUESET_VALUE_MISMATCH only.
+                let issues = vec![crate::types::ValidationIssue {
+                    severity: "error".into(),
+                    fhir_code: "invalid".into(),
+                    tx_code: "vs-invalid".into(),
+                    text: mismatch_text,
+                    expression: Some(version_loc.into()),
+                    location: Some(version_loc.into()),
+                    message_id: Some("VALUESET_VALUE_MISMATCH".into()),
+                }];
+                // Echo inc_full (the VS-pinned version), not the requested version.
+                return Some((issues, None, Some(inc_full.to_string())));
+            }
+        }
+        Some(None) => {
+            // Versionless VS include: the effective CS version is the latest stored.
+            // When the caller requested a different (but existing) version, emit
+            // VALUESET_VALUE_MISMATCH (error) — same form as a pinned-version conflict.
+            //
+            // Exception: when the VS itself carries a wildcard version (e.g. "1.x")
+            // and req_full satisfies it (e.g. "1.0.0" satisfies "1.x"), no mismatch.
+            if let Some(vs_ver) = vs_version {
+                if (vs_ver.contains(".x") || vs_ver == "x")
+                    && version_satisfies_wildcard(req_full, vs_ver)
+                {
+                    return None;
+                }
+            }
+            let latest = actual_ver.as_deref().unwrap_or(req_ver);
+            if latest != req_full {
+                let mismatch_text = format!(
+                    "The code system '{system_url}' version '{latest}' in the ValueSet include \
+                     is different to the one in the value ('{req_full}')"
+                );
+                let issues = vec![crate::types::ValidationIssue {
+                    severity: "error".into(),
+                    fhir_code: "invalid".into(),
+                    tx_code: "vs-invalid".into(),
+                    text: mismatch_text,
+                    expression: Some(version_loc.into()),
+                    location: Some(version_loc.into()),
+                    message_id: Some("VALUESET_VALUE_MISMATCH".into()),
+                }];
+                // Echo the stored version (latest), not the requested version.
+                return Some((issues, None, actual_ver.clone()));
+            }
+        }
+        None => {} // No VS context — req_ver was found, no mismatch to report.
+    }
+
+    None // No mismatch detected
+}
+
+/// When the caller provides **no** version, check whether the VS include pins
+/// a version that doesn't exist in the DB.  Emits `UNKNOWN_CODESYSTEM_VERSION`
+/// (with `x-caused-by-unknown-system`) when the pin can't be resolved.
+///
+/// Returns `None` when there is no issue (versionless include, pin resolves
+/// OK, or no VS compose context).
+async fn detect_vs_pin_unknown(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    compose_json: Option<&str>,
+    system_loc: &str,
+) -> Option<(
+    Vec<crate::types::ValidationIssue>,
+    Option<String>,
+    Option<String>,
+)> {
+    let inc_ver = compose_json
+        .and_then(|cj| vs_pinned_include_version(cj, system_url))
+        .and_then(|pin| pin)?; // only when the include has an explicit version
+
+    // Build candidates for resolution
+    let rows = client
+        .query(
+            "SELECT id, version FROM code_systems \
+             WHERE url = $1 \
+             ORDER BY COALESCE(version, '') DESC",
+            &[&system_url],
+        )
+        .await
+        .ok()?;
+    let candidates: Vec<(String, Option<String>)> = rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // If the pin resolves to a stored version, there is no issue.
+    if resolve_ver_against_candidates(&candidates, &inc_ver).is_some() {
+        return None;
+    }
+
+    // Pin doesn't exist → report it as unknown.
+    let all_versions = cs_all_stored_versions(client, system_url).await;
+    let valid_str = format_valid_versions_msg(&all_versions);
+    let error_text = format!(
+        "A definition for CodeSystem '{system_url}' version '{inc_ver}' could not be found, \
+         so the code cannot be validated. Valid versions: {valid_str}"
+    );
+    let issues = vec![crate::types::ValidationIssue {
+        severity: "error".into(),
+        fhir_code: "not-found".into(),
+        tx_code: "not-found".into(),
+        text: error_text,
+        expression: Some(system_loc.into()),
+        location: Some(system_loc.into()),
+        message_id: Some("UNKNOWN_CODESYSTEM_VERSION".into()),
+    }];
+    let caused_by = Some(format!("{system_url}|{inc_ver}"));
+    // Echo the highest stored version when pin doesn't exist.
+    let echo_version = candidates.iter().find_map(|(_, v)| v.clone());
+    Some((issues, caused_by, echo_version))
 }
 
 // ── Response builder ──────────────────────────────────────────────────────────
