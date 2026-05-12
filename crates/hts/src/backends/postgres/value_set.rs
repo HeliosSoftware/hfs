@@ -1444,62 +1444,129 @@ async fn cs_version_exists(
         .unwrap_or(false)
 }
 
+/// Returns the local property codes that map to the FHIR-canonical
+/// `<canonical>` URI for the given CodeSystem URL. Always includes
+/// `<canonical>` itself plus any locally-renamed aliases declared on the
+/// CodeSystem `property[]` array (e.g. `not-selectable` aliased to
+/// `notSelectable` via `uri: http://hl7.org/fhir/concept-properties#notSelectable`).
+///
+/// Mirrors `sqlite/code_system.rs:1599`. Tx-ecosystem fixtures rename these
+/// properties locally and the FHIR spec allows it — queries hardcoded to the
+/// canonical name miss those concepts.
+async fn cs_property_local_codes(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    canonical: &str,
+) -> Vec<String> {
+    let mut codes: Vec<String> = vec![canonical.to_string()];
+    let row = match client
+        .query_opt(
+            "SELECT resource_json FROM code_systems \
+             WHERE url = $1 \
+             ORDER BY COALESCE(version, '') DESC LIMIT 1",
+            &[&system_url],
+        )
+        .await
+    {
+        Ok(Some(r)) => r,
+        _ => return codes,
+    };
+    let Some(v) = row.get::<_, Option<serde_json::Value>>(0) else {
+        return codes;
+    };
+    let suffix = format!("#{canonical}");
+    if let Some(props) = v.get("property").and_then(|p| p.as_array()) {
+        for p in props {
+            let uri = p.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+            if uri.ends_with(&suffix) || uri == canonical {
+                if let Some(local_code) = p.get("code").and_then(|c| c.as_str()) {
+                    if !codes.iter().any(|c| c == local_code) {
+                        codes.push(local_code.to_string());
+                    }
+                }
+            }
+        }
+    }
+    codes
+}
+
 /// `true` when the concept is flagged inactive in the underlying CodeSystem.
 ///
-/// TODO: parity — SQLite resolves locally-aliased property codes via
-/// `cached_inactive_property_codes`. The PG port only honours the canonical
-/// `status` and `inactive` property names. CodeSystems that rename the
-/// `inactive` property locally (e.g. via `concept-properties#inactive`
-/// declaration) will miss this lookup until the cache is ported.
+/// Honours both the canonical `status` property (value in {retired, inactive})
+/// AND the FHIR `inactive` boolean property, including locally-renamed
+/// aliases resolved via [`cs_property_local_codes`]. `deprecated` codes are
+/// intentionally excluded: per the FHIR concept-properties IG, deprecated
+/// codes are discouraged but still active (the `deprecated/` test group
+/// relies on this — deprecated codes survive `activeOnly=true` filtering).
 async fn is_concept_inactive(
     client: &tokio_postgres::Client,
     system_url: &str,
     code: &str,
 ) -> bool {
+    let inactive_codes = cs_property_local_codes(client, system_url, "inactive").await;
+    let placeholders = (3..=inactive_codes.len() + 2)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT EXISTS(
+             SELECT 1 FROM concept_properties cp
+             JOIN concepts c ON c.id = cp.concept_id
+             JOIN code_systems s ON s.id = c.system_id
+             WHERE s.url = $1 AND c.code = $2
+               AND (
+                   (cp.property = 'status' AND cp.value IN ('retired', 'inactive'))
+                OR (cp.property IN ({placeholders}) AND cp.value = 'true')
+               )
+         )"
+    );
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        Vec::with_capacity(inactive_codes.len() + 2);
+    params.push(&system_url);
+    params.push(&code);
+    for c in inactive_codes.iter() {
+        params.push(c as &(dyn tokio_postgres::types::ToSql + Sync));
+    }
     client
-        .query_one(
-            "SELECT EXISTS(
-                 SELECT 1 FROM concept_properties cp
-                 JOIN concepts c ON c.id = cp.concept_id
-                 JOIN code_systems s ON s.id = c.system_id
-                 WHERE s.url = $1 AND c.code = $2
-                   AND (
-                       (cp.property = 'status' AND cp.value IN ('retired', 'inactive'))
-                    OR (cp.property = 'inactive' AND cp.value = 'true')
-                   )
-             )",
-            &[&system_url, &code],
-        )
+        .query_one(&sql, params.as_slice())
         .await
         .map(|r| r.get::<_, bool>(0))
         .unwrap_or(false)
 }
 
 /// `true` when the concept is flagged abstract (`notSelectable`) in the
-/// underlying CodeSystem.
-///
-/// TODO: parity — SQLite resolves locally-aliased property codes via
-/// `cached_abstract_property_codes`. The PG port only honours the canonical
-/// `notSelectable` property. CodeSystems that rename it locally (e.g.
-/// `not-selectable` with a hyphen, as some tx-ecosystem fixtures do) will
-/// miss this lookup until the cache is ported.
+/// underlying CodeSystem. Resolves locally-renamed aliases via
+/// [`cs_property_local_codes`] (e.g. `not-selectable` with a hyphen, as
+/// several tx-ecosystem fixtures use).
 async fn is_concept_abstract(
     client: &tokio_postgres::Client,
     system_url: &str,
     code: &str,
 ) -> bool {
+    let abstract_codes = cs_property_local_codes(client, system_url, "notSelectable").await;
+    let placeholders = (3..=abstract_codes.len() + 2)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT EXISTS(
+             SELECT 1 FROM concept_properties cp
+             JOIN concepts c ON c.id = cp.concept_id
+             JOIN code_systems s ON s.id = c.system_id
+             WHERE s.url = $1 AND c.code = $2
+               AND cp.property IN ({placeholders})
+               AND cp.value = 'true'
+         )"
+    );
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        Vec::with_capacity(abstract_codes.len() + 2);
+    params.push(&system_url);
+    params.push(&code);
+    for c in abstract_codes.iter() {
+        params.push(c as &(dyn tokio_postgres::types::ToSql + Sync));
+    }
     client
-        .query_one(
-            "SELECT EXISTS(
-                 SELECT 1 FROM concept_properties cp
-                 JOIN concepts c ON c.id = cp.concept_id
-                 JOIN code_systems s ON s.id = c.system_id
-                 WHERE s.url = $1 AND c.code = $2
-                   AND cp.property = 'notSelectable'
-                   AND cp.value = 'true'
-             )",
-            &[&system_url, &code],
-        )
+        .query_one(&sql, params.as_slice())
         .await
         .map(|r| r.get::<_, bool>(0))
         .unwrap_or(false)
