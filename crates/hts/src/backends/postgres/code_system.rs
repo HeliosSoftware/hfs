@@ -248,6 +248,33 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
 
+    /// Existence-only check that skips reading the row's `resource_json`
+    /// blob — the trait default falls back to `search(url=…, count=1)`
+    /// which pulls multi-MB CodeSystem bodies just to drop them. Mirrors
+    /// the SQLite override at `sqlite/code_system.rs:679`; the SQLite
+    /// version also memoises across calls via `cs_exists_cache()` and
+    /// the PG impl will gain the same cache once the PG backend grows a
+    /// per-instance cache map (tracked under the Phase 2 work).
+    async fn code_system_exists(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<bool, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1)",
+                &[&url],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        Ok(row.get::<_, bool>(0))
+    }
+
     async fn code_system_language(
         &self,
         _ctx: &TenantContext,
