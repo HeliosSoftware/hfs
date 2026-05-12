@@ -603,16 +603,19 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         let found: Option<ExpansionContains> = if candidates.is_empty() {
             None
         } else if let Some(req_v) = req_ver_exact {
-            // Simplified overload handling: prefer exact-version match, else
-            // fall back to the single candidate when only one exists.
-            // TODO: parity — full overload selection logic from SQLite.
+            // Overload handling: when the caller pins a version, require an
+            // exact match. The only fallback we accept is when the single
+            // candidate has no version recorded at all (legacy/unversioned
+            // stored data). Otherwise treat as "code is in the VS but not at
+            // the requested version" → result: false. This is what the IG
+            // `overload/validate-bad-vXcodeY` fixtures expect.
             let exact_clone = candidates
                 .iter()
                 .find(|c| c.version.as_deref() == Some(req_v))
                 .map(|c| (*c).clone());
             if let Some(c) = exact_clone {
                 Some(c)
-            } else if candidates.len() == 1 {
+            } else if candidates.len() == 1 && candidates[0].version.is_none() {
                 candidates.into_iter().next().cloned()
             } else {
                 None
