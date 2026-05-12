@@ -1731,7 +1731,7 @@ async fn lookup_value_set_version(
 }
 
 /// Highest stored CodeSystem version for a URL.
-async fn cs_version_for_msg(
+pub(super) async fn cs_version_for_msg(
     client: &tokio_postgres::Client,
     system_url: &str,
 ) -> Option<String> {
@@ -1751,7 +1751,7 @@ async fn cs_version_for_msg(
 /// Look up the `content` column for a stored CodeSystem URL. `Some("fragment")`
 /// drives the `UNKNOWN_CODE_IN_FRAGMENT` warning shape in
 /// `finish_validate_code_response`.
-async fn cs_content_for_url(
+pub(super) async fn cs_content_for_url(
     client: &tokio_postgres::Client,
     system_url: &str,
 ) -> Option<String> {
@@ -1770,7 +1770,7 @@ async fn cs_content_for_url(
 
 /// Returns `true` when the CodeSystem at `system_url` has `caseSensitive: false`
 /// explicitly set. The FHIR default (absent) is treated as case-sensitive.
-async fn cs_is_case_insensitive(
+pub(super) async fn cs_is_case_insensitive(
     client: &tokio_postgres::Client,
     system_url: &str,
 ) -> bool {
@@ -1905,7 +1905,7 @@ async fn cs_property_local_codes(
 /// intentionally excluded: per the FHIR concept-properties IG, deprecated
 /// codes are discouraged but still active (the `deprecated/` test group
 /// relies on this — deprecated codes survive `activeOnly=true` filtering).
-async fn is_concept_inactive(
+pub(super) async fn is_concept_inactive(
     client: &tokio_postgres::Client,
     system_url: &str,
     code: &str,
@@ -1945,7 +1945,7 @@ async fn is_concept_inactive(
 /// underlying CodeSystem. Resolves locally-renamed aliases via
 /// [`cs_property_local_codes`] (e.g. `not-selectable` with a hyphen, as
 /// several tx-ecosystem fixtures use).
-async fn is_concept_abstract(
+pub(super) async fn is_concept_abstract(
     client: &tokio_postgres::Client,
     system_url: &str,
     code: &str,
@@ -2152,7 +2152,7 @@ fn version_satisfies_wildcard(version: &str, pattern: &str) -> bool {
 /// - echo_version: the CS version to echo in the response `version` parameter.
 ///
 /// Returns `None` when there is no mismatch (caller should proceed normally).
-async fn detect_cs_version_mismatch(
+pub(super) async fn detect_cs_version_mismatch(
     client: &tokio_postgres::Client,
     system_url: &str,
     req_ver: &str,
