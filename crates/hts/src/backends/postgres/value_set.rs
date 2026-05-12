@@ -413,20 +413,15 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             );
                         }
                         Err(_) => {
-                            return Ok(ValidateCodeResponse {
-                                result: false,
-                                message: Some(format!(
-                                    "A definition for the value Set '{url}' could not be found"
-                                )),
-                                display: None,
-                                system: None,
-                                cs_version: None,
-                                inactive: None,
-                                issues: vec![],
-                                caused_by_unknown_system: None,
-                                concept_status: None,
-                                normalized_code: None,
-                            });
+                            // No explicit VS, no `?fhir_vs` implicit form, no
+                            // CodeSystem.valueSet link — the canonical is truly
+                            // unresolvable. Bubble as `HtsError::NotFound` so
+                            // the handler emits a top-level OperationOutcome
+                            // (4xx) per the IG `version/*-vsbb-*` fixtures, not
+                            // a `Parameters { result: false }` wrapper.
+                            return Err(HtsError::NotFound(format!(
+                                "A definition for the value Set '{url}' could not be found"
+                            )));
                         }
                     }
                 }
