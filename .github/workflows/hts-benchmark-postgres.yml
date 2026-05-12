@@ -73,6 +73,12 @@ env:
   # same self-hosted runner if scheduled concurrently.
   HTS_PORT: 8098
   HTS_LICENSED_S3_URI: ${{ secrets.HTS_LICENSED_S3_URI }}
+  # The self-hosted runner talks to a REMOTE Docker daemon. Workflows
+  # set `DOCKER_HOST` (the TCP endpoint) and `DOCKER_HOST_IP` (the IP
+  # to reach published container ports from this runner). Same pattern
+  # used by `.github/workflows/audit-events.yml`.
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
@@ -146,22 +152,37 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./hts
 
-      # ── Backend env wiring ───────────────────────────────────────────────
+      # ── Backend env wiring (Docker-aware) ────────────────────────────────
       # `hts` reads HTS_STORAGE_BACKEND + HTS_DATABASE_URL from the env via
       # clap (see crates/hts/src/config.rs:59,63,352,356), so we export both
       # here and drop the per-call `--database-url` flag from every `./hts
       # import` line below.
+      #
+      # The container binds to `-p 0:5432` so the remote Docker daemon
+      # picks a free host-side port; we read it back via `docker port` and
+      # connect via `$DOCKER_HOST_IP:$PG_PORT`. Same pattern as
+      # `.github/workflows/audit-events.yml`.
+      - name: Determine runner / Docker host IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
       - name: Configure backend env
         run: |
-          PG_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
           PG_CONTAINER="hts-bench-pg-${{ github.run_id }}"
           {
-            echo "PG_PORT=$PG_PORT"
             echo "PG_CONTAINER=$PG_CONTAINER"
             echo "HTS_STORAGE_BACKEND=postgres"
-            echo "HTS_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:$PG_PORT/postgres"
           } >> "$GITHUB_ENV"
-          echo "Postgres: container=$PG_CONTAINER port=$PG_PORT"
+          echo "Container name: $PG_CONTAINER"
 
       - name: Start ephemeral Postgres
         run: |
@@ -175,25 +196,34 @@ jobs:
             --name "$PG_CONTAINER" \
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_DB=postgres \
-            -p "$PG_PORT:5432" \
+            -p 0:5432 \
             postgres:16 \
             -c shared_buffers=512MB \
             -c work_mem=64MB \
             -c max_connections=100 >/dev/null
 
           echo "Waiting for Postgres to accept connections..."
+          PG_PORT=""
           for i in $(seq 1 30); do
             if docker exec "$PG_CONTAINER" pg_isready -U postgres -d postgres >/dev/null 2>&1; then
-              echo "Postgres ready after $((i * 2))s"
-              break
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if [ -n "$PG_PORT" ] && timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "Postgres ready on $DOCKER_HOST_IP:$PG_PORT after $((i * 2))s"
+                break
+              fi
             fi
             if [ "$i" -eq 30 ]; then
-              echo "ERROR: Postgres did not become ready within 60s"
+              echo "ERROR: Postgres did not become reachable within 60s"
               docker logs "$PG_CONTAINER" | tail -100 || true
               exit 1
             fi
             sleep 2
           done
+
+          {
+            echo "PG_PORT=$PG_PORT"
+            echo "HTS_DATABASE_URL=postgresql://postgres:postgres@$DOCKER_HOST_IP:$PG_PORT/postgres"
+          } >> "$GITHUB_ENV"
 
       # ── AWS (for syncing licensed terminology from S3) ───────────────────
 
