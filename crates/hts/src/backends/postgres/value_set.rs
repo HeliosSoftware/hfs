@@ -59,7 +59,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 Ok((vs_id, compose_json)) => {
                     let cached = fetch_cache(&client, &vs_id).await?;
                     if cached.is_empty() {
-                        let codes = compute_expansion(&client, compose_json.as_deref()).await?;
+                        let codes = compute_expansion(
+                            &client,
+                            compose_json.as_deref(),
+                            &req.force_system_versions,
+                            &req.system_version_defaults,
+                        ).await?;
                         if let Some(limit) = req.max_expansion_size {
                             if codes.len() as u64 > u64::from(limit) {
                                 return Err(HtsError::TooCostly(format!(
@@ -83,7 +88,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         "include": [{ "system": cs_url }]
                     })
                     .to_string();
-                    let codes = compute_expansion(&client, Some(&compose)).await?;
+                    let codes = compute_expansion(
+                        &client,
+                        Some(&compose),
+                        &req.force_system_versions,
+                        &req.system_version_defaults,
+                    ).await?;
                     if let Some(limit) = req.max_expansion_size {
                         if codes.len() as u64 > u64::from(limit) {
                             return Err(HtsError::TooCostly(format!(
@@ -126,7 +136,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
 
             if let Some(compose_val) = compose {
                 let compose_str = compose_val.to_string();
-                let codes = compute_expansion(&client, Some(&compose_str)).await?;
+                let codes = compute_expansion(
+                    &client,
+                    Some(&compose_str),
+                    &req.force_system_versions,
+                    &req.system_version_defaults,
+                ).await?;
                 if let Some(limit) = req.max_expansion_size {
                     if codes.len() as u64 > u64::from(limit) {
                         return Err(HtsError::TooCostly(format!(
@@ -264,8 +279,20 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     let saved = compose_json.clone();
                     let cached = fetch_cache(&client, &vs_id).await?;
                     let codes = if cached.is_empty() {
-                        let codes =
-                            compute_expansion(&client, compose_json.as_deref()).await?;
+                        // ValidateCodeRequest doesn't carry the
+                        // force-system-version / system-version pins
+                        // (those are $expand-only request params), so
+                        // pass empty maps. The IG-level interaction
+                        // between validate-code and force-system-version
+                        // is handled separately via the version-mismatch
+                        // detector below.
+                        let empty: HashMap<String, String> = HashMap::new();
+                        let codes = compute_expansion(
+                            &client,
+                            compose_json.as_deref(),
+                            &empty,
+                            &empty,
+                        ).await?;
                         populate_cache(&mut client, &vs_id, &codes).await?;
                         codes
                     } else {
@@ -874,6 +901,8 @@ async fn fetch_cache(
 async fn compute_expansion(
     client: &tokio_postgres::Client,
     compose_json: Option<&str>,
+    force_system_versions: &HashMap<String, String>,
+    system_version_defaults: &HashMap<String, String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let Some(raw) = compose_json else {
         return Ok(vec![]);
@@ -891,7 +920,14 @@ async fn compute_expansion(
             Some(s) if !s.is_empty() => s,
             _ => continue,
         };
-        let inc_version = inc["version"].as_str();
+        // Override order (mirrors `operations/expand.rs` + SQLite):
+        //   force_system_versions[url] > include.version > system_version_defaults[url]
+        // `force-system-version` overrides even an explicit include pin;
+        // `system-version` only applies when the include omits version.
+        let forced = force_system_versions.get(system_url).map(String::as_str);
+        let raw_inc_version = inc["version"].as_str();
+        let defaulted = system_version_defaults.get(system_url).map(String::as_str);
+        let inc_version = forced.or(raw_inc_version).or(defaulted);
 
         let system_id = match resolve_compose_system_id(client, system_url, inc_version).await? {
             Some(id) => id,
@@ -1018,7 +1054,11 @@ async fn compute_expansion(
             .is_some_and(|a| !a.is_empty())
             && !exc_system.is_empty()
         {
-            let exc_version = exc["version"].as_str();
+            // Same override order as the include loop above.
+            let exc_forced = force_system_versions.get(&exc_system).map(String::as_str);
+            let exc_raw = exc["version"].as_str();
+            let exc_def = system_version_defaults.get(&exc_system).map(String::as_str);
+            let exc_version = exc_forced.or(exc_raw).or(exc_def);
             if let Some(exc_system_id) =
                 resolve_compose_system_id(client, &exc_system, exc_version).await?
                 && let Some(filtered) =
