@@ -57,7 +57,18 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .await
             {
                 Ok((vs_id, compose_json)) => {
-                    let cached = fetch_cache(&client, &vs_id).await?;
+                    // Bypass the value_set_expansions cache when the compose
+                    // describes a multi-version overload — its PRIMARY KEY
+                    // (vs_id, system_url, code) silently dedupes the second
+                    // version's row, dropping half the expansion. Recomputing
+                    // is cheap for these small overload ValueSets.
+                    let multi_version =
+                        compose_has_multi_version_pins(compose_json.as_deref());
+                    let cached = if multi_version {
+                        Vec::new()
+                    } else {
+                        fetch_cache(&client, &vs_id).await?
+                    };
                     if cached.is_empty() {
                         let codes = compute_expansion(
                             &client,
@@ -75,7 +86,9 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 )));
                             }
                         }
-                        populate_cache(&mut client, &vs_id, &codes).await?;
+                        if !multi_version {
+                            populate_cache(&mut client, &vs_id, &codes).await?;
+                        }
                         codes
                     } else {
                         cached
@@ -277,7 +290,16 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             match resolution {
                 Ok((vs_id, compose_json)) => {
                     let saved = compose_json.clone();
-                    let cached = fetch_cache(&client, &vs_id).await?;
+                    // Bypass the value_set_expansions cache when the compose
+                    // describes a multi-version overload (see expand path for
+                    // the same rationale).
+                    let multi_version =
+                        compose_has_multi_version_pins(compose_json.as_deref());
+                    let cached = if multi_version {
+                        Vec::new()
+                    } else {
+                        fetch_cache(&client, &vs_id).await?
+                    };
                     let codes = if cached.is_empty() {
                         // ValidateCodeRequest doesn't carry the
                         // force-system-version / system-version pins
@@ -293,7 +315,9 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             &empty,
                             &empty,
                         ).await?;
-                        populate_cache(&mut client, &vs_id, &codes).await?;
+                        if !multi_version {
+                            populate_cache(&mut client, &vs_id, &codes).await?;
+                        }
                         codes
                     } else {
                         cached
@@ -603,9 +627,25 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         let found: Option<ExpansionContains> = if candidates.is_empty() {
             None
         } else if let Some(req_v) = req_ver_exact {
-            // Simplified overload handling: prefer exact-version match, else
-            // fall back to the single candidate when only one exists.
-            // TODO: parity — full overload selection logic from SQLite.
+            // (1) Explicit version pin. When a candidate exists at the
+            // requested version use it directly.
+            //
+            // When no candidate matches the requested version we have to
+            // discriminate between two scenarios:
+            //   (a) Overload pattern (multiple candidates from different
+            //       versions, the requested version simply lacks the code):
+            //       returning None lets the not-in-VS + Unknown_Code_in_Version
+            //       diagnostics fire — what `validate-bad-v1code4` /
+            //       `validate-bad-v2code3` expect.
+            //   (b) Single-include / single-candidate case where the
+            //       requested version genuinely doesn't exist as a stored
+            //       CS row (the failure is UNKNOWN_CODESYSTEM_VERSION, not
+            //       Unknown_Code_in_Version): the IG `code-vbb-vs10`,
+            //       `simple-code-bad-version1`, etc. expect to still echo
+            //       the lone candidate's display so the consumer can see
+            //       which code's metadata is being shown — fall back.
+            //
+            // Mirrors `sqlite/value_set.rs:1644-1702`.
             let exact_clone = candidates
                 .iter()
                 .find(|c| c.version.as_deref() == Some(req_v))
@@ -613,7 +653,22 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             if let Some(c) = exact_clone {
                 Some(c)
             } else if candidates.len() == 1 {
-                candidates.into_iter().next().cloned()
+                let single = candidates.into_iter().next().cloned();
+                let code_at_req = if let Some(c) = single.as_ref() {
+                    is_code_in_cs_at_version(&client, &c.system, req_v, &c.code).await
+                } else {
+                    false
+                };
+                let req_version_exists = if let Some(c) = single.as_ref() {
+                    cs_version_exists(&client, &c.system, req_v).await
+                } else {
+                    false
+                };
+                if code_at_req || !req_version_exists {
+                    single
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -868,7 +923,7 @@ async fn fetch_cache(
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let rows = client
         .query(
-            "SELECT system_url, code, display
+            "SELECT system_url, code, display, version
              FROM value_set_expansions
              WHERE value_set_id = $1
              ORDER BY system_url, code",
@@ -881,7 +936,7 @@ async fn fetch_cache(
         .into_iter()
         .map(|row| ExpansionContains {
             system: row.get(0),
-            version: None,
+            version: row.get(3),
             code: row.get(1),
             display: row.get(2),
             is_abstract: None,
@@ -895,6 +950,43 @@ async fn fetch_cache(
             contains: vec![],
         })
         .collect())
+}
+
+/// Returns true when `compose_json` describes the "overload" pattern: at
+/// least one `system` URL appearing in `include[]` (or `exclude[]`) at
+/// multiple distinct `version` values. Used to bypass the
+/// `value_set_expansions` cache for those ValueSets — its PRIMARY KEY does
+/// not include `version`, so caching would silently dedupe `(system, code)`
+/// pairs that legitimately differ across versions.
+///
+/// Mirrors `sqlite/value_set.rs:compose_has_multi_version_pins`.
+fn compose_has_multi_version_pins(compose_json: Option<&str>) -> bool {
+    let cj = match compose_json {
+        Some(s) => s,
+        None => return false,
+    };
+    let compose: serde_json::Value = match serde_json::from_str(cj) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut by_system: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for key in ["include", "exclude"] {
+        if let Some(arr) = compose.get(key).and_then(|v| v.as_array()) {
+            for inc in arr {
+                let sys = match inc.get("system").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let ver = inc
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                by_system.entry(sys).or_default().insert(ver);
+            }
+        }
+    }
+    by_system.values().any(|s| s.len() > 1)
 }
 
 /// Compute an expansion from the raw `compose_json`.
@@ -1549,10 +1641,16 @@ async fn populate_cache(
 
     for item in codes {
         tx.execute(
-            "INSERT INTO value_set_expansions (value_set_id, system_url, code, display)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO value_set_expansions (value_set_id, system_url, code, display, version)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT DO NOTHING",
-            &[&vs_id, &item.system, &item.code, &item.display],
+            &[
+                &vs_id,
+                &item.system,
+                &item.code,
+                &item.display,
+                &item.version,
+            ],
         )
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -1870,7 +1968,6 @@ async fn is_code_in_cs_at_version(
 }
 
 /// Returns true when the (system_url, version) pair is stored as a CS row.
-#[allow(dead_code)]
 async fn cs_version_exists(
     client: &tokio_postgres::Client,
     system_url: &str,

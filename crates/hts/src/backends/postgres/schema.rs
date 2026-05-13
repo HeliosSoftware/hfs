@@ -133,13 +133,24 @@ BEGIN
 END $$;
 
 -- ── Value Set Expansions (materialized cache) ─────────────────────────────────
+-- `version` carries the resolved CodeSystem version for each cached entry so
+-- that callers reading from the cache can echo the right CS version on
+-- validate-code and so the version-pinned overload candidate-selection branch
+-- has the data it needs to discriminate. The PRIMARY KEY excludes `version`
+-- because PG PK columns must be NOT NULL — multi-version overload composes
+-- bypass the cache (`compose_has_multi_version_pins`) instead of relying on PK
+-- dedupe behaviour.
 CREATE TABLE IF NOT EXISTS value_set_expansions (
     value_set_id TEXT NOT NULL REFERENCES value_sets(id) ON DELETE CASCADE,
     system_url   TEXT NOT NULL,
     code         TEXT NOT NULL,
     display      TEXT,
+    version      TEXT,
     PRIMARY KEY (value_set_id, system_url, code)
 );
+-- Legacy installs may have a value_set_expansions table without the `version`
+-- column; add it idempotently so upgrades round-trip.
+ALTER TABLE value_set_expansions ADD COLUMN IF NOT EXISTS version TEXT;
 
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_maps (
