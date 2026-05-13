@@ -757,6 +757,34 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             }
         };
 
+        // When compose.inactive=false the VS excludes inactive concepts.
+        // The expansion may have been computed without applying this filter
+        // (the cache path doesn't honour it), so apply it here: when the
+        // matched concept is inactive in the underlying CS, treat it as
+        // not-found. The IG `inactive/validate-inactive-2a` fixture relies
+        // on this — code is in CS but inactive, VS pins inactive=false, so
+        // validate-code returns result=false plus the STATUS_CODE_WARNING_CODE
+        // issue. Mirrors sqlite/value_set.rs:1808-1822.
+        let compose_inactive_false = compose_json_for_version
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| v.get("inactive").and_then(|b| b.as_bool()))
+            == Some(false);
+        let found = if compose_inactive_false {
+            match found {
+                Some(c) => {
+                    if is_concept_inactive(&client, &c.system, &c.code).await {
+                        None
+                    } else {
+                        Some(c)
+                    }
+                }
+                None => None,
+            }
+        } else {
+            found
+        };
+
         let system_for_msg: Option<String> = req
             .system
             .clone()
