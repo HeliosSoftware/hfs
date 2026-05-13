@@ -1055,6 +1055,7 @@ async fn compute_expansion(
         let mut candidates: Vec<ExpansionContains> =
             if let Some(explicit_codes) = inc["concept"].as_array() {
                 let mut out = Vec::with_capacity(explicit_codes.len());
+                let mut seen_codes: HashSet<String> = HashSet::new();
                 for entry in explicit_codes {
                     let code = match entry["code"].as_str() {
                         Some(c) => c.to_owned(),
@@ -1080,6 +1081,7 @@ async fn compute_expansion(
                     };
                     let display: Option<String> = row.get(0);
 
+                    seen_codes.insert(code.clone());
                     out.push(ExpansionContains {
                         system: system_url.to_owned(),
                         version: cs_version.clone(),
@@ -1092,6 +1094,50 @@ async fn compute_expansion(
                         extensions: vec![],
                         contains: vec![],
                     });
+                }
+                // IG `parameters/parameters-expand-enum-*` semantics: when an
+                // explicitly-enumerated concept is abstract (notSelectable=true),
+                // its immediate children appear alongside it in the expansion
+                // — the IG fixture lists the children flat at the top level.
+                // PG doesn't yet recurse into `compose.include[].valueSet[]`
+                // refs (Cluster C), so we always run at "depth 0" effectively
+                // and don't need a depth guard. Mirrors sqlite/value_set.rs:3502-3543.
+                let mut abstract_codes_in_set: Vec<String> = Vec::new();
+                for c in &out {
+                    if is_concept_abstract(client, &c.system, &c.code).await {
+                        abstract_codes_in_set.push(c.code.clone());
+                    }
+                }
+                for parent_code in abstract_codes_in_set {
+                    let child_rows = client
+                        .query(
+                            "SELECT c.code, c.display
+                               FROM concept_hierarchy h
+                               JOIN concepts c
+                                 ON c.system_id = h.system_id AND c.code = h.child_code
+                              WHERE h.system_id = $1 AND h.parent_code = $2",
+                            &[&system_id, &parent_code],
+                        )
+                        .await
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    for row in child_rows {
+                        let child_code: String = row.get(0);
+                        let child_display: Option<String> = row.get(1);
+                        if seen_codes.insert(child_code.clone()) {
+                            out.push(ExpansionContains {
+                                system: system_url.to_owned(),
+                                version: cs_version.clone(),
+                                code: child_code,
+                                display: child_display,
+                                is_abstract: None,
+                                inactive: None,
+                                designations: vec![],
+                                properties: vec![],
+                                extensions: vec![],
+                                contains: vec![],
+                            });
+                        }
+                    }
                 }
                 out
             } else {
@@ -1227,12 +1273,13 @@ async fn apply_compose_filters_pg(
                 pg_filter_property_eq(client, system_url, system_id, property, value).await?
             }
             "is-a" => pg_filter_is_a(client, system_url, system_id, value).await?,
+            "child-of" => pg_filter_child_of(client, system_url, system_id, value).await?,
             "regex" => pg_filter_regex(client, system_id, property, value).await?,
             other => {
-                // TODO: parity — SQLite handles descendent-of/generalizes/
-                // child-of/not-in/!=/exists/multi-value-in. Treat them as
-                // empty set so the include collapses (rather than panicking
-                // or accidentally returning every concept).
+                // TODO: parity — SQLite also handles descendent-of/generalizes/
+                // not-in/!=/exists/multi-value-in. Treat them as empty set so
+                // the include collapses (rather than panicking or accidentally
+                // returning every concept).
                 tracing::warn!(
                     system_url,
                     property,
@@ -1386,44 +1433,30 @@ async fn pg_filter_is_a(
         .collect())
 }
 
-/// Regex match against the named property using PG's POSIX `~` operator.
-/// `property` must be `code` or `display`; other properties (matching a
-/// regex against a `concept_properties` value) is currently TODO: parity.
-async fn pg_filter_regex(
+/// Direct children of `parent_code` (one level only, parent NOT included).
+/// Mirrors the SQLite `child-of` filter semantics: returns the codes whose
+/// `concept_hierarchy.parent_code` literally equals the supplied code.
+async fn pg_filter_child_of(
     client: &tokio_postgres::Client,
+    system_url: &str,
     system_id: &str,
-    property: &str,
-    value: &str,
+    parent_code: &str,
 ) -> Result<Vec<(String, Option<String>)>, HtsError> {
-    let sql = match property {
-        "code" | "" => {
-            "SELECT c.code, c.display FROM concepts c
-              WHERE c.system_id = $1 AND c.code ~ $2"
-        }
-        "display" => {
-            "SELECT c.code, c.display FROM concepts c
-              WHERE c.system_id = $1 AND c.display ~ $2"
-        }
-        _ => {
-            // TODO: parity — regex against an arbitrary concept_properties
-            // value (SQLite materialises rows and matches in Rust).
-            tracing::warn!(
-                property,
-                value,
-                "PG regex filter on non-code/display property not yet supported"
-            );
-            return Ok(Vec::new());
-        }
-    };
-
-    // PG's `~` is POSIX regex and matches substrings unless anchored. The
-    // FHIR `regex` filter requires a full match (mirrors SQLite's `\A...\z`
-    // wrap at sqlite/value_set.rs:4727). Wrap the user pattern with
-    // `^(?:...)$` to enforce that.
-    let anchored = format!("^(?:{value})$");
+    if parent_code.is_empty() {
+        return Err(HtsError::VsInvalid(format!(
+            "The system {system_url} filter with property = concept, op = child-of has no value"
+        )));
+    }
 
     let rows = client
-        .query(sql, &[&system_id, &anchored])
+        .query(
+            "SELECT c.code, c.display
+               FROM concept_hierarchy h
+               JOIN concepts c
+                 ON c.system_id = h.system_id AND c.code = h.child_code
+              WHERE h.system_id = $1 AND h.parent_code = $2",
+            &[&system_id, &parent_code],
+        )
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -1431,6 +1464,97 @@ async fn pg_filter_regex(
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
         .collect())
+}
+
+/// Regex match against the named property using PG's POSIX `~` operator.
+/// `property` may be `code`, `display`, or any concept property name. For
+/// non-code/display properties the SQL pre-narrows by `concept_properties`
+/// rows for that property name (resolving FHIR-canonical aliases via
+/// `cs_property_local_codes`), then anchored regex is applied to the value.
+async fn pg_filter_regex(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    // The FHIR `regex` filter requires a full match. PG's `~` is POSIX
+    // regex and matches substrings unless anchored, and Rust's `regex`
+    // crate likewise matches anywhere unless anchored. Wrap once here
+    // (mirrors SQLite's `\A...\z` wrap at sqlite/value_set.rs:4727).
+    let anchored_sql = format!("^(?:{value})$");
+
+    match property {
+        "code" | "" => {
+            let rows = client
+                .query(
+                    "SELECT c.code, c.display FROM concepts c
+                      WHERE c.system_id = $1 AND c.code ~ $2",
+                    &[&system_id, &anchored_sql],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+                .collect())
+        }
+        "display" => {
+            let rows = client
+                .query(
+                    "SELECT c.code, c.display FROM concepts c
+                      WHERE c.system_id = $1 AND c.display ~ $2",
+                    &[&system_id, &anchored_sql],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+                .collect())
+        }
+        _ => {
+            // Match against a named property value. Pre-narrow at SQL to
+            // rows that carry the property, then anchored regex on the
+            // value in Rust (PG's POSIX regex differs subtly from Rust's;
+            // matching in Rust keeps results consistent with the
+            // code/display branches above and with SQLite).
+            //
+            // Mirrors sqlite/value_set.rs:4783-4827.
+            let regex = match regex::Regex::new(&anchored_sql) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(HtsError::VsInvalid(format!(
+                        "Invalid regex '{value}' on property '{property}': {e}"
+                    )));
+                }
+            };
+            let rows = client
+                .query(
+                    "SELECT c.code, c.display, cp.value
+                       FROM concept_properties cp
+                       JOIN concepts c ON c.id = cp.concept_id AND c.system_id = $1
+                      WHERE cp.property = $2",
+                    &[&system_id, &property],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+            // A concept may have multiple values for the same property; keep
+            // it if any value matches. Dedupe by code in case more than one
+            // value matches.
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut out: Vec<(String, Option<String>)> = Vec::new();
+            for r in rows {
+                let code: String = r.get(0);
+                let display: Option<String> = r.get(1);
+                let value: String = r.get(2);
+                if regex.is_match(&value) && seen.insert(code.clone()) {
+                    out.push((code, display));
+                }
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// Resolve the storage id of the `code_systems` row matching the (url,
