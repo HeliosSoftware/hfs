@@ -1433,9 +1433,17 @@ async fn compute_expansion_inner_body(
                 }
                 out
             } else {
+                // ORDER BY id preserves CodeSystem-defined insertion order
+                // (concepts.id is BIGSERIAL → monotonic), which is what FHIR
+                // expansion semantics require and what the IG
+                // `exclude/exclude-gender2` fixture pins (`male` first, not
+                // `female`). Concepts are inserted in the order they appear
+                // in the source CodeSystem.concept[] array, so the
+                // autoincrement column doubles as a stable definition-order
+                // column. Mirrors sqlite/value_set.rs:3547-3556.
                 let code_rows = client
                     .query(
-                        "SELECT code, display FROM concepts WHERE system_id = $1 ORDER BY code",
+                        "SELECT code, display FROM concepts WHERE system_id = $1 ORDER BY id",
                         &[&system_id],
                     )
                     .await
