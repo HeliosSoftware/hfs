@@ -1534,13 +1534,19 @@ async fn compute_expansion_inner_body(
                 // explicitly-enumerated concept is abstract (notSelectable=true),
                 // its immediate children appear alongside it in the expansion
                 // — the IG fixture lists the children flat at the top level.
-                // PG doesn't yet recurse into `compose.include[].valueSet[]`
-                // refs (Cluster C), so we always run at "depth 0" effectively
-                // and don't need a depth guard. Mirrors sqlite/value_set.rs:3502-3543.
+                // Skip when depth > 0: a contained-VS / nested ref (Cluster C)
+                // expansion is supposed to return EXACTLY the enumerated codes
+                // so that intersections with sibling refs are well-defined.
+                // The IG `simple/simple-expand-contained` fixture pins this:
+                // its #vs1 enumerates code2 and the expected expansion is
+                // exactly {code2} (not the auto-expanded {code2, code2a, code2b}).
+                // Mirrors sqlite/value_set.rs:3502-3543 (`if depth == 0`).
                 let mut abstract_codes_in_set: Vec<String> = Vec::new();
-                for c in &out {
-                    if is_concept_abstract(client, &c.system, &c.code).await {
-                        abstract_codes_in_set.push(c.code.clone());
+                if depth == 0 {
+                    for c in &out {
+                        if is_concept_abstract(client, &c.system, &c.code).await {
+                            abstract_codes_in_set.push(c.code.clone());
+                        }
                     }
                 }
                 for parent_code in abstract_codes_in_set {
