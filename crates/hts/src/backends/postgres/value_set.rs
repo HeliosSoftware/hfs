@@ -1281,6 +1281,41 @@ async fn compute_expansion_inner_body(
         let system_id = match resolve_compose_system_id(client, system_url, inc_version).await? {
             Some(id) => id,
             None => {
+                // Distinguish two flavours of "not resolved":
+                //   (a) the system URL itself isn't present in any
+                //       CodeSystem row → silent warning + empty contribution
+                //       (preserves the IG `*-not-found` fixtures).
+                //   (b) the system exists, but the include's pinned version
+                //       didn't match any stored CS version → bubble up as
+                //       UNKNOWN_CODESYSTEM_VERSION_EXP per IG
+                //       `version/vs-expand-v-wb` family. The operations
+                //       layer (operations/expand.rs:UNKNOWN_CS_VERSION_EXP_PREFIX)
+                //       recognises this sentinel and renders the proper 4xx
+                //       OperationOutcome.
+                //
+                // Mirrors sqlite/value_set.rs:3392-3429.
+                if let Some(inc_ver) = inc_version {
+                    let any_row: bool = client
+                        .query_one(
+                            "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1)",
+                            &[&system_url],
+                        )
+                        .await
+                        .map(|r| r.get::<_, bool>(0))
+                        .unwrap_or(false);
+                    if any_row {
+                        let all_versions = pg_cs_all_stored_versions(client, system_url).await;
+                        let valid_str = format_valid_versions_msg(&all_versions);
+                        let text = format!(
+                            "A definition for CodeSystem '{system_url}' version '{inc_ver}' \
+                             could not be found, so the value set cannot be expanded. \
+                             Valid versions: {valid_str}"
+                        );
+                        return Err(HtsError::NotFound(format!(
+                            "__UNKNOWN_CS_VERSION_EXP__:{text}"
+                        )));
+                    }
+                }
                 tracing::warn!(
                     system_url,
                     inc_version,
@@ -1573,6 +1608,39 @@ async fn compute_expansion_inner_body(
 /// - `#fragment` (contained-VS) refs are not resolved here — PG doesn't yet
 ///   thread an `InlineResolutionContext` for `contained[]` lookup, so they
 ///   warn and contribute an empty set.
+/// Return all stored versions of `system_url`, sorted ascending. Used to
+/// build the IG-spec "Valid versions: ..." text in
+/// UNKNOWN_CODESYSTEM_VERSION_EXP messages. Mirrors
+/// sqlite/value_set.rs:cs_all_stored_versions.
+async fn pg_cs_all_stored_versions(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+) -> Vec<String> {
+    client
+        .query(
+            "SELECT version FROM code_systems
+             WHERE url = $1 AND version IS NOT NULL
+             ORDER BY COALESCE(version, '') ASC",
+            &[&system_url],
+        )
+        .await
+        .map(|rows| rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+        .unwrap_or_default()
+}
+
+/// Format a list of versions as "X", "X or Y", or "X, Y or Z".
+fn format_valid_versions_msg(versions: &[String]) -> String {
+    match versions {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} or {second}"),
+        _ => {
+            let (last, rest) = versions.split_last().unwrap();
+            format!("{} or {}", rest.join(", "), last)
+        }
+    }
+}
+
 async fn pg_expand_vs_reference(
     client: &tokio_postgres::Client,
     ref_url: &str,

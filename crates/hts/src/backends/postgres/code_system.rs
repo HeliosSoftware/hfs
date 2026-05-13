@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 
 use crate::error::HtsError;
-use crate::traits::{CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags};
+use crate::traits::{CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags, SupplementInfo};
 use crate::types::{
     DesignationValue, LookupRequest, LookupResponse, PropertyValue, ResourceSearchQuery,
     SubsumesRequest, SubsumesResponse, SubsumptionOutcome, ValidateCodeRequest,
@@ -702,6 +702,36 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             let value: String = row.get(2);
             out.entry(code).or_default().push((prop, value));
         }
+
+        // FHIR `definition` is stored as a column on `concepts` rather than
+        // in concept_properties (it ships in a dedicated CodeSystem field).
+        // When the caller asks for `property=definition`, surface the column
+        // value so $expand emits it as a synthesised property — matches the
+        // IG `parameters/parameters-expand-*-definitions*` fixtures. Mirrors
+        // sqlite/code_system.rs:899-942.
+        if properties.iter().any(|p| p == "definition") {
+            let def_rows = client
+                .query(
+                    "SELECT c.code, c.definition
+                       FROM concepts c
+                       JOIN code_systems s ON s.id = c.system_id
+                      WHERE s.url = $1
+                        AND c.code = ANY($2)
+                        AND c.definition IS NOT NULL",
+                    &[&system_url, &codes],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            for row in def_rows {
+                let code: String = row.get(0);
+                let definition: String = row.get(1);
+                let entry = out.entry(code).or_default();
+                if !entry.iter().any(|(p, _)| p == "definition") {
+                    entry.push(("definition".to_string(), definition));
+                }
+            }
+        }
+
         Ok(out)
     }
 
@@ -912,6 +942,167 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             for (code, entry) in local {
                 out.entry(code).or_default().push(entry);
             }
+        }
+        Ok(out)
+    }
+
+    async fn supplement_target(
+        &self,
+        _ctx: &TenantContext,
+        supplement_url: &str,
+    ) -> Result<Option<SupplementInfo>, HtsError> {
+        // Supplements live in the same code_systems table as any other CS;
+        // distinguishing field is `content='supplement'` and a `supplements`
+        // pointer in resource_json. Mirrors sqlite/code_system.rs:1208-1259.
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+        let row = client
+            .query_opt(
+                "SELECT content, version, resource_json->>'supplements'
+                 FROM code_systems
+                 WHERE url = $1
+                 LIMIT 1",
+                &[&supplement_url],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let Some(r) = row else { return Ok(None) };
+        let content: String = r.get(0);
+        if content != "supplement" {
+            return Ok(None);
+        }
+        let version: Option<String> = r.get(1);
+        let target: Option<String> = r.get(2);
+        let Some(target_url) = target else {
+            return Ok(None);
+        };
+        let supplement_canonical = match version {
+            Some(v) => format!("{supplement_url}|{v}"),
+            None => supplement_url.to_owned(),
+        };
+        Ok(Some(SupplementInfo {
+            target_url,
+            supplement_canonical,
+        }))
+    }
+
+    async fn supplement_designations(
+        &self,
+        _ctx: &TenantContext,
+        supplement_urls: &[String],
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<ConceptDesignation>>, HtsError> {
+        if supplement_urls.is_empty() || codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+        // Mirrors sqlite/code_system.rs:1261-1345.
+        let rows = client
+            .query(
+                "SELECT c.code, cd.language, cd.use_system, cd.use_code, cd.value,
+                        s.url, s.version
+                   FROM concept_designations cd
+                   JOIN concepts c ON c.id = cd.concept_id
+                   JOIN code_systems s ON s.id = c.system_id
+                  WHERE s.url = ANY($1)
+                    AND s.content = 'supplement'
+                    AND c.code = ANY($2)",
+                &[&supplement_urls, &codes],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        let mut out: std::collections::HashMap<String, Vec<ConceptDesignation>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let code: String = row.get(0);
+            let language: Option<String> = row.get(1);
+            let use_system: Option<String> = row.get(2);
+            let use_code: Option<String> = row.get(3);
+            let value: String = row.get(4);
+            let supp_url: String = row.get(5);
+            let supp_ver: Option<String> = row.get(6);
+            let source = match supp_ver {
+                Some(v) => format!("{supp_url}|{v}"),
+                None => supp_url,
+            };
+            out.entry(code).or_default().push(ConceptDesignation {
+                language,
+                use_system,
+                use_code,
+                value,
+                source: Some(source),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn supplement_property_values(
+        &self,
+        _ctx: &TenantContext,
+        supplement_urls: &[String],
+        codes: &[String],
+        properties: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+        if supplement_urls.is_empty() || codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+        // Empty `properties` slice = "every property" (lookup wildcard mode).
+        // Mirrors sqlite/code_system.rs:1347-1434.
+        let want_all_props = properties.is_empty();
+        let rows = if want_all_props {
+            client
+                .query(
+                    "SELECT c.code, cp.property, cp.value
+                       FROM concept_properties cp
+                       JOIN concepts c ON c.id = cp.concept_id
+                       JOIN code_systems s ON s.id = c.system_id
+                      WHERE s.url = ANY($1)
+                        AND s.content = 'supplement'
+                        AND c.code = ANY($2)",
+                    &[&supplement_urls, &codes],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+        } else {
+            client
+                .query(
+                    "SELECT c.code, cp.property, cp.value
+                       FROM concept_properties cp
+                       JOIN concepts c ON c.id = cp.concept_id
+                       JOIN code_systems s ON s.id = c.system_id
+                      WHERE s.url = ANY($1)
+                        AND s.content = 'supplement'
+                        AND c.code = ANY($2)
+                        AND cp.property = ANY($3)",
+                    &[&supplement_urls, &codes, &properties],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+        };
+
+        let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let code: String = row.get(0);
+            let prop: String = row.get(1);
+            let value: String = row.get(2);
+            out.entry(code).or_default().push((prop, value));
         }
         Ok(out)
     }
