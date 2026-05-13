@@ -292,8 +292,39 @@ async fn write_code_system(
     // Synthetic storage id encodes the version so multiple versions of the
     // same canonical URL coexist even when they share the same FHIR `id`
     // (tx-ecosystem `version/codesystem-version-1.json` + `-2.json` both ship
-    // `"id":"version"`). See `crate::import::fhir_bundle::storage_id_for`.
-    let storage_id = crate::import::fhir_bundle::storage_id_for(&cs.id, cs.version.as_deref());
+    // `"id":"version"`). When two DISTINCT CodeSystems share both fhir-id
+    // AND version (e.g. two unrelated CSes ship id="status" with no
+    // version), reuse the existing row for the matching (url, version) or
+    // mint a fresh UUID rather than letting the second import silently
+    // disappear via ON CONFLICT DO NOTHING. Mirrors
+    // sqlite/import/fhir_bundle.rs:189-215.
+    let preferred_id = crate::import::fhir_bundle::storage_id_for(&cs.id, cs.version.as_deref());
+    let existing_for_url_version: Option<String> = client
+        .query_opt(
+            "SELECT id FROM code_systems \
+             WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')",
+            &[&cs.url, &cs.version],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .and_then(|r| r.get::<_, Option<String>>(0));
+    let storage_id = if let Some(id) = existing_for_url_version {
+        id
+    } else {
+        let preferred_taken: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM code_systems WHERE id = $1)",
+                &[&preferred_id],
+            )
+            .await
+            .map(|r| r.get::<_, bool>(0))
+            .unwrap_or(false);
+        if preferred_taken {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            preferred_id
+        }
+    };
 
     // Upsert keyed on (url, version). The composite UNIQUE index
     // `idx_code_systems_url_version` is the conflict arbiter; the legacy
@@ -476,11 +507,43 @@ async fn write_value_set(
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
     }
 
-    // Synthetic storage id keyed by (fhir_id, version) so multi-version
-    // ValueSets don't collide on the primary key — same strategy code
-    // systems use. UPDATE below is keyed by (url, version) so each row
-    // refreshes independently of its siblings.
-    let storage_id = crate::import::fhir_bundle::storage_id_for(&vs.id, vs.version.as_deref());
+    // Synthetic storage id: `<fhir-id>|<version>` (or `<fhir-id>` when
+    // version is absent). Mirrors the code_systems strategy so multiple
+    // ValueSets that share a canonical URL but differ in version don't
+    // collide on the primary key. When two distinct VSes share both a
+    // fhir-id AND a version (e.g. tx-ecosystem ships several VSes whose
+    // `id` field is reused across DIFFERENT canonical URLs like
+    // `withdrawn`, `simple-import-bad`, etc.), reuse the existing row
+    // for the matching (url, version) or mint a fresh UUID — otherwise
+    // the second import gets silently dropped by ON CONFLICT DO NOTHING.
+    // Mirrors sqlite/import/fhir_bundle.rs:443-478.
+    let preferred_id = crate::import::fhir_bundle::storage_id_for(&vs.id, vs.version.as_deref());
+    let existing_for_url_version: Option<String> = client
+        .query_opt(
+            "SELECT id FROM value_sets \
+             WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')",
+            &[&vs.url, &vs.version],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .and_then(|r| r.get::<_, Option<String>>(0));
+    let storage_id = if let Some(id) = existing_for_url_version {
+        id
+    } else {
+        let preferred_taken: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM value_sets WHERE id = $1)",
+                &[&preferred_id],
+            )
+            .await
+            .map(|r| r.get::<_, bool>(0))
+            .unwrap_or(false);
+        if preferred_taken {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            preferred_id
+        }
+    };
 
     client
         .execute(
