@@ -557,7 +557,13 @@ jobs:
               simple/valueset-expand-contained.json \
               other/valueset-dual-filter.json \
               overload/valueset-overload-all.json \
-              errors/valueset-combination.json; do
+              errors/valueset-combination.json \
+              simple/simple-expand-contained-request-parameters.json \
+              validation/validate-contained-bad-request-parameters.json \
+              validation/validate-contained-good-request-parameters.json \
+              validation/validate-contained-bad-response-parameters.json \
+              validation/validate-contained-good-response-parameters.json \
+              simple/simple-expand-contained-response-valueSet.json; do
             src="tx-ecosystem-ig/tests/${f}"
             dst="tx-db-dump/ig-fixtures/$(echo "${f}" | tr '/' '_')"
             if [ -f "${src}" ]; then
