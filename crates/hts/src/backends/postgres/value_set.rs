@@ -1304,7 +1304,7 @@ async fn compute_expansion_inner_body(
                         .map(|r| r.get::<_, bool>(0))
                         .unwrap_or(false);
                     if any_row {
-                        let all_versions = pg_cs_all_stored_versions(client, system_url).await;
+                        let all_versions = cs_all_stored_versions(client, system_url).await;
                         let valid_str = format_valid_versions_msg(&all_versions);
                         let text = format!(
                             "A definition for CodeSystem '{system_url}' version '{inc_ver}' \
@@ -1608,39 +1608,6 @@ async fn compute_expansion_inner_body(
 /// - `#fragment` (contained-VS) refs are not resolved here — PG doesn't yet
 ///   thread an `InlineResolutionContext` for `contained[]` lookup, so they
 ///   warn and contribute an empty set.
-/// Return all stored versions of `system_url`, sorted ascending. Used to
-/// build the IG-spec "Valid versions: ..." text in
-/// UNKNOWN_CODESYSTEM_VERSION_EXP messages. Mirrors
-/// sqlite/value_set.rs:cs_all_stored_versions.
-async fn pg_cs_all_stored_versions(
-    client: &tokio_postgres::Client,
-    system_url: &str,
-) -> Vec<String> {
-    client
-        .query(
-            "SELECT version FROM code_systems
-             WHERE url = $1 AND version IS NOT NULL
-             ORDER BY COALESCE(version, '') ASC",
-            &[&system_url],
-        )
-        .await
-        .map(|rows| rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
-        .unwrap_or_default()
-}
-
-/// Format a list of versions as "X", "X or Y", or "X, Y or Z".
-fn format_valid_versions_msg(versions: &[String]) -> String {
-    match versions {
-        [] => String::new(),
-        [only] => only.clone(),
-        [first, second] => format!("{first} or {second}"),
-        _ => {
-            let (last, rest) = versions.split_last().unwrap();
-            format!("{} or {}", rest.join(", "), last)
-        }
-    }
-}
-
 async fn pg_expand_vs_reference(
     client: &tokio_postgres::Client,
     ref_url: &str,
