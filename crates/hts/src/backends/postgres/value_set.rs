@@ -1660,9 +1660,17 @@ async fn compute_expansion_inner_body(
         // set. Whole-system version-aware exclude only fires when the VS has
         // `versionsMatch=false`; otherwise the version pin is collapsed to
         // version-blind. Mirrors sqlite/value_set.rs:3744-3755.
-        if exc["filter"]
+        let has_exc_filter = exc["filter"]
             .as_array()
-            .is_some_and(|a| !a.is_empty())
+            .is_some_and(|a| !a.is_empty());
+        let has_exc_concept = exc["concept"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty());
+        // exclude { system: X } with no concept[], no filter[], no valueSet[]
+        // means "remove every code from X". Mirrors sqlite/value_set.rs:3738-3754
+        // (whole-system exclude branch). Without this PG silently dropped the
+        // exclude, leaving total != 0 for the IG `exclude/exclude-all` fixture.
+        if (has_exc_filter || (!has_exc_concept && !exc_system.is_empty()))
             && !exc_system.is_empty()
         {
             // Same override order as the include loop above.
@@ -1672,20 +1680,39 @@ async fn compute_expansion_inner_body(
             let exc_version = exc_forced.or(exc_raw).or(exc_def);
             if let Some(exc_system_id) =
                 resolve_compose_system_id(client, &exc_system, exc_version).await?
-                && let Some(filtered) =
-                    apply_compose_filters_pg(client, &exc_system, &exc_system_id, exc).await?
             {
-                for item in filtered {
+                // Either apply the explicit filters or, when there are
+                // none, expand the entire CodeSystem (whole-system exclude).
+                let codes_to_deny: Vec<String> = if has_exc_filter {
+                    let filtered = apply_compose_filters_pg(
+                        client,
+                        &exc_system,
+                        &exc_system_id,
+                        exc,
+                    )
+                    .await?;
+                    filtered.unwrap_or_default().into_iter().map(|c| c.code).collect()
+                } else {
+                    let rows = client
+                        .query(
+                            "SELECT code FROM concepts WHERE system_id = $1",
+                            &[&exc_system_id],
+                        )
+                        .await
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    rows.into_iter().map(|r| r.get::<_, String>(0)).collect()
+                };
+                for code in codes_to_deny {
                     match (&exc_version_pin, versions_match_false) {
                         (Some(v), true) => {
                             denied_whole_system_versioned.insert((
                                 exc_system.clone(),
                                 v.clone(),
-                                item.code,
+                                code,
                             ));
                         }
                         _ => {
-                            denied.insert((exc_system.clone(), item.code));
+                            denied.insert((exc_system.clone(), code));
                         }
                     }
                 }
