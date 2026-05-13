@@ -3771,6 +3771,54 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     })?;
 
     let ctx = TenantContext::system();
+
+    // tx-resource fallback for URL-based requests: when the backend has NO
+    // stored ValueSet for this URL but the caller supplied one as a
+    // `tx-resource`, promote that body to the inline-VS validator. This is
+    // strictly a fallback — when the URL IS in the store, the backend path
+    // wins, preserving every existing passing URL-based test.
+    //
+    // Drives the IG `validation/validation-simple-*-bad-import`,
+    // `validation/validation-contained-good`, and `deprecated/withdrawn-validate`
+    // fixtures, which never store the test VS in the DB and rely on the
+    // tx-resource being used for resolution.
+    {
+        let bare_url = url.split_once('|').map(|(u, _)| u).unwrap_or(&url);
+        let pipe_ver = url.split_once('|').map(|(_, v)| v.to_string());
+        let want_ver = pipe_ver
+            .clone()
+            .or_else(|| find_str_param(&params, "valueSetVersion"));
+        let backend_has_vs = ValueSetOperations::search(
+            state.backend(),
+            &ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some(bare_url.to_string()),
+                version: want_ver.clone(),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|hs| !hs.is_empty())
+        .unwrap_or(false);
+        if !backend_has_vs {
+            let tx_resources = collect_resource_params(&params, "tx-resource");
+            let inline_match = tx_resources.into_iter().find(|r| {
+                if r.get("resourceType").and_then(|v| v.as_str()) != Some("ValueSet")
+                    || r.get("url").and_then(|v| v.as_str()) != Some(bare_url)
+                {
+                    return false;
+                }
+                match want_ver.as_deref() {
+                    Some(want) => r.get("version").and_then(|v| v.as_str()) == Some(want),
+                    None => true,
+                }
+            });
+            if let Some(vs) = inline_match {
+                return process_inline_vs_validate_code(state, params, vs).await;
+            }
+        }
+    }
     // The IG `display/`, `language2/`, and parts of `validation/` test groups
     // pin the response display + invalid-display issue text against the
     // requested `displayLanguage` parameter. Pulled here so all three input
