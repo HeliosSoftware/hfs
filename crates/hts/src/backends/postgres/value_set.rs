@@ -2080,7 +2080,13 @@ async fn resolve_compose_system_id(
     }
 
     let chosen = match version {
-        Some(v) if v.contains(".x") || v == "x" || compose_short_version(v) => {
+        // Pattern matching ONLY for `.x` wildcards / bare "x" / dot-containing
+        // versions ("1.0" → highest "1.0.x"). Single-integer versions ("1",
+        // "2") with no dot must EXACT-match — IG fixtures (vs-expand-v-wb)
+        // treat bare "1" as a distinct unrecognised version that must
+        // surface UNKNOWN_CODESYSTEM_VERSION rather than alias to "1.x.x".
+        // Mirrors sqlite/value_set.rs:resolve_ver_against_candidates rules.
+        Some(v) if v.contains(".x") || v == "x" || v.contains('.') => {
             compose_select_version(&candidates, v)
         }
         Some(v) => candidates
@@ -2089,10 +2095,6 @@ async fn resolve_compose_system_id(
         None => candidates.into_iter().next(),
     };
     Ok(chosen.map(|(id, _)| id))
-}
-
-fn compose_short_version(ver: &str) -> bool {
-    !ver.contains('.') && ver.chars().all(|c| c.is_ascii_digit())
 }
 
 fn compose_select_version(
