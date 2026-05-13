@@ -453,7 +453,15 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // Inactive concept: emit the canonical INACTIVE_CONCEPT_FOUND warning.
         // The operations layer also appends a specific-status companion (e.g.
         // "...status of retired...") via `lookup_concept_status`.
-        // TODO: parity — SQLite CS validate_code doesn't currently emit this.
+        //
+        // No `location` field — the IG `validation/validate-contained-good`
+        // fixture (inline-VS path) pins this warning WITHOUT a location.
+        // The operations layer then clones the template for the
+        // specific-status companion, so the location-less template flows
+        // through both issues. URL-based VS-validate-code paths (e.g.
+        // `inactive-2a-validate`) emit their own INACTIVE_CONCEPT_FOUND
+        // WITH location via finish_validate_code_response, separately.
+        // Mirrors SQLite's CS-side behaviour (which doesn't emit at all).
         if is_inactive {
             issues.push(crate::types::ValidationIssue {
                 severity: "warning".into(),
@@ -464,7 +472,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     canonical_code
                 ),
                 expression: Some("Coding".into()),
-                location: Some("Coding".into()),
+                location: None,
                 message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
             });
         }
