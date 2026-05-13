@@ -77,6 +77,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             compose_json.as_deref(),
                             &req.force_system_versions,
                             &req.system_version_defaults,
+                            &req.default_value_set_versions,
                         ).await?;
                         if let Some(limit) = req.max_expansion_size {
                             if codes.len() as u64 > u64::from(limit) {
@@ -108,6 +109,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         Some(&compose),
                         &req.force_system_versions,
                         &req.system_version_defaults,
+                        &req.default_value_set_versions,
                     ).await?;
                     if let Some(limit) = req.max_expansion_size {
                         if codes.len() as u64 > u64::from(limit) {
@@ -157,6 +159,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     Some(&compose_str),
                     &req.force_system_versions,
                     &req.system_version_defaults,
+                    &req.default_value_set_versions,
                 ).await?;
                 if let Some(limit) = req.max_expansion_size {
                     if codes.len() as u64 > u64::from(limit) {
@@ -312,16 +315,26 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         // ValidateCodeRequest doesn't carry the
                         // force-system-version / system-version pins
                         // (those are $expand-only request params), so
-                        // pass empty maps. The IG-level interaction
-                        // between validate-code and force-system-version
-                        // is handled separately via the version-mismatch
-                        // detector below.
+                        // pass empty maps for those. The IG-level
+                        // interaction between validate-code and
+                        // force-system-version is handled separately via
+                        // the version-mismatch detector below.
+                        //
+                        // It DOES carry default_value_set_versions, which
+                        // controls how `compose.include[].valueSet[]` refs
+                        // are version-pinned during indirect resolution
+                        // (Cluster C). Without threading this, the
+                        // `valueset-version/coding-indirect-zero-pinned`
+                        // fixture regressed when indirect refs started
+                        // resolving — they'd always pick the latest VS
+                        // instead of honouring the request-side pin.
                         let empty: HashMap<String, String> = HashMap::new();
                         let codes = compute_expansion(
                             &client,
                             compose_json.as_deref(),
                             &empty,
                             &empty,
+                            &req.default_value_set_versions,
                         ).await?;
                         if !multi_version {
                             populate_cache(&mut client, &vs_id, &codes).await?;
@@ -1046,6 +1059,7 @@ async fn compute_expansion(
     compose_json: Option<&str>,
     force_system_versions: &HashMap<String, String>,
     system_version_defaults: &HashMap<String, String>,
+    default_value_set_versions: &HashMap<String, String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let mut visited: HashSet<String> = HashSet::new();
     compute_expansion_inner(
@@ -1053,6 +1067,7 @@ async fn compute_expansion(
         compose_json,
         force_system_versions,
         system_version_defaults,
+        default_value_set_versions,
         0,
         &mut visited,
     )
@@ -1072,6 +1087,7 @@ fn compute_expansion_inner<'a>(
     compose_json: Option<&'a str>,
     force_system_versions: &'a HashMap<String, String>,
     system_version_defaults: &'a HashMap<String, String>,
+    default_value_set_versions: &'a HashMap<String, String>,
     depth: u8,
     visited: &'a mut HashSet<String>,
 ) -> futures::future::BoxFuture<'a, Result<Vec<ExpansionContains>, HtsError>> {
@@ -1080,6 +1096,7 @@ fn compute_expansion_inner<'a>(
         compose_json,
         force_system_versions,
         system_version_defaults,
+        default_value_set_versions,
         depth,
         visited,
     ))
@@ -1090,6 +1107,7 @@ async fn compute_expansion_inner_body(
     compose_json: Option<&str>,
     force_system_versions: &HashMap<String, String>,
     system_version_defaults: &HashMap<String, String>,
+    default_value_set_versions: &HashMap<String, String>,
     depth: u8,
     visited: &mut HashSet<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
@@ -1146,6 +1164,7 @@ async fn compute_expansion_inner_body(
                     visited,
                     force_system_versions,
                     system_version_defaults,
+                    default_value_set_versions,
                 )
                 .await?;
                 let mut set: HashSet<(String, String)> = HashSet::new();
@@ -1187,6 +1206,7 @@ async fn compute_expansion_inner_body(
                     Some(&single_compose.to_string()),
                     force_system_versions,
                     system_version_defaults,
+                    default_value_set_versions,
                     depth + 1,
                     visited,
                 )
@@ -1439,6 +1459,7 @@ async fn compute_expansion_inner_body(
                     visited,
                     force_system_versions,
                     system_version_defaults,
+                    default_value_set_versions,
                 )
                 .await?;
                 let mut set = HashSet::new();
@@ -1472,6 +1493,7 @@ async fn compute_expansion_inner_body(
                     Some(&single_compose.to_string()),
                     force_system_versions,
                     system_version_defaults,
+                    default_value_set_versions,
                     depth + 1,
                     visited,
                 )
@@ -1532,8 +1554,9 @@ async fn compute_expansion_inner_body(
 /// - Bubbles `HtsError::VsInvalid` when the URL is already in `visited` —
 ///   cycles are reported as hard errors so the operations layer can render
 ///   the FHIR-spec OperationOutcome (4xx). Mirrors sqlite/value_set.rs:2952-2980.
-/// - Honours an explicit `|version` suffix on the ref. (`default-valueset-version`
-///   threading is a separate parity gap not addressed in this commit.)
+/// - Honours an explicit `|version` suffix on the ref, falling back to a
+///   `default-valueset-version` request-level pin when the ref is bare
+///   (mirrors sqlite/value_set.rs:3016-3026).
 /// - Recurses via `compute_expansion_inner` at depth+1 so further nested
 ///   `valueSet[]` refs participate in cycle detection and depth limits.
 /// - `#fragment` (contained-VS) refs are not resolved here — PG doesn't yet
@@ -1546,6 +1569,7 @@ async fn pg_expand_vs_reference(
     visited: &mut HashSet<String>,
     force_system_versions: &HashMap<String, String>,
     system_version_defaults: &HashMap<String, String>,
+    default_value_set_versions: &HashMap<String, String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     if visited.contains(ref_url) {
         return Err(HtsError::VsInvalid(format!(
@@ -1570,12 +1594,17 @@ async fn pg_expand_vs_reference(
         Some((u, v)) => (u, Some(v.to_string())),
         None => (ref_url, None),
     };
-    let pin_was_explicit = ref_version.is_some();
+    let effective_version: Option<String> = ref_version.clone().or_else(|| {
+        default_value_set_versions
+            .get(bare_url)
+            .cloned()
+    });
+    let pin_was_explicit = ref_version.is_some() || effective_version.is_some();
 
     let result = match resolve_value_set_versioned(
         client,
         bare_url,
-        ref_version.as_deref(),
+        effective_version.as_deref(),
         None,
     )
     .await
@@ -1589,6 +1618,7 @@ async fn pg_expand_vs_reference(
                 ref_compose.as_deref(),
                 force_system_versions,
                 system_version_defaults,
+                default_value_set_versions,
                 depth + 1,
                 visited,
             )
