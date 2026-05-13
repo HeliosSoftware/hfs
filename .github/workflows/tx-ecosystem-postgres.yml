@@ -543,6 +543,31 @@ jobs:
 
           ls -la tx-db-dump/
 
+      # Inspect specific IG fixture files to compare against what PG loaded.
+      # Cheap (~few KB per file).
+      - name: Capture IG fixture bodies for failing-test investigation
+        if: always()
+        run: |
+          mkdir -p tx-db-dump/ig-fixtures
+          for f in \
+              deprecated/valueset-withdrawn.json \
+              deprecated/valueset-not-withdrawn.json \
+              deprecated/codesystem-deprecated.json \
+              simple/valueset-import-bad.json \
+              simple/valueset-expand-contained.json \
+              other/valueset-dual-filter.json \
+              overload/valueset-overload-all.json \
+              errors/valueset-combination.json; do
+            src="tx-ecosystem-ig/tests/${f}"
+            dst="tx-db-dump/ig-fixtures/$(echo "${f}" | tr '/' '_')"
+            if [ -f "${src}" ]; then
+              cp "${src}" "${dst}"
+            else
+              echo "MISSING: ${src}" > "${dst}.MISSING"
+            fi
+          done
+          ls -la tx-db-dump/ig-fixtures/
+
       - name: Upload DB inspection dump
         if: always()
         uses: actions/upload-artifact@v7
