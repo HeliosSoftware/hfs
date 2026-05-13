@@ -1743,10 +1743,19 @@ async fn apply_compose_filters_pg(
             "is-a" => pg_filter_is_a(client, system_url, system_id, value).await?,
             "child-of" => pg_filter_child_of(client, system_url, system_id, value).await?,
             "regex" => pg_filter_regex(client, system_id, property, value).await?,
+            // Single-value `not-in` reduces to `!=`; both return concepts
+            // whose property is NOT this value (concepts without the
+            // property pass). Drives notSelectable-prop-out* IG fixtures.
+            "!=" => {
+                pg_filter_property_ne(client, system_url, system_id, property, value).await?
+            }
+            "not-in" if !value.contains(',') => {
+                pg_filter_property_ne(client, system_url, system_id, property, value).await?
+            }
             other => {
                 // TODO: parity — SQLite also handles descendent-of/generalizes/
-                // not-in/!=/exists/multi-value-in. Treat them as empty set so
-                // the include collapses (rather than panicking or accidentally
+                // exists/multi-value-in. Treat them as empty set so the
+                // include collapses (rather than panicking or accidentally
                 // returning every concept).
                 tracing::warn!(
                     system_url,
@@ -1801,12 +1810,15 @@ async fn apply_compose_filters_pg(
 }
 
 /// Resolve every concept in `system_id` matching the FHIR property/value
-/// equality, honouring locally-renamed property aliases. Treats the literal
-/// string value `"false"` for boolean properties (e.g. `notSelectable`,
-/// `inactive`) as "property value != 'true' OR property absent" — matching
-/// the FHIR rule that boolean concept properties default to false when
-/// omitted, and mirroring SQLite's behaviour for the
-/// `notSelectable/expand-noprop-false` IG fixtures.
+/// equality (strict). Honours locally-renamed property aliases. Returns the
+/// concepts that have an EXPLICIT row in `concept_properties` matching
+/// the (property-alias, value) pair — concepts that omit the property
+/// entirely do not match (mirrors SQLite's `query_property_eq`). The IG
+/// `notSelectable/notSelectable-{prop,noprop,reprop,unprop}-false`
+/// fixtures depend on strict equality for the `=false` case (a previous
+/// "absence means false" hack returned every code without an explicit
+/// =true marker, which silently included unannotated codes the IG
+/// expects filtered out).
 async fn pg_filter_property_eq(
     client: &tokio_postgres::Client,
     system_url: &str,
@@ -1815,46 +1827,59 @@ async fn pg_filter_property_eq(
     value: &str,
 ) -> Result<Vec<(String, Option<String>)>, HtsError> {
     let property_aliases = cs_property_local_codes(client, system_url, property).await;
-    // Heuristic: the literal lower-case "false" inverts the match for
-    // boolean properties (notSelectable/inactive). Any other value (incl.
-    // "true", "FALSE", "0", arbitrary strings) is a positive match.
-    let is_boolean_false = value.eq_ignore_ascii_case("false") && !value.eq_ignore_ascii_case("true");
 
-    let rows = if is_boolean_false {
-        // "= false" → concepts that do NOT have any (property=alias, value='true').
-        client
-            .query(
-                "SELECT c.code, c.display
-                   FROM concepts c
-                  WHERE c.system_id = $1
-                    AND NOT EXISTS (
-                        SELECT 1 FROM concept_properties cp
-                         WHERE cp.concept_id = c.id
-                           AND cp.property = ANY($2::text[])
-                           AND cp.value = 'true'
-                    )",
-                &[&system_id, &property_aliases],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-    } else {
-        // Standard equality: concept has a property row matching the value.
-        client
-            .query(
-                "SELECT c.code, c.display
-                   FROM concepts c
-                  WHERE c.system_id = $1
-                    AND EXISTS (
-                        SELECT 1 FROM concept_properties cp
-                         WHERE cp.concept_id = c.id
-                           AND cp.property = ANY($2::text[])
-                           AND cp.value = $3
-                    )",
-                &[&system_id, &property_aliases, &value],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?
-    };
+    let rows = client
+        .query(
+            "SELECT c.code, c.display
+               FROM concepts c
+              WHERE c.system_id = $1
+                AND EXISTS (
+                    SELECT 1 FROM concept_properties cp
+                     WHERE cp.concept_id = c.id
+                       AND cp.property = ANY($2::text[])
+                       AND cp.value = $3
+                )",
+            &[&system_id, &property_aliases, &value],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// Inverse of [`pg_filter_property_eq`]: returns every concept in
+/// `system_id` MINUS those matching the (property-alias, value) equality.
+/// Drives FHIR `op=!=` and single-value `op=not-in`. Concepts without the
+/// property at all PASS — the IG `notSelectable-prop-out*` fixtures rely on
+/// "select every concept whose `notSelectable` is NOT `true` (or absent)".
+/// Mirrors sqlite/value_set.rs:3998-4021.
+async fn pg_filter_property_ne(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    let property_aliases = cs_property_local_codes(client, system_url, property).await;
+
+    let rows = client
+        .query(
+            "SELECT c.code, c.display
+               FROM concepts c
+              WHERE c.system_id = $1
+                AND NOT EXISTS (
+                    SELECT 1 FROM concept_properties cp
+                     WHERE cp.concept_id = c.id
+                       AND cp.property = ANY($2::text[])
+                       AND cp.value = $3
+                )",
+            &[&system_id, &property_aliases, &value],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     Ok(rows
         .into_iter()
