@@ -66,7 +66,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     // is cheap for these small overload ValueSets.
                     let multi_version =
                         compose_has_multi_version_pins(compose_json.as_deref());
-                    let cached = if multi_version {
+                    // Also bypass when a default-valueset-version pin is in
+                    // effect — the cached entry reflects unpinned resolution
+                    // of any nested `compose.include[].valueSet[]` refs and
+                    // would diverge from the pinned version's content.
+                    let has_vs_pin = !req.default_value_set_versions.is_empty();
+                    let cached = if multi_version || has_vs_pin {
                         Vec::new()
                     } else {
                         fetch_cache(&client, &vs_id).await?
@@ -89,7 +94,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 )));
                             }
                         }
-                        if !multi_version {
+                        if !multi_version && !has_vs_pin {
                             populate_cache(&mut client, &vs_id, &codes).await?;
                         }
                         codes
@@ -306,7 +311,13 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     // the same rationale).
                     let multi_version =
                         compose_has_multi_version_pins(compose_json.as_deref());
-                    let cached = if multi_version {
+                    // Also bypass when a default-valueset-version pin is in
+                    // effect — the cached expansion reflects the unpinned
+                    // resolution of any nested `compose.include[].valueSet[]`
+                    // refs (latest version), which would diverge from the
+                    // pinned version's content. Mirrors sqlite/value_set.rs:1318-1324.
+                    let has_vs_pin = !req.default_value_set_versions.is_empty();
+                    let cached = if multi_version || has_vs_pin {
                         Vec::new()
                     } else {
                         fetch_cache(&client, &vs_id).await?
@@ -336,7 +347,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             &empty,
                             &req.default_value_set_versions,
                         ).await?;
-                        if !multi_version {
+                        if !multi_version && !has_vs_pin {
                             populate_cache(&mut client, &vs_id, &codes).await?;
                         }
                         codes
