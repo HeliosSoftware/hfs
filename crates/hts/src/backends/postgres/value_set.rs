@@ -1502,8 +1502,16 @@ async fn compute_expansion_inner_body(
 
     // Apply excludes — both explicit `concept[]` entries AND `filter[]`
     // entries (filters appear on exclude blocks too; same semantics).
+    //
+    // Version-aware exclude: per the IG `overload-expand-exclude*` fixtures,
+    // an `exclude.concept[]` listing with a `version` pin removes only the
+    // pinned version's copies of that code (mirrors sqlite/value_set.rs:3712-3735).
+    // The version-blind `denied` covers exc.concept[] without a pin and
+    // exc.filter[] (whose whole-system version pin SHOULD only fire when the
+    // VS has `versionsMatch=false` — that's a separate parity gap, port later).
     let excludes = compose["exclude"].as_array().unwrap_or(&empty_arr);
     let mut denied: HashSet<(String, String)> = HashSet::new();
+    let mut denied_versioned: HashSet<(String, String, String)> = HashSet::new();
 
     for exc in excludes {
         let exc_vs_refs_present = exc["valueSet"]
@@ -1586,10 +1594,25 @@ async fn compute_expansion_inner_body(
         }
 
         let exc_system = exc["system"].as_str().unwrap_or("").to_owned();
+        let exc_version_pin: Option<String> = exc["version"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         if let Some(codes) = exc["concept"].as_array() {
             for entry in codes {
                 if let Some(code) = entry["code"].as_str() {
-                    denied.insert((exc_system.clone(), code.to_owned()));
+                    match &exc_version_pin {
+                        Some(v) => {
+                            denied_versioned.insert((
+                                exc_system.clone(),
+                                v.clone(),
+                                code.to_owned(),
+                            ));
+                        }
+                        None => {
+                            denied.insert((exc_system.clone(), code.to_owned()));
+                        }
+                    }
                 }
             }
         }
@@ -1618,8 +1641,18 @@ async fn compute_expansion_inner_body(
         }
     }
 
-    if !denied.is_empty() {
-        included.retain(|c| !denied.contains(&(c.system.clone(), c.code.clone())));
+    if !denied.is_empty() || !denied_versioned.is_empty() {
+        included.retain(|c| {
+            if denied.contains(&(c.system.clone(), c.code.clone())) {
+                return false;
+            }
+            if let Some(ver) = c.version.as_deref()
+                && denied_versioned.contains(&(c.system.clone(), ver.to_owned(), c.code.clone()))
+            {
+                return false;
+            }
+            true
+        });
     }
 
     Ok(included)
