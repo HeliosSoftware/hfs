@@ -430,6 +430,106 @@ jobs:
           echo "FIXTURES_IMPORT_EXIT=$CODE" >> "$GITHUB_ENV"
           echo "IG fixtures import exit code: $CODE"
 
+      # ── DB inspection dump (debug aid for parity-porting) ─────────────────
+      # Snapshots the post-import PG state so an offline analyst can see what
+      # actually loaded vs what was expected. Output as the
+      # tx-pg-db-dump-${label} artifact. Cheap (~few KB) so always-on rather
+      # than gated.
+      - name: Dump PG DB state for debugging
+        if: always()
+        run: |
+          set +e
+          mkdir -p tx-db-dump
+          PSQL="docker exec ${PG_CONTAINER} psql -U postgres -d postgres -t -A -c"
+          # Counts
+          {
+            echo "# Row counts"
+            for table in code_systems concepts concept_hierarchy concept_properties \
+                         concept_designations value_sets value_set_expansions \
+                         concept_maps concept_map_elements; do
+              CNT=$($PSQL "SELECT COUNT(*) FROM ${table};" 2>/dev/null)
+              echo "${table}: ${CNT}"
+            done
+          } > tx-db-dump/counts.txt
+
+          # ValueSet URLs (deduped, sorted) — the canonical "what's loaded" list
+          $PSQL "SELECT DISTINCT url FROM value_sets ORDER BY url;" \
+            > tx-db-dump/vs-urls.txt 2>/dev/null
+
+          # CodeSystem URLs + versions — multi-version overload visibility
+          $PSQL "SELECT url || COALESCE('|' || version, '') FROM code_systems ORDER BY url, COALESCE(version, '');" \
+            > tx-db-dump/cs-urls-versions.txt 2>/dev/null
+
+          # Per-VS compose_json for bad-import / contained / dual-filter / deprecated
+          # tests. These are the URLs of fixtures the next-session's debug
+          # cycle wants to inspect. Each row: <url>|<version_or_blank>|<compose_json>.
+          for url in \
+              http://hl7.org/fhir/test/ValueSet/simple-import-bad \
+              http://hl7.org/fhir/test/ValueSet/simple-filter-isaX \
+              http://hl7.org/fhir/test/ValueSet/simple-expand-contained \
+              http://hl7.org/fhir/test/ValueSet/dual-filter \
+              http://hl7.org/fhir/test/ValueSet/not-withdrawn \
+              http://hl7.org/fhir/test/ValueSet/withdrawn \
+              http://hl7.org/fhir/test/ValueSet/deprecated \
+              http://hl7.org/fhir/test/ValueSet/combination \
+              http://hl7.org/fhir/test/ValueSet/overload-all; do
+            ROW=$($PSQL "SELECT url || '|' || COALESCE(version, '') || '|' || COALESCE(compose_json, 'NULL') FROM value_sets WHERE url = '${url}';" 2>/dev/null)
+            if [ -n "$ROW" ]; then
+              echo "$ROW"
+            else
+              echo "${url}|MISSING|MISSING"
+            fi
+          done > tx-db-dump/vs-compose-key.txt
+
+          # status-check: VS resource_json for deprecated/withdrawn fixtures so
+          # we can see standards-status extension shape that drives MSG_*.
+          for url in \
+              http://hl7.org/fhir/test/ValueSet/withdrawn \
+              http://hl7.org/fhir/test/ValueSet/deprecated; do
+            ROW=$($PSQL "SELECT resource_json::text FROM value_sets WHERE url = '${url}' LIMIT 1;" 2>/dev/null)
+            echo "=== ${url} ==="
+            echo "${ROW:-MISSING}"
+            echo ""
+          done > tx-db-dump/status-vs-resources.txt
+
+          # Show the IG test-case setup paths for the still-failing tests so we
+          # can verify our import bundle covers them.
+          if [ -f tx-ecosystem-ig/tests/test-cases.json ]; then
+            python3 - <<'PY' > tx-db-dump/setup-paths-for-failing-tests.txt 2>/dev/null
+          import json, os
+          targets = {
+              'simple-expand-contained',
+              'simple-code-bad-import', 'simple-coding-bad-import',
+              'simple-codeableconcept-bad-import',
+              'validate-contained-good',
+              'overload/validate-bad-unknown',
+              'dual-filter', 'validation-dual-filter-in',
+              'errors/combination-bad',
+              'not-withdrawn', 'validate-withdrawn', 'validate-not-withdrawn',
+          }
+          with open('tx-ecosystem-ig/tests/test-cases.json') as f:
+              cases = json.load(f)
+          for suite in cases.get('suites', []) or []:
+              for case in suite.get('tests', []) or []:
+                  test_id = case.get('id') or ''
+                  for t in targets:
+                      if t in test_id or t.split('/')[-1] in test_id:
+                          print(f"=== {suite.get('name','?')}/{test_id}")
+                          for k in ('setup', 'fixtures', 'tx-resources'):
+                              v = case.get(k) or suite.get(k)
+                              if v: print(f"  {k}: {v}")
+          PY
+          fi
+
+          ls -la tx-db-dump/
+
+      - name: Upload DB inspection dump
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tx-pg-db-dump-${{ matrix.label }}
+          path: tx-db-dump/
+
       # ── Run the server ─────────────────────────────────────────────────────
       - name: Kill any leftover process on port ${{ env.HTS_PORT }}
         run: fuser -k "${{ env.HTS_PORT }}/tcp" 2>/dev/null || true
