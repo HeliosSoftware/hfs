@@ -1507,11 +1507,49 @@ async fn compute_expansion_inner_body(
     // an `exclude.concept[]` listing with a `version` pin removes only the
     // pinned version's copies of that code (mirrors sqlite/value_set.rs:3712-3735).
     // The version-blind `denied` covers exc.concept[] without a pin and
-    // exc.filter[] (whose whole-system version pin SHOULD only fire when the
-    // VS has `versionsMatch=false` — that's a separate parity gap, port later).
+    // exc.filter[] without versionsMatch=false. The
+    // `denied_whole_system_versioned` set holds filter-based excludes with
+    // version pins; their effect is whole-system version-aware ONLY when
+    // the VS sets `versionsMatch=false` (otherwise collapsed into `denied`).
+    //
+    // versionsMatch=false detection mirrors sqlite/value_set.rs:3140-3169 —
+    // looks for a `valueset-expansion-parameter` extension on `compose` whose
+    // inner `name=versionsMatch, value=false`.
+    let versions_match_false = compose
+        .get("extension")
+        .and_then(|e| e.as_array())
+        .map(|exts| {
+            exts.iter().any(|ext| {
+                let url_match = ext.get("url").and_then(|u| u.as_str())
+                    == Some("http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter");
+                if !url_match {
+                    return false;
+                }
+                let inner = ext.get("extension").and_then(|e| e.as_array());
+                let mut name: Option<&str> = None;
+                let mut value: Option<&str> = None;
+                if let Some(arr) = inner {
+                    for sub in arr {
+                        match sub.get("url").and_then(|u| u.as_str()) {
+                            Some("name") => {
+                                name = sub.get("valueCode").and_then(|v| v.as_str());
+                            }
+                            Some("value") => {
+                                value = sub.get("valueString").and_then(|v| v.as_str());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                name == Some("versionsMatch") && value == Some("false")
+            })
+        })
+        .unwrap_or(false);
+
     let excludes = compose["exclude"].as_array().unwrap_or(&empty_arr);
     let mut denied: HashSet<(String, String)> = HashSet::new();
     let mut denied_versioned: HashSet<(String, String, String)> = HashSet::new();
+    let mut denied_whole_system_versioned: HashSet<(String, String, String)> = HashSet::new();
 
     for exc in excludes {
         let exc_vs_refs_present = exc["valueSet"]
@@ -1618,7 +1656,10 @@ async fn compute_expansion_inner_body(
         }
 
         // Filter-based excludes: resolve system_id and apply the same filter
-        // helper, then add the resulting codes to the denied set.
+        // helper, then add the resulting codes to the appropriate denied
+        // set. Whole-system version-aware exclude only fires when the VS has
+        // `versionsMatch=false`; otherwise the version pin is collapsed to
+        // version-blind. Mirrors sqlite/value_set.rs:3744-3755.
         if exc["filter"]
             .as_array()
             .is_some_and(|a| !a.is_empty())
@@ -1635,21 +1676,48 @@ async fn compute_expansion_inner_body(
                     apply_compose_filters_pg(client, &exc_system, &exc_system_id, exc).await?
             {
                 for item in filtered {
-                    denied.insert((exc_system.clone(), item.code));
+                    match (&exc_version_pin, versions_match_false) {
+                        (Some(v), true) => {
+                            denied_whole_system_versioned.insert((
+                                exc_system.clone(),
+                                v.clone(),
+                                item.code,
+                            ));
+                        }
+                        _ => {
+                            denied.insert((exc_system.clone(), item.code));
+                        }
+                    }
                 }
             }
         }
     }
 
-    if !denied.is_empty() || !denied_versioned.is_empty() {
+    if !denied.is_empty()
+        || !denied_versioned.is_empty()
+        || (versions_match_false && !denied_whole_system_versioned.is_empty())
+    {
         included.retain(|c| {
             if denied.contains(&(c.system.clone(), c.code.clone())) {
                 return false;
             }
-            if let Some(ver) = c.version.as_deref()
-                && denied_versioned.contains(&(c.system.clone(), ver.to_owned(), c.code.clone()))
-            {
-                return false;
+            if let Some(ver) = c.version.as_deref() {
+                if denied_versioned.contains(&(
+                    c.system.clone(),
+                    ver.to_owned(),
+                    c.code.clone(),
+                )) {
+                    return false;
+                }
+                if versions_match_false
+                    && denied_whole_system_versioned.contains(&(
+                        c.system.clone(),
+                        ver.to_owned(),
+                        c.code.clone(),
+                    ))
+                {
+                    return false;
+                }
             }
             true
         });
