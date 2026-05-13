@@ -46,6 +46,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
+        let mut compose_is_enumerated = false;
         let all_codes: Vec<ExpansionContains> = if let Some(url) = req.url.as_deref() {
             // ── URL-based path (unchanged) ───────────────────────────────────
             match resolve_value_set_versioned(
@@ -57,6 +58,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .await
             {
                 Ok((vs_id, compose_json)) => {
+                    compose_is_enumerated = compose_is_enumerated_json(compose_json.as_deref());
                     // Bypass the value_set_expansions cache when the compose
                     // describes a multi-version overload — its PRIMARY KEY
                     // (vs_id, system_url, code) silently dedupes the second
@@ -148,6 +150,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             let compose = vs.get("compose");
 
             if let Some(compose_val) = compose {
+                compose_is_enumerated = compose_is_enumerated_value(compose_val);
                 let compose_str = compose_val.to_string();
                 let codes = compute_expansion(
                     &client,
@@ -221,7 +224,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             all_codes
         };
 
-        if req.hierarchical == Some(true) {
+        // Suppress tree-building when the compose is fully enumerated — a
+        // hand-curated explicit `concept[]` list shouldn't have its CS
+        // hierarchy re-imposed even when hierarchical/excludeNested=false
+        // requested it. The IG `parameters/parameters-expand-enum-*`
+        // fixtures rely on this. Mirrors sqlite/value_set.rs:1144.
+        if req.hierarchical == Some(true) && !compose_is_enumerated {
             let total = filtered.len() as u32;
             let tree = build_hierarchical_expansion(&client, filtered).await?;
             return Ok(ExpandResponse {
@@ -950,6 +958,47 @@ async fn fetch_cache(
             contains: vec![],
         })
         .collect())
+}
+
+/// Returns true when every `compose.include[]` is a curated explicit
+/// `concept[]` enumeration (no `filter[]`, no `valueSet[]` ref). The IG
+/// `parameters/parameters-expand-enum-*` fixtures expect this shape to
+/// stay flat in the response even when `excludeNested=false` (or
+/// `hierarchical=true`) is requested — re-imposing the underlying CS
+/// hierarchy on a hand-curated list contradicts the curator's intent.
+///
+/// Mirrors the detection at sqlite/value_set.rs:520-539.
+fn compose_is_enumerated_value(compose: &serde_json::Value) -> bool {
+    match compose.get("include").and_then(|v| v.as_array()) {
+        Some(includes) if !includes.is_empty() => includes.iter().all(|inc| {
+            let has_concept = inc
+                .get("concept")
+                .and_then(|c| c.as_array())
+                .is_some_and(|a| !a.is_empty());
+            let no_filter = inc
+                .get("filter")
+                .and_then(|f| f.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
+            let no_vs_ref = inc
+                .get("valueSet")
+                .and_then(|v| v.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
+            has_concept && no_filter && no_vs_ref
+        }),
+        _ => false,
+    }
+}
+
+/// Same as [`compose_is_enumerated_value`] but accepts the compose as a
+/// serialised JSON string (the URL-path branch carries it in that form).
+fn compose_is_enumerated_json(compose_json: Option<&str>) -> bool {
+    let Some(s) = compose_json else { return false };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return false;
+    };
+    compose_is_enumerated_value(&v)
 }
 
 /// Returns true when `compose_json` describes the "overload" pattern: at
