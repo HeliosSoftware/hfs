@@ -33,9 +33,9 @@ use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    collect_canonical_params, extract_codeable_concept, extract_coding_full,
-    extract_parameter_array, find_resource_param, find_str_param, parse_query_string,
-    query_params_to_fhir_params,
+    collect_canonical_params, collect_resource_params, extract_codeable_concept,
+    extract_coding_full, extract_parameter_array, find_resource_param, find_str_param,
+    parse_query_string, query_params_to_fhir_params,
 };
 
 /// Identifies which FHIR `$validate-code` input form the operations layer is
@@ -3769,6 +3769,39 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     let url = find_str_param(&params, "url").ok_or_else(|| {
         HtsError::InvalidRequest("Missing required parameter: url (ValueSet canonical URL)".into())
     })?;
+
+    // tx-resource shortcut for URL-based requests: when one of the supplied
+    // `tx-resource` resources is a ValueSet whose URL (and, when pinned,
+    // version) matches, promote it to the inline-VS validator. This means
+    // the backend never queries its own store for that URL — the
+    // tx-resource fully shadows it for this request, matching the IG
+    // semantics already used by $expand (operations/expand.rs:1595-1643).
+    //
+    // Unblocks IG `validation/validation-simple-*-bad-import` (which expect
+    // a Parameters response with `Unable_to_resolve_value_Set_` issue
+    // rather than a 404 OperationOutcome from the backend) and the
+    // deprecated/withdrawn-validate fixtures (which never store the
+    // withdrawn VS in the DB).
+    {
+        let tx_resources = collect_resource_params(&params, "tx-resource");
+        let bare_url = url.split_once('|').map(|(u, _)| u).unwrap_or(&url);
+        let pipe_ver = url.split_once('|').map(|(_, v)| v.to_string());
+        let want_ver = pipe_ver.or_else(|| find_str_param(&params, "valueSetVersion"));
+        let inline_match = tx_resources.into_iter().find(|r| {
+            if r.get("resourceType").and_then(|v| v.as_str()) != Some("ValueSet")
+                || r.get("url").and_then(|v| v.as_str()) != Some(bare_url)
+            {
+                return false;
+            }
+            match want_ver.as_deref() {
+                Some(want) => r.get("version").and_then(|v| v.as_str()) == Some(want),
+                None => true,
+            }
+        });
+        if let Some(vs) = inline_match {
+            return process_inline_vs_validate_code(state, params, vs).await;
+        }
+    }
 
     let ctx = TenantContext::system();
     // The IG `display/`, `language2/`, and parts of `validation/` test groups
