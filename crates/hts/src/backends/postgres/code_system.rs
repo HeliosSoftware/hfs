@@ -563,6 +563,12 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         _ctx: &TenantContext,
         url: &str,
     ) -> Result<Option<String>, HtsError> {
+        // Highest-stored version wins. Without ORDER BY, PostgreSQL returned
+        // an arbitrary row (typically insertion order — for multi-version
+        // CSes like overload, that's 1.0.0 instead of 2.0.0). The IG
+        // `overload/validate-bad-unknown` fixture pins the latest version
+        // in the response — sort DESC and LIMIT 1. Mirrors
+        // sqlite/code_system.rs:651-655.
         let client = self
             .pool
             .get()
@@ -570,7 +576,10 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
         let row = client
             .query_opt(
-                "SELECT version FROM code_systems WHERE url = $1 LIMIT 1",
+                "SELECT version FROM code_systems
+                  WHERE url = $1
+                  ORDER BY COALESCE(version, '') DESC
+                  LIMIT 1",
                 &[&url],
             )
             .await
