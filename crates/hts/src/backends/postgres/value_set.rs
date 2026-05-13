@@ -1038,12 +1038,60 @@ fn compose_has_multi_version_pins(compose_json: Option<&str>) -> bool {
     by_system.values().any(|s| s.len() > 1)
 }
 
-/// Compute an expansion from the raw `compose_json`.
+/// Compute an expansion from the raw `compose_json`. Entry point used by
+/// `expand` and `validate_code` callers — sets up the recursion context
+/// (depth 0, empty `visited` set).
 async fn compute_expansion(
     client: &tokio_postgres::Client,
     compose_json: Option<&str>,
     force_system_versions: &HashMap<String, String>,
     system_version_defaults: &HashMap<String, String>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let mut visited: HashSet<String> = HashSet::new();
+    compute_expansion_inner(
+        client,
+        compose_json,
+        force_system_versions,
+        system_version_defaults,
+        0,
+        &mut visited,
+    )
+    .await
+}
+
+/// Recursive worker for `compute_expansion`. `depth` and `visited` thread
+/// through `compose.include[].valueSet[]` references (Cluster C). The
+/// reference handling intersects every referenced VS expansion (mirroring
+/// FHIR R5 §4.9.5) with any local system/concept/filter base set on the
+/// same include. Cycle detection raises `HtsError::VsInvalid`; depth >= 4
+/// emits a warning and skips the nested ref. Mirrors
+/// `sqlite/value_set.rs:expand_includes_per_clause` (3220-3354) +
+/// `expand_vs_reference` (2944-3058).
+fn compute_expansion_inner<'a>(
+    client: &'a tokio_postgres::Client,
+    compose_json: Option<&'a str>,
+    force_system_versions: &'a HashMap<String, String>,
+    system_version_defaults: &'a HashMap<String, String>,
+    depth: u8,
+    visited: &'a mut HashSet<String>,
+) -> futures::future::BoxFuture<'a, Result<Vec<ExpansionContains>, HtsError>> {
+    Box::pin(compute_expansion_inner_body(
+        client,
+        compose_json,
+        force_system_versions,
+        system_version_defaults,
+        depth,
+        visited,
+    ))
+}
+
+async fn compute_expansion_inner_body(
+    client: &tokio_postgres::Client,
+    compose_json: Option<&str>,
+    force_system_versions: &HashMap<String, String>,
+    system_version_defaults: &HashMap<String, String>,
+    depth: u8,
+    visited: &mut HashSet<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let Some(raw) = compose_json else {
         return Ok(vec![]);
@@ -1057,6 +1105,135 @@ async fn compute_expansion(
     let mut included: Vec<ExpansionContains> = Vec::new();
 
     for inc in includes {
+        let vs_refs_present = inc["valueSet"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty());
+        let has_local_system = inc["system"].as_str().is_some_and(|s| !s.is_empty());
+
+        // ── compose.include[].valueSet[] handling (FHIR R5 §4.9.5) ─────────
+        // Each entry is an additional condition on the include: a concept
+        // matches only if it appears in EVERY referenced ValueSet. When the
+        // include also has system / concept / filter, those local conditions
+        // are intersected with the ref expansions. When the include has only
+        // valueSet[] entries, the result is the intersection of the refs.
+        if vs_refs_present {
+            if depth >= 4 {
+                tracing::warn!(
+                    "Max ValueSet include depth (4) reached; skipping nested valueSet references"
+                );
+                continue;
+            }
+
+            let vs_refs = inc["valueSet"].as_array().unwrap();
+            // Preserve the FIRST referenced VS's emission order (mirrors
+            // sqlite/value_set.rs:3252-3262 — pagination determinism for
+            // exclude/exclude-gender2 etc.).
+            let mut ref_sets: Vec<HashSet<(String, String)>> = Vec::new();
+            let mut display_index: HashMap<(String, String), Option<String>> = HashMap::new();
+            let mut version_index: HashMap<(String, String), Option<String>> = HashMap::new();
+            let mut first_ref_order: Vec<(String, String)> = Vec::new();
+            let mut first_ref_seen: HashSet<(String, String)> = HashSet::new();
+
+            for (idx, vs_ref) in vs_refs.iter().enumerate() {
+                let ref_url = match vs_ref.as_str() {
+                    Some(u) => u,
+                    None => continue,
+                };
+                let codes = pg_expand_vs_reference(
+                    client,
+                    ref_url,
+                    depth,
+                    visited,
+                    force_system_versions,
+                    system_version_defaults,
+                )
+                .await?;
+                let mut set: HashSet<(String, String)> = HashSet::new();
+                for c in codes {
+                    let key = (c.system.clone(), c.code.clone());
+                    display_index
+                        .entry(key.clone())
+                        .or_insert_with(|| c.display.clone());
+                    version_index
+                        .entry(key.clone())
+                        .or_insert_with(|| c.version.clone());
+                    if idx == 0 && first_ref_seen.insert(key.clone()) {
+                        first_ref_order.push(key.clone());
+                    }
+                    set.insert(key);
+                }
+                ref_sets.push(set);
+            }
+
+            let mut intersected: HashSet<(String, String)> = match ref_sets.first() {
+                Some(first) => first.clone(),
+                None => HashSet::new(),
+            };
+            for set in ref_sets.iter().skip(1) {
+                intersected.retain(|k| set.contains(k));
+            }
+
+            // Build the local "base set" (system + concept + filter) and
+            // intersect with the ref intersection. When the include has no
+            // local system the result is just the ref intersection.
+            let final_set: HashSet<(String, String)> = if has_local_system {
+                let mut single_inc = inc.clone();
+                if let Some(obj) = single_inc.as_object_mut() {
+                    obj.remove("valueSet");
+                }
+                let single_compose = serde_json::json!({ "include": [single_inc] });
+                let base_codes = compute_expansion_inner(
+                    client,
+                    Some(&single_compose.to_string()),
+                    force_system_versions,
+                    system_version_defaults,
+                    depth + 1,
+                    visited,
+                )
+                .await?;
+                let mut bs: HashSet<(String, String)> = HashSet::new();
+                for c in &base_codes {
+                    let key = (c.system.clone(), c.code.clone());
+                    bs.insert(key.clone());
+                    display_index
+                        .entry(key.clone())
+                        .or_insert_with(|| c.display.clone());
+                    version_index
+                        .entry(key.clone())
+                        .or_insert_with(|| c.version.clone());
+                }
+                intersected.intersection(&bs).cloned().collect()
+            } else {
+                intersected
+            };
+
+            // Emit in the first ref's order; survivors not in first_ref_order
+            // (shouldn't happen — they must have been in ref_sets[0]) are
+            // skipped silently.
+            for key in &first_ref_order {
+                if !final_set.contains(key) {
+                    continue;
+                }
+                let (system, code) = key.clone();
+                let display = display_index.get(key).cloned().unwrap_or(None);
+                let version = version_index.get(key).cloned().unwrap_or(None);
+                included.push(ExpansionContains {
+                    system,
+                    version,
+                    code,
+                    display,
+                    is_abstract: None,
+                    inactive: None,
+                    designations: vec![],
+                    properties: vec![],
+                    extensions: vec![],
+                    contains: vec![],
+                });
+            }
+
+            continue;
+        }
+
         let system_url = match inc["system"].as_str() {
             Some(s) if !s.is_empty() => s,
             _ => continue,
@@ -1233,6 +1410,83 @@ async fn compute_expansion(
     let mut denied: HashSet<(String, String)> = HashSet::new();
 
     for exc in excludes {
+        let exc_vs_refs_present = exc["valueSet"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty());
+
+        // exclude.valueSet[] handling — mirror sqlite/value_set.rs:3631-3697.
+        // Each ref's expansion contributes (system, code) pairs to the denied
+        // set. Multiple refs are intersected. When the exclude also has a
+        // local system condition, the ref intersection is further narrowed
+        // by the local set.
+        if exc_vs_refs_present {
+            if depth >= 4 {
+                tracing::warn!(
+                    "Max ValueSet exclude depth (4) reached; skipping nested valueSet references"
+                );
+                continue;
+            }
+            let mut ref_sets: Vec<HashSet<(String, String)>> = Vec::new();
+            for vs_ref in exc["valueSet"].as_array().unwrap() {
+                let ref_url = match vs_ref.as_str() {
+                    Some(u) => u,
+                    None => continue,
+                };
+                let resolved = pg_expand_vs_reference(
+                    client,
+                    ref_url,
+                    depth,
+                    visited,
+                    force_system_versions,
+                    system_version_defaults,
+                )
+                .await?;
+                let mut set = HashSet::new();
+                for c in resolved {
+                    set.insert((c.system, c.code));
+                }
+                ref_sets.push(set);
+            }
+            let mut intersected: HashSet<(String, String)> = match ref_sets.first() {
+                Some(first) => first.clone(),
+                None => HashSet::new(),
+            };
+            for set in ref_sets.iter().skip(1) {
+                intersected.retain(|k| set.contains(k));
+            }
+
+            let has_exc_local_system =
+                exc["system"].as_str().is_some_and(|s| !s.is_empty());
+            if has_exc_local_system {
+                let mut single_exc = exc.clone();
+                if let Some(obj) = single_exc.as_object_mut() {
+                    obj.remove("valueSet");
+                }
+                // Reuse the include path with a synthesized single-include
+                // compose to materialise the local exclude condition's
+                // codes — same shape as the SQLite expand_single_include_local
+                // helper.
+                let single_compose = serde_json::json!({ "include": [single_exc] });
+                let local = compute_expansion_inner(
+                    client,
+                    Some(&single_compose.to_string()),
+                    force_system_versions,
+                    system_version_defaults,
+                    depth + 1,
+                    visited,
+                )
+                .await?;
+                let local_set: HashSet<(String, String)> =
+                    local.into_iter().map(|c| (c.system, c.code)).collect();
+                intersected.retain(|k| local_set.contains(k));
+            }
+
+            for k in intersected {
+                denied.insert(k);
+            }
+            continue;
+        }
+
         let exc_system = exc["system"].as_str().unwrap_or("").to_owned();
         if let Some(codes) = exc["concept"].as_array() {
             for entry in codes {
@@ -1271,6 +1525,95 @@ async fn compute_expansion(
     }
 
     Ok(included)
+}
+
+/// Resolve a `compose.include[].valueSet[]` reference to its expansion.
+///
+/// - Bubbles `HtsError::VsInvalid` when the URL is already in `visited` —
+///   cycles are reported as hard errors so the operations layer can render
+///   the FHIR-spec OperationOutcome (4xx). Mirrors sqlite/value_set.rs:2952-2980.
+/// - Honours an explicit `|version` suffix on the ref. (`default-valueset-version`
+///   threading is a separate parity gap not addressed in this commit.)
+/// - Recurses via `compute_expansion_inner` at depth+1 so further nested
+///   `valueSet[]` refs participate in cycle detection and depth limits.
+/// - `#fragment` (contained-VS) refs are not resolved here — PG doesn't yet
+///   thread an `InlineResolutionContext` for `contained[]` lookup, so they
+///   warn and contribute an empty set.
+async fn pg_expand_vs_reference(
+    client: &tokio_postgres::Client,
+    ref_url: &str,
+    depth: u8,
+    visited: &mut HashSet<String>,
+    force_system_versions: &HashMap<String, String>,
+    system_version_defaults: &HashMap<String, String>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    if visited.contains(ref_url) {
+        return Err(HtsError::VsInvalid(format!(
+            "Cyclic reference detected when excluding {ref_url} via [{ref_url}]"
+        )));
+    }
+    visited.insert(ref_url.to_owned());
+
+    if ref_url.starts_with('#') {
+        // Contained-VS refs require InlineResolutionContext threading.
+        // TODO: parity — port the SQLite InlineResolutionContext so
+        // `simple/simple-expand-contained` and similar fixtures work.
+        tracing::warn!(
+            ref_url,
+            "Contained ValueSet reference (#fragment) not yet supported on PG; treated as empty"
+        );
+        visited.remove(ref_url);
+        return Ok(vec![]);
+    }
+
+    let (bare_url, ref_version) = match ref_url.split_once('|') {
+        Some((u, v)) => (u, Some(v.to_string())),
+        None => (ref_url, None),
+    };
+    let pin_was_explicit = ref_version.is_some();
+
+    let result = match resolve_value_set_versioned(
+        client,
+        bare_url,
+        ref_version.as_deref(),
+        None,
+    )
+    .await
+    {
+        Ok((_ref_vs_id, ref_compose)) => {
+            // Recurse — the bypass for the cache mirrors compute_expansion's
+            // own multi-version handling implicitly; for ref expansion the
+            // cache is fine but we pay re-compute cost here for simplicity.
+            compute_expansion_inner(
+                client,
+                ref_compose.as_deref(),
+                force_system_versions,
+                system_version_defaults,
+                depth + 1,
+                visited,
+            )
+            .await
+        }
+        Err(e) => {
+            // Explicit version pin that doesn't resolve must surface as a
+            // hard NotFound (mirrors SQLite valueset-version/expand-indirect-
+            // expand-zero-pinned-wrong fixture). Otherwise, warn and
+            // contribute an empty set so a missing optional ref doesn't
+            // collapse the whole expansion.
+            if pin_was_explicit && matches!(e, HtsError::NotFound(_)) {
+                Err(e)
+            } else {
+                tracing::warn!(
+                    ref_url,
+                    "Referenced ValueSet not found; excluded from expansion"
+                );
+                Ok(vec![])
+            }
+        }
+    };
+
+    visited.remove(ref_url);
+    result
 }
 
 /// Apply `compose.include[].filter[]` (or `compose.exclude[].filter[]`) to
