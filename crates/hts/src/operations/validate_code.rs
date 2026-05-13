@@ -33,9 +33,9 @@ use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    collect_canonical_params, extract_codeable_concept, extract_coding_full,
-    extract_parameter_array, find_resource_param, find_str_param, parse_query_string,
-    query_params_to_fhir_params,
+    collect_canonical_params, collect_resource_params, extract_codeable_concept,
+    extract_coding_full, extract_parameter_array, find_resource_param, find_str_param,
+    parse_query_string, query_params_to_fhir_params,
 };
 
 /// Identifies which FHIR `$validate-code` input form the operations layer is
