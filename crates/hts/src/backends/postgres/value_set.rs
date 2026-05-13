@@ -831,17 +831,28 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         // cs_version priority: caller's exact request version > matched
         // concept's version > latest stored CS version.
         // TODO: parity — VS compose include pin (rule 3 in SQLite) skipped.
+        //
+        // EXCEPTION: when the code is unknown in the CS at any version
+        // (code_unknown_in_cs_anywhere=true), the caller's version pin
+        // is meaningless — the IG `overload/validate-bad-unknown`
+        // fixture expects the response to echo the LATEST stored CS
+        // version rather than the (irrelevant) requested one. Override
+        // by going straight to cs_version_for_msg in that case.
         let cs_version: Option<String> = match system_for_msg.as_deref() {
             Some(s) => {
-                let from_req = req
-                    .version
-                    .as_deref()
-                    .filter(|v| !v.contains(".x") && *v != "x")
-                    .map(str::to_string);
-                let from_found = found.as_ref().and_then(|c| c.version.clone());
-                match from_req.or(from_found) {
-                    Some(v) => Some(v),
-                    None => cs_version_for_msg(&client, s).await,
+                if code_unknown_in_cs_anywhere {
+                    cs_version_for_msg(&client, s).await
+                } else {
+                    let from_req = req
+                        .version
+                        .as_deref()
+                        .filter(|v| !v.contains(".x") && *v != "x")
+                        .map(str::to_string);
+                    let from_found = found.as_ref().and_then(|c| c.version.clone());
+                    match from_req.or(from_found) {
+                        Some(v) => Some(v),
+                        None => cs_version_for_msg(&client, s).await,
+                    }
                 }
             }
             None => None,
