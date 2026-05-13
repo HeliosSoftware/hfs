@@ -836,6 +836,110 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         }
         Ok(results)
     }
+
+    async fn concept_resource_entries(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>, HtsError> {
+        if codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+        // Read the base CodeSystem's resource_json (highest version), then
+        // walk concept[] picking entries whose code is in the requested set.
+        // Mirrors sqlite/code_system.rs:1436-1475.
+        let row = client
+            .query_opt(
+                "SELECT resource_json FROM code_systems
+                 WHERE url = $1 AND content != 'supplement'
+                 ORDER BY COALESCE(version, '') DESC LIMIT 1",
+                &[&system_url],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        let mut out: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        if let Some(r) = row
+            && let Some(v) = r.get::<_, Option<serde_json::Value>>(0)
+        {
+            walk_concepts(&v, codes, &mut out);
+        }
+        Ok(out)
+    }
+
+    async fn supplement_concept_entries(
+        &self,
+        _ctx: &TenantContext,
+        supplement_urls: &[String],
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<serde_json::Value>>, HtsError> {
+        if supplement_urls.is_empty() || codes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+
+        // Mirrors sqlite/code_system.rs:1477-1532.
+        let rows = client
+            .query(
+                "SELECT resource_json FROM code_systems
+                 WHERE url = ANY($1) AND content = 'supplement'",
+                &[&supplement_urls],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        let mut out: std::collections::HashMap<String, Vec<serde_json::Value>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let Some(v) = row.get::<_, Option<serde_json::Value>>(0) else {
+                continue;
+            };
+            let mut local: std::collections::HashMap<String, serde_json::Value> =
+                std::collections::HashMap::new();
+            walk_concepts(&v, codes, &mut local);
+            for (code, entry) in local {
+                out.entry(code).or_default().push(entry);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Recursively walk `concept[]` arrays in a CodeSystem JSON value, accumulating
+/// each concept whose `code` matches one of `codes` into `out`. Used to pull
+/// the original concept JSON (with extensions, designations, properties) from
+/// `resource_json` when that data isn't broken out into the SQL schema.
+///
+/// Mirrors `sqlite/code_system.rs:walk_concepts`.
+fn walk_concepts(
+    resource: &serde_json::Value,
+    codes: &[String],
+    out: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    let Some(concepts) = resource.get("concept").and_then(|c| c.as_array()) else {
+        return;
+    };
+    for c in concepts {
+        if let Some(code) = c.get("code").and_then(|v| v.as_str())
+            && codes.iter().any(|x| x == code)
+            && !out.contains_key(code)
+        {
+            out.insert(code.to_string(), c.clone());
+        }
+        walk_concepts(c, codes, out);
+    }
 }
 
 // ── Private DB helpers ─────────────────────────────────────────────────────────
