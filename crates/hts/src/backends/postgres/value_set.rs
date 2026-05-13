@@ -823,11 +823,25 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             Some(s) => cs_content_for_url(&client, s).await.as_deref() == Some("fragment"),
             None => false,
         };
-        // Echo display lookup at the resolved cs_version when the caller did
-        // not provide a display but the code lives in the underlying CS.
-        // TODO: parity — port `lookup_display_at_version` for stricter
-        // version-scoped matching. Skipping is harmless since the expansion
-        // already carries the canonical display in most cases.
+        // Echo display lookup: when the caller didn't provide a display but
+        // the code lives in the underlying CS, look it up from `concepts` so
+        // finish_validate_code_response can emit the `display` Parameters
+        // entry. Drives IG `regex-bad/validate-regex-bad-2` (code in CS but
+        // not in VS, expected response echoes the CS display).
+        let cs_display_lookup: Option<String> = if !code_unknown_in_cs {
+            match system_for_msg.as_deref() {
+                Some(s) => pg_lookup_cs_display(
+                    &client,
+                    s,
+                    cs_version.as_deref(),
+                    &req.code,
+                )
+                .await,
+                None => None,
+            }
+        } else {
+            None
+        };
 
         finish_validate_code_response(
             found,
@@ -845,7 +859,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             req.version.as_deref(),
             req.lenient_display_validation.unwrap_or(false),
             cs_is_fragment,
-            None,
+            cs_display_lookup.as_deref(),
             normalized_code.as_deref(),
         )
     }
@@ -2705,6 +2719,43 @@ async fn lookup_value_set_version(
 }
 
 /// Highest stored CodeSystem version for a URL.
+/// Look up the display for a code in a CodeSystem, optionally pinned to a
+/// specific version. When `version` is None, falls back to the highest
+/// stored version. Returns None when the code isn't present in any version
+/// of the system.
+async fn pg_lookup_cs_display(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    version: Option<&str>,
+    code: &str,
+) -> Option<String> {
+    let row = match version {
+        Some(v) => client
+            .query_opt(
+                "SELECT c.display FROM concepts c
+                   JOIN code_systems s ON s.id = c.system_id
+                  WHERE s.url = $1 AND s.version = $2 AND c.code = $3",
+                &[&system_url, &v, &code],
+            )
+            .await
+            .ok()
+            .flatten(),
+        None => client
+            .query_opt(
+                "SELECT c.display FROM concepts c
+                   JOIN code_systems s ON s.id = c.system_id
+                  WHERE s.url = $1 AND c.code = $2
+                  ORDER BY COALESCE(s.version, '') DESC
+                  LIMIT 1",
+                &[&system_url, &code],
+            )
+            .await
+            .ok()
+            .flatten(),
+    }?;
+    row.get::<_, Option<String>>(0)
+}
+
 pub(super) async fn cs_version_for_msg(
     client: &tokio_postgres::Client,
     system_url: &str,
