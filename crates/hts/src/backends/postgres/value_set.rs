@@ -339,14 +339,36 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         // fixture regressed when indirect refs started
                         // resolving — they'd always pick the latest VS
                         // instead of honouring the request-side pin.
+                        // validate-code is allowed to expand against a VS
+                        // whose compose.include pins a CS-version that
+                        // doesn't resolve — the validate-code response path
+                        // emits its own UNKNOWN_CODESYSTEM_VERSION (no `_EXP`
+                        // suffix) issue. Convert the
+                        // `__UNKNOWN_CS_VERSION_EXP__` sentinel raised by
+                        // compute_expansion into an empty include contribution
+                        // here so the sentinel only escapes through the
+                        // `$expand` handler (which renders the 4xx
+                        // OperationOutcome with UNKNOWN_CODESYSTEM_VERSION_EXP
+                        // the IG version/vs-expand-v-wb fixtures expect).
+                        // Mirrors sqlite/value_set.rs:1318-1357.
                         let empty: HashMap<String, String> = HashMap::new();
-                        let codes = compute_expansion(
+                        let codes = match compute_expansion(
                             &client,
                             compose_json.as_deref(),
                             &empty,
                             &empty,
                             &req.default_value_set_versions,
-                        ).await?;
+                        )
+                        .await
+                        {
+                            Ok(c) => c,
+                            Err(HtsError::NotFound(msg))
+                                if msg.starts_with("__UNKNOWN_CS_VERSION_EXP__:") =>
+                            {
+                                Vec::new()
+                            }
+                            Err(e) => return Err(e),
+                        };
                         if !multi_version && !has_vs_pin {
                             populate_cache(&mut client, &vs_id, &codes).await?;
                         }
