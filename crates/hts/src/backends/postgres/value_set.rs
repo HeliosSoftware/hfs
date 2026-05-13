@@ -1849,10 +1849,60 @@ async fn apply_compose_filters_pg(
     system_id: &str,
     inc: &serde_json::Value,
 ) -> Result<Option<Vec<ExpansionContains>>, HtsError> {
-    let filters = match inc["filter"].as_array() {
+    let filters_raw = match inc["filter"].as_array() {
         Some(f) if !f.is_empty() => f,
         _ => return Ok(None),
     };
+
+    // Normalise R4-encoded filter ops. The R5→R4 ValueSet converter clears
+    // `op` when the operator has no R4 enum value (CHILDOF, DESCENDENTLEAF)
+    // and stashes the original code in a cross-version extension. Restore
+    // the op from `_op.extension[]` (HAPI converter canonical placement) or
+    // `filter.extension[]` (legacy clients) before dispatch — drives the IG
+    // `simple-expand-child-of` "R5/R4 transformation" test that arrives with
+    // `op=null` when the server reports fhirVersion=4.x.
+    //
+    // Mirrors sqlite/value_set.rs:3812-3871.
+    const EXT_FILTER_OP_URL: &str =
+        "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.compose.include.filter.op";
+    fn find_filter_op_extension(exts: &serde_json::Value) -> Option<&str> {
+        exts.as_array()?.iter().find_map(|ext| {
+            let url = ext.get("url").and_then(|v| v.as_str())?;
+            if url == EXT_FILTER_OP_URL {
+                ext.get("valueCode").and_then(|v| v.as_str())
+            } else {
+                None
+            }
+        })
+    }
+    let filters_owned: Vec<serde_json::Value> = filters_raw
+        .iter()
+        .map(|f| {
+            let mut f = f.clone();
+            let needs_recovery = f
+                .get("op")
+                .and_then(|v| v.as_str())
+                .map(str::is_empty)
+                .unwrap_or(true);
+            if needs_recovery {
+                let recovered = f
+                    .get("_op")
+                    .and_then(|primitive| primitive.get("extension"))
+                    .and_then(find_filter_op_extension)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        f.get("extension")
+                            .and_then(find_filter_op_extension)
+                            .map(str::to_owned)
+                    });
+                if let Some(code) = recovered {
+                    f["op"] = serde_json::Value::String(code);
+                }
+            }
+            f
+        })
+        .collect();
+    let filters: &[serde_json::Value] = &filters_owned;
 
     let mut result: Option<HashSet<String>> = None;
     let mut display_map: HashMap<String, Option<String>> = HashMap::new();
