@@ -4,7 +4,6 @@
 //! default), DDL rejection (400), NDJSON / CSV output, and tenant isolation.
 //! A `MockRawSqlRunner` is used so no real database file is required.
 
-#[cfg(feature = "sof")]
 mod sof_sql_query_tests {
     use async_trait::async_trait;
     use axum::http::{HeaderName, HeaderValue, StatusCode};

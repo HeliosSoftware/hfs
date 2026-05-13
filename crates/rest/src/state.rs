@@ -6,13 +6,10 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "sof")]
 use crate::export::ExportJobController;
 use helios_auth::AuthConfig;
 use helios_persistence::core::ResourceStorage;
-#[cfg(feature = "sof")]
 use helios_persistence::core::raw_sql::RawSqlRunner;
-#[cfg(feature = "sof")]
 use helios_persistence::core::sof_runner::SofRunner;
 
 use crate::config::ServerConfig;
@@ -52,15 +49,12 @@ pub struct AppState<S> {
     auth: Option<Arc<AuthMiddlewareState>>,
 
     /// SQL-on-FHIR runner (in-DB or in-process fallback).
-    #[cfg(feature = "sof")]
     sof_runner: Option<Arc<dyn SofRunner>>,
 
     /// Export job controller (present when export is enabled).
-    #[cfg(feature = "sof")]
     export_controller: Option<Arc<dyn ExportJobController>>,
 
     /// Raw SQL query runner for `$sql-query-run` (present when enabled).
-    #[cfg(feature = "sof")]
     raw_sql_runner: Option<Arc<dyn RawSqlRunner>>,
 }
 
@@ -72,11 +66,8 @@ impl<S> Clone for AppState<S> {
             config: Arc::clone(&self.config),
             auth_config: Arc::clone(&self.auth_config),
             auth: self.auth.clone(),
-            #[cfg(feature = "sof")]
             sof_runner: self.sof_runner.clone(),
-            #[cfg(feature = "sof")]
             export_controller: self.export_controller.clone(),
-            #[cfg(feature = "sof")]
             raw_sql_runner: self.raw_sql_runner.clone(),
         }
     }
@@ -95,11 +86,8 @@ impl<S: ResourceStorage> AppState<S> {
             config: Arc::new(config),
             auth_config: Arc::new(AuthConfig::default()),
             auth: None,
-            #[cfg(feature = "sof")]
             sof_runner: None,
-            #[cfg(feature = "sof")]
             export_controller: None,
-            #[cfg(feature = "sof")]
             raw_sql_runner: None,
         }
     }
@@ -116,11 +104,8 @@ impl<S: ResourceStorage> AppState<S> {
             config: Arc::new(config),
             auth_config: Arc::new(auth_config),
             auth: auth_state,
-            #[cfg(feature = "sof")]
             sof_runner: None,
-            #[cfg(feature = "sof")]
             export_controller: None,
-            #[cfg(feature = "sof")]
             raw_sql_runner: None,
         }
     }
@@ -129,7 +114,6 @@ impl<S: ResourceStorage> AppState<S> {
     ///
     /// Typically called at startup after creating the state, once the runner has been
     /// selected (in-DB for capable backends, in-process for all others).
-    #[cfg(feature = "sof")]
     pub fn with_sof_runner(mut self, runner: Arc<dyn SofRunner>) -> Self {
         self.sof_runner = Some(runner);
         self
@@ -139,33 +123,28 @@ impl<S: ResourceStorage> AppState<S> {
     ///
     /// Handlers that need to run views should call this and fall back to creating an
     /// `InProcessRunner` if `None` is returned.
-    #[cfg(feature = "sof")]
     pub fn sof_runner(&self) -> Option<&Arc<dyn SofRunner>> {
         self.sof_runner.as_ref()
     }
 
     /// Sets the export job controller on this application state.
-    #[cfg(feature = "sof")]
     pub fn with_export_controller(mut self, controller: Arc<dyn ExportJobController>) -> Self {
         self.export_controller = Some(controller);
         self
     }
 
     /// Returns the export job controller, if one has been configured.
-    #[cfg(feature = "sof")]
     pub fn export_controller(&self) -> Option<&Arc<dyn ExportJobController>> {
         self.export_controller.as_ref()
     }
 
     /// Sets the raw SQL query runner on this application state.
-    #[cfg(feature = "sof")]
     pub fn with_raw_sql_runner(mut self, runner: Arc<dyn RawSqlRunner>) -> Self {
         self.raw_sql_runner = Some(runner);
         self
     }
 
     /// Returns the raw SQL query runner, if one has been configured.
-    #[cfg(feature = "sof")]
     pub fn raw_sql_runner(&self) -> Option<&Arc<dyn RawSqlRunner>> {
         self.raw_sql_runner.as_ref()
     }

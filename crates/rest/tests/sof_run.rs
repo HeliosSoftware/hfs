@@ -3,7 +3,6 @@
 //! Tests the POST `/ViewDefinition/$viewdefinition-run` endpoint using an
 //! in-memory SQLite backend and the in-process FHIRPath runner.
 
-#[cfg(feature = "sof")]
 mod sof_run_tests {
     use axum::http::{HeaderName, HeaderValue, StatusCode};
     use axum_test::TestServer;

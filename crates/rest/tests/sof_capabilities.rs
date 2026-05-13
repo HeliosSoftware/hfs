@@ -1,7 +1,6 @@
 //! Tests for `GET /$sql-on-fhir-capabilities` and the SOF extensions on
 //! `GET /metadata`.
 
-#[cfg(feature = "sof")]
 mod sof_capability_tests {
     use axum::http::{HeaderName, HeaderValue, StatusCode};
     use axum_test::TestServer;

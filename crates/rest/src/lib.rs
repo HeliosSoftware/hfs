@@ -140,7 +140,6 @@
 
 pub mod config;
 pub mod error;
-#[cfg(feature = "sof")]
 pub mod export;
 pub mod extractors;
 pub mod fhir_types;
@@ -162,7 +161,6 @@ pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
 use std::sync::Arc;
 
 use axum::Router;
-#[cfg(feature = "sof")]
 use helios_persistence::core::sof_runner::SofRunner;
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
@@ -285,7 +283,6 @@ where
     );
 
     // Wire SQL-on-FHIR runner and export controller
-    #[cfg(feature = "sof")]
     if config.sof_enabled {
         let runner: Arc<dyn SofRunner> = {
             // Prefer the storage's own in-DB runner (will be Some for SQLite/PG after Phase 3).

@@ -12,10 +12,7 @@ keywords = ["helios-software", "hl7", "fhir", "helios-fhir-server", "rest"]
 categories = ["web-programming", "database"]
 
 [features]
-default = ["R4", "sqlite", "sof"]
-
-# SQL-on-FHIR integration (on by default)
-sof = ["dep:sqlparser"]
+default = ["R4", "sqlite"]
 
 # FHIR version features (pass through to helios-fhir, helios-persistence, helios-serde, and helios-sof)
 R4 = ["helios-fhir/R4", "helios-persistence/R4", "helios-serde?/R4", "helios-sof/R4"]
@@ -80,8 +77,8 @@ json-patch = "3"
 futures = "0.3"
 dashmap = "6"
 
-# SQL-query-run: DDL validation (active when sof feature is enabled)
-sqlparser = { version = "0.54", optional = true }
+# SQL-query-run: DDL validation
+sqlparser = "0.54"
 
 # S3 export sink (optional — only when s3 feature is enabled)
 aws-sdk-s3 = { version = "1", optional = true }

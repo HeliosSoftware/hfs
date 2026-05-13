@@ -6,7 +6,6 @@
 //! and verify that the full request-to-response path works correctly — including
 //! the tenant-boundary CTE, output serialisation, and DDL rejection.
 
-#[cfg(feature = "sof")]
 mod sof_sql_query_sqlite_tests {
     use axum::http::{HeaderName, HeaderValue, StatusCode};
     use axum_test::TestServer;

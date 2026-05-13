@@ -4,7 +4,6 @@
 //! `/_operations/export/{job-id}`, and GET `/_operations/export/{job-id}/{file}`
 //! endpoints using an in-memory SQLite backend and InMemoryController.
 
-#[cfg(feature = "sof")]
 mod sof_export_tests {
     use axum::http::{HeaderName, StatusCode};
     use axum_test::TestServer;

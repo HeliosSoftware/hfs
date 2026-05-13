@@ -26,7 +26,6 @@ pub mod patch;
 pub mod read;
 pub mod search;
 pub mod smart_discovery;
-#[cfg(feature = "sof")]
 pub mod sof;
 pub mod update;
 pub mod versions;

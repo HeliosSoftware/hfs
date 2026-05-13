@@ -300,7 +300,6 @@ fn resolve_runner<S: SearchProvider + Send + Sync + 'static>(
     }
 
     // Use the pre-wired runner from AppState (set at startup)
-    #[cfg(feature = "sof")]
     if let Some(runner) = state.sof_runner() {
         return Arc::clone(runner);
     }

@@ -259,8 +259,7 @@ where
         .merge(create_sof_routes::<S>())
 }
 
-/// Creates SQL-on-FHIR operation routes (gated on the `sof` feature).
-#[cfg(feature = "sof")]
+/// Creates SQL-on-FHIR operation routes.
 fn create_sof_routes<S>() -> Router<AppState<S>>
 where
     S: SearchProvider
@@ -314,15 +313,6 @@ where
             "/$sql-query-run",
             post(handlers::sof::sql_query_run_handler::<S>),
         )
-}
-
-/// No-op when `sof` feature is disabled.
-#[cfg(not(feature = "sof"))]
-fn create_sof_routes<S>() -> Router<AppState<S>>
-where
-    S: ResourceStorage + Send + Sync + 'static,
-{
-    Router::new()
 }
 
 /// Creates a minimal set of routes for testing.

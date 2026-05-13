@@ -20,7 +20,6 @@
 //! The test does not require Docker.  It uses an in-memory SQLite backend, so
 //! it runs on every PR automatically.
 
-#[cfg(feature = "sof")]
 mod sof_conformance_tests {
     use axum::http::{HeaderName, HeaderValue};
     use axum_test::TestServer;

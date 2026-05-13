@@ -23,7 +23,6 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::ResourceStorage;
 use tracing::debug;
 
-#[cfg(feature = "sof")]
 use super::sof::capability::build_sof_capabilities;
 
 use crate::error::{RestError, RestResult};
@@ -142,14 +141,11 @@ where
         formats.push("application/fhir+xml");
     }
 
-    // Standard operations, extended with SOF operations when the feature is active
+    // Standard operations, extended with SOF operations
     let operations = build_rest_operations(state);
 
     // Optional SOF extension block on the rest[0] element
-    #[cfg(feature = "sof")]
     let sof_extension = build_sof_rest_extension(state);
-    #[cfg(not(feature = "sof"))]
-    let sof_extension: Option<serde_json::Value> = None;
 
     let mut rest_entry = serde_json::json!({
         "mode": "server",
@@ -188,7 +184,7 @@ where
     })
 }
 
-/// Builds the `rest[0].operation` list, injecting SOF operations when enabled.
+/// Builds the `rest[0].operation` list, including SOF operations.
 fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
     _state: &AppState<S>,
 ) -> Vec<serde_json::Value> {
@@ -203,27 +199,23 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
         }),
     ];
 
-    #[cfg(feature = "sof")]
-    {
-        ops.push(serde_json::json!({
-            "name": "viewdefinition-run",
-            "definition": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-ViewDefinition-run.html"
-        }));
-        ops.push(serde_json::json!({
-            "name": "viewdefinition-export",
-            "definition": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-ViewDefinition-export.html"
-        }));
-        ops.push(serde_json::json!({
-            "name": "sql-query-run",
-            "definition": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-sql-query-run.html"
-        }));
-    }
+    ops.push(serde_json::json!({
+        "name": "viewdefinition-run",
+        "definition": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-ViewDefinition-run.html"
+    }));
+    ops.push(serde_json::json!({
+        "name": "viewdefinition-export",
+        "definition": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-ViewDefinition-export.html"
+    }));
+    ops.push(serde_json::json!({
+        "name": "sql-query-run",
+        "definition": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-sql-query-run.html"
+    }));
 
     ops
 }
 
 /// Builds the `extension` array on `rest[0]` advertising SOF-specific flags.
-#[cfg(feature = "sof")]
 fn build_sof_rest_extension<S: ResourceStorage + Send + Sync + 'static>(
     state: &AppState<S>,
 ) -> Option<serde_json::Value> {

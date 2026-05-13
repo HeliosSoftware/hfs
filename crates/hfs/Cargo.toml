@@ -15,7 +15,7 @@ name = "hfs"
 path = "src/main.rs"
 
 [features]
-default = ["R4", "sqlite", "sof"]
+default = ["R4", "sqlite"]
 
 # FHIR version features
 R4 = ["helios-fhir/R4", "helios-rest/R4"]
@@ -32,9 +32,6 @@ postgres = ["helios-rest/postgres"]
 mongodb = ["helios-rest/mongodb"]
 elasticsearch = ["helios-rest/elasticsearch"]
 s3 = ["helios-rest/s3"]
-
-# SQL-on-FHIR (on by default)
-sof = ["helios-rest/sof"]
 
 # Auth backends
 redis = ["helios-rest/redis", "helios-auth/redis"]
