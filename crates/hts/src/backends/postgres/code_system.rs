@@ -15,8 +15,8 @@ use crate::types::{
 
 use super::PostgresTerminologyBackend;
 use super::value_set::{
-    cs_content_for_url, cs_is_case_insensitive, cs_version_for_msg, detect_cs_version_mismatch,
-    is_concept_abstract, is_concept_inactive,
+    cs_content_for_url, cs_is_case_insensitive, cs_property_local_codes, cs_version_for_msg,
+    detect_cs_version_mismatch, is_concept_abstract, is_concept_inactive,
 };
 
 #[async_trait]
@@ -720,6 +720,16 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
+        // Per FHIR concept-properties IG, the standard `notSelectable` and
+        // `inactive` properties' local CodeSystem.property.code can be ANY
+        // local name (e.g. `not-selectable` with a hyphen in the
+        // tx-ecosystem `notSelectable/` fixtures). Resolve via property[].uri
+        // → local-code mapping when available; always fall back to the
+        // canonical name so a CS that never declares property[] still
+        // reports correctly. Mirrors sqlite/code_system.rs:980-1012.
+        let abstract_codes = cs_property_local_codes(&client, system_url, "notSelectable").await;
+        let inactive_codes = cs_property_local_codes(&client, system_url, "inactive").await;
+
         let rows = client
             .query(
                 "SELECT c.code, cp.property, cp.value
@@ -728,8 +738,13 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                  JOIN code_systems s ON s.id = c.system_id
                  WHERE s.url = $1
                    AND c.code = ANY($2)
-                   AND cp.property IN ('notSelectable', 'status')",
-                &[&system_url, &codes],
+                   AND (
+                       (cp.property = ANY($3) AND cp.value = 'true')
+                    OR (cp.property = ANY($4) AND cp.value = 'true')
+                    OR (cp.property = 'status'
+                        AND cp.value IN ('retired', 'inactive'))
+                   )",
+                &[&system_url, &codes, &abstract_codes, &inactive_codes],
             )
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -739,18 +754,15 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         for row in rows {
             let code: String = row.get(0);
             let property: String = row.get(1);
-            let value: String = row.get(2);
+            // `deprecated` is intentionally excluded: per the FHIR
+            // concept-properties IG, deprecated codes are discouraged but
+            // still active (act-class expansion fixtures rely on this —
+            // deprecated codes survive `activeOnly=true` filtering).
             let flags = out.entry(code).or_default();
-            match property.as_str() {
-                "notSelectable" if value == "true" => flags.is_abstract = true,
-                // `deprecated` is intentionally excluded: per the FHIR
-                // concept-properties IG, deprecated codes are discouraged but
-                // still active (act-class expansion fixtures rely on this —
-                // deprecated codes survive `activeOnly=true` filtering).
-                "status" if matches!(value.as_str(), "retired" | "inactive") => {
-                    flags.inactive = true;
-                }
-                _ => {}
+            if property == "status" || inactive_codes.iter().any(|c| c == &property) {
+                flags.inactive = true;
+            } else if abstract_codes.iter().any(|c| c == &property) {
+                flags.is_abstract = true;
             }
         }
         Ok(out)

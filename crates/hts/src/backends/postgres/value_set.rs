@@ -1061,16 +1061,24 @@ async fn compute_expansion(
                         None => continue,
                     };
 
-                    let disp_rows = client
-                        .query(
+                    // Drop codes that don't actually exist in the CS — the
+                    // IG `simple-expand-enum-bad` fixture asserts that an
+                    // unknown code in compose.include[].concept[] is
+                    // silently filtered out of the expansion rather than
+                    // surfacing as a phantom entry. Mirrors the SQLite
+                    // INNER JOIN at sqlite/value_set.rs:3441-3470.
+                    let row = match client
+                        .query_opt(
                             "SELECT display FROM concepts WHERE system_id = $1 AND code = $2",
                             &[&system_id, &code],
                         )
                         .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-                    let display: Option<String> =
-                        disp_rows.into_iter().next().and_then(|r| r.get(0));
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let display: Option<String> = row.get(0);
 
                     out.push(ExpansionContains {
                         system: system_url.to_owned(),
@@ -1408,8 +1416,14 @@ async fn pg_filter_regex(
         }
     };
 
+    // PG's `~` is POSIX regex and matches substrings unless anchored. The
+    // FHIR `regex` filter requires a full match (mirrors SQLite's `\A...\z`
+    // wrap at sqlite/value_set.rs:4727). Wrap the user pattern with
+    // `^(?:...)$` to enforce that.
+    let anchored = format!("^(?:{value})$");
+
     let rows = client
-        .query(sql, &[&system_id, &value])
+        .query(sql, &[&system_id, &anchored])
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -1992,7 +2006,7 @@ async fn cs_version_exists(
 /// Mirrors `sqlite/code_system.rs:1599`. Tx-ecosystem fixtures rename these
 /// properties locally and the FHIR spec allows it — queries hardcoded to the
 /// canonical name miss those concepts.
-async fn cs_property_local_codes(
+pub(super) async fn cs_property_local_codes(
     client: &tokio_postgres::Client,
     system_url: &str,
     canonical: &str,
