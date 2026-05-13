@@ -678,6 +678,74 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             }
         }
 
+        // inferSystem ambiguity: when the caller did not supply a system
+        // and the bare code matches in two or more distinct CodeSystems
+        // within the VS expansion, the system URI cannot be inferred. The
+        // IG `errors/errors-combination-bad` fixture expects two issues:
+        // not-in-vs + cannot-infer ("multiple matches"). Mirrors
+        // sqlite/value_set.rs:1569-1644.
+        if req.system.is_none() && !candidates.is_empty() {
+            let distinct_systems: std::collections::BTreeSet<String> = candidates
+                .iter()
+                .map(|c| c.system.clone())
+                .collect();
+            if distinct_systems.len() >= 2 {
+                let systems_list: Vec<String> = distinct_systems.into_iter().collect();
+                let vs_v = lookup_value_set_version(&client, &url).await;
+                let vs_canonical = match vs_v.as_deref() {
+                    Some(v) if !v.is_empty() => format!("{url}|{v}"),
+                    _ => url.clone(),
+                };
+                let cannot_infer_text = format!(
+                    "The System URI could not be determined for the code '{}' in the ValueSet '{}': value set expansion has multiple matches: [{}]",
+                    req.code, vs_canonical, systems_list.join(", ")
+                );
+                let not_in_vs_text = format!(
+                    "The provided code '#{}' was not found in the value set '{}'",
+                    req.code, vs_canonical
+                );
+                let issues = vec![
+                    crate::types::ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "code-invalid".into(),
+                        tx_code: "not-in-vs".into(),
+                        text: not_in_vs_text.clone(),
+                        expression: Some("code".into()),
+                        location: Some("code".into()),
+                        message_id: Some(
+                            "None_of_the_provided_codes_are_in_the_value_set_one".into(),
+                        ),
+                    },
+                    crate::types::ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "not-found".into(),
+                        tx_code: "cannot-infer".into(),
+                        text: cannot_infer_text.clone(),
+                        expression: Some("code".into()),
+                        location: Some("code".into()),
+                        message_id: Some(
+                            "Unable_to_resolve_system__value_set_has_multiple_matches".into(),
+                        ),
+                    },
+                ];
+                let mut texts: Vec<&str> = issues.iter().map(|i| i.text.as_str()).collect();
+                texts.sort_unstable();
+                let message = texts.join("; ");
+                return Ok(crate::types::ValidateCodeResponse {
+                    result: false,
+                    message: Some(message),
+                    display: None,
+                    system: None,
+                    cs_version: None,
+                    inactive: None,
+                    issues,
+                    caused_by_unknown_system: None,
+                    concept_status: None,
+                    normalized_code: None,
+                });
+            }
+        }
+
         let found: Option<ExpansionContains> = if candidates.is_empty() {
             None
         } else if let Some(req_v) = req_ver_exact {
