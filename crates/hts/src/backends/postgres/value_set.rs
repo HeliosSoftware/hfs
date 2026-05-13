@@ -155,26 +155,16 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             // resolvable systems so this hasn't bitten yet.
             let vs = req.value_set.as_ref().expect("inline VS branch");
             let compose = vs.get("compose");
-            // Pull the inline VS's `contained[]` so `compose.include[].
-            // valueSet[]: ["#fragment"]` references can resolve to inline
-            // contained ValueSets — drives the IG `simple/simple-expand-
-            // contained` and `validation/validate-contained-good` fixtures.
-            let contained_vec: Vec<serde_json::Value> = vs
-                .get("contained")
-                .and_then(|c| c.as_array())
-                .cloned()
-                .unwrap_or_default();
 
             if let Some(compose_val) = compose {
                 compose_is_enumerated = compose_is_enumerated_value(compose_val);
                 let compose_str = compose_val.to_string();
-                let codes = compute_expansion_with_contained(
+                let codes = compute_expansion(
                     &client,
                     Some(&compose_str),
                     &req.force_system_versions,
                     &req.system_version_defaults,
                     &req.default_value_set_versions,
-                    &contained_vec,
                 ).await?;
                 if let Some(limit) = req.max_expansion_size {
                     if codes.len() as u64 > u64::from(limit) {
@@ -1225,31 +1215,6 @@ async fn compute_expansion(
     system_version_defaults: &HashMap<String, String>,
     default_value_set_versions: &HashMap<String, String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
-    compute_expansion_with_contained(
-        client,
-        compose_json,
-        force_system_versions,
-        system_version_defaults,
-        default_value_set_versions,
-        &[],
-    )
-    .await
-}
-
-/// Like [`compute_expansion`] but also accepts the inline VS body's
-/// `contained[]` array so `compose.include[].valueSet[]: ["#fragment"]`
-/// references resolve to inline contained ValueSets. Used by callers that
-/// have the full inline VS body in hand (the `expand` inline-VS branch and
-/// the `validate_code` inline-VS branch when forwarding to the inline
-/// validator). Mirrors the SQLite `InlineResolutionContext` / Cluster 5c.
-async fn compute_expansion_with_contained(
-    client: &tokio_postgres::Client,
-    compose_json: Option<&str>,
-    force_system_versions: &HashMap<String, String>,
-    system_version_defaults: &HashMap<String, String>,
-    default_value_set_versions: &HashMap<String, String>,
-    contained: &[serde_json::Value],
-) -> Result<Vec<ExpansionContains>, HtsError> {
     let mut visited: HashSet<String> = HashSet::new();
     compute_expansion_inner(
         client,
@@ -1257,7 +1222,6 @@ async fn compute_expansion_with_contained(
         force_system_versions,
         system_version_defaults,
         default_value_set_versions,
-        contained,
         0,
         &mut visited,
     )
@@ -1278,7 +1242,6 @@ fn compute_expansion_inner<'a>(
     force_system_versions: &'a HashMap<String, String>,
     system_version_defaults: &'a HashMap<String, String>,
     default_value_set_versions: &'a HashMap<String, String>,
-    contained: &'a [serde_json::Value],
     depth: u8,
     visited: &'a mut HashSet<String>,
 ) -> futures::future::BoxFuture<'a, Result<Vec<ExpansionContains>, HtsError>> {
@@ -1288,7 +1251,6 @@ fn compute_expansion_inner<'a>(
         force_system_versions,
         system_version_defaults,
         default_value_set_versions,
-        contained,
         depth,
         visited,
     ))
@@ -1300,7 +1262,6 @@ async fn compute_expansion_inner_body(
     force_system_versions: &HashMap<String, String>,
     system_version_defaults: &HashMap<String, String>,
     default_value_set_versions: &HashMap<String, String>,
-    contained: &[serde_json::Value],
     depth: u8,
     visited: &mut HashSet<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
@@ -1358,7 +1319,6 @@ async fn compute_expansion_inner_body(
                     force_system_versions,
                     system_version_defaults,
                     default_value_set_versions,
-                    contained,
                 )
                 .await?;
                 let mut set: HashSet<(String, String)> = HashSet::new();
@@ -1401,7 +1361,6 @@ async fn compute_expansion_inner_body(
                     force_system_versions,
                     system_version_defaults,
                     default_value_set_versions,
-                    contained,
                     depth + 1,
                     visited,
                 )
@@ -1744,7 +1703,6 @@ async fn compute_expansion_inner_body(
                     force_system_versions,
                     system_version_defaults,
                     default_value_set_versions,
-                    contained,
                 )
                 .await?;
                 let mut set = HashSet::new();
@@ -1779,7 +1737,6 @@ async fn compute_expansion_inner_body(
                     force_system_versions,
                     system_version_defaults,
                     default_value_set_versions,
-                    contained,
                     depth + 1,
                     visited,
                 )
@@ -1927,10 +1884,9 @@ async fn compute_expansion_inner_body(
 ///   (mirrors sqlite/value_set.rs:3016-3026).
 /// - Recurses via `compute_expansion_inner` at depth+1 so further nested
 ///   `valueSet[]` refs participate in cycle detection and depth limits.
-/// - `#fragment` (contained-VS) refs are resolved against the supplied
-///   `contained[]` array. The matched contained VS's compose is then
-///   expanded recursively — same code path as a stored VS reference but
-///   without a DB lookup.
+/// - `#fragment` (contained-VS) refs are not resolved here — PG doesn't yet
+///   thread an `InlineResolutionContext` for `contained[]` lookup, so they
+///   warn and contribute an empty set.
 async fn pg_expand_vs_reference(
     client: &tokio_postgres::Client,
     ref_url: &str,
@@ -1939,7 +1895,6 @@ async fn pg_expand_vs_reference(
     force_system_versions: &HashMap<String, String>,
     system_version_defaults: &HashMap<String, String>,
     default_value_set_versions: &HashMap<String, String>,
-    contained: &[serde_json::Value],
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     if visited.contains(ref_url) {
         return Err(HtsError::VsInvalid(format!(
@@ -1948,40 +1903,16 @@ async fn pg_expand_vs_reference(
     }
     visited.insert(ref_url.to_owned());
 
-    if let Some(id) = ref_url.strip_prefix('#') {
-        // Look up the matching contained ValueSet and recurse into its
-        // compose. Mirrors sqlite/value_set.rs:lookup_compose +
-        // expand_vs_reference.
-        let compose_str = contained.iter().find_map(|r| {
-            if r.get("id").and_then(|v| v.as_str()) == Some(id)
-                && r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet")
-            {
-                r.get("compose").map(|c| c.to_string())
-            } else {
-                None
-            }
-        });
-        let result = if let Some(compose) = compose_str {
-            compute_expansion_inner(
-                client,
-                Some(&compose),
-                force_system_versions,
-                system_version_defaults,
-                default_value_set_versions,
-                contained,
-                depth + 1,
-                visited,
-            )
-            .await
-        } else {
-            tracing::warn!(
-                ref_url,
-                "Contained ValueSet reference not found in inline contained[] array; treating as empty"
-            );
-            Ok(vec![])
-        };
+    if ref_url.starts_with('#') {
+        // Contained-VS refs require InlineResolutionContext threading.
+        // TODO: parity — port the SQLite InlineResolutionContext so
+        // `simple/simple-expand-contained` and similar fixtures work.
+        tracing::warn!(
+            ref_url,
+            "Contained ValueSet reference (#fragment) not yet supported on PG; treated as empty"
+        );
         visited.remove(ref_url);
-        return result;
+        return Ok(vec![]);
     }
 
     let (bare_url, ref_version) = match ref_url.split_once('|') {
@@ -2013,7 +1944,6 @@ async fn pg_expand_vs_reference(
                 force_system_versions,
                 system_version_defaults,
                 default_value_set_versions,
-                contained,
                 depth + 1,
                 visited,
             )
