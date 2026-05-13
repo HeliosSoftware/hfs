@@ -3951,10 +3951,17 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                         location: None,
                         message_id: Some("Unable_to_resolve_value_Set_".into()),
                     };
-                    let mut value = build_validate_response(
+                    // Surface message via the response struct's `message`
+                    // field — build_validate_response emits it as the
+                    // top-level `message` Parameters entry. Setting it here
+                    // (rather than appending after) keeps single emission.
+                    let text_for_msg = format!(
+                        "A definition for the value Set '{unresolved_vs_url}' could not be found"
+                    );
+                    let value = build_validate_response(
                         ValidateCodeResponse {
                             result: false,
-                            message: None,
+                            message: Some(text_for_msg),
                             display: None,
                             system: None,
                             cs_version: None,
@@ -3971,29 +3978,6 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                         None,
                         req_path,
                     );
-                    if let Some(arr) = value.get_mut("parameter").and_then(|p| p.as_array_mut())
-                    {
-                        let msg = arr.iter().find_map(|p| {
-                            if p.get("name").and_then(|v| v.as_str()) == Some("issues") {
-                                p.get("resource")
-                                    .and_then(|r| r.get("issue"))
-                                    .and_then(|i| i.as_array())
-                                    .and_then(|a| a.first())
-                                    .and_then(|i| i.get("details"))
-                                    .and_then(|d| d.get("text"))
-                                    .and_then(|t| t.as_str())
-                                    .map(str::to_string)
-                            } else {
-                                None
-                            }
-                        });
-                        if let Some(text) = msg {
-                            arr.push(json!({
-                                "name": "message",
-                                "valueString": text,
-                            }));
-                        }
-                    }
                     return Ok(value);
                 }
                 return process_inline_vs_validate_code(state, params, vs).await;
