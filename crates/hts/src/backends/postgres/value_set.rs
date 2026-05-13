@@ -1991,6 +1991,16 @@ async fn apply_compose_filters_pg(
                 pg_filter_property_eq(client, system_url, system_id, property, value).await?
             }
             "is-a" => pg_filter_is_a(client, system_url, system_id, value).await?,
+            // `descendent-of` is `is-a` minus the root itself — strict subtree.
+            // The IG `other/dual-filter` fixture uses
+            // `op=descendent-of, value=AA` AND-intersected with property=A; PG
+            // previously fell through to the "unsupported, treat as empty" branch
+            // and the include collapsed.
+            "descendent-of" => {
+                let mut v = pg_filter_is_a(client, system_url, system_id, value).await?;
+                v.retain(|(c, _)| c != value);
+                v
+            }
             "child-of" => pg_filter_child_of(client, system_url, system_id, value).await?,
             "regex" => pg_filter_regex(client, system_id, property, value).await?,
             // Single-value `not-in` reduces to `!=`; both return concepts

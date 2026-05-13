@@ -493,31 +493,51 @@ jobs:
           done > tx-db-dump/status-vs-resources.txt
 
           # Show the IG test-case setup paths for the still-failing tests so we
-          # can verify our import bundle covers them.
+          # can verify our import bundle covers them. Dump the raw structure of
+          # one failing-test suite + the unique top-level keys so the analyst
+          # can decode the IG schema without guessing.
           if [ -f tx-ecosystem-ig/tests/test-cases.json ]; then
-            python3 - <<'PY' > tx-db-dump/setup-paths-for-failing-tests.txt 2>/dev/null
+            python3 - <<'PY' > tx-db-dump/setup-paths-for-failing-tests.txt 2>&1
           import json, os
-          targets = {
+          fail_suites = {
+              'simple-cases', 'simple', 'validation', 'deprecated',
+              'inactive', 'overload', 'other', 'errors', 'fragment',
+          }
+          fail_tests = [
               'simple-expand-contained',
               'simple-code-bad-import', 'simple-coding-bad-import',
               'simple-codeableconcept-bad-import',
               'validate-contained-good',
-              'overload/validate-bad-unknown',
+              'validate-bad-unknown',
               'dual-filter', 'validation-dual-filter-in',
-              'errors/combination-bad',
+              'combination-bad',
               'not-withdrawn', 'validate-withdrawn', 'validate-not-withdrawn',
-          }
+          ]
           with open('tx-ecosystem-ig/tests/test-cases.json') as f:
               cases = json.load(f)
-          for suite in cases.get('suites', []) or []:
-              for case in suite.get('tests', []) or []:
-                  test_id = case.get('id') or ''
-                  for t in targets:
-                      if t in test_id or t.split('/')[-1] in test_id:
-                          print(f"=== {suite.get('name','?')}/{test_id}")
-                          for k in ('setup', 'fixtures', 'tx-resources'):
-                              v = case.get(k) or suite.get(k)
-                              if v: print(f"  {k}: {v}")
+          print(f"top-level keys: {sorted(cases.keys())}")
+          suites = cases.get('suites') or []
+          print(f"suites count: {len(suites)}")
+          if suites:
+              first = suites[0]
+              print(f"\n--- first suite raw structure ---")
+              print(json.dumps(first, indent=2)[:2000])
+          # Now look for our failing suites by name and dump
+          print("\n--- failing-test suites ---")
+          for suite in suites:
+              sname = suite.get('name', '?')
+              if sname not in fail_suites: continue
+              print(f"\n=== suite: {sname} ===")
+              print(f"  setup ({len(suite.get('setup',[]) or [])}): {suite.get('setup',[])[:5]}...")
+              tests = suite.get('tests', []) or []
+              for case in tests:
+                  tname = case.get('id') or case.get('name') or ''
+                  if any(ft in tname for ft in fail_tests):
+                      print(f"  test: {tname}")
+                      print(f"    keys: {sorted(case.keys())}")
+                      for k in case:
+                          if k in ('setup','fixtures','tx-resources','request','file'):
+                              print(f"    {k}: {case[k]}")
           PY
           fi
 
