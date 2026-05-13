@@ -303,14 +303,31 @@ where
             get(handlers::sof::get_export_status_handler::<S>)
                 .delete(handlers::sof::cancel_export_handler::<S>),
         )
+        // Export result: GET /_operations/export/{job-id}/$result
+        // Reached via the 303 redirect from the status endpoint on completion.
+        // Registered before the download route so the literal `$result` path
+        // segment isn't captured by `{filename}`.
+        .route(
+            "/_operations/export/{job_id}/$result",
+            get(handlers::sof::get_export_result_handler::<S>),
+        )
         // Export download: GET /_operations/export/{job-id}/{filename}
         .route(
             "/_operations/export/{job_id}/{filename}",
             get(handlers::sof::download_export_file_handler::<S>),
         )
-        // Raw SQL query: POST /$sql-query-run
+        // Raw SQL query (SQL-on-FHIR v2 spec: $sqlquery-run)
+        // System, type, and instance levels per the spec.
         .route(
-            "/$sql-query-run",
+            "/$sqlquery-run",
+            post(handlers::sof::sql_query_run_handler::<S>),
+        )
+        .route(
+            "/Library/$sqlquery-run",
+            post(handlers::sof::sql_query_run_handler::<S>),
+        )
+        .route(
+            "/Library/{id}/$sqlquery-run",
             post(handlers::sof::sql_query_run_handler::<S>),
         )
 }

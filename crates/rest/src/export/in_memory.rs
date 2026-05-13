@@ -29,6 +29,9 @@ pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 /// shards based on [`shard_rows`](InMemoryController::new).
 pub struct InMemoryController<Sink: ExportSink> {
     jobs: Arc<DashMap<String, JobStatus>>,
+    /// Tenant ID that submitted each job. Used to gate status / cancel /
+    /// download so one tenant cannot access another tenant's exports.
+    job_tenants: Arc<DashMap<String, String>>,
     runner: Arc<dyn SofRunner>,
     sink: Sink,
     semaphore: Arc<Semaphore>,
@@ -57,11 +60,22 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
         let concurrency = max_concurrency.unwrap_or(DEFAULT_MAX_CONCURRENCY);
         Self {
             jobs: Arc::new(DashMap::new()),
+            job_tenants: Arc::new(DashMap::new()),
             runner,
             sink,
             semaphore: Arc::new(Semaphore::new(concurrency)),
             shard_rows: shard_rows.unwrap_or(planner::DEFAULT_SHARD_ROWS),
         }
+    }
+
+    /// Returns `true` if `tenant_id` matches the tenant that submitted
+    /// `job_id`. Returns `false` if the job is unknown or owned by a
+    /// different tenant.
+    fn tenant_matches(&self, tenant_id: &str, job_id: &str) -> bool {
+        self.job_tenants
+            .get(job_id)
+            .map(|v| v.value() == tenant_id)
+            .unwrap_or(false)
     }
 }
 
@@ -69,6 +83,9 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
     fn submit(&self, task: ExportTask) -> JobId {
         let job_id = Uuid::new_v4().to_string();
         let submitted_at = Utc::now();
+
+        self.job_tenants
+            .insert(job_id.clone(), task.tenant.tenant_id().as_str().to_string());
 
         self.jobs.insert(
             job_id.clone(),
@@ -99,107 +116,130 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                 },
             );
 
-            // Run the view
-            let stream = match runner
-                .run_view(
-                    &task.tenant,
-                    task.view_definition.clone(),
-                    task.filters.clone(),
-                )
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(job_id = %jid, error = %e, "export job failed: run_view error");
-                    jobs.insert(
-                        jid,
-                        JobStatus::Failed {
-                            message: e.to_string(),
-                            submitted_at,
-                        },
-                    );
-                    return;
-                }
-            };
-
-            // Collect all rows
             let format = task.format.to_lowercase();
-            let ext = if format == "csv" {
-                "csv"
-            } else if format == "parquet" {
-                "parquet"
-            } else {
-                "ndjson"
+            let ext = match format.as_str() {
+                "csv" => "csv",
+                "parquet" => "parquet",
+                "json" => "json",
+                _ => "ndjson",
             };
 
-            let rows: Vec<serde_json::Value> = stream
-                .filter_map(|r| async move {
-                    match r {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            warn!("export row error (skipped): {e}");
-                            None
+            let mut completed_files: Vec<CompletedFile> = Vec::new();
+            let mut total_rows: usize = 0;
+
+            // Spec: `view` is 1..* — run each ViewDefinition and produce its
+            // own set of output shards. `output.name` in the manifest carries
+            // the per-view name.
+            for named in &task.views {
+                let stream = match runner
+                    .run_view(&task.tenant, named.view.clone(), task.filters.clone())
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(job_id = %jid, view = %named.name, error = %e, "export job failed: run_view error");
+                        jobs.insert(
+                            jid.clone(),
+                            JobStatus::Failed {
+                                message: e.to_string(),
+                                submitted_at,
+                            },
+                        );
+                        return;
+                    }
+                };
+
+                let rows: Vec<serde_json::Value> = stream
+                    .filter_map(|r| async move {
+                        match r {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                warn!("export row error (skipped): {e}");
+                                None
+                            }
                         }
-                    }
-                })
-                .collect()
-                .await;
+                    })
+                    .collect()
+                    .await;
 
-            let total_rows = rows.len();
+                total_rows += rows.len();
 
-            // Split into shards using the planner
-            let ranges = planner::plan(total_rows, shard_rows);
-            // At least one shard (even for empty result sets)
-            let ranges = if ranges.is_empty() {
-                // Empty result set: produce one empty shard so the manifest
-                // always contains at least one output entry.
-                let empty: std::ops::Range<usize> = 0..0;
-                vec![empty]
-            } else {
-                ranges
-            };
-
-            let mut completed_files: Vec<CompletedFile> = Vec::with_capacity(ranges.len());
-
-            for (shard_idx, range) in ranges.into_iter().enumerate() {
-                let shard_rows_slice = &rows[range.clone()];
-                let row_count = shard_rows_slice.len();
-
-                let data = match format_rows(shard_rows_slice, &format) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        warn!(job_id = %jid, shard = shard_idx, error = %e, "export shard serialization failed");
-                        jobs.insert(
-                            jid,
-                            JobStatus::Failed {
-                                message: e.to_string(),
-                                submitted_at,
-                            },
-                        );
-                        return;
-                    }
+                let ranges = planner::plan(rows.len(), shard_rows);
+                let ranges = if ranges.is_empty() {
+                    // Empty result set: still emit one empty shard so the
+                    // manifest contains at least one output entry per view.
+                    let empty: std::ops::Range<usize> = 0..0;
+                    vec![empty]
+                } else {
+                    ranges
                 };
 
-                let url = match sink.write_shard(&jid, shard_idx, data, ext) {
-                    Ok(u) => u,
-                    Err(e) => {
-                        warn!(job_id = %jid, shard = shard_idx, error = %e, "export shard write failed");
-                        jobs.insert(
-                            jid,
-                            JobStatus::Failed {
-                                message: e.to_string(),
-                                submitted_at,
-                            },
-                        );
-                        return;
-                    }
-                };
+                for (shard_idx, range) in ranges.into_iter().enumerate() {
+                    let shard_rows_slice = &rows[range.clone()];
+                    let row_count = shard_rows_slice.len();
 
-                debug!(job_id = %jid, shard = shard_idx, rows = row_count, url = %url, "shard written");
-                completed_files.push(CompletedFile { url, row_count });
+                    let data = match format_rows(shard_rows_slice, &format, task.header) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(job_id = %jid, view = %named.name, shard = shard_idx, error = %e, "export shard serialization failed");
+                            jobs.insert(
+                                jid.clone(),
+                                JobStatus::Failed {
+                                    message: e.to_string(),
+                                    submitted_at,
+                                },
+                            );
+                            return;
+                        }
+                    };
+
+                    // Use the view name as the shard's logical name when there
+                    // is more than one view; for the single-view case keep the
+                    // existing shard naming (`shard-{N}.{ext}`) for back-compat
+                    // with sinks that derive filenames from this index.
+                    let shard_key = if task.views.len() == 1 {
+                        shard_idx
+                    } else {
+                        // Encode `view_name + shard_idx` into the index space the
+                        // sink uses by using a stable hash-ish scheme. Most sinks
+                        // serialize the shard index into the filename so we use
+                        // a composite key. Concretely we prefix the per-view
+                        // filename via the sink's standard `shard-{N}` scheme,
+                        // counting offsets across views.
+                        completed_files.len() + shard_idx
+                    };
+
+                    let url = match sink.write_shard(&jid, shard_key, data, ext) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            warn!(job_id = %jid, view = %named.name, shard = shard_idx, error = %e, "export shard write failed");
+                            jobs.insert(
+                                jid.clone(),
+                                JobStatus::Failed {
+                                    message: e.to_string(),
+                                    submitted_at,
+                                },
+                            );
+                            return;
+                        }
+                    };
+
+                    debug!(job_id = %jid, view = %named.name, shard = shard_idx, rows = row_count, url = %url, "shard written");
+                    completed_files.push(CompletedFile {
+                        view_name: named.name.clone(),
+                        url,
+                        row_count,
+                    });
+                }
             }
 
-            debug!(job_id = %jid, total_rows, shards = completed_files.len(), "export job completed");
+            debug!(
+                job_id = %jid,
+                total_rows,
+                shards = completed_files.len(),
+                views = task.views.len(),
+                "export job completed"
+            );
 
             jobs.insert(
                 jid,
@@ -207,6 +247,8 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                     files: completed_files,
                     submitted_at,
                     completed_at: Utc::now(),
+                    format: task.format.clone(),
+                    client_tracking_id: task.client_tracking_id.clone(),
                 },
             );
         });
@@ -214,11 +256,17 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         job_id
     }
 
-    fn get_status(&self, job_id: &str) -> Option<JobStatus> {
+    fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
+        if !self.tenant_matches(tenant_id, job_id) {
+            return None;
+        }
         self.jobs.get(job_id).map(|v| v.clone())
     }
 
-    fn cancel(&self, job_id: &str) -> bool {
+    fn cancel(&self, tenant_id: &str, job_id: &str) -> bool {
+        if !self.tenant_matches(tenant_id, job_id) {
+            return false;
+        }
         if let Some(mut entry) = self.jobs.get_mut(job_id) {
             match &*entry {
                 JobStatus::Running { .. } => {
@@ -233,7 +281,10 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         }
     }
 
-    fn read_shard(&self, job_id: &str, filename: &str) -> Option<Vec<u8>> {
+    fn read_shard(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<Vec<u8>> {
+        if !self.tenant_matches(tenant_id, job_id) {
+            return None;
+        }
         self.sink.read_shard(job_id, filename)
     }
 }
@@ -242,12 +293,22 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
 // Row serialization helpers
 // ============================================================================
 
-fn format_rows(rows: &[serde_json::Value], format: &str) -> Result<Vec<u8>, ExportError> {
+fn format_rows(
+    rows: &[serde_json::Value],
+    format: &str,
+    include_csv_header: bool,
+) -> Result<Vec<u8>, ExportError> {
     match format {
-        "csv" => format_csv(rows),
+        "csv" => format_csv(rows, include_csv_header),
         "parquet" => format_parquet(rows),
+        "json" => format_json_array(rows),
         _ => format_ndjson(rows),
     }
+}
+
+/// Serialises rows as a single JSON array (`_format=json`).
+fn format_json_array(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
+    serde_json::to_vec(rows).map_err(|e| ExportError::Serialization(e.to_string()))
 }
 
 fn format_parquet(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
@@ -292,7 +353,7 @@ fn format_ndjson(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
     Ok(out)
 }
 
-fn format_csv(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
+fn format_csv(rows: &[serde_json::Value], include_header: bool) -> Result<Vec<u8>, ExportError> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -305,9 +366,11 @@ fn format_csv(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
 
     let mut out = Vec::new();
 
-    // Header
-    out.extend_from_slice(cols.join(",").as_bytes());
-    out.push(b'\n');
+    // Header (only when caller opts in, per the SoF `header` parameter).
+    if include_header {
+        out.extend_from_slice(cols.join(",").as_bytes());
+        out.push(b'\n');
+    }
 
     // Data rows
     for row in rows {

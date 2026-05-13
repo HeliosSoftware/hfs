@@ -756,4 +756,194 @@ mod sof_run_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["family"], "Override");
     }
+
+    // =========================================================================
+    // viewReference (T2.2): resolve a stored ViewDefinition by reference
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_run_view_definition_view_reference_relative() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-vr-1", "RefFam").await;
+
+        // Persist the ViewDefinition to storage.
+        let tenant = test_tenant();
+        let mut vd = patient_view_definition();
+        vd["id"] = json!("stored-vd-1");
+        backend
+            .create(&tenant, "ViewDefinition", vd, FhirVersion::R4)
+            .await
+            .expect("failed to seed VD");
+
+        // Run via viewReference instead of inline viewResource.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "viewReference",
+                "valueReference": {"reference": "ViewDefinition/stored-vd-1"}
+            }]
+        });
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["family"], "RefFam");
+    }
+
+    #[tokio::test]
+    async fn test_run_view_definition_view_reference_canonical_rejected() {
+        let (server, _backend) = create_test_server().await;
+
+        // Canonical references are not yet supported and should return 400.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "viewReference",
+                "valueReference": {"reference": "http://example.org/ViewDefinition/foo|1.0"}
+            }]
+        });
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    // =========================================================================
+    // Inline resources (T2.6)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_run_view_definition_inline_resources() {
+        let (server, _backend) = create_test_server().await;
+
+        // No data seeded; inline resources should drive the run.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "viewResource", "resource": patient_view_definition()},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "inline-a",
+                    "name": [{"family": "InlineA"}]
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "inline-b",
+                    "name": [{"family": "InlineB"}]
+                }}
+            ]
+        });
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "inline resources must drive the run: {rows:?}"
+        );
+        let families: Vec<&str> = rows.iter().filter_map(|r| r["family"].as_str()).collect();
+        assert!(families.contains(&"InlineA"));
+        assert!(families.contains(&"InlineB"));
+    }
+
+    // =========================================================================
+    // Multi-value patient filter (T2.4)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_run_view_definition_multi_value_patient_filter() {
+        // The patient filter is applied by the in-DB SQL runner; the in-process
+        // runner pages all resources without compartment filtering.
+        let (server, backend) = create_test_server_with_indb().await;
+        let tenant = test_tenant();
+
+        // Patients and Observations linked to two patients.
+        for (pid, family) in [("p1", "OneFam"), ("p2", "TwoFam"), ("p3", "ThreeFam")] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": pid,
+                        "name": [{"family": family}]
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("obs-{pid}"),
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "subject": {"reference": format!("Patient/{pid}")}
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+
+        let obs_view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "obs_id", "type": "string"},
+                {"path": "subject.reference", "name": "subject", "type": "string"}
+            ]}]
+        });
+
+        // Filter by two distinct patient references.
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?patient=Patient/p1,Patient/p2")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&obs_view)
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let subjects: Vec<&str> = rows.iter().filter_map(|r| r["subject"].as_str()).collect();
+        assert_eq!(
+            subjects.len(),
+            2,
+            "expected exactly 2 rows for two patient filters, got: {subjects:?}"
+        );
+        assert!(subjects.contains(&"Patient/p1"));
+        assert!(subjects.contains(&"Patient/p2"));
+        assert!(!subjects.contains(&"Patient/p3"));
+    }
 }

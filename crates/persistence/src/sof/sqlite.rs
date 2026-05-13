@@ -44,12 +44,12 @@ impl SofRunner for SqliteInDbRunner {
         "sqlite-indb"
     }
 
-    async fn run_view<'a>(
-        &'a self,
-        tenant: &'a TenantContext,
+    async fn run_view(
+        &self,
+        tenant: &TenantContext,
         view_definition: Value,
         filters: ViewFilters,
-    ) -> Result<RowStream<'a>, SofError> {
+    ) -> Result<RowStream, SofError> {
         // Compile synchronously (cheap, no I/O)
         let compiled = compile_view_definition_dialect(&view_definition, SqlDialect::Sqlite)?;
 
@@ -113,20 +113,31 @@ fn build_sqlite_sql(base_sql: &str, filters: &ViewFilters) -> (String, Vec<Strin
         next_param += 1;
     }
 
-    if let Some(patient) = &filters.patient {
-        let p = next_param;
-        conditions.push(format!(
-            "(json_extract(r.data,'$.subject.reference')=?{p} \
-             OR json_extract(r.data,'$.patient.reference')=?{p})"
-        ));
-        extra_params.push(patient.clone());
-        next_param += 1;
+    if !filters.patient.is_empty() {
+        // Multi-value: OR across all patient references, each checked against
+        // both subject.reference and patient.reference paths.
+        let mut ors: Vec<String> = Vec::with_capacity(filters.patient.len());
+        for patient in &filters.patient {
+            let p = next_param;
+            ors.push(format!(
+                "(json_extract(r.data,'$.subject.reference')=?{p} \
+                 OR json_extract(r.data,'$.patient.reference')=?{p})"
+            ));
+            extra_params.push(patient.clone());
+            next_param += 1;
+        }
+        conditions.push(format!("({})", ors.join(" OR ")));
     }
 
-    if let Some(group) = &filters.group {
-        let p = next_param;
-        conditions.push(format!("json_extract(r.data,'$.group.reference')=?{p}"));
-        extra_params.push(group.clone());
+    if !filters.group.is_empty() {
+        let mut ors: Vec<String> = Vec::with_capacity(filters.group.len());
+        for group in &filters.group {
+            let p = next_param;
+            ors.push(format!("json_extract(r.data,'$.group.reference')=?{p}"));
+            extra_params.push(group.clone());
+            next_param += 1;
+        }
+        conditions.push(format!("({})", ors.join(" OR ")));
     }
 
     if conditions.is_empty() {

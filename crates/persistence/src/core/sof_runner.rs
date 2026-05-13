@@ -22,13 +22,20 @@ use serde_json::Value;
 use crate::tenant::TenantContext;
 
 /// Filters that narrow which resources are processed by a view run.
+///
+/// Per the SQL-on-FHIR v2 spec, `patient` and `group` are `0..*` — supplying
+/// multiple values must include resources matching ANY of them (union of the
+/// corresponding compartments).
 #[derive(Debug, Clone, Default)]
 pub struct ViewFilters {
-    /// Restrict to resources belonging to this patient (FHIR reference, e.g. `Patient/123`).
-    pub patient: Option<String>,
+    /// Restrict to resources belonging to these patients (FHIR references,
+    /// e.g. `Patient/123`). Multiple values are unioned: a resource that
+    /// matches any reference is included.
+    pub patient: Vec<String>,
 
-    /// Restrict to resources belonging to this group (FHIR reference, e.g. `Group/abc`).
-    pub group: Option<String>,
+    /// Restrict to resources belonging to these groups (FHIR references,
+    /// e.g. `Group/abc`). Multiple values are unioned.
+    pub group: Vec<String>,
 
     /// Include only resources last-modified at or after this instant (RFC 3339).
     pub since: Option<chrono::DateTime<chrono::Utc>>,
@@ -43,8 +50,14 @@ pub struct ViewFilters {
 /// columns. Nested columns are dot-joined by convention (`name.family`).
 pub type ViewRow = Value;
 
-/// A pinned, heap-allocated, `Send` stream of view rows.
-pub type RowStream<'a> = Pin<Box<dyn Stream<Item = Result<ViewRow, SofError>> + Send + 'a>>;
+/// A pinned, heap-allocated, `Send + 'static` stream of view rows.
+///
+/// Streams returned by runners must own all their state (e.g. via cloned
+/// `Arc`s or owned `Vec`s) so that the caller can move them across tasks
+/// — for example, into an HTTP response body. The previous `'a` lifetime
+/// turned out to be unused by every implementation and prevented streaming
+/// responses, so it was removed.
+pub type RowStream = Pin<Box<dyn Stream<Item = Result<ViewRow, SofError>> + Send + 'static>>;
 
 /// Errors that can occur during SQL-on-FHIR view execution.
 #[derive(Debug, thiserror::Error)]
@@ -109,12 +122,12 @@ pub trait SofRunner: Send + Sync {
     /// Returns [`SofError::Uncompilable`] synchronously (before the stream is polled)
     /// when this runner cannot handle the given ViewDefinition. The handler layer
     /// must catch this and either fall back to the in-process runner or return `422`.
-    async fn run_view<'a>(
-        &'a self,
-        tenant: &'a TenantContext,
+    async fn run_view(
+        &self,
+        tenant: &TenantContext,
         view_definition: Value,
         filters: ViewFilters,
-    ) -> Result<RowStream<'a>, SofError>;
+    ) -> Result<RowStream, SofError>;
 
     /// Returns a human-readable name for this runner (used in logs and diagnostics).
     fn runner_name(&self) -> &'static str;

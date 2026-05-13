@@ -390,22 +390,22 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_CONTROLLER", default_value = "memory")]
     pub export_controller: String,
 
-    /// Enable the `$sql-query-run` operation.
+    /// Enable the `$sqlquery-run` operation.
     /// Only takes effect when the backend advertises `BackendCapability::RawSqlQuery`.
     #[arg(long, env = "HFS_SOF_SQL_QUERY_ENABLED", default_value = "false")]
     pub sof_sql_query_enabled: bool,
 
-    /// Read-only database URL for `$sql-query-run`.
+    /// Read-only database URL for `$sqlquery-run`.
     /// For Postgres: `postgres://readonly_user:pass@host/db`.
     /// For SQLite: file path (e.g. `./fhir.db`).
     #[arg(long, env = "HFS_SOF_READONLY_URL")]
     pub sof_readonly_url: Option<String>,
 
-    /// Hard timeout (seconds) for `$sql-query-run` queries.
+    /// Hard timeout (seconds) for `$sqlquery-run` queries.
     #[arg(long, env = "HFS_SOF_SQL_QUERY_TIMEOUT_SECS", default_value = "30")]
     pub sof_sql_query_timeout_secs: u64,
 
-    /// Maximum rows returned by `$sql-query-run`.
+    /// Maximum rows returned by `$sqlquery-run`.
     #[arg(long, env = "HFS_SOF_SQL_QUERY_MAX_ROWS", default_value = "100000")]
     pub sof_sql_query_max_rows: usize,
 

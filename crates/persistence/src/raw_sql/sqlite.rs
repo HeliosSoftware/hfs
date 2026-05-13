@@ -8,7 +8,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::core::raw_sql::{RawSqlError, RawSqlRunner, SqlRow};
+use crate::core::raw_sql::{
+    BoundValue, RawSqlError, RawSqlRunner, SqlRow, rewrite_named_placeholders,
+};
 
 /// Executes read-only SQL queries against a SQLite database.
 ///
@@ -42,15 +44,38 @@ impl RawSqlRunner for SqliteRawRunner {
         &self,
         tenant_id: &str,
         sql: &str,
+        named_params: &[(String, BoundValue)],
         max_rows: usize,
         timeout_secs: u64,
     ) -> Result<Vec<SqlRow>, RawSqlError> {
         let db_path = self.db_path.clone();
         let tenant_id = tenant_id.to_string();
-        let user_sql = sql.to_string();
+
+        // Rewrite `:name` → `?N` (the tenant filter is applied through a temp
+        // table, not a placeholder, so user params start at `?1`).
+        let (rewritten_sql, param_order) = rewrite_named_placeholders(sql, false, 1);
+
+        // Resolve param order against the supplied map, owning the values.
+        let mut bound_values: Vec<BoundValue> = Vec::with_capacity(param_order.len());
+        for name in &param_order {
+            match named_params.iter().find(|(n, _)| n == name) {
+                Some((_, v)) => bound_values.push(v.clone()),
+                None => {
+                    return Err(RawSqlError::Parameter(format!(
+                        "missing value for parameter ':{name}'"
+                    )));
+                }
+            }
+        }
 
         let blocking = tokio::task::spawn_blocking(move || {
-            execute_sqlite_query(&db_path, &tenant_id, &user_sql, max_rows)
+            execute_sqlite_query(
+                &db_path,
+                &tenant_id,
+                &rewritten_sql,
+                &bound_values,
+                max_rows,
+            )
         });
 
         tokio::time::timeout(Duration::from_secs(timeout_secs), blocking)
@@ -72,6 +97,7 @@ fn execute_sqlite_query(
     db_path: &str,
     tenant_id: &str,
     user_sql: &str,
+    bound_values: &[BoundValue],
     max_rows: usize,
 ) -> Result<Vec<SqlRow>, RawSqlError> {
     // Open a fresh read-only connection via URI.
@@ -99,9 +125,17 @@ fn execute_sqlite_query(
     // Collect column names before iterating rows.
     let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
 
-    // No extra parameters — the tenant filter was applied above.
+    // Bind user-supplied parameters positionally via the driver. We do not
+    // interpolate any value into the SQL string.
+    let bind_params: Vec<rusqlite::types::Value> =
+        bound_values.iter().map(bound_to_sqlite).collect();
+    let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params
+        .iter()
+        .map(|v| v as &dyn rusqlite::ToSql)
+        .collect();
+
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(bind_refs), |row| {
             let mut obj = serde_json::Map::new();
             for (i, name) in column_names.iter().enumerate() {
                 let val: rusqlite::types::Value = row.get(i)?;
@@ -120,6 +154,20 @@ fn execute_sqlite_query(
     }
 
     Ok(result)
+}
+
+/// Maps a [`BoundValue`] to a `rusqlite::types::Value` for safe binding.
+fn bound_to_sqlite(v: &BoundValue) -> rusqlite::types::Value {
+    use rusqlite::types::Value as SVal;
+    match v {
+        BoundValue::Bool(b) => SVal::Integer(if *b { 1 } else { 0 }),
+        BoundValue::Int(i) => SVal::Integer(*i),
+        BoundValue::Decimal(f) => SVal::Real(*f),
+        BoundValue::Text(s) => SVal::Text(s.clone()),
+        BoundValue::Date(d) => SVal::Text(d.to_string()),
+        BoundValue::DateTime(dt) => SVal::Text(dt.to_rfc3339()),
+        BoundValue::Null => SVal::Null,
+    }
 }
 
 fn sqlite_value_to_json(val: rusqlite::types::Value) -> Value {

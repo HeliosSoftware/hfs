@@ -34,6 +34,35 @@ pub enum RawSqlError {
         /// The cap that was exceeded.
         max_rows: usize,
     },
+
+    /// A supplied parameter is the wrong shape or an unsupported type.
+    #[error("parameter binding error: {0}")]
+    Parameter(String),
+}
+
+/// A value bound to a named parameter when executing a query.
+///
+/// Per the SQL-on-FHIR v2 spec MUST: parameter values must be safely bound
+/// by the driver, not interpolated into the SQL string. Implementations of
+/// [`RawSqlRunner`] map these variants to the backend's native bound-value
+/// representation; backends MUST NOT format these into the SQL string.
+#[derive(Debug, Clone)]
+pub enum BoundValue {
+    /// `valueBoolean`
+    Bool(bool),
+    /// `valueInteger` / `valuePositiveInt` / `valueUnsignedInt`
+    Int(i64),
+    /// `valueDecimal`
+    Decimal(f64),
+    /// `valueString` / `valueCode` / `valueId` / `valueUri` / `valueOid` /
+    /// `valueCanonical` / `valueUrl`
+    Text(String),
+    /// `valueDate` (YYYY-MM-DD)
+    Date(chrono::NaiveDate),
+    /// `valueDateTime` / `valueInstant`
+    DateTime(chrono::DateTime<chrono::Utc>),
+    /// SQL NULL
+    Null,
 }
 
 /// Executes raw SQL queries against the FHIR resource store in read-only mode.
@@ -63,16 +92,99 @@ pub trait RawSqlRunner: Send + Sync {
     ///
     /// The SQL must already have been validated as a plain `SELECT` by the
     /// caller.  The runner wraps it in a tenant-boundary CTE before execution.
+    ///
+    /// `named_params` supplies values for any `:name` placeholders that appear
+    /// in `sql`. The runner MUST bind these via the driver's parameter-binding
+    /// API (never via string interpolation) to satisfy the SQL-on-FHIR v2
+    /// MUST that parameters be safe against injection.
     async fn run_query(
         &self,
         tenant_id: &str,
         sql: &str,
+        named_params: &[(String, BoundValue)],
         max_rows: usize,
         timeout_secs: u64,
     ) -> Result<Vec<SqlRow>, RawSqlError>;
 
     /// Human-readable name for log messages and diagnostics.
     fn runner_name(&self) -> &'static str;
+}
+
+/// Rewrites `:name` placeholders in `sql` to positional `$N` (Postgres) or
+/// `?N` (SQLite) placeholders, returning the rewritten SQL plus the order in
+/// which parameters must be bound. The `start` index is the first positional
+/// index to allocate to user-supplied parameters (Postgres uses `$1` for the
+/// tenant id, so user params start at `$2`).
+///
+/// Behaviour:
+/// - `::` (Postgres cast) is skipped — it's not a placeholder.
+/// - Multi-use of the same `:name` is supported and reuses the same index.
+/// - `:` followed by whitespace or end-of-input is left untouched.
+/// - Returns the rewritten SQL and a `Vec<String>` of param names in the
+///   order their positional placeholders were assigned. The caller is
+///   responsible for looking up each name in the supplied parameter map
+///   and binding the value (driver-side, not via interpolation).
+pub fn rewrite_named_placeholders(
+    sql: &str,
+    is_postgres: bool,
+    start: usize,
+) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut order: Vec<String> = Vec::new();
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Skip Postgres `::` cast operator entirely.
+        if b == b':' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
+            out.push_str("::");
+            i += 2;
+            continue;
+        }
+        if b == b':' {
+            // Lookahead for an identifier: [A-Za-z_][A-Za-z0-9_]*
+            let mut j = i + 1;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if c == b'_' || c.is_ascii_alphanumeric() {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j > i + 1 {
+                let name = &sql[i + 1..j];
+                // First-char-must-not-be-digit check.
+                if !name.as_bytes()[0].is_ascii_digit() {
+                    // Find existing index or allocate a new one.
+                    let idx = match order.iter().position(|n| n == name) {
+                        Some(p) => start + p,
+                        None => {
+                            order.push(name.to_string());
+                            start + order.len() - 1
+                        }
+                    };
+                    if is_postgres {
+                        out.push('$');
+                    } else {
+                        out.push('?');
+                    }
+                    out.push_str(&idx.to_string());
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        // Default: copy one byte through.
+        // The source is valid UTF-8; pushing one byte at a time may split a
+        // multi-byte sequence, so we step by char boundary instead.
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    (out, order)
 }
 
 // ============================================================================
@@ -182,5 +294,38 @@ mod tests {
         let wrapped = wrap_with_tenant_cte(sql, true);
         assert!(wrapped.starts_with("WITH resources AS ("));
         assert!(wrapped.contains(", patients as ("));
+    }
+
+    #[test]
+    fn test_rewrite_placeholders_postgres() {
+        let (sql, order) = rewrite_named_placeholders(
+            "SELECT * FROM resources WHERE id = :pid AND tenant = :pid",
+            true,
+            2,
+        );
+        assert_eq!(sql, "SELECT * FROM resources WHERE id = $2 AND tenant = $2");
+        assert_eq!(order, vec!["pid".to_string()]);
+    }
+
+    #[test]
+    fn test_rewrite_placeholders_sqlite_distinct_params() {
+        let (sql, order) = rewrite_named_placeholders(
+            "SELECT * FROM resources WHERE id = :pid AND last_updated > :since",
+            false,
+            2,
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM resources WHERE id = ?2 AND last_updated > ?3"
+        );
+        assert_eq!(order, vec!["pid".to_string(), "since".to_string()]);
+    }
+
+    #[test]
+    fn test_rewrite_placeholders_skips_pg_cast() {
+        let (sql, _order) =
+            rewrite_named_placeholders("SELECT id::text FROM resources WHERE id = :pid", true, 2);
+        assert!(sql.contains("id::text"));
+        assert!(sql.contains("$2"));
     }
 }

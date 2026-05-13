@@ -45,6 +45,11 @@ pub struct InProcessRunner<S: SearchProvider + Send + Sync + 'static> {
     storage: Arc<S>,
     fhir_version: FhirVersion,
     page_size: u32,
+    /// Optional inline resources (SoF `resource` parameter). When set, the
+    /// runner ignores backend storage and evaluates the view against this list.
+    /// Used by `$viewdefinition-run` callers that pass a `Parameters` body with
+    /// one or more `resource` entries.
+    inline_resources: Option<Vec<Value>>,
 }
 
 impl<S: SearchProvider + Send + Sync + 'static> InProcessRunner<S> {
@@ -59,6 +64,23 @@ impl<S: SearchProvider + Send + Sync + 'static> InProcessRunner<S> {
             storage,
             fhir_version,
             page_size: DEFAULT_PAGE_SIZE,
+            inline_resources: None,
+        }
+    }
+
+    /// Like [`new`](Self::new) but seeds the runner with a fixed list of inline
+    /// resources. The runner evaluates the view against these resources only
+    /// and never touches the underlying storage.
+    pub fn with_inline_resources(
+        storage: Arc<S>,
+        fhir_version: FhirVersion,
+        resources: Vec<Value>,
+    ) -> Self {
+        Self {
+            storage,
+            fhir_version,
+            page_size: DEFAULT_PAGE_SIZE,
+            inline_resources: Some(resources),
         }
     }
 
@@ -146,12 +168,12 @@ impl<S: SearchProvider + Send + Sync + 'static> SofRunner for InProcessRunner<S>
         "inprocess"
     }
 
-    async fn run_view<'a>(
-        &'a self,
-        tenant: &'a TenantContext,
+    async fn run_view(
+        &self,
+        tenant: &TenantContext,
         view_definition: Value,
         filters: ViewFilters,
-    ) -> Result<RowStream<'a>, SofError> {
+    ) -> Result<RowStream, SofError> {
         // Step 1 — parse and prepare the ViewDefinition
         let sof_view = self.parse_view_definition(view_definition)?;
         let prepared = PreparedViewDefinition::new(sof_view).map_err(Self::map_sof_error)?;
@@ -169,6 +191,46 @@ impl<S: SearchProvider + Send + Sync + 'static> SofRunner for InProcessRunner<S>
         let mut chunk_index: usize = 0;
         let mut total_emitted: usize = 0;
         let limit = filters.limit;
+
+        // Inline path: feed the provided resources directly into the chunker,
+        // bypassing storage entirely. patient / group / since are ignored on
+        // the inline path because the caller is providing exactly the input
+        // they want processed.
+        if let Some(inline) = &self.inline_resources {
+            let filtered: Vec<Value> = inline
+                .iter()
+                .filter(|r| r.get("resourceType").and_then(|v| v.as_str()) == Some(&resource_type))
+                .cloned()
+                .collect();
+
+            if !filtered.is_empty() {
+                let chunk = ResourceChunk {
+                    resources: filtered,
+                    chunk_index: 0,
+                    is_last: true,
+                };
+                let chunked = prepared.process_chunk(chunk).map_err(Self::map_sof_error)?;
+                let columns = chunked.columns.clone();
+                for row in chunked.rows {
+                    if let Some(cap) = limit {
+                        if total_emitted >= cap {
+                            break;
+                        }
+                    }
+                    let json = Self::row_to_json(&columns, row.values);
+                    all_rows.push(Ok(json));
+                    total_emitted += 1;
+                }
+            }
+
+            debug!(
+                runner = "inprocess",
+                rows = total_emitted,
+                source = "inline",
+                "in-process view run complete (inline mode)"
+            );
+            return Ok(Box::pin(stream::iter(all_rows)));
+        }
 
         loop {
             let mut query = SearchQuery::new(&resource_type);

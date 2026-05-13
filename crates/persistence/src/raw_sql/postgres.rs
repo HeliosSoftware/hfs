@@ -9,8 +9,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio_postgres::NoTls;
+use tokio_postgres::types::ToSql;
 
-use crate::core::raw_sql::{RawSqlError, RawSqlRunner, SqlRow, wrap_with_tenant_cte};
+use crate::core::raw_sql::{
+    BoundValue, RawSqlError, RawSqlRunner, SqlRow, rewrite_named_placeholders, wrap_with_tenant_cte,
+};
 
 /// Executes read-only SQL queries against a PostgreSQL database.
 pub struct PgRawRunner {
@@ -34,15 +37,33 @@ impl RawSqlRunner for PgRawRunner {
         &self,
         tenant_id: &str,
         sql: &str,
+        named_params: &[(String, BoundValue)],
         max_rows: usize,
         timeout_secs: u64,
     ) -> Result<Vec<SqlRow>, RawSqlError> {
         let conn_str = self.connection_string.clone();
         let tenant_id = tenant_id.to_string();
-        let wrapped_sql = wrap_with_tenant_cte(sql, true);
 
-        let query_fut =
-            async move { execute_pg_query(&conn_str, &tenant_id, &wrapped_sql, max_rows).await };
+        // 1. Rewrite :name placeholders to $N starting at $2 (tenant occupies $1).
+        let (sql_with_dollars, param_order) = rewrite_named_placeholders(sql, true, 2);
+        let wrapped_sql = wrap_with_tenant_cte(&sql_with_dollars, true);
+
+        // 2. Resolve every placeholder name against the supplied map.
+        let mut bound_values: Vec<BoundValue> = Vec::with_capacity(param_order.len());
+        for name in &param_order {
+            match named_params.iter().find(|(n, _)| n == name) {
+                Some((_, v)) => bound_values.push(v.clone()),
+                None => {
+                    return Err(RawSqlError::Parameter(format!(
+                        "missing value for parameter ':{name}'"
+                    )));
+                }
+            }
+        }
+
+        let query_fut = async move {
+            execute_pg_query(&conn_str, &tenant_id, &wrapped_sql, &bound_values, max_rows).await
+        };
 
         tokio::time::timeout(Duration::from_secs(timeout_secs), query_fut)
             .await
@@ -62,6 +83,7 @@ async fn execute_pg_query(
     conn_str: &str,
     tenant_id: &str,
     wrapped_sql: &str,
+    bound_values: &[BoundValue],
     max_rows: usize,
 ) -> Result<Vec<SqlRow>, RawSqlError> {
     let (client, connection) = tokio_postgres::connect(conn_str, NoTls)
@@ -74,8 +96,20 @@ async fn execute_pg_query(
         let _ = connection.await;
     });
 
+    // Tenant ($1) plus each user-bound value ($2..). The Vec must own each
+    // boxed ToSql so we can build a Vec of trait-object references in order.
+    let mut owned: Vec<Box<dyn ToSql + Sync + Send>> = Vec::with_capacity(1 + bound_values.len());
+    owned.push(Box::new(tenant_id.to_string()));
+    for v in bound_values {
+        owned.push(bound_to_pg(v));
+    }
+    let refs: Vec<&(dyn ToSql + Sync)> = owned
+        .iter()
+        .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+        .collect();
+
     let rows = client
-        .query(wrapped_sql, &[&tenant_id])
+        .query(wrapped_sql, &refs)
         .await
         .map_err(|e| RawSqlError::Query(e.to_string()))?;
 
@@ -84,6 +118,19 @@ async fn execute_pg_query(
     }
 
     rows.iter().map(pg_row_to_json).collect()
+}
+
+/// Maps a [`BoundValue`] to a boxed `ToSql` trait object that Postgres can bind.
+fn bound_to_pg(v: &BoundValue) -> Box<dyn ToSql + Sync + Send> {
+    match v {
+        BoundValue::Bool(b) => Box::new(*b),
+        BoundValue::Int(i) => Box::new(*i),
+        BoundValue::Decimal(f) => Box::new(*f),
+        BoundValue::Text(s) => Box::new(s.clone()),
+        BoundValue::Date(d) => Box::new(*d),
+        BoundValue::DateTime(dt) => Box::new(*dt),
+        BoundValue::Null => Box::new(Option::<String>::None),
+    }
 }
 
 fn pg_row_to_json(row: &tokio_postgres::Row) -> Result<SqlRow, RawSqlError> {

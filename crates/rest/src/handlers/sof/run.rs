@@ -44,7 +44,11 @@ use crate::sof::in_process::InProcessRunner;
 use crate::state::AppState;
 
 /// Query parameters for `$viewdefinition-run`.
-#[derive(Debug, Deserialize)]
+///
+/// `patient` and `group` accept either a single reference or a comma-separated
+/// list (spec is `0..*`). Repeated entries supplied in a `Parameters` body are
+/// merged in via [`merge_params`] and take precedence.
+#[derive(Debug, Default, Deserialize)]
 pub struct RunQueryParams {
     /// Output format: `ndjson` (default), `csv`, `json`.
     #[serde(rename = "_format")]
@@ -64,11 +68,23 @@ pub struct RunQueryParams {
     /// Override runner: `inprocess` forces the in-process FHIRPath runner.
     pub runner: Option<String>,
 
-    /// Filter by patient reference (e.g. `Patient/123`).
+    /// Filter by patient references (comma-separated for multiple).
     pub patient: Option<String>,
 
-    /// Filter by group reference.
+    /// Filter by group references (comma-separated for multiple).
     pub group: Option<String>,
+}
+
+/// Splits a comma-separated query value into trimmed, non-empty references.
+fn split_refs(v: Option<&str>) -> Vec<String> {
+    match v {
+        Some(s) => s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// `POST /ViewDefinition/$viewdefinition-run`
@@ -76,9 +92,13 @@ pub struct RunQueryParams {
 /// The ViewDefinition must be supplied in the request body either as:
 /// - A raw `ViewDefinition` JSON object, or
 /// - A FHIR `Parameters` resource with a `viewResource` parameter.
+///
+/// When the body is a `Parameters` resource, additional parameter entries
+/// (`_format`, `_limit`, `_since`, `patient`, `group`, `header`) override
+/// the corresponding query-string values per the SQL-on-FHIR spec.
 pub async fn run_view_definition_handler<S>(
     State(state): State<AppState<S>>,
-    Query(params): Query<RunQueryParams>,
+    Query(query_params): Query<RunQueryParams>,
     tenant: TenantExtractor,
     _headers: HeaderMap,
     body: axum::extract::Json<Value>,
@@ -86,18 +106,21 @@ pub async fn run_view_definition_handler<S>(
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    let view_json = extract_view_definition(body.0)?;
-    execute_view(state, params, tenant, view_json).await
+    let body_params = extract_body_params(&body.0);
+    let view_json = resolve_view_from_body(&state, &tenant, &body.0).await?;
+    let params = merge_params(query_params, &body_params);
+    execute_view(state, params, body_params, tenant, view_json).await
 }
 
 /// `POST /ViewDefinition/{id}/$viewdefinition-run`
 ///
-/// Looks up the stored ViewDefinition by ID, then runs it.
-/// Additional `viewResource` in the body overrides the stored definition.
+/// Looks up the stored ViewDefinition by ID and runs it. If the body contains
+/// a `viewResource` (or is itself a `ViewDefinition` resource), the body
+/// overrides the stored definition.
 pub async fn run_stored_view_definition_handler<S>(
     State(state): State<AppState<S>>,
-    Path(_id): Path<String>,
-    Query(params): Query<RunQueryParams>,
+    Path(id): Path<String>,
+    Query(query_params): Query<RunQueryParams>,
     tenant: TenantExtractor,
     _headers: HeaderMap,
     body: axum::extract::Json<Value>,
@@ -105,46 +128,270 @@ pub async fn run_stored_view_definition_handler<S>(
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    // For Phase 1: treat body the same as the anonymous form.
-    // Phase 2 will add ViewDefinition lookup by ID from storage.
-    let view_json = extract_view_definition(body.0)?;
-    execute_view(state, params, tenant, view_json).await
+    let body_params = extract_body_params(&body.0);
+    // If the body provides a ViewDefinition (inline or by reference), prefer
+    // it. Otherwise, load the stored ViewDefinition by id from the path.
+    let view_json = if body_has_view(&body.0) {
+        resolve_view_from_body(&state, &tenant, &body.0).await?
+    } else {
+        let stored = state
+            .storage()
+            .read(tenant.context(), "ViewDefinition", &id)
+            .await
+            .map_err(|e| RestError::InternalError {
+                message: format!("failed to read ViewDefinition: {e}"),
+            })?
+            .ok_or_else(|| RestError::NotFound {
+                resource_type: "ViewDefinition".to_string(),
+                id: id.clone(),
+            })?;
+        stored.content().clone()
+    };
+    let params = merge_params(query_params, &body_params);
+    execute_view(state, params, body_params, tenant, view_json).await
 }
 
-/// Extracts a ViewDefinition from a request body.
-///
-/// Accepts either:
-/// - A raw `ViewDefinition` object (`resourceType == "ViewDefinition"`)
-/// - A `Parameters` resource with a `viewResource` parameter
-fn extract_view_definition(body: Value) -> Result<Value, RestError> {
-    match body.get("resourceType").and_then(|v| v.as_str()) {
-        Some("ViewDefinition") => Ok(body),
-        Some("Parameters") => {
-            // Extract the viewResource parameter value
-            body.get("parameter")
-                .and_then(|p| p.as_array())
-                .and_then(|params| {
-                    params.iter().find(|p| {
-                        p.get("name").and_then(|n| n.as_str()) == Some("viewResource")
-                    })
-                })
-                .and_then(|p| p.get("resource"))
-                .cloned()
-                .ok_or_else(|| RestError::BadRequest {
-                    message: "Parameters body must contain a 'viewResource' parameter with the ViewDefinition resource".to_string(),
-                })
-        }
-        Some(other) => Err(RestError::BadRequest {
-            message: format!(
-                "Expected a ViewDefinition or Parameters body, got resourceType='{}'",
-                other
-            ),
-        }),
-        None => Err(RestError::BadRequest {
-            message: "Request body must be a FHIR JSON resource with a 'resourceType' field"
-                .to_string(),
-        }),
+/// Parameters extracted from a FHIR `Parameters` body. Anything not present
+/// in the body stays `None`/empty so the merge step preserves the query-string
+/// value. `patient` and `group` collect every repeated entry (spec is 0..*).
+#[derive(Debug, Default)]
+struct BodyParams {
+    format: Option<String>,
+    header: Option<String>,
+    limit: Option<usize>,
+    since: Option<String>,
+    patient: Vec<String>,
+    group: Vec<String>,
+    /// Inline `resource` parameter values (any number; spec 0..*). Drives the
+    /// in-process runner when present so the view runs against these resources
+    /// instead of the tenant's stored data.
+    inline_resources: Vec<Value>,
+}
+
+/// Reads SoF-spec parameters out of a FHIR `Parameters` body. Returns an empty
+/// `BodyParams` for any non-Parameters body (e.g. a bare ViewDefinition).
+fn extract_body_params(body: &Value) -> BodyParams {
+    if body.get("resourceType").and_then(|v| v.as_str()) != Some("Parameters") {
+        return BodyParams::default();
     }
+    let Some(entries) = body.get("parameter").and_then(|p| p.as_array()) else {
+        return BodyParams::default();
+    };
+
+    let mut out = BodyParams::default();
+    for p in entries {
+        let name = match p.get("name").and_then(|n| n.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        match name {
+            "_format" => {
+                out.format = p
+                    .get("valueCode")
+                    .or_else(|| p.get("valueString"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+            "header" => {
+                if let Some(b) = p.get("valueBoolean").and_then(|v| v.as_bool()) {
+                    out.header = Some(if b { "true" } else { "false" }.to_string());
+                } else if let Some(s) = p.get("valueString").and_then(|v| v.as_str()) {
+                    out.header = Some(s.to_string());
+                }
+            }
+            "_limit" => {
+                out.limit = p
+                    .get("valueInteger")
+                    .or_else(|| p.get("valuePositiveInt"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+            }
+            "_since" => {
+                out.since = p
+                    .get("valueInstant")
+                    .or_else(|| p.get("valueDateTime"))
+                    .or_else(|| p.get("valueString"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+            "patient" => {
+                if let Some(s) = p
+                    .get("valueReference")
+                    .and_then(|r| r.get("reference"))
+                    .or_else(|| p.get("valueString"))
+                    .and_then(|v| v.as_str())
+                {
+                    out.patient.push(s.to_string());
+                }
+            }
+            "group" => {
+                if let Some(s) = p
+                    .get("valueReference")
+                    .and_then(|r| r.get("reference"))
+                    .or_else(|| p.get("valueString"))
+                    .and_then(|v| v.as_str())
+                {
+                    out.group.push(s.to_string());
+                }
+            }
+            "resource" => {
+                if let Some(r) = p.get("resource") {
+                    out.inline_resources.push(r.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Merges body parameters onto query-string parameters with body precedence
+/// for scalar values. Multi-valued fields (`patient`, `group`) and inline
+/// resources stay on the [`BodyParams`] and are consumed in [`build_filters`]
+/// / [`execute_view`].
+fn merge_params(query: RunQueryParams, body: &BodyParams) -> RunQueryParams {
+    RunQueryParams {
+        format: body.format.clone().or(query.format),
+        header: body.header.clone().or(query.header),
+        limit: body.limit.or(query.limit),
+        since: body.since.clone().or(query.since),
+        runner: query.runner,
+        patient: query.patient,
+        group: query.group,
+    }
+}
+
+/// Returns `true` when the body carries a ViewDefinition the handler should use
+/// instead of loading from storage. Accepts either a bare `ViewDefinition`
+/// resource or a `Parameters` body containing a `viewResource` *or*
+/// `viewReference` parameter.
+fn body_has_view(body: &Value) -> bool {
+    match body.get("resourceType").and_then(|v| v.as_str()) {
+        Some("ViewDefinition") => true,
+        Some("Parameters") => body
+            .get("parameter")
+            .and_then(|p| p.as_array())
+            .map(|params| {
+                params.iter().any(|p| {
+                    matches!(
+                        p.get("name").and_then(|n| n.as_str()),
+                        Some("viewResource") | Some("viewReference")
+                    )
+                })
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Resolves a ViewDefinition from a request body, fetching from storage when
+/// the caller supplies a `viewReference` instead of an inline `viewResource`.
+/// Supports relative references of the form `ViewDefinition/{id}`; canonical
+/// and absolute URL forms are rejected with a 400 until they are wired up.
+async fn resolve_view_from_body<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    body: &Value,
+) -> Result<Value, RestError>
+where
+    S: SearchProvider + Send + Sync + 'static,
+{
+    // Bare ViewDefinition body is used as-is.
+    if body.get("resourceType").and_then(|v| v.as_str()) == Some("ViewDefinition") {
+        return Ok(body.clone());
+    }
+
+    // Parameters body: look for viewResource first, fall back to viewReference.
+    if body.get("resourceType").and_then(|v| v.as_str()) == Some("Parameters") {
+        let entries = body.get("parameter").and_then(|p| p.as_array());
+
+        // 1. Inline viewResource takes precedence when both are present.
+        if let Some(arr) = entries {
+            if let Some(view) = arr
+                .iter()
+                .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("viewResource"))
+                .and_then(|p| p.get("resource"))
+            {
+                return Ok(view.clone());
+            }
+        }
+
+        // 2. Otherwise, resolve viewReference.
+        if let Some(arr) = entries {
+            if let Some(reference) = arr
+                .iter()
+                .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("viewReference"))
+                .and_then(|p| p.get("valueReference"))
+                .and_then(|r| r.get("reference"))
+                .and_then(|v| v.as_str())
+            {
+                return resolve_view_reference(state, tenant, reference).await;
+            }
+        }
+
+        return Err(RestError::BadRequest {
+            message: "Parameters body must contain a 'viewResource' or 'viewReference' parameter"
+                .to_string(),
+        });
+    }
+
+    // Anything else is an error.
+    let rt = body
+        .get("resourceType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    Err(RestError::BadRequest {
+        message: format!("Expected a ViewDefinition or Parameters body, got resourceType='{rt}'"),
+    })
+}
+
+/// Resolves a FHIR reference string into a stored ViewDefinition.
+///
+/// Supports:
+/// - Relative references: `ViewDefinition/{id}` → `storage.read(...)`
+///
+/// Canonical (`http://example.org/...`) and absolute references are not yet
+/// implemented; they return a 400 with a descriptive OperationOutcome. The
+/// `$sql-on-fhir-capabilities` response advertises this via
+/// `supportsCanonicalReference` / `supportsAbsoluteReference = false`.
+async fn resolve_view_reference<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    reference: &str,
+) -> Result<Value, RestError>
+where
+    S: SearchProvider + Send + Sync + 'static,
+{
+    let trimmed = reference.trim();
+    // Relative form: "ViewDefinition/{id}" (optionally /_history/{vid} suffix is ignored).
+    if let Some(rest) = trimmed.strip_prefix("ViewDefinition/") {
+        let id = rest.split('/').next().unwrap_or("").to_string();
+        if id.is_empty() {
+            return Err(RestError::BadRequest {
+                message: format!("viewReference '{reference}' has an empty id"),
+            });
+        }
+        let stored = state
+            .storage()
+            .read(tenant.context(), "ViewDefinition", &id)
+            .await
+            .map_err(|e| RestError::InternalError {
+                message: format!("failed to read ViewDefinition: {e}"),
+            })?
+            .ok_or_else(|| RestError::NotFound {
+                resource_type: "ViewDefinition".to_string(),
+                id: id.clone(),
+            })?;
+        return Ok(stored.content().clone());
+    }
+
+    Err(RestError::BadRequest {
+        message: format!(
+            "viewReference '{reference}' uses an unsupported form; \
+             this server currently supports only relative references like \
+             'ViewDefinition/{{id}}'. See `/$sql-on-fhir-capabilities` for details."
+        ),
+    })
 }
 
 /// Resolves the SofRunner and executes the view, returning a streaming response.
@@ -154,14 +401,28 @@ fn extract_view_definition(body: Value) -> Result<Value, RestError> {
 async fn execute_view<S>(
     state: AppState<S>,
     params: RunQueryParams,
+    body_params: BodyParams,
     tenant: TenantExtractor,
     view_json: Value,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    let runner: Arc<dyn SofRunner> = resolve_runner(&state, &params);
-    let filters = build_filters(&params);
+    // Inline resources force the in-process runner — in-DB runners can only
+    // see stored data. We feed the inline resources directly into the runner
+    // and skip backend reads entirely.
+    let has_inline = !body_params.inline_resources.is_empty();
+
+    let runner: Arc<dyn SofRunner> = if has_inline {
+        Arc::new(InProcessRunner::with_inline_resources(
+            state.storage_arc(),
+            state.config().default_fhir_version,
+            body_params.inline_resources.clone(),
+        ))
+    } else {
+        resolve_runner(&state, &params)
+    };
+    let filters = build_filters(&params, &body_params);
     let format = params.format.as_deref().unwrap_or("ndjson").to_lowercase();
     let include_header = params
         .header
@@ -176,7 +437,9 @@ where
         "dispatching $viewdefinition-run"
     );
 
-    // Determine whether auto-fallback is permitted (G6)
+    // Determine whether auto-fallback is permitted (G6). Auto-fallback is
+    // disabled when we're already on the in-process runner (including the
+    // inline-resources path).
     let is_inprocess = runner.runner_name() == "inprocess";
     let forced_inprocess = params
         .runner
@@ -185,56 +448,107 @@ where
         .unwrap_or(false);
     let can_fallback = !is_inprocess
         && !forced_inprocess
+        && !has_inline
         && state.config().sof_default_runner.to_lowercase() == "auto";
 
-    // First attempt with the resolved runner
-    match runner
+    // For the `ndjson` format we stream rows directly into the response body
+    // (T5.3) so large views don't have to be fully buffered server-side. We
+    // need a probe call to surface synchronous Uncompilable errors with the
+    // existing fallback semantics; once we have a stream we hand it off to a
+    // background task that pumps serialized bytes into the response body.
+    let probe = runner
         .run_view(tenant.context(), view_json.clone(), filters.clone())
-        .await
-    {
-        Ok(stream) => {
-            let runner_label = runner.runner_name().to_string();
-            let (ct, body) = format_stream(stream, &format, include_header).await;
-            Ok(build_response(
-                StatusCode::OK,
-                ct,
-                body,
-                &runner_label,
-                &format,
-            ))
-        }
+        .await;
+
+    let (stream, runner_label) = match probe {
+        Ok(s) => (s, runner.runner_name().to_string()),
         Err(SofError::Uncompilable { reason }) if can_fallback => {
-            // G6: transparently fall back to in-process runner
             warn!(
                 runner = runner.runner_name(),
                 reason = %reason,
                 "in-DB runner returned Uncompilable; falling back to in-process runner"
             );
-            let fallback = Arc::new(InProcessRunner::new(
+            let fallback: Arc<dyn SofRunner> = Arc::new(InProcessRunner::new(
                 state.storage_arc(),
                 state.config().default_fhir_version,
             ));
-            let stream = fallback
-                .run_view(tenant.context(), view_json, filters)
+            let s = fallback
+                .run_view(tenant.context(), view_json.clone(), filters.clone())
                 .await
                 .map_err(map_sof_error_to_rest)?;
-            let runner_label = format!("inprocess (fallback: {reason})");
-            let (ct, body) = format_stream(stream, &format, include_header).await;
-            Ok(build_response(
-                StatusCode::OK,
-                ct,
-                body,
-                &runner_label,
-                &format,
-            ))
+            (s, format!("inprocess (fallback: {reason})"))
         }
-        Err(e) => Err(map_sof_error_to_rest(e)),
+        Err(e) => return Err(map_sof_error_to_rest(e)),
+    };
+
+    // Streaming path for ndjson: forward rows incrementally.
+    if format == "ndjson" || format == "application/x-ndjson" {
+        return Ok(streaming_ndjson_response(stream, &runner_label));
     }
+
+    // Buffered paths (csv, json array, parquet) — collect the stream first.
+    let (ct, body) = format_stream(stream, &format, include_header).await;
+    Ok(build_response(
+        StatusCode::OK,
+        ct,
+        body,
+        &runner_label,
+        &format,
+    ))
+}
+
+/// Builds a chunked-transfer-encoding response that streams NDJSON rows as
+/// they arrive from the runner. Each row is serialised once and pushed
+/// through an mpsc channel into the response body, so the full result set
+/// never has to be buffered server-side.
+fn streaming_ndjson_response(
+    mut stream: helios_persistence::core::sof_runner::RowStream,
+    runner_label: &str,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(64);
+
+    tokio::spawn(async move {
+        while let Some(row) = futures::StreamExt::next(&mut stream).await {
+            let mut buf = match row {
+                Ok(r) => match serde_json::to_vec(&r) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "ndjson row serialization failed");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    warn!(error = %e, "row error while streaming ndjson");
+                    break;
+                }
+            };
+            buf.push(b'\n');
+            if tx.send(Ok(axum::body::Bytes::from(buf))).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let body_stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    });
+    let body = axum::body::Body::from_stream(body_stream);
+
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    if let Ok(v) = HeaderValue::from_str(runner_label) {
+        response.headers_mut().insert("x-hfs-runner", v);
+    }
+    response
 }
 
 /// Renders a `RowStream` to `(content_type, bytes)` for the requested format.
 async fn format_stream(
-    stream: helios_persistence::core::sof_runner::RowStream<'_>,
+    stream: helios_persistence::core::sof_runner::RowStream,
     format: &str,
     include_header: bool,
 ) -> (&'static str, Vec<u8>) {
@@ -312,12 +626,25 @@ fn resolve_runner<S: SearchProvider + Send + Sync + 'static>(
 }
 
 /// Builds `ViewFilters` from query parameters.
-fn build_filters(params: &RunQueryParams) -> ViewFilters {
+fn build_filters(params: &RunQueryParams, body_extra: &BodyParams) -> ViewFilters {
     let since = params.since.as_deref().and_then(|s| s.parse().ok());
 
+    // Effective patient/group: body's repeated entries override query when present;
+    // otherwise fall back to the comma-split query string.
+    let patient = if !body_extra.patient.is_empty() {
+        body_extra.patient.clone()
+    } else {
+        split_refs(params.patient.as_deref())
+    };
+    let group = if !body_extra.group.is_empty() {
+        body_extra.group.clone()
+    } else {
+        split_refs(params.group.as_deref())
+    };
+
     ViewFilters {
-        patient: params.patient.clone(),
-        group: params.group.clone(),
+        patient,
+        group,
         since,
         limit: params.limit,
     }
@@ -342,9 +669,7 @@ fn map_sof_error_to_rest(e: SofError) -> RestError {
 }
 
 /// Collects the row stream into Parquet bytes (G2).
-async fn stream_to_parquet(
-    mut stream: helios_persistence::core::sof_runner::RowStream<'_>,
-) -> Vec<u8> {
+async fn stream_to_parquet(mut stream: helios_persistence::core::sof_runner::RowStream) -> Vec<u8> {
     let mut rows: Vec<Value> = Vec::new();
     while let Some(result) = stream.next().await {
         match result {
@@ -400,9 +725,7 @@ async fn stream_to_parquet(
 }
 
 /// Collects the row stream into a NDJSON byte string.
-async fn stream_to_ndjson(
-    mut stream: helios_persistence::core::sof_runner::RowStream<'_>,
-) -> Vec<u8> {
+async fn stream_to_ndjson(mut stream: helios_persistence::core::sof_runner::RowStream) -> Vec<u8> {
     let mut buf = Vec::new();
     while let Some(result) = stream.next().await {
         match result {
@@ -423,7 +746,7 @@ async fn stream_to_ndjson(
 
 /// Collects the row stream into a JSON array byte string.
 async fn stream_to_json_array(
-    mut stream: helios_persistence::core::sof_runner::RowStream<'_>,
+    mut stream: helios_persistence::core::sof_runner::RowStream,
 ) -> Vec<u8> {
     let mut rows = Vec::new();
     while let Some(result) = stream.next().await {
@@ -440,7 +763,7 @@ async fn stream_to_json_array(
 
 /// Collects the row stream into CSV bytes.
 async fn stream_to_csv(
-    mut stream: helios_persistence::core::sof_runner::RowStream<'_>,
+    mut stream: helios_persistence::core::sof_runner::RowStream,
     include_header: bool,
 ) -> Vec<u8> {
     let mut rows: Vec<Value> = Vec::new();

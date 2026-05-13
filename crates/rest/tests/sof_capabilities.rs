@@ -176,17 +176,21 @@ mod sof_capability_tests {
             .filter_map(|op| op["name"].as_str())
             .collect();
 
+        // `viewdefinition-run` is unconditional when SOF is enabled.
         assert!(
             op_names.contains(&"viewdefinition-run"),
             "metadata must advertise viewdefinition-run, got: {op_names:?}"
         );
+        // `viewdefinition-export` and `sqlquery-run` are gated on the export
+        // controller and raw-SQL runner being wired, respectively. With the
+        // bare test server, neither is wired, so neither should be present.
         assert!(
-            op_names.contains(&"viewdefinition-export"),
-            "metadata must advertise viewdefinition-export, got: {op_names:?}"
+            !op_names.contains(&"viewdefinition-export"),
+            "viewdefinition-export must NOT be advertised without an export controller, got: {op_names:?}"
         );
         assert!(
-            op_names.contains(&"sql-query-run"),
-            "metadata must advertise sql-query-run, got: {op_names:?}"
+            !op_names.contains(&"sqlquery-run"),
+            "sqlquery-run must NOT be advertised without a raw-SQL runner, got: {op_names:?}"
         );
     }
 

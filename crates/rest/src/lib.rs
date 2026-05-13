@@ -414,7 +414,7 @@ where
                     tracing::warn!(
                         url = %url,
                         "HFS_SOF_READONLY_URL set but no matching backend feature \
-                         is compiled in; $sql-query-run will return 501"
+                         is compiled in; $sqlquery-run will return 501"
                     );
                 }
             }

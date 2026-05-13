@@ -1,4 +1,4 @@
-//! Integration tests for `POST /$sql-query-run`.
+//! Integration tests for `POST /$sqlquery-run`.
 //!
 //! These tests verify the handler-level behaviour: feature gate (501 by
 //! default), DDL rejection (400), NDJSON / CSV output, and tenant isolation.
@@ -54,6 +54,7 @@ mod sof_sql_query_tests {
             &self,
             _tenant_id: &str,
             _sql: &str,
+            _named_params: &[(String, helios_persistence::core::raw_sql::BoundValue)],
             _max_rows: usize,
             _timeout_secs: u64,
         ) -> Result<Vec<SqlRow>, RawSqlError> {
@@ -124,7 +125,7 @@ mod sof_sql_query_tests {
         let server = create_server_with_runner(None, false);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("SELECT 1"))
@@ -143,7 +144,7 @@ mod sof_sql_query_tests {
         let server = create_server_with_runner(None, true);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("SELECT 1"))
@@ -162,7 +163,7 @@ mod sof_sql_query_tests {
         let server = enabled_server(vec![]);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("DROP TABLE resources"))
@@ -185,7 +186,7 @@ mod sof_sql_query_tests {
         let server = enabled_server(vec![]);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters(
@@ -202,7 +203,7 @@ mod sof_sql_query_tests {
         let server = enabled_server(vec![]);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("SELECT 1; DROP TABLE resources"))
@@ -217,7 +218,7 @@ mod sof_sql_query_tests {
         let server = enabled_server(vec![json!({"id": "pt-1", "name": "Smith"})]);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters(
@@ -242,7 +243,7 @@ mod sof_sql_query_tests {
         let server = enabled_server(rows);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("SELECT id, family FROM resources"))
@@ -280,7 +281,7 @@ mod sof_sql_query_tests {
         let server = enabled_server(rows);
 
         let resp = server
-            .post("/$sql-query-run?_format=csv")
+            .post("/$sqlquery-run?_format=csv")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("SELECT id, family FROM resources"))
@@ -310,7 +311,7 @@ mod sof_sql_query_tests {
         let server = enabled_server(vec![]);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("SELECT id FROM resources WHERE 1=0"))
@@ -331,7 +332,7 @@ mod sof_sql_query_tests {
             create_server_with_runner(Some(MockRawSqlRunner::row_limit_exceeded(100)), true);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("SELECT * FROM resources"))
@@ -349,7 +350,7 @@ mod sof_sql_query_tests {
         let server = create_server_with_runner(Some(MockRawSqlRunner::timeout(30)), true);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("SELECT * FROM resources"))
@@ -371,7 +372,7 @@ mod sof_sql_query_tests {
         let server = enabled_server(vec![]);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .bytes(axum::body::Bytes::new())
@@ -392,7 +393,7 @@ mod sof_sql_query_tests {
         });
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&body)
@@ -407,7 +408,7 @@ mod sof_sql_query_tests {
         let server = enabled_server(vec![json!({"n": 1})]);
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_TEST)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_JSON)
             .json(&json!({"query": "SELECT 1 AS n"}))
@@ -443,6 +444,7 @@ mod sof_sql_query_tests {
             &self,
             tenant_id: &str,
             _sql: &str,
+            _named_params: &[(String, helios_persistence::core::raw_sql::BoundValue)],
             _max_rows: usize,
             _timeout_secs: u64,
         ) -> Result<Vec<SqlRow>, RawSqlError> {
@@ -474,7 +476,7 @@ mod sof_sql_query_tests {
         let server = TestServer::new(app).unwrap();
 
         server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_CLINIC_A)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("SELECT 1"))

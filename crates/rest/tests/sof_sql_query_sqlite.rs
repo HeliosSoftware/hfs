@@ -1,4 +1,4 @@
-//! End-to-end integration tests for `POST /$sql-query-run` against a real
+//! End-to-end integration tests for `POST /$sqlquery-run` against a real
 //! SQLite database file.
 //!
 //! Unlike `sof_sql_query.rs` (which uses a `MockRawSqlRunner`), these tests
@@ -99,7 +99,7 @@ mod sof_sql_query_sqlite_tests {
         let server = make_server(&db_path, Arc::new(backend));
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_A)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters(
@@ -145,7 +145,7 @@ mod sof_sql_query_sqlite_tests {
 
         // Query as tenant-b — should see 0 rows
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_B)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters(
@@ -194,7 +194,7 @@ mod sof_sql_query_sqlite_tests {
         let server = TestServer::new(app).unwrap();
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_A)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("SELECT id FROM resources"))
@@ -234,7 +234,7 @@ mod sof_sql_query_sqlite_tests {
         let server = make_server(&db_path, Arc::new(backend));
 
         let resp = server
-            .post("/$sql-query-run?_format=csv")
+            .post("/$sqlquery-run?_format=csv")
             .add_header(X_TENANT_ID, TENANT_A)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters(
@@ -274,7 +274,7 @@ mod sof_sql_query_sqlite_tests {
         let server = make_server(&db_path, Arc::new(backend));
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_A)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters("DROP TABLE resources"))
@@ -317,7 +317,7 @@ mod sof_sql_query_sqlite_tests {
         let server = make_server(&db_path, Arc::new(backend));
 
         let resp = server
-            .post("/$sql-query-run")
+            .post("/$sqlquery-run")
             .add_header(X_TENANT_ID, TENANT_A)
             .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
             .json(&fhir_parameters(
@@ -335,6 +335,178 @@ mod sof_sql_query_sqlite_tests {
         assert!(
             !body.contains("p-dead"),
             "deleted patient must not appear in results (tenant CTE excludes is_deleted)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Named parameter binding (T1.3): spec MUST — values bound, not interpolated
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_named_parameter_binding_returns_matching_row() {
+        let (tmp, backend) = setup().await;
+        let db_path = tmp.to_str().unwrap().to_string();
+        let t = tenant("tenant-a");
+        for (id, family) in [("a1", "Alpha"), ("b2", "Bravo")] {
+            backend
+                .create(
+                    &t,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]}),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        let server = make_server(&db_path, Arc::new(backend));
+
+        // Bind a parameter by name and assert only the matching row comes back.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "query",
+                 "valueString": "SELECT id FROM resources WHERE resource_type = 'Patient' AND id = :pid"},
+                {"name": "parameters", "resource": {
+                    "resourceType": "Parameters",
+                    "parameter": [{"name": "pid", "valueString": "a1"}]
+                }}
+            ]
+        });
+
+        let resp = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, TENANT_A)
+            .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
+            .json(&body)
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+
+        let text = resp.text();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "expected exactly one row, got: {lines:?}");
+        assert!(lines[0].contains("a1"));
+    }
+
+    #[tokio::test]
+    async fn test_named_parameter_binding_blocks_sql_injection() {
+        let (tmp, backend) = setup().await;
+        let db_path = tmp.to_str().unwrap().to_string();
+        let t = tenant("tenant-a");
+        backend
+            .create(
+                &t,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "safe", "name": [{"family": "Safe"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        let server = make_server(&db_path, Arc::new(backend));
+
+        // The :pid value contains a SQL-injection attempt. Because the runner
+        // binds the value via the driver instead of interpolating it, the
+        // query simply matches zero rows — it does NOT drop the table.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "query",
+                 "valueString": "SELECT id FROM resources WHERE id = :pid"},
+                {"name": "parameters", "resource": {
+                    "resourceType": "Parameters",
+                    "parameter": [{"name": "pid",
+                                   "valueString": "safe'; DROP TABLE resources; --"}]
+                }}
+            ]
+        });
+
+        let resp = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, TENANT_A)
+            .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
+            .json(&body)
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+
+        // Empty result set — the literal string didn't match any id.
+        let text = resp.text();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert!(lines.is_empty(), "expected no rows, got: {lines:?}");
+
+        // The table still exists: a follow-up SELECT must succeed.
+        let probe = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, TENANT_A)
+            .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
+            .json(&fhir_parameters(
+                "SELECT id FROM resources WHERE resource_type = 'Patient'",
+            ))
+            .await;
+        assert_eq!(probe.status_code(), StatusCode::OK);
+        assert!(probe.text().contains("safe"));
+    }
+
+    #[tokio::test]
+    async fn test_named_parameter_missing_value_returns_400() {
+        let (tmp, backend) = setup().await;
+        let db_path = tmp.to_str().unwrap().to_string();
+        let server = make_server(&db_path, Arc::new(backend));
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "query",
+                 "valueString": "SELECT 1 WHERE 1 = :missing"}
+            ]
+        });
+
+        let resp = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, TENANT_A)
+            .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
+            .json(&body)
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    // -------------------------------------------------------------------------
+    // _format=fhir (T5.1): SQL result serialised as a FHIR Parameters resource
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_format_fhir_returns_parameters_resource() {
+        let (tmp, backend) = setup().await;
+        let db_path = tmp.to_str().unwrap().to_string();
+        let t = tenant("tenant-a");
+        backend
+            .create(
+                &t,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "fhir-1", "name": [{"family": "Fhir"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        let server = make_server(&db_path, Arc::new(backend));
+
+        let resp = server
+            .post("/$sqlquery-run?_format=fhir")
+            .add_header(X_TENANT_ID, TENANT_A)
+            .add_header(CONTENT_TYPE, CONTENT_TYPE_FHIR)
+            .json(&fhir_parameters(
+                "SELECT id FROM resources WHERE resource_type = 'Patient'",
+            ))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+
+        let body: Value = resp.json::<Value>();
+        assert_eq!(body["resourceType"].as_str(), Some("Parameters"));
+        let parts = body["parameter"].as_array().unwrap();
+        let any_row = parts
+            .iter()
+            .any(|p| p["name"].as_str() == Some("row") && p["part"].is_array());
+        assert!(
+            any_row,
+            "_format=fhir must produce row parameters with parts: {body}"
         );
     }
 }

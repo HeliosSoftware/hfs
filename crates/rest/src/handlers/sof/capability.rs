@@ -69,10 +69,15 @@ where
         bool_param("supportsViewDefinitionExport", supports_export),
         bool_param("supportsSqlQueryRun", supports_sql_query),
         bool_param("supportsInDbRunner", supports_indb),
+        // Spec SHALL: document which ViewDefinition reference formats are
+        // supported. We currently support only relative `ViewDefinition/{id}`.
+        bool_param("supportsRelativeReference", true),
+        bool_param("supportsCanonicalReference", false),
+        bool_param("supportsAbsoluteReference", false),
     ];
 
-    // Supported output formats (G2: includes parquet)
-    for fmt in ["ndjson", "json", "csv", "parquet"] {
+    // Supported output formats (G2: includes parquet; fhir included for $sqlquery-run).
+    for fmt in ["ndjson", "json", "csv", "parquet", "fhir"] {
         params.push(json!({
             "name": "supportedFormat",
             "valueCode": fmt

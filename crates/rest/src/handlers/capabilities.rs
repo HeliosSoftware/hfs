@@ -185,8 +185,13 @@ where
 }
 
 /// Builds the `rest[0].operation` list, including SOF operations.
+///
+/// `viewdefinition-run` is always declared when SOF is enabled.
+/// `viewdefinition-export` is declared only when an export controller is wired.
+/// `sqlquery-run` is declared only when the raw-SQL runner is wired AND the
+/// feature flag is enabled (matches what `/$sql-on-fhir-capabilities` reports).
 fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
-    _state: &AppState<S>,
+    state: &AppState<S>,
 ) -> Vec<serde_json::Value> {
     let mut ops = vec![
         serde_json::json!({
@@ -197,20 +202,25 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
             "name": "versions",
             "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
         }),
+        serde_json::json!({
+            "name": "viewdefinition-run",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run"
+        }),
     ];
 
-    ops.push(serde_json::json!({
-        "name": "viewdefinition-run",
-        "definition": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-ViewDefinition-run.html"
-    }));
-    ops.push(serde_json::json!({
-        "name": "viewdefinition-export",
-        "definition": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-ViewDefinition-export.html"
-    }));
-    ops.push(serde_json::json!({
-        "name": "sql-query-run",
-        "definition": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-sql-query-run.html"
-    }));
+    if state.export_controller().is_some() {
+        ops.push(serde_json::json!({
+            "name": "viewdefinition-export",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-export"
+        }));
+    }
+
+    if state.raw_sql_runner().is_some() && state.config().sof_sql_query_enabled {
+        ops.push(serde_json::json!({
+            "name": "sqlquery-run",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-run"
+        }));
+    }
 
     ops
 }
