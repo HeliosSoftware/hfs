@@ -46,8 +46,71 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
+        // The `max_expansion_size` cap is intended as a guardrail against
+        // unbounded materialisation: when the caller has already bounded the
+        // request via `count`, SQLite's expand skips the cap (see
+        // crates/hts/src/backends/sqlite/value_set.rs — `req.count.is_none()`
+        // gates the same TooCostly branch). PG used to enforce the cap
+        // regardless of `count`, which made bench scenarios EX02/EX04/EX07
+        // 422 even though the caller only wanted a 10-200 code page. Gate the
+        // check the same way SQLite does so a paginating client gets its page.
+        let cap_enforced = req.count.is_none();
+
         let mut compose_is_enumerated = false;
         let all_codes: Vec<ExpansionContains> = if let Some(url) = req.url.as_deref() {
+            // ── `?fhir_vs` implicit ValueSet short-circuit (FHIR R4 §4.8.7) ──
+            // A CodeSystem URL with `?fhir_vs` or `?fhir_vs=isa/<code>` is an
+            // implicit ValueSet description. Resolving via the value_sets
+            // table never matches (no stored VS has that URL); the legacy
+            // `find_cs_for_implicit_vs` fallback only catches the
+            // `?fhir_vs`-bare form when a CS's `.valueSet` field happens to
+            // match, and never `?fhir_vs=isa/X`. Translate either form to a
+            // synthetic compose so `compute_expansion` handles it via the
+            // normal SNOMED hierarchy filter (mirrors sqlite's
+            // `implicit_short_circuit` at backends/sqlite/value_set.rs).
+            if let Some((cs_url, pattern)) = parse_fhir_vs_url(url) {
+                if resolve_system_id_pg(&client, &cs_url).await?.is_none() {
+                    return Err(HtsError::NotFound(format!(
+                        "A definition for the value Set '{url}' could not be found"
+                    )));
+                }
+                let compose_val = match &pattern {
+                    FhirVsPattern::AllConcepts => serde_json::json!({
+                        "include": [{ "system": cs_url }]
+                    }),
+                    FhirVsPattern::IsA(code) => serde_json::json!({
+                        "include": [{
+                            "system": cs_url,
+                            "filter": [{
+                                "property": "concept",
+                                "op": "is-a",
+                                "value": code,
+                            }],
+                        }]
+                    }),
+                };
+                let compose_str = compose_val.to_string();
+                let codes = compute_expansion(
+                    &client,
+                    Some(&compose_str),
+                    &req.force_system_versions,
+                    &req.system_version_defaults,
+                    &req.default_value_set_versions,
+                ).await?;
+                if cap_enforced {
+                    if let Some(limit) = req.max_expansion_size {
+                        if codes.len() as u64 > u64::from(limit) {
+                            return Err(HtsError::TooCostly(format!(
+                                "Implicit ValueSet expansion contains {} codes which exceeds \
+                                     the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
+                                codes.len(),
+                                limit
+                            )));
+                        }
+                    }
+                }
+                codes
+            } else {
             // ── URL-based path (unchanged) ───────────────────────────────────
             match resolve_value_set_versioned(
                 &client,
@@ -84,14 +147,16 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             &req.system_version_defaults,
                             &req.default_value_set_versions,
                         ).await?;
-                        if let Some(limit) = req.max_expansion_size {
-                            if codes.len() as u64 > u64::from(limit) {
-                                return Err(HtsError::TooCostly(format!(
-                                    "ValueSet expansion contains {} codes which exceeds \
-                                         the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                                    codes.len(),
-                                    limit
-                                )));
+                        if cap_enforced {
+                            if let Some(limit) = req.max_expansion_size {
+                                if codes.len() as u64 > u64::from(limit) {
+                                    return Err(HtsError::TooCostly(format!(
+                                        "ValueSet expansion contains {} codes which exceeds \
+                                             the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
+                                        codes.len(),
+                                        limit
+                                    )));
+                                }
                             }
                         }
                         if !multi_version && !has_vs_pin {
@@ -116,19 +181,22 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         &req.system_version_defaults,
                         &req.default_value_set_versions,
                     ).await?;
-                    if let Some(limit) = req.max_expansion_size {
-                        if codes.len() as u64 > u64::from(limit) {
-                            return Err(HtsError::TooCostly(format!(
-                                "Implicit ValueSet expansion contains {} codes which exceeds \
-                                     the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                                codes.len(),
-                                limit
-                            )));
+                    if cap_enforced {
+                        if let Some(limit) = req.max_expansion_size {
+                            if codes.len() as u64 > u64::from(limit) {
+                                return Err(HtsError::TooCostly(format!(
+                                    "Implicit ValueSet expansion contains {} codes which exceeds \
+                                         the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
+                                    codes.len(),
+                                    limit
+                                )));
+                            }
                         }
                     }
                     codes
                 }
                 Err(e) => return Err(e),
+            }
             }
         } else {
             // ── Inline-ValueSet path ─────────────────────────────────────────
@@ -176,14 +244,16 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     &req.default_value_set_versions,
                     &contained_vec,
                 ).await?;
-                if let Some(limit) = req.max_expansion_size {
-                    if codes.len() as u64 > u64::from(limit) {
-                        return Err(HtsError::TooCostly(format!(
-                            "ValueSet expansion contains {} codes which exceeds \
-                                 the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                            codes.len(),
-                            limit
-                        )));
+                if cap_enforced {
+                    if let Some(limit) = req.max_expansion_size {
+                        if codes.len() as u64 > u64::from(limit) {
+                            return Err(HtsError::TooCostly(format!(
+                                "ValueSet expansion contains {} codes which exceeds \
+                                     the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
+                                codes.len(),
+                                limit
+                            )));
+                        }
                     }
                 }
                 codes
