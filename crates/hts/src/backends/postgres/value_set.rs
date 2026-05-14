@@ -74,10 +74,11 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         "A definition for the value Set '{url}' could not be found"
                     )));
                 }
-                // Cache check — keyed by URL + version pins. EX01 hits the
-                // same `?fhir_vs=isa/<code>` per pool entry hundreds of times
-                // during a 30s vu=50 run; cold-miss is a recursive CTE on
-                // SNOMED, warm-hit is an in-memory slice.
+                // Single-flight cache check — keyed by URL + version pins. EX01
+                // hits the same `?fhir_vs=isa/<code>` per pool entry hundreds
+                // of times during a 30s vu=50 run; cold-miss is a recursive
+                // CTE on SNOMED. The OnceCell collapses simultaneous misses
+                // onto one compute.
                 let cache_key = build_url_cache_key(
                     url,
                     req.value_set_version.as_deref(),
@@ -86,26 +87,40 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     &req.default_value_set_versions,
                 );
                 let cache_eligible = req.hierarchical != Some(true);
-                if cache_eligible {
-                    if let Some(cached) = cache_get(&self.inline_compose_cache, cache_key) {
-                        return Ok(serve_from_cached(&cached, &req));
-                    }
-                }
-                let compose_val = match &pattern {
-                    FhirVsPattern::AllConcepts => serde_json::json!({
-                        "include": [{ "system": cs_url }]
-                    }),
-                    FhirVsPattern::IsA(code) => serde_json::json!({
-                        "include": [{
-                            "system": cs_url,
-                            "filter": [{
-                                "property": "concept",
-                                "op": "is-a",
-                                "value": code,
-                            }],
-                        }]
-                    }),
+                let cell = if cache_eligible {
+                    cache_cell(&self.inline_compose_cache, cache_key)
+                } else {
+                    None
                 };
+                if let Some(cell) = cell.as_ref() {
+                    let force_sv = &req.force_system_versions;
+                    let sysv = &req.system_version_defaults;
+                    let defvs = &req.default_value_set_versions;
+                    let max_size = req.max_expansion_size;
+                    let client_ref = &client;
+                    let cs_url_ref = &cs_url;
+                    let pattern_ref = &pattern;
+                    let arc = cell
+                        .get_or_try_init(|| async move {
+                            let compose_val = build_implicit_compose_value(cs_url_ref, pattern_ref);
+                            let compose_str = compose_val.to_string();
+                            let codes = compute_expansion(
+                                client_ref,
+                                Some(&compose_str),
+                                force_sv,
+                                sysv,
+                                defvs,
+                            )
+                            .await?;
+                            enforce_cap(&codes, cap_enforced, max_size, /*implicit=*/ true)?;
+                            Ok::<_, HtsError>(std::sync::Arc::new(codes))
+                        })
+                        .await?;
+                    return Ok(serve_from_cached(arc, &req));
+                }
+                // Cache at capacity OR cache_eligible=false (hierarchical):
+                // unprotected compute, no caching.
+                let compose_val = build_implicit_compose_value(&cs_url, &pattern);
                 let compose_str = compose_val.to_string();
                 let codes = compute_expansion(
                     &client,
@@ -114,25 +129,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     &req.system_version_defaults,
                     &req.default_value_set_versions,
                 ).await?;
-                if cap_enforced {
-                    if let Some(limit) = req.max_expansion_size {
-                        if codes.len() as u64 > u64::from(limit) {
-                            return Err(HtsError::TooCostly(format!(
-                                "Implicit ValueSet expansion contains {} codes which exceeds \
-                                     the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                                codes.len(),
-                                limit
-                            )));
-                        }
-                    }
-                }
-                if cache_eligible {
-                    cache_put(
-                        &self.inline_compose_cache,
-                        cache_key,
-                        std::sync::Arc::new(codes.clone()),
-                    );
-                }
+                enforce_cap(&codes, cap_enforced, req.max_expansion_size, /*implicit=*/true)?;
                 codes
             } else {
             // ── URL-based path (unchanged) ───────────────────────────────────
@@ -159,10 +156,10 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     // would diverge from the pinned version's content.
                     let has_vs_pin = !req.default_value_set_versions.is_empty();
 
-                    // In-memory cache check (EX04 hot path — VSAC URLs hit
-                    // hundreds of times per 30s run). Cold-miss reads from
-                    // `value_set_expansions` table (5,975 rows over wire each
-                    // time); warm-hit slices an in-memory Vec.
+                    // Single-flight in-memory cache (EX04 hot path — VSAC
+                    // URLs hit hundreds of times per 30s run). The OnceCell
+                    // collapses simultaneous misses onto one compute +
+                    // populate_cache, then warm-hit slices the cached Vec.
                     let cache_key = build_url_cache_key(
                         url,
                         req.value_set_version.as_deref(),
@@ -173,12 +170,54 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     let cache_eligible = req.hierarchical != Some(true)
                         && !multi_version
                         && !has_vs_pin;
-                    if cache_eligible {
-                        if let Some(cached) = cache_get(&self.inline_compose_cache, cache_key) {
-                            return Ok(serve_from_cached(&cached, &req));
-                        }
+                    let cell = if cache_eligible {
+                        cache_cell(&self.inline_compose_cache, cache_key)
+                    } else {
+                        None
+                    };
+                    if let Some(cell) = cell.as_ref() {
+                        // Pre-borrow request fields into locals so the
+                        // `async move` closure captures the borrows (not the
+                        // owned `req`). `req` stays usable for the
+                        // `serve_from_cached(arc, &req)` call below.
+                        let force_sv = &req.force_system_versions;
+                        let sysv = &req.system_version_defaults;
+                        let defvs = &req.default_value_set_versions;
+                        let max_size = req.max_expansion_size;
+                        let client_ref = &mut client;
+                        let vs_id_ref = vs_id.as_str();
+                        let compose_json_ref = compose_json.as_deref();
+                        let arc = cell
+                            .get_or_try_init(|| async move {
+                                let cached_rows = fetch_cache(&*client_ref, vs_id_ref).await?;
+                                let codes = if cached_rows.is_empty() {
+                                    let computed = compute_expansion(
+                                        &*client_ref,
+                                        compose_json_ref,
+                                        force_sv,
+                                        sysv,
+                                        defvs,
+                                    )
+                                    .await?;
+                                    enforce_cap(
+                                        &computed,
+                                        cap_enforced,
+                                        max_size,
+                                        /*implicit=*/ false,
+                                    )?;
+                                    populate_cache(client_ref, vs_id_ref, &computed).await?;
+                                    computed
+                                } else {
+                                    cached_rows
+                                };
+                                Ok::<_, HtsError>(std::sync::Arc::new(codes))
+                            })
+                            .await?;
+                        return Ok(serve_from_cached(arc, &req));
                     }
 
+                    // Non-cacheable branch (multi_version / has_vs_pin /
+                    // hierarchical) OR cache at capacity: unprotected compute.
                     let cached = if multi_version || has_vs_pin {
                         Vec::new()
                     } else {
@@ -192,37 +231,17 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             &req.system_version_defaults,
                             &req.default_value_set_versions,
                         ).await?;
-                        if cap_enforced {
-                            if let Some(limit) = req.max_expansion_size {
-                                if codes.len() as u64 > u64::from(limit) {
-                                    return Err(HtsError::TooCostly(format!(
-                                        "ValueSet expansion contains {} codes which exceeds \
-                                             the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                                        codes.len(),
-                                        limit
-                                    )));
-                                }
-                            }
-                        }
+                        enforce_cap(
+                            &codes,
+                            cap_enforced,
+                            req.max_expansion_size,
+                            /*implicit=*/ false,
+                        )?;
                         if !multi_version && !has_vs_pin {
                             populate_cache(&mut client, &vs_id, &codes).await?;
                         }
-                        if cache_eligible {
-                            cache_put(
-                                &self.inline_compose_cache,
-                                cache_key,
-                                std::sync::Arc::new(codes.clone()),
-                            );
-                        }
                         codes
                     } else {
-                        if cache_eligible {
-                            cache_put(
-                                &self.inline_compose_cache,
-                                cache_key,
-                                std::sync::Arc::new(cached.clone()),
-                            );
-                        }
                         cached
                     }
                 }
@@ -295,9 +314,10 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             if let Some(compose_val) = compose {
                 compose_is_enumerated = compose_is_enumerated_value(compose_val);
                 let compose_str = compose_val.to_string();
-                // Cache check — the EX02/05/06/07/08 benchmark scenarios all
-                // POST identical inline composes per pool entry. Warm-hit
-                // avoids the recursive-CTE / pg_filter_is_a expansion entirely.
+                // Single-flight inline-compose cache — EX02/05/06/07/08 POST
+                // identical inline composes per pool entry. The OnceCell
+                // collapses simultaneous misses onto one compute; warm-hit
+                // skips the recursive-CTE / pg_filter_is_a expansion entirely.
                 let cache_key = build_inline_cache_key(
                     &compose_str,
                     &req.force_system_versions,
@@ -307,11 +327,43 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 );
                 let cache_eligible = req.hierarchical != Some(true)
                     && req.tx_resources.is_empty();
-                if cache_eligible {
-                    if let Some(cached) = cache_get(&self.inline_compose_cache, cache_key) {
-                        return Ok(serve_from_cached(&cached, &req));
-                    }
+                let cell = if cache_eligible {
+                    cache_cell(&self.inline_compose_cache, cache_key)
+                } else {
+                    None
+                };
+                if let Some(cell) = cell.as_ref() {
+                    let force_sv = &req.force_system_versions;
+                    let sysv = &req.system_version_defaults;
+                    let defvs = &req.default_value_set_versions;
+                    let max_size = req.max_expansion_size;
+                    let client_ref = &client;
+                    let compose_str_ref = compose_str.as_str();
+                    let contained_ref = contained_vec.as_slice();
+                    let arc = cell
+                        .get_or_try_init(|| async move {
+                            let codes = compute_expansion_with_contained(
+                                client_ref,
+                                Some(compose_str_ref),
+                                force_sv,
+                                sysv,
+                                defvs,
+                                contained_ref,
+                            )
+                            .await?;
+                            enforce_cap(
+                                &codes,
+                                cap_enforced,
+                                max_size,
+                                /*implicit=*/ false,
+                            )?;
+                            Ok::<_, HtsError>(std::sync::Arc::new(codes))
+                        })
+                        .await?;
+                    return Ok(serve_from_cached(arc, &req));
                 }
+                // Non-cacheable branch (hierarchical / tx_resources) or
+                // cache at capacity: unprotected compute, no caching.
                 let codes = compute_expansion_with_contained(
                     &client,
                     Some(&compose_str),
@@ -320,25 +372,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     &req.default_value_set_versions,
                     &contained_vec,
                 ).await?;
-                if cap_enforced {
-                    if let Some(limit) = req.max_expansion_size {
-                        if codes.len() as u64 > u64::from(limit) {
-                            return Err(HtsError::TooCostly(format!(
-                                "ValueSet expansion contains {} codes which exceeds \
-                                     the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                                codes.len(),
-                                limit
-                            )));
-                        }
-                    }
-                }
-                if cache_eligible {
-                    cache_put(
-                        &self.inline_compose_cache,
-                        cache_key,
-                        std::sync::Arc::new(codes.clone()),
-                    );
-                }
+                enforce_cap(
+                    &codes,
+                    cap_enforced,
+                    req.max_expansion_size,
+                    /*implicit=*/ false,
+                )?;
                 codes
             } else if let Some(pre) = vs.get("expansion").and_then(|e| e.get("contains")) {
                 // Inline VS carries only a pre-expanded `expansion.contains[]`
@@ -4266,27 +4305,90 @@ fn build_url_cache_key(
     fnv64(canonical.as_bytes())
 }
 
-/// Look up `key` in `cache`, returning a clone of the `Arc` on hit. Returns
-/// `None` if the lock is poisoned (treated as cache miss).
-fn cache_get(
-    cache: &super::ComposeExpansionCache,
-    key: u64,
-) -> Option<std::sync::Arc<Vec<ExpansionContains>>> {
-    cache.read().ok().and_then(|g| g.get(&key).cloned())
+/// Build the synthetic compose value for a `?fhir_vs` implicit ValueSet
+/// pattern. Factored out so the `OnceCell` cold-miss closure can build it
+/// lazily (only the winning VU does the work).
+fn build_implicit_compose_value(cs_url: &str, pattern: &FhirVsPattern) -> serde_json::Value {
+    match pattern {
+        FhirVsPattern::AllConcepts => serde_json::json!({
+            "include": [{ "system": cs_url }]
+        }),
+        FhirVsPattern::IsA(code) => serde_json::json!({
+            "include": [{
+                "system": cs_url,
+                "filter": [{
+                    "property": "concept",
+                    "op": "is-a",
+                    "value": code,
+                }],
+            }]
+        }),
+    }
 }
 
-/// Insert `codes` under `key`. Respects [`super::PG_COMPOSE_CACHE_MAX`] —
-/// once the cache is full, new entries are dropped silently (warm-set wins).
-fn cache_put(
-    cache: &super::ComposeExpansionCache,
-    key: u64,
-    codes: std::sync::Arc<Vec<ExpansionContains>>,
-) {
-    if let Ok(mut g) = cache.write() {
-        if g.len() < super::PG_COMPOSE_CACHE_MAX || g.contains_key(&key) {
-            g.insert(key, codes);
+/// Apply the `max_expansion_size` guardrail to a freshly-computed code list.
+/// Only fires when `cap_enforced` (i.e. `req.count.is_none()` — see
+/// `expand()` for why count-bounded requests skip the cap to match SQLite's
+/// behaviour). `implicit` toggles the diagnostic message phrasing to match
+/// the prior call-site error texts byte-for-byte.
+fn enforce_cap(
+    codes: &[ExpansionContains],
+    cap_enforced: bool,
+    max_expansion_size: Option<u32>,
+    implicit: bool,
+) -> Result<(), HtsError> {
+    if !cap_enforced {
+        return Ok(());
+    }
+    if let Some(limit) = max_expansion_size {
+        if codes.len() as u64 > u64::from(limit) {
+            let prefix = if implicit {
+                "Implicit ValueSet expansion"
+            } else {
+                "ValueSet expansion"
+            };
+            return Err(HtsError::TooCostly(format!(
+                "{prefix} contains {} codes which exceeds \
+                     the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
+                codes.len(),
+                limit
+            )));
         }
     }
+    Ok(())
+}
+
+/// Fetch (or create) the `OnceCell` for `key`. Returns `None` if the cache
+/// is at [`super::PG_COMPOSE_CACHE_MAX`] capacity and the key isn't already
+/// present — callers fall back to an unprotected compute in that branch.
+///
+/// Single-flight pattern: the cell is the shared rendezvous point. The first
+/// caller to invoke `get_or_try_init` runs the compute closure; subsequent
+/// callers race onto the same cell and `await` its result, then clone the
+/// inner `Arc` in O(1).
+fn cache_cell(
+    cache: &super::ComposeExpansionCache,
+    key: u64,
+) -> Option<std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<Vec<ExpansionContains>>>>> {
+    // Fast path: read lock, look up; clone Arc on hit.
+    if let Ok(g) = cache.read() {
+        if let Some(cell) = g.get(&key) {
+            return Some(std::sync::Arc::clone(cell));
+        }
+    }
+    // Slow path: write lock, re-check then insert empty cell.
+    let mut g = cache.write().ok()?;
+    if let Some(cell) = g.get(&key) {
+        return Some(std::sync::Arc::clone(cell));
+    }
+    if g.len() >= super::PG_COMPOSE_CACHE_MAX {
+        // At cap: silently bypass single-flight (cold-miss VU runs unprotected).
+        // Matches the prior cache_put behaviour — warm set wins.
+        return None;
+    }
+    let cell = std::sync::Arc::new(tokio::sync::OnceCell::new());
+    g.insert(key, std::sync::Arc::clone(&cell));
+    Some(cell)
 }
 
 /// Apply request-level filter (substring on code|display) + offset + count to

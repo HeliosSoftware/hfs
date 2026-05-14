@@ -27,13 +27,18 @@ use helios_persistence::tenant::TenantContext;
 /// `inline_compose_index` (backends/sqlite/value_set.rs:296+).
 ///
 /// Key = fnv64 of canonicalised compose body + system-version pins. Value =
-/// the full, sorted, unfiltered list of expansion concepts. Slicing
-/// (filter / count / offset) happens in Rust on the cached vec, so once a
-/// compose is warm a request avoids all DB I/O.
+/// a `OnceCell` that holds the full, sorted, unfiltered list of expansion
+/// concepts. Slicing (filter / count / offset) happens in Rust on the
+/// cached vec, so once a compose is warm a request avoids all DB I/O.
 ///
-/// Wrapping the `Vec` in an `Arc` lets the read path clone in O(1) without
-/// holding the `RwLock` while serialising.
-pub type ComposeExpansionCache = Arc<RwLock<HashMap<u64, Arc<Vec<ExpansionContains>>>>>;
+/// The `OnceCell` provides **single-flight** semantics: when 50 VUs
+/// simultaneously miss the same key, only the first runs `compute_expansion`
+/// and `populate_cache`; the other 49 await the cell's value and clone its
+/// `Arc` in O(1). Without this, the bench's cold-miss stampede burned
+/// 50× redundant 5,975-row INSERTs on a single VSAC VS (EX04). On error the
+/// cell stays empty so the next caller retries cleanly.
+pub type ComposeExpansionCache =
+    Arc<RwLock<HashMap<u64, Arc<tokio::sync::OnceCell<Arc<Vec<ExpansionContains>>>>>>>;
 
 /// `$lookup` response memo. Mirrors SQLite's `lookup_response_cache`
 /// (backends/sqlite/code_system.rs:240+).
