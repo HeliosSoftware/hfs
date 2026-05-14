@@ -2840,18 +2840,30 @@ async fn populate_cache(
     .await
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    for item in codes {
+    // Bulk-insert via UNNEST over four parallel arrays. Replaces 5,975
+    // per-row roundtrips with one query for a typical VSAC VS — measurable
+    // on the EX04 cold-miss path. `ON CONFLICT DO NOTHING` is evaluated
+    // per row, preserving the prior dedupe semantics.
+    if !codes.is_empty() {
+        let n = codes.len();
+        let mut systems: Vec<&str> = Vec::with_capacity(n);
+        let mut codes_arr: Vec<&str> = Vec::with_capacity(n);
+        let mut displays: Vec<Option<&str>> = Vec::with_capacity(n);
+        let mut versions: Vec<Option<&str>> = Vec::with_capacity(n);
+        for item in codes {
+            systems.push(item.system.as_str());
+            codes_arr.push(item.code.as_str());
+            displays.push(item.display.as_deref());
+            versions.push(item.version.as_deref());
+        }
+
         tx.execute(
             "INSERT INTO value_set_expansions (value_set_id, system_url, code, display, version)
-             VALUES ($1, $2, $3, $4, $5)
+             SELECT $1, sys, code, display, version
+             FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[])
+                  AS t(sys, code, display, version)
              ON CONFLICT DO NOTHING",
-            &[
-                &vs_id,
-                &item.system,
-                &item.code,
-                &item.display,
-                &item.version,
-            ],
+            &[&vs_id, &systems, &codes_arr, &displays, &versions],
         )
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
