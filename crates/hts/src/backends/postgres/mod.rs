@@ -20,7 +20,7 @@ use crate::error::HtsError;
 use crate::import::bundle_parser::{self, ParsedCodeSystem, ParsedConceptMap, ParsedValueSet};
 use crate::import::{BundleImportBackend, ImportStats};
 use crate::traits::TerminologyMetadata;
-use crate::types::ExpansionContains;
+use crate::types::{ExpansionContains, LookupResponse};
 use helios_persistence::tenant::TenantContext;
 
 /// Per-compose in-memory expansion index. Mirrors SQLite's
@@ -35,12 +35,31 @@ use helios_persistence::tenant::TenantContext;
 /// holding the `RwLock` while serialising.
 pub type ComposeExpansionCache = Arc<RwLock<HashMap<u64, Arc<Vec<ExpansionContains>>>>>;
 
+/// `$lookup` response memo. Mirrors SQLite's `lookup_response_cache`
+/// (backends/sqlite/code_system.rs:240+).
+///
+/// Key = canonicalised request string (`system|code|version|lang|date|props`).
+/// Skipped when `useSupplement` is non-empty since the merged response depends
+/// on per-request supplement resolution.
+pub type LookupResponseCache = Arc<RwLock<HashMap<String, Arc<LookupResponse>>>>;
+
+/// `(url, version) → (system_id, name, version)` resolver cache. Mirrors
+/// SQLite's `cs_resolved_meta_cache` (backends/sqlite/code_system.rs:1686+).
+/// Populated on the `date.is_none()` fast path; bypassed when a point-in-time
+/// `date` filter is active.
+pub type ResolvedMetaCache =
+    Arc<RwLock<HashMap<(String, Option<String>), (String, String, Option<String>)>>>;
+
 /// Soft cap on cache entries. Once full, new entries are dropped silently
 /// (warm-set wins). Matches SQLite's handler-level cap order of magnitude;
 /// inline-compose entries are small (10K–100K codes each, ~50 MB max), and
 /// the bench uses ~60 distinct pool entries per scenario so 4096 has ample
 /// headroom across all scenarios concurrently.
 pub const PG_COMPOSE_CACHE_MAX: usize = 4096;
+
+/// Soft cap on `lookup_response_cache` entries — mirrors SQLite's
+/// `lookup_response_cache_max()` (backends/sqlite/code_system.rs:131-135).
+pub const PG_LOOKUP_RESPONSE_CACHE_MAX: usize = 4096;
 
 /// PostgreSQL-backed terminology service backend.
 ///
@@ -59,6 +78,13 @@ pub struct PostgresTerminologyBackend {
     /// POST $expand requests with identical compose bodies — k6 EX02/04/05/06
     /// pool entries hit the same compose hundreds of times during a 30s run.
     pub(super) inline_compose_cache: ComposeExpansionCache,
+    /// `$lookup` response memo — LK01-04 hit the same `(system, code,
+    /// version, lang)` tuples per pool entry across 50 VUs.
+    pub(super) lookup_response_cache: LookupResponseCache,
+    /// `resolve_code_system` memo, keyed by `(url, version)`. Drives LK*,
+    /// VC*, and SS01 — every CS-touching op begins by resolving the URL to
+    /// an internal `(system_id, name, version)` triple.
+    pub(super) cs_resolved_meta_cache: ResolvedMetaCache,
 }
 
 impl PostgresTerminologyBackend {
@@ -86,7 +112,25 @@ impl PostgresTerminologyBackend {
         Ok(Self {
             pool,
             inline_compose_cache: Arc::new(RwLock::new(HashMap::new())),
+            lookup_response_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Drop every per-instance response cache. Invoked after a successful
+    /// `import_bundle` so stale `$lookup` / `resolve_code_system` results
+    /// don't shadow newly-imported codes. Mirrors SQLite's eviction at
+    /// backends/sqlite/mod.rs (`clear_response_caches` flow).
+    pub(super) fn clear_response_caches(&self) {
+        if let Ok(mut g) = self.lookup_response_cache.write() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.cs_resolved_meta_cache.write() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.inline_compose_cache.write() {
+            g.clear();
+        }
     }
 
     /// Borrow the underlying `deadpool-postgres` connection pool.
@@ -242,6 +286,10 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
 
+        // Invalidate per-instance response caches — they may now shadow
+        // newly-imported codes.
+        self.clear_response_caches();
+
         Ok(stats)
     }
 
@@ -299,6 +347,10 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             }
             _ => {} // Unknown resource type — nothing to clean up.
         }
+
+        // Invalidate per-instance response caches — they may reference the
+        // now-deleted resource.
+        self.clear_response_caches();
 
         Ok(())
     }

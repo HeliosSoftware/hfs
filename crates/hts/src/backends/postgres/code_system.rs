@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
+use std::sync::Arc;
 
 use crate::error::HtsError;
 use crate::traits::{CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags, SupplementInfo};
@@ -13,11 +14,63 @@ use crate::types::{
     ValidateCodeResponse,
 };
 
-use super::PostgresTerminologyBackend;
+use super::{PG_LOOKUP_RESPONSE_CACHE_MAX, PostgresTerminologyBackend, ResolvedMetaCache};
 use super::value_set::{
     cs_content_for_url, cs_is_case_insensitive, cs_property_local_codes, cs_version_for_msg,
     detect_cs_version_mismatch, is_concept_abstract, is_concept_inactive,
 };
+
+/// Cache wrapper around [`resolve_code_system`]. The free function is
+/// preserved for tests and ad-hoc callers; impl blocks on
+/// [`PostgresTerminologyBackend`] go through this method so resolved
+/// `(system_id, name, version)` triples are memoised across requests.
+///
+/// Bypassed when `date.is_some()` — a point-in-time filter makes the
+/// cacheable result conditional on metadata the cache key doesn't carry.
+/// Mirrors backends/sqlite/code_system.rs:1683-1700.
+async fn resolve_code_system_cached(
+    cache: &ResolvedMetaCache,
+    client: &tokio_postgres::Client,
+    url: &str,
+    version: Option<&str>,
+    date: Option<&str>,
+) -> Result<(String, String, Option<String>), HtsError> {
+    if date.is_none() {
+        let key = (url.to_string(), version.map(str::to_string));
+        if let Ok(read) = cache.read() {
+            if let Some(v) = read.get(&key) {
+                return Ok(v.clone());
+            }
+        }
+        let resolved = resolve_code_system(client, url, version, date).await?;
+        if let Ok(mut w) = cache.write() {
+            w.insert(key, resolved.clone());
+        }
+        Ok(resolved)
+    } else {
+        resolve_code_system(client, url, version, date).await
+    }
+}
+
+/// Build the `$lookup` response cache key. `None` signals "skip caching"
+/// (currently when `useSupplement` is set, since merged responses depend on
+/// per-request supplement resolution).
+fn lookup_cache_key(req: &LookupRequest) -> Option<String> {
+    if !req.use_supplements.is_empty() {
+        return None;
+    }
+    let mut props = req.properties.clone();
+    props.sort();
+    Some(format!(
+        "{}|{}|{}|{}|{}|{}",
+        req.system,
+        req.code,
+        req.version.as_deref().unwrap_or(""),
+        req.display_language.as_deref().unwrap_or(""),
+        req.date.as_deref().unwrap_or(""),
+        props.join(","),
+    ))
+}
 
 #[async_trait]
 impl CodeSystemOperations for PostgresTerminologyBackend {
@@ -33,13 +86,26 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             ));
         }
 
+        // Cache check — LK01-04 hot path. The same `(system, code, version,
+        // lang)` tuple is replayed across 50 VUs for a 30s run; the warm-hit
+        // path skips the connection acquire and 4 DB roundtrips entirely.
+        let cache_key = lookup_cache_key(&req);
+        if let Some(ref k) = cache_key {
+            if let Ok(read) = self.lookup_response_cache.read() {
+                if let Some(arc) = read.get(k) {
+                    return Ok((**arc).clone());
+                }
+            }
+        }
+
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-        let (system_id, cs_name, cs_version) = resolve_code_system(
+        let (system_id, cs_name, cs_version) = resolve_code_system_cached(
+            &self.cs_resolved_meta_cache,
             &client,
             &req.system,
             req.version.as_deref(),
@@ -94,14 +160,23 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             all_designations
         };
 
-        Ok(LookupResponse {
+        let response = LookupResponse {
             name: cs_name,
             version: cs_version,
             display,
             definition,
             properties,
             designations,
-        })
+        };
+        // Populate the response cache so the warm path can return it directly.
+        if let Some(k) = cache_key {
+            if let Ok(mut w) = self.lookup_response_cache.write() {
+                if w.len() < PG_LOOKUP_RESPONSE_CACHE_MAX || w.contains_key(&k) {
+                    w.insert(k, Arc::new(response.clone()));
+                }
+            }
+        }
+        Ok(response)
     }
 
     async fn validate_code(
@@ -150,7 +225,8 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         //
         // Mirrors `sqlite/code_system.rs:396-419` for path 1; path 2 is the
         // PG-specific enhancement that re-uses the VS-port detector.
-        let resolve_result = resolve_code_system(
+        let resolve_result = resolve_code_system_cached(
+            &self.cs_resolved_meta_cache,
             &client,
             &system,
             req.version.as_deref(),
@@ -537,8 +613,14 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-        let (system_id, _, _) =
-            resolve_code_system(&client, &req.system, req.version.as_deref(), None).await?;
+        let (system_id, _, _) = resolve_code_system_cached(
+            &self.cs_resolved_meta_cache,
+            &client,
+            &req.system,
+            req.version.as_deref(),
+            None,
+        )
+        .await?;
 
         find_concept(&client, &system_id, &req.code_a).await?;
         find_concept(&client, &system_id, &req.code_b).await?;
