@@ -11,6 +11,8 @@ mod value_set;
 
 use async_trait::async_trait;
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tokio_postgres::NoTls;
 use tracing::info;
 
@@ -18,7 +20,27 @@ use crate::error::HtsError;
 use crate::import::bundle_parser::{self, ParsedCodeSystem, ParsedConceptMap, ParsedValueSet};
 use crate::import::{BundleImportBackend, ImportStats};
 use crate::traits::TerminologyMetadata;
+use crate::types::ExpansionContains;
 use helios_persistence::tenant::TenantContext;
+
+/// Per-compose in-memory expansion index. Mirrors SQLite's
+/// `inline_compose_index` (backends/sqlite/value_set.rs:296+).
+///
+/// Key = fnv64 of canonicalised compose body + system-version pins. Value =
+/// the full, sorted, unfiltered list of expansion concepts. Slicing
+/// (filter / count / offset) happens in Rust on the cached vec, so once a
+/// compose is warm a request avoids all DB I/O.
+///
+/// Wrapping the `Vec` in an `Arc` lets the read path clone in O(1) without
+/// holding the `RwLock` while serialising.
+pub type ComposeExpansionCache = Arc<RwLock<HashMap<u64, Arc<Vec<ExpansionContains>>>>>;
+
+/// Soft cap on cache entries. Once full, new entries are dropped silently
+/// (warm-set wins). Matches SQLite's handler-level cap order of magnitude;
+/// inline-compose entries are small (10K–100K codes each, ~50 MB max), and
+/// the bench uses ~60 distinct pool entries per scenario so 4096 has ample
+/// headroom across all scenarios concurrently.
+pub const PG_COMPOSE_CACHE_MAX: usize = 4096;
 
 /// PostgreSQL-backed terminology service backend.
 ///
@@ -33,6 +55,10 @@ use helios_persistence::tenant::TenantContext;
 #[derive(Clone)]
 pub struct PostgresTerminologyBackend {
     pub(super) pool: Pool,
+    /// Process-local inline-compose expansion cache. Hot path for repeated
+    /// POST $expand requests with identical compose bodies — k6 EX02/04/05/06
+    /// pool entries hit the same compose hundreds of times during a 30s run.
+    pub(super) inline_compose_cache: ComposeExpansionCache,
 }
 
 impl PostgresTerminologyBackend {
@@ -57,7 +83,10 @@ impl PostgresTerminologyBackend {
 
         info!(database_url, "PostgreSQL terminology backend initialized");
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            inline_compose_cache: Arc::new(RwLock::new(HashMap::new())),
+        })
     }
 
     /// Borrow the underlying `deadpool-postgres` connection pool.

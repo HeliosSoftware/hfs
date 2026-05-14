@@ -74,6 +74,23 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         "A definition for the value Set '{url}' could not be found"
                     )));
                 }
+                // Cache check — keyed by URL + version pins. EX01 hits the
+                // same `?fhir_vs=isa/<code>` per pool entry hundreds of times
+                // during a 30s vu=50 run; cold-miss is a recursive CTE on
+                // SNOMED, warm-hit is an in-memory slice.
+                let cache_key = build_url_cache_key(
+                    url,
+                    req.value_set_version.as_deref(),
+                    &req.force_system_versions,
+                    &req.system_version_defaults,
+                    &req.default_value_set_versions,
+                );
+                let cache_eligible = req.hierarchical != Some(true);
+                if cache_eligible {
+                    if let Some(cached) = cache_get(&self.inline_compose_cache, cache_key) {
+                        return Ok(serve_from_cached(&cached, &req));
+                    }
+                }
                 let compose_val = match &pattern {
                     FhirVsPattern::AllConcepts => serde_json::json!({
                         "include": [{ "system": cs_url }]
@@ -109,6 +126,13 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         }
                     }
                 }
+                if cache_eligible {
+                    cache_put(
+                        &self.inline_compose_cache,
+                        cache_key,
+                        std::sync::Arc::new(codes.clone()),
+                    );
+                }
                 codes
             } else {
             // ── URL-based path (unchanged) ───────────────────────────────────
@@ -134,6 +158,27 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     // of any nested `compose.include[].valueSet[]` refs and
                     // would diverge from the pinned version's content.
                     let has_vs_pin = !req.default_value_set_versions.is_empty();
+
+                    // In-memory cache check (EX04 hot path — VSAC URLs hit
+                    // hundreds of times per 30s run). Cold-miss reads from
+                    // `value_set_expansions` table (5,975 rows over wire each
+                    // time); warm-hit slices an in-memory Vec.
+                    let cache_key = build_url_cache_key(
+                        url,
+                        req.value_set_version.as_deref(),
+                        &req.force_system_versions,
+                        &req.system_version_defaults,
+                        &req.default_value_set_versions,
+                    );
+                    let cache_eligible = req.hierarchical != Some(true)
+                        && !multi_version
+                        && !has_vs_pin;
+                    if cache_eligible {
+                        if let Some(cached) = cache_get(&self.inline_compose_cache, cache_key) {
+                            return Ok(serve_from_cached(&cached, &req));
+                        }
+                    }
+
                     let cached = if multi_version || has_vs_pin {
                         Vec::new()
                     } else {
@@ -162,8 +207,22 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         if !multi_version && !has_vs_pin {
                             populate_cache(&mut client, &vs_id, &codes).await?;
                         }
+                        if cache_eligible {
+                            cache_put(
+                                &self.inline_compose_cache,
+                                cache_key,
+                                std::sync::Arc::new(codes.clone()),
+                            );
+                        }
                         codes
                     } else {
+                        if cache_eligible {
+                            cache_put(
+                                &self.inline_compose_cache,
+                                cache_key,
+                                std::sync::Arc::new(cached.clone()),
+                            );
+                        }
                         cached
                     }
                 }
@@ -236,6 +295,23 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             if let Some(compose_val) = compose {
                 compose_is_enumerated = compose_is_enumerated_value(compose_val);
                 let compose_str = compose_val.to_string();
+                // Cache check — the EX02/05/06/07/08 benchmark scenarios all
+                // POST identical inline composes per pool entry. Warm-hit
+                // avoids the recursive-CTE / pg_filter_is_a expansion entirely.
+                let cache_key = build_inline_cache_key(
+                    &compose_str,
+                    &req.force_system_versions,
+                    &req.system_version_defaults,
+                    &req.default_value_set_versions,
+                    &contained_vec,
+                );
+                let cache_eligible = req.hierarchical != Some(true)
+                    && req.tx_resources.is_empty();
+                if cache_eligible {
+                    if let Some(cached) = cache_get(&self.inline_compose_cache, cache_key) {
+                        return Ok(serve_from_cached(&cached, &req));
+                    }
+                }
                 let codes = compute_expansion_with_contained(
                     &client,
                     Some(&compose_str),
@@ -255,6 +331,13 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             )));
                         }
                     }
+                }
+                if cache_eligible {
+                    cache_put(
+                        &self.inline_compose_cache,
+                        cache_key,
+                        std::sync::Arc::new(codes.clone()),
+                    );
                 }
                 codes
             } else if let Some(pre) = vs.get("expansion").and_then(|e| e.get("contains")) {
@@ -4088,6 +4171,154 @@ fn finish_validate_code_response(
                 concept_status: None,
                 normalized_code: normalized_code.map(|s| s.to_string()),
             })
+        }
+    }
+}
+
+// ── Inline-compose expansion cache helpers ───────────────────────────────────
+//
+// Mirrors backends/sqlite/value_set.rs:296+ (inline_compose_index). The cache
+// stores the FULL unfiltered, unpaged code list for a canonicalised compose +
+// version-pin set. Filter/count/offset are applied to the cached vec in Rust
+// on each request, so repeated EX02/04/05/06/07/08 pool entries (which differ
+// only in count/filter) reuse a single cold-miss expansion.
+
+/// FNV-1a 64-bit hash. Matches `backends/sqlite/value_set.rs:fnv64`.
+fn fnv64(data: &[u8]) -> u64 {
+    const PRIME: u64 = 0x00000100000001B3;
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    let mut h = OFFSET;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+/// Canonicalise a `HashMap<String, String>` to a stable key suffix.
+fn canon_map(m: &std::collections::HashMap<String, String>) -> String {
+    if m.is_empty() {
+        return String::new();
+    }
+    let mut entries: Vec<(&String, &String)> = m.iter().collect();
+    entries.sort();
+    entries
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Build a cache key for an inline-compose expansion. Folds the compose body
+/// and every request input that changes which codes are emitted (version
+/// pins, contained VSes). Filter, count, offset, hierarchical are NOT folded
+/// in — they are post-cache slicing knobs.
+fn build_inline_cache_key(
+    compose_str: &str,
+    force_system_versions: &std::collections::HashMap<String, String>,
+    system_version_defaults: &std::collections::HashMap<String, String>,
+    default_value_set_versions: &std::collections::HashMap<String, String>,
+    contained: &[serde_json::Value],
+) -> u64 {
+    let contained_str = if contained.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(contained).unwrap_or_default()
+    };
+    let canonical = format!(
+        "inline|{compose_str}|{}|{}|{}|{contained_str}",
+        canon_map(force_system_versions),
+        canon_map(system_version_defaults),
+        canon_map(default_value_set_versions),
+    );
+    fnv64(canonical.as_bytes())
+}
+
+/// Build a cache key for a stored / `?fhir_vs` ValueSet expansion. Same idea
+/// as [`build_inline_cache_key`] but keyed by canonical URL (+ optional
+/// version pin) instead of an inline compose body.
+fn build_url_cache_key(
+    url: &str,
+    value_set_version: Option<&str>,
+    force_system_versions: &std::collections::HashMap<String, String>,
+    system_version_defaults: &std::collections::HashMap<String, String>,
+    default_value_set_versions: &std::collections::HashMap<String, String>,
+) -> u64 {
+    let canonical = format!(
+        "url|{url}|{}|{}|{}|{}",
+        value_set_version.unwrap_or(""),
+        canon_map(force_system_versions),
+        canon_map(system_version_defaults),
+        canon_map(default_value_set_versions),
+    );
+    fnv64(canonical.as_bytes())
+}
+
+/// Look up `key` in `cache`, returning a clone of the `Arc` on hit. Returns
+/// `None` if the lock is poisoned (treated as cache miss).
+fn cache_get(
+    cache: &super::ComposeExpansionCache,
+    key: u64,
+) -> Option<std::sync::Arc<Vec<ExpansionContains>>> {
+    cache.read().ok().and_then(|g| g.get(&key).cloned())
+}
+
+/// Insert `codes` under `key`. Respects [`super::PG_COMPOSE_CACHE_MAX`] —
+/// once the cache is full, new entries are dropped silently (warm-set wins).
+fn cache_put(
+    cache: &super::ComposeExpansionCache,
+    key: u64,
+    codes: std::sync::Arc<Vec<ExpansionContains>>,
+) {
+    if let Ok(mut g) = cache.write() {
+        if g.len() < super::PG_COMPOSE_CACHE_MAX || g.contains_key(&key) {
+            g.insert(key, codes);
+        }
+    }
+}
+
+/// Apply request-level filter (substring on code|display) + offset + count to
+/// a cached, unfiltered code list. Returns a fresh `ExpandResponse` whose
+/// `contains` holds at most `count` entries.
+fn serve_from_cached(codes: &[ExpansionContains], req: &ExpandRequest) -> ExpandResponse {
+    let filter_lower = req.filter.as_deref().map(str::to_lowercase);
+    let offset = req.offset.unwrap_or(0) as usize;
+    let count = req.count.map(|c| c as usize).unwrap_or(usize::MAX);
+
+    if let Some(lower) = filter_lower.as_deref() {
+        // Two-pass: count total matching, then page. Single allocator pass via
+        // an iterator over indices keeps memory bounded by `count`.
+        let mut total: u32 = 0;
+        let mut page: Vec<ExpansionContains> = Vec::new();
+        let mut seen: usize = 0;
+        for c in codes.iter() {
+            let m = c.code.to_lowercase().contains(lower)
+                || c.display
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(lower))
+                    .unwrap_or(false);
+            if m {
+                total = total.saturating_add(1);
+                if seen >= offset && page.len() < count {
+                    page.push(c.clone());
+                }
+                seen += 1;
+            }
+        }
+        ExpandResponse {
+            total: Some(total),
+            offset: req.offset,
+            contains: page,
+            warnings: vec![],
+        }
+    } else {
+        let total = codes.len() as u32;
+        let page: Vec<ExpansionContains> = codes.iter().skip(offset).take(count).cloned().collect();
+        ExpandResponse {
+            total: Some(total),
+            offset: req.offset,
+            contains: page,
+            warnings: vec![],
         }
     }
 }
