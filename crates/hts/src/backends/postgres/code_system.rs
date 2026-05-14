@@ -14,7 +14,10 @@ use crate::types::{
     ValidateCodeResponse,
 };
 
-use super::{PG_LOOKUP_RESPONSE_CACHE_MAX, PostgresTerminologyBackend, ResolvedMetaCache};
+use super::{
+    PG_LOOKUP_RESPONSE_CACHE_MAX, PG_SUBSUMES_RESPONSE_CACHE_MAX, PostgresTerminologyBackend,
+    ResolvedMetaCache,
+};
 use super::value_set::{
     cs_content_for_url, cs_is_case_insensitive, cs_property_local_codes, cs_version_for_msg,
     detect_cs_version_mismatch, is_concept_abstract, is_concept_inactive,
@@ -607,6 +610,22 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         _ctx: &TenantContext,
         req: SubsumesRequest,
     ) -> Result<SubsumesResponse, HtsError> {
+        // SS01 hot-path memo. Both ancestor-check directions are folded into
+        // the cached outcome; the key includes version so different versions
+        // of the same system don't collide.
+        let cache_key = format!(
+            "{}|{}|{}|{}",
+            req.system,
+            req.version.as_deref().unwrap_or(""),
+            req.code_a,
+            req.code_b,
+        );
+        if let Ok(read) = self.subsumes_response_cache.read() {
+            if let Some(arc) = read.get(&cache_key) {
+                return Ok((**arc).clone());
+            }
+        }
+
         let client = self
             .pool
             .get()
@@ -625,27 +644,23 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         find_concept(&client, &system_id, &req.code_a).await?;
         find_concept(&client, &system_id, &req.code_b).await?;
 
-        if req.code_a == req.code_b {
-            return Ok(SubsumesResponse {
-                outcome: SubsumptionOutcome::Equivalent,
-            });
-        }
+        let outcome = if req.code_a == req.code_b {
+            SubsumptionOutcome::Equivalent
+        } else if check_ancestor(&client, &system_id, &req.code_a, &req.code_b).await? {
+            SubsumptionOutcome::Subsumes
+        } else if check_ancestor(&client, &system_id, &req.code_b, &req.code_a).await? {
+            SubsumptionOutcome::SubsumedBy
+        } else {
+            SubsumptionOutcome::NotSubsumed
+        };
 
-        if check_ancestor(&client, &system_id, &req.code_a, &req.code_b).await? {
-            return Ok(SubsumesResponse {
-                outcome: SubsumptionOutcome::Subsumes,
-            });
+        let response = SubsumesResponse { outcome };
+        if let Ok(mut w) = self.subsumes_response_cache.write() {
+            if w.len() < PG_SUBSUMES_RESPONSE_CACHE_MAX || w.contains_key(&cache_key) {
+                w.insert(cache_key, Arc::new(response.clone()));
+            }
         }
-
-        if check_ancestor(&client, &system_id, &req.code_b, &req.code_a).await? {
-            return Ok(SubsumesResponse {
-                outcome: SubsumptionOutcome::SubsumedBy,
-            });
-        }
-
-        Ok(SubsumesResponse {
-            outcome: SubsumptionOutcome::NotSubsumed,
-        })
+        Ok(response)
     }
 
     async fn code_system_version_for_url(

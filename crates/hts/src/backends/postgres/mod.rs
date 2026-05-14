@@ -20,7 +20,7 @@ use crate::error::HtsError;
 use crate::import::bundle_parser::{self, ParsedCodeSystem, ParsedConceptMap, ParsedValueSet};
 use crate::import::{BundleImportBackend, ImportStats};
 use crate::traits::TerminologyMetadata;
-use crate::types::{ExpansionContains, LookupResponse};
+use crate::types::{ExpansionContains, LookupResponse, SubsumesResponse, TranslateResponse};
 use helios_persistence::tenant::TenantContext;
 
 /// Per-compose in-memory expansion index. Mirrors SQLite's
@@ -55,6 +55,16 @@ pub type LookupResponseCache = Arc<RwLock<HashMap<String, Arc<LookupResponse>>>>
 pub type ResolvedMetaCache =
     Arc<RwLock<HashMap<(String, Option<String>), (String, String, Option<String>)>>>;
 
+/// `$subsumes` response memo (SS01 hot path).
+/// Key = `"system|version|codeA|codeB"`. Both ancestor-check directions
+/// (subsumes / subsumed-by) share the same key — the outcome captures the
+/// resolved direction.
+pub type SubsumesResponseCache = Arc<RwLock<HashMap<String, Arc<SubsumesResponse>>>>;
+
+/// `$translate` response memo (CM01/CM02 hot path).
+/// Key = `"url|system|code|source|target|target_system|target_code|reverse|date"`.
+pub type TranslateResponseCache = Arc<RwLock<HashMap<String, Arc<TranslateResponse>>>>;
+
 /// Soft cap on cache entries. Once full, new entries are dropped silently
 /// (warm-set wins). Matches SQLite's handler-level cap order of magnitude;
 /// inline-compose entries are small (10K–100K codes each, ~50 MB max), and
@@ -65,6 +75,12 @@ pub const PG_COMPOSE_CACHE_MAX: usize = 4096;
 /// Soft cap on `lookup_response_cache` entries — mirrors SQLite's
 /// `lookup_response_cache_max()` (backends/sqlite/code_system.rs:131-135).
 pub const PG_LOOKUP_RESPONSE_CACHE_MAX: usize = 4096;
+
+/// Soft cap on `subsumes_response_cache` entries.
+pub const PG_SUBSUMES_RESPONSE_CACHE_MAX: usize = 4096;
+
+/// Soft cap on `translate_response_cache` entries.
+pub const PG_TRANSLATE_RESPONSE_CACHE_MAX: usize = 4096;
 
 /// PostgreSQL-backed terminology service backend.
 ///
@@ -90,6 +106,13 @@ pub struct PostgresTerminologyBackend {
     /// VC*, and SS01 — every CS-touching op begins by resolving the URL to
     /// an internal `(system_id, name, version)` triple.
     pub(super) cs_resolved_meta_cache: ResolvedMetaCache,
+    /// `$subsumes` response memo — SS01 hot path was at 17% of SQLite
+    /// after iter 2 because find_concept + check_ancestor (recursive CTE)
+    /// ran on every request.
+    pub(super) subsumes_response_cache: SubsumesResponseCache,
+    /// `$translate` response memo — CM01/CM02 hot paths repeat the same
+    /// (system, code, target) tuples across pool entries.
+    pub(super) translate_response_cache: TranslateResponseCache,
 }
 
 impl PostgresTerminologyBackend {
@@ -119,6 +142,8 @@ impl PostgresTerminologyBackend {
             inline_compose_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_response_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
+            subsumes_response_cache: Arc::new(RwLock::new(HashMap::new())),
+            translate_response_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -134,6 +159,12 @@ impl PostgresTerminologyBackend {
             g.clear();
         }
         if let Ok(mut g) = self.inline_compose_cache.write() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.subsumes_response_cache.write() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.translate_response_cache.write() {
             g.clear();
         }
     }

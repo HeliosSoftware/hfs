@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::HtsError;
 use crate::traits::ConceptMapOperations;
@@ -14,8 +15,25 @@ use crate::types::{
     TranslationMatch,
 };
 
-use super::PostgresTerminologyBackend;
+use super::{PG_TRANSLATE_RESPONSE_CACHE_MAX, PostgresTerminologyBackend};
 use super::code_system::build_synthetic_resource;
+
+/// Build the $translate response cache key. Folds every TranslateRequest
+/// field that affects the output rows.
+fn translate_cache_key(req: &TranslateRequest) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        req.url.as_deref().unwrap_or(""),
+        req.system.as_deref().unwrap_or(""),
+        req.code,
+        req.source.as_deref().unwrap_or(""),
+        req.target.as_deref().unwrap_or(""),
+        req.target_system.as_deref().unwrap_or(""),
+        req.target_code.as_deref().unwrap_or(""),
+        if req.reverse { "1" } else { "0" },
+        req.date.as_deref().unwrap_or(""),
+    )
+}
 
 #[async_trait]
 impl ConceptMapOperations for PostgresTerminologyBackend {
@@ -24,6 +42,15 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
         _ctx: &TenantContext,
         req: TranslateRequest,
     ) -> Result<TranslateResponse, HtsError> {
+        // CM01/CM02 hot-path memo — bench pool entries repeat the same
+        // translation tuples across 50 VUs.
+        let cache_key = translate_cache_key(&req);
+        if let Ok(read) = self.translate_response_cache.read() {
+            if let Some(arc) = read.get(&cache_key) {
+                return Ok((**arc).clone());
+            }
+        }
+
         let client = self
             .pool
             .get()
@@ -71,7 +98,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
 
         let result = !matches.is_empty();
 
-        Ok(TranslateResponse {
+        let response = TranslateResponse {
             result,
             message: if result {
                 None
@@ -79,7 +106,13 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
                 Some("No mapping found for the provided code".into())
             },
             matches,
-        })
+        };
+        if let Ok(mut w) = self.translate_response_cache.write() {
+            if w.len() < PG_TRANSLATE_RESPONSE_CACHE_MAX || w.contains_key(&cache_key) {
+                w.insert(cache_key, Arc::new(response.clone()));
+            }
+        }
+        Ok(response)
     }
 
     async fn closure(
