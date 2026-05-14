@@ -66,21 +66,22 @@ pub type SubsumesResponseCache = Arc<RwLock<HashMap<String, Arc<SubsumesResponse
 pub type TranslateResponseCache = Arc<RwLock<HashMap<String, Arc<TranslateResponse>>>>;
 
 /// Soft cap on cache entries. Once full, new entries are dropped silently
-/// (warm-set wins). Matches SQLite's handler-level cap order of magnitude;
-/// inline-compose entries are small (10K–100K codes each, ~50 MB max), and
-/// the bench uses ~60 distinct pool entries per scenario so 4096 has ample
-/// headroom across all scenarios concurrently.
-pub const PG_COMPOSE_CACHE_MAX: usize = 4096;
+/// (warm-set wins). 16384 mirrors SQLite's iter-9 cap-raise: each LK*/VC*
+/// pool holds 2000 distinct codes across 3-5 systems = 6-10K keys; the
+/// previous 4096 was being filled by the first two systems' keys, leaving
+/// later systems (LK04 RxNorm, etc.) entirely uncached.
+pub const PG_COMPOSE_CACHE_MAX: usize = 16384;
 
 /// Soft cap on `lookup_response_cache` entries — mirrors SQLite's
 /// `lookup_response_cache_max()` (backends/sqlite/code_system.rs:131-135).
-pub const PG_LOOKUP_RESPONSE_CACHE_MAX: usize = 4096;
+/// Sized to hold all LK*/VC*/SS01 keys simultaneously (~10K).
+pub const PG_LOOKUP_RESPONSE_CACHE_MAX: usize = 16384;
 
 /// Soft cap on `subsumes_response_cache` entries.
-pub const PG_SUBSUMES_RESPONSE_CACHE_MAX: usize = 4096;
+pub const PG_SUBSUMES_RESPONSE_CACHE_MAX: usize = 16384;
 
 /// Soft cap on `translate_response_cache` entries.
-pub const PG_TRANSLATE_RESPONSE_CACHE_MAX: usize = 4096;
+pub const PG_TRANSLATE_RESPONSE_CACHE_MAX: usize = 16384;
 
 /// PostgreSQL-backed terminology service backend.
 ///
