@@ -9,10 +9,34 @@ An open test server is available at https://hfs.heliossoftware.com/ for experime
 - Full FHIR RESTful API support 
 - Multiple FHIR version support
 - Pluggable storage backends (SQLite, PostgreSQL, MongoDB)
+- **Bulk Data Export (`$export`)** — system / patient / group, asynchronous,
+  with an embedded single-instance default and a multi-instance
+  PostgreSQL + S3 topology (see *Bulk Data Export* below)
 - Content negotiation (JSON)
 - Conditional operations with ETag support
 - Multi-tenant support via X-Tenant-ID header
 - CORS support
+
+## Bulk Data Export
+
+HFS implements the [FHIR Bulk Data Access IG](https://build.fhir.org/ig/HL7/bulk-data/)
+`$export` operation. Single-instance (zero config) wires SQLite job state +
+local-FS output + an in-process worker pool; multi-instance switches to a
+PostgreSQL job store and an S3-compatible output store with pre-signed
+download URLs.
+
+```bash
+# Single-instance (default)
+cargo run --bin hfs
+curl -H 'Prefer: respond-async' \
+  http://localhost:8080/Patient/\$export
+```
+
+The full configuration surface (`HFS_BULK_EXPORT_*` env vars, single- vs
+multi-instance recipes, parameter behavior) is documented in `CLAUDE.md`.
+A docker-compose stack for the multi-instance topology lives at
+`docker/bulk-export/docker-compose.yml`, and a manual Inferno Bulk Data IG
+v2.0.0 conformance workflow at `.github/workflows/inferno-bulk-data.yml`.
 
 ## Installation
 
