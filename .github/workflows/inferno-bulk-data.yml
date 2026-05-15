@@ -35,7 +35,7 @@ env:
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   SUITE_ID: bulk_data_v200
-  TEST_GROUP_ID: bulk_data_v200
+  TEST_GROUP_ID: bulk_data_v200-bulk_data_export_tests_v200
   GROUP_ID: inferno-bulk-group
   RESULTS_DIR: inferno-bulk-data-results
 
