@@ -566,7 +566,8 @@ jobs:
                 {name: "smart_auth_info", value: $smart_auth_info},
                 {name: "group_id", value: $inferno_group_id},
                 {name: "bulk_timeout", value: "600"},
-                {name: "lines_to_validate", value: "100"}
+                {name: "lines_to_validate", value: "100"},
+                {name: "since_timestamp", value: "2000-01-01T00:00:00.000Z"}
               ]
             }')"
 
