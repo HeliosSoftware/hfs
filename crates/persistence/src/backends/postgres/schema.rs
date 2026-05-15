@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// Initialize the database schema.
 pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
@@ -269,6 +269,7 @@ async fn migrate_schema(
             4 => migrate_v4_to_v5(client).await?,
             5 => migrate_v5_to_v6(client).await?,
             6 => migrate_v6_to_v7(client).await?,
+            7 => migrate_v7_to_v8(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -577,6 +578,55 @@ async fn migrate_v6_to_v7(client: &deadpool_postgres::Client) -> StorageResult<(
         )
         .await
         .map_err(|e| pg_error(format!("Migration v6->v7 index creation failed: {}", e)))?;
+
+    Ok(())
+}
+
+/// v7 -> v8: Add bulk-export worker/lease support.
+async fn migrate_v7_to_v8(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let migrations = [
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS worker_id TEXT",
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS lease_expiry TIMESTAMPTZ",
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ",
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS owner_subject TEXT",
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS request_url TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS fhir_version TEXT NOT NULL DEFAULT '4.0'",
+        "ALTER TABLE bulk_export_files ADD COLUMN IF NOT EXISTS part_index INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_export_files ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0",
+    ];
+    for sql in &migrations {
+        client
+            .execute(*sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v7->v8 failed: {}", e)))?;
+    }
+
+    // Backfill part_index: 0-based sequential per (job_id, file_type, resource_type).
+    client
+        .execute(
+            "UPDATE bulk_export_files SET part_index = sub.rn FROM (
+                SELECT id, ROW_NUMBER() OVER (
+                    PARTITION BY job_id, file_type, resource_type ORDER BY id
+                ) - 1 AS rn FROM bulk_export_files
+             ) sub WHERE bulk_export_files.id = sub.id",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v7->v8 backfill failed: {}", e)))?;
+
+    let indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_export_jobs_claim
+         ON bulk_export_jobs(tenant_id, status, lease_expiry)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_export_files_part
+         ON bulk_export_files(job_id, file_type, resource_type, part_index)",
+    ];
+    for sql in &indexes {
+        client
+            .execute(*sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v7->v8 index failed: {}", e)))?;
+    }
 
     Ok(())
 }
