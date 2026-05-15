@@ -1,17 +1,17 @@
 //! SQL-on-FHIR runner abstraction.
 //!
-//! This module defines the [`SofRunner`] trait, which abstracts over two execution
-//! strategies for `$viewdefinition-run`:
+//! This module defines the [`SofRunner`] trait, implemented by per-backend
+//! **in-DB runners** that compile a [`ViewDefinition`] to SQL and execute it
+//! directly inside the storage backend, skipping FHIRPath evaluation entirely.
+//! Two implementations exist today: one for SQLite and one for PostgreSQL.
+//! Backends advertise the capability via [`BackendCapability::InDbSofRunner`].
 //!
-//! - **In-process runner** — evaluates FHIRPath via `helios-sof` over pages fetched from
-//!   [`SearchProvider`], used as a universal fallback when no in-DB runner is available.
-//! - **In-DB runner** — compiles the [`ViewDefinition`] to SQL and executes it directly
-//!   inside the storage backend (SQLite or PostgreSQL), skipping FHIRPath evaluation
-//!   entirely. Backends advertise this capability via
-//!   [`BackendCapability::InDbSofRunner`].
+//! There is no in-process FHIRPath fallback — if the configured backend does
+//! not provide a runner, the `$viewdefinition-run` handler returns
+//! `501 Not Implemented`. Inline `resource:` parameters are materialised into
+//! a transient in-memory SQLite backend so they reuse the same in-DB pipeline.
 //!
-//! The handler layer selects the runner at request time and streams the result rows
-//! directly into the HTTP response.
+//! The handler layer streams the result rows directly into the HTTP response.
 
 use std::pin::Pin;
 
