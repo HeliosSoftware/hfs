@@ -35,7 +35,8 @@ env:
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   SUITE_ID: bulk_data_v200
-  TEST_GROUP_ID: bulk_data_v200
+  SMART_GROUP_ID: bulk_data_v200-bulk_data_smart_backend_services_v200
+  EXPORT_GROUP_ID: bulk_data_v200-bulk_data_export_tests_v200
   GROUP_ID: inferno-bulk-group
   RESULTS_DIR: inferno-bulk-data-results
 
@@ -552,93 +553,106 @@ jobs:
             encryption_algorithm: "ES384"
           }')"
 
-          RUN_PAYLOAD="$(jq -n \
-            --arg session_id "$SESSION_ID" \
-            --arg group_id "$TEST_GROUP_ID" \
-            --arg bulk_server_url "$HFS_BASE_URL" \
-            --arg smart_auth_info "$SMART_AUTH_INFO" \
-            --arg inferno_group_id "$GROUP_ID" \
-            '{
-              test_session_id: $session_id,
-              test_group_id: $group_id,
-              inputs: [
-                {name: "bulk_server_url", value: $bulk_server_url},
-                {name: "smart_auth_info", value: $smart_auth_info},
-                {name: "group_id", value: $inferno_group_id},
-                {name: "bulk_timeout", value: "600"},
-                {name: "lines_to_validate", value: "100"},
-                {name: "since_timestamp", value: "2000-01-01T00:00:00.000Z"}
-              ]
-            }')"
+          # The bulk_data_v200 suite contains two sequential groups that must each be
+          # run as a separate test_run: the SMART Backend Services group establishes the
+          # bearer token, and the Export Tests group consumes it from session state.
+          for GROUP_PAIR in "smart:$SMART_GROUP_ID" "export:$EXPORT_GROUP_ID"; do
+            LABEL="${GROUP_PAIR%%:*}"
+            GROUP_ID_VAL="${GROUP_PAIR##*:}"
 
-          echo "$RUN_PAYLOAD" > "$RESULTS_DIR/run-payload.json"
+            echo "--- Starting group: $LABEL ($GROUP_ID_VAL) ---"
 
-          for attempt in $(seq 1 5); do
-            RUN_RESPONSE=$(curl -s -X POST "$INFERNO_BASE_URL/api/test_runs" \
-              -H "Content-Type: application/json" \
-              -d "$RUN_PAYLOAD")
-            RUN_ID=$(echo "$RUN_RESPONSE" | jq -r '.id' 2>/dev/null) || true
+            RUN_PAYLOAD="$(jq -n \
+              --arg session_id "$SESSION_ID" \
+              --arg group_id "$GROUP_ID_VAL" \
+              --arg bulk_server_url "$HFS_BASE_URL" \
+              --arg smart_auth_info "$SMART_AUTH_INFO" \
+              --arg fhir_group_id "$GROUP_ID" \
+              '{
+                test_session_id: $session_id,
+                test_group_id: $group_id,
+                inputs: [
+                  {name: "bulk_server_url", value: $bulk_server_url},
+                  {name: "smart_auth_info", value: $smart_auth_info},
+                  {name: "group_id", value: $fhir_group_id},
+                  {name: "bulk_timeout", value: "600"},
+                  {name: "lines_to_validate", value: "100"},
+                  {name: "since_timestamp", value: "2000-01-01T00:00:00.000Z"}
+                ]
+              }')"
 
-            if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
-              break
+            echo "$RUN_PAYLOAD" > "$RESULTS_DIR/run-payload-$LABEL.json"
+
+            RUN_ID=""
+            RUN_RESPONSE=""
+            for attempt in $(seq 1 5); do
+              RUN_RESPONSE=$(curl -s -X POST "$INFERNO_BASE_URL/api/test_runs" \
+                -H "Content-Type: application/json" \
+                -d "$RUN_PAYLOAD")
+              RUN_ID=$(echo "$RUN_RESPONSE" | jq -r '.id' 2>/dev/null) || true
+              if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then break; fi
+              echo "Attempt $attempt/5: Failed to start $LABEL run: $RUN_RESPONSE"
+              sleep $((attempt * 3))
+            done
+
+            if [ -z "${RUN_ID:-}" ] || [ "$RUN_ID" = "null" ]; then
+              echo "Failed to start $LABEL run after 5 attempts"
+              echo "$RUN_RESPONSE"
+              exit 1
             fi
-            echo "Attempt $attempt/5: Failed to start test run: $RUN_RESPONSE"
-            sleep $((attempt * 3))
-          done
 
-          if [ -z "${RUN_ID:-}" ] || [ "$RUN_ID" = "null" ]; then
-            echo "Failed to start test run after 5 attempts"
-            echo "$RUN_RESPONSE"
-            exit 1
-          fi
+            echo "$RUN_RESPONSE" > "$RESULTS_DIR/run-$LABEL.json"
+            echo "$LABEL run started: $RUN_ID"
 
-          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
-          echo "$RUN_RESPONSE" > "$RESULTS_DIR/run.json"
-
-      - name: Poll Inferno results
-        run: |
-          MAX_POLLS=150
-          POLL_INTERVAL=10
-          API_ERRORS=0
-
-          for i in $(seq 1 $MAX_POLLS); do
-            STATUS_RESPONSE=$(curl -s "$INFERNO_BASE_URL/api/test_runs/$RUN_ID")
-            RUN_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status' 2>/dev/null) || true
-
-            if [ -z "$RUN_STATUS" ] || [ "$RUN_STATUS" = "null" ]; then
-              API_ERRORS=$((API_ERRORS + 1))
-              echo "Poll $i/$MAX_POLLS: WARNING - Inferno API returned non-JSON (error $API_ERRORS)"
-              echo "  Response (first 200 chars): ${STATUS_RESPONSE:0:200}"
-              if [ "$API_ERRORS" -ge 5 ]; then
-                echo "::error::Inferno API failed $API_ERRORS consecutive times"
-                tail -50 "$HFS_LOG"
-                exit 1
-              fi
-              sleep "$POLL_INTERVAL"
-              continue
-            fi
+            MAX_POLLS=150
             API_ERRORS=0
+            RUN_STATUS=""
+            for i in $(seq 1 $MAX_POLLS); do
+              STATUS_RESPONSE=$(curl -s "$INFERNO_BASE_URL/api/test_runs/$RUN_ID")
+              RUN_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status' 2>/dev/null) || true
 
-            RESULTS=$(curl -s "$INFERNO_BASE_URL/api/test_runs/$RUN_ID/results")
-            echo "$RESULTS" > "$RESULTS_DIR/results.json"
-            TOTAL=$(echo "$RESULTS" | jq '[.[] | select(.test_id)] | length' 2>/dev/null) || TOTAL="?"
-            PASS=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "pass")] | length' 2>/dev/null) || PASS="?"
-            FAIL=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "fail")] | length' 2>/dev/null) || FAIL="?"
-            SKIP=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "skip")] | length' 2>/dev/null) || SKIP="?"
-            ERROR=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "error")] | length' 2>/dev/null) || ERROR="?"
-            OMIT=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "omit")] | length' 2>/dev/null) || OMIT="?"
+              if [ -z "$RUN_STATUS" ] || [ "$RUN_STATUS" = "null" ]; then
+                API_ERRORS=$((API_ERRORS + 1))
+                echo "Poll $i/$MAX_POLLS [$LABEL]: WARNING - non-JSON response (error $API_ERRORS)"
+                if [ "$API_ERRORS" -ge 5 ]; then
+                  echo "::error::Inferno API failed $API_ERRORS consecutive times for $LABEL"
+                  tail -50 "$HFS_LOG"
+                  exit 1
+                fi
+                sleep 10
+                continue
+              fi
+              API_ERRORS=0
 
-            echo "Poll $i/$MAX_POLLS: Status=$RUN_STATUS Total=$TOTAL Pass=$PASS Fail=$FAIL Skip=$SKIP Error=$ERROR Omit=$OMIT"
+              RESULTS=$(curl -s "$INFERNO_BASE_URL/api/test_runs/$RUN_ID/results")
+              TOTAL=$(echo "$RESULTS" | jq '[.[] | select(.test_id)] | length' 2>/dev/null) || TOTAL="?"
+              PASS=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "pass")] | length' 2>/dev/null) || PASS="?"
+              FAIL=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "fail")] | length' 2>/dev/null) || FAIL="?"
+              SKIP=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "skip")] | length' 2>/dev/null) || SKIP="?"
+              ERROR=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "error")] | length' 2>/dev/null) || ERROR="?"
+              OMIT=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "omit")] | length' 2>/dev/null) || OMIT="?"
 
-            if [ "$RUN_STATUS" = "done" ]; then
-              exit 0
+              echo "Poll $i/$MAX_POLLS [$LABEL]: Status=$RUN_STATUS Total=$TOTAL Pass=$PASS Fail=$FAIL Skip=$SKIP Error=$ERROR Omit=$OMIT"
+
+              if [ "$RUN_STATUS" = "done" ]; then
+                echo "$RESULTS" > "$RESULTS_DIR/results-$LABEL.json"
+                break
+              fi
+
+              sleep 10
+            done
+
+            if [ "$RUN_STATUS" != "done" ]; then
+              echo "::error::Inferno $LABEL group timed out"
+              exit 1
             fi
-
-            sleep "$POLL_INTERVAL"
           done
 
-          echo "::error::Inferno Bulk Data suite timed out"
-          exit 1
+          # Merge results from both groups for downstream steps
+          jq -s 'add' \
+            "$RESULTS_DIR/results-smart.json" \
+            "$RESULTS_DIR/results-export.json" \
+            > "$RESULTS_DIR/results.json"
 
       - name: Check test results
         run: |
