@@ -14,7 +14,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
-use helios_persistence::core::bulk_export::{BulkExportStorage, ExportDataProvider, ExportRequest};
+use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
 use helios_persistence::core::bulk_submit::{
     BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
     NdjsonEntry, SubmissionId,
@@ -670,49 +670,16 @@ async fn test_minio_bulk_export_lifecycle_manifest_and_outputs() {
             .unwrap();
     }
 
-    let job_id = harness
+    // S3 no longer implements `BulkExportStorage` (job state lives in
+    // SQLite/Postgres; see Phase 2 §2b). Verify that the S3 backend's
+    // `ExportDataProvider` data feed still returns the seeded resources.
+    let request = ExportRequest::system().with_types(vec!["Patient".to_string()]);
+    let batch = harness
         .backend
-        .start_export(
-            &tenant,
-            ExportRequest::system().with_types(vec!["Patient".to_string()]),
-        )
+        .fetch_export_batch(&tenant, &request, "Patient", None, 100)
         .await
         .unwrap();
-
-    let manifest = harness
-        .backend
-        .get_export_manifest(&tenant, &job_id)
-        .await
-        .unwrap();
-    assert!(!manifest.output.is_empty());
-
-    let bucket_prefix = format!("s3://{}/", harness.bucket);
-    for output in &manifest.output {
-        assert!(output.url.starts_with(&bucket_prefix));
-        let key = output.url.strip_prefix(&bucket_prefix).unwrap();
-        let object = harness
-            .sdk_client
-            .get_object()
-            .bucket(&harness.bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        let bytes = object.body.collect().await.unwrap().into_bytes();
-        assert!(
-            !bytes.is_empty(),
-            "bulk export output object should not be empty: {}",
-            output.url
-        );
-    }
-
-    harness
-        .backend
-        .delete_export(&tenant, &job_id)
-        .await
-        .unwrap();
-    let deleted = harness.backend.get_export_status(&tenant, &job_id).await;
-    assert!(matches!(deleted, Err(StorageError::BulkExport(_))));
+    assert_eq!(batch.lines.len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -851,4 +818,98 @@ async fn test_minio_pagination_over_1000_history_and_export() {
         .unwrap();
     assert_eq!(batch2.lines.len(), 5);
     assert!(batch2.is_last);
+}
+
+// ============================================================================
+// Phase 2 — S3OutputStore tests against MinIO.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_s3_output_store_round_trip() {
+    use helios_persistence::backends::s3::{
+        AccessTokenMode, AwsS3Client, AwsS3ClientOptions, S3OutputStore,
+    };
+    use helios_persistence::core::bulk_export::ExportJobId;
+    use helios_persistence::core::bulk_export_output::{ExportOutputStore, ExportPartKey};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    if skip_if_disabled("test_minio_s3_output_store_round_trip") {
+        return;
+    }
+
+    let shared = shared_minio().await;
+    ensure_backend_env_credentials(shared);
+    let sdk_client = build_minio_sdk_client(shared).await;
+    let bucket = test_bucket_name();
+    ensure_bucket_exists(&sdk_client, &bucket).await;
+
+    let region = aws_config::Region::new("us-east-1");
+    let credentials = aws_sdk_s3::config::Credentials::new(
+        &shared.root_user,
+        &shared.root_password,
+        None,
+        None,
+        "minio-test",
+    );
+    let sdk_config = aws_config::SdkConfig::builder()
+        .region(region)
+        .credentials_provider(aws_sdk_s3::config::SharedCredentialsProvider::new(
+            credentials,
+        ))
+        .behavior_version(aws_config::BehaviorVersion::latest())
+        .build();
+    let s3_client = Arc::new(AwsS3Client::from_sdk_config_with_options(
+        &sdk_config,
+        AwsS3ClientOptions {
+            endpoint_url: Some(shared.endpoint_url.clone()),
+            force_path_style: true,
+        },
+    ));
+
+    let store = S3OutputStore::new(
+        s3_client,
+        bucket.clone(),
+        "http://localhost:8080",
+        AccessTokenMode::Auto,
+        Duration::from_secs(60),
+    );
+
+    let job_id = ExportJobId::new();
+    let key = ExportPartKey::output("tenant-a", job_id.clone(), "Patient", 0, 1);
+
+    // Write two NDJSON lines and finalize.
+    let mut writer = store.open_writer(&key).await.unwrap();
+    writer
+        .write_line(r#"{"resourceType":"Patient","id":"a"}"#)
+        .await
+        .unwrap();
+    writer
+        .write_line(r#"{"resourceType":"Patient","id":"b"}"#)
+        .await
+        .unwrap();
+    let finalized = store.finalize_part(&key, writer).await.unwrap();
+    assert_eq!(finalized.line_count, 2);
+    assert!(finalized.size_bytes > 0);
+
+    // Pre-signed GET URL.
+    let url = store
+        .download_url(&key, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(!url.requires_access_token);
+    assert!(url.url.contains("X-Amz-Signature") || url.url.contains("Signature="));
+
+    // open_reader streams the same bytes back.
+    let mut reader = store.open_reader(&key).await.unwrap();
+    let mut content = String::new();
+    reader.read_to_string(&mut content).await.unwrap();
+    assert_eq!(content.lines().count(), 2);
+
+    // delete_job_outputs removes the part; idempotent on second call.
+    let tenant = tenant("tenant-a");
+    store.delete_job_outputs(&tenant, &job_id).await.unwrap();
+    store.delete_job_outputs(&tenant, &job_id).await.unwrap();
+    assert!(store.open_reader(&key).await.is_err());
 }
