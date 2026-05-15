@@ -37,6 +37,9 @@ pub mod sqlite;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+
+/// Local filesystem [`ExportOutputStore`](crate::core::bulk_export_output::ExportOutputStore).
+pub mod local_fs;
 //
 // #[cfg(feature = "cassandra")]
 // pub mod cassandra;
