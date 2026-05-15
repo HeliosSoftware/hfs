@@ -280,10 +280,10 @@ jobs:
             exit 1
           fi
 
-          docker run --rm --network "container:$MINIO_CONTAINER" minio/mc:latest \
-            alias set local http://127.0.0.1:9000 hfs-minio hfs-minio-secret
-          docker run --rm --network "container:$MINIO_CONTAINER" minio/mc:latest \
-            mb -p local/hfs-export
+          docker run --rm --network "container:$MINIO_CONTAINER" \
+            --entrypoint /bin/sh \
+            minio/mc:latest \
+            -c 'mc alias set local http://127.0.0.1:9000 hfs-minio hfs-minio-secret && mc mb -p local/hfs-export'
 
       - name: Generate Keycloak realm for Inferno client
         run: |
