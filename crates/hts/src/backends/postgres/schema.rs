@@ -356,18 +356,29 @@ pub async fn build_concept_closure_pg(
 /// Called once at server startup so existing databases (imported before the
 /// closure table was introduced) are migrated automatically, and at the end of
 /// CLI imports so the server's first request doesn't pay the build cost.
+///
+/// Drives the search off the small `code_systems` table (typically <500 rows)
+/// with index-friendly EXISTS probes. A previous version used `SELECT DISTINCT
+/// h.system_id FROM concept_hierarchy ...`, which the PG planner converted to
+/// a parallel sequential scan of the 1.2M-row SNOMED hierarchy and exhausted
+/// the dynamic-shared-memory segment on CI containers with a 64 MB `/dev/shm`
+/// — even when no closure work was actually needed.
 pub async fn migrate_concept_closure_pg(
     client: &mut tokio_postgres::Client,
 ) -> Result<(), tokio_postgres::Error> {
     let systems_needing_closure: Vec<String> = client
         .query(
-            "SELECT DISTINCT h.system_id
-             FROM   concept_hierarchy h
-             WHERE  NOT EXISTS (
-                        SELECT 1 FROM concept_closure c
-                        WHERE  c.system_id = h.system_id
-                        LIMIT  1
-                    )",
+            "SELECT cs.id FROM code_systems cs
+             WHERE EXISTS (
+                       SELECT 1 FROM concept_hierarchy h
+                       WHERE  h.system_id = cs.id
+                       LIMIT  1
+                   )
+               AND NOT EXISTS (
+                       SELECT 1 FROM concept_closure c
+                       WHERE  c.system_id = cs.id
+                       LIMIT  1
+                   )",
             &[],
         )
         .await?
