@@ -116,6 +116,26 @@ pub type ExpandHandlerCache = Arc<RwLock<HashMap<String, Bytes>>>;
 /// Maximum number of cached `$expand` handler responses.
 pub const EXPAND_HANDLER_CACHE_MAX: usize = 16384;
 
+/// Thread-safe per-AppState cache for fully-assembled `$lookup` JSON values,
+/// keyed at the *handler* layer above every `process_lookup` pre-flight step
+/// (supplement resolution, `backend.lookup` call, `code_system_language`
+/// lookup, FHIR `Parameters` assembly).  Warm hits clone an `Arc<Value>`
+/// rather than re-running the backend round-trips and FHIR builder.
+///
+/// LK01-04 hot path: each VU replays the same `(system, code, version,
+/// displayLanguage, property...)` tuple across 50 VUs over a 30 s run.  The
+/// backend has its own `lookup_response_cache`, but a request still pays for
+/// supplement resolution, the synthesised `preferredForLanguage` designation,
+/// and the Parameters builder.  This cache short-circuits ALL of that.
+///
+/// Bounded to [`LOOKUP_HANDLER_CACHE_MAX`] entries — once full new entries
+/// drop silently.  Cleared on bundle import / CRUD writes via
+/// [`AppState::clear_expand_cache`].
+pub type LookupHandlerCache = Arc<RwLock<HashMap<String, Arc<serde_json::Value>>>>;
+
+/// Maximum number of cached `$lookup` handler responses.
+pub const LOOKUP_HANDLER_CACHE_MAX: usize = 16384;
+
 /// Shared application state injected into every Axum handler.
 ///
 /// `B` is the concrete terminology backend (e.g., `SqliteTerminologyBackend`).
@@ -204,6 +224,11 @@ pub struct AppState<B: TerminologyBackend> {
     /// iterations.  Same bound (`EXPAND_HANDLER_CACHE_MAX`) and same
     /// invalidation hook as the URL-keyed cache.
     pub inline_compose_handler_cache: ExpandHandlerCache,
+
+    /// Handler-level response cache for `CodeSystem/$lookup` (both POST and
+    /// GET handlers, type-level and instance-level — they all funnel through
+    /// `process_lookup`).  See [`LookupHandlerCache`].
+    pub lookup_handler_cache: LookupHandlerCache,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -225,6 +250,7 @@ impl<B: TerminologyBackend> AppState<B> {
             vs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             expand_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             inline_compose_handler_cache: Arc::new(RwLock::new(HashMap::new())),
+            lookup_handler_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -251,6 +277,9 @@ impl<B: TerminologyBackend> AppState<B> {
             cache.clear();
         }
         if let Ok(mut cache) = self.inline_compose_handler_cache.write() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.lookup_handler_cache.write() {
             cache.clear();
         }
     }

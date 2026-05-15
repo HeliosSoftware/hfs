@@ -30,8 +30,10 @@ use axum::{
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
+use std::sync::Arc;
+
 use crate::error::HtsError;
-use crate::state::AppState;
+use crate::state::{AppState, LOOKUP_HANDLER_CACHE_MAX, LookupHandlerCache};
 use crate::traits::{SupplementInfo, TerminologyBackend};
 use crate::types::{DesignationValue, LookupRequest, PropertyValue};
 
@@ -40,6 +42,62 @@ use super::params::{
     collect_str_params, extract_parameter_array, find_str_param, parse_query_string,
     property_value_part, query_params_to_fhir_params,
 };
+
+/// Build a canonical cache key for a `$lookup` request from its normalised
+/// FHIR Parameters array.  Returns `None` when caching MUST be skipped:
+///
+/// * Any param carries a `resource` field — `$lookup` doesn't normally accept
+///   inline resources, but defensively bail to keep the key compact.
+/// * A param is missing its `name` (malformed input — slow path will reject).
+///
+/// Otherwise produces a string of compact-JSON fragments sorted by `name`,
+/// pipe-separated.  Identical canonical inputs always collide on the same
+/// key; semantically equivalent inputs that differ only in field order would
+/// miss (worst case = a cold miss, never a wrong response).  Mirrors
+/// `build_validate_code_cache_key` / `build_expand_cache_key`.
+fn build_lookup_cache_key(params: &[Value]) -> Option<String> {
+    let mut frags: Vec<(String, String)> = Vec::with_capacity(params.len());
+    for p in params {
+        let name = match p.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return None,
+        };
+        if p.get("resource").is_some() {
+            return None;
+        }
+        let frag = match serde_json::to_string(p) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        frags.push((name.to_string(), frag));
+    }
+    frags.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::with_capacity(frags.iter().map(|(_, f)| f.len() + 1).sum());
+    for (i, (_, f)) in frags.iter().enumerate() {
+        if i > 0 {
+            out.push('|');
+        }
+        out.push_str(f);
+    }
+    Some(out)
+}
+
+/// Fetch a cached `$lookup` response by canonical key.
+fn lookup_cache_get(cache: &LookupHandlerCache, key: &str) -> Option<Arc<Value>> {
+    cache.read().ok()?.get(key).cloned()
+}
+
+/// Insert a successfully-built `$lookup` response into the per-AppState cache.
+/// Drops new entries silently once the cache reaches
+/// [`LOOKUP_HANDLER_CACHE_MAX`].
+fn lookup_cache_put(cache: &LookupHandlerCache, key: String, value: Arc<Value>) {
+    if let Ok(mut guard) = cache.write() {
+        if guard.len() >= LOOKUP_HANDLER_CACHE_MAX {
+            return;
+        }
+        guard.insert(key, value);
+    }
+}
 
 /// Core lookup logic shared by all four public handlers.
 ///
@@ -59,6 +117,35 @@ use super::params::{
 /// [`HtsError`] (400 when `system`/`code` are missing, 404 when the code is
 /// not found, 501 when `expression` is supplied).
 async fn process_lookup<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Value, HtsError> {
+    // ── Handler-level response cache ─────────────────────────────────────────
+    // Skips supplement resolution, the backend `lookup` call, the
+    // `code_system_language` lookup, and FHIR Parameters assembly when the
+    // same canonical params have produced a response earlier in this
+    // AppState's lifetime.  Cleared on every bundle import / CRUD write via
+    // `clear_expand_cache`. LK01-04 hot path: each of 2 000 distinct codes is
+    // hit ~hundreds of times by 50 VUs over a 30 s run, so the warm-hit ratio
+    // is overwhelmingly favourable.
+    let cache_key = build_lookup_cache_key(&params);
+    if let Some(ref key) = cache_key {
+        if let Some(cached) = lookup_cache_get(&state.lookup_handler_cache, key) {
+            return Ok((*cached).clone());
+        }
+    }
+    let result = process_lookup_inner(state, params).await;
+    if let (Ok(value), Some(key)) = (&result, cache_key) {
+        lookup_cache_put(
+            &state.lookup_handler_cache,
+            key,
+            Arc::new(value.clone()),
+        );
+    }
+    result
+}
+
+async fn process_lookup_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
