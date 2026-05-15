@@ -193,6 +193,44 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             {
                 Ok((vs_id, compose_json)) => {
                     compose_is_enumerated = compose_is_enumerated_json(compose_json.as_deref());
+
+                    // ── Iter 7c: pure-extensional fast path ────────────────────
+                    // For VSAC ValueSets (compose.include[].concept[] lists with
+                    // embedded display, no filter[], no valueSet[] refs), the
+                    // expansion is in the JSON. Skip compute_expansion's full
+                    // materialisation and the populate_cache UNNEST transaction
+                    // — slice the requested page in memory. Mirrors SQLite's
+                    // `compose_page_fast` (backends/sqlite/value_set.rs:5285).
+                    //
+                    // Only fires when the caller bounded the request via count,
+                    // matches SQLite's call site, and skips when version pins
+                    // would change the result (those fall through to the
+                    // existing OnceCell + compute_expansion path below).
+                    if let Some(count) = req.count.filter(|&c| c > 0) {
+                        if req.force_system_versions.is_empty()
+                            && req.system_version_defaults.is_empty()
+                            && req.default_value_set_versions.is_empty()
+                        {
+                            let page_offset = req.offset.unwrap_or(0) as usize;
+                            if let Some((page, total)) = compose_page_fast_pg(
+                                &client,
+                                compose_json.as_deref(),
+                                page_offset,
+                                count as usize,
+                                req.filter.as_deref(),
+                            )
+                            .await?
+                            {
+                                return Ok(ExpandResponse {
+                                    total: Some(total),
+                                    offset: req.offset,
+                                    contains: page,
+                                    warnings: vec![],
+                                });
+                            }
+                        }
+                    }
+
                     // Bypass the value_set_expansions cache when the compose
                     // describes a multi-version overload — its PRIMARY KEY
                     // (vs_id, system_url, code) silently dedupes the second
@@ -364,6 +402,40 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             if let Some(compose_val) = compose {
                 compose_is_enumerated = compose_is_enumerated_value(compose_val);
                 let compose_str = compose_val.to_string();
+
+                // ── Iter 7c: pure-extensional fast path (inline VS) ────────
+                // Same shape as the URL-resolved branch: bypass
+                // compute_expansion's full materialisation when the inline
+                // compose body is purely extensional and the caller is
+                // paginating. Skipped when tx_resources are present (those
+                // can reference resources that change the semantics).
+                if let Some(count) = req.count.filter(|&c| c > 0) {
+                    if req.force_system_versions.is_empty()
+                        && req.system_version_defaults.is_empty()
+                        && req.default_value_set_versions.is_empty()
+                        && req.tx_resources.is_empty()
+                        && contained_vec.is_empty()
+                    {
+                        let page_offset = req.offset.unwrap_or(0) as usize;
+                        if let Some((page, total)) = compose_page_fast_pg(
+                            &client,
+                            Some(&compose_str),
+                            page_offset,
+                            count as usize,
+                            req.filter.as_deref(),
+                        )
+                        .await?
+                        {
+                            return Ok(ExpandResponse {
+                                total: Some(total),
+                                offset: req.offset,
+                                contains: page,
+                                warnings: vec![],
+                            });
+                        }
+                    }
+                }
+
                 // Single-flight inline-compose cache — EX02/05/06/07/08 POST
                 // identical inline composes per pool entry. The OnceCell
                 // collapses simultaneous misses onto one compute; warm-hit
@@ -4377,6 +4449,170 @@ fn build_implicit_compose_value(cs_url: &str, pattern: &FhirVsPattern) -> serde_
 }
 
 /// Apply the `max_expansion_size` guardrail to a freshly-computed code list.
+/// Cold-page fast path for purely extensional ValueSets.
+///
+/// When a `compose` only carries `include[].concept[]` lists (no `filter[]`,
+/// no nested `valueSet[]` refs), the expansion is just a flat list of
+/// (system, code, display) triples already present in the JSON. We parse the
+/// compose body, apply optional `exclude[]` and the request `filter`, then
+/// slice the requested page — all in memory, no DB I/O.
+///
+/// This is the EX04 hot path. VSAC ValueSets are extensional with ~5 000
+/// codes plus embedded `display` per concept, and PG's `compute_expansion`
+/// previously took 10-30 s to materialise the full list and a `populate_cache`
+/// transaction on every cold-miss. The fast path is ~1 ms.
+///
+/// Mirrors `backends/sqlite/value_set.rs:compose_page_fast`. Returns `None`
+/// (caller falls through to `compute_expansion`) when:
+/// * any include has a non-empty `filter[]` (intensional — needs SQL filter),
+/// * any include has a non-empty `valueSet[]` ref (needs recursive expand),
+/// * any include has no `concept[]` (also intensional — implicit "all codes"),
+/// * the compose JSON fails to parse.
+///
+/// `client` is used for the rare display fallback: when an extensional
+/// `include[].concept` entry has no embedded `display` but the (system, code)
+/// row exists in the local `concepts` table. VSAC URLs always embed display,
+/// so the typical fast path makes zero DB calls.
+async fn compose_page_fast_pg(
+    client: &tokio_postgres::Client,
+    compose_json: Option<&str>,
+    offset: usize,
+    limit: usize,
+    filter: Option<&str>,
+) -> Result<Option<(Vec<ExpansionContains>, u32)>, HtsError> {
+    let compose: serde_json::Value = match compose_json {
+        Some(s) => match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+
+    let includes = match compose["include"].as_array() {
+        Some(a) if !a.is_empty() => a,
+        _ => return Ok(None),
+    };
+
+    // Bail on anything that needs a real expansion engine.
+    for inc in includes {
+        if inc["concept"].as_array().is_none() {
+            return Ok(None);
+        }
+        if inc["filter"].as_array().is_some_and(|f| !f.is_empty()) {
+            return Ok(None);
+        }
+        if inc["valueSet"].as_array().is_some_and(|v| !v.is_empty()) {
+            return Ok(None);
+        }
+    }
+
+    // Collect (system_url, code, embedded_display) triples in compose order.
+    let mut all_triples: Vec<(String, String, Option<String>)> = Vec::new();
+    for inc in includes {
+        let system_url = match inc["system"].as_str() {
+            Some(s) if !s.is_empty() => s.to_owned(),
+            _ => continue,
+        };
+        if let Some(concepts) = inc["concept"].as_array() {
+            for c in concepts {
+                if let Some(code) = c["code"].as_str() {
+                    let display = c["display"].as_str().map(|s| s.to_owned());
+                    all_triples.push((system_url.clone(), code.to_owned(), display));
+                }
+            }
+        }
+    }
+
+    // Apply exclusions (pure code-based, no DB).
+    if let Some(excl) = compose["exclude"].as_array() {
+        if !excl.is_empty() {
+            let mut exclude_set: HashSet<(String, String)> = HashSet::new();
+            for exc in excl {
+                let sys = exc["system"].as_str().unwrap_or("").to_owned();
+                if let Some(concepts) = exc["concept"].as_array() {
+                    for c in concepts {
+                        if let Some(code) = c["code"].as_str() {
+                            exclude_set.insert((sys.clone(), code.to_owned()));
+                        }
+                    }
+                }
+            }
+            all_triples
+                .retain(|(sys, code, _)| !exclude_set.contains(&(sys.clone(), code.clone())));
+        }
+    }
+
+    // Apply text filter against compose-embedded code and display — pure
+    // in-memory, no DB required. Mirrors the SQLite path's behaviour for
+    // VSAC ValueSets that the local DB doesn't carry every code for.
+    if let Some(f) = filter {
+        let lower = f.to_lowercase();
+        all_triples.retain(|(_, code, display)| {
+            code.to_lowercase().contains(&lower)
+                || display
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(&lower))
+                    .unwrap_or(false)
+        });
+    }
+
+    let total = all_triples.len() as u32;
+
+    // Paginate.
+    let page_triples: Vec<(String, String, Option<String>)> =
+        all_triples.into_iter().skip(offset).take(limit).collect();
+
+    if page_triples.is_empty() {
+        return Ok(Some((vec![], total)));
+    }
+
+    // Build result. Use the compose-embedded display when present; only fall
+    // back to a DB lookup when the compose entry omitted it (rare for VSAC).
+    let mut result = Vec::with_capacity(page_triples.len());
+    let mut system_id_cache: HashMap<String, Option<String>> = HashMap::new();
+
+    for (system_url, code, embedded_display) in &page_triples {
+        let display = if embedded_display.is_some() {
+            embedded_display.clone()
+        } else {
+            let system_id = if let Some(sid) = system_id_cache.get(system_url) {
+                sid.clone()
+            } else {
+                let sid = resolve_system_id_pg(client, system_url).await?;
+                system_id_cache.insert(system_url.clone(), sid.clone());
+                sid
+            };
+            if let Some(sid) = system_id {
+                client
+                    .query_opt(
+                        "SELECT display FROM concepts WHERE system_id = $1 AND code = $2",
+                        &[&sid, &code],
+                    )
+                    .await
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .and_then(|r| r.get::<_, Option<String>>(0))
+            } else {
+                None
+            }
+        };
+
+        result.push(ExpansionContains {
+            system: system_url.clone(),
+            version: None,
+            code: code.clone(),
+            display,
+            is_abstract: None,
+            inactive: None,
+            designations: vec![],
+            properties: vec![],
+            extensions: vec![],
+            contains: vec![],
+        });
+    }
+
+    Ok(Some((result, total)))
+}
+
 /// Only fires when `cap_enforced` (i.e. `req.count.is_none()` — see
 /// `expand()` for why count-bounded requests skip the cap to match SQLite's
 /// behaviour). `implicit` toggles the diagnostic message phrasing to match
