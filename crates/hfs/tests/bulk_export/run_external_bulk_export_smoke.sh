@@ -224,7 +224,7 @@ kickoff_get() {
     "$BASE_URL$path")"
   expect_status "$status" "202" "$label kickoff" "$response"
   local content_location
-  content_location="$(awk 'BEGIN{IGNORECASE=1} /^Content-Location:/ {sub(/\r$/, "", $0); sub(/^[^:]+:[[:space:]]*/, "", $0); print; exit}' "$headers")"
+  content_location="$(grep -i '^content-location:' "$headers" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')"
   if [ -z "$content_location" ]; then
     fail "$label kickoff did not return Content-Location"
   fi
@@ -249,7 +249,7 @@ EOF
     --data-binary @"$body")"
   expect_status "$status" "202" "$label kickoff" "$response"
   local content_location
-  content_location="$(awk 'BEGIN{IGNORECASE=1} /^Content-Location:/ {sub(/\r$/, "", $0); sub(/^[^:]+:[[:space:]]*/, "", $0); print; exit}' "$headers")"
+  content_location="$(grep -i '^content-location:' "$headers" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')"
   if [ -z "$content_location" ]; then
     fail "$label kickoff did not return Content-Location"
   fi
@@ -307,7 +307,7 @@ expect_export_failure() {
   esac
 
   local status_url
-  status_url="$(awk 'BEGIN{IGNORECASE=1} /^Content-Location:/ {sub(/\r$/, "", $0); sub(/^[^:]+:[[:space:]]*/, "", $0); print; exit}' "$headers")"
+  status_url="$(grep -i '^content-location:' "$headers" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')"
   if [ -z "$status_url" ]; then
     fail "$label expected-negative kickoff returned 202 without Content-Location"
   fi
