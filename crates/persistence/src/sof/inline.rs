@@ -11,8 +11,6 @@
 //! the streaming task; once the response stream finishes, both drop and the
 //! database is freed.
 
-#![cfg(feature = "sqlite")]
-
 use std::sync::Arc;
 
 use serde_json::Value;
