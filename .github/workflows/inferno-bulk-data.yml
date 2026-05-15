@@ -1,7 +1,23 @@
 name: Inferno Bulk Data
 
-# Runs the Inferno Bulk Data Test Kit (Bulk Data IG v2.0.0) against HFS.
-# This is manual-only while the suite is being stabilized.
+# Runs the Inferno Bulk Data Test Kit (Bulk Data IG v2.0.0) against a
+# multi-instance HFS deployment (PostgreSQL + MinIO).
+#
+# This workflow is **manual only** (workflow_dispatch), matching the existing
+# inferno-us-core.yml / inferno-subscription.yml pattern. It is not run on
+# every push.
+#
+# Usage:
+#   GitHub Actions → "Inferno Bulk Data" → Run workflow.
+#
+# Pass/skip expectations: the core export groups (system / patient / group
+# kick-off, status polling, manifest validation, NDJSON validation, and SMART
+# Backend Services) MUST pass. Groups exercising deferred features
+# (`organizeOutputBy`, `includeAssociatedData`, `allowPartialManifests`,
+# `Prefer: separate-export-status`) are expected to skip or fail-as-known.
+#
+# The exact suite id and group identifiers must be read from the kit's
+# `lib/.../*_test_suite.rb` source — DO NOT hard-code a guessed id.
 
 on:
   workflow_dispatch:
