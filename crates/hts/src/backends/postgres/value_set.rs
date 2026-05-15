@@ -40,12 +40,6 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             ));
         }
 
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
-
         // The `max_expansion_size` cap is intended as a guardrail against
         // unbounded materialisation: when the caller has already bounded the
         // request via `count`, SQLite's expand skips the cap (see
@@ -55,6 +49,62 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         // 422 even though the caller only wanted a 10-200 code page. Gate the
         // check the same way SQLite does so a paginating client gets its page.
         let cap_enforced = req.count.is_none();
+
+        // ── Pool-free warm-hit fast path ─────────────────────────────────
+        // Check the in-memory inline_compose_cache before acquiring a pool
+        // connection. The bench's warm path (90%+ of requests once caches
+        // are populated) does not need DB access at all; holding a pool
+        // connection on warm-hit was the bottleneck causing EX01 to stay
+        // at 123 RPS in iter 4+5 even with full cache coverage.
+        let warm_cache_key: Option<u64> = if let Some(url) = req.url.as_deref() {
+            // URL-based: key is the same as the URL cold-miss path. Skip when
+            // hierarchical (those bypass the cache).
+            if req.hierarchical != Some(true) {
+                Some(build_url_cache_key(
+                    url,
+                    req.value_set_version.as_deref(),
+                    &req.force_system_versions,
+                    &req.system_version_defaults,
+                    &req.default_value_set_versions,
+                ))
+            } else {
+                None
+            }
+        } else if let Some(vs) = req.value_set.as_ref() {
+            // Inline VS: key is the same as the inline cold-miss path.
+            if req.hierarchical != Some(true) && req.tx_resources.is_empty() {
+                let compose_str_opt = vs.get("compose").map(|c| c.to_string());
+                let contained_vec: Vec<serde_json::Value> = vs
+                    .get("contained")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                compose_str_opt.map(|compose_str| {
+                    build_inline_cache_key(
+                        &compose_str,
+                        &req.force_system_versions,
+                        &req.system_version_defaults,
+                        &req.default_value_set_versions,
+                        &contained_vec,
+                    )
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(k) = warm_cache_key {
+            if let Some(arc) = cache_get_initialized(&self.inline_compose_cache, k) {
+                return Ok(serve_from_cached(&arc, &req));
+            }
+        }
+
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
         let mut compose_is_enumerated = false;
         let all_codes: Vec<ExpansionContains> = if let Some(url) = req.url.as_deref() {
@@ -4356,6 +4406,27 @@ fn enforce_cap(
         }
     }
     Ok(())
+}
+
+/// Fast-path cache read — looks up `key` under the HashMap's read lock and
+/// returns the cached `Arc<Vec<…>>` only when the cell exists AND has been
+/// fully initialized. Never creates a new cell. Used to skip pool
+/// acquisition on warm hits.
+///
+/// **Why this matters:** the bench dispatches 50 VUs at vu=50 against a
+/// 16-connection deadpool. Without this helper, `expand()` acquired a pool
+/// connection at the top of the function regardless of whether the cache
+/// would hit; 50 VUs would compete for 16 slots even when every request
+/// was a sub-millisecond warm hit. The iter-4+5 PG log shows EX01 was at
+/// 123 RPS even though the cache was fully populated — the bottleneck was
+/// pool contention on warm-hit, not compute.
+fn cache_get_initialized(
+    cache: &super::ComposeExpansionCache,
+    key: u64,
+) -> Option<std::sync::Arc<Vec<ExpansionContains>>> {
+    let g = cache.read().ok()?;
+    let cell = g.get(&key)?;
+    cell.get().cloned()
 }
 
 /// Fetch (or create) the `OnceCell` for `key`. Returns `None` if the cache
