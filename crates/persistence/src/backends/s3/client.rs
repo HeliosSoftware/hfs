@@ -117,7 +117,8 @@ pub trait S3Api: Send + Sync {
     ) -> Result<ObjectMetadata, S3ClientError>;
 
     /// Deletes the object at the given key. Succeeds even if the key does not
-    /// exist.
+    /// exist. Reserved for the Phase 2 `S3OutputStore` integration.
+    #[allow(dead_code)]
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3ClientError>;
 
     /// Lists objects whose keys start with `prefix`, with optional
@@ -129,6 +130,21 @@ pub trait S3Api: Send + Sync {
         continuation: Option<&str>,
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError>;
+
+    /// Generates a pre-signed `GET` URL for `key`, valid for `ttl`.
+    ///
+    /// The default implementation reports the capability as unsupported;
+    /// [`AwsS3Client`] overrides it using the AWS SDK presigner.
+    async fn presign_get(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _ttl: std::time::Duration,
+    ) -> Result<String, S3ClientError> {
+        Err(S3ClientError::Internal(
+            "pre-signed URLs are not supported by this S3 client".to_string(),
+        ))
+    }
 }
 
 /// Production `S3Api` implementation backed by the AWS SDK.
@@ -138,9 +154,12 @@ pub struct AwsS3Client {
     client: Client,
 }
 
+/// S3-compatible endpoint overrides for [`AwsS3Client`].
 #[derive(Debug, Clone, Default)]
 pub struct AwsS3ClientOptions {
+    /// Override the endpoint URL (for MinIO, R2, GCS interop, etc.).
     pub endpoint_url: Option<String>,
+    /// Force path-style addressing (`bucket` in path, not subdomain).
     pub force_path_style: bool,
 }
 
@@ -356,6 +375,25 @@ impl S3Api for AwsS3Client {
             items,
             next_continuation_token: out.next_continuation_token().map(|s| s.to_string()),
         })
+    }
+
+    async fn presign_get(
+        &self,
+        bucket: &str,
+        key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, S3ClientError> {
+        let presign_config = aws_sdk_s3::presigning::PresigningConfig::expires_in(ttl)
+            .map_err(|e| S3ClientError::Internal(format!("invalid presign TTL: {e}")))?;
+        let presigned = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .presigned(presign_config)
+            .await
+            .map_err(map_sdk_error)?;
+        Ok(presigned.uri().to_string())
     }
 }
 
