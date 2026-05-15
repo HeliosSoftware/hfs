@@ -392,6 +392,10 @@ pub enum BulkExportError {
     /// Too many concurrent exports.
     #[error("too many concurrent exports (maximum: {max_concurrent})")]
     TooManyConcurrentExports { max_concurrent: u32 },
+
+    /// The worker lease for this job was lost (reclaimed by another worker).
+    #[error("export job {job_id} lease lost (reclaimed by another worker)")]
+    LeaseLost { job_id: String },
 }
 
 /// Errors related to bulk submit operations.
