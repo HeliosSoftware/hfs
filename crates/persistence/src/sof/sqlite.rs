@@ -11,6 +11,7 @@
 //! full result set is read.  The blocking SQLite iteration runs in a dedicated
 //! `spawn_blocking` thread so it never stalls the async runtime.
 
+use helios_fhir::FhirVersion;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::ValueRef;
@@ -29,12 +30,25 @@ const CHANNEL_BUFFER: usize = 256;
 /// SQL-on-FHIR runner that compiles ViewDefinitions to SQLite SQL.
 pub struct SqliteInDbRunner {
     pool: Pool<SqliteConnectionManager>,
+    fhir_version: FhirVersion,
 }
 
 impl SqliteInDbRunner {
-    /// Creates a new runner backed by the given connection pool.
+    /// Creates a new runner backed by the given connection pool. Uses the
+    /// default FHIR version (R4) for compile-time cardinality lookups; call
+    /// [`Self::with_fhir_version`] to override.
     pub fn new(pool: Pool<SqliteConnectionManager>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            fhir_version: FhirVersion::default(),
+        }
+    }
+
+    /// Returns a runner that consults the given FHIR version's field-type
+    /// table when validating `collection: false` columns.
+    pub fn with_fhir_version(mut self, version: FhirVersion) -> Self {
+        self.fhir_version = version;
+        self
     }
 }
 
@@ -51,7 +65,11 @@ impl SofRunner for SqliteInDbRunner {
         filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
         // Compile synchronously (cheap, no I/O)
-        let compiled = compile_view_definition_dialect(&view_definition, SqlDialect::Sqlite)?;
+        let compiled = compile_view_definition_dialect(
+            &view_definition,
+            SqlDialect::Sqlite,
+            self.fhir_version,
+        )?;
 
         debug!(
             runner = "sqlite-indb",

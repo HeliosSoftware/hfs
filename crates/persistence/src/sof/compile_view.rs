@@ -16,6 +16,7 @@
 
 #![allow(missing_docs)] // Per-field docs land alongside their consumers in stages 4–5.
 
+use helios_fhir::FhirVersion;
 use helios_sof::ConstantValue;
 use serde_json::Value;
 
@@ -40,6 +41,7 @@ const FOREACH_ALIAS_PREFIX: &str = "fe";
 pub fn build_plan(
     view_json: &Value,
     dialect: &dyn super::dialect::Dialect,
+    fhir_version: FhirVersion,
 ) -> Result<(PlanNode, Vec<LitValue>), SofError> {
     let resource_type = view_json
         .get("resource")
@@ -64,7 +66,11 @@ pub fn build_plan(
         ));
     }
 
-    let mut env = CompileEnv::new(format!("{ROOT_ALIAS}.data"));
+    let mut env = CompileEnv::new_for_resource(
+        format!("{ROOT_ALIAS}.data"),
+        resource_type.clone(),
+        fhir_version,
+    );
     populate_constants(view_json, &mut env)?;
 
     // Top-level where filters apply to the resource row, before any unnest.
@@ -666,7 +672,9 @@ fn read_columns(
         // verify cardinality precisely, but a multi-Field path through
         // commonly-multi-valued FHIR root fields is a strong signal — reject
         // those at compile time so the validator/conformance test passes.
-        if collection_opt == Some(false) && path_likely_multi_valued(path) {
+        if collection_opt == Some(false)
+            && path_likely_multi_valued(path, &env.resource_type, env.fhir_version)
+        {
             return Err(SofError::InvalidViewDefinition(format!(
                 "column '{}' declares `collection: false` but path '{}' may yield \
                  multiple values; declare `collection: true` or pick a single element",
@@ -733,41 +741,69 @@ fn where_path_is_provably_non_boolean(path: &str) -> bool {
     !has_operator && !has_call && !has_bool_kw && trimmed.contains('.')
 }
 
-/// Heuristic: returns true when the FHIRPath source `path` likely yields
-/// multiple values per resource. Without FHIR schema knowledge this is a
-/// guess — a known-array root field followed by further navigation almost
-/// always returns a flattened collection. Used by the strict
-/// `collection: false` check to reject views the runtime would mishandle.
-fn path_likely_multi_valued(path: &str) -> bool {
-    // Known array-shaped root fields per the FHIR R4/R5 spec. Conservative
-    // list — only fields that are unambiguously `0..*` at the resource root.
-    const ARRAY_ROOTS: &[&str] = &[
-        "name",
-        "telecom",
-        "address",
-        "identifier",
-        "contact",
-        "communication",
-        "given",
-        "extension",
-        "modifierExtension",
-        "link",
-        "photo",
-        "qualification",
-        "endpoint",
-        "alias",
-        "type",
-        "category",
-    ];
+/// Returns true when the FHIRPath source `path` navigates *through* a
+/// collection-cardinality FHIR element. Used by the strict `collection: false`
+/// check to reject views the runtime would mishandle.
+///
+/// Uses the per-version `get_field_type` lookup tables generated from FHIR
+/// StructureDefinitions (see `helios_fhir::{r4,r4b,r5,r6}::FIELD_TYPES`). The
+/// walk only handles plain dot navigation — any segment containing `(`, `[`,
+/// or whitespace is treated as opaque and stops the walk (returning the
+/// accumulated result so far). This stays conservative: function calls like
+/// `.first()` or `.where(...)` may change cardinality in ways the lookup
+/// can't model, so we don't speculate past them.
+fn path_likely_multi_valued(path: &str, resource_type: &str, fhir_version: FhirVersion) -> bool {
     let trimmed = path.trim();
-    // Multi-Field paths through known array roots
-    if let Some(first_dot) = trimmed.find('.') {
-        let head = &trimmed[..first_dot];
-        if ARRAY_ROOTS.contains(&head) {
+    if trimmed.is_empty() || resource_type.is_empty() {
+        return false;
+    }
+    let mut parent = resource_type.to_string();
+    let mut segments = trimmed.split('.').peekable();
+    while let Some(seg) = segments.next() {
+        // Opaque segment (function call, indexer, anything non-trivial) —
+        // bail rather than guess.
+        if seg.is_empty() || seg.chars().any(|c| !c.is_ascii_alphanumeric()) {
+            return false;
+        }
+        let Some((field_type, is_collection)) = lookup_field_type(fhir_version, &parent, seg)
+        else {
+            return false;
+        };
+        // We only fail the column when the collection appears *before* the
+        // final segment — `path = "name"` (which yields the full list) is
+        // accepted because the column projection wraps it in a JSON array.
+        if is_collection && segments.peek().is_some() {
             return true;
         }
+        parent = field_type.to_string();
     }
     false
+}
+
+/// Dispatches to the per-version field-type table in `helios-fhir`. Returns
+/// `(field_type, is_collection)` when the `(parent_type, field_name)` pair
+/// is known.
+fn lookup_field_type(
+    version: FhirVersion,
+    parent_type: &str,
+    field_name: &str,
+) -> Option<(&'static str, bool)> {
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => helios_fhir::r4::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => helios_fhir::r4b::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => helios_fhir::r5::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => helios_fhir::r6::get_field_type(parent_type, field_name),
+        // The `FhirVersion` enum's variants are gated on `helios-fhir`'s own
+        // feature flags, which may not align with this crate's feature flags
+        // when an upstream consumer enables a version on `helios-fhir`
+        // directly. Fall back to "no info" rather than failing to compile.
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
 }
 
 /// Splits a forEach path source like `"name.where(use = X)"` into the base

@@ -14,6 +14,7 @@
 //! There is no in-process fallback — the REST handler maps these errors
 //! to `422 Unprocessable Entity`.
 
+use helios_fhir::FhirVersion;
 use serde_json::Value;
 
 use crate::core::sof_runner::SofError;
@@ -57,12 +58,17 @@ fn dialect_for(d: SqlDialect) -> Box<dyn Dialect> {
 
 /// Compiles a raw ViewDefinition JSON value into a [`CompiledQuery`] for SQLite.
 ///
-/// Shorthand for `compile_view_definition_dialect(view_json, SqlDialect::Sqlite)`.
+/// Shorthand for `compile_view_definition_dialect(view_json, SqlDialect::Sqlite,
+/// FhirVersion::default())`.
 pub fn compile_view_definition(view_json: &Value) -> Result<CompiledQuery, SofError> {
-    compile_view_definition_dialect(view_json, SqlDialect::Sqlite)
+    compile_view_definition_dialect(view_json, SqlDialect::Sqlite, FhirVersion::default())
 }
 
 /// Compiles a raw ViewDefinition JSON value into a [`CompiledQuery`] for the given dialect.
+///
+/// `fhir_version` controls which generated `get_field_type` lookup table the
+/// compile-time cardinality validator consults. Pass the configured server
+/// default when calling from a runner.
 ///
 /// # Errors
 ///
@@ -71,9 +77,10 @@ pub fn compile_view_definition(view_json: &Value) -> Result<CompiledQuery, SofEr
 pub fn compile_view_definition_dialect(
     view_json: &Value,
     dialect: SqlDialect,
+    fhir_version: FhirVersion,
 ) -> Result<CompiledQuery, SofError> {
     let dial = dialect_for(dialect);
-    let (plan, constants) = build_plan(view_json, dial.as_ref())?;
+    let (plan, constants) = build_plan(view_json, dial.as_ref(), fhir_version)?;
     let emitted = emit_plan(&plan, dial.as_ref())?;
     Ok(CompiledQuery {
         sql: emitted.sql,
@@ -364,7 +371,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn compile_pg(view: serde_json::Value) -> Result<CompiledQuery, SofError> {
-        compile_view_definition_dialect(&view, SqlDialect::Postgres)
+        compile_view_definition_dialect(&view, SqlDialect::Postgres, FhirVersion::default())
     }
 
     #[test]

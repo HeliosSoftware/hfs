@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 
+use helios_fhir::FhirVersion;
 use helios_fhirpath::parse_expression;
 use helios_fhirpath::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
 
@@ -59,6 +60,15 @@ pub struct CompileEnv {
     /// Distinct from the plan-level `AliasSeq` so expression-internal
     /// aliases never collide with `forEach` / `repeat` aliases.
     pub next_where_alias: usize,
+    /// Root FHIR resource type the ViewDefinition runs over (the
+    /// `ViewDefinition.resource` value). Used to seed per-segment field-type
+    /// lookups via `helios_fhir::*::get_field_type` — empty when the
+    /// compiler is invoked outside the ViewDefinition entry point (e.g.
+    /// expression-only unit tests).
+    pub resource_type: String,
+    /// FHIR version for the field-type lookup tables. Defaults to R4 when
+    /// the caller doesn't supply one.
+    pub fhir_version: FhirVersion,
 }
 
 /// A `ViewDefinition.constant[]` entry resolved to a typed value.
@@ -79,7 +89,23 @@ impl CompileEnv {
             param_bindings: Vec::new(),
             column_type_hint: None,
             next_where_alias: 0,
+            resource_type: String::new(),
+            fhir_version: FhirVersion::default(),
         }
+    }
+
+    /// Same as [`Self::new`] but seeds the FHIR resource type and version so
+    /// downstream cardinality checks can consult the per-version
+    /// `get_field_type` tables.
+    pub fn new_for_resource(
+        root_alias: impl Into<String>,
+        resource_type: impl Into<String>,
+        fhir_version: FhirVersion,
+    ) -> Self {
+        let mut env = Self::new(root_alias);
+        env.resource_type = resource_type.into();
+        env.fhir_version = fhir_version;
+        env
     }
 }
 

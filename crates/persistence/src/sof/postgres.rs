@@ -14,6 +14,7 @@
 
 use deadpool_postgres::Pool;
 use futures::StreamExt as _;
+use helios_fhir::FhirVersion;
 use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
@@ -29,12 +30,25 @@ const CHANNEL_BUFFER: usize = 256;
 /// SQL-on-FHIR runner that compiles ViewDefinitions to PostgreSQL SQL.
 pub struct PgInDbRunner {
     pool: Pool,
+    fhir_version: FhirVersion,
 }
 
 impl PgInDbRunner {
-    /// Creates a new runner backed by the given connection pool.
+    /// Creates a new runner backed by the given connection pool. Uses the
+    /// default FHIR version (R4) for compile-time cardinality lookups; call
+    /// [`Self::with_fhir_version`] to override.
     pub fn new(pool: Pool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            fhir_version: FhirVersion::default(),
+        }
+    }
+
+    /// Returns a runner that consults the given FHIR version's field-type
+    /// table when validating `collection: false` columns.
+    pub fn with_fhir_version(mut self, version: FhirVersion) -> Self {
+        self.fhir_version = version;
+        self
     }
 }
 
@@ -51,7 +65,11 @@ impl SofRunner for PgInDbRunner {
         filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
         // Compile synchronously (cheap, no I/O)
-        let compiled = compile_view_definition_dialect(&view_definition, SqlDialect::Postgres)?;
+        let compiled = compile_view_definition_dialect(
+            &view_definition,
+            SqlDialect::Postgres,
+            self.fhir_version,
+        )?;
 
         debug!(
             runner = "postgres-indb",
