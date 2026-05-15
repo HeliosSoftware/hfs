@@ -2825,4 +2825,162 @@ mod postgres_integration {
             .unwrap();
         assert_eq!(ids, vec!["p1".to_string()]);
     }
+
+    // ========================================================================
+    // Bulk Export — Phase 2 multi-instance job state on Postgres.
+    // ========================================================================
+
+    use chrono::Utc;
+    use helios_persistence::core::bulk_export::{
+        BulkExportStorage, ExportRequest, ExportStatus, StartExportInput, TypeExportProgress,
+    };
+    use helios_persistence::core::bulk_export_worker::{
+        ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId,
+    };
+    use std::time::Duration as StdDuration;
+
+    fn export_input(request: ExportRequest) -> StartExportInput {
+        StartExportInput {
+            request,
+            transaction_time: Utc::now(),
+            request_url: "http://localhost/$export".to_string(),
+            owner_subject: Some("pg-test".to_string()),
+            fhir_version: FhirVersion::default(),
+        }
+    }
+
+    /// Claims jobs in a loop until the lease for `target` is returned;
+    /// releases any other jobs claimed along the way. Robust to concurrent
+    /// tests sharing the testcontainers PostgreSQL instance.
+    async fn claim_specific(
+        backend: &helios_persistence::backends::postgres::PostgresBackend,
+        worker_id: &WorkerId,
+        target: &helios_persistence::core::bulk_export::ExportJobId,
+        lease_duration: StdDuration,
+    ) -> helios_persistence::core::bulk_export_worker::ExportJobLease {
+        for _ in 0..100 {
+            match backend.claim_next(worker_id, lease_duration).await.unwrap() {
+                Some(lease) if &lease.job_id == target => return lease,
+                Some(other) => {
+                    // Drain other tests' jobs out of the queue by completing
+                    // them (so the claim ordering moves on instead of
+                    // looping back to the same job after `release`).
+                    let _ = backend
+                        .finish_export_job(
+                            &other.tenant,
+                            &other.job_id,
+                            &other.worker_id,
+                            other.fencing_token,
+                        )
+                        .await;
+                }
+                None => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+        panic!("never claimed the expected job");
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_export_claim_skip_locked() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-claim");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker_a = WorkerId::new(format!("pg-worker-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_secs(60)).await;
+        assert!(lease_a.fencing_token >= 1);
+
+        // Worker A finishes via the fenced ExportWorkerStorage.
+        backend
+            .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+            .await
+            .unwrap();
+        backend
+            .update_export_type_progress(
+                &tenant,
+                &job_id,
+                &worker_a,
+                lease_a.fencing_token,
+                &TypeExportProgress::new("Patient"),
+            )
+            .await
+            .unwrap();
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+            .await
+            .unwrap();
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_export_stale_worker_fenced_out() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-fence");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Worker A takes a very short lease, then Worker B reclaims.
+        let worker_a = WorkerId::new(format!("pg-stale-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_millis(1)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_b = WorkerId::new(format!("pg-stale-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+
+        // Worker A is fenced out from every mutation.
+        assert!(matches!(
+            backend
+                .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+        assert!(matches!(
+            backend
+                .finish_export_job(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        // Worker B can still finish.
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_export_count_active_and_expire() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-cleanup");
+
+        for _ in 0..2 {
+            backend
+                .start_export(&tenant, export_input(ExportRequest::system()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(backend.count_active_exports(&tenant).await.unwrap(), 2);
+
+        // Nothing is expired yet.
+        let expired_now = backend
+            .list_expired_exports(Utc::now(), StdDuration::from_secs(3600), 100)
+            .await
+            .unwrap();
+        // Only completed/error/cancelled jobs can expire — these are accepted.
+        assert!(expired_now.is_empty());
+    }
 }
