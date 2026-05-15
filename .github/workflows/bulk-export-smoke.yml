@@ -1,0 +1,436 @@
+name: HFS Bulk Export External Smoke
+
+# Manual external smoke coverage for HFS Bulk Data Export. This is intentionally
+# separate from Inferno: it validates HFS-owned end-to-end behavior with real
+# backing services, while Inferno remains the conformance suite.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+
+jobs:
+  matrix-setup:
+    name: Generate matrix
+    runs-on: [self-hosted, Linux]
+    outputs:
+      smoke-matrix: ${{ steps.gen.outputs.smoke-matrix }}
+    steps:
+      - id: gen
+        run: |
+          FHIR_VERSIONS='["R4","R4B","R5"]'
+          ROWS='[
+            {"backend":"sqlite","bulk_mode":"embedded-local","expectation":"full"},
+            {"backend":"sqlite","bulk_mode":"postgres-s3","expectation":"full"},
+            {"backend":"postgres","bulk_mode":"embedded-local","expectation":"full"},
+            {"backend":"postgres","bulk_mode":"postgres-s3","expectation":"full"},
+            {"backend":"sqlite-elasticsearch","bulk_mode":"embedded-local","expectation":"endpoint-unavailable"},
+            {"backend":"sqlite-elasticsearch","bulk_mode":"postgres-s3","expectation":"endpoint-unavailable"},
+            {"backend":"postgres-elasticsearch","bulk_mode":"embedded-local","expectation":"endpoint-unavailable"},
+            {"backend":"postgres-elasticsearch","bulk_mode":"postgres-s3","expectation":"endpoint-unavailable"},
+            {"backend":"mongodb","bulk_mode":"postgres-s3","expectation":"unsupported"},
+            {"backend":"mongodb-elasticsearch","bulk_mode":"postgres-s3","expectation":"endpoint-unavailable"},
+            {"backend":"s3","bulk_mode":"postgres-s3","expectation":"endpoint-unavailable"},
+            {"backend":"s3-elasticsearch","bulk_mode":"postgres-s3","expectation":"endpoint-unavailable"}
+          ]'
+
+          MATRIX=$(jq -c --argjson versions "$FHIR_VERSIONS" \
+            '[.[] as $row | $versions[] as $version | $row + {fhir_version: $version}]' \
+            <<<"$ROWS")
+          echo "smoke-matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Smoke matrix: $(jq 'length' <<<"$MATRIX") jobs"
+
+  build:
+    name: Build HFS for bulk export smoke
+    needs: matrix-setup
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Build HFS binary
+        run: |
+          cargo build -p helios-hfs --no-default-features \
+            --features R4,R4B,R5,sqlite,elasticsearch,postgres,mongodb,s3
+
+      - name: Upload HFS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-bulk-export-smoke-binary
+          path: target/debug/hfs
+          retention-days: 1
+
+  bulk-export-smoke:
+    name: Smoke (${{ matrix.fhir_version }} / ${{ matrix.backend }} / ${{ matrix.bulk_mode }})
+    needs: [matrix-setup, build]
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.matrix-setup.outputs.smoke-matrix) }}
+    env:
+      RESULTS_DIR: bulk-export-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}/${{ matrix.bulk_mode }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-bulk-export-smoke-binary
+          path: target/debug
+
+      - name: Make executables available
+        run: |
+          chmod +x target/debug/hfs
+          chmod +x crates/hfs/tests/bulk_export/run_external_bulk_export_smoke.sh
+
+      - name: Determine runner and Docker host IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      - name: Start Elasticsearch
+        if: contains(matrix.backend, 'elasticsearch')
+        run: |
+          ES_CONTAINER="es-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}"
+          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$ES_CONTAINER" -p 0:9200 \
+            -e "discovery.type=single-node" \
+            -e "xpack.security.enabled=false" \
+            -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+            elasticsearch:8.15.0
+          echo "ES_CONTAINER=$ES_CONTAINER" >> "$GITHUB_ENV"
+
+          for i in {1..30}; do
+            ES_PORT=$(docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$ES_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" >/dev/null 2>&1; then
+              echo "ES_PORT=$ES_PORT" >> "$GITHUB_ENV"
+              echo "Elasticsearch is ready on port $ES_PORT"
+              exit 0
+            fi
+            echo "Attempt $i/30: Elasticsearch not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$ES_CONTAINER"
+          exit 1
+
+      - name: Start PostgreSQL
+        if: contains(matrix.backend, 'postgres') || matrix.bulk_mode == 'postgres-s3'
+        run: |
+          PG_CONTAINER="pg-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}"
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PG_CONTAINER" -p 0:5432 \
+            -e POSTGRES_USER=helios \
+            -e POSTGRES_PASSWORD=helios \
+            -e POSTGRES_DB=helios \
+            postgres:16
+          echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+
+          for i in {1..30}; do
+            if docker exec "$PG_CONTAINER" pg_isready -U helios >/dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
+                echo "PG_URL=postgresql://helios:helios@$DOCKER_HOST_IP:$PG_PORT/helios" >> "$GITHUB_ENV"
+                echo "PostgreSQL is ready on port $PG_PORT"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: PostgreSQL not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$PG_CONTAINER"
+          exit 1
+
+      - name: Start MongoDB replica set
+        if: contains(matrix.backend, 'mongodb')
+        run: |
+          MONGO_CONTAINER="mongo-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}"
+          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7 \
+            --replSet rs0 --bind_ip_all
+          echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
+
+          for i in {1..30}; do
+            MONGO_PORT=$(docker port "$MONGO_CONTAINER" 27017 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$MONGO_PORT" ]; then
+              if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]})' >/dev/null 2>&1 || true; then
+                if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'db.hello().isWritablePrimary' | grep -q true; then
+                  echo "MONGO_PORT=$MONGO_PORT" >> "$GITHUB_ENV"
+                  echo "MongoDB replica set is ready on port $MONGO_PORT"
+                  exit 0
+                fi
+              fi
+            fi
+            echo "Attempt $i/30: MongoDB not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$MONGO_CONTAINER"
+          exit 1
+
+      - name: Start MinIO
+        if: matrix.bulk_mode == 'postgres-s3' || startsWith(matrix.backend, 's3')
+        run: |
+          MINIO_CONTAINER="minio-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}"
+          docker rm -f "$MINIO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MINIO_CONTAINER" -p 0:9000 -p 0:9001 \
+            -e MINIO_ROOT_USER=hfs-minio \
+            -e MINIO_ROOT_PASSWORD=hfs-minio-secret \
+            minio/minio:latest server /data --console-address ":9001"
+          echo "MINIO_CONTAINER=$MINIO_CONTAINER" >> "$GITHUB_ENV"
+
+          for i in {1..30}; do
+            MINIO_PORT=$(docker port "$MINIO_CONTAINER" 9000 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$MINIO_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$MINIO_PORT/minio/health/live" >/dev/null 2>&1; then
+              echo "MINIO_PORT=$MINIO_PORT" >> "$GITHUB_ENV"
+              echo "MINIO_ENDPOINT=http://$DOCKER_HOST_IP:$MINIO_PORT" >> "$GITHUB_ENV"
+              docker run --rm --network "container:$MINIO_CONTAINER" \
+                --entrypoint /bin/sh \
+                minio/mc:latest \
+                -c 'mc alias set local http://127.0.0.1:9000 hfs-minio hfs-minio-secret && mc mb -p local/hfs-export || true && mc mb -p local/hfs-primary || true'
+              echo "MinIO is ready on port $MINIO_PORT"
+              exit 0
+            fi
+            echo "Attempt $i/30: MinIO not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$MINIO_CONTAINER"
+          exit 1
+
+      - name: Start HFS server
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          HFS_PORT=$((18100 + ${{ strategy['job-index'] }}))
+          HFS_LOG="$RESULTS_DIR/hfs.log"
+          echo "HFS_PORT=$HFS_PORT" >> "$GITHUB_ENV"
+          echo "HFS_LOG=$HFS_LOG" >> "$GITHUB_ENV"
+
+          COMMON_ENV=(
+            HFS_BASE_URL="http://localhost:$HFS_PORT"
+            HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}"
+            HFS_BULK_EXPORT_ENABLED=true
+            HFS_BULK_EXPORT_BATCH_SIZE=1
+            HFS_BULK_EXPORT_FILE_URL_TTL=3600
+            HFS_BULK_EXPORT_OUTPUT_TTL=3600
+            AWS_ACCESS_KEY_ID=hfs-minio
+            AWS_SECRET_ACCESS_KEY=hfs-minio-secret
+            AWS_REGION=us-east-1
+          )
+
+          BULK_ENV=()
+          if [ "${{ matrix.bulk_mode }}" = "embedded-local" ]; then
+            BULK_ENV=(
+              HFS_BULK_EXPORT_BACKEND=embedded
+              HFS_BULK_EXPORT_OUTPUT_BACKEND=local-fs
+              HFS_BULK_EXPORT_OUTPUT_DIR="$RESULTS_DIR/export-output"
+              HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=true
+            )
+            echo "EXPECT_REQUIRES_ACCESS_TOKEN=true" >> "$GITHUB_ENV"
+          else
+            BULK_ENV=(
+              HFS_BULK_EXPORT_BACKEND=postgres-s3
+              HFS_BULK_EXPORT_DATABASE_URL="${PG_URL:-}"
+              HFS_BULK_EXPORT_OUTPUT_BACKEND=s3
+              HFS_BULK_EXPORT_S3_BUCKET=hfs-export
+              HFS_BULK_EXPORT_S3_ENDPOINT="${MINIO_ENDPOINT:-}"
+              HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE=true
+              HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=false
+            )
+            echo "EXPECT_REQUIRES_ACCESS_TOKEN=false" >> "$GITHUB_ENV"
+          fi
+
+          case "${{ matrix.backend }}" in
+            sqlite)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=sqlite \
+                ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            sqlite-elasticsearch)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=sqlite-elasticsearch \
+                HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+                ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            postgres)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=postgres \
+                HFS_DATABASE_URL="$PG_URL" \
+                HFS_PG_HOST="$DOCKER_HOST_IP" \
+                HFS_PG_PORT="$PG_PORT" \
+                HFS_PG_DBNAME=helios \
+                HFS_PG_USER=helios \
+                HFS_PG_PASSWORD=helios \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            postgres-elasticsearch)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=postgres-elasticsearch \
+                HFS_DATABASE_URL="$PG_URL" \
+                HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            mongodb)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=mongodb \
+                HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+                HFS_MONGODB_DATABASE="helios_bulk_export_smoke_${{ github.run_id }}_${{ github.run_attempt }}_${{ strategy['job-index'] }}" \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            mongodb-elasticsearch)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=mongodb-elasticsearch \
+                HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+                HFS_MONGODB_DATABASE="helios_bulk_export_smoke_${{ github.run_id }}_${{ github.run_attempt }}_${{ strategy['job-index'] }}" \
+                HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            s3)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=s3 \
+                HFS_S3_BUCKET=hfs-primary \
+                HFS_S3_PREFIX="ci/bulk-export-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ strategy['job-index'] }}/" \
+                HFS_S3_VALIDATE_BUCKETS=false \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            s3-elasticsearch)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=s3-elasticsearch \
+                HFS_S3_BUCKET=hfs-primary \
+                HFS_S3_PREFIX="ci/bulk-export-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ strategy['job-index'] }}/" \
+                HFS_S3_VALIDATE_BUCKETS=false \
+                HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+          esac
+
+          echo $! > /tmp/hfs-bulk-export-smoke-${{ strategy['job-index'] }}.pid
+          echo "HFS_PID=$(cat /tmp/hfs-bulk-export-smoke-${{ strategy['job-index'] }}.pid)" >> "$GITHUB_ENV"
+
+      - name: Wait for HFS to be ready
+        run: |
+          for i in {1..45}; do
+            if ! kill -0 "$HFS_PID" 2>/dev/null; then
+              echo "HFS process exited"
+              cat "$HFS_LOG"
+              exit 1
+            fi
+            if curl -sf "http://localhost:$HFS_PORT/health" >/dev/null 2>&1; then
+              echo "HFS is ready"
+              exit 0
+            fi
+            echo "Attempt $i/45: HFS not ready yet..."
+            sleep 2
+          done
+
+          tail -100 "$HFS_LOG"
+          exit 1
+
+      - name: Run bulk export smoke checks
+        run: |
+          BASE_URL="http://localhost:$HFS_PORT" \
+          FHIR_VERSION="${{ matrix.fhir_version }}" \
+          RESULTS_DIR="$RESULTS_DIR" \
+          SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}" \
+          BULK_EXPORT_EXPECTATION="${{ matrix.expectation }}" \
+          EXPECT_REQUIRES_ACCESS_TOKEN="$EXPECT_REQUIRES_ACCESS_TOKEN" \
+          ./crates/hfs/tests/bulk_export/run_external_bulk_export_smoke.sh
+
+      - name: Stop HFS gracefully
+        if: always()
+        run: |
+          if [ -n "${HFS_PID:-}" ] && kill -0 "$HFS_PID" 2>/dev/null; then
+            kill -INT "$HFS_PID" 2>/dev/null || true
+            for _ in {1..50}; do
+              if kill -0 "$HFS_PID" 2>/dev/null; then
+                sleep 0.2
+              else
+                break
+              fi
+            done
+            kill -9 "$HFS_PID" 2>/dev/null || true
+          fi
+          rm -f /tmp/hfs-bulk-export-smoke-${{ strategy['job-index'] }}.pid
+
+      - name: Collect backend container logs
+        if: always()
+        run: |
+          mkdir -p "$RESULTS_DIR/backend-logs"
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker logs "$ES_CONTAINER" > "$RESULTS_DIR/backend-logs/elasticsearch.log" 2>&1 || true
+          fi
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker logs "$PG_CONTAINER" > "$RESULTS_DIR/backend-logs/postgres.log" 2>&1 || true
+          fi
+          if [ -n "${MONGO_CONTAINER:-}" ]; then
+            docker logs "$MONGO_CONTAINER" > "$RESULTS_DIR/backend-logs/mongodb.log" 2>&1 || true
+          fi
+          if [ -n "${MINIO_CONTAINER:-}" ]; then
+            docker logs "$MINIO_CONTAINER" > "$RESULTS_DIR/backend-logs/minio.log" 2>&1 || true
+          fi
+
+      - name: Append smoke report to summary
+        if: always()
+        run: |
+          if [ -f "$RESULTS_DIR/summary.md" ]; then
+            cat "$RESULTS_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Bulk Export Smoke" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No summary produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload bulk export smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bulk-export-smoke-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bulk-export-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}/${{ matrix.bulk_mode }}/
+          retention-days: 30
+
+      - name: Cleanup containers
+        if: always()
+        run: |
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${MONGO_CONTAINER:-}" ]; then
+            docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${MINIO_CONTAINER:-}" ]; then
+            docker rm -f "$MINIO_CONTAINER" 2>/dev/null || true
+          fi
