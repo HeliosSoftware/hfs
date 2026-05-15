@@ -79,7 +79,7 @@ pub fn not_function(
         FhirVersion::R4 => true,
         #[cfg(feature = "R4B")]
         FhirVersion::R4B => true,
-        #[cfg(any(feature = "R5", feature = "R6"))]
+        #[allow(unreachable_patterns)]
         _ => false,
     };
     let base_as_logic_bool = invocation_base.to_boolean_for_logic_with_r4_compat(r4_compat)?;
@@ -89,8 +89,8 @@ pub fn not_function(
     // not(false) -> true
     // not({}) -> {}
     match base_as_logic_bool {
-        EvaluationResult::Boolean(true, _) => Ok(EvaluationResult::boolean(false)),
-        EvaluationResult::Boolean(false, _) => Ok(EvaluationResult::boolean(true)),
+        EvaluationResult::Boolean(true, _, _) => Ok(EvaluationResult::boolean(false)),
+        EvaluationResult::Boolean(false, _, _) => Ok(EvaluationResult::boolean(true)),
         EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         _ => unreachable!("to_boolean_for_logic should only return Boolean or Empty on Ok"),
     }

@@ -49,6 +49,93 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+/// Audit event helpers for bulk export operations.
+#[cfg(feature = "audit")]
+pub mod audit {
+    use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
+
+    use super::ExportLevel;
+
+    /// Record an audit event for a bulk export lifecycle event.
+    ///
+    /// Call this at export start, completion, cancellation, or failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_export_event(
+        sink: &dyn AuditSink,
+        source_observer: &str,
+        agent: Option<&str>,
+        job_id: &str,
+        level: &ExportLevel,
+        resource_types: &[String],
+        outcome: &str,
+        outcome_desc: Option<&str>,
+    ) {
+        let mut builder = AuditEventBuilder::new(source_observer)
+            .event_type(
+                "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                "object",
+            )
+            .action(AuditAction::Execute)
+            .outcome(outcome)
+            .detail("audit-operation", "bulk-export")
+            .detail("job-id", job_id)
+            .detail("export-level", level.to_string());
+        if !resource_types.is_empty() {
+            builder = builder.detail("resource-types", resource_types.join(","));
+        }
+        if let Some(a) = agent {
+            builder = builder.agent(a, None, true);
+        }
+        if let Some(d) = outcome_desc {
+            builder = builder.outcome_desc(d);
+        }
+        sink.record(builder.build()).await;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use helios_audit::sinks::NullSink;
+
+        use super::*;
+        use crate::core::bulk_export::ExportLevel;
+
+        #[tokio::test]
+        async fn test_export_event_has_job_id() {
+            let sink = NullSink;
+            record_export_event(
+                &sink,
+                "Device/hfs",
+                Some("Practitioner/dr-1"),
+                "job-abc",
+                &ExportLevel::System,
+                &["Patient".to_string()],
+                "0",
+                None,
+            )
+            .await;
+            // NullSink discards; we verify it doesn't panic and compiles correctly
+        }
+
+        #[test]
+        fn test_export_event_type_is_object_for_bulk_export() {
+            let event = AuditEventBuilder::new("Device/hfs")
+                .event_type(
+                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                    "object",
+                )
+                .action(AuditAction::Execute)
+                .outcome("0")
+                .detail("audit-operation", "bulk-export")
+                .detail("job-id", "j1")
+                .build();
+            assert_eq!(
+                event.r#type.code.as_ref().and_then(|c| c.value.as_deref()),
+                Some("object")
+            );
+        }
+    }
+}
+
 use crate::error::StorageResult;
 use crate::tenant::TenantContext;
 

@@ -923,6 +923,41 @@ impl SearchProvider for CompositeStorage {
             }))
         }
     }
+
+    fn search_param_registry(
+        &self,
+    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        // Same routing as `search`: prefer the dedicated Search backend's
+        // registry, fall back to primary, otherwise an empty registry. The
+        // returned reference outlives `&self` because both providers are
+        // owned by `self.search_providers` for the lifetime of the composite.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.search_param_registry();
+            }
+        }
+
+        if let Some(provider) = self
+            .search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+        {
+            return provider.search_param_registry();
+        }
+
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<
+            std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
+        > = OnceLock::new();
+        EMPTY.get_or_init(|| {
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::search::SearchParameterRegistry::new(),
+            ))
+        })
+    }
 }
 
 #[async_trait]
@@ -1472,30 +1507,65 @@ impl CompositeStorage {
     }
 
     /// Extracts references from a resource for a given search parameter.
+    ///
+    /// Resolution order:
+    /// 1. Look up the search parameter in the registry and evaluate its
+    ///    FHIRPath `expression` via `SearchParameterExtractor` — the canonical
+    ///    FHIR source of truth for every standard parameter and any custom
+    ///    parameter the user has registered.
+    /// 2. Fall back to the prior heuristic (look for the search-param name as
+    ///    a JSON field, plus a small alias map for `patient`/`subject`/etc.)
+    ///    only when the registry doesn't know about the parameter at all.
+    ///    That keeps unregistered custom parameters working as they did
+    ///    before this change.
     fn extract_references(&self, resource: &StoredResource, search_param: &str) -> Vec<String> {
         let content = resource.content();
-        let mut refs = Vec::new();
+        let resource_type = resource.resource_type();
 
-        // Simple extraction - looks for the search param as a field
-        // A real implementation would use FHIRPath or search parameter definitions
+        let registered = {
+            let registry = self.search_param_registry().read();
+            registry
+                .get_param(resource_type, search_param)
+                .or_else(|| registry.get_param("Resource", search_param))
+        };
+
+        if let Some(param_def) = registered {
+            let extractor = crate::search::SearchParameterExtractor::new(Arc::clone(
+                self.search_param_registry(),
+            ));
+            if let Ok(values) = extractor.extract_for_param(content, &param_def) {
+                // Trust the registry: if the param is registered, return what
+                // the FHIRPath expression yields (even if empty) rather than
+                // also running the heuristic — otherwise an _include against
+                // a resource that genuinely has no matching reference would
+                // accidentally match an unrelated JSON field with the same
+                // name.
+                return values
+                    .into_iter()
+                    .filter_map(|v| match v.value {
+                        crate::search::IndexValue::Reference { reference, .. } => Some(reference),
+                        _ => None,
+                    })
+                    .collect();
+            }
+        }
+
+        // Heuristic fallback for unregistered custom parameters.
+        let mut refs = Vec::new();
         if let Some(value) = content.get(search_param) {
             Self::extract_reference_values(value, &mut refs);
         }
-
-        // Also check common reference field names
-        let field_name = match search_param {
+        let alias = match search_param {
             "patient" | "subject" => Some("subject"),
             "encounter" => Some("encounter"),
             "performer" => Some("performer"),
             _ => None,
         };
-
-        if let Some(field) = field_name {
+        if let Some(field) = alias {
             if let Some(value) = content.get(field) {
                 Self::extract_reference_values(value, &mut refs);
             }
         }
-
         refs
     }
 
@@ -1570,21 +1640,7 @@ impl ChainedSearchProvider for CompositeStorage {
         chain: &str,
         value: &str,
     ) -> StorageResult<Vec<String>> {
-        // Chain resolution - delegate to graph backend if available
-        let graph_backend = self
-            .config
-            .backends_with_role(super::config::BackendRole::Graph)
-            .next();
-
-        if let Some(backend) = graph_backend {
-            if let Some(_provider) = self.search_providers.get(&backend.id) {
-                // Would need to downcast to ChainedSearchProvider
-                // For now, fall back to iterative resolution
-            }
-        }
-
-        // Fallback: iterative chain resolution
-        self.resolve_chain_iterative(tenant, base_type, chain, value)
+        self.resolve_chain_via_search(tenant, base_type, chain, value)
             .await
     }
 
@@ -1631,27 +1687,159 @@ impl ChainedSearchProvider for CompositeStorage {
 }
 
 impl CompositeStorage {
-    /// Resolves a chain iteratively.
-    async fn resolve_chain_iterative(
+    /// Resolves a forward chain by issuing iterative SearchQueries against
+    /// composite's regular search routing.
+    ///
+    /// For `Observation?subject.organization.name=Hospital`:
+    ///   1. Parse the chain via the registry: links = [(subject -> Patient),
+    ///      (organization -> Organization)], terminal = name.
+    ///   2. Search Organization for `name=Hospital` — collect refs.
+    ///   3. Search Patient for `organization=<refs>` — collect refs.
+    ///   4. Search Observation for `subject=<refs>` — return resource IDs.
+    ///
+    /// Each step issues exactly one SearchQuery, so the cost is proportional
+    /// to the chain depth, not the result-set fan-out (the inner backend
+    /// applies the multi-value `OR` semantics natively).
+    async fn resolve_chain_via_search(
         &self,
-        _tenant: &TenantContext,
-        _base_type: &str,
+        tenant: &TenantContext,
+        base_type: &str,
         chain: &str,
-        _value: &str,
+        value: &str,
     ) -> StorageResult<Vec<String>> {
-        // Parse chain: "patient.organization.name" -> ["patient", "organization", "name"]
-        let parts: Vec<&str> = chain.split('.').collect();
+        use crate::types::{SearchParameter, SearchQuery, SearchValue};
 
-        if parts.is_empty() {
+        let parts: Vec<&str> = chain.split('.').collect();
+        if parts.len() < 2 {
             return Ok(Vec::new());
         }
 
-        // This is a simplified implementation
-        // A full implementation would handle multiple chain segments
-        // and different parameter types
+        // Resolve target type per chain link from the registry. Mirrors
+        // chain_builder::resolve_target_type so composite agrees with SQLite
+        // and Postgres on ambiguous reference disambiguation.
+        let target_types: Vec<String> = {
+            let registry = self.search_param_registry().read();
+            let mut types = Vec::with_capacity(parts.len() - 1);
+            let mut current = base_type.to_string();
+            for ref_param in parts.iter().take(parts.len() - 1) {
+                let next = registry
+                    .get_param(&current, ref_param)
+                    .and_then(|def| {
+                        def.target.as_ref().and_then(|t| {
+                            if t.len() == 1 {
+                                Some(t[0].clone())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or_else(|| infer_chain_target_type(ref_param));
+                types.push(next.clone());
+                current = next;
+            }
+            types
+        };
 
-        // For now, just return empty - this would need FHIRPath evaluation
-        Ok(Vec::new())
+        // Innermost: search the deepest target type for the terminal param.
+        let terminal_param = parts[parts.len() - 1];
+        let deepest_type = target_types.last().map(String::as_str).unwrap_or(base_type);
+
+        let terminal_query = SearchQuery::new(deepest_type).with_parameter(SearchParameter {
+            name: terminal_param.to_string(),
+            param_type: {
+                let registry = self.search_param_registry().read();
+                crate::search::resolve_param_type(
+                    &registry,
+                    deepest_type,
+                    terminal_param,
+                    &[SearchValue::eq(value)],
+                )
+            },
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = self.search(tenant, &terminal_query).await?;
+        let mut current_refs: Vec<String> = result
+            .resources
+            .items
+            .into_iter()
+            .map(|r| format!("{}/{}", r.resource_type(), r.id()))
+            .collect();
+
+        if current_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Walk back: for each link from deepest to outermost, search the
+        // parent type for resources whose reference param matches the
+        // accumulated refs.
+        for i in (0..parts.len() - 1).rev() {
+            let ref_param = parts[i];
+            let parent_type = if i == 0 {
+                base_type
+            } else {
+                &target_types[i - 1]
+            };
+
+            let values: Vec<SearchValue> = current_refs.iter().map(SearchValue::eq).collect();
+            let query = SearchQuery::new(parent_type).with_parameter(SearchParameter {
+                name: ref_param.to_string(),
+                param_type: crate::types::SearchParamType::Reference,
+                modifier: None,
+                values,
+                chain: vec![],
+                components: vec![],
+            });
+
+            let r = self.search(tenant, &query).await?;
+            current_refs = r
+                .resources
+                .items
+                .into_iter()
+                .map(|res| {
+                    if i == 0 {
+                        // Outermost: caller wants raw IDs, not refs.
+                        res.id().to_string()
+                    } else {
+                        format!("{}/{}", res.resource_type(), res.id())
+                    }
+                })
+                .collect();
+
+            if current_refs.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+
+        Ok(current_refs)
+    }
+}
+
+/// Hardcoded fallback for ambiguous reference targets. Matches
+/// `sqlite/search/chain_builder::infer_target_type` so composite agrees with
+/// the underlying backends. See the open-question note in the plan about
+/// migrating to a registry-driven first-target pick.
+fn infer_chain_target_type(ref_param: &str) -> String {
+    match ref_param {
+        "patient" | "subject" => "Patient".to_string(),
+        "practitioner" | "performer" | "requester" | "author" => "Practitioner".to_string(),
+        "organization" | "managingOrganization" | "custodian" => "Organization".to_string(),
+        "encounter" | "context" => "Encounter".to_string(),
+        "location" => "Location".to_string(),
+        "device" => "Device".to_string(),
+        "specimen" => "Specimen".to_string(),
+        "medication" => "Medication".to_string(),
+        "condition" => "Condition".to_string(),
+        _ => {
+            let mut chars = ref_param.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().chain(chars).collect(),
+                None => ref_param.to_string(),
+            }
+        }
     }
 }
 
@@ -1933,6 +2121,20 @@ mod tests {
                 backend_name: self.backend_name.to_string(),
                 message: self.error_message.to_string(),
             }))
+        }
+
+        fn search_param_registry(
+            &self,
+        ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+            use std::sync::OnceLock;
+            static EMPTY: OnceLock<
+                std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
+            > = OnceLock::new();
+            EMPTY.get_or_init(|| {
+                std::sync::Arc::new(parking_lot::RwLock::new(
+                    crate::search::SearchParameterRegistry::new(),
+                ))
+            })
         }
     }
 
@@ -2734,6 +2936,152 @@ mod tests {
         assert!(refs.is_empty());
     }
 
+    /// `extract_references` should consult the registry first and use the
+    /// FHIRPath `expression` from the registered SearchParameter, not the
+    /// hardcoded JSON-field-name heuristic. This exercises the new wiring
+    /// from PR #2 of the load-bearing-stub-fixes plan.
+    #[test]
+    fn test_extract_references_uses_registry_expression() {
+        use crate::search::{SearchParameterDefinition, SearchParameterRegistry};
+        use crate::tenant::TenantId;
+        use crate::types::SearchParamType;
+
+        // Composite wrapped around a backend whose registry has been seeded
+        // with an Encounter.subject param whose FHIRPath expression points at
+        // a JSON field name that is *different* from the search-param name —
+        // proving the registry's expression is what's evaluated, not the
+        // hardcoded "patient" -> "subject" alias.
+        let registry = Arc::new(parking_lot::RwLock::new(SearchParameterRegistry::new()));
+        registry
+            .write()
+            .register(
+                SearchParameterDefinition::new(
+                    "http://hl7.org/fhir/SearchParameter/Encounter-subject",
+                    "subject",
+                    SearchParamType::Reference,
+                    "Encounter.subject",
+                )
+                .with_base(vec!["Encounter"])
+                .with_targets(vec!["Patient", "Group"]),
+            )
+            .unwrap();
+
+        struct MockWithRegistry {
+            registry: Arc<parking_lot::RwLock<SearchParameterRegistry>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ResourceStorage for MockWithRegistry {
+            fn backend_name(&self) -> &'static str {
+                "mock-with-registry"
+            }
+            async fn create(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _resource: serde_json::Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<crate::types::StoredResource> {
+                unimplemented!()
+            }
+            async fn create_or_update(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+                _resource: serde_json::Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<(crate::types::StoredResource, bool)> {
+                unimplemented!()
+            }
+            async fn read(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+            ) -> StorageResult<Option<crate::types::StoredResource>> {
+                Ok(None)
+            }
+            async fn update(
+                &self,
+                _tenant: &TenantContext,
+                _current: &crate::types::StoredResource,
+                _resource: serde_json::Value,
+            ) -> StorageResult<crate::types::StoredResource> {
+                unimplemented!()
+            }
+            async fn delete(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+            ) -> StorageResult<()> {
+                Ok(())
+            }
+            async fn count(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: Option<&str>,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl SearchProvider for MockWithRegistry {
+            async fn search(
+                &self,
+                _tenant: &TenantContext,
+                _query: &crate::types::SearchQuery,
+            ) -> StorageResult<SearchResult> {
+                use crate::types::Page;
+                Ok(SearchResult::new(Page::empty()))
+            }
+            async fn search_count(
+                &self,
+                _tenant: &TenantContext,
+                _query: &crate::types::SearchQuery,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+            fn search_param_registry(&self) -> &Arc<parking_lot::RwLock<SearchParameterRegistry>> {
+                &self.registry
+            }
+        }
+
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .build()
+            .unwrap();
+        let backend = Arc::new(MockWithRegistry {
+            registry: Arc::clone(&registry),
+        });
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), backend.clone() as DynStorage);
+        let mut providers = HashMap::new();
+        providers.insert("primary".to_string(), backend.clone() as DynSearchProvider);
+        let composite = CompositeStorage::new(config, backends)
+            .unwrap()
+            .with_search_providers(providers);
+
+        // Encounter resource referencing Patient/p1 via subject.
+        let content = serde_json::json!({
+            "resourceType": "Encounter",
+            "id": "e1",
+            "subject": {"reference": "Patient/p1"},
+        });
+        let resource = crate::types::StoredResource::new(
+            "Encounter",
+            "e1",
+            TenantId::new("t"),
+            content,
+            FhirVersion::default(),
+        );
+
+        let refs = composite.extract_references(&resource, "subject");
+        assert_eq!(refs, vec!["Patient/p1".to_string()]);
+    }
+
     #[test]
     fn test_extract_reference_values_null_ignored() {
         let val = serde_json::Value::Null;
@@ -2791,6 +3139,65 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    fn make_composite_with_search_provider() -> CompositeStorage {
+        let composite = make_composite_no_secondary();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "primary".to_string(),
+            Arc::new(MockStorage) as DynSearchProvider,
+        );
+        composite.with_search_providers(providers)
+    }
+
+    /// `resolve_chain` should run iterative SearchQueries against composite's
+    /// own search routing rather than the previous stub that returned an
+    /// empty Vec for any chain longer than 2 segments. This test uses
+    /// MockStorage (which returns no results) so the assertion is just that
+    /// the implementation runs to completion and yields empty (not that it
+    /// finds anything) — full end-to-end coverage comes from inferno against
+    /// real backends.
+    #[tokio::test]
+    async fn test_resolve_chain_three_segments_does_not_error() {
+        use crate::core::ChainedSearchProvider;
+        let composite = make_composite_with_search_provider();
+        let tenant = make_tenant();
+        let result = composite
+            .resolve_chain(
+                &tenant,
+                "Observation",
+                "subject.organization.name",
+                "Hospital",
+            )
+            .await;
+        assert!(result.is_ok(), "resolve_chain failed: {:?}", result.err());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_chain_short_chain_does_not_error() {
+        use crate::core::ChainedSearchProvider;
+        let composite = make_composite_with_search_provider();
+        let tenant = make_tenant();
+        let result = composite
+            .resolve_chain(&tenant, "Observation", "patient.name", "Smith")
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_chain_invalid_chain_returns_empty() {
+        use crate::core::ChainedSearchProvider;
+        let composite = make_composite_with_search_provider();
+        let tenant = make_tenant();
+        // Single segment isn't a chain — must return empty, not error.
+        let result = composite
+            .resolve_chain(&tenant, "Observation", "patient", "x")
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
     // SearchProvider impl for MockStorage (must live inside test module).
     #[async_trait::async_trait]
     impl SearchProvider for MockStorage {
@@ -2809,6 +3216,20 @@ mod tests {
             _query: &crate::types::SearchQuery,
         ) -> StorageResult<u64> {
             Ok(0)
+        }
+
+        fn search_param_registry(
+            &self,
+        ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+            use std::sync::OnceLock;
+            static EMPTY: OnceLock<
+                std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
+            > = OnceLock::new();
+            EMPTY.get_or_init(|| {
+                std::sync::Arc::new(parking_lot::RwLock::new(
+                    crate::search::SearchParameterRegistry::new(),
+                ))
+            })
         }
     }
 }

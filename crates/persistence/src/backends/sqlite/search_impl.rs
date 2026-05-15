@@ -413,6 +413,12 @@ impl SearchProvider for SqliteBackend {
 
         Ok(count as u64)
     }
+
+    fn search_param_registry(
+        &self,
+    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.search_registry()
+    }
 }
 
 #[async_trait]
@@ -1012,29 +1018,6 @@ impl SqliteBackend {
         false
     }
 
-    /// Infer the target resource type for a reference parameter.
-    #[allow(dead_code)]
-    fn infer_target_type(&self, _base_type: &str, reference_param: &str) -> String {
-        // This is a simplified mapping - a real implementation would use
-        // search parameter definitions from the FHIR specification
-        match reference_param {
-            "patient" | "subject" => "Patient".to_string(),
-            "practitioner" | "performer" => "Practitioner".to_string(),
-            "organization" => "Organization".to_string(),
-            "encounter" => "Encounter".to_string(),
-            "location" => "Location".to_string(),
-            "device" => "Device".to_string(),
-            _ => {
-                // Default: capitalize first letter
-                let mut chars = reference_param.chars();
-                match chars.next() {
-                    Some(c) => c.to_uppercase().chain(chars).collect(),
-                    None => reference_param.to_string(),
-                }
-            }
-        }
-    }
-
     /// Find resources matching a simple field value search using the search index.
     #[allow(dead_code)]
     fn find_resources_by_value(
@@ -1174,7 +1157,17 @@ mod tests {
     use serde_json::json;
 
     fn create_test_backend() -> SqliteBackend {
-        let backend = SqliteBackend::in_memory().unwrap();
+        // Point at the workspace's data directory so the search-parameter
+        // registry loads the full FHIR spec (otherwise only the 5 minimal
+        // embedded params are available and chained-search tests fail to
+        // resolve param types like Observation.code → Token).
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("data");
+        let mut config = crate::backends::sqlite::backend::SqliteBackendConfig::default();
+        config.data_dir = Some(data_dir);
+        let backend = SqliteBackend::with_config(":memory:", config).unwrap();
         backend.init_schema().unwrap();
         backend
     }
@@ -2194,30 +2187,6 @@ mod tests {
 
         let result = backend.parse_reference("http://example.com/fhir/Patient/456");
         assert_eq!(result, Some(("Patient".to_string(), "456".to_string())));
-    }
-
-    #[test]
-    fn test_infer_target_type() {
-        let backend = SqliteBackend::in_memory().unwrap();
-
-        assert_eq!(
-            backend.infer_target_type("Observation", "patient"),
-            "Patient"
-        );
-        assert_eq!(
-            backend.infer_target_type("Observation", "subject"),
-            "Patient"
-        );
-        assert_eq!(
-            backend.infer_target_type("Encounter", "practitioner"),
-            "Practitioner"
-        );
-        assert_eq!(
-            backend.infer_target_type("Patient", "organization"),
-            "Organization"
-        );
-        // Unknown param - capitalize first letter
-        assert_eq!(backend.infer_target_type("Observation", "custom"), "Custom");
     }
 
     // ========================================================================

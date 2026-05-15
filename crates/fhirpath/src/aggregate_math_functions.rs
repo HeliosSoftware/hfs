@@ -19,22 +19,28 @@ fn extract_items(input: &EvaluationResult) -> Vec<&EvaluationResult> {
 /// Returns None if the types are incomparable.
 fn compare_values(a: &EvaluationResult, b: &EvaluationResult) -> Option<Ordering> {
     match (a, b) {
-        (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => Some(a.cmp(b)),
-        (EvaluationResult::Integer64(a, _), EvaluationResult::Integer64(b, _)) => Some(a.cmp(b)),
-        (EvaluationResult::Decimal(a, _), EvaluationResult::Decimal(b, _)) => Some(a.cmp(b)),
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => Some(a.cmp(b)),
+        (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer64(b, _, _)) => {
+            Some(a.cmp(b))
+        }
+        (EvaluationResult::Decimal(a, _, _), EvaluationResult::Decimal(b, _, _)) => Some(a.cmp(b)),
         // Mixed numeric: promote to Decimal
-        (EvaluationResult::Integer(a, _), EvaluationResult::Decimal(b, _)) => {
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Decimal(b, _, _)) => {
             Some(Decimal::from(*a).cmp(b))
         }
-        (EvaluationResult::Decimal(a, _), EvaluationResult::Integer(b, _)) => {
+        (EvaluationResult::Decimal(a, _, _), EvaluationResult::Integer(b, _, _)) => {
             Some(a.cmp(&Decimal::from(*b)))
         }
-        (EvaluationResult::Integer(a, _), EvaluationResult::Integer64(b, _)) => Some(a.cmp(b)),
-        (EvaluationResult::Integer64(a, _), EvaluationResult::Integer(b, _)) => Some(a.cmp(b)),
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer64(b, _, _)) => {
+            Some(a.cmp(b))
+        }
+        (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer(b, _, _)) => {
+            Some(a.cmp(b))
+        }
         // Quantity comparison (same unit only)
         (
-            EvaluationResult::Quantity(val_a, unit_a, _),
-            EvaluationResult::Quantity(val_b, unit_b, _),
+            EvaluationResult::Quantity(val_a, unit_a, _, _),
+            EvaluationResult::Quantity(val_b, unit_b, _, _),
         ) => {
             if unit_a == unit_b {
                 Some(val_a.cmp(val_b))
@@ -43,11 +49,13 @@ fn compare_values(a: &EvaluationResult, b: &EvaluationResult) -> Option<Ordering
             }
         }
         // String comparison
-        (EvaluationResult::String(a, _), EvaluationResult::String(b, _)) => Some(a.cmp(b)),
+        (EvaluationResult::String(a, _, _), EvaluationResult::String(b, _, _)) => Some(a.cmp(b)),
         // Date/Time comparisons
-        (EvaluationResult::Date(a, _), EvaluationResult::Date(b, _)) => Some(a.cmp(b)),
-        (EvaluationResult::DateTime(a, _), EvaluationResult::DateTime(b, _)) => Some(a.cmp(b)),
-        (EvaluationResult::Time(a, _), EvaluationResult::Time(b, _)) => Some(a.cmp(b)),
+        (EvaluationResult::Date(a, _, _), EvaluationResult::Date(b, _, _)) => Some(a.cmp(b)),
+        (EvaluationResult::DateTime(a, _, _), EvaluationResult::DateTime(b, _, _)) => {
+            Some(a.cmp(b))
+        }
+        (EvaluationResult::Time(a, _, _), EvaluationResult::Time(b, _, _)) => Some(a.cmp(b)),
         _ => None,
     }
 }
@@ -157,12 +165,16 @@ pub fn avg_function(
     let sum = sum_function(invocation_base)?;
 
     match sum {
-        EvaluationResult::Integer(v, _) => Ok(EvaluationResult::decimal(Decimal::from(v) / count)),
-        EvaluationResult::Integer64(v, _) => {
+        EvaluationResult::Integer(v, _, _) => {
             Ok(EvaluationResult::decimal(Decimal::from(v) / count))
         }
-        EvaluationResult::Decimal(v, _) => Ok(EvaluationResult::decimal(v / count)),
-        EvaluationResult::Quantity(v, unit, _) => Ok(EvaluationResult::quantity(v / count, unit)),
+        EvaluationResult::Integer64(v, _, _) => {
+            Ok(EvaluationResult::decimal(Decimal::from(v) / count))
+        }
+        EvaluationResult::Decimal(v, _, _) => Ok(EvaluationResult::decimal(v / count)),
+        EvaluationResult::Quantity(v, unit, _, _) => {
+            Ok(EvaluationResult::quantity(v / count, unit))
+        }
         _ => Err(EvaluationError::TypeError(
             "avg() requires numeric or quantity items".to_string(),
         )),
@@ -175,32 +187,32 @@ fn add_values(
     b: &EvaluationResult,
 ) -> Result<EvaluationResult, EvaluationError> {
     match (a, b) {
-        (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => {
             Ok(EvaluationResult::integer(a + b))
         }
-        (EvaluationResult::Integer64(a, _), EvaluationResult::Integer64(b, _)) => {
+        (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer64(b, _, _)) => {
             Ok(EvaluationResult::integer64(*a + *b))
         }
-        (EvaluationResult::Decimal(a, _), EvaluationResult::Decimal(b, _)) => {
+        (EvaluationResult::Decimal(a, _, _), EvaluationResult::Decimal(b, _, _)) => {
             Ok(EvaluationResult::decimal(*a + *b))
         }
         // Mixed numeric: promote to Decimal
-        (EvaluationResult::Integer(a, _), EvaluationResult::Decimal(b, _)) => {
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Decimal(b, _, _)) => {
             Ok(EvaluationResult::decimal(Decimal::from(*a) + *b))
         }
-        (EvaluationResult::Decimal(a, _), EvaluationResult::Integer(b, _)) => {
+        (EvaluationResult::Decimal(a, _, _), EvaluationResult::Integer(b, _, _)) => {
             Ok(EvaluationResult::decimal(*a + Decimal::from(*b)))
         }
-        (EvaluationResult::Integer(a, _), EvaluationResult::Integer64(b, _)) => {
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer64(b, _, _)) => {
             Ok(EvaluationResult::integer64(*a + *b))
         }
-        (EvaluationResult::Integer64(a, _), EvaluationResult::Integer(b, _)) => {
+        (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer(b, _, _)) => {
             Ok(EvaluationResult::integer64(*a + *b))
         }
         // Quantity addition (same unit)
         (
-            EvaluationResult::Quantity(val_a, unit_a, _),
-            EvaluationResult::Quantity(val_b, unit_b, _),
+            EvaluationResult::Quantity(val_a, unit_a, _, _),
+            EvaluationResult::Quantity(val_b, unit_b, _, _),
         ) => {
             if unit_a == unit_b {
                 Ok(EvaluationResult::quantity(*val_a + *val_b, unit_a.clone()))

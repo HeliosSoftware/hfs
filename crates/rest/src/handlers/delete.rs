@@ -12,7 +12,7 @@ use helios_persistence::core::{ConditionalStorage, ResourceStorage};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::TenantExtractor;
+use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::state::AppState;
 
 /// Handler for the delete interaction.
@@ -39,16 +39,38 @@ pub async fn delete_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
+    #[cfg_attr(not(feature = "subscriptions"), allow(unused_variables))]
+    version: FhirVersionExtractor,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
 {
+    // AuditEvent resources are immutable — block write operations
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "DELETE".to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
+
     debug!(
         resource_type = %resource_type,
         id = %id,
         tenant = %tenant.tenant_id(),
         "Processing delete request"
     );
+
+    #[cfg(feature = "subscriptions")]
+    let existing_resource = state
+        .storage()
+        .read(tenant.context(), &resource_type, &id)
+        .await?;
+
+    #[cfg(feature = "subscriptions")]
+    let fhir_version = existing_resource
+        .as_ref()
+        .map(|stored| stored.fhir_version())
+        .unwrap_or_else(|| version.storage_version());
 
     // Perform the delete
     state
@@ -61,6 +83,19 @@ where
         id = %id,
         "Resource deleted"
     );
+
+    // Emit subscription event
+    #[cfg(feature = "subscriptions")]
+    if let Some(engine) = state.subscription_engine() {
+        super::subscription_event::emit_delete_event(
+            engine,
+            tenant.context(),
+            &resource_type,
+            &id,
+            fhir_version,
+            existing_resource.map(|stored| stored.content().clone()),
+        );
+    }
 
     // Return 204 No Content (or 200 with OperationOutcome)
     Ok(StatusCode::NO_CONTENT.into_response())

@@ -1,0 +1,194 @@
+//! PostgreSQL DDL for the HTS schema.
+//!
+//! Uses `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` throughout
+//! so this is safe to re-apply on every startup (idempotent).
+//!
+//! Key differences from the SQLite schema:
+//! - `INTEGER PRIMARY KEY` → `BIGSERIAL PRIMARY KEY` for auto-increment tables
+//! - `resource_json TEXT` → `resource_json JSONB`
+//! - `title TEXT` and `resource_json JSONB` are part of the base schema (no migrations)
+//! - `name TEXT` is included in `concept_maps` from the start
+//! - Trigram GIN index on `concepts.display` for fast substring search
+
+/// Full PostgreSQL DDL for the HTS normalized schema.
+pub const SCHEMA: &str = "
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- ── Code Systems ──────────────────────────────────────────────────────────────
+-- Multi-version: a canonical URL may have multiple rows so long as each row has
+-- a distinct `version`. Uniqueness is enforced via the composite expression
+-- index `idx_code_systems_url_version` (the column-level UNIQUE on `url` was
+-- dropped). Rows with NULL version are coalesced to the empty string by the
+-- index so two un-versioned imports of the same URL still collide.
+CREATE TABLE IF NOT EXISTS code_systems (
+    id           TEXT PRIMARY KEY,
+    url          TEXT NOT NULL,
+    version      TEXT,
+    name         TEXT,
+    title        TEXT,
+    status       TEXT NOT NULL DEFAULT 'active',
+    content      TEXT NOT NULL DEFAULT 'complete',
+    resource_json JSONB,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
+    ON code_systems(url, COALESCE(version, ''));
+CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);
+
+-- Legacy installs created code_systems with `url TEXT NOT NULL UNIQUE`, which
+-- bakes uniqueness into a hidden constraint that blocks multi-version imports.
+-- Drop both the standalone constraint name and the auto-named one so subsequent
+-- (url, version) duplicates can coexist; both forms are silently ignored when
+-- absent (legacy index is unnamed across PG versions).
+DO $$
+DECLARE
+    cons_name text;
+BEGIN
+    FOR cons_name IN
+        SELECT conname FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = 'code_systems'
+          AND c.contype = 'u'
+          AND pg_get_constraintdef(c.oid) = 'UNIQUE (url)'
+    LOOP
+        EXECUTE format('ALTER TABLE code_systems DROP CONSTRAINT %I', cons_name);
+    END LOOP;
+END $$;
+
+-- ── Concepts ───────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS concepts (
+    id         BIGSERIAL PRIMARY KEY,
+    system_id  TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    code       TEXT NOT NULL,
+    display    TEXT,
+    definition TEXT,
+    UNIQUE (system_id, code)
+);
+CREATE INDEX IF NOT EXISTS idx_concepts_system_code ON concepts(system_id, code);
+CREATE INDEX IF NOT EXISTS idx_concepts_display_trgm ON concepts USING gin(display gin_trgm_ops);
+
+-- ── Hierarchy (pre-materialized parent-child links) ───────────────────────────
+CREATE TABLE IF NOT EXISTS concept_hierarchy (
+    system_id   TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    parent_code TEXT NOT NULL,
+    child_code  TEXT NOT NULL,
+    PRIMARY KEY (system_id, parent_code, child_code)
+);
+CREATE INDEX IF NOT EXISTS idx_hierarchy_child ON concept_hierarchy(system_id, child_code);
+
+-- ── Concept Properties (arbitrary FHIR properties) ────────────────────────────
+CREATE TABLE IF NOT EXISTS concept_properties (
+    id         BIGSERIAL PRIMARY KEY,
+    concept_id BIGINT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    property   TEXT NOT NULL,
+    value_type TEXT NOT NULL,
+    value      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_props_concept ON concept_properties(concept_id);
+
+-- ── Designations (alternate names / translations) ─────────────────────────────
+CREATE TABLE IF NOT EXISTS concept_designations (
+    id         BIGSERIAL PRIMARY KEY,
+    concept_id BIGINT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    language   TEXT,
+    use_system TEXT,
+    use_code   TEXT,
+    value      TEXT NOT NULL
+);
+
+-- ── Value Sets ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS value_sets (
+    id            TEXT PRIMARY KEY,
+    url           TEXT NOT NULL,
+    version       TEXT,
+    name          TEXT,
+    title         TEXT,
+    status        TEXT NOT NULL DEFAULT 'active',
+    compose_json  TEXT,
+    resource_json JSONB,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_value_sets_url_version
+    ON value_sets(url, COALESCE(version, ''));
+CREATE INDEX IF NOT EXISTS idx_value_sets_url ON value_sets(url);
+
+-- Drop any legacy column-level UNIQUE on value_sets.url for the same reason
+-- code_systems above had it removed: tx-ecosystem ships per-version VS
+-- fixtures sharing a canonical URL.
+DO $$
+DECLARE
+    cons_name text;
+BEGIN
+    FOR cons_name IN
+        SELECT conname FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = 'value_sets'
+          AND c.contype = 'u'
+          AND pg_get_constraintdef(c.oid) = 'UNIQUE (url)'
+    LOOP
+        EXECUTE format('ALTER TABLE value_sets DROP CONSTRAINT %I', cons_name);
+    END LOOP;
+END $$;
+
+-- ── Value Set Expansions (materialized cache) ─────────────────────────────────
+CREATE TABLE IF NOT EXISTS value_set_expansions (
+    value_set_id TEXT NOT NULL REFERENCES value_sets(id) ON DELETE CASCADE,
+    system_url   TEXT NOT NULL,
+    code         TEXT NOT NULL,
+    display      TEXT,
+    PRIMARY KEY (value_set_id, system_url, code)
+);
+
+-- ── Concept Maps ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS concept_maps (
+    id            TEXT PRIMARY KEY,
+    url           TEXT NOT NULL UNIQUE,
+    version       TEXT,
+    name          TEXT,
+    title         TEXT,
+    source_uri    TEXT,
+    target_uri    TEXT,
+    status        TEXT NOT NULL DEFAULT 'active',
+    resource_json JSONB,
+    created_at    TEXT NOT NULL
+);
+
+-- ── Concept Map Elements ───────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS concept_map_elements (
+    id            BIGSERIAL PRIMARY KEY,
+    map_id        TEXT NOT NULL REFERENCES concept_maps(id) ON DELETE CASCADE,
+    source_system TEXT NOT NULL,
+    source_code   TEXT NOT NULL,
+    target_system TEXT NOT NULL,
+    target_code   TEXT NOT NULL,
+    equivalence   TEXT NOT NULL DEFAULT 'equivalent'
+);
+CREATE INDEX IF NOT EXISTS idx_map_source
+    ON concept_map_elements(map_id, source_system, source_code);
+";
+
+/// Apply the HTS PostgreSQL schema to the given client connection.
+///
+/// Safe to call on every startup — all statements are idempotent. Concurrent
+/// callers are serialized via a session-scoped advisory lock so that racing
+/// `CREATE EXTENSION IF NOT EXISTS pg_trgm` calls cannot collide on
+/// `pg_extension_name_index` (Postgres's `IF NOT EXISTS` guard is not
+/// transactional with concurrent writers).
+pub async fn apply(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    // Arbitrary constant — must match across all callers that apply this
+    // schema. Use an application-scoped value that won't collide with
+    // user-chosen advisory locks.
+    const HTS_SCHEMA_LOCK: i64 = 0x4854_535f_5343_484du64 as i64; // "HTS_SCHM"
+
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&HTS_SCHEMA_LOCK])
+        .await?;
+    let result = client.batch_execute(SCHEMA).await;
+    // Always release the lock, even if schema apply failed.
+    let _ = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&HTS_SCHEMA_LOCK])
+        .await;
+    result
+}

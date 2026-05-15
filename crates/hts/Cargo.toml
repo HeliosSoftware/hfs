@@ -1,0 +1,81 @@
+[package]
+name = "helios-hts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/hts"
+rust-version.workspace = true
+description = "Helios Terminology Server — FHIR Terminology Operations"
+keywords = ["helios-software", "hl7", "fhir", "terminology", "healthcare"]
+categories = ["web-programming"]
+
+[lib]
+name = "helios_hts"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hts"
+path = "src/main.rs"
+
+[features]
+default = ["sqlite", "R4"]
+sqlite = ["dep:rusqlite", "dep:r2d2", "dep:r2d2_sqlite"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "helios-persistence/postgres"]
+R4 = ["helios-fhir/R4", "helios-persistence/R4"]
+R4B = ["helios-fhir/R4B", "helios-persistence/R4B"]
+R5 = ["helios-fhir/R5", "helios-persistence/R5"]
+R6 = ["helios-fhir/R6", "helios-persistence/R6"]
+
+[dependencies]
+helios-fhir = { workspace = true }
+helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false, features = ["sqlite"] }
+
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json", "query"] }
+futures = "0.3"
+bytes = "1"
+tower = { version = "0.5" }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
+tokio = { version = "1", features = ["full"] }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = "1"
+csv = "1"
+flate2 = "1"
+roxmltree = "0.20"
+form_urlencoded = "1"
+tar = "0.4"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.0", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+
+# SQLite (default)
+rusqlite = { version = "0.33", features = ["bundled"], optional = true }
+r2d2 = { version = "0.8", optional = true }
+r2d2_sqlite = { version = "0.26", optional = true }
+
+# PostgreSQL
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"], optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+ctor = "0.2"
+
+# `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.
+# Windows test runs don't need SIGTERM cleanup, so drop the feature there.
+[target.'cfg(not(windows))'.dev-dependencies]
+testcontainers = { version = "0.27", features = ["watchdog"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+testcontainers = { version = "0.27" }

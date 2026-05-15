@@ -131,6 +131,8 @@ sof-cli -v view-definition.json -b data.ndjson -f ndjson --skip-invalid
                               When exceeded, creates numbered files (e.g., output_001.parquet)
     --chunk-size <N>           Number of resources per chunk for streaming NDJSON [default: 1000]
     --skip-invalid             Skip invalid JSON lines in NDJSON files instead of failing
+    --terminology-server <URL> Terminology server URL for FHIRPath functions
+                               [env: SOF_TERMINOLOGY_SERVER]
 -h, --help                     Print help
 
 * Additional FHIR versions (R4B, R5, R6) available when compiled with corresponding features
@@ -332,6 +334,7 @@ simple web service for SQL-on-FHIR implementations. Should you need to perform S
 transformations using server-stored ViewDefinitions and server-stored FHIR data, use the full
 capabilities of the Helios FHIR Server in [hfs](../hfs).
 
+An open test server is available at https://sof.heliossoftware.com/ for experimentation and evaluation.
 
 ```bash
 # Start server with defaults
@@ -367,6 +370,7 @@ The server can be configured using either command-line arguments or environment 
 | `SOF_CORS_ORIGINS` | Allowed CORS origins (comma-separated, * for any) | `*` |
 | `SOF_CORS_METHODS` | Allowed CORS methods (comma-separated, * for any) | `GET,POST,PUT,DELETE,OPTIONS` |
 | `SOF_CORS_HEADERS` | Allowed CORS headers (comma-separated, * for any) | Common headers¹ |
+| `SOF_TERMINOLOGY_SERVER` | Terminology server URL for FHIRPath functions (memberOf, subsumes) | (none) |
 
 ##### Command-Line Arguments
 
@@ -381,6 +385,7 @@ The server can be configured using either command-line arguments or environment 
 | `--cors-origins` | | Allowed origins (comma-separated) | `*` |
 | `--cors-methods` | | Allowed methods (comma-separated) | `GET,POST,PUT,DELETE,OPTIONS` |
 | `--cors-headers` | | Allowed headers (comma-separated) | Common headers¹ |
+| `--terminology-server` | | Terminology server URL | (none) |
 
 ##### Examples
 

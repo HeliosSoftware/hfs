@@ -22,6 +22,7 @@
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
 //! | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name for tenant (future use) |
+//! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions |
 //!
 //! # Example
 //!
@@ -46,6 +47,7 @@ use std::str::FromStr;
 
 use clap::Parser;
 use helios_fhir::FhirVersion;
+use helios_persistence::BackendKind;
 
 /// Storage backend mode.
 ///
@@ -74,6 +76,24 @@ pub enum StorageBackendMode {
     /// AWS S3 for CRUD/history + Elasticsearch for search.
     /// Requires AWS credentials and a running Elasticsearch instance.
     S3Elasticsearch,
+}
+
+impl StorageBackendMode {
+    /// Returns the primary storage backend kind for this mode.
+    pub fn primary_backend_kind(self) -> BackendKind {
+        match self {
+            StorageBackendMode::Sqlite | StorageBackendMode::SqliteElasticsearch => {
+                BackendKind::Sqlite
+            }
+            StorageBackendMode::Postgres | StorageBackendMode::PostgresElasticsearch => {
+                BackendKind::Postgres
+            }
+            StorageBackendMode::MongoDB | StorageBackendMode::MongoDBElasticsearch => {
+                BackendKind::MongoDB
+            }
+            StorageBackendMode::S3 | StorageBackendMode::S3Elasticsearch => BackendKind::S3,
+        }
+    }
 }
 
 impl fmt::Display for StorageBackendMode {
@@ -406,6 +426,19 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_SQL_QUERY_MAX_ROWS", default_value = "100000")]
     pub sof_sql_query_max_rows: usize,
 
+    /// URL of the Helios Terminology Server (HTS) for terminology operations.
+    ///
+    /// When set, HFS delegates the following operations to the HTS:
+    /// - FHIR search `:in` modifier  → `POST /ValueSet/$expand`
+    /// - FHIR search `:not-in` modifier → `POST /ValueSet/$expand` (expansion-based)
+    /// - FHIRPath `memberOf()` → `POST /ValueSet/$validate-code` (via env var passthrough)
+    /// - FHIRPath `subsumes()` → `POST /CodeSystem/$subsumes` (via env var passthrough)
+    ///
+    /// Leave unset (default: none) to disable terminology integration.
+    /// Example: `http://localhost:8090`
+    #[arg(long, env = "HFS_TERMINOLOGY_SERVER")]
+    pub terminology_server: Option<String>,
+
     /// Multitenancy configuration (loaded from environment variables).
     #[arg(skip)]
     pub multitenancy: MultitenancyConfig,
@@ -459,6 +492,7 @@ impl Default for ServerConfig {
             sof_readonly_url: None,
             sof_sql_query_timeout_secs: 30,
             sof_sql_query_max_rows: 100_000,
+            terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
         }
     }
@@ -562,6 +596,7 @@ impl ServerConfig {
             sof_readonly_url: None,
             sof_sql_query_timeout_secs: 30,
             sof_sql_query_max_rows: 100_000,
+            terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
         }
     }
@@ -808,6 +843,42 @@ mod tests {
         assert_eq!(
             StorageBackendMode::S3Elasticsearch.to_string(),
             "s3-elasticsearch"
+        );
+    }
+
+    #[test]
+    fn test_storage_backend_mode_primary_backend_kind() {
+        assert_eq!(
+            StorageBackendMode::Sqlite.primary_backend_kind(),
+            BackendKind::Sqlite
+        );
+        assert_eq!(
+            StorageBackendMode::SqliteElasticsearch.primary_backend_kind(),
+            BackendKind::Sqlite
+        );
+        assert_eq!(
+            StorageBackendMode::Postgres.primary_backend_kind(),
+            BackendKind::Postgres
+        );
+        assert_eq!(
+            StorageBackendMode::PostgresElasticsearch.primary_backend_kind(),
+            BackendKind::Postgres
+        );
+        assert_eq!(
+            StorageBackendMode::MongoDB.primary_backend_kind(),
+            BackendKind::MongoDB
+        );
+        assert_eq!(
+            StorageBackendMode::MongoDBElasticsearch.primary_backend_kind(),
+            BackendKind::MongoDB
+        );
+        assert_eq!(
+            StorageBackendMode::S3.primary_backend_kind(),
+            BackendKind::S3
+        );
+        assert_eq!(
+            StorageBackendMode::S3Elasticsearch.primary_backend_kind(),
+            BackendKind::S3
         );
     }
 

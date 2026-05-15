@@ -53,7 +53,7 @@ fn test_uri_type_preservation() {
     let result = evaluate_expression("identifier[0].type.coding[0].system", &context).unwrap();
 
     // Verify the value is correct
-    if let helios_fhirpath_support::EvaluationResult::String(value, _type_info) = &result {
+    if let helios_fhirpath_support::EvaluationResult::String(value, _type_info, _) = &result {
         assert_eq!(value, "http://terminology.hl7.org/CodeSystem/v2-0203");
 
         // Test 2: Check the type using type() function
@@ -61,7 +61,7 @@ fn test_uri_type_preservation() {
             evaluate_expression("identifier[0].type.coding[0].system.type().name", &context)
                 .unwrap();
 
-        if let helios_fhirpath_support::EvaluationResult::String(type_name, _) = type_result {
+        if let helios_fhirpath_support::EvaluationResult::String(type_name, _, _) = type_result {
             // This should be "uri" but currently returns "String"
             println!("Type name: {}", type_name);
             assert_eq!(
@@ -79,7 +79,8 @@ fn test_uri_type_preservation() {
             &context,
         )
         .unwrap();
-        if let helios_fhirpath_support::EvaluationResult::String(namespace, _) = namespace_result {
+        if let helios_fhirpath_support::EvaluationResult::String(namespace, _, _) = namespace_result
+        {
             println!("Namespace: {}", namespace);
             assert_eq!(
                 namespace, "FHIR",
@@ -120,7 +121,7 @@ fn test_code_type_preservation() {
     let type_result =
         evaluate_expression("identifier[0].type.coding[0].code.type().name", &context).unwrap();
 
-    if let helios_fhirpath_support::EvaluationResult::String(type_name, _) = type_result {
+    if let helios_fhirpath_support::EvaluationResult::String(type_name, _, _) = type_result {
         println!("Code type name: {}", type_name);
         assert_eq!(
             type_name, "code",

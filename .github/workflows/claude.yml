@@ -25,10 +25,27 @@ jobs:
       id-token: write
       actions: read # Required for Claude to read CI results on PRs
     steps:
+      - name: Check permissions
+        if: >
+          github.event.comment.author_association != 'OWNER' &&
+          github.event.comment.author_association != 'MEMBER' &&
+          github.event.comment.author_association != 'COLLABORATOR'
+        run: |
+          echo "Unauthorized user, skipping"
+          exit 0
+
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
+
+      - name: Import GPG key and configure signing
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          git config --global user.signingkey ${{ secrets.GPG_KEY_ID }}
+          git config --global commit.gpgsign true
+          git config --global user.email "claude-bot@heliossoftware.com"
+          git config --global user.name "Claude Bot"
 
       - name: Run Claude Code
         id: claude

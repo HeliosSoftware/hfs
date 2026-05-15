@@ -149,6 +149,7 @@ pub mod responses;
 pub mod routing;
 pub mod state;
 pub mod tenant;
+pub mod terminology;
 
 // Re-export commonly used types
 pub use config::{MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode};
@@ -159,7 +160,7 @@ pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
 
 use std::sync::Arc;
 
-use axum::Router;
+use axum::{Router, extract::DefaultBodyLimit};
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
 };
@@ -238,18 +239,28 @@ where
         + Sync
         + 'static,
 {
-    create_app_with_auth(storage, config, helios_auth::AuthConfig::default(), None)
+    create_app_with_auth(
+        storage,
+        config,
+        helios_auth::AuthConfig::default(),
+        None,
+        None,
+    )
 }
 
 /// Creates the Axum application with custom configuration and optional authentication.
 ///
 /// When `auth_state` is `Some`, authentication and authorization middleware
 /// are added to the middleware stack.
+///
+/// When `audit_state` is `Some`, audit middleware is added to record FHIR
+/// operation events as `AuditEvent` resources.
 pub fn create_app_with_auth<S>(
     storage: S,
     config: ServerConfig,
     auth_config: helios_auth::AuthConfig,
     auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
 ) -> Router
 where
     S: ResourceStorage
@@ -272,12 +283,29 @@ where
     // Wrap storage in Arc so we can share it with the SofRunner
     let storage_arc = Arc::new(storage);
 
+    let (app_audit_sink, app_audit_source_observer) = audit_state
+        .as_ref()
+        .map(|audit| {
+            (
+                Some(Arc::clone(&audit.sink)),
+                audit.config.source_observer.clone(),
+            )
+        })
+        .unwrap_or((None, "Device/hfs".to_string()));
+
+    // Build the outbound auth provider before moving auth_config into the
+    // app state — the subscription engine (constructed below) consumes it.
+    #[cfg(feature = "subscriptions")]
+    let outbound_auth_provider = auth_config.outbound_provider();
+
     // Create application state
-    let mut state = AppState::with_auth(
+    let mut state = AppState::with_auth_and_audit(
         Arc::clone(&storage_arc),
         config.clone(),
         auth_config,
         auth_state.clone(),
+        app_audit_sink,
+        app_audit_source_observer,
     );
 
     // Wire SQL-on-FHIR runner and export controller. The SOF runtime path is
@@ -413,9 +441,74 @@ where
             }
         }
     }
+    // Inject subscription engine if enabled
+    #[cfg(feature = "subscriptions")]
+    let state = {
+        let subscriptions_enabled = std::env::var("HFS_SUBSCRIPTIONS_ENABLED")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
+            .unwrap_or(false);
+        if subscriptions_enabled {
+            let smtp = build_smtp_settings_from_env();
+            let messaging = build_messaging_settings_from_env(&config.base_url);
+            let mut supported = vec!["rest-hook".to_string(), "websocket".to_string()];
+            if smtp.is_some() {
+                supported.push("email".to_string());
+                info!("Email subscription channel ENABLED");
+            }
+            if messaging.is_some() {
+                supported.push("message".to_string());
+                info!("FHIR Messaging subscription channel ENABLED");
+            }
+            let default_sub_config = helios_subscriptions::SubscriptionConfig::default();
+            let sub_config = helios_subscriptions::SubscriptionConfig {
+                supported_channel_types: supported,
+                smtp,
+                messaging,
+                handshake_initial_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS",
+                    default_sub_config.handshake_initial_delay,
+                ),
+                handshake_max_attempts: subscription_u32_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS",
+                    default_sub_config.handshake_max_attempts,
+                )
+                .max(1),
+                handshake_retry_initial_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS",
+                    default_sub_config.handshake_retry_initial_delay,
+                ),
+                handshake_retry_max_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS",
+                    default_sub_config.handshake_retry_max_delay,
+                ),
+                ..default_sub_config
+            };
+            // Outbound auth provider was built above (static bearer when
+            // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
+            let engine = helios_subscriptions::SubscriptionEngine::with_outbound_auth(
+                sub_config,
+                config.base_url.clone(),
+                outbound_auth_provider,
+            );
+            info!("Subscriptions engine ENABLED");
+            state.with_subscription_engine(Arc::new(engine))
+        } else {
+            state
+        }
+    };
 
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
+
+    // Apply audit middleware if enabled (inner layer = runs after auth)
+    let router = if let Some(audit) = audit_state {
+        router.layer(axum::middleware::from_fn_with_state(
+            audit,
+            helios_audit::middleware::audit_middleware,
+        ))
+    } else {
+        router
+    };
 
     // Apply auth middleware if enabled (outermost = runs first)
     let router = if let Some(ref auth) = auth_state {
@@ -448,8 +541,121 @@ where
         router
     };
 
+    // Raise the body-size limit from axum's 2 MiB default to the configured
+    // ceiling. Without this, `HFS_MAX_BODY_SIZE` / `--max-body-size` has no
+    // effect on the REST router: individual batch/transaction handlers read
+    // their body via `axum::body::to_bytes(..., config.max_body_size)`, but
+    // axum's `DefaultBodyLimit` extractor runs first and rejects any request
+    // > 2 MiB with 413 "length limit exceeded" before the handler is called.
+    // Mirrors the pattern already used in `crates/sof/src/server.rs`.
+    let router = router.layer(DefaultBodyLimit::max(config.max_body_size));
+
     // Apply remaining middleware
     router.layer(service_builder)
+}
+
+#[cfg(feature = "subscriptions")]
+fn subscription_u32_from_env(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "subscriptions")]
+fn subscription_duration_ms_from_env(
+    name: &str,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(default)
+}
+
+/// Build SMTP settings for the email subscription channel from `HFS_SUBSCRIPTION_SMTP_*`
+/// environment variables. Returns `None` when `HOST` or `FROM` is unset — in that
+/// case the email channel is not advertised and any email Subscription is rejected.
+#[cfg(feature = "subscriptions")]
+fn build_smtp_settings_from_env() -> Option<helios_subscriptions::config::SmtpSettings> {
+    use helios_subscriptions::config::{SmtpEncryption, SmtpSettings};
+
+    let host = std::env::var("HFS_SUBSCRIPTION_SMTP_HOST").ok()?;
+    let from_address = std::env::var("HFS_SUBSCRIPTION_SMTP_FROM").ok()?;
+    if host.trim().is_empty() || from_address.trim().is_empty() {
+        return None;
+    }
+
+    let port = std::env::var("HFS_SUBSCRIPTION_SMTP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+    let encryption = std::env::var("HFS_SUBSCRIPTION_SMTP_ENCRYPTION")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+        .and_then(|v| match v {
+            "none" => Some(SmtpEncryption::None),
+            "starttls" => Some(SmtpEncryption::StartTls),
+            "tls" => Some(SmtpEncryption::Tls),
+            _ => None,
+        })
+        .unwrap_or(SmtpEncryption::StartTls);
+    let username = std::env::var("HFS_SUBSCRIPTION_SMTP_USERNAME")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let password = std::env::var("HFS_SUBSCRIPTION_SMTP_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let default_subject = std::env::var("HFS_SUBSCRIPTION_SMTP_DEFAULT_SUBJECT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let timeout_secs = std::env::var("HFS_SUBSCRIPTION_SMTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
+    Some(SmtpSettings {
+        host,
+        port,
+        username,
+        password,
+        encryption,
+        from_address,
+        default_subject,
+        timeout_secs,
+    })
+}
+
+#[cfg(feature = "subscriptions")]
+fn build_messaging_settings_from_env(
+    base_url: &str,
+) -> Option<helios_subscriptions::config::MessagingSettings> {
+    use helios_subscriptions::config::MessagingSettings;
+
+    let enabled = std::env::var("HFS_SUBSCRIPTION_MESSAGING_ENABLED")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    let source_endpoint = std::env::var("HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| base_url.to_string());
+
+    let allow_private_endpoints = std::env::var("HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false);
+
+    Some(MessagingSettings {
+        source_endpoint,
+        allow_private_endpoints,
+    })
 }
 
 /// Builds the CORS layer based on configuration.
@@ -507,8 +713,8 @@ pub fn init_logging(level: &str) {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(format!(
-            "helios_hfs={},helios_rest={},helios_persistence={},tower_http=debug",
-            level, level, level
+            "helios_hfs={},helios_rest={},helios_persistence={},helios_subscriptions={},tower_http=debug",
+            level, level, level, level
         ))
     });
 

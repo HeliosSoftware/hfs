@@ -26,16 +26,19 @@ s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types"]
 # Configuration advisor binary
 advisor = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber"]
 
-# FHIR version features (pass through to helios-fhir)
-R4 = ["helios-fhir/R4"]
-R4B = ["helios-fhir/R4B"]
-R5 = ["helios-fhir/R5"]
-R6 = ["helios-fhir/R6"]
+# Audit event integration
+audit = ["dep:helios-audit"]
+
+# FHIR version features (pass through to helios-fhir and helios-fhirpath)
+R4 = ["helios-fhir/R4", "helios-fhirpath/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhirpath/R5"]
+R6 = ["helios-fhir/R6", "helios-fhirpath/R6"]
 
 [dependencies]
 # Core dependencies (always included)
-helios-fhir = { path = "../fhir", version = "0.1.47" }
-helios-fhirpath = { path = "../fhirpath", version = "0.1.47" }
+helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
+helios-fhirpath = { path = "../fhirpath", version = "0.1.47", default-features = false }
 helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.47" }
 rust_decimal = "1"
 serde.workspace = true
@@ -78,9 +81,15 @@ neo4rs = { version = "0.8", optional = true }
 elasticsearch = { version = "8.15.0-alpha.1", optional = true }
 
 # S3 backend
-aws-sdk-s3 = { version = "1", optional = true }
+# Disable default features to avoid the legacy `rustls` feature that pulls
+# in vulnerable rustls 0.21 / rustls-webpki 0.101. `default-https-client`
+# uses the modern rustls-aws-lc path instead.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
+
+# Audit event integration
+helios-audit = { path = "../audit", version = "0.1.47", optional = true }
 
 # Configuration advisor HTTP server
 axum = { version = "0.8", optional = true }
@@ -96,9 +105,16 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
 tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
-testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "elastic_search", "minio"] }
 paste = "1.0"
+
+# `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.
+# Windows test runs don't need SIGTERM cleanup, so drop the feature there.
+[target.'cfg(not(windows))'.dev-dependencies]
+testcontainers = { version = "0.27", features = ["watchdog"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+testcontainers = { version = "0.27" }
 
 # Configuration advisor binary
 [[bin]]

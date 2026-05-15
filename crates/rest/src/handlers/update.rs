@@ -13,6 +13,7 @@ use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirResource, FhirVersionExtractor, TenantExtractor};
+use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
@@ -66,6 +67,14 @@ pub async fn update_handler<S>(
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
+    // AuditEvent resources are immutable — block write operations
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "PUT".to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
+
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version();
 
@@ -175,6 +184,23 @@ where
         "Resource updated"
     );
 
+    // Emit subscription event
+    #[cfg(feature = "subscriptions")]
+    if let Some(engine) = state.subscription_engine() {
+        let event_type = if created {
+            helios_subscriptions::ResourceEventType::Create
+        } else {
+            helios_subscriptions::ResourceEventType::Update
+        };
+        super::subscription_event::emit_subscription_event(
+            engine,
+            tenant.context(),
+            &stored,
+            fhir_version,
+            event_type,
+        );
+    }
+
     build_update_response(
         status,
         &stored,
@@ -184,6 +210,16 @@ where
         &prefer,
         negotiated.format,
     )
+    .map(|mut response| {
+        response
+            .extensions_mut()
+            .insert(helios_audit::AuditResponseContext {
+                resource_type: Some(resource_type.clone()),
+                resource_id: Some(stored.id().to_string()),
+                patient_reference: extract_patient_from_resource(&resource_type, stored.content()),
+            });
+        response
+    })
 }
 
 /// Conditional update handler.
@@ -265,6 +301,19 @@ where
                 &prefer,
                 negotiated.format,
             )
+            .map(|mut response| {
+                response
+                    .extensions_mut()
+                    .insert(helios_audit::AuditResponseContext {
+                        resource_type: Some(resource_type.clone()),
+                        resource_id: Some(stored.id().to_string()),
+                        patient_reference: extract_patient_from_resource(
+                            &resource_type,
+                            stored.content(),
+                        ),
+                    });
+                response
+            })
         }
         ConditionalUpdateResult::Created(stored) => {
             let headers = ResourceHeaders::from_stored(&stored, &state);
@@ -277,6 +326,19 @@ where
                 &prefer,
                 negotiated.format,
             )
+            .map(|mut response| {
+                response
+                    .extensions_mut()
+                    .insert(helios_audit::AuditResponseContext {
+                        resource_type: Some(resource_type.clone()),
+                        resource_id: Some(stored.id().to_string()),
+                        patient_reference: extract_patient_from_resource(
+                            &resource_type,
+                            stored.content(),
+                        ),
+                    });
+                response
+            })
         }
         ConditionalUpdateResult::NoMatch => {
             // With upsert=true, this shouldn't happen, but handle it

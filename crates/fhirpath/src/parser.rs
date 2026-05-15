@@ -480,6 +480,43 @@ fn clean_backtick_identifier(id: &str) -> String {
     }
 }
 
+/// Combines a sequence of code units (from literal scalars and `\uXXXX` escapes)
+/// into a FHIRPath string. Adjacent high/low UTF-16 surrogate escapes are joined
+/// into a single Unicode scalar value; unpaired surrogates are rejected. This
+/// matches the FHIRPath string-literal rules (FHIR-53554).
+fn combine_string_code_units(codes: Vec<u32>) -> Result<String, &'static str> {
+    let mut out = String::with_capacity(codes.len());
+    let mut i = 0;
+    while i < codes.len() {
+        let c = codes[i];
+        if (0xD800..=0xDBFF).contains(&c) {
+            if let Some(&lo) = codes.get(i + 1) {
+                if (0xDC00..=0xDFFF).contains(&lo) {
+                    let scalar = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                    match char::from_u32(scalar) {
+                        Some(ch) => {
+                            out.push(ch);
+                            i += 2;
+                            continue;
+                        }
+                        None => return Err("Invalid surrogate pair"),
+                    }
+                }
+            }
+            return Err("Unpaired high surrogate in \\uXXXX escape");
+        }
+        if (0xDC00..=0xDFFF).contains(&c) {
+            return Err("Unpaired low surrogate in \\uXXXX escape");
+        }
+        match char::from_u32(c) {
+            Some(ch) => out.push(ch),
+            None => return Err("Invalid Unicode code point"),
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
 /// Creates a parser for FHIRPath expressions
 ///
 /// This function creates and returns a parser that can parse FHIRPath expressions
@@ -539,32 +576,30 @@ where
 
 pub fn parser<'src>()
 -> impl Parser<'src, &'src str, Expression, extra::Err<Rich<'src, char>>> + Clone + 'src {
-    // Parser for escape sequences within string literals
-    // Handles standard escape sequences like \n, \t, \r, etc., plus Unicode
-    // escape sequences in the form \uXXXX where XXXX is a 4-digit hex code.
+    // Parser for escape sequences within string literals. Produces a raw
+    // code unit (u32) so that `\uXXXX` UTF-16 surrogate escapes can be paired
+    // into a single scalar value by `combine_string_code_units`.
     let esc = just('\\').ignore_then(choice((
-        just('`').to('`'),        // Backtick escape
-        just('\'').to('\''),      // Single quote escape
-        just('\\').to('\\'),      // Backslash escape
-        just('/').to('/'),        // Forward slash escape
-        just('f').to('\u{000C}'), // Form feed
-        just('n').to('\n'),       // Newline
-        just('r').to('\r'),       // Carriage return
-        just('t').to('\t'),       // Tab
-        just('"').to('"'),        // Double quote escape
-        // Unicode escape sequence: \uXXXX
+        just('`').to('`' as u32),
+        just('\'').to('\'' as u32),
+        just('\\').to('\\' as u32),
+        just('/').to('/' as u32),
+        just('f').to(0x000C_u32),
+        just('n').to('\n' as u32),
+        just('r').to('\r' as u32),
+        just('t').to('\t' as u32),
+        just('"').to('"' as u32),
+        // Unicode escape sequence: \uXXXX. May be a surrogate half that will
+        // be paired with a following escape in `combine_string_code_units`.
         just('u').ignore_then(
             any()
                 .filter(|c: &char| c.is_ascii_hexdigit())
                 .repeated()
-                .exactly(4) // Require exactly 4 hex digits
+                .exactly(4)
                 .collect::<String>()
                 .try_map(
                     |digits: String, span| match u32::from_str_radix(&digits, 16) {
-                        Ok(code) => match char::from_u32(code) {
-                            Some(c) => Ok(c),
-                            None => Err(Rich::custom(span, "Invalid Unicode code point")),
-                        },
+                        Ok(code) => Ok(code),
                         Err(_) => Err(Rich::custom(span, "Invalid hex digits")),
                     },
                 ),
@@ -596,13 +631,15 @@ pub fn parser<'src>()
     // Handles escape sequences and allows any characters between single quotes
     let string = just('\'')
         .ignore_then(
-            none_of("\\\'") // Any character except \ or '
-                .or(esc) // Or an escape sequence
+            none_of("\\\'")
+                .map(|c: char| c as u32)
+                .or(esc)
                 .repeated()
-                .collect::<String>(),
+                .collect::<Vec<u32>>(),
         )
-        .then_ignore(just('\'')) // End with a closing quote
-        .map(Literal::String) // Convert to String literal
+        .then_ignore(just('\''))
+        .try_map(|codes, span| combine_string_code_units(codes).map_err(|e| Rich::custom(span, e)))
+        .map(Literal::String)
         .boxed();
 
     // Parser for integer literals
@@ -857,12 +894,14 @@ pub fn parser<'src>()
     // These are arbitrary units enclosed in single quotes
     let unit_string_literal = just('\'')
         .ignore_then(
-            none_of("\\\'") // Any character except \ or '
-                .or(esc) // Or an escape sequence
+            none_of("\\\'")
+                .map(|c: char| c as u32)
+                .or(esc)
                 .repeated()
-                .collect::<String>(),
+                .collect::<Vec<u32>>(),
         )
-        .then_ignore(just('\''));
+        .then_ignore(just('\''))
+        .try_map(|codes, span| combine_string_code_units(codes).map_err(|e| Rich::custom(span, e)));
 
     // Combined parser for all unit forms
     let unit = choice((
@@ -1021,8 +1060,15 @@ pub fn parser<'src>()
 
     // DELIMITEDIDENTIFIER: '`' (ESC | .)*? '`'
     let delimited_identifier = just('`')
-        .ignore_then(none_of("`").or(esc).repeated().collect::<String>())
+        .ignore_then(
+            none_of("`")
+                .map(|c: char| c as u32)
+                .or(esc)
+                .repeated()
+                .collect::<Vec<u32>>(),
+        )
         .then_ignore(just('`'))
+        .try_map(|codes, span| combine_string_code_units(codes).map_err(|e| Rich::custom(span, e)))
         .padded();
 
     // Combined identifier parser - allow true/false as identifiers
@@ -1088,8 +1134,15 @@ pub fn parser<'src>()
 
     // Create a separate string parser for external constants
     let string_for_external = just('\'')
-        .ignore_then(none_of("\'\\").or(esc).repeated().collect::<String>())
+        .ignore_then(
+            none_of("\'\\")
+                .map(|c: char| c as u32)
+                .or(esc)
+                .repeated()
+                .collect::<Vec<u32>>(),
+        )
         .then_ignore(just('\''))
+        .try_map(|codes, span| combine_string_code_units(codes).map_err(|e| Rich::custom(span, e)))
         .padded();
 
     // External constants
@@ -1403,17 +1456,18 @@ pub fn parser<'src>()
 /// using chumsky's `map_with` combinator.
 pub fn spanned_parser<'src>()
 -> impl Parser<'src, &'src str, SpannedExpression, extra::Err<Rich<'src, char>>> + Clone + 'src {
-    // Parser for escape sequences (same as parser())
+    // Parser for escape sequences (same as parser()). Emits a raw code unit
+    // so surrogate pairs can be combined in `combine_string_code_units`.
     let esc = just('\\').ignore_then(choice((
-        just('`').to('`'),
-        just('\'').to('\''),
-        just('\\').to('\\'),
-        just('/').to('/'),
-        just('f').to('\u{000C}'),
-        just('n').to('\n'),
-        just('r').to('\r'),
-        just('t').to('\t'),
-        just('"').to('"'),
+        just('`').to('`' as u32),
+        just('\'').to('\'' as u32),
+        just('\\').to('\\' as u32),
+        just('/').to('/' as u32),
+        just('f').to(0x000C_u32),
+        just('n').to('\n' as u32),
+        just('r').to('\r' as u32),
+        just('t').to('\t' as u32),
+        just('"').to('"' as u32),
         just('u').ignore_then(
             any()
                 .filter(|c: &char| c.is_ascii_hexdigit())
@@ -1422,10 +1476,7 @@ pub fn spanned_parser<'src>()
                 .collect::<String>()
                 .try_map(
                     |digits: String, span| match u32::from_str_radix(&digits, 16) {
-                        Ok(code) => match char::from_u32(code) {
-                            Some(c) => Ok(c),
-                            None => Err(Rich::custom(span, "Invalid Unicode code point")),
-                        },
+                        Ok(code) => Ok(code),
                         Err(_) => Err(Rich::custom(span, "Invalid hex digits")),
                     },
                 ),
@@ -1443,8 +1494,15 @@ pub fn spanned_parser<'src>()
     .boxed();
 
     let string = just('\'')
-        .ignore_then(none_of("\\\'").or(esc).repeated().collect::<String>())
+        .ignore_then(
+            none_of("\\\'")
+                .map(|c: char| c as u32)
+                .or(esc)
+                .repeated()
+                .collect::<Vec<u32>>(),
+        )
         .then_ignore(just('\''))
+        .try_map(|codes, span| combine_string_code_units(codes).map_err(|e| Rich::custom(span, e)))
         .map(Literal::String)
         .boxed();
 
@@ -1622,8 +1680,15 @@ pub fn spanned_parser<'src>()
     ));
 
     let unit_string_literal = just('\'')
-        .ignore_then(none_of("\\\'").or(esc).repeated().collect::<String>())
-        .then_ignore(just('\''));
+        .ignore_then(
+            none_of("\\\'")
+                .map(|c: char| c as u32)
+                .or(esc)
+                .repeated()
+                .collect::<Vec<u32>>(),
+        )
+        .then_ignore(just('\''))
+        .try_map(|codes, span| combine_string_code_units(codes).map_err(|e| Rich::custom(span, e)));
 
     let unit = choice((unit_keyword, unit_string_literal)).boxed().padded();
 
@@ -1759,8 +1824,15 @@ pub fn spanned_parser<'src>()
         .padded();
 
     let delimited_identifier = just('`')
-        .ignore_then(none_of("`").or(esc).repeated().collect::<String>())
+        .ignore_then(
+            none_of("`")
+                .map(|c: char| c as u32)
+                .or(esc)
+                .repeated()
+                .collect::<Vec<u32>>(),
+        )
         .then_ignore(just('`'))
+        .try_map(|codes, span| combine_string_code_units(codes).map_err(|e| Rich::custom(span, e)))
         .padded();
 
     let identifier = choice((
@@ -1804,8 +1876,15 @@ pub fn spanned_parser<'src>()
     let qualified_identifier = custom_padded(qualified_identifier);
 
     let string_for_external = just('\'')
-        .ignore_then(none_of("\'\\").or(esc).repeated().collect::<String>())
+        .ignore_then(
+            none_of("\'\\")
+                .map(|c: char| c as u32)
+                .or(esc)
+                .repeated()
+                .collect::<Vec<u32>>(),
+        )
         .then_ignore(just('\''))
+        .try_map(|codes, span| combine_string_code_units(codes).map_err(|e| Rich::custom(span, e)))
         .padded();
 
     let external_constant = just('%')

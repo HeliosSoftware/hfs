@@ -27,9 +27,29 @@ pub mod read;
 pub mod search;
 pub mod smart_discovery;
 pub mod sof;
+#[cfg(feature = "subscriptions")]
+pub mod subscription_event;
+#[cfg(feature = "subscriptions")]
+pub mod subscriptions;
 pub mod update;
 pub mod versions;
 pub mod vread;
+#[cfg(feature = "subscriptions")]
+pub mod ws;
+
+/// Resolves a patient reference from a resource body for audit enrichment.
+pub(crate) fn extract_patient_from_resource(
+    resource_type: &str,
+    resource: &serde_json::Value,
+) -> Option<String> {
+    let resource_id = resource.get("id").and_then(serde_json::Value::as_str);
+    helios_audit::patient::PatientResolver::resolve(
+        resource_type,
+        resource_id,
+        Some(resource),
+        None,
+    )
+}
 
 // Re-export handlers for convenience
 pub use batch::batch_handler;

@@ -1,0 +1,672 @@
+//! Domain types shared across HTS operations and storage backends.
+//!
+//! These structs model the request/response contracts for all FHIR terminology
+//! operations: `$lookup`, `$validate-code`, `$subsumes`, `$expand`,
+//! `$translate`, and `$closure`.
+#![allow(dead_code)]
+
+use serde::{Deserialize, Serialize};
+
+// ─── Shared helpers ────────────────────────────────────────────────────────────
+
+/// A property value attached to a concept (arbitrary FHIR property).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PropertyValue {
+    /// Property code (e.g. "parent", "inactive", "synonym")
+    pub code: String,
+    /// FHIR property type: code | string | boolean | integer | decimal | dateTime
+    pub value_type: String,
+    /// Serialised value (always a string for simplicity; callers cast as needed)
+    pub value: String,
+    /// Human-readable description of the property (optional)
+    pub description: Option<String>,
+}
+
+/// An alternate name or translation for a concept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DesignationValue {
+    pub language: Option<String>,
+    pub use_system: Option<String>,
+    pub use_code: Option<String>,
+    pub value: String,
+    /// CodeSystem URL (`url|version` when known) that contributed this
+    /// designation. `None` for the base CodeSystem; `Some` when the value was
+    /// merged in from an applied supplement (FHIR `useSupplement`). Surfaced
+    /// in `$lookup` responses as a `designation.source` part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+// ─── $lookup ──────────────────────────────────────────────────────────────────
+
+/// Request for `CodeSystem/$lookup`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct LookupRequest {
+    /// CodeSystem canonical URL.
+    pub system: String,
+    /// Concept code to look up.
+    pub code: String,
+    /// Optional version of the code system.
+    pub version: Option<String>,
+    /// Preferred language for display.
+    pub display_language: Option<String>,
+    /// SNOMED post-coordination expression — returns `NotSupported` in SQLite MVP.
+    pub expression: Option<String>,
+    /// Which properties to include in the response (empty = all).
+    pub properties: Vec<String>,
+    /// Point-in-time date for evaluation (ISO-8601). Only resources whose
+    /// `$.date` field is ≤ this value are considered.
+    #[serde(default)]
+    pub date: Option<String>,
+    /// Canonical URLs of CodeSystem supplements to apply on top of the base
+    /// CodeSystem. Each must be the URL of a stored CodeSystem with
+    /// `content=supplement` and `supplements=<base url>`. The supplement's
+    /// designations and properties for the requested code (matched by code)
+    /// are merged into the response. See FHIR R5 §4.7.10 (CodeSystem
+    /// supplements) and the IG `useSupplement` parameter.
+    #[serde(default)]
+    pub use_supplements: Vec<String>,
+}
+
+/// Response from `CodeSystem/$lookup`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct LookupResponse {
+    /// The canonical name of the code system.
+    pub name: String,
+    pub version: Option<String>,
+    pub display: Option<String>,
+    /// Optional concept definition text — surfaced as a top-level
+    /// `definition` parameter in the FHIR Parameters response.
+    #[serde(default)]
+    pub definition: Option<String>,
+    pub properties: Vec<PropertyValue>,
+    pub designations: Vec<DesignationValue>,
+}
+
+// ─── $validate-code ───────────────────────────────────────────────────────────
+
+/// Request for `CodeSystem/$validate-code` and `ValueSet/$validate-code`.
+///
+/// Either `url` (for a ValueSet) or `system` (for a CodeSystem) should be set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ValidateCodeRequest {
+    /// ValueSet URL (used when validating against a value set).
+    pub url: Option<String>,
+    /// ValueSet version pin (per FHIR `valueSetVersion` request param). When
+    /// set, only the matching `(url, version)` ValueSet is consulted; without
+    /// it the highest-versioned ValueSet sharing the URL wins.
+    #[serde(default)]
+    pub value_set_version: Option<String>,
+    /// CodeSystem URL (used when validating directly against a code system).
+    pub system: Option<String>,
+    /// The code to validate.
+    pub code: String,
+    /// Optional version.
+    pub version: Option<String>,
+    /// Expected display; if provided the response includes whether it matches.
+    pub display: Option<String>,
+    /// FHIR `abstract` parameter — when explicitly false, abstract concepts
+    /// (those with `notSelectable=true`) are rejected with a "code is
+    /// abstract, and not allowed in this context" message. None / true mean
+    /// abstract concepts pass when the VS otherwise contains them.
+    #[serde(default)]
+    pub include_abstract: Option<bool>,
+    /// Point-in-time date for evaluation (ISO-8601).
+    #[serde(default)]
+    pub date: Option<String>,
+    /// Which FHIR parameter form was used to supply the code. One of:
+    /// `"code"` (bare code), `"coding"` (valueCoding), `"codeableConcept"`.
+    /// Drives the `location[]` field in version-mismatch issues.
+    #[serde(default)]
+    pub input_form: Option<String>,
+    /// When true, display mismatches are reported as `severity: warning`
+    /// and do not flip `result` to false. Corresponds to the FHIR
+    /// `lenient-display-validation` parameter.
+    #[serde(default)]
+    pub lenient_display_validation: Option<bool>,
+    /// `default-valueset-version` request param: per-canonical-URL version
+    /// pins applied when a `compose.include[].valueSet[]` reference (or the
+    /// top-level `url`) does not carry an explicit `|version`. The keys are
+    /// bare canonical URLs (no `|version` suffix); the values are the
+    /// pinned versions. Mirrors `force-system-version` for value sets.
+    #[serde(default)]
+    pub default_value_set_versions: std::collections::HashMap<String, String>,
+}
+
+/// One discrete concern detected during `$validate-code`. Multiple issues are
+/// joined into a single `OperationOutcome.issue[]` in the response, and their
+/// text values are concatenated (sorted, semicolon-separated) into the
+/// top-level `message` parameter — that matches the IG tx-ecosystem fixtures
+/// in `validation/`, `notSelectable/`, `inactive/`, etc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationIssue {
+    /// `error` | `warning` | `information`. The IG drives `result=false` from
+    /// any error-severity issue; warnings/info do not.
+    pub severity: String,
+    /// FHIR `OperationOutcome.issue.code` (e.g. `code-invalid`, `not-found`,
+    /// `business-rule`, `invalid`).
+    pub fhir_code: String,
+    /// FHIR tx-issue-type code emitted in `details.coding` (e.g. `not-in-vs`,
+    /// `not-found`, `code-rule`, `code-comment`, `invalid-display`).
+    pub tx_code: String,
+    /// Human-readable text — also concatenated into the top-level `message`.
+    pub text: String,
+    /// FHIRPath-style path inside the input (e.g. `Coding.code`).
+    /// Emitted as `expression[]`. Stripped to bare form for `BareCode` requests.
+    pub expression: Option<String>,
+    /// Structural location — emitted as `location[]` only. Set alongside
+    /// `expression` for version-mismatch issues (`vs-invalid`, `not-found`
+    /// UNKNOWN_CODESYSTEM_VERSION) and `code-comment`; `None` for all others.
+    pub location: Option<String>,
+    /// IG `operationoutcome-message-id` extension value (e.g.
+    /// `None_of_the_provided_codes_are_in_the_value_set_one`). The fixtures
+    /// mark the extension `$optional$: "!tx.fhir.org"`, so it's optional —
+    /// but supplying it improves diagnostic equivalence.
+    pub message_id: Option<String>,
+}
+
+/// Response from `$validate-code`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ValidateCodeResponse {
+    /// `true` if the code is valid.
+    pub result: bool,
+    /// Explanation when `result` is `false`, or a confirmation message.
+    pub message: Option<String>,
+    /// The preferred display for the code (present on success).
+    pub display: Option<String>,
+    /// CodeSystem URL the matched concept came from. Set when the operations
+    /// layer used `inferSystem=true` (or the request omitted `system` and the
+    /// backend inferred it from the VS expansion). Surfaces as the top-level
+    /// `system` parameter so the IG `inferSystem` fixtures can echo it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    /// The CodeSystem version that the backend actually resolved and used
+    /// during validation. Populated by the storage backend so the operations
+    /// layer can echo the correct version regardless of what the caller
+    /// requested. `None` when the system is unknown or has no stored version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cs_version: Option<String>,
+    /// `Some(true)` when the matched concept is inactive (status in
+    /// retired/deprecated/withdrawn/inactive). The IG fixtures expect this
+    /// to surface as a top-level `inactive` parameter on the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive: Option<bool>,
+    /// Structured per-concern issues. The operations layer renders these as
+    /// `OperationOutcome.issue[]` entries inside the `issues` parameter and
+    /// joins their `.text` values into the top-level `message` parameter.
+    /// When empty, the operations layer falls back to the legacy single-issue
+    /// path driven off `message`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<ValidationIssue>,
+    /// When set, emitted as `x-caused-by-unknown-system` in the Parameters
+    /// response. Carries the `url|version` canonical for version-not-found
+    /// cases (e.g. the caller requested version 1.0.0 but only 0.1.0 exists).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caused_by_unknown_system: Option<String>,
+    /// When set, emitted as a top-level `status` parameter on the response —
+    /// surfaces the concept's `structuredefinition-standards-status` extension
+    /// value (e.g. `deprecated`, `withdrawn`). Distinct from the FHIR concept
+    /// `status` property — purely a render-time marker so the IG fixtures
+    /// `extensions/validate-code-inactive` etc. can echo the deprecated state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_status: Option<String>,
+    /// When set, emitted as a top-level `normalized-code` parameter on the
+    /// response. Populated when the caller's code differs from the canonical
+    /// code in a `caseSensitive: false` CodeSystem — the IG `case/` fixtures
+    /// expect the canonical (correct-case) code echoed back so consumers can
+    /// see what the case-insensitive match resolved to. The accompanying
+    /// `CODE_CASE_DIFFERENCE` informational issue (added by the backend)
+    /// describes which input differed and what the canonical form is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_code: Option<String>,
+}
+
+// ─── $subsumes ────────────────────────────────────────────────────────────────
+
+/// The four possible outcomes of `CodeSystem/$subsumes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubsumptionOutcome {
+    /// code_a and code_b are the same concept.
+    Equivalent,
+    /// code_a subsumes code_b (code_a is an ancestor of code_b).
+    Subsumes,
+    /// code_a is subsumed by code_b (code_a is a descendant of code_b).
+    SubsumedBy,
+    /// Neither code subsumes the other.
+    NotSubsumed,
+}
+
+impl SubsumptionOutcome {
+    /// Returns the FHIR-specified string value for this outcome.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Equivalent => "equivalent",
+            Self::Subsumes => "subsumes",
+            Self::SubsumedBy => "subsumed-by",
+            Self::NotSubsumed => "not-subsumed",
+        }
+    }
+}
+
+/// Request for `CodeSystem/$subsumes`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubsumesRequest {
+    /// CodeSystem canonical URL.
+    pub system: String,
+    /// Optional version.
+    pub version: Option<String>,
+    /// First code.
+    pub code_a: String,
+    /// Second code.
+    pub code_b: String,
+}
+
+/// Response from `CodeSystem/$subsumes`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubsumesResponse {
+    pub outcome: SubsumptionOutcome,
+}
+
+// ─── $expand ──────────────────────────────────────────────────────────────────
+
+/// A single concept in a ValueSet expansion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpansionContains {
+    /// Code system URL.
+    pub system: String,
+    /// Code system version this concept came from. Set by the backend when the
+    /// expansion draws from a specific CS version. The operations layer clears
+    /// it when all contains items for a given system share the same version
+    /// (FHIR only requires `version` when the expansion mixes versions of the
+    /// same system URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub code: String,
+    pub display: Option<String>,
+    /// FHIR `abstract` flag — mirrors the concept's `notSelectable` property.
+    /// Populated by the operations layer post-expansion via a batch lookup.
+    #[serde(default, rename = "abstract")]
+    pub is_abstract: Option<bool>,
+    pub inactive: Option<bool>,
+    /// Designations attached to this concept (translations, alternate
+    /// labels). Populated post-expansion when the caller asked for
+    /// `includeDesignations=true`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub designations: Vec<ExpansionContainsDesignation>,
+    /// Properties attached to this concept (FHIR concept properties).
+    /// Populated post-expansion when the caller passed a `property`
+    /// parameter naming one or more property codes to surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<ExpansionContainsProperty>,
+    /// Concept-level FHIR extensions (e.g. `rendering-style`, `rendering-xhtml`,
+    /// `valueset-deprecated`, `valueset-concept-definition`). Populated
+    /// post-expansion from the base CodeSystem `concept[].extension[]` and
+    /// any applied supplement's matching concept entry. Each value is an
+    /// already-rendered FHIR `Extension` JSON object.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<serde_json::Value>,
+    /// Nested contains for hierarchical expansions.
+    #[serde(default)]
+    pub contains: Vec<ExpansionContains>,
+}
+
+/// One property entry on an `ExpansionContains` — mirrors the FHIR
+/// `expansion.contains[].property[]` shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpansionContainsProperty {
+    pub code: String,
+    /// FHIR `value[x]` type label (e.g. "Code", "String", "Boolean").
+    pub value_type: String,
+    /// Serialised value (always a string; the serializer routes it to the
+    /// correct FHIR `value[x]` field based on `value_type`).
+    pub value: String,
+}
+
+/// One designation entry on an `ExpansionContains`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpansionContainsDesignation {
+    pub language: Option<String>,
+    /// `{system, code}` of the designation use; both optional.
+    pub use_system: Option<String>,
+    pub use_code: Option<String>,
+    pub value: String,
+    /// Designation-level FHIR extensions (e.g. `coding-sctdescid`,
+    /// `structuredefinition-standards-status`). Populated post-expansion from
+    /// the originating CodeSystem `concept[].designation[].extension[]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<serde_json::Value>,
+}
+
+/// Request for `ValueSet/$expand`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ExpandRequest {
+    /// ValueSet canonical URL.
+    pub url: Option<String>,
+    /// ValueSet version pin (per FHIR `valueSetVersion` request param). When
+    /// set, only the matching `(url, version)` ValueSet is consulted; without
+    /// it the highest-versioned ValueSet sharing the URL wins.
+    #[serde(default)]
+    pub value_set_version: Option<String>,
+    /// Inline ValueSet resource (used when no `url` is provided).
+    pub value_set: Option<serde_json::Value>,
+    /// Free-text filter applied to code + display.
+    pub filter: Option<String>,
+    /// Maximum number of codes to return.
+    pub count: Option<u32>,
+    /// Zero-based offset for pagination.
+    pub offset: Option<u32>,
+    /// Server-side ceiling: if the full (unfiltered) expansion exceeds this
+    /// value the backend returns `HtsError::TooCostly`. `None` means no limit.
+    #[serde(skip)]
+    pub max_expansion_size: Option<u32>,
+    /// Point-in-time date for evaluation (ISO-8601).
+    #[serde(default)]
+    pub date: Option<String>,
+    /// When `true`, return a tree-structured expansion using the CodeSystem
+    /// hierarchy instead of a flat list. Pagination is not applied in tree mode.
+    #[serde(default)]
+    pub hierarchical: Option<bool>,
+    /// When `true`, the caller explicitly set the legacy HL7-tx
+    /// `hierarchical=true` parameter (rather than triggering tree mode via
+    /// `excludeNested=false`). Backends use this to decide whether to nest
+    /// enumerated expansions: `hierarchical=true` always builds a tree;
+    /// `excludeNested=false` keeps enumerated VSes flat to match the IG
+    /// `parameters/parameters-expand-enum-*` fixtures.
+    #[serde(default)]
+    pub hierarchical_explicit: bool,
+    /// `tx-resource` parameters supplied with the request.
+    ///
+    /// Each entry is a FHIR resource (typically a `ValueSet`) whose canonical
+    /// URL becomes resolvable for this single request only — the resource is
+    /// never persisted to the database. Used by the tx-ecosystem IG to provide
+    /// ad-hoc terminology that the caller doesn't want to upload separately.
+    /// Resolution order during nested `compose.include[].valueSet[]` walks:
+    /// `tx-resource` map first, then the local store, then NotFound.
+    #[serde(default)]
+    pub tx_resources: Vec<serde_json::Value>,
+    /// CodeSystem-version overrides forced by the `force-system-version`
+    /// $expand parameter (FHIR R5 §4.9.5 / IG `version/parameters-fixed-version`
+    /// profile).  Maps a CodeSystem canonical URL → version pin (which may be
+    /// a literal `"1.0.0"` or a wildcard like `"1.0.x"` / `"1.x"`).  The
+    /// backend treats these as overrides applied to every
+    /// `compose.include[].system` matching the URL, regardless of any
+    /// explicit `include.version` already on the include.
+    #[serde(default)]
+    pub force_system_versions: std::collections::HashMap<String, String>,
+    /// Default CodeSystem versions from the `system-version` $expand
+    /// parameter.  Same shape as [`Self::force_system_versions`] but only
+    /// applies when the include itself does NOT pin a version.  Resolution
+    /// order: explicit `include.version` > force_system_versions >
+    /// system_version_defaults > latest stored version.
+    #[serde(default)]
+    pub system_version_defaults: std::collections::HashMap<String, String>,
+    /// `default-valueset-version` request param: per-canonical-URL version
+    /// pins applied when a `compose.include[].valueSet[]` reference (or the
+    /// top-level `url`) does not carry an explicit `|version`. The keys are
+    /// bare canonical URLs (no `|version` suffix); the values are the
+    /// pinned versions.
+    #[serde(default)]
+    pub default_value_set_versions: std::collections::HashMap<String, String>,
+}
+
+/// Response from `ValueSet/$expand`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpandResponse {
+    pub total: Option<u32>,
+    pub offset: Option<u32>,
+    pub contains: Vec<ExpansionContains>,
+    /// FHIR `expansion.parameter[].name = "warning"` messages emitted when
+    /// one or more systems in an inline compose were not loaded and were
+    /// silently excluded from the expansion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+// ─── $translate ───────────────────────────────────────────────────────────────
+
+/// A single translation match returned by `ConceptMap/$translate`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranslationMatch {
+    /// FHIR equivalence code (e.g. "equivalent", "wider", "narrower").
+    pub equivalence: String,
+    pub concept_system: String,
+    pub concept_code: String,
+    pub concept_display: Option<String>,
+    /// Reference to the source of the mapping (ConceptMap URL).
+    pub source: Option<String>,
+    /// Optional ConceptMap version, used to build the `originMap` canonical
+    /// reference (`url|version`) in the response.
+    #[serde(default)]
+    pub map_version: Option<String>,
+    /// The source-side Coding of this mapping. Populated for reverse
+    /// translations so the response can include a `source` part identifying
+    /// the original code that was reverse-mapped from.
+    #[serde(default)]
+    pub source_system: Option<String>,
+    #[serde(default)]
+    pub source_code: Option<String>,
+}
+
+/// Request for `ConceptMap/$translate`.
+///
+/// Supports both R4 parameter names (`code`, `system`) and R5 names
+/// (`sourceCode`, `sourceSystem`, `targetCode`, `targetSystem`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TranslateRequest {
+    /// ConceptMap canonical URL (optional; if absent, all maps are searched).
+    pub url: Option<String>,
+    /// Source code system URL (R4 `system` / R5 `sourceSystem`).
+    pub system: Option<String>,
+    /// Source code to translate (R4 `code` / R5 `sourceCode`).
+    /// Empty string when reverse mode is driven by `target_code` instead.
+    pub code: String,
+    /// Source value set URL.
+    pub source: Option<String>,
+    /// Target value set URL.
+    pub target: Option<String>,
+    /// Target code system URL.
+    pub target_system: Option<String>,
+    /// Target code (R5 `targetCode`) — used to drive reverse translations
+    /// without an explicit `reverse=true` flag.
+    #[serde(default)]
+    pub target_code: Option<String>,
+    /// If `true`, reverse the mapping direction (look up target → source).
+    #[serde(default)]
+    pub reverse: bool,
+    /// Point-in-time date for evaluation (ISO-8601).
+    #[serde(default)]
+    pub date: Option<String>,
+}
+
+/// Response from `ConceptMap/$translate`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranslateResponse {
+    /// `true` if at least one match was found.
+    pub result: bool,
+    pub message: Option<String>,
+    pub matches: Vec<TranslationMatch>,
+}
+
+// ─── Search ───────────────────────────────────────────────────────────────────
+
+/// Query parameters for searching CodeSystem, ValueSet, or ConceptMap resources.
+///
+/// All fields are optional — omitting a field means "no filter on that field".
+/// Multiple fields are ANDed together.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct ResourceSearchQuery {
+    /// Filter by canonical URL (exact match).
+    pub url: Option<String>,
+    /// Filter by version string (exact match).
+    pub version: Option<String>,
+    /// Filter by computer-friendly name (exact match).
+    pub name: Option<String>,
+    /// Filter by human-friendly title (exact match).
+    pub title: Option<String>,
+    /// Filter by status: `draft`, `active`, `retired`, or `unknown`.
+    pub status: Option<String>,
+    /// Maximum number of results to return (default: 20).
+    #[serde(rename = "_count")]
+    pub count: Option<u32>,
+    /// Zero-based offset for pagination (default: 0).
+    #[serde(rename = "_offset")]
+    pub offset: Option<u32>,
+    /// When `"true"`, return a summary representation without large data arrays.
+    /// Avoids reading the `resource_json` blob; returns a synthetic summary instead.
+    #[serde(rename = "_summary")]
+    pub summary: Option<String>,
+}
+
+// ─── $closure ─────────────────────────────────────────────────────────────────
+
+/// A coded concept supplied to `ConceptMap/$closure`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodingConcept {
+    pub system: String,
+    pub code: String,
+    pub display: Option<String>,
+}
+
+/// Request for `ConceptMap/$closure`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosureRequest {
+    /// Name of the closure table to maintain.
+    pub name: String,
+    /// Concepts to add to the closure table.
+    #[serde(default)]
+    pub concept: Vec<CodingConcept>,
+    pub version: Option<String>,
+}
+
+/// Response from `ConceptMap/$closure`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosureResponse {
+    /// Name of the closure table.
+    pub name: String,
+    pub version: Option<String>,
+    /// A ConceptMap resource (as JSON) representing the computed closure.
+    pub concept_map: Option<serde_json::Value>,
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subsumption_outcome_as_str() {
+        assert_eq!(SubsumptionOutcome::Equivalent.as_str(), "equivalent");
+        assert_eq!(SubsumptionOutcome::Subsumes.as_str(), "subsumes");
+        assert_eq!(SubsumptionOutcome::SubsumedBy.as_str(), "subsumed-by");
+        assert_eq!(SubsumptionOutcome::NotSubsumed.as_str(), "not-subsumed");
+    }
+
+    #[test]
+    fn subsumption_outcome_roundtrip() {
+        let outcomes = [
+            SubsumptionOutcome::Equivalent,
+            SubsumptionOutcome::Subsumes,
+            SubsumptionOutcome::SubsumedBy,
+            SubsumptionOutcome::NotSubsumed,
+        ];
+        for outcome in &outcomes {
+            let json = serde_json::to_string(outcome).unwrap();
+            let decoded: SubsumptionOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(outcome, &decoded);
+        }
+    }
+
+    #[test]
+    fn lookup_request_roundtrip() {
+        let req = LookupRequest {
+            system: "http://example.org/cs".into(),
+            code: "ABC".into(),
+            version: Some("1.0".into()),
+            display_language: None,
+            expression: None,
+            properties: vec!["display".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LookupRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn validate_code_request_roundtrip() {
+        let req = ValidateCodeRequest {
+            url: None,
+            system: Some("http://example.org/cs".into()),
+            code: "ABC".into(),
+            version: None,
+            display: Some("Alpha Beta Charlie".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: ValidateCodeRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn expand_request_roundtrip() {
+        let req = ExpandRequest {
+            url: Some("http://example.org/vs".into()),
+            count: Some(100),
+            offset: Some(0),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: ExpandRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn translate_request_default_reverse() {
+        // `reverse` defaults to false when absent from JSON
+        let json = r#"{"code":"A","system":"http://cs.org"}"#;
+        let req: TranslateRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.reverse);
+    }
+
+    #[test]
+    fn closure_request_default_concepts() {
+        // `concept` defaults to empty vec when absent from JSON
+        let json = r#"{"name":"my-closure"}"#;
+        let req: ClosureRequest = serde_json::from_str(json).unwrap();
+        assert!(req.concept.is_empty());
+    }
+
+    #[test]
+    fn expansion_contains_nested() {
+        let child = ExpansionContains {
+            system: "http://example.org/cs".into(),
+            version: None,
+            code: "CHILD".into(),
+            display: Some("Child Concept".into()),
+            is_abstract: None,
+            inactive: None,
+            designations: vec![],
+            properties: vec![],
+            extensions: vec![],
+            contains: vec![],
+        };
+        let parent = ExpansionContains {
+            system: "http://example.org/cs".into(),
+            version: None,
+            code: "PARENT".into(),
+            display: Some("Parent Concept".into()),
+            is_abstract: None,
+            inactive: None,
+            designations: vec![],
+            properties: vec![],
+            extensions: vec![],
+            contains: vec![child.clone()],
+        };
+        let json = serde_json::to_string(&parent).unwrap();
+        let decoded: ExpansionContains = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.contains.len(), 1);
+        assert_eq!(decoded.contains[0].code, "CHILD");
+    }
+}

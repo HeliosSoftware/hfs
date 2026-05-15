@@ -35,17 +35,17 @@ pub fn to_long(
         }
 
         // Integer is already a 64-bit integer in our implementation, so just return it
-        EvaluationResult::Integer(i, _) => Ok(EvaluationResult::integer(*i)),
+        EvaluationResult::Integer(i, _, _) => Ok(EvaluationResult::integer(*i)),
 
         // Decimal is converted to Long by truncating the fractional part
         // Return Empty if conversion fails (e.g., overflow)
-        EvaluationResult::Decimal(d, _) => match d.to_i64() {
+        EvaluationResult::Decimal(d, _, _) => match d.to_i64() {
             Some(i) => Ok(EvaluationResult::integer(i)),
             None => Ok(EvaluationResult::Empty),
         },
 
         // Boolean: true -> 1, false -> 0
-        EvaluationResult::Boolean(b, _) => {
+        EvaluationResult::Boolean(b, _, _) => {
             if *b {
                 Ok(EvaluationResult::integer(1))
             } else {
@@ -54,7 +54,7 @@ pub fn to_long(
         }
 
         // String: attempt to parse as a Long
-        EvaluationResult::String(s, _) => match s.parse::<i64>() {
+        EvaluationResult::String(s, _, _) => match s.parse::<i64>() {
             Ok(i) => Ok(EvaluationResult::integer(i)),
             Err(_) => Ok(EvaluationResult::Empty),
         },
@@ -93,16 +93,18 @@ pub fn converts_to_long(
         }
 
         // Integer is already a 64-bit integer in our implementation, so always convertible
-        EvaluationResult::Integer(_, _) => Ok(EvaluationResult::boolean(true)),
+        EvaluationResult::Integer(_, _, _) => Ok(EvaluationResult::boolean(true)),
 
         // Decimal is convertible if it can fit in an i64
-        EvaluationResult::Decimal(d, _) => Ok(EvaluationResult::boolean(d.to_i64().is_some())),
+        EvaluationResult::Decimal(d, _, _) => Ok(EvaluationResult::boolean(d.to_i64().is_some())),
 
         // Boolean is always convertible
-        EvaluationResult::Boolean(_, _) => Ok(EvaluationResult::boolean(true)),
+        EvaluationResult::Boolean(_, _, _) => Ok(EvaluationResult::boolean(true)),
 
         // String is convertible if it can be parsed as an i64
-        EvaluationResult::String(s, _) => Ok(EvaluationResult::boolean(s.parse::<i64>().is_ok())),
+        EvaluationResult::String(s, _, _) => {
+            Ok(EvaluationResult::boolean(s.parse::<i64>().is_ok()))
+        }
 
         // All other types are not convertible
         _ => Ok(EvaluationResult::boolean(false)),

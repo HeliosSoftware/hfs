@@ -6,13 +6,14 @@
 
 use std::sync::Arc;
 
-use crate::export::ExportJobController;
+use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::core::raw_sql::RawSqlRunner;
 use helios_persistence::core::sof_runner::SofRunner;
 
 use crate::config::ServerConfig;
+use crate::export::ExportJobController;
 use crate::middleware::auth::AuthMiddlewareState;
 
 /// Shared application state for the REST API.
@@ -56,6 +57,16 @@ pub struct AppState<S> {
 
     /// Raw SQL query runner for `$sql-query-run` (present when enabled).
     raw_sql_runner: Option<Arc<dyn RawSqlRunner>>,
+
+    /// Optional audit sink for handler-level per-entry audit emission.
+    audit_sink: Option<Arc<dyn AuditSink>>,
+
+    /// Audit source observer reference used when emitting handler-level events.
+    audit_source_observer: String,
+
+    /// Optional subscription engine for FHIR topic-based subscriptions.
+    #[cfg(feature = "subscriptions")]
+    subscription_engine: Option<Arc<helios_subscriptions::SubscriptionEngine>>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -69,6 +80,10 @@ impl<S> Clone for AppState<S> {
             sof_runner: self.sof_runner.clone(),
             export_controller: self.export_controller.clone(),
             raw_sql_runner: self.raw_sql_runner.clone(),
+            audit_sink: self.audit_sink.clone(),
+            audit_source_observer: self.audit_source_observer.clone(),
+            #[cfg(feature = "subscriptions")]
+            subscription_engine: self.subscription_engine.clone(),
         }
     }
 }
@@ -89,6 +104,10 @@ impl<S: ResourceStorage> AppState<S> {
             sof_runner: None,
             export_controller: None,
             raw_sql_runner: None,
+            audit_sink: None,
+            audit_source_observer: "Device/hfs".to_string(),
+            #[cfg(feature = "subscriptions")]
+            subscription_engine: None,
         }
     }
 
@@ -99,6 +118,18 @@ impl<S: ResourceStorage> AppState<S> {
         auth_config: AuthConfig,
         auth_state: Option<Arc<AuthMiddlewareState>>,
     ) -> Self {
+        Self::with_auth_and_audit(storage, config, auth_config, auth_state, None, "Device/hfs")
+    }
+
+    /// Creates a new AppState with auth and audit configuration.
+    pub fn with_auth_and_audit(
+        storage: Arc<S>,
+        config: ServerConfig,
+        auth_config: AuthConfig,
+        auth_state: Option<Arc<AuthMiddlewareState>>,
+        audit_sink: Option<Arc<dyn AuditSink>>,
+        audit_source_observer: impl Into<String>,
+    ) -> Self {
         Self {
             storage,
             config: Arc::new(config),
@@ -107,6 +138,10 @@ impl<S: ResourceStorage> AppState<S> {
             sof_runner: None,
             export_controller: None,
             raw_sql_runner: None,
+            audit_sink,
+            audit_source_observer: audit_source_observer.into(),
+            #[cfg(feature = "subscriptions")]
+            subscription_engine: None,
         }
     }
 
@@ -146,6 +181,16 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns the raw SQL query runner, if one has been configured.
     pub fn raw_sql_runner(&self) -> Option<&Arc<dyn RawSqlRunner>> {
         self.raw_sql_runner.as_ref()
+    }
+
+    /// Sets the subscription engine on this AppState.
+    #[cfg(feature = "subscriptions")]
+    pub fn with_subscription_engine(
+        mut self,
+        engine: Arc<helios_subscriptions::SubscriptionEngine>,
+    ) -> Self {
+        self.subscription_engine = Some(engine);
+        self
     }
 
     /// Returns a reference to the storage backend.
@@ -198,19 +243,33 @@ impl<S: ResourceStorage> AppState<S> {
         self.config.return_gone
     }
 
-    /// Returns the auth configuration.
+    /// Returns a reference to the auth configuration.
     pub fn auth_config(&self) -> &AuthConfig {
         &self.auth_config
     }
 
-    /// Returns the auth middleware state if auth is enabled.
-    pub fn auth_state(&self) -> Option<&Arc<AuthMiddlewareState>> {
-        self.auth.as_ref()
+    /// Returns the configured terminology server URL, if any.
+    ///
+    /// When `Some`, the search handler will use this URL to expand ValueSets
+    /// for `:in` and `:not-in` search modifiers.
+    pub fn terminology_server_url(&self) -> Option<&str> {
+        self.config.terminology_server.as_deref()
     }
 
-    /// Returns whether authentication is enabled.
-    pub fn auth_enabled(&self) -> bool {
-        self.auth.is_some()
+    /// Returns the audit sink for handler-level audit emission, if configured.
+    pub fn audit_sink(&self) -> Option<&Arc<dyn AuditSink>> {
+        self.audit_sink.as_ref()
+    }
+
+    /// Returns the configured audit source observer reference.
+    pub fn audit_source_observer(&self) -> &str {
+        &self.audit_source_observer
+    }
+
+    /// Returns the subscription engine, if configured.
+    #[cfg(feature = "subscriptions")]
+    pub fn subscription_engine(&self) -> Option<&Arc<helios_subscriptions::SubscriptionEngine>> {
+        self.subscription_engine.as_ref()
     }
 }
 

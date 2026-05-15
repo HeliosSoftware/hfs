@@ -185,7 +185,7 @@ where
         + Sync
         + 'static,
 {
-    Router::new()
+    let router = Router::new()
         // System-level routes
         .route("/metadata", get(handlers::capabilities_handler::<S>))
         .route("/$versions", get(handlers::versions_handler::<S>))
@@ -249,8 +249,30 @@ where
         .route(
             "/{resource_type}/{id}/_history/{version_id}",
             delete(handlers::delete_version_handler::<S>),
+        );
+
+    // Subscription operations (feature-gated, before compartment search)
+    #[cfg(feature = "subscriptions")]
+    let router = router
+        .route(
+            "/{resource_type}/{id}/$status",
+            get(handlers::subscriptions::subscription_status_handler::<S>),
         )
-        // Compartment search: GET [base]/[compartment-type]/[id]/[target-type]?params
+        .route(
+            "/{resource_type}/{id}/$events",
+            get(handlers::subscriptions::subscription_events_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$get-ws-binding-token",
+            get(handlers::subscriptions::get_ws_binding_token_handler::<S>),
+        )
+        .route(
+            "/ws/subscriptions/bind",
+            get(handlers::ws::ws_bind_handler::<S>),
+        );
+
+    // Compartment search: GET [base]/[compartment-type]/[id]/[target-type]?params
+    router
         .route(
             "/{compartment_type}/{compartment_id}/{target_type}",
             get(handlers::compartment_search_handler::<S>),

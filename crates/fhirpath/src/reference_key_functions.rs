@@ -23,17 +23,17 @@ pub fn get_resource_key_function(
         EvaluationResult::Object { map, .. } => {
             // Extract resourceType and id
             let resource_type = map.get("resourceType").and_then(|rt| match rt {
-                EvaluationResult::String(s, _) => Some(s.clone()),
+                EvaluationResult::String(s, _, _) => Some(s.clone()),
                 _ => None,
             });
 
             let id = map.get("id").and_then(|id_val| match id_val {
-                EvaluationResult::String(s, _) => Some(s.clone()),
+                EvaluationResult::String(s, _, _) => Some(s.clone()),
                 _ => None,
             });
 
             match (resource_type, id) {
-                (Some(_rt), Some(id_str)) => Ok(EvaluationResult::String(id_str, None)),
+                (Some(_rt), Some(id_str)) => Ok(EvaluationResult::String(id_str, None, None)),
                 _ => Ok(EvaluationResult::Empty),
             }
         }
@@ -72,7 +72,7 @@ pub fn get_reference_key_function(
         None
     } else {
         match &args[0] {
-            EvaluationResult::String(s, _) => Some(s.clone()),
+            EvaluationResult::String(s, _, _) => Some(s.clone()),
             EvaluationResult::Empty => {
                 // When a bare type identifier evaluates to Empty, treat as no filter
                 None
@@ -81,7 +81,7 @@ pub fn get_reference_key_function(
             result if result.type_name() == "Type" => {
                 // For type arguments like 'Patient', extract the type name
                 if let EvaluationResult::Object { map, .. } = result {
-                    if let Some(EvaluationResult::String(type_name, _)) = map.get("name") {
+                    if let Some(EvaluationResult::String(type_name, _, _)) = map.get("name") {
                         Some(type_name.clone())
                     } else {
                         None
@@ -104,7 +104,7 @@ pub fn get_reference_key_function(
             // Look for the reference field
             if let Some(reference_value) = map.get("reference") {
                 match reference_value {
-                    EvaluationResult::String(ref_str, _) => {
+                    EvaluationResult::String(ref_str, _, _) => {
                         // Parse the reference string (e.g., "Patient/123")
                         if let Some((resource_type, id)) = parse_reference(ref_str) {
                             // Check type filter if provided
@@ -115,7 +115,7 @@ pub fn get_reference_key_function(
                             }
 
                             // Return just the ID part as the key
-                            Ok(EvaluationResult::String(id, None))
+                            Ok(EvaluationResult::String(id, None, None))
                         } else {
                             Ok(EvaluationResult::Empty)
                         }
@@ -156,11 +156,11 @@ mod tests {
         let mut resource_map = HashMap::new();
         resource_map.insert(
             "resourceType".to_string(),
-            EvaluationResult::String("Patient".to_string(), None),
+            EvaluationResult::String("Patient".to_string(), None, None),
         );
         resource_map.insert(
             "id".to_string(),
-            EvaluationResult::String("123".to_string(), None),
+            EvaluationResult::String("123".to_string(), None, None),
         );
 
         let resource = EvaluationResult::Object {
@@ -171,7 +171,7 @@ mod tests {
         let result = get_resource_key_function(&resource).unwrap();
 
         match result {
-            EvaluationResult::String(key, _) => {
+            EvaluationResult::String(key, _, _) => {
                 assert_eq!(key, "123");
             }
             _ => panic!("Expected string result"),
@@ -184,7 +184,7 @@ mod tests {
         let mut reference_map = HashMap::new();
         reference_map.insert(
             "reference".to_string(),
-            EvaluationResult::String("Patient/456".to_string(), None),
+            EvaluationResult::String("Patient/456".to_string(), None, None),
         );
 
         let reference = EvaluationResult::Object {
@@ -196,25 +196,25 @@ mod tests {
         let result = get_reference_key_function(&reference, &[]).unwrap();
 
         match result {
-            EvaluationResult::String(key, _) => {
+            EvaluationResult::String(key, _, _) => {
                 assert_eq!(key, "456");
             }
             _ => panic!("Expected string result"),
         }
 
         // Test with matching type filter
-        let type_filter = EvaluationResult::String("Patient".to_string(), None);
+        let type_filter = EvaluationResult::String("Patient".to_string(), None, None);
         let result = get_reference_key_function(&reference, &[type_filter]).unwrap();
 
         match result {
-            EvaluationResult::String(key, _) => {
+            EvaluationResult::String(key, _, _) => {
                 assert_eq!(key, "456");
             }
             _ => panic!("Expected string result"),
         }
 
         // Test with non-matching type filter
-        let wrong_type_filter = EvaluationResult::String("Observation".to_string(), None);
+        let wrong_type_filter = EvaluationResult::String("Observation".to_string(), None, None);
         let result = get_reference_key_function(&reference, &[wrong_type_filter]).unwrap();
 
         assert!(matches!(result, EvaluationResult::Empty));

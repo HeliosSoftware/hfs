@@ -1,0 +1,5296 @@
+//! Handlers for `ValueSet/$expand` — type-level and instance-level.
+//!
+//! Expansion resolves all codes that belong to a ValueSet and returns them
+//! inside a `ValueSet.expansion.contains[]` array.  Four handler variants are
+//! provided:
+//!
+//! * **Type-level POST** — `POST /ValueSet/$expand` with a FHIR `Parameters` body.
+//! * **Type-level GET** — `GET /ValueSet/$expand?url=<url>`.
+//! * **Instance-level POST** — `POST /ValueSet/{id}/$expand`.
+//! * **Instance-level GET** — `GET /ValueSet/{id}/$expand?filter=...`.
+//!
+//! ## Supported parameters
+//!
+//! | Parameter | Type | Description |
+//! |-----------|------|-------------|
+//! | `url` | uri | Canonical URL of the ValueSet (type-level) |
+//! | `filter` | string | Substring filter on code or display |
+//! | `count` | integer | Page size |
+//! | `offset` | integer | Zero-based page start |
+//! | `date` | dateTime | Point-in-time ISO-8601 date for evaluation |
+//! | `hierarchical` | boolean | Return a tree-structured expansion instead of a flat list |
+//! | `excludeNested` | boolean | When `false`, return a tree-structured expansion (alias for `hierarchical=true`); when `true` or absent, return a flat list |
+//!
+//! ## Implicit ValueSets
+//!
+//! When `url` matches a CodeSystem's `valueSet` property and no explicit
+//! ValueSet resource exists for that URL, the expansion falls back to all
+//! codes in that CodeSystem (FHIR R5 §4.8.7).
+//!
+//! ## FHIR specification
+//!
+//! <https://hl7.org/fhir/valueset-operation-expand.html>
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::time::Instant;
+
+use axum::{
+    Json,
+    extract::{Path, RawQuery, State},
+    http::{HeaderMap, StatusCode, header},
+    response::Response,
+};
+use bytes::Bytes;
+use helios_persistence::tenant::TenantContext;
+use serde_json::{Value, json};
+
+use crate::error::HtsError;
+use crate::state::{
+    AppState, EXPAND_CACHE_MAX, EXPAND_HANDLER_CACHE_MAX, ExpandCacheKey, ExpandHandlerCache,
+    NOT_FOUND_CACHE_MAX,
+};
+use crate::traits::{SupplementInfo, TerminologyBackend, ValueSetOperations};
+use crate::types::{ExpandRequest, ExpansionContains};
+
+use super::format::{ResponseFormat, json_to_fhir_xml, negotiate_format};
+use super::params::{
+    collect_resource_params, extract_parameter_array, find_resource_param, find_str_param,
+    parse_query_string, query_params_to_fhir_params,
+};
+
+/// Standards-status codes that warrant a `warning-<status>` expansion
+/// parameter. The IG fixtures only ever expect these four codes; surveying
+/// the entire `tx-ecosystem-ig/tests/**` corpus turns up no other
+/// `warning-*` parameter names. Anything else (notably `normative`,
+/// `trial-use`, `informative`) is informational metadata, not a warning,
+/// and emitting it produces spurious extra parameters that fail the
+/// `exclude/exclude-gender*` and `exclude/{include,exclude}-combo`
+/// fixtures (which reference FHIR-core `administrative-gender` and
+/// `publication-status` — both shipped with `standards-status=normative`).
+const WARNING_STANDARDS_STATUSES: &[&str] = &["deprecated", "draft", "experimental", "withdrawn"];
+
+fn is_warning_status(code: &str) -> bool {
+    WARNING_STANDARDS_STATUSES.contains(&code)
+}
+
+/// Collect the standards-status codes that should fire `warning-<status>`
+/// expansion parameters for a CodeSystem or ValueSet.
+///
+/// Surveys three FHIR markers, in this order:
+///
+/// 1. The `http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status`
+///    extension's `valueCode` — typically `deprecated`, `withdrawn`, or `draft`.
+/// 2. `experimental: true` → emits `experimental` (only on CodeSystem; ValueSets
+///    use the same field but the IG fixtures don't ask for `warning-experimental`
+///    on a VS-level basis — driven by the contributing CS).
+/// 3. `status: "draft"` → emits `draft` (mirrors the standards-status pattern
+///    when the resource simply uses FHIR's status field rather than the
+///    extension).
+///
+/// Returns the deduplicated list of status codes, preserving the order above.
+/// Only codes in [`WARNING_STANDARDS_STATUSES`] survive the filter — informational
+/// statuses (`normative`, `trial-use`, …) are dropped so we don't emit phantom
+/// `warning-normative` parameters that the IG fixtures never expect.
+fn standards_statuses(resource: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |code: &str| {
+        if !code.is_empty() && is_warning_status(code) && !out.iter().any(|c| c == code) {
+            out.push(code.to_string());
+        }
+    };
+
+    if let Some(exts) = resource.get("extension").and_then(|e| e.as_array()) {
+        for ext in exts {
+            if ext.get("url").and_then(|u| u.as_str())
+                == Some(
+                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                )
+            {
+                if let Some(code) = ext.get("valueCode").and_then(|v| v.as_str()) {
+                    push_unique(code);
+                }
+            }
+        }
+    }
+
+    if resource.get("experimental").and_then(|v| v.as_bool()) == Some(true) {
+        push_unique("experimental");
+    }
+
+    if resource.get("status").and_then(|v| v.as_str()) == Some("draft") {
+        push_unique("draft");
+    }
+
+    out
+}
+
+/// Like [`standards_statuses`] but for ValueSets — only the standards-status
+/// extension contributes a warning. The bare `status` and `experimental`
+/// flags on a VS do NOT emit a `warning-<status>` per the IG fixtures
+/// (`search/*`, `deprecated/*`); those rules apply only to CodeSystems.
+fn vs_extension_statuses(resource: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(exts) = resource.get("extension").and_then(|e| e.as_array()) {
+        for ext in exts {
+            if ext.get("url").and_then(|u| u.as_str())
+                == Some(
+                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                )
+            {
+                if let Some(code) = ext.get("valueCode").and_then(|v| v.as_str()) {
+                    if !code.is_empty() && is_warning_status(code) && !out.iter().any(|c| c == code)
+                    {
+                        out.push(code.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Recursively serializes nested `contains` arrays, so that a hierarchical
+/// expansion (produced when `hierarchical=true`) is correctly represented as
+/// nested `contains[]` objects rather than a flat list.
+///
+/// The `display` field is omitted when absent, and `contains` is omitted when
+/// the entry has no children — keeping the output compact for flat expansions.
+fn serialize_expansion_contains(
+    c: &ExpansionContains,
+    multi_version_systems: &std::collections::HashSet<String>,
+) -> Value {
+    let mut item = serde_json::Map::new();
+    // Concept-level extensions appear FIRST in the IG fixtures (the FHIR
+    // canonical ordering puts `extension` ahead of `system` for any element).
+    if !c.extensions.is_empty() {
+        item.insert("extension".into(), json!(c.extensions));
+    }
+    item.insert("system".into(), json!(c.system));
+    item.insert("code".into(), json!(c.code));
+    if let Some(display) = &c.display {
+        item.insert("display".into(), json!(display));
+    }
+    // Only emit version when the expansion mixes multiple versions of this
+    // system — for single-version CSes the version is implicit (and the IG
+    // fixtures don't expect it in the contains items).
+    if multi_version_systems.contains(&c.system) {
+        if let Some(version) = &c.version {
+            item.insert("version".into(), json!(version));
+        }
+    }
+    // FHIR expansion.contains.abstract / .inactive — only emit when true.
+    if c.is_abstract == Some(true) {
+        item.insert("abstract".into(), json!(true));
+    }
+    if c.inactive == Some(true) {
+        item.insert("inactive".into(), json!(true));
+    }
+    if !c.designations.is_empty() {
+        let designations: Vec<Value> = c
+            .designations
+            .iter()
+            .map(|d| {
+                let mut entry = serde_json::Map::new();
+                if !d.extensions.is_empty() {
+                    entry.insert("extension".into(), json!(d.extensions));
+                }
+                if let Some(lang) = &d.language {
+                    entry.insert("language".into(), json!(lang));
+                }
+                if d.use_system.is_some() || d.use_code.is_some() {
+                    let mut us = serde_json::Map::new();
+                    if let Some(s) = &d.use_system {
+                        us.insert("system".into(), json!(s));
+                    }
+                    if let Some(c) = &d.use_code {
+                        us.insert("code".into(), json!(c));
+                    }
+                    entry.insert("use".into(), Value::Object(us));
+                }
+                entry.insert("value".into(), json!(d.value));
+                Value::Object(entry)
+            })
+            .collect();
+        item.insert("designation".into(), json!(designations));
+    }
+    if !c.properties.is_empty() {
+        // Sort by property code for stable, IG-fixture-matching output. The
+        // fixtures (e.g. extensions/expand-echo-all) emit
+        // `contains[].property[]` in alphabetical-by-code order regardless
+        // of insertion order at the contributor sources.
+        let mut sorted_props = c.properties.clone();
+        sorted_props.sort_by(|a, b| a.code.cmp(&b.code));
+        let props: Vec<Value> = sorted_props
+            .iter()
+            .map(|p| {
+                // Map our internal type label to a FHIR `value[x]` field.
+                let key = match p.value_type.as_str() {
+                    "Boolean" => "valueBoolean",
+                    "Integer" => "valueInteger",
+                    "Decimal" => "valueDecimal",
+                    "DateTime" => "valueDateTime",
+                    "Code" => "valueCode",
+                    _ => "valueString",
+                };
+                let value: Value = if key == "valueBoolean" {
+                    json!(p.value == "true")
+                } else if key == "valueInteger" {
+                    json!(p.value.parse::<i64>().unwrap_or(0))
+                } else if key == "valueDecimal" {
+                    if let Ok(i) = p.value.parse::<i64>() {
+                        json!(i)
+                    } else if let Ok(f) = p.value.parse::<f64>() {
+                        json!(f)
+                    } else {
+                        json!(p.value)
+                    }
+                } else {
+                    json!(p.value)
+                };
+                json!({ "code": p.code, key: value })
+            })
+            .collect();
+        item.insert("property".into(), json!(props));
+    }
+    if !c.contains.is_empty() {
+        let nested: Vec<Value> = c
+            .contains
+            .iter()
+            .map(|child| serialize_expansion_contains(child, multi_version_systems))
+            .collect();
+        item.insert("contains".into(), json!(nested));
+    }
+    Value::Object(item)
+}
+
+/// Resolve `is_abstract` / `inactive` flags on each expansion entry via a
+/// per-system batched lookup. Backends construct ExpansionContains entries
+/// with both flags as `None`; this fills them so $expand responses surface
+/// the standard FHIR contains[].abstract / contains[].inactive fields.
+fn populate_concept_flags<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use std::collections::HashMap;
+        // Bucket codes per system so we issue one query per system.
+        let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.as_str())
+                .or_default()
+                .push(c.code.clone());
+        }
+        // Issue per-system queries concurrently — ValueSets often span 5+
+        // systems (e.g. EX04 VSAC extensional pulls from SNOMED/LOINC/RxNorm
+        // simultaneously) and serialising the awaits makes the post-expand
+        // step the dominant cost of every request. The HashMap insert order
+        // is irrelevant: keys are (system, code) tuples and values overwrite
+        // last-wins.
+        let queries = by_system.iter().map(|(system, codes)| {
+            let system_owned: String = (*system).to_string();
+            let codes = codes.clone();
+            async move {
+                let res = backend
+                    .concept_expansion_flags(ctx, &system_owned, &codes)
+                    .await
+                    .ok();
+                (system_owned, res)
+            }
+        });
+        let results = futures::future::join_all(queries).await;
+        let mut flag_map: HashMap<(String, String), crate::traits::ConceptExpansionFlags> =
+            HashMap::new();
+        for (system, flags_opt) in results {
+            if let Some(flags) = flags_opt {
+                for (code, f) in flags {
+                    flag_map.insert((system.clone(), code), f);
+                }
+            }
+        }
+        for c in contains.iter_mut() {
+            if let Some(f) = flag_map.get(&(c.system.clone(), c.code.clone())) {
+                if f.is_abstract {
+                    c.is_abstract = Some(true);
+                }
+                if f.inactive {
+                    c.inactive = Some(true);
+                }
+            }
+            if !c.contains.is_empty() {
+                populate_concept_flags(backend, ctx, &mut c.contains).await;
+            }
+        }
+    })
+}
+
+/// Populate `designations` on each expansion entry in-place via a per-system
+/// batched lookup. Mirrors `populate_concept_flags` and is only invoked when
+/// the caller passes `includeDesignations=true`.
+fn populate_designations<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::ExpansionContainsDesignation;
+        use std::collections::HashMap;
+        let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.as_str())
+                .or_default()
+                .push(c.code.clone());
+        }
+        // Per-system designation queries fan out concurrently for the same
+        // reason as `populate_concept_flags`: VSAC-style multi-system
+        // expansions otherwise pay N×spawn_blocking + r2d2 round-trips.
+        let queries = by_system.iter().map(|(system, codes)| {
+            let system_owned: String = (*system).to_string();
+            let codes = codes.clone();
+            async move {
+                let res = backend
+                    .concept_designations(ctx, &system_owned, &codes)
+                    .await
+                    .ok();
+                (system_owned, res)
+            }
+        });
+        let results = futures::future::join_all(queries).await;
+        let mut map: HashMap<(String, String), Vec<ExpansionContainsDesignation>> = HashMap::new();
+        for (system, ds_opt) in results {
+            if let Some(ds) = ds_opt {
+                for (code, list) in ds {
+                    let entries = list
+                        .into_iter()
+                        .map(|d| ExpansionContainsDesignation {
+                            language: d.language,
+                            use_system: d.use_system,
+                            use_code: d.use_code,
+                            value: d.value,
+                            extensions: vec![],
+                        })
+                        .collect();
+                    map.insert((system.clone(), code), entries);
+                }
+            }
+        }
+        for c in contains.iter_mut() {
+            if let Some(ds) = map.remove(&(c.system.clone(), c.code.clone())) {
+                c.designations = ds;
+            }
+            if !c.contains.is_empty() {
+                populate_designations(backend, ctx, &mut c.contains).await;
+            }
+        }
+    })
+}
+
+/// Populate `properties` on each expansion entry from a per-system batched
+/// lookup of the named properties. Mirrors `populate_designations`. Walks
+/// nested `contains[]` recursively.
+fn populate_properties<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+    properties: &'a [String],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::ExpansionContainsProperty;
+        use std::collections::HashMap;
+        let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.as_str())
+                .or_default()
+                .push(c.code.clone());
+        }
+        let mut map: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+        // `prop_types_by_system` holds the (property_code → FHIR type) mapping
+        // declared on each contributing CodeSystem (and any supplements that
+        // share its URL). We consult it when serialising the property values
+        // so that e.g. a CS-declared `prop1: type=string` surfaces as
+        // `valueString` rather than the default `valueCode`. Drives the
+        // `parameters/parameters-expand-supplement-good` fixture's `prop1`
+        // entry which the IG pins as a `valueString`.
+        let mut prop_types_by_system: HashMap<String, HashMap<String, String>> = HashMap::new();
+        // Per-system: issue (property-values, CS-search) concurrently inside
+        // each task via `tokio::join!`, and fan all per-system tasks out via
+        // `join_all` so multi-system VS expansions don't pay N×serialised
+        // round-trips. Same correctness: the order of insertion into the
+        // shared HashMaps is irrelevant — keys uniquely identify each entry.
+        let queries = by_system.iter().map(|(system, codes)| {
+            let system_owned: String = (*system).to_string();
+            let codes = codes.clone();
+            async move {
+                let pv_fut =
+                    backend.concept_property_values(ctx, &system_owned, &codes, properties);
+                let cs_fut = crate::traits::CodeSystemOperations::search(
+                    backend,
+                    ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(system_owned.clone()),
+                        count: Some(20),
+                        ..Default::default()
+                    },
+                );
+                let (pv_res, cs_res) = tokio::join!(pv_fut, cs_fut);
+                (system_owned, pv_res.ok(), cs_res.ok())
+            }
+        });
+        let results = futures::future::join_all(queries).await;
+        for (system, pv_opt, cs_opt) in results {
+            if let Some(props) = pv_opt {
+                for (code, list) in props {
+                    map.insert((system.clone(), code), list);
+                }
+            }
+            if let Some(hits) = cs_opt {
+                let mut type_map: HashMap<String, String> = HashMap::new();
+                for cs in &hits {
+                    if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
+                        for entry in props {
+                            if let (Some(code), Some(ty)) = (
+                                entry.get("code").and_then(|v| v.as_str()),
+                                entry.get("type").and_then(|v| v.as_str()),
+                            ) {
+                                type_map
+                                    .entry(code.to_string())
+                                    .or_insert_with(|| ty.to_string());
+                            }
+                        }
+                    }
+                }
+                if !type_map.is_empty() {
+                    prop_types_by_system.insert(system, type_map);
+                }
+            }
+        }
+        for c in contains.iter_mut() {
+            if let Some(list) = map.remove(&(c.system.clone(), c.code.clone())) {
+                let cs_types = prop_types_by_system.get(&c.system);
+                c.properties = list
+                    .into_iter()
+                    .filter(|(code, value)| {
+                        // The `status` property is auto-included in the
+                        // population lookup so retired/deprecated/withdrawn
+                        // concepts get a per-concept marker without the
+                        // caller asking. Active codes carry no marker — the
+                        // IG `tho/expand-vs-act-class`, `fragment/fragment-expand`,
+                        // and `parameters/parameters-expand-supplement-good`
+                        // fixtures all omit `status:active` from contains[].
+                        // Only emit when the status is non-active.
+                        !(code == "status" && value == "active")
+                    })
+                    .map(|(code, value)| {
+                        // Pick the FHIR `value[x]` shape from the property
+                        // code:
+                        //   - When the CS / supplement declares the property
+                        //     with an explicit `type`, honour that.
+                        //   - `definition` is always a string per FHIR (it's
+                        //     the synthesised CS column).
+                        //   - Everything else defaults to `Code` — concept
+                        //     property values are most commonly Code and
+                        //     tests have not flagged false positives.
+                        let value_type = match cs_types.and_then(|m| m.get(&code)) {
+                            Some(ty) => fhir_property_type_to_value_type(ty),
+                            None if code == "definition" => "string".to_string(),
+                            None => "Code".to_string(),
+                        };
+                        ExpansionContainsProperty {
+                            code,
+                            value_type,
+                            value,
+                        }
+                    })
+                    .collect();
+            }
+            if !c.contains.is_empty() {
+                populate_properties(backend, ctx, &mut c.contains, properties).await;
+            }
+        }
+    })
+}
+
+/// Translate a FHIR `CodeSystem.property[].type` value (one of `code`,
+/// `Coding`, `string`, `integer`, `boolean`, `dateTime`, `decimal`) into the
+/// internal value-type label used by [`crate::types::ExpansionContainsProperty`]
+/// for serialization. The labels mirror the FHIR `value[x]` field suffix.
+fn fhir_property_type_to_value_type(fhir_type: &str) -> String {
+    match fhir_type {
+        "boolean" | "Boolean" => "Boolean".to_string(),
+        "integer" | "Integer" => "Integer".to_string(),
+        "decimal" | "Decimal" => "Decimal".to_string(),
+        "dateTime" | "DateTime" => "DateTime".to_string(),
+        "code" | "Code" => "Code".to_string(),
+        // string, Coding, and any unrecognised type fall back to a string
+        // serialization so the FHIR `valueString` field carries the value.
+        _ => "string".to_string(),
+    }
+}
+
+/// Parsed `displayLanguage` request parameter.
+///
+/// FHIR allows simple language codes (`de`), comma-separated lists with an
+/// optional wildcard (`de,*`), and Accept-Language style q-weights
+/// (`de,*; q=0`). The HL7 IG `language/expand-xform-*` fixtures distinguish:
+///
+/// | Form | preferred | hard_fallback | Meaning |
+/// |------|-----------|---------------|---------|
+/// | `de` | `de` | `false` | Try de; otherwise keep CS-default display |
+/// | `de,*` | `de` | `false` | Same as above (`*` is just an explicit fallback) |
+/// | `de,*; q=0` | `de` | `true` | Try de; if missing, drop top-level display |
+///
+/// `preferred` is the first non-wildcard tag (the language we want to swap
+/// in); `hard_fallback` is `true` when the wildcard carries `q=0`, signalling
+/// that no fallback is allowed.
+struct DisplayLangSpec {
+    preferred: String,
+    hard_fallback: bool,
+}
+
+/// Parse a `displayLanguage` parameter value into a [`DisplayLangSpec`].
+fn parse_display_language(raw: &str) -> Option<DisplayLangSpec> {
+    let mut preferred: Option<String> = None;
+    let mut hard_fallback = false;
+
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Split q= weight (Accept-Language style): "*; q=0" → tag="*", q=Some(0.0)
+        let (tag, q) = if let Some((t, rest)) = trimmed.split_once(';') {
+            let q = rest
+                .trim()
+                .strip_prefix("q=")
+                .or_else(|| rest.trim().strip_prefix("Q="))
+                .and_then(|s| s.parse::<f32>().ok());
+            (t.trim(), q)
+        } else {
+            (trimmed, None)
+        };
+        if tag == "*" {
+            // q=0 on wildcard means "do not fall back to anything" → hard mode.
+            if q == Some(0.0) {
+                hard_fallback = true;
+            }
+        } else if preferred.is_none() && !tag.is_empty() {
+            preferred = Some(tag.to_string());
+        }
+    }
+
+    preferred.map(|p| DisplayLangSpec {
+        preferred: p,
+        hard_fallback,
+    })
+}
+
+/// The HL7 `hl7TermMaintInfra` system + code identifying a designation as
+/// the "preferred for language" entry. Used when the displayLanguage swap
+/// rotates the CodeSystem's original-language display into the designation
+/// list — the IG fixtures expect this `use` coding to flag that entry.
+const HL7_TERM_MAINT_INFRA_SYSTEM: &str = "http://terminology.hl7.org/CodeSystem/hl7TermMaintInfra";
+
+/// Append designations contributed by applied CodeSystem supplements onto
+/// each expansion entry. Mirrors [`populate_designations`] but reads via the
+/// backend's `supplement_designations` API and merges into the existing
+/// `designations` vec rather than replacing it. Walks nested `contains[]`
+/// recursively.
+///
+/// Supplements live in the same `code_systems` table (with `content =
+/// 'supplement'`) so we look them up by URL — the supplement-side rows are
+/// matched to base concepts by code only. The backend tags each returned
+/// row with `source = "url|version"` so callers can emit the FHIR
+/// `designation.source` part on `$lookup`; for `$expand.contains[]` the
+/// source is informational only.
+fn apply_supplement_designations<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+    supplement_urls: &'a [String],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::ExpansionContainsDesignation;
+        use std::collections::HashMap;
+        if supplement_urls.is_empty() {
+            return;
+        }
+        let mut codes: Vec<String> = Vec::new();
+        for c in contains.iter() {
+            if !codes.contains(&c.code) {
+                codes.push(c.code.clone());
+            }
+        }
+        let map = backend
+            .supplement_designations(ctx, supplement_urls, &codes)
+            .await
+            .unwrap_or_default();
+        // Build a flat code → designations map keyed only by code (supplements
+        // are typically scoped to a single base CS, so collisions on code
+        // across systems are unusual and acceptable here).
+        let mut by_code: HashMap<String, Vec<ExpansionContainsDesignation>> = HashMap::new();
+        for (code, list) in map {
+            let entries = list
+                .into_iter()
+                .map(|d| ExpansionContainsDesignation {
+                    language: d.language,
+                    use_system: d.use_system,
+                    use_code: d.use_code,
+                    value: d.value,
+                    extensions: vec![],
+                })
+                .collect();
+            by_code.insert(code, entries);
+        }
+        for c in contains.iter_mut() {
+            if let Some(extra) = by_code.get(&c.code) {
+                for d in extra {
+                    c.designations.push(d.clone());
+                }
+            }
+            if !c.contains.is_empty() {
+                apply_supplement_designations(backend, ctx, &mut c.contains, supplement_urls).await;
+            }
+        }
+    })
+}
+
+/// Append property values contributed by applied CodeSystem supplements onto
+/// each expansion entry. Mirrors [`populate_properties`] but reads via the
+/// backend's `supplement_property_values` API. Walks nested `contains[]`
+/// recursively. When a supplement defines a property for a code that the
+/// base CS doesn't, the supplement value is added to the entry; values
+/// defined in BOTH base and supplement are surfaced once each (the IG
+/// fixtures don't deduplicate by property code).
+fn apply_supplement_properties<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+    supplement_urls: &'a [String],
+    properties: &'a [String],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::ExpansionContainsProperty;
+        use std::collections::HashMap;
+        if supplement_urls.is_empty() || properties.is_empty() {
+            return;
+        }
+        let mut codes: Vec<String> = Vec::new();
+        for c in contains.iter() {
+            if !codes.contains(&c.code) {
+                codes.push(c.code.clone());
+            }
+        }
+        let map = backend
+            .supplement_property_values(ctx, supplement_urls, &codes, properties)
+            .await
+            .unwrap_or_default();
+        let mut by_code: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (code, list) in map {
+            by_code.insert(code, list);
+        }
+        // Build a property-code → FHIR-type map from the supplement CodeSystems
+        // themselves. The IG `parameters/parameters-expand-supplement-good`
+        // fixture pins `prop1` (declared `type=string` on the supplement CS) as
+        // a `valueString` rather than the default `valueCode`. Without this
+        // type lookup the value silently surfaces under the wrong `value[x]`.
+        let mut supp_prop_types: HashMap<String, String> = HashMap::new();
+        for raw in supplement_urls {
+            let bare = raw.split('|').next().unwrap_or(raw).to_string();
+            if let Ok(hits) = crate::traits::CodeSystemOperations::search(
+                backend,
+                ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(bare),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                for cs in &hits {
+                    if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
+                        for entry in props {
+                            if let (Some(code), Some(ty)) = (
+                                entry.get("code").and_then(|v| v.as_str()),
+                                entry.get("type").and_then(|v| v.as_str()),
+                            ) {
+                                supp_prop_types
+                                    .entry(code.to_string())
+                                    .or_insert_with(|| ty.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for c in contains.iter_mut() {
+            if let Some(extra) = by_code.get(&c.code) {
+                for (prop, value) in extra {
+                    let value_type = match supp_prop_types.get(prop) {
+                        Some(ty) => fhir_property_type_to_value_type(ty),
+                        None => "Code".to_string(),
+                    };
+                    c.properties.push(ExpansionContainsProperty {
+                        code: prop.clone(),
+                        value_type,
+                        value: value.clone(),
+                    });
+                }
+            }
+            if !c.contains.is_empty() {
+                apply_supplement_properties(
+                    backend,
+                    ctx,
+                    &mut c.contains,
+                    supplement_urls,
+                    properties,
+                )
+                .await;
+            }
+        }
+    })
+}
+
+/// Standards-extension URLs that surface as concept-level FHIR extensions on
+/// `expansion.contains[].extension[]`. Each entry has a corresponding URL
+/// literal in the FHIR-published "rendering" StructureDefinitions. See:
+/// <https://hl7.org/fhir/extensions/StructureDefinition-rendering-style.html>
+/// and <https://hl7.org/fhir/extensions/StructureDefinition-rendering-xhtml.html>.
+const PASSTHROUGH_CONCEPT_EXTENSIONS: &[&str] = &[
+    "http://hl7.org/fhir/StructureDefinition/rendering-style",
+    "http://hl7.org/fhir/StructureDefinition/rendering-xhtml",
+    "http://hl7.org/fhir/StructureDefinition/valueset-concept-definition",
+    "http://hl7.org/fhir/StructureDefinition/valueset-deprecated",
+];
+
+/// Concept-level extension URLs whose value gets synthesised into a
+/// concept-property entry on `expansion.contains[].property[]` rather than
+/// appearing as a literal `extension[]` entry. The mapping (extension URL →
+/// FHIR concept-property code) follows the ordering convention in the IG
+/// `extensions/extensions-all` fixture: each extension's value contributes a
+/// property whose `code` is the FHIR-canonical concept-property name and
+/// whose `uri` is `http://hl7.org/fhir/concept-properties#<code>`.
+fn extension_to_property_code(url: &str) -> Option<&'static str> {
+    match url {
+        "http://hl7.org/fhir/StructureDefinition/codesystem-conceptOrder" => Some("order"),
+        "http://hl7.org/fhir/StructureDefinition/codesystem-label" => Some("label"),
+        "http://hl7.org/fhir/StructureDefinition/itemWeight" => Some("weight"),
+        // The concept-level `structuredefinition-standards-status` extension
+        // synthesises a `status` property when its valueCode is `deprecated`
+        // or `withdrawn` (consistent with the IG extensions/extensions-all
+        // expectation that only deprecated/withdrawn concepts surface a
+        // status row in the expansion).
+        "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status" => {
+            Some("status")
+        }
+        _ => None,
+    }
+}
+
+/// Determine the FHIR `value[x]` field on an extension JSON object. Returns
+/// the type label (e.g. "Decimal", "String", "Code") and a canonical string
+/// representation of the value, matching the convention used by
+/// [`crate::types::ExpansionContainsProperty`].
+fn extension_value_for_property(ext: &Value) -> Option<(&'static str, String)> {
+    if let Some(v) = ext.get("valueDecimal") {
+        if let Some(f) = v.as_f64() {
+            return Some(("Decimal", normalize_decimal(f)));
+        }
+        if let Some(i) = v.as_i64() {
+            return Some(("Decimal", i.to_string()));
+        }
+    }
+    if let Some(v) = ext.get("valueInteger").and_then(|v| v.as_i64()) {
+        return Some(("Decimal", v.to_string()));
+    }
+    if let Some(v) = ext.get("valueString").and_then(|v| v.as_str()) {
+        return Some(("String", v.to_string()));
+    }
+    if let Some(v) = ext.get("valueCode").and_then(|v| v.as_str()) {
+        return Some(("Code", v.to_string()));
+    }
+    if let Some(v) = ext.get("valueBoolean").and_then(|v| v.as_bool()) {
+        return Some(("Boolean", v.to_string()));
+    }
+    None
+}
+
+/// Render a finite f64 as the shortest decimal string that round-trips, to
+/// avoid surfacing artifacts like `1.2000000000000002`. Falls back to the
+/// default Display when the value is integral.
+fn normalize_decimal(f: f64) -> String {
+    if f.fract() == 0.0 {
+        format!("{}", f as i64)
+    } else {
+        // 6 fractional digits is enough precision for the IG fixtures and
+        // strips trailing zeros via the trim_end_matches step.
+        let s = format!("{f:.6}");
+        let trimmed = s.trim_end_matches('0').trim_end_matches('.').to_string();
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            trimmed
+        }
+    }
+}
+
+/// Walk every `contains[]` entry, fetch its concept resource JSON from the
+/// base CodeSystem and any applied supplements, and merge:
+/// - concept-level passthrough extensions (rendering-style, rendering-xhtml,
+///   valueset-concept-definition, valueset-deprecated) into `c.extensions`,
+/// - per-designation extensions (coding-sctdescid,
+///   structuredefinition-standards-status) into the matching designation's
+///   `extensions` field,
+/// - synthesised concept properties (order/label/weight/status) derived from
+///   well-known concept-level extensions, into `c.properties`.
+///
+/// Processed alongside (and after) the existing
+/// [`populate_properties`] / [`apply_supplement_properties`] calls so the
+/// resulting property set is the union of (a) declared concept properties,
+/// (b) well-known extension-derived properties.
+fn apply_concept_extension_data<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+    supplement_urls: &'a [String],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::ExpansionContainsProperty;
+        use std::collections::HashMap;
+        // Bucket codes per system for one batched lookup per system.
+        let mut by_system: HashMap<String, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.clone())
+                .or_default()
+                .push(c.code.clone());
+        }
+        // For each system: fetch base concept entries and supplement
+        // concept entries (one map per system).
+        let mut base_entries: HashMap<(String, String), Value> = HashMap::new();
+        let mut supp_entries: HashMap<(String, String), Vec<Value>> = HashMap::new();
+        for (system, codes) in &by_system {
+            if let Ok(map) = backend.concept_resource_entries(ctx, system, codes).await {
+                for (code, entry) in map {
+                    base_entries.insert((system.clone(), code), entry);
+                }
+            }
+            if !supplement_urls.is_empty() {
+                if let Ok(map) = backend
+                    .supplement_concept_entries(ctx, supplement_urls, codes)
+                    .await
+                {
+                    for (code, entries) in map {
+                        supp_entries.insert((system.clone(), code), entries);
+                    }
+                }
+            }
+        }
+
+        for c in contains.iter_mut() {
+            // Order the contributing entries: base first, then any supplement
+            // overrides (later wins for properties; for extensions the IG
+            // expects supplement values to OVERRIDE the base for the same
+            // URL — see `extensions-enumerated` which expects the supplement
+            // rendering-style/rendering-xhtml on code2 instead of base).
+            let mut sources: Vec<&Value> = Vec::new();
+            if let Some(base) = base_entries.get(&(c.system.clone(), c.code.clone())) {
+                sources.push(base);
+            }
+            if let Some(extras) = supp_entries.get(&(c.system.clone(), c.code.clone())) {
+                for e in extras {
+                    sources.push(e);
+                }
+            }
+
+            // Pass 1: passthrough concept-level extensions. Supplement
+            // entries OVERRIDE the base for the same URL — drop any prior
+            // entry with the same url before pushing.
+            for src in &sources {
+                let Some(exts) = src.get("extension").and_then(|e| e.as_array()) else {
+                    continue;
+                };
+                for ext in exts {
+                    let url = match ext.get("url").and_then(|u| u.as_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if !PASSTHROUGH_CONCEPT_EXTENSIONS.contains(&url) {
+                        continue;
+                    }
+                    c.extensions.retain(|existing| {
+                        existing.get("url").and_then(|u| u.as_str()) != Some(url)
+                    });
+                    c.extensions.push(ext.clone());
+                }
+            }
+
+            // Pass 2: synthesise properties from well-known extensions.
+            // Supplement-provided values override base for the same property
+            // code (so e.g. base codesystem-conceptOrder=6 → order=6, but a
+            // supplement codesystem-conceptOrder would override it).
+            for src in &sources {
+                let Some(exts) = src.get("extension").and_then(|e| e.as_array()) else {
+                    continue;
+                };
+                for ext in exts {
+                    let url = match ext.get("url").and_then(|u| u.as_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let Some(prop_code) = extension_to_property_code(url) else {
+                        continue;
+                    };
+                    let Some((value_type, value)) = extension_value_for_property(ext) else {
+                        continue;
+                    };
+                    // For the standards-status → status mapping, only emit
+                    // when the status is deprecated/withdrawn (matches IG
+                    // extensions-all expectation; an `active` status would
+                    // otherwise add noise to every concept).
+                    if prop_code == "status"
+                        && !matches!(value.as_str(), "deprecated" | "withdrawn")
+                    {
+                        continue;
+                    }
+                    // Drop any existing property with the same code so the
+                    // last-seen (supplement-overrides-base) value wins.
+                    c.properties.retain(|p| p.code != prop_code);
+                    c.properties.push(ExpansionContainsProperty {
+                        code: prop_code.to_string(),
+                        value_type: value_type.to_string(),
+                        value,
+                    });
+                }
+            }
+
+            // Pass 3: per-designation extensions. Match each base/supplement
+            // designation against the entry's existing designations by
+            // (language, value) and copy across its extension[].
+            //
+            // Only annotate ALREADY-PRESENT designations — never invent new
+            // ones here.  Pre-Pass 3 the only path that populates
+            // `c.designations` is `populate_designations` (gated on
+            // `includeDesignations=true`) and `apply_supplement_designations`
+            // (gated on `includeDesignations` AND a supplement being applied).
+            // Adding designations here unconditionally surfaces base CS
+            // designations on every expansion, breaking
+            // `parameters/parameters-expand-supplement-none` which expects
+            // a designation-free response.
+            for src in &sources {
+                let Some(desigs) = src.get("designation").and_then(|d| d.as_array()) else {
+                    continue;
+                };
+                for d in desigs {
+                    let value = match d.get("value").and_then(|v| v.as_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let language = d
+                        .get("language")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let Some(d_exts) = d.get("extension").and_then(|e| e.as_array()) else {
+                        continue;
+                    };
+                    if d_exts.is_empty() {
+                        continue;
+                    }
+                    let target = c.designations.iter_mut().find(|existing| {
+                        existing.value.eq_ignore_ascii_case(value) && existing.language == language
+                    });
+                    if let Some(t) = target {
+                        for d_ext in d_exts {
+                            let url = match d_ext.get("url").and_then(|u| u.as_str()) {
+                                Some(s) => s,
+                                None => continue,
+                            };
+                            t.extensions
+                                .retain(|e| e.get("url").and_then(|u| u.as_str()) != Some(url));
+                            t.extensions.push(d_ext.clone());
+                        }
+                    }
+                    // (No `else` branch — see comment above.)
+                }
+            }
+
+            if !c.contains.is_empty() {
+                apply_concept_extension_data(backend, ctx, &mut c.contains, supplement_urls).await;
+            }
+        }
+    })
+}
+
+/// Replace each contains[] entry's `display` with a designation matching the
+/// requested displayLanguage. Mirrors the `lookup()` language-aware behavior
+/// and walks nested `contains[]` recursively.
+///
+/// Per the HL7 IG `language/expand-xform-*` fixtures, when a swap fires we
+/// also rotate the original CS-language display into `c.designations` as a
+/// `{language: <cs-lang>, use: preferredForLanguage, value: <orig display>}`
+/// entry, and remove the now-redundant matching-language designation. The
+/// `cs_lang_by_url` map is read from the contributing CodeSystem's top-level
+/// `language` field.
+///
+/// `hard_fallback` controls behavior when no matching designation exists:
+/// `true` drops the top-level display entirely (per the `*; q=0` convention),
+/// `false` leaves the original display in place.
+fn apply_display_language<'a, B: TerminologyBackend>(
+    backend: &'a B,
+    ctx: &'a TenantContext,
+    contains: &'a mut [ExpansionContains],
+    spec: &'a DisplayLangSpec,
+    cs_lang_by_url: &'a std::collections::HashMap<String, Option<String>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::types::ExpansionContainsDesignation;
+        use std::collections::HashMap;
+        let language = spec.preferred.as_str();
+
+        // Bucket codes per system for a single batched designation lookup.
+        let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
+        for c in contains.iter() {
+            by_system
+                .entry(c.system.as_str())
+                .or_default()
+                .push(c.code.clone());
+        }
+        // (system, code) → (designation language tag, designation value).
+        // Match using BCP 47 / RFC 4647 Lookup: prefer an exact match, then
+        // accept any designation whose tag starts with the requested tag plus
+        // a `-` subtag separator (so `de` matches `de-CH` but not `den`).
+        let mut match_map: HashMap<(String, String), (Option<String>, String)> = HashMap::new();
+        for (system, codes) in &by_system {
+            if let Ok(ds) = backend.concept_designations(ctx, system, codes).await {
+                for (code, list) in ds {
+                    let exact = list
+                        .iter()
+                        .find(|d| d.language.as_deref() == Some(language));
+                    let chosen = exact.cloned().or_else(|| {
+                        list.into_iter().find(|d| {
+                            d.language.as_deref().is_some_and(|lang| {
+                                let prefix = format!("{language}-");
+                                lang.eq_ignore_ascii_case(language)
+                                    || lang
+                                        .to_ascii_lowercase()
+                                        .starts_with(&prefix.to_ascii_lowercase())
+                            })
+                        })
+                    });
+                    if let Some(d) = chosen {
+                        match_map.insert(((*system).to_string(), code), (d.language, d.value));
+                    }
+                }
+            }
+        }
+
+        for c in contains.iter_mut() {
+            let cs_lang = cs_lang_by_url.get(&c.system).cloned().flatten();
+            let original_display = c.display.clone();
+            // When the CS's own `language` already matches the requested
+            // displayLanguage exactly, the top-level `display` is already
+            // in the requested language. Don't promote a (broader-match)
+            // designation in that case — doing so would drop the source
+            // designation entry that the IG `language/expand-echo-de-multi-de-*`
+            // fixtures expect to survive (e.g. a `de-CH` designation alongside
+            // a CS with `language=de`).
+            let cs_lang_already_matches = cs_lang.as_deref() == Some(language);
+            if cs_lang_already_matches {
+                // Skip the swap entirely; designations are preserved as-is.
+                if !c.contains.is_empty() {
+                    apply_display_language(backend, ctx, &mut c.contains, spec, cs_lang_by_url)
+                        .await;
+                }
+                continue;
+            }
+            if let Some((matched_lang, matched_value)) =
+                match_map.remove(&(c.system.clone(), c.code.clone()))
+            {
+                // Swap top-level display for the matching-language designation.
+                c.display = Some(matched_value.clone());
+
+                // Drop the source designation we just promoted (matched on
+                // both language + value to be precise — broader-match designations
+                // for unrelated codes survive untouched).
+                c.designations
+                    .retain(|d| !(d.language == matched_lang && d.value == matched_value));
+
+                // Rotate the former display into designations[] tagged with the
+                // CS's own language and `use=preferredForLanguage`. Skip when
+                // the original display would just duplicate the matched value
+                // (degenerate case where CS-lang == requested lang).
+                if let Some(orig) = original_display
+                    .filter(|s| !s.is_empty() && cs_lang.as_deref() != Some(language))
+                {
+                    let already = c
+                        .designations
+                        .iter()
+                        .any(|d| d.language == cs_lang && d.value == orig);
+                    if !already {
+                        c.designations.push(ExpansionContainsDesignation {
+                            language: cs_lang.clone(),
+                            use_system: Some(HL7_TERM_MAINT_INFRA_SYSTEM.to_string()),
+                            use_code: Some("preferredForLanguage".to_string()),
+                            value: orig,
+                            extensions: vec![],
+                        });
+                    }
+                }
+            } else if spec.hard_fallback {
+                // No matching designation and the caller forbade fallback —
+                // drop the top-level display entirely. The IG fixtures still
+                // surface the original (CS-default) display as a designation
+                // with `use=preferredForLanguage` so consumers can recover it.
+                if let Some(orig) = original_display {
+                    if !orig.is_empty() {
+                        let already = c
+                            .designations
+                            .iter()
+                            .any(|d| d.language == cs_lang && d.value == orig);
+                        if !already {
+                            c.designations.push(ExpansionContainsDesignation {
+                                language: cs_lang.clone(),
+                                use_system: Some(HL7_TERM_MAINT_INFRA_SYSTEM.to_string()),
+                                use_code: Some("preferredForLanguage".to_string()),
+                                value: orig,
+                                extensions: vec![],
+                            });
+                        }
+                    }
+                }
+                c.display = None;
+            }
+
+            if !c.contains.is_empty() {
+                apply_display_language(backend, ctx, &mut c.contains, spec, cs_lang_by_url).await;
+            }
+        }
+    })
+}
+
+/// Build a canonical cache key for the `$expand` handler-response cache.
+///
+/// Returns `None` when caching MUST be skipped because the response is
+/// effectively unique-per-request:
+///
+/// * any parameter carries an inline `resource` body (`valueSet`,
+///   `tx-resource`, `system`, …) — those vary on every distinct compose /
+///   supplement payload and would pollute the cache;
+/// * the request includes `force-system-version`, `system-version`,
+///   `check-system-version`, `default-valueset-version`, or `useSupplement`
+///   — these force slow paths whose outcome depends on global terminology
+///   state in ways that the simple per-params key cannot fully capture
+///   safely.  The IG `version/*` and `supplement/*` fixtures rely on these
+///   bypassing any cache so the post-expand version-check / supplement-merge
+///   logic always runs.
+///
+/// Otherwise every `(name, valueXxx)` pair is serialised as a compact JSON
+/// fragment and the fragments are sorted by name (stable for repeated
+/// parameter names: their relative order is preserved as a secondary key
+/// because we rely on `sort_by` on the primary axis).  The resulting string
+/// is the cache key.
+fn build_expand_cache_key(params: &[Value]) -> Option<String> {
+    const SKIP_NAMES: &[&str] = &[
+        "useSupplement",
+        "default-valueset-version",
+        "force-system-version",
+        "system-version",
+        "check-system-version",
+    ];
+    let mut frags: Vec<(String, String)> = Vec::with_capacity(params.len());
+    for p in params {
+        let name = match p.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return None,
+        };
+        // Inline resources (`valueSet`, `tx-resource`, …): bail.  Even one
+        // `resource` field on any param means we can't cheaply build a stable,
+        // compact key — and `tx-resource` carries fixture-specific bodies that
+        // must NOT be conflated across requests.
+        if p.get("resource").is_some() {
+            return None;
+        }
+        if SKIP_NAMES.contains(&name) {
+            return None;
+        }
+        // Compact JSON of the whole entry — captures every `valueXxx`,
+        // including `valueUri`, `valueString`, `valueBoolean`, `valueInteger`.
+        // The serialiser preserves field order from the input map; for a
+        // given fixture the wire bytes are identical per request, so two
+        // semantically-equal payloads that differ only in field order would
+        // miss the cache (worst case = a cold miss, never an incorrect
+        // response: identical canonical params always produce identical
+        // handler output by construction).
+        let frag = match serde_json::to_string(p) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        frags.push((name.to_string(), frag));
+    }
+    frags.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::with_capacity(frags.iter().map(|(_, f)| f.len() + 1).sum());
+    for (i, (_, f)) in frags.iter().enumerate() {
+        if i > 0 {
+            out.push('|');
+        }
+        out.push_str(f);
+    }
+    Some(out)
+}
+
+/// Build a compose-keyed cache key for `$expand` requests that carry an inline
+/// `valueSet` body (and possibly `tx-resource` fixture resources) — the case
+/// `build_expand_cache_key` bails on.
+///
+/// Returns `None` when caching MUST be skipped:
+///
+/// * No `valueSet` resource param is present (this builder only handles
+///   inline-VS requests; URL-only requests go through
+///   `build_expand_cache_key`).
+/// * Any param has the same skip-list names as `build_expand_cache_key`
+///   (`useSupplement`, `default-valueset-version`, `force-system-version`,
+///   `system-version`, `check-system-version`).
+/// * A param has neither a `name` nor anything we can serialise.
+///
+/// Otherwise builds a key shaped as:
+/// `"inline:" + hex(combined hash of every `resource` body, sorted) + "|" +
+/// JSON of every non-resource param sorted by name`.
+///
+/// Uses [`DefaultHasher`] (SipHash) — a fast non-cryptographic hash that's
+/// already in `std`.  Resource bodies are serialised to canonical JSON via
+/// `serde_json::to_string` before hashing; serde's default field-order
+/// preservation makes the digest stable for any given fixture (k6 sends
+/// identical bytes per iteration).
+fn build_inline_compose_cache_key(params: &[Value]) -> Option<String> {
+    const SKIP_NAMES: &[&str] = &[
+        "useSupplement",
+        "default-valueset-version",
+        "force-system-version",
+        "system-version",
+        "check-system-version",
+    ];
+    let mut has_inline_vs = false;
+    let mut resource_hashes: Vec<u64> = Vec::new();
+    let mut non_resource_frags: Vec<(String, String)> = Vec::new();
+    for p in params {
+        let name = p.get("name").and_then(|v| v.as_str())?;
+        if SKIP_NAMES.contains(&name) {
+            return None;
+        }
+        if let Some(resource) = p.get("resource") {
+            if name == "valueSet" {
+                has_inline_vs = true;
+            }
+            // Hash the (name, body) pair so two different resource params
+            // can't be transposed without changing the key.
+            let serialised = serde_json::to_string(resource).ok()?;
+            let mut hasher = DefaultHasher::new();
+            name.hash(&mut hasher);
+            serialised.hash(&mut hasher);
+            resource_hashes.push(hasher.finish());
+        } else {
+            // Compact JSON of the whole entry — captures every `valueXxx`
+            // (Uri / String / Boolean / Integer / …).
+            let frag = serde_json::to_string(p).ok()?;
+            non_resource_frags.push((name.to_string(), frag));
+        }
+    }
+    if !has_inline_vs {
+        return None;
+    }
+    // Sort hashes so that tx-resource ordering doesn't fragment the key.
+    // The (name, body) pairing prevents semantic confusion across param types.
+    resource_hashes.sort_unstable();
+    let mut combined = DefaultHasher::new();
+    for h in &resource_hashes {
+        h.hash(&mut combined);
+    }
+    let resource_digest = combined.finish();
+
+    non_resource_frags.sort_by(|a, b| a.0.cmp(&b.0));
+    let extras_len: usize = non_resource_frags.iter().map(|(_, f)| f.len() + 1).sum();
+    let mut out = String::with_capacity(8 + 16 + 1 + extras_len);
+    out.push_str("inline:");
+    out.push_str(&format!("{resource_digest:016x}"));
+    out.push('|');
+    for (i, (_, f)) in non_resource_frags.iter().enumerate() {
+        if i > 0 {
+            out.push('|');
+        }
+        out.push_str(f);
+    }
+    Some(out)
+}
+
+/// Fetch a cached `$expand` response by canonical key.
+fn expand_handler_cache_get(cache: &ExpandHandlerCache, key: &str) -> Option<Bytes> {
+    cache.read().ok()?.get(key).cloned()
+}
+
+/// Insert a successfully-built `$expand` response into the per-AppState cache.
+/// Drops new entries silently once the cache reaches
+/// [`EXPAND_HANDLER_CACHE_MAX`].
+fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Bytes) {
+    if let Ok(mut guard) = cache.write() {
+        if guard.len() >= EXPAND_HANDLER_CACHE_MAX {
+            return;
+        }
+        guard.insert(key, value);
+    }
+}
+
+/// Expand a ValueSet and return the result as pre-serialized JSON bytes.
+///
+/// Bytes are cached keyed on request parameters.  On a cache hit the stored
+/// [`Bytes`] handle is cloned in O(1) (reference-count bump only — no heap
+/// allocation or JSON re-serialization).  On a cache miss the result is
+/// serialized once, stored, and returned.
+///
+/// The handler-level cache here sits *above* every pre-flight step
+/// (`useSupplement` resolution, URL parse, `tx-resource` shortcut detection,
+/// the inner `expand_cache` lookup, …) so warm hits return immediately.
+/// The inner [`process_expand_inner`] still maintains the pre-existing
+/// `state.expand_cache`, which catches misses on this outer cache that
+/// nonetheless map to the same canonical URL+params bucket (e.g. when the
+/// caller adds `valueSet` / `tx-resource` inline payloads that force this
+/// outer cache to skip but otherwise produce the same expansion).
+async fn process_expand<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Bytes, HtsError> {
+    // ── Handler-level response cache ─────────────────────────────────────────
+    // Skips ALL pre-call helpers when the same canonical params have produced
+    // a response earlier in this AppState's lifetime.  Cleared on every
+    // bundle import / CRUD write via `clear_expand_cache`.
+    //
+    // Two key strategies:
+    // 1. URL-only requests → `build_expand_cache_key` (compact, no resource bodies).
+    // 2. Inline-`valueSet` requests → `build_inline_compose_cache_key`
+    //    (hashes resource bodies so the key stays small).
+    //
+    // Either path is short-circuited on a hit.  Falling through both means
+    // the request has a `tx-resource` *without* an inline `valueSet`, or
+    // carries a skip-listed slow-path knob — bail and call inner directly.
+    if let Some(key) = build_expand_cache_key(&params) {
+        if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {
+            return Ok(cached);
+        }
+        let value = process_expand_inner(state, params).await?;
+        expand_handler_cache_put(&state.expand_handler_cache, key, value.clone());
+        return Ok(value);
+    }
+    if let Some(key) = build_inline_compose_cache_key(&params) {
+        if let Some(cached) = expand_handler_cache_get(&state.inline_compose_handler_cache, &key) {
+            return Ok(cached);
+        }
+        let value = process_expand_inner(state, params).await?;
+        expand_handler_cache_put(&state.inline_compose_handler_cache, key, value.clone());
+        return Ok(value);
+    }
+    process_expand_inner(state, params).await
+}
+
+async fn process_expand_inner<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Bytes, HtsError> {
+    // EX_PROBE: total wall time for the request, plus per-stage breakdown.
+    // Stripped after the iter11 diagnosis lands.
+    let probe_t0 = Instant::now();
+    // Parse the `url` parameter. FHIR supports pipe-separated canonical URLs
+    // (`http://example.org/vs|1.0.0`) — split and promote the version to
+    // `valueSetVersion` when no explicit `valueSetVersion` param is present.
+    let (url, pipe_version) = match find_str_param(&params, "url") {
+        Some(raw) => {
+            if let Some(pos) = raw.find('|') {
+                let base = raw[..pos].to_string();
+                let ver = raw[pos + 1..].to_string();
+                (Some(base), Some(ver))
+            } else {
+                (Some(raw), None)
+            }
+        }
+        None => (None, None),
+    };
+    let value_set = if url.is_none() {
+        find_resource_param(&params, "valueSet")
+    } else {
+        None
+    };
+    // Did the caller pass an explicit `valueSet` body parameter?  This is the
+    // ONLY signal that should cause the response to echo `compose` /
+    // `contained` back to the client.  `tx-resource` matches (handled by the
+    // shortcut below) must NOT count — the IG validator silently injects
+    // every fixture VS as a `tx-resource` for every request, so using the
+    // shortcut's promoted `value_set` to gate compose echo would leak the
+    // stored VS shape on URL-only requests.
+    let caller_supplied_inline_vs = value_set.is_some();
+
+    if url.is_none() && value_set.is_none() {
+        return Err(HtsError::InvalidRequest(
+            "Missing required parameter: url (ValueSet canonical URL) or valueSet (inline ValueSet resource)".into()
+        ));
+    }
+
+    let filter = find_str_param(&params, "filter");
+
+    // `count` and `offset` may arrive as integer or string parameters.
+    let count = find_str_param(&params, "count")
+        .and_then(|s| s.parse::<u32>().ok())
+        .or_else(|| {
+            params
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("count"))
+                .and_then(|p| p.get("valueInteger").and_then(|v| v.as_u64()))
+                .map(|v| v as u32)
+        });
+
+    let offset = find_str_param(&params, "offset")
+        .and_then(|s| s.parse::<u32>().ok())
+        .or_else(|| {
+            params
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("offset"))
+                .and_then(|p| p.get("valueInteger").and_then(|v| v.as_u64()))
+                .map(|v| v as u32)
+        });
+
+    // `hierarchical` and `excludeNested` both control nesting:
+    // - `hierarchical=true` (HL7-tx convention) → tree.
+    // - `excludeNested=false` (FHIR R5 §$expand) → tree.
+    //   `excludeNested=true` (or absent) → flat list.
+    // The IG conformance suite's `parameters/parameters-expand-*` fixtures all
+    // pass `excludeNested=false` and expect nested `contains[]`, so we treat
+    // either signal as a request for tree mode.
+    let hierarchical_param = find_str_param(&params, "hierarchical").map(|s| s == "true");
+    let exclude_nested = find_str_param(&params, "excludeNested").map(|s| s == "true");
+    let hierarchical = match (hierarchical_param, exclude_nested) {
+        (Some(true), _) => Some(true),
+        (_, Some(false)) => Some(true),
+        (other, _) => other,
+    };
+    // Track which signal turned tree mode on so the backend can keep
+    // enumerated expansions flat when only excludeNested=false was the
+    // trigger (per the IG enum-* fixtures).
+    let hierarchical_explicit = hierarchical_param == Some(true);
+
+    // ── Resolve supplements (request `useSupplement` params) ────────────────
+    // Walk every `useSupplement` and confirm a matching `content=supplement`
+    // CodeSystem exists. Unknown supplements become a NotFound error so the
+    // bad-supplement IG fixtures reject with 4xx. The resolved info list is
+    // applied later, after expansion completes.
+    let mut applied_supplements: Vec<SupplementInfo> = Vec::new();
+    let mut supplement_inputs: Vec<String> = params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
+        .filter_map(|p| {
+            p.get("valueCanonical")
+                .or_else(|| p.get("valueUri"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    if !supplement_inputs.is_empty() {
+        let ctx = TenantContext::system();
+        for raw in &supplement_inputs {
+            let bare = raw.split('|').next().unwrap_or(raw);
+            match state.backend().supplement_target(&ctx, bare).await? {
+                Some(info) => applied_supplements.push(info),
+                None => {
+                    return Err(HtsError::NotFound(format!(
+                        "Required supplement not found: {bare}"
+                    )));
+                }
+            }
+        }
+    }
+    // (bare_supplement_urls is rebuilt below after the source-VS extension
+    // pass appends any auto-applied supplements to `supplement_inputs`.)
+
+    // ── Cache lookup ─────────────────────────────────────────────────────────
+    // Build a stable key from the request parameters. For inline ValueSets
+    // (ad-hoc POST) we serialise the body to compact JSON; k6 sends identical
+    // bytes each iteration so the string is a reliable cache discriminator.
+    // Build a canonical (name-sorted) form of the input parameters minus the
+    // ones already captured in `url_or_body`. This makes cache entries unique
+    // per combination of "extra" inputs that the response will echo back in
+    // `expansion.parameter`.
+    let extra_params = {
+        let mut sorted: Vec<&Value> = params
+            .iter()
+            .filter(|p| {
+                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                !matches!(name, "url" | "valueSet")
+            })
+            .collect();
+        sorted.sort_by(|a, b| {
+            let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            an.cmp(bn)
+        });
+        serde_json::to_string(&sorted).unwrap_or_default()
+    };
+
+    // When a pipe-version was supplied (or a `valueSetVersion` request param
+    // exists) include it in `url_or_body` so two URLs differing only in
+    // version do not collide. The IG `version/vs-expand-v1` and `vs-expand-v2`
+    // fixtures share the same bare URL but pin different versions; without
+    // this discriminator the second request would hit the first's cached
+    // bytes and report the wrong version's codes.
+    let cache_url_key = match url.clone() {
+        Some(u) => {
+            let v_explicit = find_str_param(&params, "valueSetVersion");
+            match (pipe_version.as_ref(), v_explicit.as_ref()) {
+                (Some(v), _) => format!("{u}|{v}"),
+                (None, Some(v)) => format!("{u}|{v}"),
+                _ => u,
+            }
+        }
+        None => value_set
+            .as_ref()
+            .and_then(|vs| serde_json::to_string(vs).ok())
+            .unwrap_or_default(),
+    };
+    let cache_key = ExpandCacheKey {
+        url_or_body: cache_url_key,
+        filter: filter.clone().unwrap_or_default(),
+        count: count.unwrap_or(u32::MAX),
+        offset: offset.unwrap_or(0),
+        hierarchical: hierarchical.unwrap_or(false),
+        extra_params,
+    };
+
+    if let Ok(cache) = state.expand_cache.read() {
+        if let Some(cached) = cache.get(&cache_key) {
+            // O(1) clone — just bumps the reference count on the shared buffer.
+            return Ok(cached.clone());
+        }
+    }
+
+    // ── Negative-cache check (URL-based 404s) ─────────────────────────────────
+    // URLs that previously returned NotFound are remembered here so we can skip
+    // all backend queries on repeated requests (saves 5+ SQLite round-trips per
+    // hit).
+    if let Some(ref url_str) = url {
+        if let Ok(neg) = state.not_found_urls.read() {
+            if neg.contains(url_str.as_str()) {
+                return Err(HtsError::NotFound(url_str.clone()));
+            }
+        }
+    }
+
+    // `tx-resource` parameters provide ad-hoc terminology that the caller does
+    // not want to import. Each is a full FHIR resource (typically a ValueSet)
+    // that the backend should treat as in-scope only for this single request —
+    // used heavily by the tx-ecosystem IG include-combo / exclude-combo
+    // fixtures, which provide the entire ValueSet whose URL was passed in the
+    // `url` parameter.
+    let tx_resources = collect_resource_params(&params, "tx-resource");
+
+    // ── tx-resource shortcut for URL-based requests ──────────────────────────
+    // When the request carries a `url` parameter and one of the supplied
+    // `tx-resource` resources is a ValueSet whose URL matches, promote that
+    // ValueSet to the inline-body path. This means the backend never queries
+    // its own store for that URL — the tx-resource fully shadows it for this
+    // request — which matches the IG semantics for the include-combo /
+    // exclude-combo fixtures.
+    //
+    // When the request URL pinned a specific version (`url|version`), require
+    // the tx-resource to ALSO match on `version`.  The IG validator injects
+    // every fixture VS as a tx-resource — so for tests that target a specific
+    // version (e.g. `vs-expand-v2` requesting `…/version|1.2.0`), URL-only
+    // matching would silently grab `valueset-version-1` and produce v1
+    // metadata + codes.  Skip the shortcut entirely when no version-aligned
+    // candidate exists so the backend's `resolve_value_set_versioned` path
+    // (which DOES filter on version) is used instead.
+    //
+    // The version pin can arrive via `url|version` pipe syntax OR an explicit
+    // `valueSetVersion` Parameters entry — both must be honoured here, or
+    // the `default-valueset-version/direct-expand-two` fixture (plain url
+    // + `valueSetVersion: 2.0.0`) silently latches onto v1.0.0's tx-resource.
+    let want_version_for_shortcut = pipe_version
+        .clone()
+        .or_else(|| find_str_param(&params, "valueSetVersion"));
+    let (url, value_set) = if value_set.is_none() {
+        if let Some(ref url_str) = url {
+            let want_version = want_version_for_shortcut.as_deref();
+            let inline_match = tx_resources.iter().find(|r| {
+                if r.get("resourceType").and_then(|v| v.as_str()) != Some("ValueSet")
+                    || r.get("url").and_then(|v| v.as_str()) != Some(url_str.as_str())
+                {
+                    return false;
+                }
+                match want_version {
+                    Some(want) => r.get("version").and_then(|v| v.as_str()) == Some(want),
+                    None => true,
+                }
+            });
+            if let Some(vs) = inline_match {
+                (None, Some(vs.clone()))
+            } else {
+                (url, value_set)
+            }
+        } else {
+            (url, value_set)
+        }
+    } else {
+        (url, value_set)
+    };
+    // Preserve the URL before it moves into ExpandRequest so we can record it
+    // in the negative cache if the backend returns NotFound. Also clone the
+    // inline ValueSet body (when present) so we can echo its top-level
+    // metadata back in the response after expansion completes.
+    let url_for_neg_cache = url.clone();
+    let value_set_for_response = value_set.clone();
+
+    // ── system-version / force-system-version overrides ─────────────────────
+    // Both parameters are repeating canonical (`url|version`) values.  The
+    // FHIR IG `version/parameters-fixed-version` profile applies them as
+    // `force-system-version` (override even when the include pins a version)
+    // and `system-version` (apply only when the include omits version) to
+    // pin which CodeSystem revision contributes to the expansion.
+    fn collect_version_pins(
+        params: &[Value],
+        name: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        for p in params {
+            if p.get("name").and_then(|v| v.as_str()) != Some(name) {
+                continue;
+            }
+            // Accept valueCanonical / valueUri / valueString / valueUrl.
+            let raw = ["valueCanonical", "valueUri", "valueString", "valueUrl"]
+                .iter()
+                .filter_map(|k| p.get(*k).and_then(|v| v.as_str()))
+                .next();
+            if let Some(s) = raw {
+                if let Some(pos) = s.find('|') {
+                    let url = s[..pos].to_string();
+                    let ver = s[pos + 1..].to_string();
+                    if !url.is_empty() && !ver.is_empty() {
+                        out.entry(url).or_insert(ver);
+                    }
+                }
+            }
+        }
+        out
+    }
+    let force_system_versions = collect_version_pins(&params, "force-system-version");
+    let mut system_version_defaults = collect_version_pins(&params, "system-version");
+    // `default-valueset-version` request param (FHIR R5 §$expand): per-VS
+    // version pins applied when a `compose.include[].valueSet[]` reference
+    // lacks a `|version` suffix. Same `<url>|<version>` shape as the
+    // `*-system-version` pins; collected via the same helper.
+    let default_value_set_versions = collect_version_pins(&params, "default-valueset-version");
+    // `check-system-version` acts as both a DEFAULT (same shape as
+    // `system-version` — applied only when no other version pin wins) AND
+    // a post-expansion verifier.  When the resolved CS version doesn't
+    // satisfy the pattern, the IG fixtures expect a 4xx OperationOutcome
+    // with `version-error` / VALUESET_VERSION_CHECK
+    // (`version/vs-expand-v-w-check`, `vs-expand-all-v-check`).
+    let check_system_versions = collect_version_pins(&params, "check-system-version");
+    for (sys, pat) in &check_system_versions {
+        // `system-version` (DEFAULT) wins over `check-system-version` when
+        // both pins target the same system.
+        system_version_defaults
+            .entry(sys.clone())
+            .or_insert_with(|| pat.clone());
+    }
+
+    // ── Cache miss: compute ───────────────────────────────────────────────────
+    // Resolve the effective `valueSetVersion` for the top-level url:
+    // explicit `valueSetVersion` param > pipe-parsed > `default-valueset-version`
+    // pin matching the bare url (when no other version was supplied).
+    let explicit_vs_version = find_str_param(&params, "valueSetVersion").or(pipe_version.clone());
+    let effective_vs_version = explicit_vs_version.clone().or_else(|| {
+        url.as_deref()
+            .and_then(|u| default_value_set_versions.get(u).cloned())
+    });
+    // Cloned for downstream `used-valueset` echo logic which needs to apply
+    // the same default-version pins to refs lacking a `|version` suffix.
+    let default_value_set_versions_for_echo = default_value_set_versions.clone();
+    let req = ExpandRequest {
+        url,
+        value_set_version: effective_vs_version,
+        value_set,
+        filter: filter.clone(),
+        count,
+        offset,
+        max_expansion_size: Some(
+            params
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("__max_expansion_size__"))
+                .and_then(|p| p.get("valueInteger").and_then(|v| v.as_u64()))
+                .map(|v| v as u32)
+                .unwrap_or(state.max_expansion_size),
+        ),
+        date: find_str_param(&params, "date"),
+        hierarchical,
+        hierarchical_explicit,
+        tx_resources,
+        force_system_versions: force_system_versions.clone(),
+        system_version_defaults,
+        default_value_set_versions,
+    };
+
+    let ctx = TenantContext::system();
+    // EX_PROBE: measure the backend expand call only (excludes parse + later
+    // post-processing). Captures the dominant cost on cold paths.
+    let probe_t_backend = Instant::now();
+    let probe_url_short: String = req
+        .url
+        .as_deref()
+        .map(|u| {
+            // Truncate long URLs for log readability; keep enough to identify scenario.
+            if u.len() > 80 {
+                format!("{}…", &u[..80])
+            } else {
+                u.to_string()
+            }
+        })
+        .unwrap_or_else(|| "<inline>".to_string());
+    let probe_has_inline = req.value_set.is_some();
+    let probe_has_filter = req.filter.is_some();
+    let probe_count = req.count;
+    let mut resp = match ValueSetOperations::expand(state.backend(), &ctx, req).await {
+        Ok(r) => {
+            let backend_ms = probe_t_backend.elapsed().as_micros() as f64 / 1000.0;
+            tracing::info!(
+                target: "hts::probe",
+                "EX_PROBE: backend_expand took {:.3}ms url={} inline={} filter={} count={:?} contains_n={}",
+                backend_ms,
+                probe_url_short,
+                probe_has_inline,
+                probe_has_filter,
+                probe_count,
+                r.contains.len(),
+            );
+            r
+        }
+        Err(HtsError::NotFound(msg)) => {
+            // Populate the negative cache so future requests for this URL
+            // are resolved in O(1) without touching the database.
+            //
+            // Skip the cache when the failure originated from a nested
+            // `compose.include[].valueSet[]` reference (signalled by the
+            // message naming a different URL than the top-level request).
+            // Caching the top-level URL there would be wrong: the parent VS
+            // exists, only an inner pinned ref was missing — used by the IG
+            // `valueset-version/expand-indirect-expand-zero-pinned-wrong`
+            // fixture which pins `default-valueset-version` to a non-existent
+            // version of an imported ValueSet.
+            if let Some(ref url_str) = url_for_neg_cache {
+                let msg_names_top =
+                    msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"));
+                if msg_names_top {
+                    if let Ok(mut neg) = state.not_found_urls.write() {
+                        if neg.len() < NOT_FOUND_CACHE_MAX {
+                            neg.insert(url_str.clone());
+                        }
+                    }
+                }
+            }
+            // The IG fixtures format VS-not-found errors as
+            //   "A definition for the value Set 'url|version' could not be found"
+            // when a `valueSetVersion` was supplied. Rewrite the backend's
+            // version-less message in-place when we have one.
+            let vs_version = find_str_param(&params, "valueSetVersion");
+            let msg =
+                if let (Some(url), Some(v)) = (url_for_neg_cache.as_ref(), vs_version.as_ref()) {
+                    let needle = format!("'{url}'");
+                    let replacement = format!("'{url}|{v}'");
+                    msg.replace(&needle, &replacement)
+                } else {
+                    msg
+                };
+            return Err(HtsError::NotFound(msg));
+        }
+        Err(e) => return Err(e),
+    };
+
+    // ── Populate abstract / inactive flags ───────────────────────────────────
+    // Backends construct ExpansionContains with both flags as None; resolve
+    // them here in a per-system batch so the per-concept SQL stays cold-path.
+    //
+    // The source-ValueSet metadata lookup below is independent of
+    // populate_concept_flags (it touches a different table and doesn't share
+    // the `resp.contains` borrow), so we issue both concurrently via
+    // `tokio::join!`. For VSAC-style multi-system expansions this halves the
+    // serialised post-expand cost.
+    //
+    // Source ValueSet is used for parameter extension, metadata copy, and to
+    // discover the `valueset-supplement` extension that auto-applies a
+    // supplement without needing an explicit `useSupplement` request param.
+    // Honour the requested valueSetVersion (when present) so the metadata
+    // we echo back — including the top-level `version` field — matches the
+    // ValueSet that was actually used for expansion. With multiple VSes
+    // sharing a canonical URL, a URL-only search would otherwise pick
+    // whichever row came first in created_at order.
+    //
+    // The "effective" version used for the source VS lookup includes:
+    //   1. an explicit `valueSetVersion` request param;
+    //   2. the version side of a piped url (`<url>|<version>`);
+    //   3. a `default-valueset-version` pin matching the bare url.
+    // This must agree with the version the backend used in
+    // `resolve_value_set_versioned` so the metadata copied back into the
+    // response (top-level `id`, `version`, `name`, …) reflects the same row
+    // the codes came from.
+    let req_vs_version = find_str_param(&params, "valueSetVersion")
+        .or_else(|| pipe_version.clone())
+        .or_else(|| {
+            url_for_neg_cache
+                .as_deref()
+                .and_then(|u| default_value_set_versions_for_echo.get(u).cloned())
+        });
+    let flags_fut = populate_concept_flags(state.backend(), &ctx, &mut resp.contains);
+    let source_vs_fut = async {
+        if let Some(ref u) = url_for_neg_cache {
+            ValueSetOperations::search(
+                state.backend(),
+                &ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(u.clone()),
+                    version: req_vs_version.clone(),
+                    count: Some(20),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+        } else {
+            None
+        }
+    };
+    let (_, source_vs_search) = tokio::join!(flags_fut, source_vs_fut);
+    let source_vs: Option<Value> = if url_for_neg_cache.is_some() {
+        source_vs_search.and_then(|mut v| {
+            // If a specific version was requested, return the row whose
+            // `version` matches exactly. Defensive post-filter: the search
+            // SQL already filters by version, but multiple rows can leak in
+            // (e.g. when the search predicate gets lost downstream in a
+            // composite backend) — picking by exact match here keeps the
+            // top-level metadata aligned with the version the backend
+            // actually expanded against (`vs-expand-v2` / `vs-expand-v2-default`
+            // / `vs-expand-v2-force` regress without this check).
+            //
+            // When no version is pinned, pick the highest version (matches
+            // `resolve_value_set_versioned`).
+            if let Some(ref want) = req_vs_version {
+                let exact: Option<Value> = v
+                    .iter()
+                    .find(|r| r.get("version").and_then(|x| x.as_str()) == Some(want.as_str()))
+                    .cloned();
+                exact.or_else(|| v.into_iter().next())
+            } else {
+                v.sort_by(|a, b| {
+                    let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                    let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                    bv.cmp(av)
+                });
+                v.into_iter().next()
+            }
+        })
+    } else {
+        value_set_for_response.clone()
+    };
+
+    // Pull additional supplements pinned by the source VS via the
+    // `valueset-supplement` extension (per HL7 IG `extensions/extensions-all`,
+    // which omits `useSupplement` from the request and relies on the VS to
+    // declare which supplement applies). Resolve each via `supplement_target`.
+    // Unknown supplements pinned via this extension are a hard error — the
+    // IG `extensions/expand-echo-bad-supplement` fixture expects a 4xx
+    // OperationOutcome whose text mentions both "supplement" and the missing
+    // CS canonical URL (matching `$fragments:supplement|...$`).
+    if let Some(vs) = source_vs.as_ref() {
+        if let Some(exts) = vs.get("extension").and_then(|e| e.as_array()) {
+            for ext in exts {
+                if ext.get("url").and_then(|u| u.as_str())
+                    != Some("http://hl7.org/fhir/StructureDefinition/valueset-supplement")
+                {
+                    continue;
+                }
+                let raw = match ext
+                    .get("valueCanonical")
+                    .or_else(|| ext.get("valueUri"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let bare = raw.split('|').next().unwrap_or(&raw).to_string();
+                if supplement_inputs
+                    .iter()
+                    .any(|s| s.split('|').next() == Some(&bare))
+                {
+                    continue;
+                }
+                match state.backend().supplement_target(&ctx, &bare).await {
+                    Ok(Some(info)) => {
+                        supplement_inputs.push(raw.clone());
+                        applied_supplements.push(info);
+                    }
+                    Ok(None) => {
+                        return Err(HtsError::NotFound(format!(
+                            "Required supplement not found: {bare}"
+                        )));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    // Rebuild bare_supplement_urls including any VS-extension additions.
+    let bare_supplement_urls: Vec<String> = supplement_inputs
+        .iter()
+        .map(|s| s.split('|').next().unwrap_or(s).to_string())
+        .collect();
+
+    // ── Populate designations (only if explicitly requested) ─────────────────
+    let include_designations = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("includeDesignations"))
+        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    if include_designations {
+        populate_designations(state.backend(), &ctx, &mut resp.contains).await;
+        // After base designations are loaded, append any supplement-derived
+        // entries so contains[].designation contains BOTH the base and
+        // supplement values for each concept (matched by code).
+        if !bare_supplement_urls.is_empty() {
+            apply_supplement_designations(
+                state.backend(),
+                &ctx,
+                &mut resp.contains,
+                &bare_supplement_urls,
+            )
+            .await;
+        }
+
+        // Apply the `designation` filter parameters when supplied. Each
+        // entry uses the FHIR token shape `<system>|<code>`. The
+        // `urn:ietf:bcp:47|<lang>` family pins a language; otherwise
+        // `<use-system>|<use-code>` pins designation.use. The IG fixtures
+        // (language/expand-echo-en-designation) expect codes whose
+        // matching designations don't exist to ship with no designation
+        // array at all.
+        let designation_filters: Vec<(String, String)> = params
+            .iter()
+            .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("designation"))
+            .filter_map(|p| {
+                p.get("valueString")
+                    .or_else(|| p.get("valueCode"))
+                    .and_then(|v| v.as_str())
+            })
+            .filter_map(|s| {
+                s.split_once('|')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+            })
+            .collect();
+        if !designation_filters.is_empty() {
+            fn filter_designations(
+                contains: &mut [crate::types::ExpansionContains],
+                filters: &[(String, String)],
+            ) {
+                for c in contains.iter_mut() {
+                    c.designations.retain(|d| {
+                        filters.iter().any(|(sys, code)| {
+                            if sys == "urn:ietf:bcp:47" {
+                                d.language.as_deref() == Some(code.as_str())
+                            } else {
+                                d.use_system.as_deref() == Some(sys.as_str())
+                                    && d.use_code.as_deref() == Some(code.as_str())
+                            }
+                        })
+                    });
+                    if !c.contains.is_empty() {
+                        filter_designations(&mut c.contains, filters);
+                    }
+                }
+            }
+            filter_designations(&mut resp.contains, &designation_filters);
+        }
+    }
+
+    // ── Populate properties (always include the well-known `status` property,
+    // plus any others the caller asked for via `property=X` parameters). ─────
+    // The IG fixtures `simple/simple-expand-contained`, `fragment/fragment-expand`,
+    // `deprecated/expand-*`, and `notSelectable/*` emit a per-concept
+    // `status` (retired / deprecated / withdrawn) on the matching contains[]
+    // entry without the caller having to opt in — `status` is a FHIR
+    // well-known concept property defined under
+    // `http://hl7.org/fhir/concept-properties#status`.
+    //
+    // The caller's explicit `property=X` request list (no auto-injection) —
+    // used downstream to decide whether to emit an `expansion.property[]`
+    // declaration. Auto-including `status` in the *population* lookup is
+    // safe (it only surfaces a value when the CS actually carries one), but
+    // it MUST NOT bleed into the declaration block — otherwise vanilla
+    // expansions (language/exclude/search/...) gain a spurious
+    // `expansion.property[{code: status}]` that the IG fixtures don't
+    // expect.
+    let requested_properties: Vec<String> = params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("property"))
+        .filter_map(|p| {
+            p.get("valueString")
+                .or_else(|| p.get("valueCode"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let mut population_properties: Vec<String> = requested_properties.clone();
+    if !population_properties.iter().any(|p| p == "status") {
+        population_properties.push("status".to_string());
+    }
+    populate_properties(
+        state.backend(),
+        &ctx,
+        &mut resp.contains,
+        &population_properties,
+    )
+    .await;
+    if !bare_supplement_urls.is_empty() {
+        apply_supplement_properties(
+            state.backend(),
+            &ctx,
+            &mut resp.contains,
+            &bare_supplement_urls,
+            &population_properties,
+        )
+        .await;
+    }
+
+    // ── Walk concept-level extensions (base + supplements) ────────────────────
+    // Surfaces well-known concept extensions (rendering-style, rendering-xhtml,
+    // valueset-concept-definition) on contains[].extension[] AND derives
+    // synthetic concept-properties (order/label/weight/status) from the
+    // {codesystem-conceptOrder, codesystem-label, itemWeight,
+    // structuredefinition-standards-status} extensions.  Drives the IG
+    // `extensions/expand-echo-{all,enumerated}` fixtures.
+    apply_concept_extension_data(
+        state.backend(),
+        &ctx,
+        &mut resp.contains,
+        &bare_supplement_urls,
+    )
+    .await;
+
+    // ── Apply VS compose-level concept extensions (valueset-deprecated etc.) ──
+    // The IG `extensions/extensions-enumerated` fixture pins per-include-concept
+    // extensions like `valueset-deprecated: true` and
+    // `valueset-concept-definition: "..."` on the compose entry; expand needs
+    // to surface those on the matching contains[] entry.
+    if let Some(vs) = source_vs.as_ref() {
+        if let Some(includes) = vs
+            .get("compose")
+            .and_then(|c| c.get("include"))
+            .and_then(|i| i.as_array())
+        {
+            for inc in includes {
+                let inc_sys = inc.get("system").and_then(|s| s.as_str());
+                let Some(concepts) = inc.get("concept").and_then(|c| c.as_array()) else {
+                    continue;
+                };
+                for concept in concepts {
+                    let Some(code) = concept.get("code").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    // VS-compose-level designations attach to the matching
+                    // contains[] entry, alongside any base/supplement-derived
+                    // designations. The IG `extensions/expand-echo-enumerated`
+                    // fixture pins a `de`-language designation on the VS-
+                    // compose `code2` concept that must surface on the
+                    // expansion's contains entry — without this merge the
+                    // server only emits the supplement-contributed designation.
+                    if let Some(desigs) = concept.get("designation").and_then(|d| d.as_array()) {
+                        fn merge_designations_into_contains(
+                            list: &mut [crate::types::ExpansionContains],
+                            wanted_sys: Option<&str>,
+                            wanted_code: &str,
+                            desigs: &[Value],
+                        ) {
+                            use crate::types::ExpansionContainsDesignation;
+                            for c in list.iter_mut() {
+                                if c.code == wanted_code && wanted_sys.is_none_or(|s| s == c.system)
+                                {
+                                    for d in desigs {
+                                        let Some(value) = d.get("value").and_then(|v| v.as_str())
+                                        else {
+                                            continue;
+                                        };
+                                        let language = d
+                                            .get("language")
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string);
+                                        // De-dupe by (language, value).
+                                        let dup = c.designations.iter().any(|existing| {
+                                            existing.value == value && existing.language == language
+                                        });
+                                        if dup {
+                                            continue;
+                                        }
+                                        // Only carry over extensions whose URL
+                                        // is well-known to the IG (the fixture
+                                        // doesn't expect every ad-hoc
+                                        // extension to round-trip — e.g.
+                                        // `unknown-extension-6` is filtered).
+                                        let extensions = d
+                                            .get("extension")
+                                            .and_then(|e| e.as_array())
+                                            .map(|a| {
+                                                a.iter()
+                                                    .filter(|ext| {
+                                                        let url = ext
+                                                            .get("url")
+                                                            .and_then(|u| u.as_str())
+                                                            .unwrap_or("");
+                                                        url == "http://hl7.org/fhir/StructureDefinition/coding-sctdescid"
+                                                            || url == "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status"
+                                                    })
+                                                    .cloned()
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default();
+                                        c.designations.push(ExpansionContainsDesignation {
+                                            language,
+                                            use_system: None,
+                                            use_code: None,
+                                            value: value.to_string(),
+                                            extensions,
+                                        });
+                                    }
+                                }
+                                if !c.contains.is_empty() {
+                                    merge_designations_into_contains(
+                                        &mut c.contains,
+                                        wanted_sys,
+                                        wanted_code,
+                                        desigs,
+                                    );
+                                }
+                            }
+                        }
+                        merge_designations_into_contains(&mut resp.contains, inc_sys, code, desigs);
+                    }
+                    let Some(exts) = concept.get("extension").and_then(|e| e.as_array()) else {
+                        continue;
+                    };
+                    // VS-compose-applied extensions get a SUPERSET of the
+                    // base passthrough list. The `deprecated/expand-deprecating`
+                    // fixture pins `structuredefinition-standards-status:
+                    // deprecated` on a VS-compose concept and expects it to
+                    // surface verbatim on the matching contains[] entry.
+                    // (We don't add it to `PASSTHROUGH_CONCEPT_EXTENSIONS` for
+                    // the CS-resource path because `apply_concept_extension_data`
+                    // already converts that extension to a `status` property
+                    // for CS-native concepts — see `extension_to_property_code`.)
+                    fn vs_compose_passthrough(url: &str) -> bool {
+                        PASSTHROUGH_CONCEPT_EXTENSIONS.contains(&url)
+                            || url
+                                == "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status"
+                    }
+                    /// Map VS-compose-level extension URLs onto the FHIR
+                    /// concept-property `code` they synthesise. Mirrors
+                    /// [`extension_to_property_code`] but for the
+                    /// VS-compose-level shape (`valueset-conceptOrder` /
+                    /// `valueset-label`).  These OVERRIDE the CS-level values
+                    /// when both exist — IG `parameters/parameters-expand-
+                    /// enum-definitions3` and `extensions/expand-echo-
+                    /// enumerated` pin VS-compose `valueset-conceptOrder=0,1,
+                    /// 2,…` over a CS-level `codesystem-conceptOrder=6,5,4,…`.
+                    fn vs_compose_property_code(url: &str) -> Option<&'static str> {
+                        match url {
+                            "http://hl7.org/fhir/StructureDefinition/valueset-conceptOrder" => {
+                                Some("order")
+                            }
+                            "http://hl7.org/fhir/StructureDefinition/valueset-label" => {
+                                Some("label")
+                            }
+                            "http://hl7.org/fhir/StructureDefinition/itemWeight" => Some("weight"),
+                            _ => None,
+                        }
+                    }
+                    fn merge_into_contains(
+                        list: &mut [crate::types::ExpansionContains],
+                        wanted_sys: Option<&str>,
+                        wanted_code: &str,
+                        exts: &[Value],
+                    ) {
+                        use crate::types::ExpansionContainsProperty;
+                        for c in list.iter_mut() {
+                            if c.code == wanted_code && wanted_sys.is_none_or(|s| s == c.system) {
+                                for ext in exts {
+                                    let url = match ext.get("url").and_then(|u| u.as_str()) {
+                                        Some(s) => s,
+                                        None => continue,
+                                    };
+                                    if vs_compose_passthrough(url) {
+                                        c.extensions.retain(|existing| {
+                                            existing.get("url").and_then(|u| u.as_str())
+                                                != Some(url)
+                                        });
+                                        c.extensions.push(ext.clone());
+                                    }
+                                    // Synthesise/override CS-level property
+                                    // values from VS-compose-level extensions
+                                    // (last-writer-wins by `code`).
+                                    if let Some(prop_code) = vs_compose_property_code(url) {
+                                        if let Some((value_type, value)) =
+                                            extension_value_for_property(ext)
+                                        {
+                                            c.properties.retain(|p| p.code != prop_code);
+                                            c.properties.push(ExpansionContainsProperty {
+                                                code: prop_code.to_string(),
+                                                value_type: value_type.to_string(),
+                                                value,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            if !c.contains.is_empty() {
+                                merge_into_contains(&mut c.contains, wanted_sys, wanted_code, exts);
+                            }
+                        }
+                    }
+                    merge_into_contains(&mut resp.contains, inc_sys, code, exts);
+                }
+            }
+        }
+    }
+
+    // ── Per-system CodeSystem metadata lookup (one search per distinct URL) ──
+    // The CS resource is consulted by THREE downstream blocks:
+    //   - apply_display_language (for CS.language → preferredForLanguage)
+    //   - the used-codesystem emission (for CS.version)
+    //   - the warning-<status> emission (for extension/status/experimental)
+    //
+    // Centralising the lookup here avoids duplicating the search and keeps
+    // the call count to one per system on the cache-miss path.
+    use std::collections::HashMap;
+    let mut cs_by_url: HashMap<String, Option<Value>> = HashMap::new();
+    {
+        // Collect systems from expansion items first.
+        let mut systems: Vec<String> = resp.contains.iter().map(|c| c.system.clone()).fold(
+            Vec::<String>::new(),
+            |mut acc, s| {
+                if !acc.contains(&s) {
+                    acc.push(s);
+                }
+                acc
+            },
+        );
+        // Also add systems from compose.include[] so that empty expansions
+        // (e.g. count=0 or filter matched nothing) still populate cs_by_url,
+        // enabling used-codesystem to carry the |version suffix.
+        if let Some(vs) = source_vs.as_ref() {
+            if let Some(includes) = vs
+                .get("compose")
+                .and_then(|c| c.get("include"))
+                .and_then(|i| i.as_array())
+            {
+                for inc in includes {
+                    if let Some(sys) = inc.get("system").and_then(|s| s.as_str()) {
+                        let s = sys.to_string();
+                        if !systems.contains(&s) {
+                            systems.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        systems.sort();
+        // Fan out per-system CS searches concurrently so total latency is
+        // O(1) round-trip instead of O(N). For VSAC's typical 5+ systems
+        // this collapses ~50ms of serialised waits into ~10ms.
+        let cs_searches = systems.iter().map(|system_url| {
+            let url = system_url.clone();
+            let backend = state.backend();
+            let ctx = &ctx;
+            async move {
+                let cs = crate::traits::CodeSystemOperations::search(
+                    backend,
+                    ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(url.clone()),
+                        count: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|mut v| v.pop());
+                (url, cs)
+            }
+        });
+        for (url, cs) in futures::future::join_all(cs_searches).await {
+            cs_by_url.insert(url, cs);
+        }
+    }
+    let cs_lang_by_url: HashMap<String, Option<String>> = cs_by_url
+        .iter()
+        .map(|(url, cs)| {
+            let lang = cs
+                .as_ref()
+                .and_then(|c| c.get("language"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            (url.clone(), lang)
+        })
+        .collect();
+
+    // ── displayLanguage: swap display from matching designation ──────────────
+    let display_language = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("displayLanguage"))
+        .and_then(|p| {
+            p.get("valueCode")
+                .or_else(|| p.get("valueString"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    if let Some(raw) = display_language.as_deref() {
+        if let Some(spec) = parse_display_language(raw) {
+            apply_display_language(
+                state.backend(),
+                &ctx,
+                &mut resp.contains,
+                &spec,
+                &cs_lang_by_url,
+            )
+            .await;
+        }
+    }
+
+    // ── activeOnly / compose.inactive=false filter ──────────────────────────
+    // The IG fixtures drop inactive concepts when EITHER:
+    //   - the request passes `activeOnly=true`, OR
+    //   - the source VS has `compose.inactive: false` (FHIR R5)
+    // Post-filter using the freshly-populated inactive flag and adjust
+    // `total` to match.
+    let active_only_request = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
+        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let compose_inactive_false = source_vs
+        .as_ref()
+        .and_then(|vs| vs.get("compose"))
+        .and_then(|c| c.get("inactive"))
+        .and_then(|i| i.as_bool())
+        == Some(false);
+    if active_only_request || compose_inactive_false {
+        // Walk the tree splicing out inactive nodes and promoting their
+        // active descendants up to the parent's level. Mirrors the IG
+        // `parameters/parameters-expand-all-active` semantics: when an
+        // inactive code has active children, those children stay in the
+        // response as roots rather than being dropped with their parent.
+        // Returns the new top-level list and the count of inactive nodes
+        // that were spliced out (used to keep `total` aligned).
+        fn splice_inactive(
+            input: Vec<crate::types::ExpansionContains>,
+        ) -> (Vec<crate::types::ExpansionContains>, u32) {
+            let mut removed: u32 = 0;
+            let mut out: Vec<crate::types::ExpansionContains> = Vec::new();
+            for mut entry in input {
+                let (children, child_removed) =
+                    splice_inactive(std::mem::take(&mut entry.contains));
+                removed += child_removed;
+                if entry.inactive == Some(true) {
+                    removed += 1;
+                    out.extend(children);
+                } else {
+                    entry.contains = children;
+                    out.push(entry);
+                }
+            }
+            (out, removed)
+        }
+
+        let (filtered, removed) = splice_inactive(std::mem::take(&mut resp.contains));
+        resp.contains = filtered;
+        if let Some(t) = resp.total.as_mut() {
+            *t = t.saturating_sub(removed);
+        }
+    }
+
+    // ── Build FHIR ValueSet response with expansion ──────────────────────────
+    // Determine which systems appear with more than one distinct version in
+    // this expansion. Only for those systems do we emit the version field on
+    // individual contains items (so multi-version expansions are unambiguous
+    // while single-version expansions stay compact).
+    //
+    // ALSO retain `version` on contains items whose source ValueSet pins
+    // DIFFERENT versions in include[] and exclude[] for the same system —
+    // i.e. the `overload/overload-expand-exclude*` cross-version pattern.
+    // A single-version pin in include[] (e.g. version-1 / version-2 fixtures)
+    // does NOT trigger version echo: those expansions are single-version and
+    // the IG fixtures expect compact `contains[]` entries without per-item
+    // `version`.
+    let pinned_systems_for_version_echo: std::collections::HashSet<String> = source_vs
+        .as_ref()
+        .and_then(|vs| vs.get("compose"))
+        .map(|compose| {
+            let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Map: system -> (include_versions, exclude_versions).
+            let mut by_system: std::collections::HashMap<String, (Vec<String>, Vec<String>)> =
+                std::collections::HashMap::new();
+            for key in ["include", "exclude"] {
+                if let Some(arr) = compose.get(key).and_then(|v| v.as_array()) {
+                    for inc in arr {
+                        let v = inc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        if let (Some(sys), Some(ver)) =
+                            (inc.get("system").and_then(|s| s.as_str()), v)
+                        {
+                            let entry = by_system.entry(sys.to_string()).or_default();
+                            if key == "include" {
+                                entry.0.push(ver);
+                            } else {
+                                entry.1.push(ver);
+                            }
+                        }
+                    }
+                }
+            }
+            for (sys, (incs, excs)) in &by_system {
+                // Only echo per-contains version when both include AND exclude
+                // pin a version for this system AND those version sets differ.
+                if !incs.is_empty() && !excs.is_empty() && incs.iter().any(|i| !excs.contains(i)) {
+                    out.insert(sys.clone());
+                }
+                // `force-system-version` collapses multi-version include pins
+                // into a single forced version, but the IG
+                // `version/vs-expand-v-mixed-force` fixture still expects the
+                // forced version echoed on every contains item. Trigger
+                // version echo whenever the source VS pinned MULTIPLE distinct
+                // versions for this system AND a force pin is in effect.
+                let distinct_inc_versions: std::collections::HashSet<&str> =
+                    incs.iter().map(|s| s.as_str()).collect();
+                if distinct_inc_versions.len() >= 2 && force_system_versions.contains_key(sys) {
+                    out.insert(sys.clone());
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+    let multi_version_systems: std::collections::HashSet<String> = {
+        use std::collections::HashMap;
+        let mut sys_versions: HashMap<&str, Option<&str>> = HashMap::new();
+        let mut multi = std::collections::HashSet::new();
+        for c in &resp.contains {
+            let ver = c.version.as_deref();
+            match sys_versions.get(c.system.as_str()) {
+                None => {
+                    sys_versions.insert(&c.system, ver);
+                }
+                Some(&prev) if prev != ver => {
+                    multi.insert(c.system.clone());
+                }
+                _ => {}
+            }
+        }
+        // Promote pinned single-version systems too — see comment above.
+        for sys in &pinned_systems_for_version_echo {
+            multi.insert(sys.clone());
+        }
+        multi
+    };
+    let contains: Vec<Value> = resp
+        .contains
+        .iter()
+        .map(|c| serialize_expansion_contains(c, &multi_version_systems))
+        .collect();
+
+    // The IG validator (txTests) treats `expansion.identifier` and
+    // `expansion.timestamp` as required (they appear in every fixture without
+    // an `$optional$` marker). The values are matched as `$uuid$` / `$instant$`
+    // wildcards, so any well-formed value satisfies the comparison.
+    let mut expansion = json!({
+        "identifier": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "contains": contains,
+    });
+
+    if let Some(total) = resp.total {
+        expansion["total"] = json!(total);
+    }
+    if let Some(off) = resp.offset {
+        expansion["offset"] = json!(off);
+    }
+
+    // ── expansion.parameter ──────────────────────────────────────────────────
+    // Echo back the input parameters that influenced the result (e.g.
+    // `excludeNested`, `displayLanguage`, `includeDesignations`, `count`,
+    // `offset`, `activeOnly`). The validator's tests check that we report
+    // every honored input here.
+    //
+    // Skip the `url` / `valueSet` discriminators (they identify the
+    // ValueSet, not a knob), and skip `filter` (already reflected in the
+    // contains[] result).
+    //
+    // Critically: the FHIR R5 ValueSet model requires every
+    // `expansion.parameter[].value[x]` to be a primitive (boolean | string |
+    // integer | decimal | uri | code | dateTime). The HL7 IG validator
+    // augments our request with `tx-resource` parameters whose payload is a
+    // Resource (no value[x] at all) plus `profile.parameter` entries. If we
+    // echo any of those, the R5 parser produces a ValueSetExpansionParameterComponent
+    // with `getValue() == null`, and TxTesterSorters.ExpParameterSorter NPEs
+    // on the sort. Drop anything without a primitive value[x] field.
+    let mut emitted_params: Vec<Value> = params
+        .iter()
+        .filter(|p| {
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            // Discriminator inputs (identify the ValueSet) — not knobs to echo.
+            // `filter` is emitted later as a normalised valueString.
+            // `property` is a request-side filter for contains[].property —
+            // the IG fixtures don't echo it back.
+            // `valueSetVersion` selects which (url, version) ValueSet — the
+            // IG fixtures expose the chosen version via the response's
+            // top-level `version` field, not as an expansion.parameter echo.
+            if matches!(
+                name,
+                "url" | "valueSet" | "valueSetVersion" | "filter" | "property"
+            ) {
+                return false;
+            }
+            // `system-version` and `check-system-version` are instruction
+            // knobs (default / verify-only semantics).
+            //
+            // Echo them ONLY when the source VS's compose includes a
+            // VERSIONLESS reference for the system pinned by the param —
+            // i.e. when the param actually defaulted/checked the version
+            // resolution (`version/vs-expand-v-n-default`,
+            // `vs-expand-v-n-check`).  When the include already pins a
+            // version, the param is irrelevant and the IG fixtures do
+            // NOT echo it (`vs-expand-v1-default`, `vs-expand-v1-check`).
+            if matches!(name, "system-version" | "check-system-version") {
+                let pin_sys = ["valueCanonical", "valueUri", "valueString", "valueUrl"]
+                    .iter()
+                    .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
+                    .and_then(|s| s.split_once('|').map(|(u, _)| u.to_string()));
+                let echo = match pin_sys {
+                    Some(sys) => source_vs
+                        .as_ref()
+                        .and_then(|vs| vs.get("compose"))
+                        .and_then(|c| c.get("include"))
+                        .and_then(|i| i.as_array())
+                        .map(|incs| {
+                            incs.iter().any(|inc| {
+                                inc.get("system").and_then(|s| s.as_str()) == Some(sys.as_str())
+                                    && inc
+                                        .get("version")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|s| !s.is_empty())
+                                        .is_none()
+                            })
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if !echo {
+                    return false;
+                }
+            }
+            // `useSupplement` is consumed (it drives `used-supplement`
+            // emission) — the IG `parameters-expand-supplement-good` fixture
+            // does NOT echo `useSupplement` itself.
+            if name == "useSupplement" {
+                return false;
+            }
+            // Configuration inputs that the IG validator passes via the
+            // `profile` parameter set — they steer test execution rather than
+            // request semantics, and the validator does NOT expect them back
+            // in expansion.parameter[]. Echoing produces "Unexpected Node
+            // found in array" diffs against every fixture.
+            if matches!(name, "uuid" | "binding-style") {
+                return false;
+            }
+            // Synthetic internal-only params injected by handlers — never
+            // echo (e.g. `__max_expansion_size__` set by the
+            // X-TOO-COSTLY-THRESHOLD header injector).
+            if name.starts_with("__") && name.ends_with("__") {
+                return false;
+            }
+            // Must carry a primitive value[x] to be valid in expansion.parameter.
+            p.as_object()
+                .map(|obj| obj.keys().any(|k| k.starts_with("value")))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
+    // Emit `filter` as a normalised valueString (the IG fixtures expect that
+    // form regardless of whether the request used valueString or valueUri).
+    if let Some(f) = filter.as_deref() {
+        emitted_params.push(json!({"name": "filter", "valueString": f}));
+    }
+
+    // Normalise version-override params to `valueUri` regardless of whether
+    // the request supplied them as `valueCanonical`/`valueUrl`/etc.  The IG
+    // `version/parameters-*-version` and `valueset-version/expand-indirect-*-pinned`
+    // fixtures echo them as `valueUri`.  `check-system-version` follows the
+    // same shape (echoed as `valueUri` per `version/vs-expand-v-n-check`).
+    for ep in emitted_params.iter_mut() {
+        let name = ep.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(
+            name,
+            "system-version"
+                | "force-system-version"
+                | "check-system-version"
+                | "default-valueset-version"
+        ) {
+            continue;
+        }
+        let raw = ["valueCanonical", "valueUri", "valueString", "valueUrl"]
+            .iter()
+            .filter_map(|k| {
+                ep.get(*k)
+                    .and_then(|v| v.as_str())
+                    .map(|s| (*k, s.to_owned()))
+            })
+            .next();
+        if let Some((had_key, val)) = raw {
+            if had_key != "valueUri" {
+                if let Some(obj) = ep.as_object_mut() {
+                    obj.remove(had_key);
+                    obj.insert("valueUri".into(), json!(val));
+                }
+            }
+        }
+    }
+
+    // Pull additional default expansion parameters from the source ValueSet's
+    // `compose.extension[].valueset-expansion-parameter` entries. The IG fixtures
+    // use this to pin defaults like displayLanguage="en" without forcing every
+    // caller to pass it explicitly. Each extension nests two sub-extensions
+    // (`name` and `value`); convert each into a {name, value[x]} parameter.
+    if let Some(vs) = source_vs.as_ref() {
+        let exts = vs
+            .get("compose")
+            .and_then(|c| c.get("extension"))
+            .and_then(|e| e.as_array());
+        if let Some(exts) = exts {
+            for ext in exts {
+                if ext.get("url").and_then(|u| u.as_str())
+                    != Some("http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter")
+                {
+                    continue;
+                }
+                let inner = match ext.get("extension").and_then(|i| i.as_array()) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let mut name: Option<&str> = None;
+                let mut value_entry: Option<(String, Value)> = None;
+                for sub in inner {
+                    let sub_url = sub.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                    if sub_url == "name" {
+                        name = sub.get("valueCode").and_then(|v| v.as_str());
+                    } else if let Some(obj) = sub.as_object() {
+                        if let Some((k, v)) = obj.iter().find(|(k, _)| k.starts_with("value")) {
+                            value_entry = Some((k.clone(), v.clone()));
+                        }
+                    }
+                }
+                if let (Some(n), Some((k, v))) = (name, value_entry) {
+                    // `versionsMatch` is a tx-ecosystem-extension carried on
+                    // `compose` to choose between version-blind and
+                    // version-aware exclude/merge semantics. The IG fixtures
+                    // (`overload/overload-expand-all-merged` etc.) echo the
+                    // *true* form back as `valueBoolean: true` (and suppress
+                    // the *false* form entirely). Translate the valueString
+                    // from the extension into the Boolean shape the fixtures
+                    // assert against.
+                    if n == "versionsMatch" {
+                        let val_str = match &v {
+                            Value::String(s) => s.as_str(),
+                            _ => "",
+                        };
+                        if val_str.eq_ignore_ascii_case("true") {
+                            let already = emitted_params.iter().any(|p| {
+                                p.get("name").and_then(|x| x.as_str()) == Some("versionsMatch")
+                            });
+                            if !already {
+                                emitted_params.push(json!({
+                                    "name": "versionsMatch",
+                                    "valueBoolean": true,
+                                }));
+                            }
+                        }
+                        continue;
+                    }
+                    // Don't double-emit if the caller already provided this knob.
+                    let already = emitted_params
+                        .iter()
+                        .any(|p| p.get("name").and_then(|x| x.as_str()) == Some(n));
+                    if !already {
+                        emitted_params.push(json!({ "name": n, k: v }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Default-versionsMatch heuristic (applies when no extension is set):
+    // the IG fixtures `overload/overload-expand-exclude` and
+    // `overload-expand-exclude-merged` expect a `versionsMatch=true`
+    // parameter when a whole-system `exclude[]` clause targets a different
+    // version than the contributing `include[]`s.  Per-concept excludes
+    // (with `concept[]`) do *not* trigger this — those are inherently
+    // version-aware (`overload-expand-exclude-enum`).
+    if let Some(vs) = source_vs.as_ref() {
+        let already = emitted_params
+            .iter()
+            .any(|p| p.get("name").and_then(|x| x.as_str()) == Some("versionsMatch"));
+        if !already {
+            let compose = vs.get("compose");
+            let has_versions_match_ext = compose
+                .and_then(|c| c.get("extension"))
+                .and_then(|e| e.as_array())
+                .map(|exts| {
+                    exts.iter().any(|ext| {
+                        ext.get("url").and_then(|u| u.as_str())
+                            == Some(
+                                "http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter",
+                            )
+                            && ext
+                                .get("extension")
+                                .and_then(|e| e.as_array())
+                                .is_some_and(|inner| {
+                                    inner.iter().any(|sub| {
+                                        sub.get("url").and_then(|u| u.as_str()) == Some("name")
+                                            && sub.get("valueCode").and_then(|v| v.as_str())
+                                                == Some("versionsMatch")
+                                    })
+                                })
+                    })
+                })
+                .unwrap_or(false);
+            if !has_versions_match_ext {
+                let mut include_versions: std::collections::HashMap<
+                    String,
+                    std::collections::HashSet<String>,
+                > = std::collections::HashMap::new();
+                if let Some(arr) = compose
+                    .and_then(|c| c.get("include"))
+                    .and_then(|i| i.as_array())
+                {
+                    for inc in arr {
+                        let sys = match inc.get("system").and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        let ver = inc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        include_versions.entry(sys).or_default().insert(ver);
+                    }
+                }
+                let mut whole_system_cross_version_exclude = false;
+                if let Some(arr) = compose
+                    .and_then(|c| c.get("exclude"))
+                    .and_then(|i| i.as_array())
+                {
+                    for exc in arr {
+                        let has_concept = exc
+                            .get("concept")
+                            .and_then(|c| c.as_array())
+                            .is_some_and(|a| !a.is_empty());
+                        if has_concept {
+                            // Per-concept excludes are inherently version-aware.
+                            continue;
+                        }
+                        let sys = match exc.get("system").and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        let ver = exc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if let Some(includes) = include_versions.get(&sys) {
+                            if !includes.contains(&ver) {
+                                whole_system_cross_version_exclude = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if whole_system_cross_version_exclude {
+                    emitted_params.push(json!({
+                        "name": "versionsMatch",
+                        "valueBoolean": true,
+                    }));
+                }
+            }
+        }
+    }
+
+    // ── used-codesystem + warning-<status> per contributing CodeSystem ───────
+    // Derive `used-codesystem` from the actual `(system, version)` pairs in
+    // the expansion contains items. This is more accurate than querying all
+    // stored CS versions: it emits only the versions that were actually used,
+    // handling both single-version (vs-expand-all-v → one entry) and
+    // multi-version (overload-expand-all → two entries) expansions correctly.
+    //
+    // Post-processing rule: FHIR only requires `version` on contains items
+    // when the expansion mixes different versions of the same system URL.
+    // When all items for a given system come from the same version, clear the
+    // `version` field so it is not emitted in the JSON output.
+    //
+    // When the filter narrows to zero matches, fall back to the compose.include[]
+    // system+version references so `used-codesystem` still surfaces even for
+    // empty expansions (filter='xxx' → empty contains[] but used-codesystem
+    // is still echoed for the included CS).
+
+    // Collect distinct (system_url, version) pairs from contains (flat walk).
+    let mut used_pairs: Vec<(String, Option<String>)> = {
+        fn collect_pairs(
+            items: &[crate::types::ExpansionContains],
+            out: &mut Vec<(String, Option<String>)>,
+        ) {
+            for item in items {
+                let pair = (item.system.clone(), item.version.clone());
+                if !out.contains(&pair) {
+                    out.push(pair);
+                }
+                collect_pairs(&item.contains, out);
+            }
+        }
+        let mut pairs = Vec::new();
+        collect_pairs(&resp.contains, &mut pairs);
+        pairs
+    };
+
+    // Augment with `compose.include[]` AND `compose.exclude[]` system/version
+    // pins so every CS that influenced the expansion shape (even ones that
+    // contributed only via exclusion, e.g. `overload/overload-expand-exclude`
+    // where the v1 include is fully exclude-subsumed) surfaces as a
+    // `used-codesystem` parameter.
+    //
+    // Skip wildcard pins (e.g. `1.x.x`) entirely — the expansion will have
+    // resolved them into concrete contains[] rows whose `(system, version)`
+    // pair already lives in `used_pairs`. Adding the raw pattern would emit
+    // a spurious extra `used-codesystem` parameter (per the IG
+    // `version/vs-expand-v-w` and `vs-expand-v-n` fixtures, which expect
+    // only the resolved concrete pair).
+    //
+    // Skip versionless pins on systems that already produced contains[]
+    // rows — the resolved-from-DB version we'd derive is exactly what's
+    // already in `used_pairs`.
+    //
+    // Skip pins for systems that have a `force-system-version` override
+    // applied — the forced version is what actually contributes; the
+    // include's pinned version becomes irrelevant (per IG
+    // `version/vs-expand-all-v-force` and `vs-expand-all-v2-force`).
+    let force_pinned_systems: std::collections::HashSet<String> = params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("force-system-version"))
+        .filter_map(|p| {
+            ["valueCanonical", "valueUri", "valueString", "valueUrl"]
+                .iter()
+                .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
+                .and_then(|s| s.split_once('|').map(|(u, _)| u.to_string()))
+        })
+        .collect();
+    if let Some(vs) = source_vs.as_ref() {
+        for key in ["include", "exclude"] {
+            if let Some(arr) = vs
+                .get("compose")
+                .and_then(|c| c.get(key))
+                .and_then(|i| i.as_array())
+            {
+                for inc in arr {
+                    if let Some(sys) = inc.get("system").and_then(|s| s.as_str()) {
+                        // Skip when a force-system-version overrides this
+                        // system; the contains[] pair already reflects the
+                        // forced version.
+                        if force_pinned_systems.contains(sys) {
+                            continue;
+                        }
+                        let ver = inc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        // Skip wildcard pins — contains[] carries the
+                        // concrete resolution.
+                        if ver.as_deref().is_some_and(|v| v.contains(".x") || v == "x") {
+                            continue;
+                        }
+                        // Skip versionless pins when contains[] already
+                        // covers this system — they resolve to the same
+                        // concrete (system, version) pair.
+                        if ver.is_none() && used_pairs.iter().any(|(s, _)| s == sys) {
+                            continue;
+                        }
+                        // When no version pin, use the single cached CS version.
+                        let resolved_ver = ver.or_else(|| {
+                            cs_by_url
+                                .get(sys)
+                                .and_then(|c| c.as_ref())
+                                .and_then(|c| c.get("version"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        });
+                        let pair = (sys.to_string(), resolved_ver);
+                        if !used_pairs.contains(&pair) {
+                            used_pairs.push(pair);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── check-system-version post-expansion verification ────────────────────
+    // For every `check-system-version` pin, find the version actually used
+    // for that system in the expansion. If it doesn't satisfy the pattern,
+    // emit a 4xx OperationOutcome with VALUESET_VERSION_CHECK / version-error
+    // — matches the IG `version/vs-expand-v-w-check` fixture family. We
+    // surface this through `HtsError::VsInvalid` with a sentinel prefix that
+    // [`version_check_response`] (registered alongside
+    // [`cyclic_reference_response`]) detects to format the FHIR-spec response
+    // shape.
+    if !check_system_versions.is_empty() {
+        for (chk_sys, chk_pat) in &check_system_versions {
+            let mut violator: Option<String> = None;
+            for (sys, ver) in &used_pairs {
+                if sys != chk_sys {
+                    continue;
+                }
+                let v = match ver.as_deref() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if !expand_version_satisfies_wildcard(v, chk_pat) {
+                    violator = Some(v.to_string());
+                    break;
+                }
+            }
+            if let Some(v) = violator {
+                let text = format!(
+                    "The version '{v}' is not allowed for system '{chk_sys}': required to be \
+                     '{chk_pat}' by a version-check parameter"
+                );
+                return Err(HtsError::VsInvalid(format!(
+                    "{VERSION_CHECK_ERR_PREFIX}{text}"
+                )));
+            }
+        }
+    }
+
+    // Group pairs by system URL to detect multi-version systems.
+    // Sort within each group for deterministic output (ascending version).
+    used_pairs.sort_by(|a, b| {
+        a.0.cmp(&b.0).then(
+            a.1.as_deref()
+                .unwrap_or("")
+                .cmp(b.1.as_deref().unwrap_or("")),
+        )
+    });
+    let mut versions_per_system: std::collections::HashMap<&str, Vec<Option<String>>> =
+        std::collections::HashMap::new();
+    for (sys, ver) in &used_pairs {
+        versions_per_system
+            .entry(sys)
+            .or_default()
+            .push(ver.clone());
+    }
+
+    // Clear `version` on contains items for single-version systems — FHIR only
+    // requires it when a system appears with multiple different versions.
+    //
+    // Exception ("overload" pattern): only retain `version` when the source VS
+    // pins DIFFERENT versions in include[] vs exclude[] for the same system
+    // (overload/overload-expand-exclude*).  A single-version pin in include[]
+    // alone (version-1, version-2 fixtures) does NOT require per-item
+    // `version` — those expansions are single-version, and the IG
+    // `version/vs-expand-v1` / `vs-expand-v2` fixtures expect compact
+    // contains[] without a version field.
+    {
+        let pinned_systems: std::collections::HashSet<String> = source_vs
+            .as_ref()
+            .and_then(|vs| vs.get("compose"))
+            .map(|compose| {
+                let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut by_system: std::collections::HashMap<String, (Vec<String>, Vec<String>)> =
+                    std::collections::HashMap::new();
+                for key in ["include", "exclude"] {
+                    if let Some(arr) = compose.get(key).and_then(|v| v.as_array()) {
+                        for inc in arr {
+                            let v = inc
+                                .get("version")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string);
+                            if let (Some(sys), Some(ver)) =
+                                (inc.get("system").and_then(|s| s.as_str()), v)
+                            {
+                                let entry = by_system.entry(sys.to_string()).or_default();
+                                if key == "include" {
+                                    entry.0.push(ver);
+                                } else {
+                                    entry.1.push(ver);
+                                }
+                            }
+                        }
+                    }
+                }
+                for (sys, (incs, excs)) in &by_system {
+                    if !incs.is_empty()
+                        && !excs.is_empty()
+                        && incs.iter().any(|i| !excs.contains(i))
+                    {
+                        out.insert(sys.clone());
+                    }
+                    // `force-system-version` collapses multi-version include
+                    // pins to a single forced version — every contains item
+                    // for the system surfaces with the forced version.  When
+                    // the source VS pinned MULTIPLE distinct versions for
+                    // the system, the IG `vs-expand-v-mixed-force` fixture
+                    // expects the (forced) `version` retained on every
+                    // contains item even though the post-force expansion is
+                    // technically single-version. Mark the system pinned so
+                    // `clear_single_version` doesn't strip it.
+                    let distinct_inc_versions: std::collections::HashSet<&str> =
+                        incs.iter().map(|s| s.as_str()).collect();
+                    let force_active = force_system_versions.contains_key(sys);
+                    if distinct_inc_versions.len() >= 2 && force_active {
+                        out.insert(sys.clone());
+                    }
+                }
+                out
+            })
+            .unwrap_or_default();
+
+        fn clear_single_version(
+            items: &mut Vec<crate::types::ExpansionContains>,
+            multi_version_systems: &std::collections::HashSet<String>,
+            pinned_systems: &std::collections::HashSet<String>,
+        ) {
+            for item in items {
+                if !multi_version_systems.contains(&item.system)
+                    && !pinned_systems.contains(&item.system)
+                {
+                    item.version = None;
+                }
+                clear_single_version(&mut item.contains, multi_version_systems, pinned_systems);
+            }
+        }
+        let multi_version_systems: std::collections::HashSet<String> = versions_per_system
+            .iter()
+            .filter(|(_, vers)| vers.len() > 1)
+            .map(|(sys, _)| sys.to_string())
+            .collect();
+        clear_single_version(&mut resp.contains, &multi_version_systems, &pinned_systems);
+
+        // Compute the set of systems whose includes are *all* explicitly
+        // version-pinned. The IG `overload/overload-expand-all*` fixtures
+        // sort duplicates of a code latest-version-first when every include
+        // for the system carries a pinned version.  When any include is
+        // versionless (`overload-expand-mixed`), the original include-order
+        // is preserved so the user can see how the unversioned reference
+        // resolved.
+        let fully_pinned_systems: std::collections::HashSet<String> = source_vs
+            .as_ref()
+            .and_then(|vs| vs.get("compose"))
+            .and_then(|c| c.get("include"))
+            .and_then(|i| i.as_array())
+            .map(|includes| {
+                let mut by_system: std::collections::HashMap<String, (usize, usize)> =
+                    std::collections::HashMap::new();
+                for inc in includes {
+                    if let Some(sys) = inc.get("system").and_then(|s| s.as_str()) {
+                        let entry = by_system.entry(sys.to_string()).or_insert((0, 0));
+                        entry.0 += 1;
+                        let pinned = inc
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .is_some();
+                        if pinned {
+                            entry.1 += 1;
+                        }
+                    }
+                }
+                by_system
+                    .into_iter()
+                    .filter(|(_, (total, pinned))| *total >= 2 && total == pinned)
+                    .map(|(sys, _)| sys)
+                    .collect::<std::collections::HashSet<String>>()
+            })
+            .unwrap_or_default();
+
+        // For systems that contribute multiple versions and have all
+        // includes pinned, the IG fixtures (overload/overload-expand-all*)
+        // expect the latest version of each code to appear *before* its
+        // older counterparts. Sort stably so the relative order of distinct
+        // codes is preserved while duplicates of the same code surface
+        // latest-first.
+        let sortable_systems: std::collections::HashSet<String> = multi_version_systems
+            .intersection(&fully_pinned_systems)
+            .cloned()
+            .collect();
+        if !sortable_systems.is_empty() {
+            let mut indexed: Vec<(usize, crate::types::ExpansionContains)> =
+                resp.contains.drain(..).enumerate().collect();
+            // Group by (system, code), sort each group by version DESC,
+            // then re-emit in original first-occurrence order of (system, code).
+            let mut first_idx: std::collections::HashMap<(String, String), usize> =
+                std::collections::HashMap::new();
+            for (i, item) in indexed.iter() {
+                let key = (item.system.clone(), item.code.clone());
+                first_idx.entry(key).or_insert(*i);
+            }
+            // Stable sort by: original group position, then version DESC
+            // (only for systems in `sortable_systems`).
+            indexed.sort_by(|a, b| {
+                let ka = (a.1.system.clone(), a.1.code.clone());
+                let kb = (b.1.system.clone(), b.1.code.clone());
+                let ga = first_idx.get(&ka).copied().unwrap_or(a.0);
+                let gb = first_idx.get(&kb).copied().unwrap_or(b.0);
+                ga.cmp(&gb).then_with(|| {
+                    if sortable_systems.contains(&a.1.system)
+                        && sortable_systems.contains(&b.1.system)
+                    {
+                        b.1.version
+                            .as_deref()
+                            .unwrap_or("")
+                            .cmp(a.1.version.as_deref().unwrap_or(""))
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+            });
+            resp.contains = indexed.into_iter().map(|(_, c)| c).collect();
+
+            // When the source ValueSet declares `versionsMatch=true` (via
+            // `compose.extension.valueset-expansion-parameter`), the IG
+            // `overload/overload-expand-all-merged` and `expand-exclude-merged`
+            // fixtures DEDUPLICATE codes that surface across multiple versions
+            // — keep the first occurrence (latest, thanks to the sort above).
+            //
+            // The reverse setting `versionsMatch=false` (IG
+            // `overload/overload-expand-all-versioned`) MUST NOT dedupe — it
+            // explicitly opts in to keeping every (system, version, code)
+            // tuple.  Only treat `merged` as true when both the name AND the
+            // value pair are present and value is the literal string `true`.
+            let merged = source_vs
+                .as_ref()
+                .and_then(|vs| vs.get("compose"))
+                .and_then(|c| c.get("extension"))
+                .and_then(|e| e.as_array())
+                .map(|exts| {
+                    exts.iter().any(|ext| {
+                        if ext.get("url").and_then(|u| u.as_str())
+                            != Some(
+                                "http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter",
+                            )
+                        {
+                            return false;
+                        }
+                        let inner = match ext.get("extension").and_then(|e| e.as_array()) {
+                            Some(a) => a,
+                            None => return false,
+                        };
+                        let mut name_is_versions_match = false;
+                        let mut value_is_true = false;
+                        for sub in inner {
+                            match sub.get("url").and_then(|u| u.as_str()) {
+                                Some("name") => {
+                                    if sub.get("valueCode").and_then(|v| v.as_str())
+                                        == Some("versionsMatch")
+                                    {
+                                        name_is_versions_match = true;
+                                    }
+                                }
+                                Some("value") => {
+                                    if sub.get("valueString").and_then(|v| v.as_str())
+                                        == Some("true")
+                                    {
+                                        value_is_true = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        name_is_versions_match && value_is_true
+                    })
+                })
+                .unwrap_or(false);
+            if merged {
+                let mut seen: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                resp.contains
+                    .retain(|c| seen.insert((c.system.clone(), c.code.clone())));
+                if let Some(t) = resp.total.as_mut() {
+                    *t = resp.contains.len() as u32;
+                }
+            }
+
+            // The serialized `contains` array (built earlier at the start of
+            // the response-build phase) was produced from the pre-sort order
+            // — re-serialize from `resp.contains` so the expansion reflects
+            // the latest-version-first ordering required by the
+            // overload/overload-expand-all* fixtures.
+            let resorted: Vec<Value> = resp
+                .contains
+                .iter()
+                .map(|c| serialize_expansion_contains(c, &multi_version_systems))
+                .collect();
+            expansion["contains"] = json!(resorted);
+            if merged {
+                expansion["total"] = json!(resp.contains.len());
+            }
+        }
+    }
+
+    let mut warning_params: Vec<Value> = Vec::new();
+    // Emit one `used-codesystem` per distinct (system, version) pair.
+    let mut warned_systems: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (system_url, version) in &used_pairs {
+        let value_uri = match version {
+            Some(v) => format!("{system_url}|{v}"),
+            None => {
+                // Single-version systems don't populate version on contains items.
+                // Fall back to the CS metadata in cs_by_url so used-codesystem
+                // still carries the |version suffix.
+                let cs_ver = cs_by_url
+                    .get(system_url.as_str())
+                    .and_then(|c| c.as_ref())
+                    .and_then(|c| c.get("version"))
+                    .and_then(|v| v.as_str());
+                match cs_ver {
+                    Some(v) => format!("{system_url}|{v}"),
+                    None => system_url.clone(),
+                }
+            }
+        };
+        emitted_params.push(json!({
+            "name": "used-codesystem",
+            "valueUri": value_uri,
+        }));
+        // The IG `fragment/fragment-expansion` fixture expects an additional
+        // `used-fragment` parameter (mirroring `used-codesystem`'s value) when
+        // the contributing CodeSystem declares `content: "fragment"`. Plus an
+        // `expansion.extension` pair (`valueset-unclosed` + `valueset-unclosed-
+        // reason`) flagging the partial coverage.
+        if let Some(cs) = cs_by_url.get(system_url).and_then(|c| c.as_ref()) {
+            if cs.get("content").and_then(|v| v.as_str()) == Some("fragment") {
+                emitted_params.push(json!({
+                    "name": "used-fragment",
+                    "valueUri": value_uri,
+                }));
+            }
+        }
+        // Emit `warning-<status>` only once per system URL (first pair wins).
+        if warned_systems.insert(system_url.clone()) {
+            let cs = cs_by_url.get(system_url).and_then(|c| c.as_ref());
+            if let Some(cs) = cs {
+                for status_code in standards_statuses(cs) {
+                    warning_params.push(json!({
+                        "name": format!("warning-{status_code}"),
+                        "valueUri": value_uri,
+                    }));
+                }
+            }
+        }
+    }
+
+    // ── expansion.extension: valueset-unclosed (fragment CSes) ───────────────
+    // Per the IG `fragment/fragment-expansion` fixture, when ANY contributing
+    // CodeSystem has `content: "fragment"`, the response's `expansion` element
+    // gains two extensions advertising that the expansion is partial:
+    //   * `valueset-unclosed` (boolean true)
+    //   * `valueset-unclosed-reason` (string explaining which CS is partial)
+    let fragment_systems: Vec<&String> = used_pairs
+        .iter()
+        .map(|(s, _)| s)
+        .filter(|s| {
+            cs_by_url
+                .get(s.as_str())
+                .and_then(|c| c.as_ref())
+                .and_then(|c| c.get("content"))
+                .and_then(|v| v.as_str())
+                == Some("fragment")
+        })
+        .collect();
+    if !fragment_systems.is_empty() {
+        // Match the IG fixture wording verbatim — txTests compares the string
+        // (no $external$ wildcard for the reason text).
+        let reason = format!(
+            "This extension is based on a fragment of the code system {}",
+            fragment_systems[0]
+        );
+        expansion["extension"] = json!([
+            {
+                "url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed",
+                "valueBoolean": true
+            },
+            {
+                "url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed-reason",
+                "valueString": reason
+            }
+        ]);
+    }
+
+    // ── used-valueset entries ────────────────────────────────────────────────
+    // The IG `valueset-version/expand-indirect-*` and `simple/expand-contained`
+    // fixtures expect one `used-valueset` parameter per distinct ValueSet
+    // referenced from the source VS's compose.include[].valueSet[] array,
+    // formatted as `<url>|<version>` matching the resolved row. Walk the
+    // compose, dedupe by URL, look up each via search.
+    if let Some(vs) = source_vs.as_ref() {
+        let mut emitted_used_vs: Vec<String> = Vec::new();
+        let collect_vs_refs = |inc: &Value, out: &mut Vec<String>| {
+            if let Some(refs) = inc.get("valueSet").and_then(|v| v.as_array()) {
+                for r in refs {
+                    if let Some(s) = r.as_str() {
+                        // tx-ecosystem's #fragment refs aren't surfaced as
+                        // used-valueset (they're contained-only). Skip them.
+                        if !s.starts_with('#') && !out.contains(&s.to_string()) {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        };
+        let mut vs_refs: Vec<String> = Vec::new();
+        if let Some(includes) = vs
+            .get("compose")
+            .and_then(|c| c.get("include"))
+            .and_then(|i| i.as_array())
+        {
+            for inc in includes {
+                collect_vs_refs(inc, &mut vs_refs);
+            }
+        }
+        if let Some(excludes) = vs
+            .get("compose")
+            .and_then(|c| c.get("exclude"))
+            .and_then(|i| i.as_array())
+        {
+            for exc in excludes {
+                collect_vs_refs(exc, &mut vs_refs);
+            }
+        }
+        for raw_ref in &vs_refs {
+            let (bare_url, mut pinned_version) = match raw_ref.split_once('|') {
+                Some((u, v)) => (u.to_string(), Some(v.to_string())),
+                None => (raw_ref.clone(), None),
+            };
+            // Honour `default-valueset-version` pin when the ref itself
+            // doesn't carry an explicit `|version` (FHIR R5 §$expand).
+            if pinned_version.is_none() {
+                if let Some(default_v) = default_value_set_versions_for_echo.get(&bare_url) {
+                    pinned_version = Some(default_v.clone());
+                }
+            }
+            // When no version pin is in effect, fetch up to 20 candidates and
+            // pick the highest version — mirrors `resolve_value_set_versioned`'s
+            // order-by-version-DESC behaviour.  `count: Some(1)` against the
+            // search SQL (which orders by created_at) yields the earliest-
+            // imported row instead, silently picking vs-version-a1 over -a2
+            // for the `default-valueset-version/indirect-expand-zero` fixture.
+            let count_hint = if pinned_version.is_some() { 1 } else { 20 };
+            let referenced_vs: Option<Value> = ValueSetOperations::search(
+                state.backend(),
+                &ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(bare_url.clone()),
+                    version: pinned_version.clone(),
+                    count: Some(count_hint),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+            .and_then(|mut hits| {
+                if pinned_version.is_some() {
+                    hits.pop()
+                } else {
+                    // No pin: highest version wins (matches the backend's
+                    // `ORDER BY COALESCE(version,'') DESC` resolution).
+                    hits.sort_by(|a, b| {
+                        let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                        let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                        bv.cmp(av)
+                    });
+                    hits.into_iter().next()
+                }
+            });
+            let resolved_version = referenced_vs
+                .as_ref()
+                .and_then(|h| {
+                    h.get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .or(pinned_version.clone());
+            let value_uri = match resolved_version {
+                Some(v) => format!("{bare_url}|{v}"),
+                None => bare_url.clone(),
+            };
+            if !emitted_used_vs.contains(&value_uri) {
+                emitted_used_vs.push(value_uri.clone());
+                emitted_params.push(json!({
+                    "name": "used-valueset",
+                    "valueUri": value_uri,
+                }));
+                // Surface warnings for the referenced VS the same way we do
+                // for the source VS — IG `deprecated/not-withdrawn` expects
+                // a `warning-withdrawn` for the referenced (withdrawn) VS
+                // alongside its `used-valueset` entry.
+                if let Some(ref ref_vs) = referenced_vs {
+                    for status_code in vs_extension_statuses(ref_vs) {
+                        warning_params.push(json!({
+                            "name": format!("warning-{status_code}"),
+                            "valueUri": value_uri,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Then add any warning-* derived from the source VS itself. ValueSets
+    // only contribute warnings via the explicit standards-status extension —
+    // the IG fixtures (search/*, deprecated/*) treat a VS-level
+    // `status: draft` as a non-event, unlike the same field on a CodeSystem.
+    if let Some(vs) = source_vs.as_ref() {
+        let vs_url = vs.get("url").and_then(|v| v.as_str());
+        let vs_version = vs.get("version").and_then(|v| v.as_str());
+        let vs_value_uri = match (vs_url, vs_version) {
+            (Some(u), Some(v)) => Some(format!("{u}|{v}")),
+            (Some(u), None) => Some(u.to_string()),
+            _ => None,
+        };
+        if let Some(uri) = vs_value_uri {
+            for status_code in vs_extension_statuses(vs) {
+                warning_params.push(json!({
+                    "name": format!("warning-{status_code}"),
+                    "valueUri": uri,
+                }));
+            }
+        }
+    }
+    emitted_params.extend(warning_params);
+
+    // ── used-supplement entries ──────────────────────────────────────────────
+    // Echo each applied supplement so the IG validator sees we honored it
+    // (matches `parameters-expand-supplement-good` and the
+    // `extensions/expand-echo-all` fixtures). Value is the supplement's
+    // canonical (`url|version` when stored).
+    for info in &applied_supplements {
+        emitted_params.push(json!({
+            "name": "used-supplement",
+            "valueUri": info.supplement_canonical,
+        }));
+    }
+
+    // Append any expansion warnings as parameter entries with name=warning.
+    for w in &resp.warnings {
+        emitted_params.push(json!({ "name": "warning", "valueString": w }));
+    }
+
+    if !emitted_params.is_empty() {
+        expansion["parameter"] = json!(emitted_params);
+    }
+
+    // ── expansion.property declarations ──────────────────────────────────────
+    // The IG fixtures expect a parallel `expansion.property[]` array declaring
+    // each property's `code` and (ideally) `uri` whenever ANY contains entry
+    // carries a property — whether driven by an explicit `property` request
+    // param or by an extension-derived synthesis (label/order/weight/status).
+    //
+    // Build the union of (a) caller-requested property codes and (b) every
+    // distinct property code currently surfaced on a contains[] entry. This
+    // means extension-derived properties (from `apply_concept_extension_data`)
+    // also get declared at the expansion level — matches the
+    // `extensions/expand-echo-{all,enumerated}` fixture shape.
+    {
+        // FHIR-spec well-known concept-property URIs (
+        // http://hl7.org/fhir/concept-properties).  Used as a fallback when a
+        // stored CodeSystem doesn't declare a matching `property[].uri`.
+        // Mapping covers the "infrastructure" properties surfaced by HTS
+        // (definition, status, inactive, deprecated, notSelectable, parent,
+        // child, partOf, synonym, alternateCode) plus the synthesised
+        // extension-derived properties (label, order, weight).
+        fn well_known_property_uri(code: &str) -> Option<&'static str> {
+            match code {
+                "definition" => Some("http://hl7.org/fhir/concept-properties#definition"),
+                "status" => Some("http://hl7.org/fhir/concept-properties#status"),
+                "inactive" => Some("http://hl7.org/fhir/concept-properties#inactive"),
+                "deprecated" => Some("http://hl7.org/fhir/concept-properties#deprecated"),
+                "notSelectable" => Some("http://hl7.org/fhir/concept-properties#notSelectable"),
+                "parent" => Some("http://hl7.org/fhir/concept-properties#parent"),
+                "child" => Some("http://hl7.org/fhir/concept-properties#child"),
+                "partOf" => Some("http://hl7.org/fhir/concept-properties#partOf"),
+                "synonym" => Some("http://hl7.org/fhir/concept-properties#synonym"),
+                "alternateCode" => Some("http://hl7.org/fhir/concept-properties#alternateCode"),
+                "label" => Some("http://hl7.org/fhir/concept-properties#label"),
+                "order" => Some("http://hl7.org/fhir/concept-properties#order"),
+                "weight" => Some("http://hl7.org/fhir/concept-properties#itemWeight"),
+                _ => None,
+            }
+        }
+
+        // Collect distinct property codes appearing on contains[] entries,
+        // walking nested children too. Maintain insertion order via a Vec
+        // (HashSet drops ordering and we want deterministic output).
+        fn collect_property_codes(list: &[crate::types::ExpansionContains], out: &mut Vec<String>) {
+            for c in list {
+                for p in &c.properties {
+                    if !out.contains(&p.code) {
+                        out.push(p.code.clone());
+                    }
+                }
+                if !c.contains.is_empty() {
+                    collect_property_codes(&c.contains, out);
+                }
+            }
+        }
+        let mut emitted_codes: Vec<String> = Vec::new();
+        // The IG `extensions/expand-echo-all` fixture orders the property
+        // declarations as: weight, label, order, status (i.e. the extension-
+        // derived ones first in that fixed order, with status last). Mirror
+        // that convention so the fixture comparator matches.
+        let synthetic_order = ["weight", "label", "order", "status"];
+        let mut surfaced: Vec<String> = Vec::new();
+        collect_property_codes(&resp.contains, &mut surfaced);
+        for code in synthetic_order {
+            if surfaced.iter().any(|c| c == code) && !emitted_codes.iter().any(|c| c == code) {
+                emitted_codes.push(code.to_string());
+            }
+        }
+        for code in &requested_properties {
+            if !emitted_codes.contains(code) {
+                emitted_codes.push(code.clone());
+            }
+        }
+        for code in &surfaced {
+            if !emitted_codes.contains(code) {
+                emitted_codes.push(code.clone());
+            }
+        }
+
+        if !emitted_codes.is_empty() {
+            // Look up `property[].uri` from the primary contributing CS.
+            // Also walk applied supplement CodeSystems — the IG
+            // `parameters/parameters-expand-supplement-good` fixture pins
+            // `prop1` (a supplement-declared property) with the URI from
+            // the supplement, not the base CS.
+            use std::collections::HashMap;
+            let primary_system = resp.contains.first().map(|c| c.system.clone());
+            let mut uri_by_code: HashMap<String, String> = HashMap::new();
+            let mut lookup_urls: Vec<String> = Vec::new();
+            if let Some(sys) = &primary_system {
+                lookup_urls.push(sys.clone());
+            }
+            for s in &applied_supplements {
+                let bare = s
+                    .supplement_canonical
+                    .split_once('|')
+                    .map(|(u, _)| u.to_string())
+                    .unwrap_or_else(|| s.supplement_canonical.clone());
+                if !lookup_urls.contains(&bare) {
+                    lookup_urls.push(bare);
+                }
+            }
+            for url in &lookup_urls {
+                if let Ok(mut hits) = crate::traits::CodeSystemOperations::search(
+                    state.backend(),
+                    &ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(url.clone()),
+                        count: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                {
+                    if let Some(cs) = hits.pop() {
+                        if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
+                            for entry in props {
+                                if let (Some(code), Some(uri)) = (
+                                    entry.get("code").and_then(|v| v.as_str()),
+                                    entry.get("uri").and_then(|v| v.as_str()),
+                                ) {
+                                    // First-writer-wins so primary CS values
+                                    // dominate when a supplement re-declares
+                                    // an existing property code.
+                                    uri_by_code
+                                        .entry(code.to_string())
+                                        .or_insert_with(|| uri.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let prop_decls: Vec<Value> = emitted_codes
+                .iter()
+                .map(|code| {
+                    let mut entry = json!({"code": code});
+                    if let Some(uri) = uri_by_code.get(code) {
+                        entry["uri"] = json!(uri);
+                    } else if let Some(uri) = well_known_property_uri(code) {
+                        entry["uri"] = json!(uri);
+                    }
+                    entry
+                })
+                .collect();
+            expansion["property"] = json!(prop_decls);
+        }
+    }
+
+    // ── Copy metadata from the source ValueSet ───────────────────────────────
+    // The IG fixtures expect the response to mirror the original ValueSet's
+    // top-level fields (url, version, name, title, status, ...) — without
+    // them tests fail with "missing property url" / etc.
+    //
+    // For URL-based requests, look up the stored ValueSet and copy across
+    // the canonical-resource fields. For inline ValueSet requests, the
+    // caller supplied the body — copy from there.
+    let mut response = json!({ "resourceType": "ValueSet" });
+    if let Some(ref vs) = source_vs {
+        if let Some(obj) = vs.as_object() {
+            // Copy required-by-fixtures fields plus a few common optionals.
+            //
+            // For URL-based requests, do NOT copy `compose` / `contained` —
+            // every IG `expand-*-response*` fixture lists them under
+            // `$optional-properties$` and echoing the stored shape produces
+            // "unexpected property" diffs (extra `inactive`, wrong `system`,
+            // extra `valueSet` ref, …).
+            //
+            // For INLINE VS requests (`valueSet` body parameter) the caller
+            // supplied the document, and the IG `simple/expand-contained`
+            // fixture EXPECTS it echoed back — so we must copy it.  Apply
+            // small R4→R5 normalisations on the way out:
+            //   * `filter[].op = "child-of"` becomes `"is-a"` (semantically
+            //     identical; R4 spelling is deprecated in R5).
+            //   * `compose.inactive: false` is dropped (canonical R5 form
+            //     omits the property when its value is the default).
+            for field in [
+                "id",
+                "language",
+                "url",
+                "version",
+                "name",
+                "title",
+                "status",
+                "experimental",
+                "date",
+                "publisher",
+            ] {
+                if let Some(v) = obj.get(field) {
+                    response[field] = v.clone();
+                }
+            }
+            // Echo top-level `extension[]` from the source ValueSet, minus
+            // entries that the expansion pipeline has already "consumed" so
+            // they don't double-fire on the response.  The IG
+            // `parameters/parameters-expand-enum-definitions3` fixture pins
+            // both `valueset-supplement` and an unknown extension (the spec
+            // says unknown extensions are ignored, but the round-tripped
+            // resource still echoes them verbatim).  In contrast,
+            // `deprecated/expand-withdrawn-response-valueSet` drops the
+            // top-level `structuredefinition-standards-status` because that
+            // extension is what triggered the warning emission upstream.
+            // Echo extension[] only when the source has at least one
+            // extension that ISN'T fully "consumed" by the expansion pipeline.
+            // valueset-supplement is consumed (it auto-applies a supplement
+            // CS — extensions/extensions-all expects no top-level extension
+            // when the source carries supplement alone). When the source
+            // ALSO carries a non-consumed extension (e.g. the unknown
+            // extension on extensions-enumerated, used by enum-definitions3),
+            // echo all extensions as-is — including supplement.
+            if let Some(exts) = obj.get("extension").and_then(|e| e.as_array()) {
+                let consumed_urls: &[&str] = &[
+                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                    "http://hl7.org/fhir/StructureDefinition/valueset-supplement",
+                ];
+                let has_non_consumed = exts.iter().any(|ext| {
+                    let url = ext.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                    !consumed_urls.contains(&url)
+                });
+                if has_non_consumed {
+                    let filtered: Vec<Value> = exts
+                        .iter()
+                        .filter(|ext| {
+                            ext.get("url").and_then(|u| u.as_str())
+                                != Some(
+                                    "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                                )
+                        })
+                        .cloned()
+                        .collect();
+                    if !filtered.is_empty() {
+                        response["extension"] = Value::Array(filtered);
+                    }
+                }
+            }
+            // We deliberately do NOT echo `compose` on $expand responses.
+            // Every IG `expand-*-response*` fixture lists `compose` under
+            // `$optional-properties$`, so omitting it always satisfies the
+            // comparator. Echoing it instead invites mismatches: the
+            // `simple/simple-expand-contained` fixture, for example, expects
+            // a normalised compose (single include with filter:is-a derived
+            // from the resolved `valueSet[]` reference) — emitting the raw
+            // request compose surfaces an unexpected `valueSet[]` property.
+            // `contained` is still echoed because some fixtures pin it.
+            if caller_supplied_inline_vs {
+                if let Some(c) = obj.get("contained") {
+                    response["contained"] = c.clone();
+                }
+            }
+        }
+    }
+    response["expansion"] = expansion;
+
+    // ── R4 / R4B downconversion ──────────────────────────────────────────────
+    // R4 and R4B `ValueSet.expansion` lack `property[]`, both at the
+    // expansion level and on `contains[]`. The HL7 tx-ecosystem test runner
+    // converts the server's response through the R4 model when
+    // `CapabilityStatement.fhirVersion` is 4.x — that conversion DROPS our
+    // typed `property[]` fields and the validator then reports
+    // "missing property property" for every contains[] entry that should
+    // carry properties (parameters-expand-{all,enum,isa}-{property,
+    // definitions2}, parameters-expand-supplement-{none,good},
+    // extensions-echo-{all,enumerated}, …).
+    //
+    // The IG documents the cross-version extension shape that round-trips
+    // through the R4↔R5 converter (see tx-ecosystem-ig /tests/r4.md):
+    //   * `expansion.property[]`         → `expansion.extension[]` with URL
+    //     `http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property`
+    //     and inner extensions `code` (valueCode) / `uri` (valueUri).
+    //   * `contains[].property[]`        → `contains[].extension[]` with URL
+    //     `http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property`
+    //     and inner extensions `code` (valueCode) / `value` (value[x],
+    //     keeping the primitive type from the original property entry).
+    //
+    // Only applied on R4-class builds (R4 or R4B; neither R5 nor R6
+    // enabled). R5/R6 builds emit the typed fields as-is.
+    if (cfg!(feature = "R4") || cfg!(feature = "R4B"))
+        && !cfg!(feature = "R5")
+        && !cfg!(feature = "R6")
+    {
+        downconvert_property_to_r4_extension(&mut response);
+    }
+
+    // ── Serialize once, cache, return ─────────────────────────────────────────
+    // `serde_json::to_vec` writes directly into a Vec<u8>; wrapping in
+    // `Bytes::from` transfers ownership without copying.
+    let bytes = Bytes::from(
+        serde_json::to_vec(&response)
+            .map_err(|e| HtsError::Internal(format!("JSON serialization failed: {e}")))?,
+    );
+
+    if let Ok(mut cache) = state.expand_cache.write() {
+        if cache.len() < EXPAND_CACHE_MAX {
+            // `Bytes::clone` is O(1); storing it here and returning the clone
+            // below means both the cache and the caller share the same buffer.
+            cache.insert(cache_key, bytes.clone());
+        }
+    }
+
+    // EX_PROBE: total wall time for the whole request including parse + post-
+    // processing + serialization.
+    let total_ms = probe_t0.elapsed().as_micros() as f64 / 1000.0;
+    tracing::info!(
+        target: "hts::probe",
+        "EX_PROBE: total request took {:.3}ms bytes={}",
+        total_ms,
+        bytes.len(),
+    );
+
+    Ok(bytes)
+}
+
+/// Rewrite R5-typed `expansion.property[]` and `expansion.contains[].property[]`
+/// into the cross-version extensions documented at tx-ecosystem-ig
+/// `/tests/r4.md`. Only invoked on R4 / R4B builds — R5 / R6 leave the typed
+/// fields in place. Walks nested `contains[]` recursively.
+///
+/// Mapping:
+/// * `expansion.property[]` → extension on `expansion` with URL
+///   `http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property`,
+///   inner `code` (valueCode) and optional `uri` (valueUri).
+/// * `expansion.contains[].property[]` → extension on each contains entry
+///   with URL `http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property`,
+///   inner `code` (valueCode) plus `value` carrying the original primitive
+///   typed value (`valueCode`, `valueString`, `valueInteger`,
+///   `valueDecimal`, `valueBoolean`, `valueDateTime`).
+///
+/// Existing extensions on the target object are preserved; the new entries
+/// are appended.
+fn downconvert_property_to_r4_extension(response: &mut Value) {
+    /// Find the `value[x]` field inside a serialized property entry and
+    /// mirror it under the extension's `value` slot. Returns the inner
+    /// extension object `{ "url": "value", "value<Type>": <v> }` when a
+    /// `value*` key exists.
+    fn property_value_extension(prop: &Value) -> Option<Value> {
+        // Property entries always have a single `value*` key besides `code`.
+        let obj = prop.as_object()?;
+        for (k, v) in obj {
+            if let Some(suffix) = k.strip_prefix("value") {
+                if !suffix.is_empty() {
+                    let mut sub = serde_json::Map::new();
+                    sub.insert("url".into(), Value::String("value".into()));
+                    sub.insert(k.clone(), v.clone());
+                    return Some(Value::Object(sub));
+                }
+            }
+        }
+        None
+    }
+
+    /// Convert a `property[]` array on `target` (a JSON object) into
+    /// `extension[]` entries appended in place. The original `property`
+    /// field is removed.
+    fn convert(target: &mut Value, ext_url: &'static str, contains: bool) {
+        let Some(obj) = target.as_object_mut() else {
+            return;
+        };
+        let Some(props) = obj.remove("property") else {
+            return;
+        };
+        let Some(props) = props.as_array() else {
+            return;
+        };
+
+        let mut new_exts: Vec<Value> = Vec::with_capacity(props.len());
+        for prop in props {
+            let Some(prop_obj) = prop.as_object() else {
+                continue;
+            };
+            let mut sub: Vec<Value> = Vec::new();
+            if let Some(code) = prop_obj.get("code").and_then(|v| v.as_str()) {
+                sub.push(json!({ "url": "code", "valueCode": code }));
+            }
+            if contains {
+                if let Some(value_ext) = property_value_extension(prop) {
+                    sub.push(value_ext);
+                }
+            } else {
+                // Top-level expansion.property: declares `code` + `uri`.
+                if let Some(uri) = prop_obj.get("uri").and_then(|v| v.as_str()) {
+                    sub.push(json!({ "url": "uri", "valueUri": uri }));
+                }
+            }
+            if sub.is_empty() {
+                continue;
+            }
+            new_exts.push(json!({ "extension": sub, "url": ext_url }));
+        }
+
+        if new_exts.is_empty() {
+            return;
+        }
+
+        // Append after any pre-existing extension[] entries so test fixtures
+        // that emit `extension` first (rendering-style etc.) keep their
+        // ordering.
+        match obj.get_mut("extension") {
+            Some(Value::Array(arr)) => arr.extend(new_exts),
+            _ => {
+                obj.insert("extension".into(), Value::Array(new_exts));
+            }
+        }
+    }
+
+    /// Walk `contains[]` recursively, applying the contains-level
+    /// rewrite to each entry.
+    fn walk_contains(arr: &mut Value) {
+        let Some(items) = arr.as_array_mut() else {
+            return;
+        };
+        for item in items {
+            convert(
+                item,
+                "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property",
+                true,
+            );
+            if let Some(nested) = item.get_mut("contains") {
+                walk_contains(nested);
+            }
+        }
+    }
+
+    let Some(expansion) = response.get_mut("expansion") else {
+        return;
+    };
+
+    convert(
+        expansion,
+        "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property",
+        false,
+    );
+
+    if let Some(contains) = expansion.get_mut("contains") {
+        walk_contains(contains);
+    }
+}
+
+/// Turn pre-serialized JSON bytes into an HTTP response.
+///
+/// For JSON format: the bytes are returned directly with no extra copy.
+/// For XML format: the bytes are deserialized back to a `Value` first (rare
+/// code path — the benchmark always uses JSON).
+fn expand_bytes_respond(bytes: Bytes, format: ResponseFormat) -> Response {
+    use axum::response::IntoResponse;
+    match format {
+        ResponseFormat::Json => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/fhir+json; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        ResponseFormat::Xml => {
+            let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let xml = json_to_fhir_xml(&value);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/fhir+xml; charset=utf-8")],
+                xml,
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /ValueSet/$expand`
+///
+/// Accepts a FHIR `Parameters` body.  The `url` parameter (canonical ValueSet
+/// URL) is required.  Content negotiation via `Accept` header or `_format`
+/// query parameter selects JSON or XML output.
+pub async fn expand_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let mut params = extract_parameter_array(&body)?;
+    inject_accept_language(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params);
+    match process_expand(&state, params).await {
+        Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
+        Err(e) => {
+            if let Some(resp) = version_check_response(&e) {
+                return Ok(resp);
+            }
+            if let Some(resp) = unknown_cs_version_exp_response(&e) {
+                return Ok(resp);
+            }
+            match cyclic_reference_response(&e) {
+                Some(resp) => Ok(resp),
+                None => Err(e),
+            }
+        }
+    }
+}
+
+/// `GET /ValueSet/$expand?url=<url>`
+///
+/// URL query parameters are mapped to FHIR `Parameters` name/value pairs and
+/// processed identically to the POST form.  `url`, `filter`, `count`, `offset`,
+/// `date`, `hierarchical`, and `excludeNested` are all accepted.
+pub async fn get_expand_handler<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let mut params = query_params_to_fhir_params(pairs);
+    inject_accept_language(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params);
+    match process_expand(&state, params).await {
+        Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
+        Err(e) => {
+            if let Some(resp) = version_check_response(&e) {
+                return Ok(resp);
+            }
+            if let Some(resp) = unknown_cs_version_exp_response(&e) {
+                return Ok(resp);
+            }
+            match cyclic_reference_response(&e) {
+                Some(resp) => Ok(resp),
+                None => Err(e),
+            }
+        }
+    }
+}
+
+/// If `err` is a `VsInvalid` produced by the cyclic-reference detector in the
+/// SQLite backend (`expand_vs_reference`), build the FHIR-IG-compliant
+/// OperationOutcome that the `big/expand-circle` test fixture expects:
+/// status 422, issue.code=`processing`, tx-issue-type=`vs-invalid`, plus a
+/// `VALUESET_CIRCULAR_REFERENCE` `operationoutcome-message-id` extension.
+/// Returns `None` when the error is not a cycle so the caller falls through
+/// to the generic [`HtsError`] [`IntoResponse`] path.
+/// Sentinel marker prepended to a [`HtsError::VsInvalid`] when an $expand
+/// operation fails the `check-system-version` post-check.  Picked up by
+/// [`version_check_response`] to format the IG-spec OperationOutcome shape.
+const VERSION_CHECK_ERR_PREFIX: &str = "__VALUESET_VERSION_CHECK__:";
+
+/// Returns true if `version` satisfies the wildcard `pattern`. Local copy of
+/// the helper in `backends/sqlite/value_set.rs` so $expand can verify the
+/// `check-system-version` pattern without crossing crate boundaries.
+fn expand_version_satisfies_wildcard(version: &str, pattern: &str) -> bool {
+    if pattern == "x" {
+        return true;
+    }
+    let pat_segs: Vec<&str> = pattern.split('.').collect();
+    let ver_segs: Vec<&str> = version.split('.').collect();
+    let ends_with_x = pat_segs.last().is_some_and(|s| *s == "x");
+    if !ends_with_x && pat_segs.len() != ver_segs.len() {
+        return false;
+    }
+    if ends_with_x && ver_segs.len() < pat_segs.len() - 1 {
+        return false;
+    }
+    for (i, ps) in pat_segs.iter().enumerate() {
+        if *ps == "x" {
+            continue;
+        }
+        match ver_segs.get(i) {
+            Some(vs) if vs == ps => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// If `err` is a `check-system-version` failure raised inside `process_expand`,
+/// render the FHIR `OperationOutcome` shape the IG fixtures expect:
+/// `severity=error`, `code=exception`, `version-error` tx-issue-type,
+/// `VALUESET_VERSION_CHECK` message-id, HTTP 400.
+fn version_check_response(err: &HtsError) -> Option<Response> {
+    use axum::response::IntoResponse;
+    let HtsError::VsInvalid(msg) = err else {
+        return None;
+    };
+    let text = msg.strip_prefix(VERSION_CHECK_ERR_PREFIX)?;
+    let body = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                "valueString": "VALUESET_VERSION_CHECK"
+            }],
+            "severity": "error",
+            "code": "exception",
+            "details": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                    "code": "version-error"
+                }],
+                "text": text,
+            },
+        }]
+    });
+    Some((StatusCode::BAD_REQUEST, Json(body)).into_response())
+}
+
+/// Sentinel marker prepended to a [`HtsError::NotFound`] when an $expand
+/// operation hits a `compose.include[]` whose `system + version` pin doesn't
+/// resolve to any stored CodeSystem version. Picked up by
+/// [`unknown_cs_version_exp_response`] to format the IG-spec OperationOutcome
+/// (status 400, `code=not-found`, `tx-issue-type=not-found`,
+/// `UNKNOWN_CODESYSTEM_VERSION_EXP` message-id).
+const UNKNOWN_CS_VERSION_EXP_PREFIX: &str = "__UNKNOWN_CS_VERSION_EXP__:";
+
+/// If `err` is the sentinel error from the SQLite include-resolver, render the
+/// `UNKNOWN_CODESYSTEM_VERSION_EXP` OperationOutcome shape that the IG
+/// `version/vs-expand-v-wb` family expects.
+fn unknown_cs_version_exp_response(err: &HtsError) -> Option<Response> {
+    use axum::response::IntoResponse;
+    let HtsError::NotFound(msg) = err else {
+        return None;
+    };
+    let text = msg.strip_prefix(UNKNOWN_CS_VERSION_EXP_PREFIX)?;
+    let body = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                "valueString": "UNKNOWN_CODESYSTEM_VERSION_EXP"
+            }],
+            "severity": "error",
+            "code": "not-found",
+            "details": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                    "code": "not-found"
+                }],
+                "text": text,
+            },
+        }]
+    });
+    Some((StatusCode::BAD_REQUEST, Json(body)).into_response())
+}
+
+fn cyclic_reference_response(err: &HtsError) -> Option<Response> {
+    use axum::response::IntoResponse;
+    let HtsError::VsInvalid(msg) = err else {
+        return None;
+    };
+    if !msg.starts_with("Cyclic reference detected when excluding ") {
+        return None;
+    }
+    let body = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                "valueString": "VALUESET_CIRCULAR_REFERENCE"
+            }],
+            "severity": "error",
+            "code": "processing",
+            "details": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                    "code": "vs-invalid"
+                }],
+                "text": msg
+            },
+            "diagnostics": msg
+        }]
+    });
+    Some((StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response())
+}
+
+/// Honour the `X-TOO-COSTLY-THRESHOLD` request header from the IG
+/// `big/big-echo-no-limit` test (and the wider HL7 tx-ecosystem fixtures).
+/// The header carries a per-request maximum expansion size — when set, the
+/// server must return an `OperationOutcome` with `code=too-costly` if the
+/// expansion would exceed it, regardless of the configured global limit.
+/// We surface the value as a synthetic `__max_expansion_size__` parameter so
+/// `process_expand` can override `state.max_expansion_size` for this request.
+fn inject_too_costly_threshold(headers: &HeaderMap, params: &mut Vec<Value>) {
+    if let Some(v) = headers
+        .get("x-too-costly-threshold")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        params.retain(|p| p.get("name").and_then(|x| x.as_str()) != Some("__max_expansion_size__"));
+        params.push(json!({"name": "__max_expansion_size__", "valueInteger": v}));
+    }
+}
+
+/// If the request carried an `Accept-Language` header and the params don't
+/// already pin a `displayLanguage`, inject one synthesised from the header.
+/// This is what the IG validator uses to express the language it wants
+/// (`client().setAcceptLanguage(lang)`), and the expected fixtures echo
+/// `displayLanguage` in `expansion.parameter` even when the request body
+/// didn't carry it explicitly.
+pub(crate) fn inject_accept_language(headers: &HeaderMap, params: &mut Vec<Value>) {
+    let lang = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        // Take just the primary tag (strip q-values, secondary tags).
+        .map(|s| s.split([',', ';']).next().unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty() && s != "*");
+    let already = params
+        .iter()
+        .any(|p| p.get("name").and_then(|v| v.as_str()) == Some("displayLanguage"));
+    if let Some(l) = lang {
+        if !already {
+            params.push(json!({"name": "displayLanguage", "valueCode": l}));
+        }
+    }
+}
+
+/// Inject (or replace) the `url` parameter in a params list.
+///
+/// Removes any existing `url` entry from the caller's params so that the
+/// resource-id-resolved URL always wins, then prepends the canonical URL as a
+/// `valueUri` parameter.
+fn inject_url(mut params: Vec<Value>, url: String) -> Vec<Value> {
+    params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("url"));
+    let mut with_url = vec![json!({"name": "url", "valueUri": url})];
+    with_url.append(&mut params);
+    with_url
+}
+
+/// POST /ValueSet/{id}/$expand
+///
+/// Resolves the ValueSet canonical URL from its FHIR `id`, then delegates to
+/// the same expansion logic used by the system-level endpoint.
+pub async fn expand_by_id_post<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let url = state
+        .backend()
+        .resource_url_by_id("ValueSet", &id)
+        .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
+
+    let raw_params = body
+        .and_then(|Json(v)| extract_parameter_array(&v).ok())
+        .unwrap_or_default();
+    let mut params = inject_url(raw_params, url);
+    inject_accept_language(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params);
+    Ok(expand_bytes_respond(
+        process_expand(&state, params).await?,
+        format,
+    ))
+}
+
+/// `GET /ValueSet/{id}/$expand?filter=<text>&count=<n>`
+///
+/// Instance-level GET variant.  Resolves the ValueSet canonical URL from its
+/// FHIR logical `id` and merges it with the remaining query-string parameters
+/// before dispatching to the shared expansion pipeline.
+///
+/// Returns 404 when no ValueSet with the given `id` is found.
+pub async fn get_expand_by_id<B: TerminologyBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, HtsError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_format(raw.as_deref(), accept);
+    let url = state
+        .backend()
+        .resource_url_by_id("ValueSet", &id)
+        .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
+
+    let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
+    let params = query_params_to_fhir_params(pairs);
+    let mut params = inject_url(params, url);
+    inject_accept_language(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params);
+    Ok(expand_bytes_respond(
+        process_expand(&state, params).await?,
+        format,
+    ))
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, body::Body, http::Request, routing::post};
+    use tower::ServiceExt;
+
+    use crate::backends::sqlite::SqliteTerminologyBackend;
+    use crate::state::AppState;
+
+    fn make_app_with_data() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+
+        // Seed directly via SQL (same pattern as other operation handler tests).
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at)
+                 VALUES ('cs1', 'http://example.org/cs', '1.0', 'TestCS',
+                         'active', 'complete', '2024-01-01', '2024-01-01');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (1, 'cs1', 'A', 'Alpha'),
+                        (2, 'cs1', 'B', 'Beta'),
+                        (3, 'cs1', 'C', 'Gamma');
+
+                 INSERT INTO value_sets
+                     (id, url, name, status, compose_json, created_at, updated_at)
+                 VALUES ('vs1', 'http://example.org/vs', 'TestVS', 'active',
+                         '{\"include\":[{\"system\":\"http://example.org/cs\",\"concept\":[{\"code\":\"A\"},{\"code\":\"B\"}]}]}',
+                         '2024-01-01', '2024-01-01');",
+            )
+            .unwrap();
+        }
+
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    async fn post_json(app: Router, uri: &str, body: Value) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn body_json(response: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        // On R4 / R4B builds the response handler rewrites `property[]` into
+        // cross-version extensions. Reverse the transform here so tests can
+        // assert on a uniform `property[]` shape regardless of the active
+        // FHIR feature.
+        if (cfg!(feature = "R4") || cfg!(feature = "R4B"))
+            && !cfg!(feature = "R5")
+            && !cfg!(feature = "R6")
+        {
+            lift_property_extension_for_tests(&mut value);
+        }
+        value
+    }
+
+    /// Test-only inverse of [`downconvert_property_to_r4_extension`]: walks
+    /// `expansion` + `expansion.contains[]` (recursively) and reconstructs
+    /// `property[]` arrays from the cross-version extensions, dropping the
+    /// extension entries it consumed.
+    fn lift_property_extension_for_tests(response: &mut Value) {
+        const EXP_PROP_URL: &str =
+            "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property";
+        const CONTAINS_PROP_URL: &str = "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property";
+
+        fn lift(target: &mut Value, ext_url: &str, contains: bool) {
+            let Some(obj) = target.as_object_mut() else {
+                return;
+            };
+            let mut props: Vec<Value> = Vec::new();
+            let exts_empty: bool;
+            {
+                let Some(exts) = obj.get_mut("extension").and_then(|e| e.as_array_mut()) else {
+                    return;
+                };
+                exts.retain(|e| {
+                    if e.get("url").and_then(|u| u.as_str()) != Some(ext_url) {
+                        return true;
+                    }
+                    let Some(inner) = e.get("extension").and_then(|i| i.as_array()) else {
+                        return true;
+                    };
+                    let mut prop = serde_json::Map::new();
+                    for sub in inner {
+                        let url = sub.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                        let sub_obj = match sub.as_object() {
+                            Some(o) => o,
+                            None => continue,
+                        };
+                        if url == "code" {
+                            if let Some(c) = sub_obj.get("valueCode") {
+                                prop.insert("code".into(), c.clone());
+                            }
+                        } else if url == "uri" && !contains {
+                            if let Some(u) = sub_obj.get("valueUri") {
+                                prop.insert("uri".into(), u.clone());
+                            }
+                        } else if url == "value" && contains {
+                            for (k, v) in sub_obj {
+                                if k.starts_with("value") && k != "value" {
+                                    prop.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                    props.push(Value::Object(prop));
+                    false
+                });
+                exts_empty = exts.is_empty();
+            }
+            if exts_empty {
+                obj.remove("extension");
+            }
+            if !props.is_empty() {
+                obj.insert("property".into(), Value::Array(props));
+            }
+        }
+
+        fn walk_contains(arr: &mut Value) {
+            let Some(items) = arr.as_array_mut() else {
+                return;
+            };
+            for item in items {
+                lift(item, CONTAINS_PROP_URL, true);
+                if let Some(nested) = item.get_mut("contains") {
+                    walk_contains(nested);
+                }
+            }
+        }
+
+        let Some(expansion) = response.get_mut("expansion") else {
+            return;
+        };
+        lift(expansion, EXP_PROP_URL, false);
+        if let Some(contains) = expansion.get_mut("contains") {
+            walk_contains(contains);
+        }
+    }
+
+    // ── Happy path ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn expand_returns_valueset_resource() {
+        let app = make_app_with_data();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs" }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["resourceType"], "ValueSet");
+        assert!(json["expansion"].is_object());
+    }
+
+    #[tokio::test]
+    async fn expand_returns_correct_codes() {
+        let app = make_app_with_data();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs" }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        let json = body_json(resp).await;
+
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 2);
+
+        let codes: Vec<&str> = contains
+            .iter()
+            .map(|c| c["code"].as_str().unwrap())
+            .collect();
+        assert!(codes.contains(&"A"));
+        assert!(codes.contains(&"B"));
+        assert!(!codes.contains(&"C"));
+    }
+
+    #[tokio::test]
+    async fn expand_returns_total_count() {
+        let app = make_app_with_data();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs" }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        let json = body_json(resp).await;
+
+        assert_eq!(json["expansion"]["total"], 2);
+    }
+
+    // ── Pagination ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn expand_with_count_limits_results() {
+        let app = make_app_with_data();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs" },
+                { "name": "count", "valueInteger": 1 }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        let json = body_json(resp).await;
+
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 1);
+        assert_eq!(json["expansion"]["total"], 2); // total is still the full count
+    }
+
+    // ── Missing url → 400 ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn expand_missing_url_returns_400() {
+        let app = make_app_with_data();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": []
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 400);
+    }
+
+    // ── Unknown value set → 404 ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn expand_unknown_value_set_returns_404() {
+        let app = make_app_with_data();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://unknown.org/vs" }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 404);
+    }
+
+    // ── Wrong resource type → 400 ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn expand_wrong_resource_type_returns_400() {
+        let app = make_app_with_data();
+        let body = json!({ "resourceType": "ValueSet", "parameter": [] });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 400);
+    }
+
+    // ── standards_statuses helper ──────────────────────────────────────────────
+    //
+    // These exercise the deprecated/withdrawn/experimental/draft → warning-*
+    // mapping that drives expansion.parameter emission in process_expand.
+
+    #[test]
+    fn standards_statuses_picks_extension_status() {
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                "valueCode": "deprecated"
+            }],
+            "status": "active",
+            "experimental": false
+        });
+        assert_eq!(standards_statuses(&cs), vec!["deprecated".to_string()]);
+    }
+
+    #[test]
+    fn standards_statuses_picks_experimental_flag() {
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "status": "active",
+            "experimental": true
+        });
+        assert_eq!(standards_statuses(&cs), vec!["experimental".to_string()]);
+    }
+
+    #[test]
+    fn standards_statuses_picks_draft_status() {
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "status": "draft",
+            "experimental": false
+        });
+        assert_eq!(standards_statuses(&cs), vec!["draft".to_string()]);
+    }
+
+    #[test]
+    fn standards_statuses_combines_multiple_markers() {
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                "valueCode": "withdrawn"
+            }],
+            "status": "draft",
+            "experimental": true
+        });
+        // Order: extension first, then experimental, then draft.
+        assert_eq!(
+            standards_statuses(&cs),
+            vec![
+                "withdrawn".to_string(),
+                "experimental".to_string(),
+                "draft".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn standards_statuses_returns_empty_for_active_resource() {
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "status": "active",
+            "experimental": false
+        });
+        assert!(standards_statuses(&cs).is_empty());
+    }
+
+    #[test]
+    fn standards_statuses_dedupes_when_extension_matches_status() {
+        // Both the standards-status extension and the FHIR status field say
+        // "draft" — emit only one entry.
+        let cs = json!({
+            "resourceType": "CodeSystem",
+            "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                "valueCode": "draft"
+            }],
+            "status": "draft"
+        });
+        assert_eq!(standards_statuses(&cs), vec!["draft".to_string()]);
+    }
+
+    // ── parse_display_language helper ──────────────────────────────────────────
+
+    #[test]
+    fn parse_display_language_simple_tag() {
+        let spec = parse_display_language("de").unwrap();
+        assert_eq!(spec.preferred, "de");
+        assert!(!spec.hard_fallback);
+    }
+
+    #[test]
+    fn parse_display_language_with_explicit_fallback() {
+        let spec = parse_display_language("de,*").unwrap();
+        assert_eq!(spec.preferred, "de");
+        assert!(!spec.hard_fallback);
+    }
+
+    #[test]
+    fn parse_display_language_hard_mode_q0() {
+        // Wildcard with q=0 → no fallback allowed.
+        let spec = parse_display_language("de,*; q=0").unwrap();
+        assert_eq!(spec.preferred, "de");
+        assert!(spec.hard_fallback);
+    }
+
+    #[test]
+    fn parse_display_language_hard_mode_with_extra_whitespace() {
+        let spec = parse_display_language("de, *; q=0").unwrap();
+        assert_eq!(spec.preferred, "de");
+        assert!(spec.hard_fallback);
+    }
+
+    #[test]
+    fn parse_display_language_picks_first_real_tag() {
+        let spec = parse_display_language("de-CH,en,*").unwrap();
+        assert_eq!(spec.preferred, "de-CH");
+        assert!(!spec.hard_fallback);
+    }
+
+    #[test]
+    fn parse_display_language_only_wildcard_returns_none() {
+        // No real preferred tag — caller should treat as "no displayLanguage".
+        assert!(parse_display_language("*").is_none());
+        assert!(parse_display_language("*; q=0").is_none());
+    }
+
+    // ── useSupplement (IG `parameters-expand-supplement-good`) ────────────────
+
+    fn make_supplement_app() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, status, content, created_at, updated_at, resource_json)
+                 VALUES ('base', 'http://hl7.org/fhir/test/CodeSystem/extensions', '5.0.0',
+                         'active', 'complete',
+                         '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\"}');
+
+                 INSERT INTO code_systems
+                     (id, url, version, status, content, created_at, updated_at, resource_json)
+                 VALUES ('supp', 'http://hl7.org/fhir/test/CodeSystem/supplement', '0.1.1',
+                         'active', 'supplement',
+                         '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\",\"supplements\":\"http://hl7.org/fhir/test/CodeSystem/extensions\"}');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (20, 'base', 'code1', 'Display 1'),
+                        (21, 'supp', 'code1', NULL);
+
+                 INSERT INTO concept_designations (concept_id, language, value)
+                 VALUES (21, 'nl', 'ectenoot');
+
+                 INSERT INTO value_sets
+                     (id, url, status, compose_json, created_at, updated_at, resource_json)
+                 VALUES ('vs-extns', 'http://hl7.org/fhir/test/ValueSet/extensions-all-ns',
+                         'active',
+                         '{\"include\":[{\"system\":\"http://hl7.org/fhir/test/CodeSystem/extensions\"}]}',
+                         '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"ValueSet\"}');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    // ── excludeNested parameter (tree-mode trigger) ────────────────────────────
+
+    /// Seeds an in-memory backend with a 3-level hierarchy:
+    ///   root → child → grandchild
+    /// plus a sibling "orphan" with no parent. The companion ValueSet
+    /// includes the entire system, so all 4 codes are in the expansion.
+    fn make_app_with_hierarchy() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at)
+                 VALUES ('cs-h', 'http://example.org/cs-h', '1.0', 'HierCS',
+                         'active', 'complete', '2024-01-01', '2024-01-01');
+
+                 INSERT INTO concepts (id, system_id, code, display) VALUES
+                     (10, 'cs-h', 'root',       'Root'),
+                     (11, 'cs-h', 'child',      'Child'),
+                     (12, 'cs-h', 'grandchild', 'Grandchild'),
+                     (13, 'cs-h', 'orphan',     'Orphan');
+
+                 INSERT INTO concept_hierarchy (system_id, parent_code, child_code) VALUES
+                     ('cs-h', 'root',  'child'),
+                     ('cs-h', 'child', 'grandchild');
+
+                 INSERT INTO value_sets
+                     (id, url, name, status, compose_json, created_at, updated_at)
+                 VALUES ('vs-h', 'http://example.org/vs-h', 'HierVS', 'active',
+                         '{\"include\":[{\"system\":\"http://example.org/cs-h\"}]}',
+                         '2024-01-01', '2024-01-01');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn expand_with_use_supplement_emits_used_supplement_param() {
+        let app = make_supplement_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://hl7.org/fhir/test/ValueSet/extensions-all-ns"},
+                {"name": "useSupplement", "valueCanonical": "http://hl7.org/fhir/test/CodeSystem/supplement"},
+                {"name": "includeDesignations", "valueBoolean": true}
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["expansion"]["parameter"].as_array().unwrap();
+        let used = params
+            .iter()
+            .find(|p| p["name"] == "used-supplement")
+            .expect("used-supplement parameter expected in expansion.parameter");
+        assert_eq!(
+            used["valueUri"],
+            "http://hl7.org/fhir/test/CodeSystem/supplement|0.1.1"
+        );
+
+        // Designation merged into contains[code1].
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        let code1 = contains.iter().find(|c| c["code"] == "code1").unwrap();
+        let designations = code1["designation"].as_array().unwrap();
+        assert!(
+            designations
+                .iter()
+                .any(|d| d["value"] == "ectenoot" && d["language"] == "nl"),
+            "supplement designation 'ectenoot' must appear in contains[code1].designation"
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_unknown_supplement_returns_404() {
+        let app = make_supplement_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://hl7.org/fhir/test/ValueSet/extensions-all-ns"},
+                {"name": "useSupplement", "valueCanonical": "http://does-not-exist/cs"}
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// `excludeNested=false` should produce a tree (root contains child contains grandchild,
+    /// plus orphan as a sibling root).  Total stays 4 (full count); contains[] has 2 roots.
+    #[tokio::test]
+    async fn expand_exclude_nested_false_returns_tree() {
+        let app = make_app_with_hierarchy();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs-h" },
+                { "name": "excludeNested", "valueBoolean": false }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+
+        // Total reflects the full flat count.
+        assert_eq!(json["expansion"]["total"], 4);
+
+        // Roots: "orphan" and "root".
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 2, "expected 2 root entries (orphan + root)");
+
+        let root = contains
+            .iter()
+            .find(|c| c["code"] == "root")
+            .expect("root should be a top-level entry");
+        let root_children = root["contains"].as_array().unwrap();
+        assert_eq!(root_children.len(), 1);
+        assert_eq!(root_children[0]["code"], "child");
+
+        let grandchildren = root_children[0]["contains"].as_array().unwrap();
+        assert_eq!(grandchildren.len(), 1);
+        assert_eq!(grandchildren[0]["code"], "grandchild");
+    }
+
+    /// `excludeNested=true` (default) should keep the historical flat behaviour.
+    #[tokio::test]
+    async fn expand_exclude_nested_true_returns_flat_list() {
+        let app = make_app_with_hierarchy();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs-h" },
+                { "name": "excludeNested", "valueBoolean": true }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        let json = body_json(resp).await;
+
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 4, "all four codes should appear flat");
+        for c in contains {
+            assert!(
+                c.get("contains").is_none(),
+                "flat entries must not carry nested contains[]"
+            );
+        }
+    }
+
+    /// Omitting both `excludeNested` and `hierarchical` keeps the historical
+    /// flat behaviour — the simple/* IG fixtures rely on this.
+    #[tokio::test]
+    async fn expand_no_nesting_param_returns_flat_list() {
+        let app = make_app_with_hierarchy();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs-h" }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        let json = body_json(resp).await;
+
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 4);
+        for c in contains {
+            assert!(c.get("contains").is_none());
+        }
+    }
+
+    /// `hierarchical=true` (legacy alias) and `excludeNested=false` must agree.
+    #[tokio::test]
+    async fn expand_hierarchical_true_matches_exclude_nested_false() {
+        let app1 = make_app_with_hierarchy();
+        let body1 = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs-h" },
+                { "name": "hierarchical", "valueBoolean": true }
+            ]
+        });
+        let resp1 = body_json(post_json(app1, "/ValueSet/$expand", body1).await).await;
+
+        let app2 = make_app_with_hierarchy();
+        let body2 = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/vs-h" },
+                { "name": "excludeNested", "valueBoolean": false }
+            ]
+        });
+        let resp2 = body_json(post_json(app2, "/ValueSet/$expand", body2).await).await;
+
+        assert_eq!(
+            resp1["expansion"]["contains"],
+            resp2["expansion"]["contains"]
+        );
+    }
+
+    // ── Extension-derived properties (codesystem-conceptOrder → order) ─────────
+    //
+    // Mirrors the IG `parameters/parameters-expand-supplement-none` and
+    // `extensions/extensions-echo-all` fixtures: a concept-level
+    // `codesystem-conceptOrder` extension on the base CodeSystem must be
+    // surfaced as a `property[{code:"order", valueDecimal:N}]` entry on the
+    // matching `expansion.contains[]` even when the caller passes no explicit
+    // `property=` request parameter.  Drives `apply_concept_extension_data`
+    // Pass 2 — the fixture comparator fails with "missing property property"
+    // when this regresses.
+    async fn make_app_with_extension_order() -> Router {
+        use crate::import::BundleImportBackend;
+        use helios_persistence::tenant::TenantContext;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                { "resource": {
+                    "resourceType": "CodeSystem",
+                    "id": "ext-cs",
+                    "url": "http://example.org/ext-cs",
+                    "status": "active",
+                    "content": "complete",
+                    "concept": [
+                        {
+                            "code": "code1",
+                            "display": "Display 1",
+                            "extension": [{
+                                "url": "http://hl7.org/fhir/StructureDefinition/codesystem-conceptOrder",
+                                "valueInteger": 6
+                            }]
+                        },
+                        {
+                            "code": "code2",
+                            "display": "Display 2",
+                            "extension": [{
+                                "url": "http://hl7.org/fhir/StructureDefinition/codesystem-conceptOrder",
+                                "valueInteger": 5
+                            }]
+                        }
+                    ]
+                }},
+                { "resource": {
+                    "resourceType": "ValueSet",
+                    "id": "ext-vs",
+                    "url": "http://example.org/ext-vs",
+                    "status": "active",
+                    "compose": {
+                        "include": [{ "system": "http://example.org/ext-cs" }]
+                    }
+                }}
+            ]
+        });
+        backend
+            .import_bundle(&TenantContext::system(), bundle.to_string().as_bytes())
+            .await
+            .unwrap();
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn expand_surfaces_codesystem_conceptorder_as_order_property() {
+        let app = make_app_with_extension_order().await;
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/ext-vs" },
+                { "name": "excludeNested", "valueBoolean": true }
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 2);
+
+        // Each contains entry should carry a property[] with the derived
+        // `order` value (6 for code1, 5 for code2).
+        let by_code: std::collections::HashMap<&str, &Value> = contains
+            .iter()
+            .filter_map(|c| c["code"].as_str().map(|k| (k, c)))
+            .collect();
+
+        let c1 = by_code.get("code1").expect("code1 in expansion");
+        let c1_props = c1["property"].as_array().expect("code1 property[] present");
+        let order = c1_props
+            .iter()
+            .find(|p| p["code"] == "order")
+            .expect("code1 has order property");
+        assert_eq!(order["valueDecimal"], 6, "code1 order should be 6");
+
+        let c2 = by_code.get("code2").expect("code2 in expansion");
+        let c2_props = c2["property"].as_array().expect("code2 property[] present");
+        let order = c2_props
+            .iter()
+            .find(|p| p["code"] == "order")
+            .expect("code2 has order property");
+        assert_eq!(order["valueDecimal"], 5, "code2 order should be 5");
+    }
+
+    /// Variant: caller passes `property=prop` for a concept that has the
+    /// `prop` property declared in the CS.  Verifies `populate_properties`
+    /// (the SQL-backed lookup, distinct from extension synthesis above).
+    #[tokio::test]
+    async fn expand_surfaces_requested_concept_property() {
+        use crate::import::BundleImportBackend;
+        use helios_persistence::tenant::TenantContext;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                { "resource": {
+                    "resourceType": "CodeSystem",
+                    "id": "prop-cs",
+                    "url": "http://example.org/prop-cs",
+                    "status": "active",
+                    "content": "complete",
+                    "property": [{
+                        "code": "prop",
+                        "uri": "http://example.org/prop",
+                        "type": "code"
+                    }],
+                    "concept": [
+                        {
+                            "code": "code1",
+                            "display": "Display 1",
+                            "property": [{ "code": "prop", "valueCode": "old" }]
+                        },
+                        {
+                            "code": "code2",
+                            "display": "Display 2",
+                            "property": [{ "code": "prop", "valueCode": "new" }]
+                        }
+                    ]
+                }},
+                { "resource": {
+                    "resourceType": "ValueSet",
+                    "id": "prop-vs",
+                    "url": "http://example.org/prop-vs",
+                    "status": "active",
+                    "compose": {
+                        "include": [{ "system": "http://example.org/prop-cs" }]
+                    }
+                }}
+            ]
+        });
+        backend
+            .import_bundle(&TenantContext::system(), bundle.to_string().as_bytes())
+            .await
+            .unwrap();
+        let state = AppState::new(backend);
+        let app: Router = Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": "http://example.org/prop-vs" },
+                { "name": "excludeNested", "valueBoolean": true },
+                { "name": "property", "valueString": "prop" }
+            ]
+        });
+        let resp = post_json(app, "/ValueSet/$expand", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let contains = json["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 2);
+
+        let by_code: std::collections::HashMap<&str, &Value> = contains
+            .iter()
+            .filter_map(|c| c["code"].as_str().map(|k| (k, c)))
+            .collect();
+
+        let c1 = by_code.get("code1").expect("code1 in expansion");
+        let c1_props = c1["property"].as_array().expect("code1 property[] present");
+        let prop = c1_props
+            .iter()
+            .find(|p| p["code"] == "prop")
+            .expect("code1 has prop property");
+        assert_eq!(prop["valueCode"], "old", "code1 prop should be 'old'");
+    }
+
+    /// `downconvert_property_to_r4_extension` rewrites typed `property[]`
+    /// arrays on `expansion` and `expansion.contains[]` (recursively) into
+    /// the cross-version extensions documented at tx-ecosystem-ig
+    /// `/tests/r4.md`. Used on R4 / R4B builds where the FHIR ValueSet model
+    /// does not have native property fields and the test runner's R5→R4
+    /// conversion would otherwise drop them.
+    #[test]
+    fn downconvert_emits_cross_version_extensions_for_property() {
+        let mut response = json!({
+            "resourceType": "ValueSet",
+            "expansion": {
+                "property": [
+                    { "code": "order", "uri": "http://hl7.org/fhir/concept-properties#order" }
+                ],
+                "contains": [
+                    {
+                        "extension": [
+                            { "url": "http://hl7.org/fhir/StructureDefinition/rendering-style",
+                              "valueString": "font-weight: bold" }
+                        ],
+                        "system": "http://hl7.org/fhir/test/CodeSystem/extensions",
+                        "code": "code1",
+                        "display": "Display 1",
+                        "property": [
+                            { "code": "order", "valueDecimal": 6 },
+                            { "code": "label", "valueString": "a." }
+                        ]
+                    },
+                    {
+                        "system": "http://hl7.org/fhir/test/CodeSystem/extensions",
+                        "code": "parent",
+                        "display": "Parent",
+                        "contains": [
+                            {
+                                "system": "http://hl7.org/fhir/test/CodeSystem/extensions",
+                                "code": "child",
+                                "display": "Child",
+                                "property": [
+                                    { "code": "status", "valueCode": "deprecated" }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        downconvert_property_to_r4_extension(&mut response);
+
+        let expansion = &response["expansion"];
+
+        // Top-level `property[]` was removed and converted into the
+        // expansion-level extension URL.
+        assert!(
+            expansion.get("property").is_none(),
+            "expansion.property[] should have been removed",
+        );
+        let exp_exts = expansion["extension"]
+            .as_array()
+            .expect("expansion.extension[] present");
+        let prop_decl = exp_exts
+            .iter()
+            .find(|e| {
+                e["url"]
+                    == "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property"
+            })
+            .expect("expansion property cross-version extension");
+        let inner = prop_decl["extension"].as_array().expect("inner extensions");
+        assert!(
+            inner
+                .iter()
+                .any(|e| e["url"] == "code" && e["valueCode"] == "order"),
+            "code sub-extension"
+        );
+        assert!(
+            inner.iter().any(|e| e["url"] == "uri"
+                && e["valueUri"] == "http://hl7.org/fhir/concept-properties#order"),
+            "uri sub-extension"
+        );
+
+        // contains[0]: original extension preserved, property converted,
+        // typed values mapped to value[x] inside the cross-version extension.
+        let c1 = &expansion["contains"][0];
+        assert!(c1.get("property").is_none(), "contains[0].property removed");
+        let c1_exts = c1["extension"].as_array().expect("contains[0].extension[]");
+        assert!(
+            c1_exts
+                .iter()
+                .any(|e| e["url"] == "http://hl7.org/fhir/StructureDefinition/rendering-style"),
+            "rendering-style extension preserved",
+        );
+        let order_prop = c1_exts
+            .iter()
+            .find(|e| {
+                if e["url"]
+                    != "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property"
+                {
+                    return false;
+                }
+                e["extension"]
+                    .as_array()
+                    .map(|inner| {
+                        inner
+                            .iter()
+                            .any(|s| s["url"] == "code" && s["valueCode"] == "order")
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("order property cross-version extension");
+        let order_inner = order_prop["extension"].as_array().unwrap();
+        let value_ext = order_inner
+            .iter()
+            .find(|s| s["url"] == "value")
+            .expect("value sub-extension");
+        assert_eq!(
+            value_ext["valueDecimal"], 6,
+            "valueDecimal preserved on contains property"
+        );
+
+        // Recursive: nested contains[].property[] converted too.
+        let nested = &expansion["contains"][1]["contains"][0];
+        assert!(nested.get("property").is_none(), "nested property removed");
+        let nested_exts = nested["extension"].as_array().expect("nested extension[]");
+        let status_ext = nested_exts
+            .iter()
+            .find(|e| {
+                e["url"]
+                    == "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property"
+            })
+            .expect("nested cross-version extension");
+        let status_inner = status_ext["extension"].as_array().unwrap();
+        assert!(
+            status_inner
+                .iter()
+                .any(|s| s["url"] == "value" && s["valueCode"] == "deprecated"),
+            "valueCode preserved for status property"
+        );
+    }
+}
+// rebuild marker
