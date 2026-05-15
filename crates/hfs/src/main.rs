@@ -30,9 +30,7 @@ use helios_rest::{
 };
 use tracing::info;
 
-#[cfg(feature = "sqlite")]
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
-#[cfg(feature = "sqlite")]
 use helios_persistence::core::{
     BulkExportJobStore, DefaultExportWorker, ExportOutputStore, WorkerId,
 };
@@ -536,9 +534,19 @@ async fn init_auth_with_audit(
                  Build with: cargo build -p helios-hfs --features redis"
             );
         }
-        _ => {
+        "memory" => {
             info!("Using in-memory JTI cache");
             Arc::new(InMemoryJtiCache::new())
+        }
+        "disabled" | "none" => {
+            info!("JTI replay cache is DISABLED");
+            Arc::new(helios_auth::DisabledJtiCache)
+        }
+        other => {
+            anyhow::bail!(
+                "Invalid HFS_AUTH_JTI_BACKEND '{}'. Valid values: memory, redis, disabled",
+                other
+            );
         }
     };
 
