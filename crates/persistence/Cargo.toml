@@ -29,17 +29,20 @@ advisor = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber"]
 # Audit event integration
 audit = ["dep:helios-audit"]
 
-# FHIR version features (pass through to helios-fhir and helios-fhirpath)
-R4 = ["helios-fhir/R4", "helios-fhirpath/R4"]
-R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B"]
-R5 = ["helios-fhir/R5", "helios-fhirpath/R5"]
-R6 = ["helios-fhir/R6", "helios-fhirpath/R6"]
+# FHIR version features (pass through to helios-fhir, helios-fhirpath, helios-sof)
+R4 = ["helios-fhir/R4", "helios-fhirpath/R4", "helios-sof/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B", "helios-sof/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhirpath/R5", "helios-sof/R5"]
+R6 = ["helios-fhir/R6", "helios-fhirpath/R6", "helios-sof/R6"]
 
 [dependencies]
 # Core dependencies (always included)
 helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
 helios-fhirpath = { path = "../fhirpath", version = "0.1.47", default-features = false }
 helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.47" }
+# Shared SoF v2 spec parsing (ConstantValue, run-params extractor). Kept
+# default-features = false so persistence can pick its own FHIR-version set.
+helios-sof = { path = "../sof", version = "0.1.47", default-features = false }
 rust_decimal = "1"
 serde.workspace = true
 serde_json.workspace = true

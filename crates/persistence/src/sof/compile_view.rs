@@ -16,6 +16,7 @@
 
 #![allow(missing_docs)] // Per-field docs land alongside their consumers in stages 4–5.
 
+use helios_sof::ConstantValue;
 use serde_json::Value;
 
 use crate::core::sof_runner::SofError;
@@ -113,29 +114,23 @@ pub fn build_plan(
     Ok((plan, env.param_bindings))
 }
 
-/// Reads `ViewDefinition.constant[]` and populates `env.constants` with
-/// typed values. Each entry must have a `name` and exactly one `valueX`
-/// field per the SoF v2 spec; the spec lists `valueString`,
-/// `valueBoolean`, `valueInteger`, `valueDecimal`, `valueDate`,
-/// `valueDateTime`, `valueTime`, plus the various `value{primitive}` shapes
-/// for FHIR primitives. Unknown / unsupported value types fail compilation.
+/// Reads `ViewDefinition.constant[]` and populates `env.constants` with typed
+/// values. Each entry must have a `name` and exactly one `valueX` field per
+/// the SoF v2 spec. Delegates the field walk to
+/// [`helios_sof::parse_constant_from_json`] so the spec field list lives in
+/// one place; here we just lift the neutral [`ConstantValue`] into the
+/// compiler's [`LitValue`] (which keeps dates/times as text — FHIRPath
+/// `@`/`@T` prefixing only matters for the in-process evaluator).
 fn populate_constants(view_json: &Value, env: &mut CompileEnv) -> Result<(), SofError> {
     let Some(constants) = view_json.get("constant").and_then(|v| v.as_array()) else {
         return Ok(());
     };
     for c in constants {
-        let name = c.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SofError::InvalidViewDefinition("ViewDefinition.constant.name is required".to_string())
-        })?;
-        let value = parse_constant_value(c).ok_or_else(|| {
-            SofError::InvalidViewDefinition(format!(
-                "ViewDefinition.constant '{name}' must have exactly one supported value[X] field"
-            ))
-        })?;
+        let (name, value) = helios_sof::parse_constant_from_json(c).map_err(lift_sof_error)?;
         env.constants.insert(
-            name.to_string(),
+            name,
             Constant {
-                value,
+                value: lit_value_from_constant(value),
                 bound_to: None,
             },
         );
@@ -143,48 +138,39 @@ fn populate_constants(view_json: &Value, env: &mut CompileEnv) -> Result<(), Sof
     Ok(())
 }
 
-/// Extracts the typed value from a `ViewDefinition.constant[]` entry.
-fn parse_constant_value(c: &Value) -> Option<LitValue> {
-    if let Some(s) = c.get("valueString").and_then(|v| v.as_str()) {
-        return Some(LitValue::Str(s.to_string()));
+/// Lowers a neutral [`ConstantValue`] into the in-DB compiler's [`LitValue`].
+/// All FHIR string-shaped primitives collapse to `Str`; the date/time/instant
+/// families keep their lexical form (no `@`-prefixing — SQL parameter binding
+/// takes plain ISO 8601 strings).
+fn lit_value_from_constant(value: ConstantValue) -> LitValue {
+    match value {
+        ConstantValue::String(s)
+        | ConstantValue::Code(s)
+        | ConstantValue::Identifier(s)
+        | ConstantValue::Base64Binary(s)
+        | ConstantValue::Markdown(s)
+        | ConstantValue::Date(s)
+        | ConstantValue::DateTime(s)
+        | ConstantValue::Time(s)
+        | ConstantValue::Instant(s) => LitValue::Str(s),
+        ConstantValue::Boolean(b) => LitValue::Bool(b),
+        ConstantValue::Integer(i)
+        | ConstantValue::PositiveInt(i)
+        | ConstantValue::UnsignedInt(i)
+        | ConstantValue::Integer64(i) => LitValue::Int(i),
+        ConstantValue::Decimal(s) => LitValue::Decimal(s),
     }
-    if let Some(b) = c.get("valueBoolean").and_then(|v| v.as_bool()) {
-        return Some(LitValue::Bool(b));
+}
+
+/// Maps `helios_sof::SofError` (raised by the shared SoF spec parser) onto
+/// the persistence crate's local `SofError`. Only `InvalidViewDefinition`
+/// is reachable from the parser today; other variants pass through as the
+/// same flavour to keep the 422-mapping consistent.
+fn lift_sof_error(e: helios_sof::SofError) -> SofError {
+    match e {
+        helios_sof::SofError::InvalidViewDefinition(msg) => SofError::InvalidViewDefinition(msg),
+        other => SofError::InvalidViewDefinition(other.to_string()),
     }
-    if let Some(n) = c.get("valueInteger").and_then(|v| v.as_i64()) {
-        return Some(LitValue::Int(n));
-    }
-    if let Some(n) = c.get("valuePositiveInt").and_then(|v| v.as_i64()) {
-        return Some(LitValue::Int(n));
-    }
-    if let Some(n) = c.get("valueUnsignedInt").and_then(|v| v.as_i64()) {
-        return Some(LitValue::Int(n));
-    }
-    if let Some(n) = c.get("valueDecimal") {
-        // Preserve precision by going through the JSON string form.
-        return Some(LitValue::Decimal(n.to_string()));
-    }
-    // FHIR string-shaped primitives — all bind as text.
-    for key in [
-        "valueCode",
-        "valueId",
-        "valueUri",
-        "valueUrl",
-        "valueOid",
-        "valueUuid",
-        "valueDate",
-        "valueDateTime",
-        "valueTime",
-        "valueInstant",
-        "valueBase64Binary",
-        "valueCanonical",
-        "valueMarkdown",
-    ] {
-        if let Some(s) = c.get(key).and_then(|v| v.as_str()) {
-            return Some(LitValue::Str(s.to_string()));
-        }
-    }
-    None
 }
 
 /// Walks a list of select clauses sharing a parent row source. Builds either

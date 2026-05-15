@@ -34,7 +34,8 @@ use futures::StreamExt;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::{SofError, ViewFilters};
 use helios_sof::{
-    ContentType, RunOptions, create_bundle_from_resources_for_version,
+    ContentType, ExtractedRunParams, RunOptions, body_has_view_definition,
+    create_bundle_from_resources_for_version, extract_run_params_from_json,
     filter_resources_by_patient_and_group, filter_resources_by_since,
     parse_view_definition_for_version, run_view_definition_with_options,
 };
@@ -106,7 +107,7 @@ pub async fn run_view_definition_handler<S>(
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    let body_params = extract_body_params(&body.0);
+    let body_params = extract_run_params_from_json(&body.0);
     let view_json = resolve_view_from_body(&state, &tenant, &body.0).await?;
     let params = merge_params(query_params, &body_params);
     execute_view(state, params, body_params, tenant, view_json).await
@@ -128,10 +129,10 @@ pub async fn run_stored_view_definition_handler<S>(
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    let body_params = extract_body_params(&body.0);
+    let body_params = extract_run_params_from_json(&body.0);
     // If the body provides a ViewDefinition (inline or by reference), prefer
     // it. Otherwise, load the stored ViewDefinition by id from the path.
-    let view_json = if body_has_view(&body.0) {
+    let view_json = if body_has_view_definition(&body.0) {
         resolve_view_from_body(&state, &tenant, &body.0).await?
     } else {
         let stored = state
@@ -151,135 +152,30 @@ where
     execute_view(state, params, body_params, tenant, view_json).await
 }
 
-/// Parameters extracted from a FHIR `Parameters` body. Anything not present
-/// in the body stays `None`/empty so the merge step preserves the query-string
-/// value. `patient` and `group` collect every repeated entry (spec is 0..*).
-#[derive(Debug, Default)]
-struct BodyParams {
-    format: Option<String>,
-    header: Option<String>,
-    limit: Option<usize>,
-    since: Option<String>,
-    patient: Vec<String>,
-    group: Vec<String>,
-    /// Inline `resource` parameter values (any number; spec 0..*). Drives the
-    /// in-process runner when present so the view runs against these resources
-    /// instead of the tenant's stored data.
-    inline_resources: Vec<Value>,
-}
-
-/// Reads SoF-spec parameters out of a FHIR `Parameters` body. Returns an empty
-/// `BodyParams` for any non-Parameters body (e.g. a bare ViewDefinition).
-fn extract_body_params(body: &Value) -> BodyParams {
-    if body.get("resourceType").and_then(|v| v.as_str()) != Some("Parameters") {
-        return BodyParams::default();
-    }
-    let Some(entries) = body.get("parameter").and_then(|p| p.as_array()) else {
-        return BodyParams::default();
-    };
-
-    let mut out = BodyParams::default();
-    for p in entries {
-        let name = match p.get("name").and_then(|n| n.as_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        match name {
-            "_format" => {
-                out.format = p
-                    .get("valueCode")
-                    .or_else(|| p.get("valueString"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-            }
-            "header" => {
-                if let Some(b) = p.get("valueBoolean").and_then(|v| v.as_bool()) {
-                    out.header = Some(if b { "true" } else { "false" }.to_string());
-                } else if let Some(s) = p.get("valueString").and_then(|v| v.as_str()) {
-                    out.header = Some(s.to_string());
-                }
-            }
-            "_limit" => {
-                out.limit = p
-                    .get("valueInteger")
-                    .or_else(|| p.get("valuePositiveInt"))
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
-            }
-            "_since" => {
-                out.since = p
-                    .get("valueInstant")
-                    .or_else(|| p.get("valueDateTime"))
-                    .or_else(|| p.get("valueString"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-            }
-            "patient" => {
-                if let Some(s) = p
-                    .get("valueReference")
-                    .and_then(|r| r.get("reference"))
-                    .or_else(|| p.get("valueString"))
-                    .and_then(|v| v.as_str())
-                {
-                    out.patient.push(s.to_string());
-                }
-            }
-            "group" => {
-                if let Some(s) = p
-                    .get("valueReference")
-                    .and_then(|r| r.get("reference"))
-                    .or_else(|| p.get("valueString"))
-                    .and_then(|v| v.as_str())
-                {
-                    out.group.push(s.to_string());
-                }
-            }
-            "resource" => {
-                if let Some(r) = p.get("resource") {
-                    out.inline_resources.push(r.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 /// Merges body parameters onto query-string parameters with body precedence
 /// for scalar values. Multi-valued fields (`patient`, `group`) and inline
-/// resources stay on the [`BodyParams`] and are consumed in [`build_filters`]
-/// / [`execute_view`].
-fn merge_params(query: RunQueryParams, body: &BodyParams) -> RunQueryParams {
+/// resources stay on the [`ExtractedRunParams`] and are consumed in
+/// [`build_filters`] / [`execute_view`].
+///
+/// `header` is normalised back to `Option<String>` so it matches the axum
+/// query-string shape — `execute_view` lowers it to bool at the use site.
+fn merge_params(query: RunQueryParams, body: &ExtractedRunParams) -> RunQueryParams {
     RunQueryParams {
         format: body.format.clone().or(query.format),
-        header: body.header.clone().or(query.header),
-        limit: body.limit.or(query.limit),
+        header: body
+            .header
+            .map(|b| {
+                if b {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            })
+            .or(query.header),
+        limit: body.limit.map(|n| n as usize).or(query.limit),
         since: body.since.clone().or(query.since),
         patient: query.patient,
         group: query.group,
-    }
-}
-
-/// Returns `true` when the body carries a ViewDefinition the handler should use
-/// instead of loading from storage. Accepts either a bare `ViewDefinition`
-/// resource or a `Parameters` body containing a `viewResource` *or*
-/// `viewReference` parameter.
-fn body_has_view(body: &Value) -> bool {
-    match body.get("resourceType").and_then(|v| v.as_str()) {
-        Some("ViewDefinition") => true,
-        Some("Parameters") => body
-            .get("parameter")
-            .and_then(|p| p.as_array())
-            .map(|params| {
-                params.iter().any(|p| {
-                    matches!(
-                        p.get("name").and_then(|n| n.as_str()),
-                        Some("viewResource") | Some("viewReference")
-                    )
-                })
-            })
-            .unwrap_or(false),
-        _ => false,
     }
 }
 
@@ -302,30 +198,16 @@ where
 
     // Parameters body: look for viewResource first, fall back to viewReference.
     if body.get("resourceType").and_then(|v| v.as_str()) == Some("Parameters") {
-        let entries = body.get("parameter").and_then(|p| p.as_array());
+        let extracted = extract_run_params_from_json(body);
 
         // 1. Inline viewResource takes precedence when both are present.
-        if let Some(arr) = entries {
-            if let Some(view) = arr
-                .iter()
-                .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("viewResource"))
-                .and_then(|p| p.get("resource"))
-            {
-                return Ok(view.clone());
-            }
+        if let Some(view) = extracted.view_resource {
+            return Ok(view);
         }
 
         // 2. Otherwise, resolve viewReference.
-        if let Some(arr) = entries {
-            if let Some(reference) = arr
-                .iter()
-                .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("viewReference"))
-                .and_then(|p| p.get("valueReference"))
-                .and_then(|r| r.get("reference"))
-                .and_then(|v| v.as_str())
-            {
-                return resolve_view_reference(state, tenant, reference).await;
-            }
+        if let Some(reference) = extracted.view_reference {
+            return resolve_view_reference(state, tenant, &reference).await;
         }
 
         return Err(RestError::BadRequest {
@@ -403,7 +285,7 @@ where
 async fn execute_view<S>(
     state: AppState<S>,
     params: RunQueryParams,
-    body_params: BodyParams,
+    body_params: ExtractedRunParams,
     tenant: TenantExtractor,
     view_json: Value,
 ) -> Result<Response, RestError>
@@ -477,7 +359,7 @@ where
 fn execute_view_inline<S>(
     state: &AppState<S>,
     params: &RunQueryParams,
-    body_params: &BodyParams,
+    body_params: &ExtractedRunParams,
     view_json: Value,
     format: &str,
     include_header: bool,
@@ -545,18 +427,7 @@ where
     let body = run_view_definition_with_options(view_definition, bundle, content_type, options)
         .map_err(map_sof_lib_error_to_rest)?;
 
-    let response_format = match content_type {
-        ContentType::Csv | ContentType::CsvWithHeader => "csv",
-        ContentType::Json => "json",
-        ContentType::NdJson => "ndjson",
-        ContentType::Parquet => "parquet",
-    };
-    let ct_header: &'static str = match content_type {
-        ContentType::Csv | ContentType::CsvWithHeader => "text/csv; charset=utf-8",
-        ContentType::Json => "application/json",
-        ContentType::NdJson => "application/x-ndjson",
-        ContentType::Parquet => "application/octet-stream",
-    };
+    let (ct_header, response_format) = content_type_headers(content_type);
 
     Ok(build_response(
         StatusCode::OK,
@@ -565,6 +436,18 @@ where
         "in-process",
         response_format,
     ))
+}
+
+/// Maps a [`ContentType`] to its (HTTP `Content-Type` header, `_format`-label)
+/// pair. Shared between the inline and streaming response paths so both emit
+/// the same content-type strings.
+fn content_type_headers(ct: ContentType) -> (&'static str, &'static str) {
+    match ct {
+        ContentType::Csv | ContentType::CsvWithHeader => ("text/csv; charset=utf-8", "csv"),
+        ContentType::Json => ("application/json", "json"),
+        ContentType::NdJson => ("application/x-ndjson", "ndjson"),
+        ContentType::Parquet => ("application/octet-stream", "parquet"),
+    }
 }
 
 /// Maps a `_format` string + header flag to a `ContentType` understood by the
@@ -653,30 +536,40 @@ fn streaming_ndjson_response(
     response
 }
 
-/// Renders a `RowStream` to `(content_type, bytes)` for the requested format.
+/// Renders a `RowStream` to `(content_type_header, bytes)` for the requested
+/// format. NDJSON has its own dedicated streaming path
+/// ([`streaming_ndjson_response`]); buffered formats (csv, json, parquet) drain
+/// here and pass through `helios_sof::format_output` so REST output matches
+/// `sof-server` / `pysof` byte-for-byte. Unknown formats fall back to NDJSON.
 async fn format_stream(
     stream: helios_persistence::core::sof_runner::RowStream,
     format: &str,
     include_header: bool,
 ) -> (&'static str, Vec<u8>) {
-    match format {
-        "csv" | "text/csv" => {
-            let body = stream_to_csv(stream, include_header).await;
-            ("text/csv; charset=utf-8", body)
-        }
-        "json" | "application/json" => {
-            let body = stream_to_json_array(stream).await;
-            ("application/json", body)
-        }
-        "parquet" | "application/octet-stream" => {
-            let body = stream_to_parquet(stream).await;
-            ("application/octet-stream", body)
-        }
-        _ => {
-            let body = stream_to_ndjson(stream).await;
-            ("application/x-ndjson", body)
+    let rows = drain_stream(stream).await;
+    let content_type = parse_content_type(format, include_header).unwrap_or(ContentType::NdJson);
+    let result = helios_sof::rows_to_processed_result(rows);
+    let body = helios_sof::format_output(result, content_type, None).unwrap_or_else(|e| {
+        warn!(error = %e, format, "shared output formatter failed; returning empty body");
+        Vec::new()
+    });
+    (content_type_headers(content_type).0, body)
+}
+
+/// Drains a [`RowStream`] into a `Vec<Value>`, stopping at the first stream
+/// error after logging it. Used by the buffered output paths.
+async fn drain_stream(mut stream: helios_persistence::core::sof_runner::RowStream) -> Vec<Value> {
+    let mut rows = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(row) => rows.push(row),
+            Err(e) => {
+                warn!(error = %e, "row error while collecting stream");
+                break;
+            }
         }
     }
+    rows
 }
 
 /// Builds the final `Response` with `X-HFS-Runner` and optional Content-Disposition.
@@ -703,7 +596,7 @@ fn build_response(
 }
 
 /// Builds `ViewFilters` from query parameters.
-fn build_filters(params: &RunQueryParams, body_extra: &BodyParams) -> ViewFilters {
+fn build_filters(params: &RunQueryParams, body_extra: &ExtractedRunParams) -> ViewFilters {
     let since = params.since.as_deref().and_then(|s| s.parse().ok());
 
     // Effective patient/group: body's repeated entries override query when present;
@@ -743,162 +636,4 @@ fn map_sof_error_to_rest(e: SofError) -> RestError {
             }
         }
     }
-}
-
-/// Collects the row stream into Parquet bytes (G2).
-async fn stream_to_parquet(mut stream: helios_persistence::core::sof_runner::RowStream) -> Vec<u8> {
-    let mut rows: Vec<Value> = Vec::new();
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(row) => rows.push(row),
-            Err(e) => {
-                warn!(error = %e, "row error during Parquet streaming");
-                break;
-            }
-        }
-    }
-
-    if rows.is_empty() {
-        return Vec::new();
-    }
-
-    // Build a ProcessedResult from the flat JSON rows
-    let columns: Vec<String> = if let Value::Object(map) = &rows[0] {
-        map.keys().cloned().collect()
-    } else {
-        return Vec::new();
-    };
-
-    let processed_rows: Vec<helios_sof::ProcessedRow> = rows
-        .iter()
-        .map(|row| {
-            let values = columns
-                .iter()
-                .map(|col| {
-                    if let Value::Object(map) = row {
-                        map.get(col).cloned()
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            helios_sof::ProcessedRow { values }
-        })
-        .collect();
-
-    let result = helios_sof::ProcessedResult {
-        columns,
-        rows: processed_rows,
-    };
-
-    // Use a very large max_file_size to produce a single Parquet file
-    match helios_sof::format_parquet_multi_file(result, None, usize::MAX) {
-        Ok(files) => files.into_iter().next().unwrap_or_default(),
-        Err(e) => {
-            warn!(error = %e, "Parquet serialisation failed");
-            Vec::new()
-        }
-    }
-}
-
-/// Collects the row stream into a NDJSON byte string.
-async fn stream_to_ndjson(mut stream: helios_persistence::core::sof_runner::RowStream) -> Vec<u8> {
-    let mut buf = Vec::new();
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(row) => {
-                if let Ok(line) = serde_json::to_string(&row) {
-                    buf.extend_from_slice(line.as_bytes());
-                    buf.push(b'\n');
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "row error during NDJSON streaming");
-                break;
-            }
-        }
-    }
-    buf
-}
-
-/// Collects the row stream into a JSON array byte string.
-async fn stream_to_json_array(
-    mut stream: helios_persistence::core::sof_runner::RowStream,
-) -> Vec<u8> {
-    let mut rows = Vec::new();
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(row) => rows.push(row),
-            Err(e) => {
-                warn!(error = %e, "row error during JSON array streaming");
-                break;
-            }
-        }
-    }
-    serde_json::to_vec(&rows).unwrap_or_default()
-}
-
-/// Collects the row stream into CSV bytes.
-async fn stream_to_csv(
-    mut stream: helios_persistence::core::sof_runner::RowStream,
-    include_header: bool,
-) -> Vec<u8> {
-    let mut rows: Vec<Value> = Vec::new();
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(row) => rows.push(row),
-            Err(e) => {
-                warn!(error = %e, "row error during CSV streaming");
-                break;
-            }
-        }
-    }
-
-    if rows.is_empty() {
-        return Vec::new();
-    }
-
-    let mut buf = Vec::new();
-
-    // Collect column names from first row
-    let columns: Vec<String> = if let Value::Object(map) = &rows[0] {
-        map.keys().cloned().collect()
-    } else {
-        return Vec::new();
-    };
-
-    // Header row
-    if include_header {
-        let header_line = columns.join(",");
-        buf.extend_from_slice(header_line.as_bytes());
-        buf.push(b'\n');
-    }
-
-    // Data rows
-    for row in &rows {
-        if let Value::Object(map) = row {
-            let values: Vec<String> = columns
-                .iter()
-                .map(|col| {
-                    match map.get(col) {
-                        Some(Value::String(s)) => {
-                            // Escape strings with quotes if they contain commas or quotes
-                            if s.contains(',') || s.contains('"') || s.contains('\n') {
-                                format!("\"{}\"", s.replace('"', "\"\""))
-                            } else {
-                                s.clone()
-                            }
-                        }
-                        Some(Value::Null) | None => String::new(),
-                        Some(v) => v.to_string(),
-                    }
-                })
-                .collect();
-            let line = values.join(",");
-            buf.extend_from_slice(line.as_bytes());
-            buf.push(b'\n');
-        }
-    }
-
-    buf
 }

@@ -575,7 +575,19 @@ fn process_parameter(
     Ok(())
 }
 
-/// Extract all parameters from a Parameters resource in a version-independent way
+/// Extract all parameters from a Parameters resource in a version-independent way.
+///
+/// Walks the typed FHIR `Parameters` resource and pulls each operation
+/// parameter into [`ExtractedParameters`]. Validation is interleaved with
+/// extraction here (e.g. `_limit` upper bound, RFC 3339 `_since`, `compression`
+/// allowed values, `header` boolean shape) — see [`process_parameter`].
+///
+/// **Relation to [`crate::params::extract_run_params_from_json`]**: the
+/// shared extractor in `helios-sof::params` performs the same field walk
+/// permissively (no validation). The REST handler uses it directly; this
+/// function keeps the stricter validation path for the standalone sof-server.
+/// A future refactor may fold the two together by lifting validation into a
+/// separate `validate_run_params` pass over the shared output.
 pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParameters, String> {
     let mut result = ExtractedParameters::default();
 

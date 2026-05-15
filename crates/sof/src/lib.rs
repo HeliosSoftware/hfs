@@ -180,9 +180,14 @@
 //! - `R5`: FHIR 5.0.0 support
 //! - `R6`: FHIR 6.0.0 support
 
+pub mod constants;
 pub mod data_source;
+pub mod params;
 pub mod parquet_schema;
 pub mod traits;
+
+pub use constants::{ConstantValue, parse_constant_from_json};
+pub use params::{ExtractedRunParams, body_has_view_definition, extract_run_params_from_json};
 
 use chrono::{DateTime, Utc};
 use helios_fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
@@ -3353,7 +3358,13 @@ fn apply_pagination_to_result(
     Ok(result)
 }
 
-fn format_output(
+/// Renders a [`ProcessedResult`] to bytes in the requested [`ContentType`].
+///
+/// Dispatches to [`format_csv`], [`format_json`], [`format_ndjson`], or
+/// [`format_parquet`] based on `content_type`. Callers outside this crate
+/// (REST handlers, pysof, sof-server) use this entry point so output shape is
+/// consistent across consumers.
+pub fn format_output(
     result: ProcessedResult,
     content_type: ContentType,
     parquet_options: Option<&ParquetOptions>,
@@ -3368,7 +3379,42 @@ fn format_output(
     }
 }
 
-fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, SofError> {
+/// Builds a [`ProcessedResult`] from a stream of flat JSON-object rows.
+///
+/// Used by callers that receive rows as `serde_json::Value` (e.g. the REST
+/// SoF runner streams) and want to feed them through the shared output
+/// formatters. Column order is taken from the first row's key order;
+/// subsequent rows fill in missing keys as `None`.
+pub fn rows_to_processed_result(rows: Vec<serde_json::Value>) -> ProcessedResult {
+    let columns: Vec<String> = match rows.first() {
+        Some(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+        _ => Vec::new(),
+    };
+    let processed_rows = rows
+        .iter()
+        .map(|row| {
+            let values = columns
+                .iter()
+                .map(|col| match row {
+                    serde_json::Value::Object(map) => map.get(col).cloned(),
+                    _ => None,
+                })
+                .collect();
+            ProcessedRow { values }
+        })
+        .collect();
+    ProcessedResult {
+        columns,
+        rows: processed_rows,
+    }
+}
+
+/// Encodes a [`ProcessedResult`] as CSV bytes via the `csv` crate (RFC 4180).
+///
+/// String values are emitted raw; non-string values are JSON-serialised. The
+/// underlying writer handles quoting for fields containing `,`, `"`, or
+/// newlines, so callers do not need to escape.
+pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, SofError> {
     let mut wtr = csv::Writer::from_writer(vec![]);
 
     if include_header {
@@ -3399,7 +3445,9 @@ fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, 
         .map_err(|e| SofError::CsvWriterError(e.to_string()))
 }
 
-fn format_json(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
+/// Encodes a [`ProcessedResult`] as a pretty-printed JSON array of row
+/// objects. Missing column values are emitted as `null`.
+pub fn format_json(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     let mut output = Vec::new();
 
     for row in result.rows {
@@ -3419,7 +3467,9 @@ fn format_json(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     Ok(serde_json::to_vec_pretty(&output)?)
 }
 
-fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
+/// Encodes a [`ProcessedResult`] as newline-delimited JSON. One row per
+/// line; missing column values are emitted as `null`.
+pub fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     let mut output = Vec::new();
 
     for row in result.rows {
@@ -3441,7 +3491,14 @@ fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     Ok(output)
 }
 
-fn format_parquet(
+/// Encodes a [`ProcessedResult`] as a single Parquet file in memory.
+///
+/// Schema is inferred from `result.columns` and the row values; type mapping
+/// follows Pathling conventions (boolean→BOOLEAN, string/code/uri→UTF8,
+/// integer→INT32, decimal→FLOAT64, dateTime/date→UTF8). Use
+/// [`format_parquet_multi_file`] when the output needs to be split across
+/// files by size.
+pub fn format_parquet(
     result: ProcessedResult,
     options: Option<&ParquetOptions>,
 ) -> Result<Vec<u8>, SofError> {
