@@ -70,9 +70,16 @@ impl SofRunner for PgInDbRunner {
         let columns = compiled.columns.clone();
         let pool = self.pool.clone();
 
-        // Build SQL with runtime filters and collect typed params
-        let (sql, params) =
-            build_pg_sql_and_params(&compiled.sql, tenant_id, resource_type, &filters);
+        // Build SQL with runtime filters and collect typed params. The
+        // compiled query already reserves `$3..$N` for ViewDefinition
+        // constants; runtime filters allocate from the next free slot.
+        let (sql, params) = build_pg_sql_and_params(
+            &compiled.sql,
+            tenant_id,
+            resource_type,
+            &compiled.constants,
+            &filters,
+        );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
 
@@ -96,11 +103,18 @@ fn build_pg_sql_and_params(
     base_sql: &str,
     tenant_id: String,
     resource_type: String,
+    constants: &[super::ir::LitValue],
     filters: &ViewFilters,
 ) -> (String, Vec<PgParam>) {
     let mut conditions: Vec<String> = Vec::new();
     let mut extra: Vec<PgParam> = Vec::new();
-    let mut next_param = 3usize;
+    // Constants occupy `$3..$(2+constants.len())`; runtime filters start
+    // immediately after.
+    let mut constant_params: Vec<PgParam> = Vec::with_capacity(constants.len());
+    for c in constants {
+        constant_params.push(PgParam::from_lit(c));
+    }
+    let mut next_param = 3usize + constants.len();
 
     if let Some(since) = filters.since {
         conditions.push(format!("r.last_updated >= ${next_param}"));
@@ -143,6 +157,7 @@ fn build_pg_sql_and_params(
     };
 
     let mut all_params = vec![PgParam::Text(tenant_id), PgParam::Text(resource_type)];
+    all_params.extend(constant_params);
     all_params.extend(extra);
 
     (sql, all_params)
@@ -172,7 +187,26 @@ fn inject_before_order_by(sql: &str, extra: &str) -> String {
 #[derive(Clone)]
 enum PgParam {
     Text(String),
+    Bool(bool),
+    Int(i64),
+    Decimal(String),
+    Null,
     Timestamp(chrono::DateTime<chrono::Utc>),
+}
+
+impl PgParam {
+    /// Lifts a [`super::ir::LitValue`] (used by `ViewDefinition.constant[]`)
+    /// into the runtime parameter representation. Decimals bind as text and
+    /// rely on PG's implicit cast to `numeric` at the call site.
+    fn from_lit(v: &super::ir::LitValue) -> Self {
+        match v {
+            super::ir::LitValue::Null => PgParam::Null,
+            super::ir::LitValue::Bool(b) => PgParam::Bool(*b),
+            super::ir::LitValue::Int(n) => PgParam::Int(*n),
+            super::ir::LitValue::Decimal(s) => PgParam::Decimal(s.clone()),
+            super::ir::LitValue::Str(s) => PgParam::Text(s.clone()),
+        }
+    }
 }
 
 // ============================================================================
@@ -205,10 +239,15 @@ async fn stream_pg_rows_inner(
         .await
         .map_err(|e| SofError::Storage(format!("failed to acquire Postgres connection: {e}")))?;
 
-    let stmt = client
-        .prepare(&sql)
-        .await
-        .map_err(|e| SofError::Backend(format!("failed to prepare SQL: {e}")))?;
+    if std::env::var("PG_SOF_DEBUG_ALL").is_ok() {
+        eprintln!("[PG_SOF_DEBUG_ALL] preparing\n--- SQL ---\n{sql}\n---");
+    }
+    let stmt = client.prepare(&sql).await.map_err(|e| {
+        if std::env::var("PG_SOF_DEBUG").is_ok() {
+            eprintln!("[PG_SOF_DEBUG] prepare failed: {e}\n--- SQL ---\n{sql}\n---");
+        }
+        SofError::Backend(format!("failed to prepare SQL: {e}"))
+    })?;
 
     // Build boxed params for query_raw; these are 'static + Send
     let boxed: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = params
@@ -216,6 +255,19 @@ async fn stream_pg_rows_inner(
         .map(|p| -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
             match p {
                 PgParam::Text(s) => Box::new(s),
+                // Bind Bool/Int/Decimal constants as text so they compare
+                // cleanly against `->>`/`#>>` JSON-text projections without
+                // a per-call PG type-mismatch. Numeric contexts apply
+                // explicit `::numeric` casts via `lower_binop_dialect`;
+                // boolean contexts compare against `'true'`/`'false'`.
+                PgParam::Bool(b) => Box::new(if b {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }),
+                PgParam::Int(n) => Box::new(n.to_string()),
+                PgParam::Decimal(s) => Box::new(s),
+                PgParam::Null => Box::new(None::<String>),
                 PgParam::Timestamp(dt) => Box::new(dt),
             }
         })
@@ -232,7 +284,12 @@ async fn stream_pg_rows_inner(
     let raw = client
         .query_raw(&stmt, param_refs.iter().copied())
         .await
-        .map_err(|e| SofError::Backend(format!("query execution failed: {e}")))?;
+        .map_err(|e| {
+            if std::env::var("PG_SOF_DEBUG").is_ok() {
+                eprintln!("[PG_SOF_DEBUG] query failed: {e}\n--- SQL ---\n{sql}\n---");
+            }
+            SofError::Backend(format!("query execution failed: {e}"))
+        })?;
 
     // params no longer needed after query_raw returns (data sent to DB)
     drop(param_refs);
@@ -263,6 +320,9 @@ async fn stream_pg_rows_inner(
                 }
             }
             Err(e) => {
+                if std::env::var("PG_SOF_DEBUG").is_ok() {
+                    eprintln!("[PG_SOF_DEBUG] row error: {e}\n--- SQL ---\n{sql}\n---");
+                }
                 let _ = tx
                     .send(Err(SofError::Backend(format!("row error: {e}"))))
                     .await;

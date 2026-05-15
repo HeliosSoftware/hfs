@@ -101,6 +101,12 @@ jsonpath-rust = "0.7"
 # Regex for pattern matching in tests
 regex = "1"
 
+# Postgres conformance test (gated via #[ignore] + PG_CONFORMANCE env var).
+# Brings up a PostgreSQL container locally — same versions used by
+# `helios-persistence`'s integration tests for binary-version parity.
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+
 [package.metadata.docs.rs]
 features = ["R4", "sqlite"]
 rustdoc-args = ["--cfg", "docsrs"]

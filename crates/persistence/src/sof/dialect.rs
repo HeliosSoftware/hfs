@@ -62,6 +62,18 @@ pub trait Dialect: Send + Sync {
 
     /// Predicate testing whether `expr` has the given JSON type.
     fn has_json_type(&self, expr: &str, ty: JsonType) -> String;
+
+    /// Boolean coercion at the WHERE-clause boundary — represents FHIRPath's
+    /// three-valued-logic rule that an empty / NULL operand filters the row
+    /// out. The expression `expr` may be a text projection (PG `->>`), a JSON
+    /// value (PG `->`), or a SQLite JSON1 extracted scalar; the dialect picks
+    /// an appropriate form.
+    fn truthy_predicate(&self, expr: &str) -> String;
+
+    /// Substring of `s` after the last `/` — used by `getReferenceKey()` to
+    /// extract the id portion of a FHIR `Reference.reference` like
+    /// `Patient/123` (or `http://server/path/Patient/123`).
+    fn last_path_segment(&self, s: &str) -> String;
 }
 
 // ============================================================================
@@ -118,7 +130,11 @@ impl Dialect for PgDialect {
     }
 
     fn json_agg(&self, expr: &str) -> String {
-        format!("jsonb_agg({expr})")
+        // PG's `jsonb_agg` returns NULL for empty input; coalesce to `[]`
+        // so `collection: true` columns always project an array (matching
+        // SQLite's `json_group_array`, which already returns `[]` for the
+        // empty case).
+        format!("coalesce(jsonb_agg({expr}), '[]'::jsonb)")
     }
 
     fn string_agg(&self, expr: &str, sep_param: &str) -> String {
@@ -140,9 +156,27 @@ impl Dialect for PgDialect {
     fn cast(&self, inner: &str, ty: SqlType) -> String {
         match ty {
             SqlType::Text => format!("({inner})::text"),
-            SqlType::Integer => format!("({inner})::bigint"),
-            SqlType::Decimal => format!("({inner})::numeric"),
-            SqlType::Boolean => format!("({inner})::boolean"),
+            // Numeric column projections wrap with an outer `::text` so the
+            // PG row mapper (which reads each column as `Option<String>` to
+            // stay type-agnostic) can decode the value. Round-tripping
+            // through numeric first preserves canonical formatting (`1.0`
+            // stays `1.0`, not `1`); the runner then JSON-parses the text
+            // back to a number.
+            SqlType::Integer => format!("(({inner})::bigint)::text"),
+            SqlType::Decimal => format!("(({inner})::numeric)::text"),
+            // Column projections want JSON-parsable text: literal `'true'` /
+            // `'false'` deserialise as JSON booleans in the row mapper. The
+            // input may be either a JSON `->>` text projection (`'true'` /
+            // `'false'` / NULL) or a native boolean expression (e.g. a
+            // comparison `(a = b)` projected through `type: boolean`); both
+            // shapes cast cleanly via `::boolean` and route through `IS
+            // TRUE` / `IS FALSE` to give the right text literal back.
+            SqlType::Boolean => {
+                format!(
+                    "CASE WHEN ({inner})::boolean IS TRUE THEN 'true' \
+                     WHEN ({inner})::boolean IS FALSE THEN 'false' END"
+                )
+            }
             SqlType::Json => format!("({inner})::jsonb"),
         }
     }
@@ -157,6 +191,18 @@ impl Dialect for PgDialect {
             JsonType::Null => "null",
         };
         format!("jsonb_typeof({expr}) = '{name}'")
+    }
+
+    fn truthy_predicate(&self, expr: &str) -> String {
+        // Already-boolean SQL fragments (e.g. `x IS NOT NULL`) cast back to
+        // boolean cheaply; text JSON projections (`r.data->>'active'`)
+        // require an explicit `::boolean` cast since `IS TRUE` is strict.
+        format!("({expr})::boolean IS TRUE")
+    }
+
+    fn last_path_segment(&self, s: &str) -> String {
+        // POSIX regexp on PG: strip everything up to and including the last `/`.
+        format!("regexp_replace({s}, '.*/', '')")
     }
 }
 
@@ -189,7 +235,21 @@ impl Dialect for SqliteDialect {
     }
 
     fn json_path(&self, base: &str, segments: &[&str]) -> String {
-        format!("json_extract({base}, '$.{}')", segments.join("."))
+        // SQLite JSON1 paths use `[N]` for array indices and `.field` for
+        // object members. Numeric-only segments are array indices and must
+        // not be preceded by a dot.
+        let mut path = String::from("$");
+        for seg in segments {
+            if seg.chars().all(|c| c.is_ascii_digit()) {
+                path.push('[');
+                path.push_str(seg);
+                path.push(']');
+            } else {
+                path.push('.');
+                path.push_str(seg);
+            }
+        }
+        format!("json_extract({base}, '{path}')")
     }
 
     fn json_path_text(&self, base: &str, segments: &[&str]) -> String {
@@ -233,7 +293,12 @@ impl Dialect for SqliteDialect {
             SqlType::Text => format!("CAST({inner} AS TEXT)"),
             SqlType::Integer => format!("CAST({inner} AS INTEGER)"),
             SqlType::Decimal => format!("CAST({inner} AS REAL)"),
-            SqlType::Boolean => format!("CAST({inner} AS INTEGER)"),
+            // Boolean column projections — emit `'true'`/`'false'` text so the
+            // runner's row mapper deserializes them as JSON booleans rather
+            // than the JSON-number 1/0 it would get from CAST AS INTEGER.
+            SqlType::Boolean => {
+                format!("CASE WHEN ({inner}) THEN 'true' WHEN NOT ({inner}) THEN 'false' END")
+            }
             SqlType::Json => format!("json({inner})"),
         }
     }
@@ -248,6 +313,21 @@ impl Dialect for SqliteDialect {
             JsonType::Null => "null",
         };
         format!("json_type({expr}) = '{name}'")
+    }
+
+    fn truthy_predicate(&self, expr: &str) -> String {
+        // `json_extract` returns the JSON value's native SQLite type:
+        // JSON booleans → integer 1/0, numbers → integer/real, strings → text.
+        // Truthy is: non-NULL AND not zero/false. The explicit text-equality
+        // check covers literal `'true'`/`'false'` text values just in case.
+        format!("({expr}) IS NOT NULL AND ({expr}) != 0 AND ({expr}) != 'false'")
+    }
+
+    fn last_path_segment(&self, s: &str) -> String {
+        // Calls the `fhir_last_segment` scalar UDF registered on every
+        // pooled SQLite connection by the backend's connection initialiser
+        // (see `crates/persistence/src/sof/sqlite_udfs.rs`).
+        format!("fhir_last_segment({s})")
     }
 }
 

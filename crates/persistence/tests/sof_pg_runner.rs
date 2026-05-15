@@ -20,7 +20,7 @@ mod sof_pg_runner_tests {
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
     use helios_persistence::core::ResourceStorage;
-    use helios_persistence::core::sof_runner::{SofError, SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -372,40 +372,34 @@ mod sof_pg_runner_tests {
     }
 
     // =========================================================================
-    // 5. Uncompilable ViewDefinitions are rejected correctly
+    // 5. FHIRPath expressions previously rejected by the in-DB runner that
+    //    the new IR-based pipeline now compiles to SQL.
     // =========================================================================
 
-    async fn expect_uncompilable(runner: &dyn SofRunner, view: Value) {
+    #[tokio::test]
+    async fn test_pg_compiles_bare_boolean_where() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
         let tenant = test_tenant();
-        let result = runner.run_view(&tenant, view, ViewFilters::default()).await;
-        match result {
-            Err(SofError::Uncompilable { .. }) | Err(SofError::InvalidViewDefinition(_)) => {}
-            Ok(_) => panic!("expected Uncompilable or InvalidViewDefinition, got Ok"),
-            Err(e) => panic!("expected Uncompilable or InvalidViewDefinition, got Err({e})"),
-        }
-    }
 
-    #[tokio::test]
-    async fn test_pg_rejects_union_all() {
-        let backend = create_backend().await;
-        let runner = backend.sof_runner().expect("must have runner");
-
-        let view = json!({
-            "resourceType": "ViewDefinition",
-            "resource": "Patient",
-            "status": "active",
-            "select": [{"unionAll": [
-                {"column": [{"path": "id", "name": "id"}]},
-                {"column": [{"path": "id", "name": "id"}]}
-            ]}]
-        });
-        expect_uncompilable(runner.as_ref(), view).await;
-    }
-
-    #[tokio::test]
-    async fn test_pg_rejects_where_clause() {
-        let backend = create_backend().await;
-        let runner = backend.sof_runner().expect("must have runner");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p-active", "active": true}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed active");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p-inactive", "active": false}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed inactive");
 
         let view = json!({
             "resourceType": "ViewDefinition",
@@ -414,13 +408,34 @@ mod sof_pg_runner_tests {
             "where": [{"path": "active"}],
             "select": [{"column": [{"path": "id", "name": "id"}]}]
         });
-        expect_uncompilable(runner.as_ref(), view).await;
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1, "only active=true patient should match");
     }
 
     #[tokio::test]
-    async fn test_pg_rejects_function_call_in_path() {
+    async fn test_pg_compiles_exists_function_in_path() {
         let backend = create_backend().await;
         let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "X"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed p1");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p2"}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed p2");
 
         let view = json!({
             "resourceType": "ViewDefinition",
@@ -428,6 +443,7 @@ mod sof_pg_runner_tests {
             "status": "active",
             "select": [{"column": [{"path": "name.exists()", "name": "has_name"}]}]
         });
-        expect_uncompilable(runner.as_ref(), view).await;
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 2);
     }
 }

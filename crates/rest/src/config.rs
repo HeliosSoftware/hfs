@@ -348,13 +348,10 @@ pub struct ServerConfig {
     pub elasticsearch_password: Option<String>,
 
     /// Enable SQL-on-FHIR operations ($viewdefinition-run, $viewdefinition-export).
+    /// When enabled, the configured storage backend MUST provide an in-DB
+    /// SOF runner (sqlite or postgres) — there is no in-process fallback.
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
     pub sof_enabled: bool,
-
-    /// Default runner for $viewdefinition-run: "auto" (prefer in-DB, fall back to in-process),
-    /// "inprocess" (always use in-process FHIRPath evaluation).
-    #[arg(long, env = "HFS_SOF_DEFAULT_RUNNER", default_value = "auto")]
-    pub sof_default_runner: String,
 
     /// Export sink type: "fs" (default, local filesystem) or "s3" (AWS S3).
     #[arg(long, env = "HFS_EXPORT_SINK", default_value = "fs")]
@@ -450,7 +447,6 @@ impl Default for ServerConfig {
             elasticsearch_username: None,
             elasticsearch_password: None,
             sof_enabled: true,
-            sof_default_runner: "auto".to_string(),
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
@@ -554,7 +550,6 @@ impl ServerConfig {
             elasticsearch_username: None,
             elasticsearch_password: None,
             sof_enabled: true,
-            sof_default_runner: "auto".to_string(),
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,

@@ -1,56 +1,142 @@
-//! SQL-on-FHIR v2 official conformance test suite (in-DB runner).
+//! SQL-on-FHIR v2 official conformance test suite — PostgreSQL in-DB runner.
 //!
-//! Runs every test case in `crates/sof/tests/sql-on-fhir-v2/tests/*.json`
-//! against the SQLite in-DB SOF runner via the public HTTP endpoint, and
-//! reports all failures at the end. A test case is considered passing if:
+//! Mirrors `sof_conformance.rs` (which targets SQLite) but wires the
+//! HTTP server's storage backend to a PostgreSQL container via
+//! `testcontainers`. Same fixture set (`crates/sof/tests/sql-on-fhir-v2/tests/`),
+//! same comparator, same regression-floor pattern.
 //!
-//! - `expectError: true`  → the endpoint returns a non-2xx status code.
-//! - `expect: [...]`       → the returned NDJSON rows match the expected rows
-//!                           (order-insensitive, only checking expected keys).
-//!
-//! Tests outside the in-DB runner's compilation coverage are skipped via the
-//! `KNOWN_SKIPS` table with a reason. Skipped tests are counted but do not
-//! cause the suite to fail.
-//!
-//! ## Skips
-//!
-//! Some test cases exercise FHIRPath functions that are not yet implemented in
-//! `helios-fhirpath`.  Those are listed in `SKIP_TEST_TITLES` together with the
-//! reason for the skip.  Skipped tests are counted but do NOT cause the suite to
-//! fail.
-//!
-//! ## CI
-//!
-//! The test does not require Docker.  It uses an in-memory SQLite backend, so
-//! it runs on every PR automatically.
+//! Requires Docker (testcontainers spins up a real PostgreSQL instance).
+//! Matches the gating used by `crates/persistence/tests/sof_pg_runner.rs`
+//! and the other testcontainers-backed integration tests in this repo —
+//! bare `#[tokio::test]`, no `#[ignore]`, no env-var opt-in. CI's
+//! self-hosted runner has Docker available; the per-run container label
+//! (`github.run_id`) lets the workflow's cleanup job reap it.
 
-mod sof_conformance_tests {
+#![cfg(feature = "postgres")]
+
+mod sof_conformance_postgres_tests {
     use axum::http::{HeaderName, HeaderValue};
     use axum_test::TestServer;
     use helios_fhir::FhirVersion;
-    use helios_persistence::backends::sqlite::SqliteBackend;
+    use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+    use tokio::sync::OnceCell;
 
     const X_TENANT_ID: HeaderName = HeaderName::from_static("x-tenant-id");
 
     // =========================================================================
-    // Known-skip list
-    //
-    // Format: ("fixture_title::test_title", "reason")
+    // Shared container setup — single PG container for the whole suite,
+    // mirroring `crates/persistence/tests/sof_pg_runner.rs`. Each conformance
+    // fixture runs under a unique tenant id inside the same database so the
+    // container starts up once.
     // =========================================================================
 
-    /// Test cases that are intentionally skipped because they require FHIRPath
-    /// functions or features not yet implemented in `helios-fhirpath`.
-    ///
-    /// Each entry is a `(fixture_title::test_title, reason)` pair.  The test
-    /// will be counted as "skipped" rather than "failed".
+    struct SharedPg {
+        host: String,
+        port: u16,
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
+
+    async fn shared_pg() -> &'static SharedPg {
+        SHARED_PG
+            .get_or_init(|| async {
+                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                let container = Postgres::default()
+                    .with_label("github.run_id", &run_id)
+                    .start()
+                    .await
+                    .expect("failed to start PostgreSQL container");
+
+                let port = container
+                    .get_host_port_ipv4(5432)
+                    .await
+                    .expect("failed to get host port");
+
+                let host = container
+                    .get_host()
+                    .await
+                    .expect("failed to get host")
+                    .to_string();
+
+                // `data_dir` points at the workspace `data/` directory so the
+                // backend can load search-parameter definitions for the active
+                // FHIR version.
+                let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("data"))
+                    .unwrap_or_else(|| PathBuf::from("data"));
+
+                let config = PostgresConfig {
+                    host: host.clone(),
+                    port,
+                    dbname: "postgres".to_string(),
+                    user: "postgres".to_string(),
+                    password: Some("postgres".to_string()),
+                    max_connections: 5,
+                    data_dir: Some(data_dir),
+                    ..Default::default()
+                };
+
+                let backend = PostgresBackend::new(config)
+                    .await
+                    .expect("failed to create PostgresBackend");
+
+                backend
+                    .init_schema()
+                    .await
+                    .expect("failed to initialize schema");
+
+                SharedPg {
+                    host,
+                    port,
+                    _container: container,
+                }
+            })
+            .await
+    }
+
+    async fn create_backend() -> Arc<PostgresBackend> {
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 5,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        Arc::new(
+            PostgresBackend::new(config)
+                .await
+                .expect("failed to create PostgresBackend"),
+        )
+    }
+
+    // =========================================================================
+    // Known-skip list — same set as the SQLite suite (the IR is dialect-
+    // independent so anything skipped on SQLite is also skipped on PG).
+    // =========================================================================
+
     const KNOWN_SKIPS: &[(&str, &str)] = &[
-        // `%rowIndex` pseudo-constant is not implemented.
         (
             "row_index::%rowIndex at top level",
             "%rowIndex not implemented",
@@ -90,7 +176,7 @@ mod sof_conformance_tests {
     ];
 
     // =========================================================================
-    // Fixture loading
+    // Fixture loading (identical to sof_conformance.rs)
     // =========================================================================
 
     #[derive(Debug)]
@@ -109,15 +195,12 @@ mod sof_conformance_tests {
     }
 
     fn load_fixtures() -> Vec<Fixture> {
-        // Single canonical fixture set — `crates/sof/tests/sql-on-fhir-v2/tests/`.
         let dir = std::path::Path::new("../sof/tests/sql-on-fhir-v2/tests");
         assert!(
             dir.exists(),
             "conformance fixture directory not found: {}",
             dir.display()
         );
-
-        let mut fixtures = Vec::new();
         let mut paths: Vec<_> = std::fs::read_dir(dir)
             .expect("failed to read conformance dir")
             .filter_map(|e| e.ok())
@@ -126,92 +209,74 @@ mod sof_conformance_tests {
             .collect();
         paths.sort();
 
+        let mut fixtures = Vec::new();
         for path in paths {
             let content = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
             let json: Value = serde_json::from_str(&content)
                 .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
-
             let title = json["title"].as_str().unwrap_or("unknown").to_string();
             let resources: Vec<Value> = json["resources"].as_array().cloned().unwrap_or_default();
-
             let tests = json["tests"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
-                .map(|t| {
-                    let test_title = t["title"].as_str().unwrap_or("unnamed").to_string();
-                    let expect_error = t["expectError"].as_bool().unwrap_or(false);
-                    let expect = t.get("expect").and_then(|e| e.as_array()).cloned();
-                    let view = t["view"].clone();
-                    TestCase {
-                        title: test_title,
-                        view,
-                        expect,
-                        expect_error,
-                    }
+                .map(|t| TestCase {
+                    title: t["title"].as_str().unwrap_or("unnamed").to_string(),
+                    view: t["view"].clone(),
+                    expect: t.get("expect").and_then(|e| e.as_array()).cloned(),
+                    expect_error: t["expectError"].as_bool().unwrap_or(false),
                 })
                 .collect();
-
             fixtures.push(Fixture {
                 title,
                 resources,
                 tests,
             });
         }
-
         fixtures
     }
 
     // =========================================================================
-    // Test infrastructure
+    // Per-fixture HTTP server. Each fixture seeds its own resources under a
+    // unique tenant so the shared container can host the whole suite without
+    // cross-fixture bleed.
     // =========================================================================
 
-    fn test_tenant() -> TenantContext {
-        TenantContext::new(
-            TenantId::new("test-tenant"),
-            TenantPermissions::full_access(),
-        )
+    fn unique_tenant() -> (TenantContext, String) {
+        let id = format!("sof_pg_conf_{}", uuid::Uuid::new_v4().simple());
+        let tenant = TenantContext::new(TenantId::new(&id), TenantPermissions::full_access());
+        (tenant, id)
     }
 
-    async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
-        let backend = SqliteBackend::with_config(":memory:", Default::default())
-            .expect("failed to create SQLite backend");
-        backend.init_schema().expect("failed to init schema");
-        let backend = Arc::new(backend);
-
+    async fn create_test_server(backend: Arc<PostgresBackend>) -> TestServer {
         let runner = backend
             .sof_runner()
-            .expect("SqliteBackend must provide an in-DB SOF runner");
-
+            .expect("PostgresBackend must provide an in-DB SOF runner");
         let config = ServerConfig::for_testing();
         let state =
             helios_rest::AppState::new(Arc::clone(&backend), config).with_sof_runner(runner);
         let app = helios_rest::routing::fhir_routes::create_routes(state);
-        let server = TestServer::new(app).expect("failed to create test server");
-
-        (server, backend)
+        TestServer::new(app).expect("failed to create test server")
     }
 
-    async fn seed_resources(backend: &SqliteBackend, resources: &[Value]) {
-        let tenant = test_tenant();
+    async fn seed_resources(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        resources: &[Value],
+    ) {
         for resource in resources {
             let rt = match resource["resourceType"].as_str() {
                 Some(t) => t,
-                None => continue, // skip resources without a type
+                None => continue,
             };
-            let id = resource["id"].as_str().unwrap_or("unknown");
-            // Some fixtures have no `id` — skip those safely
-            let _ = id;
             backend
-                .create(&tenant, rt, resource.clone(), FhirVersion::R4)
+                .create(tenant, rt, resource.clone(), FhirVersion::R4)
                 .await
-                .ok(); // ignore duplicate-key errors if any
+                .ok();
         }
     }
 
-    /// Normalises a view from the fixture into a proper ViewDefinition body.
-    /// Adds `resourceType: "ViewDefinition"` if absent.
     fn normalise_view(view: &Value) -> Value {
         let mut v = view.clone();
         if let Value::Object(ref mut map) = v {
@@ -221,7 +286,6 @@ mod sof_conformance_tests {
         v
     }
 
-    /// Parse an NDJSON response body into a sorted list of row objects.
     fn parse_ndjson(body: &str) -> Vec<BTreeMap<String, Value>> {
         body.lines()
             .filter(|l| !l.trim().is_empty())
@@ -239,8 +303,6 @@ mod sof_conformance_tests {
             .collect()
     }
 
-    /// Returns true if `actual` contains all the key-value pairs in `expected`.
-    /// Extra keys in `actual` are tolerated (the spec only checks listed columns).
     fn row_matches_expected(actual: &BTreeMap<String, Value>, expected: &Value) -> bool {
         let expected_obj = match expected.as_object() {
             Some(o) => o,
@@ -254,7 +316,6 @@ mod sof_conformance_tests {
                     }
                 }
                 None => {
-                    // Missing key in actual — only fail if expected value is not null
                     if !ev.is_null() {
                         return false;
                     }
@@ -264,11 +325,6 @@ mod sof_conformance_tests {
         true
     }
 
-    /// Loose equality: null ≈ missing, numbers compared as f64, and a number
-    /// is considered equal to its string form (the SQLite runner's row
-    /// mapper auto-parses numeric-looking text as JSON numbers, so a column
-    /// declared as `id`/`string` containing the literal `"1"` shows up as
-    /// `Number(1)` in the response).
     fn values_equal(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Null, Value::Null) => true,
@@ -288,8 +344,6 @@ mod sof_conformance_tests {
         }
     }
 
-    /// Checks that for every `expected` row there is a matching `actual` row
-    /// (order-insensitive).  Returns a mismatch message or `None` on success.
     fn compare_rows(actual: &[BTreeMap<String, Value>], expected: &[Value]) -> Option<String> {
         if actual.len() != expected.len() {
             return Some(format!(
@@ -316,8 +370,9 @@ mod sof_conformance_tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_sof_v2_conformance_in_db_sqlite() {
+    async fn test_sof_v2_conformance_in_db_postgres() {
         let fixtures = load_fixtures();
+        let backend = create_backend().await;
 
         let mut passed = 0usize;
         let mut failed = 0usize;
@@ -325,13 +380,13 @@ mod sof_conformance_tests {
         let mut failure_msgs: Vec<String> = Vec::new();
 
         for fixture in &fixtures {
-            let (server, backend) = create_test_server().await;
-            seed_resources(&backend, &fixture.resources).await;
+            let (tenant, tenant_id) = unique_tenant();
+            seed_resources(&backend, &tenant, &fixture.resources).await;
+            let server = create_test_server(Arc::clone(&backend)).await;
 
             for test in &fixture.tests {
                 let key = format!("{}::{}", fixture.title, test.title);
 
-                // Check skip list
                 if let Some((_, reason)) = KNOWN_SKIPS.iter().find(|(k, _)| *k == key.as_str()) {
                     skipped += 1;
                     eprintln!("  SKIP  {key} — {reason}");
@@ -339,10 +394,9 @@ mod sof_conformance_tests {
                 }
 
                 let view_body = normalise_view(&test.view);
-
                 let resp = server
                     .post("/ViewDefinition/$viewdefinition-run")
-                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(X_TENANT_ID, HeaderValue::from_str(&tenant_id).unwrap())
                     .add_header(
                         axum::http::HeaderName::from_static("content-type"),
                         HeaderValue::from_static("application/fhir+json"),
@@ -373,7 +427,6 @@ mod sof_conformance_tests {
                     continue;
                 }
 
-                // Compare rows
                 let body = resp.text();
                 let actual = parse_ndjson(&body);
 
@@ -393,25 +446,25 @@ mod sof_conformance_tests {
                         }
                     }
                 } else {
-                    // No `expect` assertion — just verify it didn't error
                     eprintln!("  PASS  {key} (no assertion)");
                     passed += 1;
                 }
             }
         }
 
-        eprintln!("\nSoF v2 conformance: {passed} passed, {failed} failed, {skipped} skipped");
+        eprintln!(
+            "\nSoF v2 conformance (PostgreSQL): {passed} passed, {failed} failed, {skipped} skipped"
+        );
 
-        // Regression floor — the in-DB compiler currently passes this many
-        // upstream conformance fixtures. Lowering this number means the
-        // compiler regressed; raising it (after expanding compiler coverage)
-        // means more of the spec is now in-DB-compilable. This is intentionally
-        // a one-way ratchet so unrelated changes that lose coverage get
-        // caught in CI.
-        const PASS_FLOOR: usize = 125;
+        // Regression floor — mirrors the SQLite ratchet at
+        // `sof_conformance.rs`. The full SoF v2 corpus passes against
+        // PostgreSQL; lowering this requires the same justification as the
+        // SQLite floor (a fixture genuinely outside the in-DB runner's
+        // coverage, listed in `KNOWN_SKIPS` with a reason).
+        const PG_PASS_FLOOR: usize = 125;
         assert!(
-            passed >= PASS_FLOOR,
-            "regression: only {passed} fixtures pass (floor: {PASS_FLOOR}). \
+            passed >= PG_PASS_FLOOR,
+            "regression: only {passed} fixtures pass (floor: {PG_PASS_FLOOR}). \
              Failures:\n  {}",
             failure_msgs.join("\n  "),
         );

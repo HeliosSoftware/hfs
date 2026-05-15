@@ -88,6 +88,97 @@ pub enum SqlExpr {
     /// Names an inner expression for reuse (lowered as a CTE column reference
     /// when the same scalar appears in multiple projections).
     Alias { name: String, inner: Box<SqlExpr> },
+
+    /// Extracts the id portion of a `Reference.reference` string. When
+    /// `expected_type` is supplied, returns NULL unless the reference's type
+    /// segment matches (e.g. `getReferenceKey(Patient)` over `Observation/123`
+    /// returns NULL).
+    ReferenceKey {
+        reference: Box<SqlExpr>,
+        expected_type: Option<String>,
+    },
+
+    /// FHIRPath `lowBoundary()` / `highBoundary()` — emits a precision-driven
+    /// CASE expression over the source's text form (decimal expands by a
+    /// half-step in the last digit; date/dateTime/time pad with the first or
+    /// last instant of the largest unspecified unit). The expected
+    /// `column.type` is supplied so the dialect can pick decimal vs.
+    /// date/dateTime/time logic.
+    Boundary {
+        side: BoundarySide,
+        kind: BoundaryKind,
+        source: Box<SqlExpr>,
+    },
+
+    /// FHIRPath `<focus>.where(<crit>).exists()` — lowers to an `EXISTS`
+    /// subquery that iterates the focus collection (a lateral unnest of a
+    /// JSON path) and tests `crit` against each element. The criterion is
+    /// pre-lowered with `iter_alias.value` set as its path root.
+    WhereExists {
+        focus: Box<SqlExpr>,
+        iter_alias: String,
+        predicate: Box<SqlExpr>,
+        /// Mirrors `where(crit).empty()` — negate the EXISTS.
+        negate: bool,
+    },
+
+    /// FHIRPath `<focus>.where(<crit>).<navigation>` collapsed to a scalar
+    /// subquery: iterate the focus collection, filter by the criterion,
+    /// project the navigation off the iteration alias, return at most one
+    /// row. Used when a column's path threads a `where()` call somewhere in
+    /// the middle (e.g. `name.where(use='official').family`).
+    WhereScalar {
+        focus: Box<SqlExpr>,
+        iter_alias: String,
+        predicate: Box<SqlExpr>,
+        projection: Box<SqlExpr>,
+    },
+
+    /// FHIRPath `<base>.<field>.join(<sep>)` — aggregates the values of
+    /// `<field>` across each element of `<base>` (flattened) into a single
+    /// separator-joined string. Lowers to `string_agg` (PG) /
+    /// `group_concat` (SQLite) over a chained lateral unnest.
+    JoinAggregate {
+        outer_focus: Box<SqlExpr>,
+        outer_alias: String,
+        inner_field: String,
+        inner_alias: String,
+        separator: String,
+    },
+
+    /// `column.collection: true` projection — aggregates the flattened
+    /// values of a JSON path into a JSON array. Each `Field` step in `path`
+    /// becomes a lateral unnest; the final element values feed into a
+    /// `json_agg` / `json_group_array`.
+    CollectionAgg { root: String, path: JsonPath },
+
+    /// Correlated scalar subquery used for `forEach: "<chain>[N]"` paths —
+    /// FHIRPath indexes the FLATTENED iteration result, but SQLite forbids
+    /// correlated subqueries in `FROM`. Lowering each column to a
+    /// scalar-subquery in the SELECT side bypasses that limitation:
+    ///
+    /// `(SELECT <projection> FROM <chain_sql> LIMIT 1 OFFSET <offset>)`.
+    ScalarFromChain {
+        chain_sql: String,
+        projection: Box<SqlExpr>,
+        offset: i64,
+    },
+}
+
+/// Selects between `lowBoundary()` and `highBoundary()` semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundarySide {
+    Low,
+    High,
+}
+
+/// Source value type for [`SqlExpr::Boundary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryKind {
+    Decimal,
+    Date,
+    DateTime,
+    Time,
 }
 
 /// Literal scalar value embedded directly in SQL.
@@ -226,11 +317,19 @@ pub enum PlanNode {
 
     /// Lateral unnest of a JSON-array source. `out_alias` names the iteration
     /// row; `left_join` distinguishes `forEach` from `forEachOrNull`.
+    /// `on_filter`, if set, is appended to the JOIN ON clause and lets a
+    /// trailing `where(crit)` on the forEach path filter rows in-place
+    /// (preserving LEFT JOIN semantics for `forEachOrNull`). `flat_index`,
+    /// if set, restricts the unnest to the Nth element of the flattened
+    /// collection (FHIRPath `name[0]` style indexing applied to the result
+    /// of an array-flattening navigation).
     LateralUnnest {
         parent: Box<PlanNode>,
         source: SqlExpr,
         out_alias: String,
         left_join: bool,
+        on_filter: Option<SqlExpr>,
+        flat_index: Option<i64>,
     },
 
     /// `WHERE` filter applied to `parent`. Multiple `Filter` nodes compose

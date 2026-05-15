@@ -119,10 +119,9 @@ impl<S: ResourceStorage> AppState<S> {
         self
     }
 
-    /// Returns the SQL-on-FHIR runner, if one has been configured.
-    ///
-    /// Handlers that need to run views should call this and fall back to creating an
-    /// `InProcessRunner` if `None` is returned.
+    /// Returns the SQL-on-FHIR runner, if one has been configured. The
+    /// `$viewdefinition-run` handler returns `501 Not Implemented` when this
+    /// is `None` — there is no in-process fallback.
     pub fn sof_runner(&self) -> Option<&Arc<dyn SofRunner>> {
         self.sof_runner.as_ref()
     }

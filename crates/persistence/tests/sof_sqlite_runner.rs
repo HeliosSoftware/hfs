@@ -12,7 +12,7 @@ mod sqlite_runner_tests {
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::sqlite::SqliteBackend;
     use helios_persistence::core::ResourceStorage;
-    use helios_persistence::core::sof_runner::{SofError, SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -261,23 +261,35 @@ mod sqlite_runner_tests {
     }
 
     // =========================================================================
-    // 3. Uncompilable ViewDefinitions are rejected correctly
+    // 3. FHIRPath expressions previously rejected by the in-DB runner that
+    //    the new IR-based pipeline now compiles to SQL.
     // =========================================================================
 
-    async fn expect_uncompilable(runner: &dyn SofRunner, view: Value) {
-        let tenant = test_tenant();
-        let result = runner.run_view(&tenant, view, ViewFilters::default()).await;
-        match result {
-            Err(SofError::Uncompilable { .. }) | Err(SofError::InvalidViewDefinition(_)) => {}
-            Ok(_) => panic!("expected Uncompilable or InvalidViewDefinition, got Ok"),
-            Err(e) => panic!("expected Uncompilable or InvalidViewDefinition, got Err({e})"),
-        }
-    }
-
     #[tokio::test]
-    async fn test_rejects_function_call_in_path() {
+    async fn test_compiles_exists_function_in_path() {
         let backend = make_backend().await;
         let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+
+        // Seed one patient with `name`, one without.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "X"}]}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed p1");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p2"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed p2");
 
         let view = json!({
             "resourceType": "ViewDefinition",
@@ -285,7 +297,8 @@ mod sqlite_runner_tests {
             "status": "active",
             "select": [{"column": [{"path": "name.exists()", "name": "has_name"}]}]
         });
-        expect_uncompilable(runner.as_ref(), view).await;
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 2);
     }
 
     #[tokio::test]
@@ -327,9 +340,29 @@ mod sqlite_runner_tests {
     }
 
     #[tokio::test]
-    async fn test_rejects_where_clause() {
+    async fn test_compiles_bare_boolean_where() {
         let backend = make_backend().await;
         let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p-active", "active": true}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed active");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p-inactive", "active": false}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed inactive");
 
         let view = json!({
             "resourceType": "ViewDefinition",
@@ -338,13 +371,521 @@ mod sqlite_runner_tests {
             "where": [{"path": "active"}],
             "select": [{"column": [{"path": "id", "name": "id"}]}]
         });
-        expect_uncompilable(runner.as_ref(), view).await;
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1, "only active=true patient should match");
     }
 
     #[tokio::test]
-    async fn test_rejects_literal_string_path() {
+    async fn test_union_all_with_sibling_root_column() {
+        // A sibling top-level column (`id`) is merged into every unionAll
+        // branch's projection. Each branch iterates a single-level array.
+        // (Path-through-array flattening — e.g. `contact.telecom` over an
+        // array-of-objects-of-arrays — needs additional lateral unnests
+        // and isn't covered until stage 4.)
         let backend = make_backend().await;
         let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p1",
+                    "telecom": [
+                        {"value": "t1", "system": "phone"},
+                        {"value": "t2", "system": "email"}
+                    ],
+                    "name": [
+                        {"family": "Doe", "given": ["John"]}
+                    ]
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed p1");
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [
+                {"column": [{"path": "id", "name": "id"}]},
+                {"unionAll": [
+                    {"forEach": "telecom", "column": [
+                        {"path": "value", "name": "v"},
+                        {"path": "system", "name": "s"}
+                    ]},
+                    {"forEach": "name", "column": [
+                        {"path": "family", "name": "v"},
+                        {"path": "use", "name": "s"}
+                    ]}
+                ]}
+            ]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        // 2 telecoms + 1 name = 3 rows; each carries the parent id.
+        assert_eq!(rows.len(), 3, "rows: {:?}", rows);
+        for row in &rows {
+            assert_eq!(row.get("id").and_then(|v| v.as_str()), Some("p1"));
+            assert!(row.get("v").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nested_select_contributes_columns() {
+        // A clause with both `column[]` and a nested `select[]` produces a
+        // single row containing the union of both column lists.
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "gender": "female"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed p1");
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "select": [{
+                "column": [{"path": "id", "name": "outer_id"}],
+                "select": [{
+                    "column": [{"path": "gender", "name": "g"}]
+                }]
+            }]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("outer_id").and_then(|v| v.as_str()), Some("p1"));
+        assert_eq!(rows[0].get("g").and_then(|v| v.as_str()), Some("female"));
+    }
+
+    #[tokio::test]
+    async fn test_foreach_flattens_array_through_array() {
+        // FHIRPath flattens through array boundaries automatically:
+        // `forEach: "contact.telecom"` over `contact[]` → each contact's
+        // `telecom[]` should produce one row per inner element.
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p1",
+                    "contact": [
+                        {"telecom": [{"value": "c1.t1"}, {"value": "c1.t2"}]},
+                        {"telecom": [{"value": "c2.t1"}]}
+                    ]
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed p1");
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "select": [
+                {"column": [{"path": "id", "name": "id"}]},
+                {"forEach": "contact.telecom", "column": [
+                    {"path": "value", "name": "tel"}
+                ]}
+            ]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        // 2 + 1 = 3 telecoms.
+        assert_eq!(rows.len(), 3, "rows: {:?}", rows);
+        let tels: Vec<_> = rows
+            .iter()
+            .map(|r| r.get("tel").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        assert!(tels.contains(&"c1.t1"));
+        assert!(tels.contains(&"c1.t2"));
+        assert!(tels.contains(&"c2.t1"));
+    }
+
+    #[tokio::test]
+    async fn test_sibling_foreach_cross_join() {
+        // Two top-level clauses each with a `forEach` produce a Cartesian
+        // product (one row per (name, address) pair).
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p1",
+                    "name": [{"family": "Doe"}, {"family": "Smith"}],
+                    "address": [{"city": "Boston"}, {"city": "Seattle"}]
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed p1");
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "select": [
+                {"forEach": "name", "column": [{"path": "family", "name": "family"}]},
+                {"forEach": "address", "column": [{"path": "city", "name": "city"}]}
+            ]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 4, "2 names × 2 addresses = 4 rows: {:?}", rows);
+    }
+
+    #[tokio::test]
+    async fn test_get_resource_key_returns_id() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed p1");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "select": [{"column": [{"path": "getResourceKey()", "name": "k"}]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("k").and_then(|v| v.as_str()), Some("p1"));
+    }
+
+    #[tokio::test]
+    async fn test_get_reference_key_extracts_id() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "subject": {"reference": "Patient/p1"}
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed o1");
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o2",
+                    "subject": {"reference": "Group/g1"}
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed o2");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{"column": [
+                {"path": "id", "name": "id"},
+                {"path": "subject.getReferenceKey()", "name": "any_key"},
+                {"path": "subject.getReferenceKey(Patient)", "name": "patient_key"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 2);
+        let by_id: std::collections::HashMap<&str, &std::collections::BTreeMap<String, Value>> =
+            rows.iter()
+                .map(|r| (r.get("id").unwrap().as_str().unwrap(), r))
+                .collect();
+        // any_key returns the id portion regardless of reference type
+        assert_eq!(
+            by_id["o1"].get("any_key").and_then(|v| v.as_str()),
+            Some("p1")
+        );
+        assert_eq!(
+            by_id["o2"].get("any_key").and_then(|v| v.as_str()),
+            Some("g1")
+        );
+        // patient_key returns only when the reference type matches
+        assert_eq!(
+            by_id["o1"].get("patient_key").and_then(|v| v.as_str()),
+            Some("p1")
+        );
+        // Mismatched type yields NULL → key absent from the row map.
+        assert!(by_id["o2"].get("patient_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_constant_binding() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        for (id, gender) in [("p1", "male"), ("p2", "female"), ("p3", "male")] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "gender": gender}),
+                    helios_fhir::FhirVersion::R4,
+                )
+                .await
+                .expect("seed");
+        }
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "constant": [{"name": "g", "valueString": "male"}],
+            "where": [{"path": "gender = %g"}],
+            "select": [{"column": [{"path": "id", "name": "id"}]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 2, "rows: {:?}", rows);
+    }
+
+    #[tokio::test]
+    async fn test_of_type_complex_polymorphic() {
+        // `Observation.value.ofType(Quantity).value` rewrites to
+        // `valueQuantity.value`.
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "valueQuantity": {"value": 42.5, "unit": "kg"}
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed o1");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{"column": [
+                {"path": "id", "name": "id"},
+                {"path": "value.ofType(Quantity).value", "name": "v"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        // `valueQuantity.value` is a JSON number; SQLite returns it as
+        // numeric, runner preserves the type.
+        let v = rows[0].get("v").expect("v column missing");
+        assert_eq!(v.as_f64(), Some(42.5));
+    }
+
+    #[tokio::test]
+    async fn test_arithmetic_operators() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "valueRange": {"low": {"value": 2.0}, "high": {"value": 5.0}}
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed o1");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{"column": [
+                {"path": "id", "name": "id"},
+                {"path": "value.ofType(Range).low.value + value.ofType(Range).high.value", "name": "add", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("add").and_then(|v| v.as_f64()), Some(7.0));
+    }
+
+    #[tokio::test]
+    async fn test_decimal_low_high_boundary() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "valueQuantity": {"value": 1.0}
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed o1");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{"column": [
+                {"path": "id", "name": "id"},
+                {"path": "value.ofType(Quantity).value.lowBoundary()", "name": "lo", "type": "decimal"},
+                {"path": "value.ofType(Quantity).value.highBoundary()", "name": "hi", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("lo").and_then(|v| v.as_f64()), Some(0.95));
+        assert_eq!(rows[0].get("hi").and_then(|v| v.as_f64()), Some(1.05));
+    }
+
+    #[tokio::test]
+    async fn test_date_low_high_boundary() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "birthDate": "1970-06"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed p1");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "select": [{"column": [
+                {"path": "id", "name": "id"},
+                {"path": "birthDate.lowBoundary()", "name": "lo", "type": "date"},
+                {"path": "birthDate.highBoundary()", "name": "hi", "type": "date"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get("lo").and_then(|v| v.as_str()),
+            Some("1970-06-01")
+        );
+        // Calendar-aware: June has 30 days, not 31.
+        assert_eq!(
+            rows[0].get("hi").and_then(|v| v.as_str()),
+            Some("1970-06-30")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeat_walks_tree() {
+        // SoF `repeat: ["item"]` recursively descends a QuestionnaireResponse,
+        // yielding every nested item as its own row.
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "QuestionnaireResponse",
+                json!({
+                    "resourceType": "QuestionnaireResponse",
+                    "id": "qr1",
+                    "item": [
+                        {"linkId": "1", "text": "Group 1", "item": [
+                            {"linkId": "1.1", "text": "Q 1.1"},
+                            {"linkId": "1.2", "text": "Q 1.2", "item": [
+                                {"linkId": "1.2.1", "text": "Q 1.2.1"}
+                            ]}
+                        ]},
+                        {"linkId": "2", "text": "Group 2"}
+                    ]
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed qr1");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "QuestionnaireResponse",
+            "select": [
+                {"column": [{"path": "id", "name": "id"}]},
+                {"repeat": ["item"], "column": [
+                    {"path": "linkId", "name": "linkId"},
+                    {"path": "text", "name": "text"}
+                ]}
+            ]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 5, "rows: {:?}", rows);
+        // SQLite's row mapper auto-parses numeric-looking text as JSON
+        // numbers, so `linkId: "1"` lands as Number(1). Compare via
+        // string form to tolerate both shapes.
+        let link_ids: std::collections::HashSet<String> = rows
+            .iter()
+            .map(|r| {
+                let v = r.get("linkId").expect("missing linkId");
+                match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                }
+            })
+            .collect();
+        for expected in ["1", "1.1", "1.2", "1.2.1", "2"] {
+            assert!(
+                link_ids.contains(expected),
+                "missing {} in {:?}",
+                expected,
+                link_ids
+            );
+        }
+        // All rows carry the parent id from the joined `resources` table.
+        for r in &rows {
+            assert_eq!(r.get("id").and_then(|v| v.as_str()), Some("qr1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compiles_literal_string_path() {
+        // A bare string literal in column.path is a valid (if unusual)
+        // FHIRPath expression that lowers to a constant projection.
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed p1");
 
         let view = json!({
             "resourceType": "ViewDefinition",
@@ -352,6 +893,7 @@ mod sqlite_runner_tests {
             "status": "active",
             "select": [{"column": [{"path": "'constant'", "name": "x"}]}]
         });
-        expect_uncompilable(runner.as_ref(), view).await;
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
     }
 }

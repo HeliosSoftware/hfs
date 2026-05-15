@@ -19,5 +19,11 @@ pub mod ir;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite_udfs;
+
+#[cfg(feature = "sqlite")]
+pub mod inline;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;

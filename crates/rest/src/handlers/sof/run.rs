@@ -33,6 +33,8 @@ use axum::{
 use futures::StreamExt;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::{SofError, SofRunner, ViewFilters};
+use helios_persistence::sof::inline::build_inline_runner;
+use helios_persistence::tenant::TenantContext;
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -40,7 +42,6 @@ use tracing::{debug, warn};
 
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
-use crate::sof::in_process::InProcessRunner;
 use crate::state::AppState;
 
 /// Query parameters for `$viewdefinition-run`.
@@ -64,9 +65,6 @@ pub struct RunQueryParams {
     /// Include only resources modified at or after this instant (RFC 3339).
     #[serde(rename = "_since")]
     pub since: Option<String>,
-
-    /// Override runner: `inprocess` forces the in-process FHIRPath runner.
-    pub runner: Option<String>,
 
     /// Filter by patient references (comma-separated for multiple).
     pub patient: Option<String>,
@@ -255,7 +253,6 @@ fn merge_params(query: RunQueryParams, body: &BodyParams) -> RunQueryParams {
         header: body.header.clone().or(query.header),
         limit: body.limit.or(query.limit),
         since: body.since.clone().or(query.since),
-        runner: query.runner,
         patient: query.patient,
         group: query.group,
     }
@@ -396,8 +393,9 @@ where
 
 /// Resolves the SofRunner and executes the view, returning a streaming response.
 ///
-/// Handles G2 (Parquet output), G6 (auto-fallback on Uncompilable), and
-/// adds an `X-HFS-Runner` header identifying which runner produced the result.
+/// Inline `resource:` parameters are materialised into a transient in-memory
+/// SQLite backend so they flow through the same in-DB compile-to-SQL pipeline
+/// as persisted resources — there is no in-process FHIRPath fallback.
 async fn execute_view<S>(
     state: AppState<S>,
     params: RunQueryParams,
@@ -408,20 +406,28 @@ async fn execute_view<S>(
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    // Inline resources force the in-process runner — in-DB runners can only
-    // see stored data. We feed the inline resources directly into the runner
-    // and skip backend reads entirely.
     let has_inline = !body_params.inline_resources.is_empty();
 
-    let runner: Arc<dyn SofRunner> = if has_inline {
-        Arc::new(InProcessRunner::with_inline_resources(
-            state.storage_arc(),
-            state.config().default_fhir_version,
+    let (runner, effective_tenant): (Arc<dyn SofRunner>, TenantContext) = if has_inline {
+        let (r, t) = build_inline_runner(
             body_params.inline_resources.clone(),
-        ))
+            state.config().default_fhir_version,
+        )
+        .await
+        .map_err(map_sof_error_to_rest)?;
+        (r, t)
     } else {
-        resolve_runner(&state, &params)
+        let r = state
+            .sof_runner()
+            .ok_or_else(|| RestError::NotImplemented {
+                feature: "$viewdefinition-run is not available: the configured storage backend \
+                          does not provide an in-DB SOF runner"
+                    .to_string(),
+            })?
+            .clone();
+        (r, tenant.context().clone())
     };
+
     let filters = build_filters(&params, &body_params);
     let format = params.format.as_deref().unwrap_or("ndjson").to_lowercase();
     let include_header = params
@@ -432,54 +438,18 @@ where
 
     debug!(
         runner = runner.runner_name(),
-        tenant = %tenant.tenant_id(),
+        tenant = %effective_tenant.tenant_id(),
         format = %format,
         "dispatching $viewdefinition-run"
     );
 
-    // Determine whether auto-fallback is permitted (G6). Auto-fallback is
-    // disabled when we're already on the in-process runner (including the
-    // inline-resources path).
-    let is_inprocess = runner.runner_name() == "inprocess";
-    let forced_inprocess = params
-        .runner
-        .as_deref()
-        .map(|r| r.to_lowercase() == "inprocess")
-        .unwrap_or(false);
-    let can_fallback = !is_inprocess
-        && !forced_inprocess
-        && !has_inline
-        && state.config().sof_default_runner.to_lowercase() == "auto";
-
-    // For the `ndjson` format we stream rows directly into the response body
-    // (T5.3) so large views don't have to be fully buffered server-side. We
-    // need a probe call to surface synchronous Uncompilable errors with the
-    // existing fallback semantics; once we have a stream we hand it off to a
-    // background task that pumps serialized bytes into the response body.
-    let probe = runner
-        .run_view(tenant.context(), view_json.clone(), filters.clone())
-        .await;
-
-    let (stream, runner_label) = match probe {
-        Ok(s) => (s, runner.runner_name().to_string()),
-        Err(SofError::Uncompilable { reason }) if can_fallback => {
-            warn!(
-                runner = runner.runner_name(),
-                reason = %reason,
-                "in-DB runner returned Uncompilable; falling back to in-process runner"
-            );
-            let fallback: Arc<dyn SofRunner> = Arc::new(InProcessRunner::new(
-                state.storage_arc(),
-                state.config().default_fhir_version,
-            ));
-            let s = fallback
-                .run_view(tenant.context(), view_json.clone(), filters.clone())
-                .await
-                .map_err(map_sof_error_to_rest)?;
-            (s, format!("inprocess (fallback: {reason})"))
-        }
-        Err(e) => return Err(map_sof_error_to_rest(e)),
-    };
+    // Probe the runner — surfaces synchronous Uncompilable errors as 422
+    // before we start streaming bytes to the client.
+    let stream = runner
+        .run_view(&effective_tenant, view_json.clone(), filters.clone())
+        .await
+        .map_err(map_sof_error_to_rest)?;
+    let runner_label = runner.runner_name().to_string();
 
     // Streaming path for ndjson: forward rows incrementally.
     if format == "ndjson" || format == "application/x-ndjson" {
@@ -593,36 +563,6 @@ fn build_response(
         );
     }
     (status, headers, body).into_response()
-}
-
-/// Selects the SofRunner based on state and query params.
-fn resolve_runner<S: SearchProvider + Send + Sync + 'static>(
-    state: &AppState<S>,
-    params: &RunQueryParams,
-) -> Arc<dyn SofRunner> {
-    // Allow per-request override via ?runner=inprocess
-    if params
-        .runner
-        .as_deref()
-        .map(|r| r.to_lowercase() == "inprocess")
-        .unwrap_or(false)
-    {
-        return Arc::new(InProcessRunner::new(
-            state.storage_arc(),
-            state.config().default_fhir_version,
-        ));
-    }
-
-    // Use the pre-wired runner from AppState (set at startup)
-    if let Some(runner) = state.sof_runner() {
-        return Arc::clone(runner);
-    }
-
-    // Fallback: create a fresh InProcessRunner
-    Arc::new(InProcessRunner::new(
-        state.storage_arc(),
-        state.config().default_fhir_version,
-    ))
 }
 
 /// Builds `ViewFilters` from query parameters.

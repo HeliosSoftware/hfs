@@ -70,8 +70,10 @@ impl SofRunner for SqliteInDbRunner {
         let columns = compiled.columns.clone();
         let pool = self.pool.clone();
 
-        // Inject runtime filter conditions (since, patient/group)
-        let (sql, extra_params) = build_sqlite_sql(&compiled.sql, &filters);
+        // Inject runtime filter conditions (since, patient/group). The
+        // compiled query already reserves `?3..?N` for ViewDefinition
+        // constants; runtime filters allocate from the next free slot.
+        let (sql, extra_params) = build_sqlite_sql(&compiled.sql, &compiled.constants, &filters);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
 
@@ -97,19 +99,29 @@ impl SofRunner for SqliteInDbRunner {
 // ============================================================================
 
 /// Appends runtime filter conditions (`since`, `patient`) to the compiled SQL
-/// and returns the extra positional parameters needed.
+/// and returns the bound parameters that follow `tenant_id` and
+/// `resource_type` (i.e. ViewDefinition constants then runtime filter values).
 ///
 /// SQLite positional parameters are `?1`, `?2`, … The base SQL always uses
-/// `?1 = tenant_id` and `?2 = resource_type`.  Extra conditions use `?3`, `?4`, …
-fn build_sqlite_sql(base_sql: &str, filters: &ViewFilters) -> (String, Vec<String>) {
+/// `?1 = tenant_id` and `?2 = resource_type`. Constants then occupy
+/// `?3..?(2+constants.len())`; runtime filter conditions bind from the next
+/// free slot.
+fn build_sqlite_sql(
+    base_sql: &str,
+    constants: &[super::ir::LitValue],
+    filters: &ViewFilters,
+) -> (String, Vec<SqliteParam>) {
     let mut conditions: Vec<String> = Vec::new();
-    let mut extra_params: Vec<String> = Vec::new();
-    let mut next_param = 3usize;
+    let mut extra_params: Vec<SqliteParam> = constants
+        .iter()
+        .map(SqliteParam::from_lit)
+        .collect::<Vec<_>>();
+    let mut next_param = 3usize + constants.len();
 
     if let Some(since) = &filters.since {
         conditions.push(format!("r.last_updated >= ?{next_param}"));
         // Store as RFC 3339 string — SQLite datetime columns are TEXT
-        extra_params.push(since.to_rfc3339());
+        extra_params.push(SqliteParam::Text(since.to_rfc3339()));
         next_param += 1;
     }
 
@@ -123,7 +135,7 @@ fn build_sqlite_sql(base_sql: &str, filters: &ViewFilters) -> (String, Vec<Strin
                 "(json_extract(r.data,'$.subject.reference')=?{p} \
                  OR json_extract(r.data,'$.patient.reference')=?{p})"
             ));
-            extra_params.push(patient.clone());
+            extra_params.push(SqliteParam::Text(patient.clone()));
             next_param += 1;
         }
         conditions.push(format!("({})", ors.join(" OR ")));
@@ -134,7 +146,7 @@ fn build_sqlite_sql(base_sql: &str, filters: &ViewFilters) -> (String, Vec<Strin
         for group in &filters.group {
             let p = next_param;
             ors.push(format!("json_extract(r.data,'$.group.reference')=?{p}"));
-            extra_params.push(group.clone());
+            extra_params.push(SqliteParam::Text(group.clone()));
             next_param += 1;
         }
         conditions.push(format!("({})", ors.join(" OR ")));
@@ -168,6 +180,56 @@ fn inject_before_order_by(sql: &str, extra: &str) -> String {
 }
 
 // ============================================================================
+// Typed parameter — same role as `PgParam` on the PostgreSQL runner.
+// ============================================================================
+
+/// Bound-parameter value for the SQLite runner. Mirrors [`super::ir::LitValue`]
+/// plus a Text variant for runtime filter strings.
+#[derive(Clone, Debug)]
+enum SqliteParam {
+    Text(String),
+    Bool(bool),
+    Int(i64),
+    /// Decimal preserved as text — SQLite is dynamic-typed and accepts text
+    /// for numeric comparisons.
+    Decimal(String),
+    Null,
+}
+
+impl SqliteParam {
+    fn from_lit(v: &super::ir::LitValue) -> Self {
+        match v {
+            super::ir::LitValue::Null => SqliteParam::Null,
+            super::ir::LitValue::Bool(b) => SqliteParam::Bool(*b),
+            super::ir::LitValue::Int(n) => SqliteParam::Int(*n),
+            super::ir::LitValue::Decimal(s) => SqliteParam::Decimal(s.clone()),
+            super::ir::LitValue::Str(s) => SqliteParam::Text(s.clone()),
+        }
+    }
+}
+
+impl rusqlite::ToSql for SqliteParam {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::{ToSqlOutput, Value};
+        Ok(match self {
+            SqliteParam::Text(s) => ToSqlOutput::Borrowed(s.as_str().into()),
+            SqliteParam::Bool(b) => ToSqlOutput::Owned(Value::Integer(if *b { 1 } else { 0 })),
+            SqliteParam::Int(n) => ToSqlOutput::Owned(Value::Integer(*n)),
+            // Bind as REAL so SQLite's type-affinity rules let the value
+            // compare numerically against `json_extract` results (which are
+            // INTEGER/REAL for JSON numbers). Binding as TEXT puts the
+            // value in a different storage class and SQLite ranks any TEXT
+            // as greater than any numeric value, breaking `<` / `>`.
+            SqliteParam::Decimal(s) => match s.parse::<f64>() {
+                Ok(n) => ToSqlOutput::Owned(Value::Real(n)),
+                Err(_) => ToSqlOutput::Owned(Value::Text(s.clone())),
+            },
+            SqliteParam::Null => ToSqlOutput::Owned(Value::Null),
+        })
+    }
+}
+
+// ============================================================================
 // Blocking row iterator → channel
 // ============================================================================
 
@@ -177,7 +239,7 @@ fn stream_sqlite_rows(
     sql: &str,
     tenant_id: &str,
     resource_type: &str,
-    extra_params: Vec<String>,
+    extra_params: Vec<SqliteParam>,
     columns: &[String],
     limit: Option<usize>,
     tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
@@ -202,15 +264,17 @@ fn stream_sqlite_rows(
         }
     };
 
+    // Build the bound-parameter list: tenant_id, resource_type, then the
+    // typed constants + runtime filters from `extra_params`.
+    let mut all_params: Vec<SqliteParam> = Vec::with_capacity(2 + extra_params.len());
+    all_params.push(SqliteParam::Text(tenant_id.to_string()));
+    all_params.push(SqliteParam::Text(resource_type.to_string()));
+    all_params.extend(extra_params);
+
     let row_iter = {
-        match stmt.query_map(
-            rusqlite::params_from_iter(
-                std::iter::once(tenant_id.to_string())
-                    .chain(std::iter::once(resource_type.to_string()))
-                    .chain(extra_params.iter().cloned()),
-            ),
-            |row| map_sqlite_row(row, columns),
-        ) {
+        match stmt.query_map(rusqlite::params_from_iter(all_params.iter()), |row| {
+            map_sqlite_row(row, columns)
+        }) {
             Ok(iter) => iter,
             Err(e) => {
                 let _ = tx.blocking_send(Err(SofError::Backend(format!(

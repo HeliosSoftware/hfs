@@ -19,17 +19,21 @@ mod sof_run_tests {
     const CONTENT_TYPE: HeaderName = HeaderName::from_static("content-type");
 
     /// Creates an in-memory SQLite-backed test server with all FHIR routes.
-    ///
-    /// The SOF runner is not explicitly wired — `resolve_runner` in the handler
-    /// falls back to creating a fresh `InProcessRunner` per request.
+    /// Wires the SQLite in-DB SOF runner into AppState — there is no
+    /// in-process runner for the handler to fall back to.
     async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
         let backend = Arc::new(backend);
 
+        let runner = backend
+            .sof_runner()
+            .expect("SqliteBackend must provide an in-DB SOF runner");
+
         let config = ServerConfig::for_testing();
-        let state = helios_rest::AppState::new(Arc::clone(&backend), config);
+        let state =
+            helios_rest::AppState::new(Arc::clone(&backend), config).with_sof_runner(runner);
         let app = helios_rest::routing::fhir_routes::create_routes(state);
         let server = TestServer::new(app).expect("failed to create test server");
 
@@ -660,26 +664,30 @@ mod sof_run_tests {
     }
 
     // =========================================================================
-    // Fallback test — auto-fallback on Uncompilable
+    // Uncompilable view → 422 (no in-process fallback exists)
     // =========================================================================
 
-    /// When `HFS_SOF_DEFAULT_RUNNER=auto` (the default) and the in-DB runner returns
-    /// `SofError::Uncompilable`, the handler transparently retries with `InProcessRunner`
-    /// and returns HTTP 200.  The `X-HFS-Runner` header must contain `"inprocess (fallback"`.
+    /// Views the in-DB compiler can't handle return `422 Unprocessable Entity`
+    /// directly — there is no in-process FHIRPath fallback. `lowBoundary()` on
+    /// a string column is one such case (the boundary functions need the
+    /// `column.type` hint to pick decimal vs. date semantics).
     #[tokio::test]
-    async fn test_run_view_definition_auto_fallback() {
-        let (server, backend) = create_test_server_with_indb().await;
-        seed_patient(&backend, "pt-fallback-1", "FallbackFam").await;
+    async fn test_run_view_definition_uncompilable_returns_422() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-1", "Smith").await;
 
-        // A view with a `where` clause is unsupported by the in-DB runner and
-        // triggers SofError::Uncompilable, which activates the auto-fallback path.
-        let view_with_where = json!({
+        // `lowBoundary()` requires the column to declare a `type` so the
+        // compiler can pick decimal vs. date/dateTime/time semantics. Omitting
+        // it returns Uncompilable.
+        let view = json!({
             "resourceType": "ViewDefinition",
             "resource": "Patient",
             "status": "active",
-            "where": [{ "path": "active" }],
             "select": [{
-                "column": [{ "path": "id", "name": "patient_id", "type": "string" }]
+                "column": [
+                    { "path": "id", "name": "patient_id" },
+                    { "path": "birthDate.lowBoundary()", "name": "birth_low" }
+                ]
             }]
         });
 
@@ -690,71 +698,10 @@ mod sof_run_tests {
                 CONTENT_TYPE,
                 HeaderValue::from_static("application/fhir+json"),
             )
-            .json(&view_with_where)
+            .json(&view)
             .await;
 
-        // Must succeed (200), not 422
-        response.assert_status(StatusCode::OK);
-
-        // X-HFS-Runner must indicate the inprocess fallback was used
-        let runner_header = response
-            .headers()
-            .get("x-hfs-runner")
-            .expect("X-HFS-Runner header must be present")
-            .to_str()
-            .unwrap();
-        assert!(
-            runner_header.contains("inprocess (fallback"),
-            "X-HFS-Runner must contain 'inprocess (fallback', got: {runner_header}"
-        );
-
-        // The fallback runner must produce correct rows
-        let body = response.text();
-        let rows: Vec<Value> = body
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-        assert_eq!(
-            rows.len(),
-            1,
-            "fallback runner must return 1 row; got {rows:?}"
-        );
-        assert_eq!(rows[0]["patient_id"], "pt-fallback-1");
-    }
-
-    // =========================================================================
-    // Runner override
-    // =========================================================================
-
-    /// `?runner=inprocess` forces the in-process runner even when a wired runner
-    /// is present, and still returns correct results.
-    #[tokio::test]
-    async fn test_run_view_definition_inprocess_override() {
-        let (server, backend) = create_test_server().await;
-        seed_patient(&backend, "pt-ip-1", "Override").await;
-
-        let response = server
-            .post("/ViewDefinition/$viewdefinition-run?runner=inprocess")
-            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-            .add_header(
-                CONTENT_TYPE,
-                HeaderValue::from_static("application/fhir+json"),
-            )
-            .json(&patient_view_definition())
-            .await;
-
-        response.assert_status(StatusCode::OK);
-
-        let body = response.text();
-        let rows: Vec<Value> = body
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["family"], "Override");
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     // =========================================================================

@@ -147,7 +147,6 @@ pub mod handlers;
 pub mod middleware;
 pub mod responses;
 pub mod routing;
-pub mod sof;
 pub mod state;
 pub mod tenant;
 
@@ -161,7 +160,6 @@ pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
 use std::sync::Arc;
 
 use axum::Router;
-use helios_persistence::core::sof_runner::SofRunner;
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
 };
@@ -282,30 +280,25 @@ where
         auth_state.clone(),
     );
 
-    // Wire SQL-on-FHIR runner and export controller
+    // Wire SQL-on-FHIR runner and export controller. The SOF runtime path is
+    // in-DB SQL only — backends without a SOF runner can't serve
+    // `$viewdefinition-run` and the handler returns 501 if SOF is enabled
+    // without one.
     if config.sof_enabled {
-        let runner: Arc<dyn SofRunner> = {
-            // Prefer the storage's own in-DB runner (will be Some for SQLite/PG after Phase 3).
-            // Force in-process when HFS_SOF_DEFAULT_RUNNER=inprocess.
-            let force_inprocess = config.sof_default_runner.to_lowercase() == "inprocess";
-            if !force_inprocess {
-                storage_arc.sof_runner()
-            } else {
-                None
-            }
-        }
-        .unwrap_or_else(|| {
-            use crate::sof::in_process::InProcessRunner;
-            info!(
-                runner = "inprocess",
-                fhir_version = ?config.default_fhir_version,
-                "Using in-process SofRunner (no in-DB runner available)"
+        let Some(runner) = storage_arc.sof_runner() else {
+            // Hard config error — surfaced as a startup panic so misconfiguration
+            // doesn't silently disable a feature the operator asked for.
+            panic!(
+                "HFS_SOF_ENABLED=true but storage backend '{}' does not provide an in-DB SOF \
+                 runner; either disable SOF or use a backend that supports it (sqlite, postgres)",
+                storage_arc.backend_name()
             );
-            Arc::new(InProcessRunner::new(
-                Arc::clone(&storage_arc),
-                config.default_fhir_version,
-            ))
-        });
+        };
+        info!(
+            runner = runner.runner_name(),
+            fhir_version = ?config.default_fhir_version,
+            "Using in-DB SofRunner"
+        );
 
         // Keep a clone for the export controller before moving runner into state.
         let runner_for_export = Arc::clone(&runner);
