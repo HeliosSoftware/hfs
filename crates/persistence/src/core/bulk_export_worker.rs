@@ -405,11 +405,31 @@ where
                         )
                         .await
                         .map_err(LeaseError::Storage)?,
+                    None if matches!(view.level, ExportLevel::Patient)
+                        && !request.patient_refs.is_empty() =>
+                    {
+                        // Patient-level with specific patient filter: scope to
+                        // exactly the requested patients' compartments.
+                        let patient_ids: Vec<String> = request
+                            .patient_refs
+                            .iter()
+                            .map(|r| r.strip_prefix("Patient/").unwrap_or(r).to_string())
+                            .collect();
+                        self.data
+                            .fetch_patient_compartment_batch(
+                                tenant,
+                                request,
+                                resource_type,
+                                &patient_ids,
+                                cursor.as_deref(),
+                                batch_size,
+                            )
+                            .await
+                            .map_err(LeaseError::Storage)?
+                    }
                     None if matches!(view.level, ExportLevel::Patient) => {
-                        // Patient-level: export the whole patient compartment.
-                        // For simplicity, treat it like a system-level fetch of
-                        // the type (patient-scoped filtering is applied by the
-                        // provider via the request).
+                        // Patient-level without a patient filter: export all
+                        // resources of this type across the patient compartment.
                         self.data
                             .fetch_export_batch(
                                 tenant,
