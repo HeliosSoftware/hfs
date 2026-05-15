@@ -34,8 +34,10 @@ pub struct HistoryIndexEvent {
 
 /// Durable state of a bulk export job stored in S3.
 ///
-/// Written to `bulk/export/jobs/<job-id>/state.json` and updated as the job
-/// transitions through `accepted → in-progress → complete/error/cancelled`.
+/// Reserved for the Phase 2 `S3OutputStore` integration; the S3 backend is no
+/// longer a bulk-export *job-state* backend (job state lives in SQLite or
+/// PostgreSQL), so this type is currently unused.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportJobState {
     /// The original export request parameters.
