@@ -102,6 +102,8 @@ impl S3Backend {
     }
 
     /// Deletes the object at `key`. Succeeds silently if the key does not exist.
+    /// Reserved for the Phase 2 `S3OutputStore` integration.
+    #[allow(dead_code)]
     pub(crate) async fn delete_object(&self, bucket: &str, key: &str) -> StorageResult<()> {
         self.client
             .delete_object(bucket, key)
