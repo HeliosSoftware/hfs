@@ -382,35 +382,28 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         // full closure is built once at end-of-CLI via
         // `migrate_concept_closure_pg` (called from main.rs). Mirrors the
         // SQLite post-commit closure rebuild.
-        //
-        // A URL may map to multiple `code_systems` rows when several versions
-        // share a canonical URL (e.g. the hl7.terminology@7.0.1 SNOMED stub
-        // sharing `http://snomed.info/sct` with the RF2 import that follows).
-        // Iterate every matching row and build the closure for each system_id
-        // that has hierarchy edges.
         for url in &systems_needing_closure {
-            let rows = client
-                .query("SELECT id FROM code_systems WHERE url = $1", &[url])
+            let row = client
+                .query_opt("SELECT id FROM code_systems WHERE url = $1", &[url])
                 .await
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            for row in rows {
-                let sid: String = row.get(0);
-                let has_hier: bool = client
-                    .query_one(
-                        "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = $1 LIMIT 1)",
-                        &[&sid],
-                    )
-                    .await
-                    .map(|r| r.get(0))
-                    .unwrap_or(false);
-                if has_hier {
-                    if let Err(e) = schema::build_concept_closure_pg(&mut client, &sid).await {
-                        tracing::warn!(
-                            system_id = %sid,
-                            error = %e,
-                            "Failed to build concept_closure after import"
-                        );
-                    }
+            let Some(sid_row) = row else { continue };
+            let sid: String = sid_row.get(0);
+            let has_hier: bool = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = $1 LIMIT 1)",
+                    &[&sid],
+                )
+                .await
+                .map(|r| r.get(0))
+                .unwrap_or(false);
+            if has_hier {
+                if let Err(e) = schema::build_concept_closure_pg(&mut client, &sid).await {
+                    tracing::warn!(
+                        system_id = %sid,
+                        error = %e,
+                        "Failed to build concept_closure after import"
+                    );
                 }
             }
         }
