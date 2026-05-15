@@ -336,30 +336,31 @@ where
         // sync) — the IG-recommended behavior under the `exclude` toggle.
         let group_patient_ids: Option<Vec<String>> = match &view.level {
             ExportLevel::Group { group_id } => {
-                let ids = if self.exclude_since_newly_added && view.request.since.is_some() {
-                    let since = view.request.since.unwrap();
-                    let members = self
+                let ids = match (self.exclude_since_newly_added, view.request.since.as_ref()) {
+                    (true, Some(since)) => {
+                        let members = self
+                            .data
+                            .get_group_members_with_periods(tenant, group_id)
+                            .await
+                            .map_err(LeaseError::Storage)?;
+                        members
+                            .into_iter()
+                            .filter_map(|(reference, period_start)| {
+                                let pid = reference.strip_prefix("Patient/")?;
+                                // Keep members whose period.start is unknown OR
+                                // <= since (i.e., were already members at since).
+                                match period_start {
+                                    Some(start) if start > *since => None,
+                                    _ => Some(pid.to_string()),
+                                }
+                            })
+                            .collect()
+                    }
+                    _ => self
                         .data
-                        .get_group_members_with_periods(tenant, group_id)
-                        .await
-                        .map_err(LeaseError::Storage)?;
-                    members
-                        .into_iter()
-                        .filter_map(|(reference, period_start)| {
-                            let pid = reference.strip_prefix("Patient/")?;
-                            // Keep members whose period.start is unknown OR
-                            // <= since (i.e., were already members at since).
-                            match period_start {
-                                Some(start) if start > since => None,
-                                _ => Some(pid.to_string()),
-                            }
-                        })
-                        .collect()
-                } else {
-                    self.data
                         .resolve_group_patient_ids(tenant, group_id)
                         .await
-                        .map_err(LeaseError::Storage)?
+                        .map_err(LeaseError::Storage)?,
                 };
                 Some(ids)
             }
