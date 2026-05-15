@@ -14,3 +14,4 @@ ignore:
   - "crates/fhir/src/r4b.rs"
   - "crates/fhir/src/r5.rs"
   - "crates/fhir/src/r6.rs"
+  - "crates/hfs/src/main.rs"

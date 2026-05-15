@@ -1211,6 +1211,66 @@ mod tests {
         assert!(config.storage_backend_mode().is_err());
     }
 
+    // ── BulkExportConfig::validate ────────────────────────────────
+
+    #[test]
+    fn test_bulk_export_config_default_is_valid() {
+        assert!(BulkExportConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_export_config_invalid_backend() {
+        let cfg = BulkExportConfig {
+            backend: "unknown".to_string(),
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("HFS_BULK_EXPORT_BACKEND")));
+    }
+
+    #[test]
+    fn test_bulk_export_config_s3_output_requires_bucket() {
+        let cfg = BulkExportConfig {
+            output_backend: "s3".to_string(),
+            s3_bucket: None,
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("S3_BUCKET")));
+    }
+
+    #[test]
+    fn test_bulk_export_config_local_fs_requires_access_token() {
+        let cfg = BulkExportConfig {
+            output_backend: "local-fs".to_string(),
+            requires_access_token: "false".to_string(),
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("local-fs")));
+    }
+
+    #[test]
+    fn test_bulk_export_config_lease_must_exceed_heartbeat() {
+        let cfg = BulkExportConfig {
+            lease_duration_secs: 10,
+            heartbeat_interval_secs: 20,
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("LEASE_DURATION")));
+    }
+
+    #[test]
+    fn test_bulk_export_config_invalid_since_newly_added() {
+        let cfg = BulkExportConfig {
+            since_newly_added: "maybe".to_string(),
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("SINCE_NEWLY_ADDED")));
+    }
+
     // ── display for StorageBackendMode ────────────────────────────
 
     #[test]

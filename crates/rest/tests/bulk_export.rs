@@ -316,6 +316,108 @@ async fn test_status_and_download_unknown_job() {
 }
 
 #[tokio::test]
+async fn test_post_kickoff_with_parameters_body() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 2).await;
+
+    // POST kickoff using a FHIR Parameters resource body.
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_type", "valueString": "Patient"}
+        ]
+    });
+    let resp = server
+        .post("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert!(resp.headers().get("content-location").is_some());
+
+    drain_workers(&backend, &output).await;
+}
+
+#[tokio::test]
+async fn test_since_parameter_accepted() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 1).await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_since", "2020-01-01T00:00:00Z")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+
+    drain_workers(&backend, &output).await;
+}
+
+#[tokio::test]
+async fn test_invalid_since_rejected() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_since", "not-a-date")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_elements_parameter_accepted() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 1).await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .add_query_param("_elements", "id,name")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let status_url = resp
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status_path = status_url.strip_prefix("http://localhost:8080").unwrap();
+
+    drain_workers(&backend, &output).await;
+
+    let done = server
+        .get(status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_valid_type_filter_accepted() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 1).await;
+
+    // _typeFilter with valid resource type (in _type) and allowed search param.
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .add_query_param("_typeFilter", "Patient?active=true")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+
+    drain_workers(&backend, &output).await;
+}
+
+#[tokio::test]
 async fn test_capability_statement_advertises_export() {
     let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
     let resp = server
