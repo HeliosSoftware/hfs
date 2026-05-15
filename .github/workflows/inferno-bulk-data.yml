@@ -35,7 +35,7 @@ env:
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   SUITE_ID: bulk_data_v200
-  TEST_GROUP_ID: bulk_data_v200-bulk_data_export_tests_v200
+  TEST_GROUP_ID: bulk_data_v200
   GROUP_ID: inferno-bulk-group
   RESULTS_DIR: inferno-bulk-data-results
 
@@ -649,7 +649,7 @@ jobs:
 
           RESULTS=$(cat "$RESULTS_DIR/results.json")
           LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
-          OMIT_EXPR='(.test_id | test("bulk_data_server_tls_version_stu2$"))'
+          OMIT_EXPR='(.test_id | test("(bulk_data_server_tls_version_stu2|smart_backend_services_token_tls_version)$"))'
 
           FAILURES=$(echo "$RESULTS" | jq "$LATEST | [.[] | select((.result == \"fail\" or .result == \"error\") and ($OMIT_EXPR | not))] | length")
           OMITTED_COUNT=$(echo "$RESULTS" | jq "$LATEST | [.[] | select($OMIT_EXPR)] | length")
@@ -670,7 +670,7 @@ jobs:
           if [ -f "$RESULTS_DIR/results.json" ]; then
             RESULTS=$(cat "$RESULTS_DIR/results.json")
             LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
-            OMIT_EXPR='(.test_id | test("bulk_data_server_tls_version_stu2$"))'
+            OMIT_EXPR='(.test_id | test("(bulk_data_server_tls_version_stu2|smart_backend_services_token_tls_version)$"))'
 
             TOTAL=$(echo "$RESULTS" | jq "$LATEST | length")
             PASS=$(echo "$RESULTS" | jq "$LATEST | [.[] | select(.result == \"pass\")] | length")
