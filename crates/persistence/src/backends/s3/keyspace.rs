@@ -139,11 +139,13 @@ impl S3Keyspace {
     }
 
     /// Key for the JSON state object of a bulk export job.
+    #[allow(dead_code)]
     pub fn export_job_state_key(&self, job_id: &str) -> String {
         self.join(&["bulk", "export", "jobs", job_id, "state.json"])
     }
 
     /// Key for per-type export progress within a job.
+    #[allow(dead_code)]
     pub fn export_job_progress_key(&self, job_id: &str, resource_type: &str) -> String {
         self.join(&[
             "bulk",
@@ -156,11 +158,13 @@ impl S3Keyspace {
     }
 
     /// Key for the completed export manifest of a job.
+    #[allow(dead_code)]
     pub fn export_job_manifest_key(&self, job_id: &str) -> String {
         self.join(&["bulk", "export", "jobs", job_id, "manifest.json"])
     }
 
     /// Key for a single NDJSON output part within an export job.
+    #[allow(dead_code)]
     pub fn export_job_output_key(&self, job_id: &str, resource_type: &str, part: u32) -> String {
         self.join(&[
             "bulk",
@@ -174,11 +178,13 @@ impl S3Keyspace {
     }
 
     /// Prefix covering all export job objects.
+    #[allow(dead_code)]
     pub fn export_jobs_prefix(&self) -> String {
         self.join(&["bulk", "export", "jobs/"])
     }
 
     /// Prefix covering all objects belonging to a single export job.
+    #[allow(dead_code)]
     pub fn export_job_prefix(&self, job_id: &str) -> String {
         self.join(&["bulk", "export", "jobs", job_id, "/"])
     }
