@@ -11,9 +11,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use helios_sof::{
-    ContentType, RunOptions, SofBundle, SofViewDefinition,
+    ContentType, RunOptions, SofBundle, SofError, SofViewDefinition,
+    create_bundle_from_resources_for_version as sof_create_bundle_from_resources_for_version,
     data_source::{DataSource, UniversalDataSource},
-    format_parquet_multi_file, get_fhir_version_string, get_newest_enabled_fhir_version,
+    filter_resources_by_patient_and_group as sof_filter_resources_by_patient_and_group,
+    filter_resources_by_since as sof_filter_resources_by_since, format_parquet_multi_file,
+    get_fhir_version_string, get_newest_enabled_fhir_version,
+    parse_view_definition_for_version as sof_parse_view_definition_for_version,
     process_view_definition, run_view_definition_with_options,
 };
 use tracing::{debug, info};
@@ -485,40 +489,10 @@ fn parse_view_definition_for_version(
     json: serde_json::Value,
     version: helios_fhir::FhirVersion,
 ) -> ServerResult<SofViewDefinition> {
-    match version {
-        #[cfg(feature = "R4")]
-        helios_fhir::FhirVersion::R4 => {
-            let view_def: helios_fhir::r4::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
-                    ServerError::BadRequest(format!("Invalid R4 ViewDefinition: {}", e))
-                })?;
-            Ok(SofViewDefinition::R4(view_def))
-        }
-        #[cfg(feature = "R4B")]
-        helios_fhir::FhirVersion::R4B => {
-            let view_def: helios_fhir::r4b::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
-                    ServerError::BadRequest(format!("Invalid R4B ViewDefinition: {}", e))
-                })?;
-            Ok(SofViewDefinition::R4B(view_def))
-        }
-        #[cfg(feature = "R5")]
-        helios_fhir::FhirVersion::R5 => {
-            let view_def: helios_fhir::r5::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
-                    ServerError::BadRequest(format!("Invalid R5 ViewDefinition: {}", e))
-                })?;
-            Ok(SofViewDefinition::R5(view_def))
-        }
-        #[cfg(feature = "R6")]
-        helios_fhir::FhirVersion::R6 => {
-            let view_def: helios_fhir::r6::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
-                    ServerError::BadRequest(format!("Invalid R6 ViewDefinition: {}", e))
-                })?;
-            Ok(SofViewDefinition::R6(view_def))
-        }
-    }
+    sof_parse_view_definition_for_version(json, version).map_err(|e| match e {
+        SofError::InvalidViewDefinition(msg) => ServerError::BadRequest(msg),
+        other => ServerError::from(other),
+    })
 }
 
 /// Parse a Parameters resource from JSON
@@ -576,50 +550,10 @@ fn create_bundle_from_resources_for_version(
     resources: Vec<serde_json::Value>,
     version: helios_fhir::FhirVersion,
 ) -> ServerResult<SofBundle> {
-    let bundle_json = serde_json::json!({
-        "resourceType": "Bundle",
-        "type": "collection",
-        "entry": resources.into_iter().map(|resource| {
-            serde_json::json!({
-                "resource": resource
-            })
-        }).collect::<Vec<_>>()
-    });
-
-    match version {
-        #[cfg(feature = "R4")]
-        helios_fhir::FhirVersion::R4 => {
-            let bundle: helios_fhir::r4::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R4 Bundle: {}", e))
-                })?;
-            Ok(SofBundle::R4(bundle))
-        }
-        #[cfg(feature = "R4B")]
-        helios_fhir::FhirVersion::R4B => {
-            let bundle: helios_fhir::r4b::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R4B Bundle: {}", e))
-                })?;
-            Ok(SofBundle::R4B(bundle))
-        }
-        #[cfg(feature = "R5")]
-        helios_fhir::FhirVersion::R5 => {
-            let bundle: helios_fhir::r5::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R5 Bundle: {}", e))
-                })?;
-            Ok(SofBundle::R5(bundle))
-        }
-        #[cfg(feature = "R6")]
-        helios_fhir::FhirVersion::R6 => {
-            let bundle: helios_fhir::r6::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R6 Bundle: {}", e))
-                })?;
-            Ok(SofBundle::R6(bundle))
-        }
-    }
+    sof_create_bundle_from_resources_for_version(resources, version).map_err(|e| match e {
+        SofError::InvalidViewDefinition(msg) => ServerError::InternalError(msg),
+        other => ServerError::from(other),
+    })
 }
 
 /// Extract resources from a bundle as JSON values
@@ -751,79 +685,12 @@ fn filter_resources_by_patient_and_group(
     patient_ref: Option<&str>,
     group_ref: Option<&str>,
 ) -> ServerResult<Vec<serde_json::Value>> {
-    let mut filtered = resources;
-
-    // Apply patient filter if provided
-    if let Some(patient_ref) = patient_ref {
-        // Normalize the patient reference to always include "Patient/" prefix
-        let normalized_patient_ref = if patient_ref.starts_with("Patient/") {
-            patient_ref.to_string()
-        } else {
-            format!("Patient/{}", patient_ref)
-        };
-        debug!(
-            "Filtering resources by patient: {} (normalized: {})",
-            patient_ref, normalized_patient_ref
-        );
-        let patient_ref_to_match = normalized_patient_ref.as_str();
-        filtered.retain(|resource| {
-            // Check if resource belongs to patient compartment
-            // This is a simplified implementation - in production, this would
-            // need to check all patient compartment definitions
-            if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
-                match resource_type {
-                    "Patient" => {
-                        // Check if this is the patient themselves
-                        if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
-                            return format!("Patient/{}", id) == patient_ref_to_match;
-                        }
-                    }
-                    "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
-                        // Check subject reference
-                        if let Some(subject) = resource.get("subject") {
-                            if let Some(reference) =
-                                subject.get("reference").and_then(|r| r.as_str())
-                            {
-                                return reference == patient_ref_to_match;
-                            }
-                        }
-                    }
-                    "Encounter" => {
-                        // Check subject reference
-                        if let Some(subject) = resource.get("subject") {
-                            if let Some(reference) =
-                                subject.get("reference").and_then(|r| r.as_str())
-                            {
-                                return reference == patient_ref_to_match;
-                            }
-                        }
-                    }
-                    _ => {
-                        // For other resource types, check if they have a patient reference
-                        if let Some(patient) = resource.get("patient") {
-                            if let Some(reference) =
-                                patient.get("reference").and_then(|r| r.as_str())
-                            {
-                                return reference == patient_ref_to_match;
-                            }
-                        }
-                    }
-                }
-            }
-            false
-        });
-    }
-
-    // Apply group filter if provided
-    if let Some(_group_ref) = group_ref {
-        // Group filtering would require loading the Group resource and checking membership
-        // This is not implemented in this stateless server
-        return Err(ServerError::NotImplemented(
-            "Group filtering is not yet implemented".to_string(),
-        ));
-    }
-
-    Ok(filtered)
+    sof_filter_resources_by_patient_and_group(resources, patient_ref, group_ref).map_err(
+        |e| match e {
+            SofError::InvalidViewDefinition(msg) => ServerError::NotImplemented(msg),
+            other => ServerError::from(other),
+        },
+    )
 }
 
 /// Filter resources by their last updated time using the _since parameter
@@ -842,38 +709,7 @@ fn filter_resources_by_since(
     resources: Vec<serde_json::Value>,
     since: DateTime<Utc>,
 ) -> ServerResult<Vec<serde_json::Value>> {
-    debug!("Filtering resources modified since: {}", since);
-
-    let filtered: Vec<serde_json::Value> = resources
-        .into_iter()
-        .filter(|resource| {
-            // Check if resource has meta.lastUpdated field
-            if let Some(meta) = resource.get("meta") {
-                if let Some(last_updated) = meta.get("lastUpdated").and_then(|lu| lu.as_str()) {
-                    // Parse the lastUpdated timestamp
-                    match DateTime::parse_from_rfc3339(last_updated) {
-                        Ok(resource_updated) => {
-                            // Compare timestamps - keep if resource was updated after _since
-                            return resource_updated.with_timezone(&Utc) > since;
-                        }
-                        Err(e) => {
-                            // Log warning but don't fail the entire request
-                            debug!(
-                                "Failed to parse lastUpdated timestamp '{}': {}",
-                                last_updated, e
-                            );
-                        }
-                    }
-                }
-            }
-            // If no meta.lastUpdated field, exclude the resource
-            // This is conservative - we only include resources we know were updated after _since
-            false
-        })
-        .collect();
-
-    debug!("Filtered {} resources by _since parameter", filtered.len());
-    Ok(filtered)
+    sof_filter_resources_by_since(resources, since).map_err(ServerError::from)
 }
 
 /// Simple health check endpoint

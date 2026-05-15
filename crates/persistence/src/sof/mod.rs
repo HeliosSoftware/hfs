@@ -8,6 +8,10 @@
 //!   in stages 2–5.
 //! - [`sqlite`] — [`SqliteInDbRunner`] implementing [`SofRunner`] for SQLite.
 //! - [`postgres`] — [`PgInDbRunner`] implementing [`SofRunner`] for PostgreSQL.
+//!
+//! Inline `resource:` parameters on `$viewdefinition-run` are handled by the
+//! REST layer via the in-process `helios-sof` FHIRPath evaluator, so this
+//! module no longer needs a per-backend inline runner.
 
 pub mod compile_path;
 pub mod compile_view;
@@ -21,9 +25,6 @@ pub mod sqlite;
 
 #[cfg(feature = "sqlite")]
 pub mod sqlite_udfs;
-
-#[cfg(feature = "sqlite")]
-pub mod inline;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;

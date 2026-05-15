@@ -941,6 +941,197 @@ pub fn run_view_definition(
     run_view_definition_with_options(view_definition, bundle, content_type, RunOptions::default())
 }
 
+/// Parses a JSON value into a [`SofViewDefinition`] using the newest enabled
+/// FHIR version.
+///
+/// Use [`parse_view_definition_for_version`] to pick a specific version (for
+/// example when matching the FHIR version of an inline `Bundle` parameter).
+pub fn parse_view_definition(json: serde_json::Value) -> Result<SofViewDefinition, SofError> {
+    parse_view_definition_for_version(json, get_newest_enabled_fhir_version())
+}
+
+/// Parses a JSON value into a [`SofViewDefinition`] using the specified FHIR
+/// version.
+pub fn parse_view_definition_for_version(
+    json: serde_json::Value,
+    version: helios_fhir::FhirVersion,
+) -> Result<SofViewDefinition, SofError> {
+    match version {
+        #[cfg(feature = "R4")]
+        helios_fhir::FhirVersion::R4 => {
+            let view_def: helios_fhir::r4::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Invalid R4 ViewDefinition: {}", e))
+                })?;
+            Ok(SofViewDefinition::R4(view_def))
+        }
+        #[cfg(feature = "R4B")]
+        helios_fhir::FhirVersion::R4B => {
+            let view_def: helios_fhir::r4b::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Invalid R4B ViewDefinition: {}", e))
+                })?;
+            Ok(SofViewDefinition::R4B(view_def))
+        }
+        #[cfg(feature = "R5")]
+        helios_fhir::FhirVersion::R5 => {
+            let view_def: helios_fhir::r5::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Invalid R5 ViewDefinition: {}", e))
+                })?;
+            Ok(SofViewDefinition::R5(view_def))
+        }
+        #[cfg(feature = "R6")]
+        helios_fhir::FhirVersion::R6 => {
+            let view_def: helios_fhir::r6::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Invalid R6 ViewDefinition: {}", e))
+                })?;
+            Ok(SofViewDefinition::R6(view_def))
+        }
+    }
+}
+
+/// Wraps a list of raw FHIR resources in a `collection` Bundle of the newest
+/// enabled FHIR version.
+pub fn create_bundle_from_resources(
+    resources: Vec<serde_json::Value>,
+) -> Result<SofBundle, SofError> {
+    create_bundle_from_resources_for_version(resources, get_newest_enabled_fhir_version())
+}
+
+/// Wraps a list of raw FHIR resources in a `collection` Bundle of the
+/// specified FHIR version.
+pub fn create_bundle_from_resources_for_version(
+    resources: Vec<serde_json::Value>,
+    version: helios_fhir::FhirVersion,
+) -> Result<SofBundle, SofError> {
+    let bundle_json = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": resources.into_iter().map(|resource| {
+            serde_json::json!({ "resource": resource })
+        }).collect::<Vec<_>>()
+    });
+
+    match version {
+        #[cfg(feature = "R4")]
+        helios_fhir::FhirVersion::R4 => {
+            let bundle: helios_fhir::r4::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Failed to create R4 Bundle: {}", e))
+                })?;
+            Ok(SofBundle::R4(bundle))
+        }
+        #[cfg(feature = "R4B")]
+        helios_fhir::FhirVersion::R4B => {
+            let bundle: helios_fhir::r4b::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Failed to create R4B Bundle: {}", e))
+                })?;
+            Ok(SofBundle::R4B(bundle))
+        }
+        #[cfg(feature = "R5")]
+        helios_fhir::FhirVersion::R5 => {
+            let bundle: helios_fhir::r5::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Failed to create R5 Bundle: {}", e))
+                })?;
+            Ok(SofBundle::R5(bundle))
+        }
+        #[cfg(feature = "R6")]
+        helios_fhir::FhirVersion::R6 => {
+            let bundle: helios_fhir::r6::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Failed to create R6 Bundle: {}", e))
+                })?;
+            Ok(SofBundle::R6(bundle))
+        }
+    }
+}
+
+/// Filters raw FHIR resource JSON by an optional patient and/or group
+/// reference. The patient filter implements the standard patient-compartment
+/// projection used by `$viewdefinition-run`; the group filter currently
+/// returns [`SofError::InvalidViewDefinition`] since group expansion is not
+/// supported in this stateless path.
+pub fn filter_resources_by_patient_and_group(
+    resources: Vec<serde_json::Value>,
+    patient_ref: Option<&str>,
+    group_ref: Option<&str>,
+) -> Result<Vec<serde_json::Value>, SofError> {
+    let mut filtered = resources;
+
+    if let Some(patient_ref) = patient_ref {
+        let normalized_patient_ref = if patient_ref.starts_with("Patient/") {
+            patient_ref.to_string()
+        } else {
+            format!("Patient/{}", patient_ref)
+        };
+        let patient_ref_to_match = normalized_patient_ref.as_str();
+        filtered.retain(|resource| {
+            if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
+                match resource_type {
+                    "Patient" => {
+                        if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
+                            return format!("Patient/{}", id) == patient_ref_to_match;
+                        }
+                    }
+                    "Observation" | "Condition" | "MedicationRequest" | "Procedure"
+                    | "Encounter" => {
+                        if let Some(subject) = resource.get("subject") {
+                            if let Some(reference) =
+                                subject.get("reference").and_then(|r| r.as_str())
+                            {
+                                return reference == patient_ref_to_match;
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(patient) = resource.get("patient") {
+                            if let Some(reference) =
+                                patient.get("reference").and_then(|r| r.as_str())
+                            {
+                                return reference == patient_ref_to_match;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        });
+    }
+
+    if group_ref.is_some() {
+        return Err(SofError::InvalidViewDefinition(
+            "Group filtering is not yet implemented".to_string(),
+        ));
+    }
+
+    Ok(filtered)
+}
+
+/// Filters raw FHIR resource JSON by their `meta.lastUpdated` timestamp,
+/// returning only resources whose `lastUpdated` is strictly after `since`.
+/// Resources without `meta.lastUpdated` are excluded.
+pub fn filter_resources_by_since(
+    resources: Vec<serde_json::Value>,
+    since: DateTime<Utc>,
+) -> Result<Vec<serde_json::Value>, SofError> {
+    Ok(resources
+        .into_iter()
+        .filter(|resource| {
+            resource
+                .get("meta")
+                .and_then(|m| m.get("lastUpdated"))
+                .and_then(|lu| lu.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc) > since)
+                .unwrap_or(false)
+        })
+        .collect())
+}
+
 /// Configuration options for Parquet file generation.
 #[derive(Debug, Clone)]
 pub struct ParquetOptions {

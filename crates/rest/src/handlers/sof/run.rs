@@ -32,12 +32,14 @@ use axum::{
 };
 use futures::StreamExt;
 use helios_persistence::core::search::SearchProvider;
-use helios_persistence::core::sof_runner::{SofError, SofRunner, ViewFilters};
-use helios_persistence::sof::inline::build_inline_runner;
-use helios_persistence::tenant::TenantContext;
+use helios_persistence::core::sof_runner::{SofError, ViewFilters};
+use helios_sof::{
+    ContentType, RunOptions, create_bundle_from_resources_for_version,
+    filter_resources_by_patient_and_group, filter_resources_by_since,
+    parse_view_definition_for_version, run_view_definition_with_options,
+};
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::error::RestError;
@@ -393,9 +395,11 @@ where
 
 /// Resolves the SofRunner and executes the view, returning a streaming response.
 ///
-/// Inline `resource:` parameters are materialised into a transient in-memory
-/// SQLite backend so they flow through the same in-DB compile-to-SQL pipeline
-/// as persisted resources — there is no in-process FHIRPath fallback.
+/// Inline `resource:` parameters are evaluated through the in-process
+/// `helios-sof` FHIRPath pipeline (the same code path `sof-server` uses),
+/// so this handler does not require any storage backend when the caller
+/// supplies resources inline. Persistent requests are dispatched to the
+/// backend's in-DB SOF runner.
 async fn execute_view<S>(
     state: AppState<S>,
     params: RunQueryParams,
@@ -406,35 +410,34 @@ async fn execute_view<S>(
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    let has_inline = !body_params.inline_resources.is_empty();
-
-    let (runner, effective_tenant): (Arc<dyn SofRunner>, TenantContext) = if has_inline {
-        let (r, t) = build_inline_runner(
-            body_params.inline_resources.clone(),
-            state.config().default_fhir_version,
-        )
-        .await
-        .map_err(map_sof_error_to_rest)?;
-        (r, t)
-    } else {
-        let r = state
-            .sof_runner()
-            .ok_or_else(|| RestError::NotImplemented {
-                feature: "$viewdefinition-run is not available: the configured storage backend \
-                          does not provide an in-DB SOF runner"
-                    .to_string(),
-            })?
-            .clone();
-        (r, tenant.context().clone())
-    };
-
-    let filters = build_filters(&params, &body_params);
     let format = params.format.as_deref().unwrap_or("ndjson").to_lowercase();
     let include_header = params
         .header
         .as_deref()
         .map(|h| h == "true" || h == "1")
         .unwrap_or(true);
+
+    if !body_params.inline_resources.is_empty() {
+        return execute_view_inline(
+            &state,
+            &params,
+            &body_params,
+            view_json,
+            &format,
+            include_header,
+        );
+    }
+
+    let runner = state
+        .sof_runner()
+        .ok_or_else(|| RestError::NotImplemented {
+            feature: "$viewdefinition-run is not available: the configured storage backend \
+                      does not provide an in-DB SOF runner"
+                .to_string(),
+        })?
+        .clone();
+    let effective_tenant = tenant.context().clone();
+    let filters = build_filters(&params, &body_params);
 
     debug!(
         runner = runner.runner_name(),
@@ -465,6 +468,140 @@ where
         &runner_label,
         &format,
     ))
+}
+
+/// Runs the view against inline `resource:` parameters using the in-process
+/// `helios-sof` FHIRPath evaluator. Returns fully buffered output bytes —
+/// inline runs do not stream because the evaluator materialises the entire
+/// result set before formatting.
+fn execute_view_inline<S>(
+    state: &AppState<S>,
+    params: &RunQueryParams,
+    body_params: &BodyParams,
+    view_json: Value,
+    format: &str,
+    include_header: bool,
+) -> Result<Response, RestError>
+where
+    S: SearchProvider + Send + Sync + 'static,
+{
+    let fhir_version = state.config().default_fhir_version;
+
+    let view_definition = parse_view_definition_for_version(view_json, fhir_version)
+        .map_err(map_sof_lib_error_to_rest)?;
+
+    let mut resources = body_params.inline_resources.clone();
+
+    // Patient/group filtering: prefer the multi-valued body entries; fall
+    // back to a single comma-split query value. The in-process evaluator
+    // takes a single reference, so we only apply the first one for now.
+    let patient_ref = body_params
+        .patient
+        .first()
+        .cloned()
+        .or_else(|| split_refs(params.patient.as_deref()).into_iter().next());
+    let group_ref = body_params
+        .group
+        .first()
+        .cloned()
+        .or_else(|| split_refs(params.group.as_deref()).into_iter().next());
+
+    if patient_ref.is_some() || group_ref.is_some() {
+        resources = filter_resources_by_patient_and_group(
+            resources,
+            patient_ref.as_deref(),
+            group_ref.as_deref(),
+        )
+        .map_err(map_sof_lib_error_to_rest)?;
+    }
+
+    let since = params.since.as_deref().and_then(|s| s.parse().ok());
+    if let Some(since) = since {
+        resources =
+            filter_resources_by_since(resources, since).map_err(map_sof_lib_error_to_rest)?;
+    }
+
+    let bundle = create_bundle_from_resources_for_version(resources, fhir_version)
+        .map_err(map_sof_lib_error_to_rest)?;
+
+    let content_type =
+        parse_content_type(format, include_header).ok_or_else(|| RestError::BadRequest {
+            message: format!("Unsupported _format value: {format}"),
+        })?;
+
+    let options = RunOptions {
+        since,
+        limit: params.limit,
+        page: None,
+        parquet_options: None,
+    };
+
+    debug!(
+        runner = "in-process",
+        format = %format,
+        "dispatching $viewdefinition-run (inline)"
+    );
+
+    let body = run_view_definition_with_options(view_definition, bundle, content_type, options)
+        .map_err(map_sof_lib_error_to_rest)?;
+
+    let response_format = match content_type {
+        ContentType::Csv | ContentType::CsvWithHeader => "csv",
+        ContentType::Json => "json",
+        ContentType::NdJson => "ndjson",
+        ContentType::Parquet => "parquet",
+    };
+    let ct_header: &'static str = match content_type {
+        ContentType::Csv | ContentType::CsvWithHeader => "text/csv; charset=utf-8",
+        ContentType::Json => "application/json",
+        ContentType::NdJson => "application/x-ndjson",
+        ContentType::Parquet => "application/octet-stream",
+    };
+
+    Ok(build_response(
+        StatusCode::OK,
+        ct_header,
+        body,
+        "in-process",
+        response_format,
+    ))
+}
+
+/// Maps a `_format` string + header flag to a `ContentType` understood by the
+/// in-process evaluator. Returns `None` when the format is not recognised.
+fn parse_content_type(format: &str, include_header: bool) -> Option<ContentType> {
+    match format {
+        "ndjson" | "application/x-ndjson" | "application/ndjson" => Some(ContentType::NdJson),
+        "json" | "application/json" => Some(ContentType::Json),
+        "csv" | "text/csv" => Some(if include_header {
+            ContentType::CsvWithHeader
+        } else {
+            ContentType::Csv
+        }),
+        "parquet" | "application/parquet" | "application/octet-stream" => {
+            Some(ContentType::Parquet)
+        }
+        _ => None,
+    }
+}
+
+/// Maps a `helios_sof::SofError` to a `RestError`. Distinct from
+/// [`map_sof_error_to_rest`] which handles the `helios_persistence` `SofError`
+/// variants emitted by storage-backed runners.
+fn map_sof_lib_error_to_rest(e: helios_sof::SofError) -> RestError {
+    use helios_sof::SofError as LibErr;
+    match e {
+        LibErr::InvalidViewDefinition(msg) | LibErr::FhirPathError(msg) => {
+            RestError::UnprocessableEntity { message: msg }
+        }
+        LibErr::UnsupportedContentType(msg) => RestError::BadRequest { message: msg },
+        other => {
+            warn!(error = %other, "in-process SOF evaluator error");
+            RestError::InternalError {
+                message: other.to_string(),
+            }
+        }
+    }
 }
 
 /// Builds a chunked-transfer-encoding response that streams NDJSON rows as
