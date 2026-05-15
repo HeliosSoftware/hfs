@@ -879,6 +879,14 @@ where
                     .as_ref()
                     .map(|d| format!("{d}/bulk_export.db"))
                     .unwrap_or_else(|| "./data/bulk_export.db".to_string());
+                if let Some(parent) = std::path::Path::new(&job_db).parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        anyhow::anyhow!(
+                            "create bulk export job DB directory {}: {e}",
+                            parent.display()
+                        )
+                    })?;
+                }
                 let job_backend = SqliteBackend::with_config(
                     &job_db,
                     SqliteBackendConfig {
