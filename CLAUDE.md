@@ -612,6 +612,99 @@ cargo run --bin hts -- import ./package.tgz \
 
 ---
 
+## Bulk Data Export ($export)
+
+HFS implements the [FHIR Bulk Data Access IG](https://build.fhir.org/ig/HL7/bulk-data/)
+`$export` family asynchronously: kick-off → poll → manifest → download → delete.
+
+### Endpoints
+
+| Operation | Method | URL |
+|-----------|--------|-----|
+| system kick-off | GET / POST | `/$export` |
+| patient kick-off | GET / POST | `/Patient/$export` |
+| group kick-off | GET / POST | `/Group/{id}/$export` |
+| status / manifest | GET | `/export-status/{job_id}` |
+| cancel + delete | DELETE | `/export-status/{job_id}` |
+| HFS-served download | GET | `/export-file/{job_id}/{type}-{part}` |
+
+All kick-offs require `Prefer: respond-async`. The default response is
+`202 Accepted` with a `Content-Location` status URL.
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_BULK_EXPORT_ENABLED` | `true` | Master switch — when `false`, all `$export` endpoints return `501`. |
+| `HFS_BULK_EXPORT_BACKEND` | `embedded` | Job-state backend: `embedded` (SQLite) or `postgres-s3`. |
+| `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Output store: `local-fs` or `s3`. |
+| `HFS_BULK_EXPORT_OUTPUT_DIR` | `${HFS_DATA_DIR}/exports` | Local-FS output root. |
+| `HFS_BULK_EXPORT_S3_BUCKET` | (none) | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
+| `HFS_BULK_EXPORT_S3_ENDPOINT` | (AWS) | S3-compatible endpoint URL (e.g. MinIO). |
+| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers. |
+| `HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: `auto` / `true` / `false`. **`false` is invalid with `local-fs`** (no pre-signed URLs). |
+| `HFS_BULK_EXPORT_FILE_URL_TTL` | `3600` | Pre-signed download URL lifetime, seconds. |
+| `HFS_BULK_EXPORT_OUTPUT_TTL` | `86400` | Output retention after job completion, seconds. |
+| `HFS_BULK_EXPORT_WORKER_CONCURRENCY` | `2` | In-process worker pool size. |
+| `HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers (use a separate exporter). |
+| `HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-job cap (kick-off → 429 if exceeded). |
+| `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per `fetch_export_batch`. |
+| `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length, seconds. Must be > heartbeat interval. |
+| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
+| `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
+| `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group-export `_since` toggle (`include` / `exclude`). |
+| `HFS_BULK_EXPORT_DATABASE_URL` | (from `HFS_DATABASE_URL`) | Postgres URL for the `postgres-s3` job store. |
+
+### Single-instance recipe (zero-config)
+
+```
+cargo run --bin hfs
+```
+
+This starts HFS with embedded bulk export: SQLite job state at
+`./data/bulk_export.db`, NDJSON output under `./data/exports/`, and an
+in-process worker pool. Kick off:
+
+```
+curl -H 'Prefer: respond-async' http://localhost:8080/Patient/\$export
+```
+
+### Multi-instance recipe (PostgreSQL + S3 / MinIO)
+
+```
+HFS_STORAGE_BACKEND=postgres \
+HFS_DATABASE_URL=postgresql://hfs:hfs@localhost/hfs \
+HFS_BULK_EXPORT_BACKEND=postgres-s3 \
+HFS_BULK_EXPORT_OUTPUT_BACKEND=s3 \
+HFS_BULK_EXPORT_S3_BUCKET=hfs-export \
+HFS_BULK_EXPORT_S3_ENDPOINT=http://localhost:9000 \
+HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE=true \
+HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=false \
+cargo run --bin hfs --features postgres,s3
+```
+
+The full stack (HFS + Postgres + MinIO + Keycloak) is described by
+`docker/bulk-export/docker-compose.yml`. See `.github/workflows/inferno-bulk-data.yml`
+for the manual conformance run.
+
+### Behavior notes
+
+- **`_typeFilter`** is parsed and applied; unsupported result-control params
+  (`_sort`, `_include`, `_revinclude`, `_count`, `_elements`) inside a
+  `_typeFilter` query are rejected `400` regardless of `Prefer: handling`.
+- **`_elements`** is implemented: subset to listed paths + `id` /
+  `resourceType` / `meta`, with a `SUBSETTED` `meta.tag` added.
+- **Unsupported parameters** (`includeAssociatedData`, `organizeOutputBy`,
+  `allowPartialManifests`) — **`Prefer: handling=strict`** → `400`; absent or
+  `handling=lenient` (IG-default) → ignored with a warning logged.
+- **`_since` + late-membership** for Group exports: `include` (default)
+  returns pre-`_since` resources for patients added after `_since`; `exclude`
+  is reserved for a follow-up that requires group-membership-history tracking.
+- **Group export** flattens nested `Group/` members iteratively with a
+  visited-set cycle guard.
+
+---
+
 ## Docker
 
 Generic Dockerfile supporting all server binaries via `BINARY_NAME` build arg:
