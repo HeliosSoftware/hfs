@@ -127,24 +127,13 @@ impl PostgresTerminologyBackend {
         let pool = build_pool(database_url)?;
 
         {
-            let mut client = pool.get().await.map_err(|e| {
+            let client = pool.get().await.map_err(|e| {
                 HtsError::StorageError(format!("Failed to acquire PG connection: {e}"))
             })?;
 
             schema::apply(&client)
                 .await
                 .map_err(|e| HtsError::StorageError(format!("Failed to apply HTS schema: {e}")))?;
-
-            // Backfill `concept_closure` for any system that has hierarchy edges
-            // but no closure rows yet. Idempotent and per-system, so existing
-            // closures aren't rebuilt. For a fresh CI database, this is a no-op
-            // because `hts import` already triggered the build via
-            // `migrate_concept_closure_pg` at the end of the import phase.
-            schema::migrate_concept_closure_pg(&mut client)
-                .await
-                .map_err(|e| {
-                    HtsError::StorageError(format!("Failed to build concept_closure: {e}"))
-                })?;
         }
 
         info!(database_url, "PostgreSQL terminology backend initialized");
@@ -184,24 +173,6 @@ impl PostgresTerminologyBackend {
     /// Borrow the underlying `deadpool-postgres` connection pool.
     pub fn pool(&self) -> &Pool {
         &self.pool
-    }
-
-    /// Build (or rebuild) `concept_closure` for every system that has
-    /// hierarchy edges but no closure rows.
-    ///
-    /// Called once at the end of a CLI bulk import so the server's first
-    /// request doesn't pay the build cost. For SNOMED CT (~20M closure pairs)
-    /// this takes ~30–60 s.
-    pub async fn rebuild_missing_closures(&self) -> Result<(), HtsError> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
-        schema::migrate_concept_closure_pg(&mut client)
-            .await
-            .map_err(|e| HtsError::StorageError(format!("concept_closure migration: {e}")))?;
-        Ok(())
     }
 }
 
@@ -318,30 +289,6 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-        // Before the transaction: record which CodeSystems currently have zero
-        // concepts in the DB so the post-commit closure build only touches
-        // newly-imported (or empty-stub) systems. Systems being updated in a
-        // batch import (e.g. SNOMED RF2 chunks) skip the per-batch rebuild
-        // because rebuilding per chunk is O(n²) — the SNOMED full closure
-        // is built once via the end-of-CLI `migrate_concept_closure_pg` call.
-        // Mirrors the SQLite import_bundle pattern.
-        let mut systems_needing_closure: Vec<String> = Vec::new();
-        for cs in &parsed.code_systems {
-            let row = client
-                .query_opt(
-                    "SELECT COUNT(*) FROM concepts c
-                     JOIN code_systems s ON c.system_id = s.id
-                     WHERE s.url = $1",
-                    &[&cs.url],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            let count: i64 = row.map(|r| r.get(0)).unwrap_or(0);
-            if count == 0 {
-                systems_needing_closure.push(cs.url.clone());
-            }
-        }
-
         let tx = client
             .transaction()
             .await
@@ -375,38 +322,6 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         tx.commit()
             .await
             .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
-
-        // Rebuild concept_closure for newly-imported (previously empty) code
-        // systems. Skipped for batch imports of existing systems so SNOMED
-        // RF2's ~1300 batches don't each pay the closure-rebuild cost — the
-        // full closure is built once at end-of-CLI via
-        // `migrate_concept_closure_pg` (called from main.rs). Mirrors the
-        // SQLite post-commit closure rebuild.
-        for url in &systems_needing_closure {
-            let row = client
-                .query_opt("SELECT id FROM code_systems WHERE url = $1", &[url])
-                .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            let Some(sid_row) = row else { continue };
-            let sid: String = sid_row.get(0);
-            let has_hier: bool = client
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = $1 LIMIT 1)",
-                    &[&sid],
-                )
-                .await
-                .map(|r| r.get(0))
-                .unwrap_or(false);
-            if has_hier {
-                if let Err(e) = schema::build_concept_closure_pg(&mut client, &sid).await {
-                    tracing::warn!(
-                        system_id = %sid,
-                        error = %e,
-                        "Failed to build concept_closure after import"
-                    );
-                }
-            }
-        }
 
         // Invalidate per-instance response caches — they may now shadow
         // newly-imported codes.
@@ -662,18 +577,6 @@ async fn write_code_system(
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
         }
     }
-
-    // Invalidate stale closure rows so the post-import / startup migration
-    // knows to (re)build the full closure once all batches are loaded. Without
-    // this, a partial closure from an earlier batch would be mistakenly treated
-    // as complete. Mirrors sqlite/import/fhir_bundle.rs.
-    client
-        .execute(
-            "DELETE FROM concept_closure WHERE system_id = $1",
-            &[&system_id],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     stats.code_systems += 1;
     Ok(())

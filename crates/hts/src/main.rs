@@ -313,22 +313,7 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
         #[cfg(feature = "postgres")]
         {
             let backend = PostgresTerminologyBackend::new(&args.database_url).await?;
-            let result = run_import_for_path(&backend, &ctx, &args, rxnorm_dir).await?;
-
-            // Pre-build concept closures now so server startup only needs to
-            // observe them present (idempotent migration sees no work). Without
-            // this the first ?fhir_vs=isa request would block on a SNOMED
-            // closure build, blowing past the 60 s health-check timeout.
-            if !args.dry_run {
-                info!("Building concept closures (this may take ~30–60 s for SNOMED CT)…");
-                backend
-                    .rebuild_missing_closures()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to build concept closures: {e}"))?;
-                info!("Concept closures ready");
-            }
-
-            result
+            run_import_for_path(&backend, &ctx, &args, rxnorm_dir).await?
         }
         #[cfg(not(feature = "postgres"))]
         anyhow::bail!(
