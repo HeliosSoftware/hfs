@@ -1044,13 +1044,15 @@ impl ExportDataProvider for PostgresBackend {
         if let Some(cursor) = cursor {
             let parts: Vec<&str> = cursor.splitn(2, '|').collect();
             if parts.len() == 2 {
-                sql.push_str(&format!(
-                    " AND (last_updated, id) > (${}, ${})",
-                    param_idx,
-                    param_idx + 1
-                ));
-                params.push(Box::new(parts[0].to_string()));
-                params.push(Box::new(parts[1].to_string()));
+                if let Ok(dt) = DateTime::parse_from_rfc3339(parts[0]) {
+                    sql.push_str(&format!(
+                        " AND (last_updated, id) > (${}, ${})",
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    params.push(Box::new(dt.with_timezone(&Utc)));
+                    params.push(Box::new(parts[1].to_string()));
+                }
             }
         }
 
@@ -1181,13 +1183,15 @@ impl PatientExportProvider for PostgresBackend {
             if let Some(cursor) = cursor {
                 let parts: Vec<&str> = cursor.splitn(2, '|').collect();
                 if parts.len() == 2 {
-                    sql.push_str(&format!(
-                        " AND (last_updated, id) > (${}, ${})",
-                        param_idx,
-                        param_idx + 1
-                    ));
-                    params.push(Box::new(parts[0].to_string()));
-                    params.push(Box::new(parts[1].to_string()));
+                    if let Ok(dt) = DateTime::parse_from_rfc3339(parts[0]) {
+                        sql.push_str(&format!(
+                            " AND (last_updated, id) > (${}, ${})",
+                            param_idx,
+                            param_idx + 1
+                        ));
+                        params.push(Box::new(dt.with_timezone(&Utc)));
+                        params.push(Box::new(parts[1].to_string()));
+                    }
                 }
             }
 
@@ -1268,13 +1272,15 @@ impl PatientExportProvider for PostgresBackend {
         if let Some(cursor) = cursor {
             let parts: Vec<&str> = cursor.splitn(2, '|').collect();
             if parts.len() == 2 {
-                sql.push_str(&format!(
-                    " AND (r.last_updated, r.id) > (${}, ${})",
-                    param_idx,
-                    param_idx + 1
-                ));
-                params.push(Box::new(parts[0].to_string()));
-                params.push(Box::new(parts[1].to_string()));
+                if let Ok(dt) = DateTime::parse_from_rfc3339(parts[0]) {
+                    sql.push_str(&format!(
+                        " AND (r.last_updated, r.id) > (${}, ${})",
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    params.push(Box::new(dt.with_timezone(&Utc)));
+                    params.push(Box::new(parts[1].to_string()));
+                }
             }
         }
 
