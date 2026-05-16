@@ -647,6 +647,19 @@ jobs:
               echo "::error::Inferno $LABEL group timed out"
               exit 1
             fi
+
+            if [ "$LABEL" = "smart" ]; then
+              SMART_AUTH_INFO="$(jq -r '
+                [.[] | .outputs[]? | select(.name == "smart_auth_info") | .value | select(contains("\"access_token\""))]
+                | last // empty
+              ' "$RESULTS_DIR/results-smart.json")"
+
+              if [ -z "$SMART_AUTH_INFO" ]; then
+                echo "::error::SMART group did not produce access-token auth info for export tests"
+                jq -r '.[] | select(.result == "fail" or .result == "error") | "  \(.test_id): \(.result) - \(.result_message // "No message")"' "$RESULTS_DIR/results-smart.json"
+                exit 1
+              fi
+            fi
           done
 
           # Merge results from both groups for downstream steps

@@ -35,6 +35,14 @@ pub struct SmartConfiguration {
 impl SmartConfiguration {
     /// Build the SMART configuration document from `AuthConfig`.
     pub fn from_config(config: &AuthConfig) -> Self {
+        let mut response_types_supported = vec!["token".to_string()];
+        let mut grant_types_supported = vec!["client_credentials".to_string()];
+
+        if config.smart_authorize_endpoint.is_some() {
+            response_types_supported.push("code".to_string());
+            grant_types_supported.push("authorization_code".to_string());
+        }
+
         Self {
             issuer: config.expected_issuer.clone(),
             jwks_uri: config
@@ -52,8 +60,8 @@ impl SmartConfiguration {
                 "system/*.rs".to_string(),
                 "system/*.r".to_string(),
             ],
-            response_types_supported: vec!["token".to_string()],
-            grant_types_supported: vec!["client_credentials".to_string()],
+            response_types_supported,
+            grant_types_supported,
             token_endpoint_auth_methods_supported: vec!["private_key_jwt".to_string()],
             code_challenge_methods_supported: vec!["S256".to_string()],
             token_endpoint_auth_signing_alg_values_supported: vec![
@@ -93,6 +101,7 @@ mod tests {
         let config = AuthConfig {
             expected_issuer: Some("https://idp.example.com".to_string()),
             smart_token_endpoint: Some("https://idp.example.com/token".to_string()),
+            smart_authorize_endpoint: Some("https://idp.example.com/authorize".to_string()),
             smart_jwks_url: Some("https://idp.example.com/.well-known/jwks.json".to_string()),
             ..AuthConfig::default()
         };
@@ -103,6 +112,12 @@ mod tests {
             smart.token_endpoint.as_deref(),
             Some("https://idp.example.com/token")
         );
+        assert!(
+            smart
+                .grant_types_supported
+                .contains(&"authorization_code".to_string())
+        );
+        assert!(smart.response_types_supported.contains(&"code".to_string()));
         assert_eq!(
             smart.jwks_uri.as_deref(),
             Some("https://idp.example.com/.well-known/jwks.json")
