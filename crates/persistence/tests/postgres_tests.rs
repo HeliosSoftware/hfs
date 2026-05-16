@@ -504,7 +504,7 @@ mod postgres_integration {
     use testcontainers::ImageExt;
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
-    use tokio::sync::OnceCell;
+    use tokio::sync::{Mutex, OnceCell};
 
     /// Shared PostgreSQL container reused across all tests in this module.
     struct SharedPg {
@@ -515,6 +515,7 @@ mod postgres_integration {
     }
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
+    static BULK_EXPORT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
@@ -2884,6 +2885,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_export_claim_skip_locked() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
         let backend = create_backend().await;
         let tenant = create_tenant("export-claim");
 
@@ -2923,6 +2925,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_export_stale_worker_fenced_out() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
         let backend = create_backend().await;
         let tenant = create_tenant("export-fence");
 
@@ -2964,6 +2967,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_export_count_active_and_expire() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
         let backend = create_backend().await;
         let tenant = create_tenant("export-cleanup");
 
