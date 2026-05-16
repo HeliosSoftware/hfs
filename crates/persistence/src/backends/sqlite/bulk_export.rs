@@ -1324,8 +1324,10 @@ impl PatientExportProvider for SqliteBackend {
             .iter()
             .map(|id| format!("Patient/{}", id))
             .collect();
+        let since_value = request.since.map(|s| s.to_rfc3339());
+        let patient_ref_param_start = if since_value.is_some() { 4 } else { 3 };
         let placeholders: Vec<String> = (0..patient_refs.len())
-            .map(|i| format!("?{}", i + 4))
+            .map(|i| format!("?{}", i + patient_ref_param_start))
             .collect();
 
         let mut query = format!(
@@ -1346,8 +1348,6 @@ impl PatientExportProvider for SqliteBackend {
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
         ];
-        // Placeholder for since filter slot
-        let since_value = request.since.map(|s| s.to_rfc3339());
         if since_value.is_some() {
             params_vec.push(Box::new(since_value.clone().unwrap()));
         }
