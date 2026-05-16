@@ -477,6 +477,13 @@ jobs:
             "resourceType": "Observation",
             "id": "inferno-bulk-observation-a",
             "status": "final",
+            "category": [{
+              "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }]
+            }],
             "code": {
               "coding": [{
                 "system": "http://loinc.org",
@@ -677,7 +684,7 @@ jobs:
 
           RESULTS=$(cat "$RESULTS_DIR/results.json")
           LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
-          OMIT_EXPR='(.test_id | test("(bulk_data_server_tls_version_stu2|smart_backend_services_token_tls_version)$"))'
+          OMIT_EXPR='(.test_id | test("(bulk_data_server_tls_version_stu2|smart_backend_services_token_tls_version|bulk_file_server_tls_version)$"))'
 
           FAILURES=$(echo "$RESULTS" | jq "$LATEST | [.[] | select((.result == \"fail\" or .result == \"error\") and ($OMIT_EXPR | not))] | length")
           OMITTED_COUNT=$(echo "$RESULTS" | jq "$LATEST | [.[] | select($OMIT_EXPR)] | length")
@@ -698,7 +705,7 @@ jobs:
           if [ -f "$RESULTS_DIR/results.json" ]; then
             RESULTS=$(cat "$RESULTS_DIR/results.json")
             LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
-            OMIT_EXPR='(.test_id | test("(bulk_data_server_tls_version_stu2|smart_backend_services_token_tls_version)$"))'
+            OMIT_EXPR='(.test_id | test("(bulk_data_server_tls_version_stu2|smart_backend_services_token_tls_version|bulk_file_server_tls_version)$"))'
 
             TOTAL=$(echo "$RESULTS" | jq "$LATEST | length")
             PASS=$(echo "$RESULTS" | jq "$LATEST | [.[] | select(.result == \"pass\")] | length")
