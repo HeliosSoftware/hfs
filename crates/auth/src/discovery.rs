@@ -27,6 +27,7 @@ pub struct SmartConfiguration {
     pub response_types_supported: Vec<String>,
     pub grant_types_supported: Vec<String>,
     pub token_endpoint_auth_methods_supported: Vec<String>,
+    pub code_challenge_methods_supported: Vec<String>,
     pub token_endpoint_auth_signing_alg_values_supported: Vec<String>,
     pub capabilities: Vec<String>,
 }
@@ -54,6 +55,7 @@ impl SmartConfiguration {
             response_types_supported: vec!["token".to_string()],
             grant_types_supported: vec!["client_credentials".to_string()],
             token_endpoint_auth_methods_supported: vec!["private_key_jwt".to_string()],
+            code_challenge_methods_supported: vec!["S256".to_string()],
             token_endpoint_auth_signing_alg_values_supported: vec![
                 "RS384".to_string(),
                 "ES384".to_string(),
@@ -83,6 +85,7 @@ mod tests {
         assert!(smart.issuer.is_none());
         assert!(smart.token_endpoint.is_none());
         assert!(smart.capabilities.contains(&"permission-v2".to_string()));
+        assert_eq!(smart.code_challenge_methods_supported, vec!["S256"]);
     }
 
     #[test]
@@ -117,6 +120,10 @@ mod tests {
 
         assert!(json["capabilities"].is_array());
         assert!(json["scopes_supported"].is_array());
+        assert_eq!(
+            json["code_challenge_methods_supported"],
+            serde_json::json!(["S256"])
+        );
         // Fields that are None should be omitted
         assert!(json.get("authorization_endpoint").is_none());
     }

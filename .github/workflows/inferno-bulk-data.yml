@@ -309,7 +309,8 @@ jobs:
               "attributes": {
                 "use.jwks.url": "true",
                 "jwks.url": $jwks_url,
-                "token.endpoint.auth.signing.alg": "ES384"
+                "token.endpoint.auth.signing.alg": "ES384",
+                "token.endpoint.auth.signing.max.exp": "600"
               }
             }]
           ' docker/keycloak/realm.json > "$RESULTS_DIR/keycloak-realm.json"
