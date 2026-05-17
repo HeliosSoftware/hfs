@@ -33,9 +33,6 @@ use futures::Stream;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_persistence::tenant::TenantContext;
-use helios_persistence::types::{
-    SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
-};
 use helios_sof::sqlquery::SqlQueryError;
 use helios_sof::{
     ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableSchema, bind_supplied_params,
@@ -46,6 +43,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tracing::warn;
 
+use super::references::resolve_resource_canonical_or_relative;
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
@@ -413,111 +411,6 @@ where
     S: SearchProvider + Send + Sync + 'static,
 {
     resolve_resource_canonical_or_relative(state, tenant, "ViewDefinition", url).await
-}
-
-/// Resolves a canonical-or-relative reference for the given resource type.
-///
-/// Accepts both:
-/// - `Type/{id}` — relative reference, served by `ResourceStorage::read`.
-/// - absolute canonical URL (`http(s)://…`, optionally `…|version`) — resolved
-///   via `SearchProvider::search` with `url=` (and `version=` when supplied),
-///   picking the newest match by `meta.lastUpdated`.
-///
-/// The spec pins `relatedArtifact.resource` to `canonical([Resource])`, but
-/// relative references are widely used in practice and FHIR treats them as
-/// valid canonical references in a server-local context.
-async fn resolve_resource_canonical_or_relative<S>(
-    state: &AppState<S>,
-    tenant: &TenantContext,
-    resource_type: &str,
-    reference: &str,
-) -> Result<Value, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    let trimmed = reference.trim();
-    let prefix = format!("{resource_type}/");
-    if let Some(rest) = trimmed.strip_prefix(prefix.as_str()) {
-        let id = rest.split('/').next().unwrap_or("");
-        if id.is_empty() {
-            return Err(RestError::BadRequest {
-                message: format!("'{reference}' has an empty id after '{resource_type}/'"),
-            });
-        }
-        let stored = state
-            .storage()
-            .read(tenant, resource_type, id)
-            .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("failed to read {resource_type}: {e}"),
-            })?
-            .ok_or_else(|| RestError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            })?;
-        return Ok(stored.content().clone());
-    }
-    resolve_by_canonical_url(state, tenant, resource_type, trimmed).await
-}
-
-async fn resolve_by_canonical_url<S>(
-    state: &AppState<S>,
-    tenant: &TenantContext,
-    resource_type: &str,
-    url: &str,
-) -> Result<Value, RestError>
-where
-    S: SearchProvider + Send + Sync + 'static,
-{
-    // Accept `url|version` syntax per the FHIR canonical convention.
-    let (canonical, version) = match url.split_once('|') {
-        Some((u, v)) => (u.to_string(), Some(v.to_string())),
-        None => (url.to_string(), None),
-    };
-
-    let mut query = SearchQuery::new(resource_type);
-    query.parameters.push(SearchParameter {
-        name: "url".to_string(),
-        param_type: SearchParamType::Uri,
-        modifier: None,
-        values: vec![SearchValue::new(SearchPrefix::Eq, canonical)],
-        chain: Vec::new(),
-        components: Vec::new(),
-    });
-    if let Some(v) = version {
-        query.parameters.push(SearchParameter {
-            name: "version".to_string(),
-            param_type: SearchParamType::Token,
-            modifier: None,
-            values: vec![SearchValue::new(SearchPrefix::Eq, v)],
-            chain: Vec::new(),
-            components: Vec::new(),
-        });
-    }
-
-    let result =
-        state
-            .storage()
-            .search(tenant, &query)
-            .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
-            })?;
-
-    let candidates: Vec<_> = result.resources.items.into_iter().collect();
-    if candidates.is_empty() {
-        return Err(RestError::UnprocessableEntity {
-            message: format!("could not resolve canonical {resource_type} '{url}'"),
-        });
-    }
-    // Pick newest by last_modified.
-    let chosen = candidates
-        .into_iter()
-        .max_by_key(|r| r.last_modified())
-        .ok_or_else(|| RestError::InternalError {
-            message: "unreachable: candidates was non-empty".into(),
-        })?;
-    Ok(chosen.content().clone())
 }
 
 /// Convert a `RowStream<Result<Value, SofError>>` into a stream

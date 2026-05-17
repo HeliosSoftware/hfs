@@ -611,6 +611,37 @@ impl SearchParameterLoader {
             .with_source(SearchParameterSource::Embedded),
         );
 
+        // SQL-on-FHIR canonical resources: `url` and `version` are not in the
+        // base FHIR R4/R4B search-parameters bundle for ViewDefinition (which
+        // first appears in R5+). The SoF `$viewdefinition-run`,
+        // `$viewdefinition-export`, and `$sqlquery-run` operations resolve
+        // `viewReference`/`queryReference` canonical URLs via SearchProvider;
+        // without these embedded fallbacks the resolver returns zero matches
+        // and the capability statement's `supportsCanonicalReference: true`
+        // claim isn't truthful.
+        for rt in ["ViewDefinition", "Library"] {
+            params.push(
+                SearchParameterDefinition::new(
+                    format!("http://hl7.org/fhir/SearchParameter/{rt}-url"),
+                    "url",
+                    SearchParamType::Uri,
+                    "url",
+                )
+                .with_base(vec![rt])
+                .with_source(SearchParameterSource::Embedded),
+            );
+            params.push(
+                SearchParameterDefinition::new(
+                    format!("http://hl7.org/fhir/SearchParameter/{rt}-version"),
+                    "version",
+                    SearchParamType::Token,
+                    "version",
+                )
+                .with_base(vec![rt])
+                .with_source(SearchParameterSource::Embedded),
+            );
+        }
+
         params
     }
 }
@@ -636,9 +667,11 @@ mod tests {
         let loader = SearchParameterLoader::new(FhirVersion::R4);
         let params = loader.load_embedded().unwrap();
 
-        // Minimal fallback only contains Resource-level params
+        // Minimal fallback contains the five Resource-level params plus
+        // SQL-on-FHIR canonical search params (url+version) for
+        // ViewDefinition and Library (4 additional entries).
         assert!(!params.is_empty());
-        assert!(params.len() <= 5, "Minimal fallback should have ~5 params");
+        assert!(params.len() <= 9, "Minimal fallback should have ~9 params");
 
         // Check for essential Resource-level parameters
         let has_id = params.iter().any(|p| p.code == "_id");

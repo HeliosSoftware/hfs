@@ -299,7 +299,16 @@ where
             "/$sql-on-fhir-capabilities",
             get(handlers::sof::sof_capabilities_handler::<S>),
         )
-        // Anonymous run: POST /ViewDefinition/$viewdefinition-run
+        // Run (system level): POST/GET /$viewdefinition-run
+        // Spec lists system-level invocation at [base]/$viewdefinition-run
+        // with no resource-type prefix, matching the export and sqlquery-run
+        // operations.
+        .route(
+            "/$viewdefinition-run",
+            post(handlers::sof::run_view_definition_handler::<S>)
+                .get(handlers::sof::run_view_definition_handler::<S>),
+        )
+        // Anonymous run (type level): POST /ViewDefinition/$viewdefinition-run
         // GET is permitted per spec when the ViewDefinition is supplied via
         // `viewReference` query parameter (no `viewResource`/`resource` body).
         .route(

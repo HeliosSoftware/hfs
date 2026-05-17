@@ -2,6 +2,7 @@
 
 pub mod capability;
 pub mod export;
+pub(crate) mod references;
 pub mod run;
 pub mod sqlquery;
 

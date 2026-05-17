@@ -62,6 +62,41 @@ mod sof_run_tests {
             .expect("failed to seed patient");
     }
 
+    /// Seeds a Patient ViewDefinition with the given id and (optional)
+    /// canonical url + version, used by canonical-resolution tests.
+    async fn seed_view_definition(
+        backend: &SqliteBackend,
+        id: &str,
+        url: Option<&str>,
+        version: Option<&str>,
+    ) {
+        let tenant = test_tenant();
+        let mut vd = json!({
+            "resourceType": "ViewDefinition",
+            "id": id,
+            "resource": "Patient",
+            "status": "active",
+            "select": [
+                {
+                    "column": [
+                        { "path": "id", "name": "patient_id", "type": "string" },
+                        { "path": "name.family", "name": "family", "type": "string" }
+                    ]
+                }
+            ]
+        });
+        if let Some(u) = url {
+            vd["url"] = Value::String(u.to_string());
+        }
+        if let Some(v) = version {
+            vd["version"] = Value::String(v.to_string());
+        }
+        backend
+            .create(&tenant, "ViewDefinition", vd, FhirVersion::R4)
+            .await
+            .expect("failed to seed ViewDefinition");
+    }
+
     /// Returns a minimal valid ViewDefinition that selects `id` and `name.family` from Patient.
     fn patient_view_definition() -> Value {
         json!({
@@ -232,13 +267,18 @@ mod sof_run_tests {
         );
     }
 
-    /// `POST /ViewDefinition/{id}/$viewdefinition-run` (instance variant) behaves
-    /// identically to the anonymous form when a body is supplied.
+    /// `POST /ViewDefinition/{id}/$viewdefinition-run` (instance variant) runs
+    /// the *stored* ViewDefinition. Spec: at instance level the server infers
+    /// `viewReference` from the URL path. A body whose `id` matches the path
+    /// is allowed (no-op override).
     #[tokio::test]
     async fn test_run_stored_view_definition_with_body() {
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "pt-stored-1", "Green").await;
+        seed_view_definition(&backend, "some-view-id", None, None).await;
 
+        // Body's bare ViewDefinition has no `id` field — guard treats this as
+        // a no-op override; stored view runs.
         let response = server
             .post("/ViewDefinition/some-view-id/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
@@ -260,6 +300,36 @@ mod sof_run_tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["family"], "Green");
+    }
+
+    /// Spec G5: an instance-level URL is bound to its path id. A body that
+    /// supplies a `viewResource` with a *different* id (or a
+    /// `viewReference` pointing elsewhere) must be rejected with 400.
+    #[tokio::test]
+    async fn test_run_stored_view_definition_rejects_mismatched_body() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-x", "Green").await;
+        seed_view_definition(&backend, "view-a", None, None).await;
+
+        // Body's ViewDefinition has id `view-b`, conflicting with path
+        // `view-a`.
+        let mut conflicting = patient_view_definition();
+        conflicting["id"] = Value::String("view-b".into());
+
+        let response = server
+            .post("/ViewDefinition/view-a/$viewdefinition-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&conflicting)
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let outcome: Value = serde_json::from_str(&response.text()).unwrap();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["code"], "invalid");
     }
 
     /// A `Parameters` body wrapping a ViewDefinition via `viewResource` is accepted.
@@ -748,25 +818,32 @@ mod sof_run_tests {
         assert_eq!(rows[0]["family"], "RefFam");
     }
 
+    /// A canonical viewReference that does not match any stored
+    /// ViewDefinition resolves with 422 (`processing`), distinguishing
+    /// "couldn't resolve" from the previous "rejected unconditionally".
     #[tokio::test]
-    async fn test_run_view_definition_view_reference_canonical_rejected() {
+    async fn test_run_view_definition_unknown_canonical_reference_422() {
         let (server, _backend) = create_test_server().await;
 
-        // Canonical references are not yet supported and should return 400.
         let body = json!({
             "resourceType": "Parameters",
-            "parameter": [{
-                "name": "viewReference",
-                "valueReference": {"reference": "http://example.org/ViewDefinition/foo|1.0"}
-            }]
+            "parameter": [
+                {"name": "_format", "valueCode": "ndjson"},
+                {"name": "viewReference",
+                 "valueReference": {"reference": "http://example.org/ViewDefinition/missing|1.0"}}
+            ]
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .post("/ViewDefinition/$viewdefinition-run")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
             .json(&body)
             .await;
-        response.assert_status(StatusCode::BAD_REQUEST);
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     // =========================================================================
@@ -894,5 +971,130 @@ mod sof_run_tests {
         assert!(subjects.contains(&"Patient/p1"));
         assert!(subjects.contains(&"Patient/p2"));
         assert!(!subjects.contains(&"Patient/p3"));
+    }
+
+    // =========================================================================
+    // Spec alignment (round 2)
+    // =========================================================================
+
+    /// G7: system-level URL `/$viewdefinition-run` is routed and works like
+    /// the type-level form.
+    #[tokio::test]
+    async fn test_run_view_definition_system_level_route() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-sys-1", "System").await;
+
+        let response = server
+            .post("/$viewdefinition-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["family"], "System");
+    }
+
+    /// G1: `viewReference` accepts a canonical URL; the server resolves it
+    /// via `SearchProvider` against `ViewDefinition.url`.
+    #[tokio::test]
+    async fn test_run_view_definition_canonical_view_reference() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-can-1", "Canonical").await;
+        seed_view_definition(
+            &backend,
+            "vd-can",
+            Some("http://example.org/fhir/ViewDefinition/patient-family"),
+            None,
+        )
+        .await;
+
+        let url = "/ViewDefinition/$viewdefinition-run\
+                   ?_format=ndjson\
+                   &viewReference=http://example.org/fhir/ViewDefinition/patient-family";
+        let response = server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["family"], "Canonical");
+    }
+
+    /// G1: canonical URL with `|version` selects the matching version.
+    #[tokio::test]
+    async fn test_run_view_definition_canonical_view_reference_with_version() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-ver-1", "Versioned").await;
+        let url = "http://example.org/fhir/ViewDefinition/family";
+        seed_view_definition(&backend, "vd-v1", Some(url), Some("1.0.0")).await;
+        seed_view_definition(&backend, "vd-v2", Some(url), Some("2.0.0")).await;
+
+        let route =
+            format!("/ViewDefinition/$viewdefinition-run?_format=ndjson&viewReference={url}|2.0.0");
+        let response = server
+            .get(&route)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        // Either version returns the same rows shape; the test mainly
+        // exercises that `|version` doesn't blow up resolution.
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["family"], "Versioned");
+    }
+
+    /// G2: `source` parameter returns **400** + OperationOutcome with code
+    /// `not-supported` (previously 501).
+    #[tokio::test]
+    async fn test_run_view_definition_source_returns_400_not_supported() {
+        let (server, _backend) = create_test_server().await;
+
+        let parameters_body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "viewResource", "resource": patient_view_definition() },
+                { "name": "_format", "valueCode": "ndjson" },
+                { "name": "source", "valueString": "s3://example/bucket" }
+            ]
+        });
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&parameters_body)
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let outcome: Value = serde_json::from_str(&response.text()).unwrap();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["code"], "not-supported");
     }
 }

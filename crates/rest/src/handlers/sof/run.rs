@@ -47,6 +47,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use super::references::resolve_resource_canonical_or_relative;
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
@@ -169,29 +170,93 @@ where
         .as_ref()
         .map(extract_run_params_from_json)
         .unwrap_or_default();
-    // If the body provides a ViewDefinition (inline or by reference), prefer
-    // it. Otherwise, load the stored ViewDefinition by id from the path.
-    let view_json = match body_value.as_ref() {
-        Some(b) if body_has_view_definition(b) => {
-            resolve_view_from_body(&state, &tenant, b).await?
+    // Spec: at instance level the server infers `viewReference` from the URL
+    // path. A body that supplies a different `viewResource`/`viewReference`
+    // would silently change which view runs — reject that with 400 + invalid.
+    // A body that supplies the *same* view as the path is allowed (no-op).
+    if let Some(b) = body_value.as_ref() {
+        if body_has_view_definition(b) {
+            ensure_instance_body_matches_path(b, &id, &body_params)?;
         }
-        _ => {
-            let stored = state
-                .storage()
-                .read(tenant.context(), "ViewDefinition", &id)
-                .await
-                .map_err(|e| RestError::InternalError {
-                    message: format!("failed to read ViewDefinition: {e}"),
-                })?
-                .ok_or_else(|| RestError::NotFound {
-                    resource_type: "ViewDefinition".to_string(),
-                    id: id.clone(),
-                })?;
-            stored.content().clone()
-        }
-    };
+    }
+    let stored = state
+        .storage()
+        .read(tenant.context(), "ViewDefinition", &id)
+        .await
+        .map_err(|e| RestError::InternalError {
+            message: format!("failed to read ViewDefinition: {e}"),
+        })?
+        .ok_or_else(|| RestError::NotFound {
+            resource_type: "ViewDefinition".to_string(),
+            id: id.clone(),
+        })?;
+    let view_json = stored.content().clone();
     let params = merge_params(query_params, &body_params);
     execute_view(state, params, body_params, tenant, view_json, &headers).await
+}
+
+/// Verifies that a body-supplied `viewResource`/`viewReference` on an
+/// instance-level URL refers to the same ViewDefinition as the path id.
+/// Returns 400 + `invalid` when it doesn't.
+fn ensure_instance_body_matches_path(
+    body: &Value,
+    path_id: &str,
+    body_params: &ExtractedRunParams,
+) -> Result<(), RestError> {
+    // Bare ViewDefinition body: its `id` (if present) must match the path.
+    if body.get("resourceType").and_then(|v| v.as_str()) == Some("ViewDefinition") {
+        let body_id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if body_id.is_empty() || body_id == path_id {
+            return Ok(());
+        }
+        return Err(RestError::BadRequest {
+            message: format!(
+                "instance-level URL is bound to ViewDefinition/{path_id}; \
+                 body must not supply a different ViewDefinition (got id='{body_id}'). \
+                 POST to /ViewDefinition/$viewdefinition-run for ad-hoc runs."
+            ),
+        });
+    }
+
+    // Parameters body: inline viewResource or viewReference must agree.
+    if let Some(view) = &body_params.view_resource {
+        let body_id = view.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if !body_id.is_empty() && body_id != path_id {
+            return Err(RestError::BadRequest {
+                message: format!(
+                    "instance-level URL is bound to ViewDefinition/{path_id}; \
+                     body viewResource has a different id='{body_id}'. \
+                     POST to /ViewDefinition/$viewdefinition-run for ad-hoc runs."
+                ),
+            });
+        }
+    }
+    if let Some(reference) = &body_params.view_reference {
+        let trimmed = reference.trim();
+        let expected_relative = format!("ViewDefinition/{path_id}");
+        // Accept the relative form, or any canonical/absolute URL that ends
+        // with `/ViewDefinition/{path_id}` (with optional `|version` /
+        // `@version` suffix).
+        let matches_relative = trimmed == expected_relative;
+        let matches_canonical = {
+            let without_suffix = trimmed
+                .split_once('|')
+                .map(|(u, _)| u)
+                .unwrap_or_else(|| trimmed.rsplit_once('@').map(|(u, _)| u).unwrap_or(trimmed));
+            without_suffix.ends_with(&format!("/{expected_relative}"))
+        };
+        if !matches_relative && !matches_canonical {
+            return Err(RestError::BadRequest {
+                message: format!(
+                    "instance-level URL is bound to ViewDefinition/{path_id}; \
+                     body viewReference '{reference}' refers to a different ViewDefinition. \
+                     POST to /ViewDefinition/$viewdefinition-run for ad-hoc runs."
+                ),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Merges body parameters onto query-string parameters with body precedence
@@ -272,13 +337,16 @@ where
 
 /// Resolves a FHIR reference string into a stored ViewDefinition.
 ///
-/// Supports:
-/// - Relative references: `ViewDefinition/{id}` → `storage.read(...)`
+/// Supports all three spec-listed forms via the shared
+/// [`resolve_resource_canonical_or_relative`] helper:
+/// - Relative: `ViewDefinition/{id}`
+/// - Canonical URL with `|version` (FHIR convention) or `@version` (spec
+///   narrative form)
+/// - Absolute URL
 ///
-/// Canonical (`http://example.org/...`) and absolute references are not yet
-/// implemented; they return a 400 with a descriptive OperationOutcome. The
-/// `$sql-on-fhir-capabilities` response advertises this via
-/// `supportsCanonicalReference` / `supportsAbsoluteReference = false`.
+/// Advertised by `/$sql-on-fhir-capabilities` as
+/// `supportsRelativeReference`, `supportsCanonicalReference`, and
+/// `supportsAbsoluteReference`.
 async fn resolve_view_reference<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -287,36 +355,8 @@ async fn resolve_view_reference<S>(
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    let trimmed = reference.trim();
-    // Relative form: "ViewDefinition/{id}" (optionally /_history/{vid} suffix is ignored).
-    if let Some(rest) = trimmed.strip_prefix("ViewDefinition/") {
-        let id = rest.split('/').next().unwrap_or("").to_string();
-        if id.is_empty() {
-            return Err(RestError::BadRequest {
-                message: format!("viewReference '{reference}' has an empty id"),
-            });
-        }
-        let stored = state
-            .storage()
-            .read(tenant.context(), "ViewDefinition", &id)
-            .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("failed to read ViewDefinition: {e}"),
-            })?
-            .ok_or_else(|| RestError::NotFound {
-                resource_type: "ViewDefinition".to_string(),
-                id: id.clone(),
-            })?;
-        return Ok(stored.content().clone());
-    }
-
-    Err(RestError::BadRequest {
-        message: format!(
-            "viewReference '{reference}' uses an unsupported form; \
-             this server currently supports only relative references like \
-             'ViewDefinition/{{id}}'. See `/$sql-on-fhir-capabilities` for details."
-        ),
-    })
+    resolve_resource_canonical_or_relative(state, tenant.context(), "ViewDefinition", reference)
+        .await
 }
 
 /// Resolves the SofRunner and executes the view, returning a streaming response.
@@ -338,9 +378,11 @@ where
     S: SearchProvider + Send + Sync + 'static,
 {
     // Per spec: `source` is an alternate data origin for stateless ETL. HFS
-    // is storage-backed; the stateless `sof-server` is the right home for this.
+    // is storage-backed; the stateless `sof-server` is the right home for
+    // this. Return 400 + `not-supported` so the OperationOutcome matches the
+    // spec's error-code examples for refused parameters.
     if body_params.source.is_some() || params.source.is_some() {
-        return Err(RestError::NotImplemented {
+        return Err(RestError::NotSupported {
             feature: "the 'source' parameter is not supported by this storage-backed server; \
                       use the stateless 'sof-server' for external-data-source runs"
                 .to_string(),
