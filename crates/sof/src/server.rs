@@ -311,9 +311,13 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
     let mut app = Router::new()
         // FHIR endpoints
         .route("/metadata", get(handlers::capability_statement))
+        // Per spec, GET is permitted for simple invocations (no
+        // viewResource/resource body). sof-server is stateless and rejects
+        // viewReference, so GET will normally surface a 400/501 — but the
+        // route exists so clients can negotiate the method correctly.
         .route(
             "/ViewDefinition/$viewdefinition-run",
-            post(handlers::run_view_definition_handler),
+            post(handlers::run_view_definition_handler).get(handlers::run_view_definition_handler),
         )
         // Health check endpoint
         .route("/health", get(handlers::health_check))

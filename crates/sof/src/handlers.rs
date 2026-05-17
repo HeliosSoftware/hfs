@@ -80,13 +80,40 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 pub async fn run_view_definition_handler(
     Query(params): Query<RunQueryParams>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    body: Option<Json<serde_json::Value>>,
 ) -> ServerResult<Response> {
     info!("Handling ViewDefinition/$viewdefinition-run request");
     debug!("Query params: {:?}", params);
 
-    // Validate and parse query parameters
+    // Enforce spec cardinality `_format = 1..1`: at least one of `_format`
+    // (query or body) or a usable `Accept` header must be present. Body is
+    // inspected permissively here so we can fail fast before parsing the
+    // typed Parameters resource.
     let accept_header = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
+    let body_has_format = body
+        .as_ref()
+        .is_some_and(|Json(b)| helios_sof::extract_run_params_from_json(b).format.is_some());
+    if params.format.is_none() && accept_header.is_none() && !body_has_format {
+        return Err(ServerError::BadRequest(
+            "_format is required (or provide an Accept header with a supported MIME type); \
+             supported formats: json, ndjson, csv, parquet"
+                .to_string(),
+        ));
+    }
+
+    // GET / bodyless requests can't carry viewResource or resource. With no
+    // body to extract a ViewDefinition from and no viewReference support
+    // (sof-server is stateless), we reject early with a 400.
+    let Some(Json(body)) = body else {
+        return Err(ServerError::BadRequest(
+            "GET /ViewDefinition/$viewdefinition-run requires a 'viewReference' to be supported \
+             by the server; this stateless server does not resolve viewReference. Use POST \
+             with viewResource in a Parameters body instead."
+                .to_string(),
+        ));
+    };
+
+    // Validate and parse query parameters
     let validated_params =
         validate_query_params(&params, accept_header).map_err(ServerError::BadRequest)?;
 

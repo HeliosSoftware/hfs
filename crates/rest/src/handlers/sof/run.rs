@@ -2,12 +2,14 @@
 //!
 //! Implements the SQL-on-FHIR
 //! [`$viewdefinition-run`](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/operations-viewdefinition-run.html)
-//! operation in two forms:
+//! operation. Both `POST` and `GET` are routed:
 //!
 //! - `POST /ViewDefinition/$viewdefinition-run` — supply the ViewDefinition inline in the body
-//! - `POST /ViewDefinition/{id}/$viewdefinition-run` — run a stored ViewDefinition
+//! - `POST /ViewDefinition/{id}/$viewdefinition-run` — run a stored ViewDefinition (body may override)
+//! - `GET /ViewDefinition/$viewdefinition-run?viewReference=ViewDefinition/{id}&_format=ndjson`
+//! - `GET /ViewDefinition/{id}/$viewdefinition-run?_format=ndjson`
 //!
-//! ## Request body
+//! ## Request body (POST)
 //!
 //! Accepts a FHIR `Parameters` resource or a raw `ViewDefinition` JSON object.
 //!
@@ -16,14 +18,16 @@
 //! | `viewResource` | Resource | The ViewDefinition to execute (Parameters form) |
 //! | `patient` | string | Restrict to this patient reference |
 //! | `group` | string | Restrict to this group reference |
-//! | `_format` | string | Output format: `ndjson` (default), `csv`, `json` |
+//! | `_format` | string | Output format: `ndjson`, `csv`, `json`, `parquet` (required; may also be supplied via `Accept`) |
 //! | `_limit` | integer | Maximum number of output rows |
 //! | `_since` | instant | Only include resources modified after this time |
 //!
 //! ## Response
 //!
 //! - `200 OK` — stream of output rows in the requested format
+//! - `400 Bad Request` — missing `_format`, unsupported format, or invalid parameters
 //! - `422 Unprocessable Entity` — ViewDefinition could not be compiled or executed
+//! - `501 Not Implemented` — `source` parameter (storage-backed server)
 
 use axum::{
     extract::{Path, Query, State},
@@ -54,7 +58,8 @@ use crate::state::AppState;
 /// merged in via [`merge_params`] and take precedence.
 #[derive(Debug, Default, Deserialize)]
 pub struct RunQueryParams {
-    /// Output format: `ndjson` (default), `csv`, `json`.
+    /// Output format: `ndjson`, `csv`, `json`, `parquet`. Required by spec
+    /// (`1..1`) — but may also be supplied via the `Accept` header.
     #[serde(rename = "_format")]
     pub format: Option<String>,
 
@@ -74,6 +79,15 @@ pub struct RunQueryParams {
 
     /// Filter by group references (comma-separated for multiple).
     pub group: Option<String>,
+
+    /// Reference to a stored ViewDefinition. Only meaningful on GET requests
+    /// (POST callers supply `viewResource`/`viewReference` in the body).
+    #[serde(rename = "viewReference")]
+    pub view_reference: Option<String>,
+
+    /// External data source. HFS rejects this with 501 (storage-backed; the
+    /// stateless `sof-server` is the right place for source-based ETL).
+    pub source: Option<String>,
 }
 
 /// Splits a comma-separated query value into trimmed, non-empty references.
@@ -88,11 +102,15 @@ fn split_refs(v: Option<&str>) -> Vec<String> {
     }
 }
 
-/// `POST /ViewDefinition/$viewdefinition-run`
+/// `POST` (or `GET`) `/ViewDefinition/$viewdefinition-run`
 ///
-/// The ViewDefinition must be supplied in the request body either as:
+/// On `POST`, the ViewDefinition must be supplied in the request body either as:
 /// - A raw `ViewDefinition` JSON object, or
 /// - A FHIR `Parameters` resource with a `viewResource` parameter.
+///
+/// On `GET`, no body is permitted (per spec: `viewResource` and `resource` are
+/// POST-only). The ViewDefinition must come from the `viewReference` query
+/// parameter.
 ///
 /// When the body is a `Parameters` resource, additional parameter entries
 /// (`_format`, `_limit`, `_since`, `patient`, `group`, `header`) override
@@ -101,55 +119,79 @@ pub async fn run_view_definition_handler<S>(
     State(state): State<AppState<S>>,
     Query(query_params): Query<RunQueryParams>,
     tenant: TenantExtractor,
-    _headers: HeaderMap,
-    body: axum::extract::Json<Value>,
+    headers: HeaderMap,
+    body: Option<axum::extract::Json<Value>>,
 ) -> Result<impl IntoResponse, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    let body_params = extract_run_params_from_json(&body.0);
-    let view_json = resolve_view_from_body(&state, &tenant, &body.0).await?;
+    let body_value = body.map(|j| j.0);
+    let body_params = body_value
+        .as_ref()
+        .map(extract_run_params_from_json)
+        .unwrap_or_default();
+    let view_json = match body_value.as_ref() {
+        Some(b) => resolve_view_from_body(&state, &tenant, b).await?,
+        None => match query_params.view_reference.as_deref() {
+            Some(reference) => resolve_view_reference(&state, &tenant, reference).await?,
+            None => {
+                return Err(RestError::BadRequest {
+                    message: "GET $viewdefinition-run requires a 'viewReference' query parameter; \
+                              use POST to supply 'viewResource' or 'resource' in the body"
+                        .to_string(),
+                });
+            }
+        },
+    };
     let params = merge_params(query_params, &body_params);
-    execute_view(state, params, body_params, tenant, view_json).await
+    execute_view(state, params, body_params, tenant, view_json, &headers).await
 }
 
-/// `POST /ViewDefinition/{id}/$viewdefinition-run`
+/// `POST` (or `GET`) `/ViewDefinition/{id}/$viewdefinition-run`
 ///
-/// Looks up the stored ViewDefinition by ID and runs it. If the body contains
-/// a `viewResource` (or is itself a `ViewDefinition` resource), the body
-/// overrides the stored definition.
+/// Looks up the stored ViewDefinition by ID and runs it. On POST, if the body
+/// contains a `viewResource` (or is itself a `ViewDefinition` resource), the
+/// body overrides the stored definition. GET infers the ViewDefinition from
+/// the path id and ignores any body.
 pub async fn run_stored_view_definition_handler<S>(
     State(state): State<AppState<S>>,
     Path(id): Path<String>,
     Query(query_params): Query<RunQueryParams>,
     tenant: TenantExtractor,
-    _headers: HeaderMap,
-    body: axum::extract::Json<Value>,
+    headers: HeaderMap,
+    body: Option<axum::extract::Json<Value>>,
 ) -> Result<impl IntoResponse, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    let body_params = extract_run_params_from_json(&body.0);
+    let body_value = body.map(|j| j.0);
+    let body_params = body_value
+        .as_ref()
+        .map(extract_run_params_from_json)
+        .unwrap_or_default();
     // If the body provides a ViewDefinition (inline or by reference), prefer
     // it. Otherwise, load the stored ViewDefinition by id from the path.
-    let view_json = if body_has_view_definition(&body.0) {
-        resolve_view_from_body(&state, &tenant, &body.0).await?
-    } else {
-        let stored = state
-            .storage()
-            .read(tenant.context(), "ViewDefinition", &id)
-            .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("failed to read ViewDefinition: {e}"),
-            })?
-            .ok_or_else(|| RestError::NotFound {
-                resource_type: "ViewDefinition".to_string(),
-                id: id.clone(),
-            })?;
-        stored.content().clone()
+    let view_json = match body_value.as_ref() {
+        Some(b) if body_has_view_definition(b) => {
+            resolve_view_from_body(&state, &tenant, b).await?
+        }
+        _ => {
+            let stored = state
+                .storage()
+                .read(tenant.context(), "ViewDefinition", &id)
+                .await
+                .map_err(|e| RestError::InternalError {
+                    message: format!("failed to read ViewDefinition: {e}"),
+                })?
+                .ok_or_else(|| RestError::NotFound {
+                    resource_type: "ViewDefinition".to_string(),
+                    id: id.clone(),
+                })?;
+            stored.content().clone()
+        }
     };
     let params = merge_params(query_params, &body_params);
-    execute_view(state, params, body_params, tenant, view_json).await
+    execute_view(state, params, body_params, tenant, view_json, &headers).await
 }
 
 /// Merges body parameters onto query-string parameters with body precedence
@@ -176,6 +218,8 @@ fn merge_params(query: RunQueryParams, body: &ExtractedRunParams) -> RunQueryPar
         since: body.since.clone().or(query.since),
         patient: query.patient,
         group: query.group,
+        view_reference: query.view_reference,
+        source: body.source.clone().or(query.source),
     }
 }
 
@@ -288,16 +332,39 @@ async fn execute_view<S>(
     body_params: ExtractedRunParams,
     tenant: TenantExtractor,
     view_json: Value,
+    headers: &HeaderMap,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    let format = params.format.as_deref().unwrap_or("ndjson").to_lowercase();
+    // Per spec: `source` is an alternate data origin for stateless ETL. HFS
+    // is storage-backed; the stateless `sof-server` is the right home for this.
+    if body_params.source.is_some() || params.source.is_some() {
+        return Err(RestError::NotImplemented {
+            feature: "the 'source' parameter is not supported by this storage-backed server; \
+                      use the stateless 'sof-server' for external-data-source runs"
+                .to_string(),
+        });
+    }
+
+    // Resolve `_format`: spec says `1..1`. Precedence: `_format` (query or
+    // body, already merged) > `Accept` header. Missing both is a 400.
+    let format = resolve_format(params.format.as_deref(), headers)?;
     let include_header = params
         .header
         .as_deref()
         .map(|h| h == "true" || h == "1")
         .unwrap_or(true);
+
+    // Validate the format value up front so unknown values fail with 400 on
+    // every path (inline + streaming), not only the inline one.
+    if parse_content_type(&format, include_header).is_none() {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "unsupported _format value '{format}'; supported: ndjson, json, csv, parquet"
+            ),
+        });
+    }
 
     if !body_params.inline_resources.is_empty() {
         return execute_view_inline(
@@ -450,6 +517,44 @@ fn content_type_headers(ct: ContentType) -> (&'static str, &'static str) {
     }
 }
 
+/// Resolves the output format for a run. Spec precedence: `_format` parameter
+/// (already merged from query and body upstream) > `Accept` header. Missing
+/// both is a 400 — `_format` is `1..1` in the operation definition.
+///
+/// Accept-header values map: `application/json` → `json`,
+/// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
+/// `application/octet-stream`/`application/parquet` → `parquet`. Unknown or
+/// wildcard Accept values fall through to the 400.
+fn resolve_format(format_param: Option<&str>, headers: &HeaderMap) -> Result<String, RestError> {
+    if let Some(f) = format_param {
+        return Ok(f.to_lowercase());
+    }
+    if let Some(accept) = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_lowercase)
+    {
+        let mapped = accept
+            .split(',')
+            .map(|s| s.split(';').next().unwrap_or("").trim())
+            .find_map(|mime| match mime {
+                "application/json" => Some("json"),
+                "application/x-ndjson" | "application/ndjson" => Some("ndjson"),
+                "text/csv" => Some("csv"),
+                "application/octet-stream" | "application/parquet" => Some("parquet"),
+                _ => None,
+            });
+        if let Some(f) = mapped {
+            return Ok(f.to_string());
+        }
+    }
+    Err(RestError::BadRequest {
+        message: "_format is required (or provide an Accept header with a supported MIME type); \
+                  supported formats: ndjson, json, csv, parquet"
+            .to_string(),
+    })
+}
+
 /// Maps a `_format` string + header flag to a `ContentType` understood by the
 /// in-process evaluator. Returns `None` when the format is not recognised.
 fn parse_content_type(format: &str, include_header: bool) -> Option<ContentType> {
@@ -540,14 +645,17 @@ fn streaming_ndjson_response(
 /// format. NDJSON has its own dedicated streaming path
 /// ([`streaming_ndjson_response`]); buffered formats (csv, json, parquet) drain
 /// here and pass through `helios_sof::format_output` so REST output matches
-/// `sof-server` / `pysof` byte-for-byte. Unknown formats fall back to NDJSON.
+/// `sof-server` / `pysof` byte-for-byte. The `format` string is validated by
+/// [`execute_view`] before reaching this function — unknown formats are a 400
+/// long before we open a row stream.
 async fn format_stream(
     stream: helios_persistence::core::sof_runner::RowStream,
     format: &str,
     include_header: bool,
 ) -> (&'static str, Vec<u8>) {
     let rows = drain_stream(stream).await;
-    let content_type = parse_content_type(format, include_header).unwrap_or(ContentType::NdJson);
+    let content_type = parse_content_type(format, include_header)
+        .expect("format already validated by execute_view");
     let result = helios_sof::rows_to_processed_result(rows);
     let body = helios_sof::format_output(result, content_type, None).unwrap_or_else(|e| {
         warn!(error = %e, format, "shared output formatter failed; returning empty body");

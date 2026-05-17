@@ -83,8 +83,8 @@ mod sof_run_tests {
     // Happy path
     // =========================================================================
 
-    /// `POST /ViewDefinition/$viewdefinition-run` with seeded data returns 200
-    /// and NDJSON rows containing the expected columns.
+    /// `POST /ViewDefinition/$viewdefinition-run?_format=ndjson` with seeded
+    /// data returns 200 and NDJSON rows containing the expected columns.
     #[tokio::test]
     async fn test_run_view_definition_ndjson_happy_path() {
         let (server, backend) = create_test_server().await;
@@ -92,7 +92,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-002", "Jones").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -103,7 +103,7 @@ mod sof_run_tests {
 
         response.assert_status(StatusCode::OK);
 
-        // Content-Type must be NDJSON (default format)
+        // Content-Type must be NDJSON
         let content_type = response
             .headers()
             .get("content-type")

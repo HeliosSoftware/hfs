@@ -227,13 +227,19 @@ pub fn validate_query_params(
     })
 }
 
-/// Parse content type from Accept header and query parameters
+/// Parse content type from Accept header and query parameters.
+///
+/// Spec precedence: `_format` (query or body) > `Accept` header. When both are
+/// absent, this falls back to `application/json` as a placeholder so callers
+/// that intend to override from a body parameter (typically a `Parameters`
+/// resource with `_format`) can still drive the validation pass; the
+/// `_format = 1..1` rule is enforced at the handler entry point before
+/// dispatching here, so a true missing-format will already have errored.
 pub fn parse_content_type(
     accept_header: Option<&str>,
     format_param: Option<&str>,
     header_param: Option<bool>,
 ) -> Result<ContentType, helios_sof::SofError> {
-    // Query parameter takes precedence over Accept header
     let content_type_str = format_param.or(accept_header).unwrap_or("application/json");
 
     // Handle CSV header parameter
