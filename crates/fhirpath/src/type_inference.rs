@@ -257,30 +257,14 @@ fn infer_member_type(
     Some(inferred)
 }
 
-/// Dispatches a field-type lookup to the per-version generated table in `helios-fhir`.
+/// Thin alias for [`helios_fhir::get_field_type`] — kept so this module's
+/// existing call sites read the same as before the wrapper was consolidated.
 fn lookup_field_type(
     version: FhirVersion,
     parent_type: &str,
     field_name: &str,
 ) -> Option<(&'static str, bool)> {
-    match version {
-        #[cfg(feature = "R4")]
-        FhirVersion::R4 => helios_fhir::r4::get_field_type(parent_type, field_name),
-        #[cfg(feature = "R4B")]
-        FhirVersion::R4B => helios_fhir::r4b::get_field_type(parent_type, field_name),
-        #[cfg(feature = "R5")]
-        FhirVersion::R5 => helios_fhir::r5::get_field_type(parent_type, field_name),
-        #[cfg(feature = "R6")]
-        FhirVersion::R6 => helios_fhir::r6::get_field_type(parent_type, field_name),
-        // The `FhirVersion` enum's variants are gated on `helios-fhir`'s own
-        // feature flags, which can disagree with this crate's feature flags
-        // when an upstream consumer enables a version on `helios-fhir`
-        // directly without enabling the same version on `helios-fhirpath`.
-        // In that case we have no field-type table for the variant — fall back
-        // to "no info" rather than failing to compile.
-        #[allow(unreachable_patterns)]
-        _ => None,
-    }
+    helios_fhir::get_field_type(version, parent_type, field_name)
 }
 
 /// Returns true if the given FHIR type code corresponds to a FHIRPath system primitive.
@@ -289,42 +273,16 @@ fn lookup_field_type(
 /// `System.*` URL forms (already stripped to `Boolean`, `Integer`, `String` by the
 /// generator) project to the FHIRPath `system` namespace; everything else is `FHIR.<Name>`.
 fn is_system_primitive(ty: &str) -> bool {
+    if helios_fhir::is_primitive_type(ty) {
+        return true;
+    }
+    // Capitalized System.* names (FHIRPath system primitives) — note we
+    // deliberately exclude `Quantity` because the FHIR complex type
+    // `Quantity` shares the same name and is the overwhelmingly common
+    // referent.
     matches!(
         ty,
-        // Lowercase FHIR primitive type codes
-        "boolean"
-            | "integer"
-            | "integer64"
-            | "decimal"
-            | "string"
-            | "code"
-            | "id"
-            | "uri"
-            | "url"
-            | "canonical"
-            | "oid"
-            | "uuid"
-            | "markdown"
-            | "base64Binary"
-            | "instant"
-            | "date"
-            | "dateTime"
-            | "time"
-            | "positiveInt"
-            | "unsignedInt"
-            | "xhtml"
-            // Capitalized System.* names (FHIRPath system primitives) — note
-            // we deliberately exclude `Quantity` because the FHIR complex type
-            // `Quantity` shares the same name and is the overwhelmingly common
-            // referent.
-            | "Boolean"
-            | "Integer"
-            | "Long"
-            | "Decimal"
-            | "String"
-            | "Date"
-            | "DateTime"
-            | "Time"
+        "Boolean" | "Integer" | "Long" | "Decimal" | "String" | "Date" | "DateTime" | "Time"
     )
 }
 

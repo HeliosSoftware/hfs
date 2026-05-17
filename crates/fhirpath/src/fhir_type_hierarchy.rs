@@ -2,42 +2,23 @@
 //!
 //! Implements FHIR type system navigation and inheritance checking for FHIRPath type operations.
 
-use once_cell::sync::Lazy;
-use std::collections::HashSet;
-
-/// FHIR Type Hierarchy module
-///
-/// This module provides utility functions for FHIR type checking and string manipulation.
-/// It includes primitive type checking and string capitalization utilities.
-///
-/// Set of FHIR primitive types
-static FHIR_PRIMITIVE_TYPES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    let mut s = HashSet::new();
-    s.insert("boolean");
-    s.insert("string");
-    s.insert("integer");
-    s.insert("decimal");
-    s.insert("date");
-    s.insert("dateTime");
-    s.insert("time");
-    s.insert("code");
-    s.insert("id");
-    s.insert("uri");
-    s.insert("url");
-    s.insert("canonical");
-    s.insert("markdown");
-    s.insert("base64Binary");
-    s.insert("instant");
-    s.insert("oid");
-    s.insert("positiveInt");
-    s.insert("unsignedInt");
-    s.insert("uuid");
-    s
-});
-
-/// Checks if a type is a FHIR primitive type
+/// Checks if a type code is a FHIR primitive datatype. Forgiving on case so
+/// callers can pass `"Boolean"` or `"boolean"`; delegates to the canonical
+/// list in [`helios_fhir::is_primitive_type`].
 pub fn is_fhir_primitive_type(type_name: &str) -> bool {
-    FHIR_PRIMITIVE_TYPES.contains(type_name.to_lowercase().as_str())
+    helios_fhir::is_primitive_type(&lowercase_first_char(type_name))
+}
+
+/// FHIR primitive type codes are lowercase in the spec, but FHIRPath
+/// expressions often use the capitalized System form (`Boolean`,
+/// `Integer`). Lowering just the first character normalizes both shapes
+/// to the FHIR primitive code (`boolean`, `integer`, `dateTime`).
+fn lowercase_first_char(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_ascii_lowercase().to_string() + chars.as_str(),
+    }
 }
 
 /// Utility function to capitalize the first letter of a string

@@ -1850,6 +1850,98 @@ impl FhirVersion {
     }
 }
 
+/// Dispatches a field-type lookup to the per-version generated `FIELD_TYPES`
+/// table. Returns `(field_type, is_collection)` when the
+/// `(parent_type, field_name)` pair is known, or `None` when the version
+/// variant isn't compiled in (e.g. a downstream crate enabled `helios-fhir`
+/// features that this build doesn't have).
+///
+/// Centralizes what used to be a hand-rolled match in
+/// `helios-persistence::sof` and `helios-fhirpath::type_inference`.
+pub fn get_field_type(
+    version: FhirVersion,
+    parent_type: &str,
+    field_name: &str,
+) -> Option<(&'static str, bool)> {
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => crate::r4::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => crate::r4b::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => crate::r5::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => crate::r6::get_field_type(parent_type, field_name),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Returns true when `name` is the type code of a FHIR primitive datatype
+/// (case-sensitive, lowercase as in the FHIR spec — `boolean`, `integer`,
+/// `dateTime`, …). The set is the union across FHIR versions, so
+/// `integer64` (added in R5) and `xhtml` are included regardless of which
+/// version feature is enabled.
+///
+/// Centralizes what used to be three hand-maintained primitive-type lists
+/// inside `helios-fhirpath` (`fhir_type_hierarchy`, `resource_type`,
+/// `type_inference`).
+pub fn is_primitive_type(name: &str) -> bool {
+    matches!(
+        name,
+        "base64Binary"
+            | "boolean"
+            | "canonical"
+            | "code"
+            | "date"
+            | "dateTime"
+            | "decimal"
+            | "id"
+            | "instant"
+            | "integer"
+            | "integer64"
+            | "markdown"
+            | "oid"
+            | "positiveInt"
+            | "string"
+            | "time"
+            | "unsignedInt"
+            | "uri"
+            | "url"
+            | "uuid"
+            | "xhtml"
+    )
+}
+
+/// Returns true when `field_name` appears anywhere in the per-version
+/// `FIELD_TYPES` table. Used as a parent-context-free fallback for
+/// detecting polymorphic typed variants (`valueQuantity`,
+/// `deceasedBoolean`, …) when the parent FHIR type isn't statically known.
+pub fn field_exists_anywhere(version: FhirVersion, field_name: &str) -> bool {
+    field_types(version).is_some_and(|t| t.iter().any(|(_, f, _, _)| *f == field_name))
+}
+
+/// Returns the per-version `FIELD_TYPES` slice when the version's feature
+/// is compiled in. Each entry is `(parent_type, field_name, field_type,
+/// is_collection)`. Use this when you need to enumerate all fields of a
+/// parent type — for a single-field lookup, prefer [`get_field_type`].
+pub fn field_types(
+    version: FhirVersion,
+) -> Option<&'static [(&'static str, &'static str, &'static str, bool)]> {
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => Some(crate::r4::FIELD_TYPES),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => Some(crate::r4b::FIELD_TYPES),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => Some(crate::r5::FIELD_TYPES),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => Some(crate::r6::FIELD_TYPES),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
 /// Implements `Display` trait for user-friendly output formatting.
 ///
 /// This enables `FhirVersion` to be used in string formatting operations
