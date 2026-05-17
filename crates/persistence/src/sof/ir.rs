@@ -12,7 +12,6 @@
 //! defines the shapes so later work has a stable target.
 
 #![allow(dead_code)] // Stage 1 scaffold; consumers land in stages 2–5.
-#![allow(missing_docs)] // Per-field docs land alongside their consumers in stages 2–5.
 
 use std::sync::Arc;
 
@@ -31,7 +30,12 @@ pub enum SqlExpr {
     /// `root` is the alias provided by the surrounding plan node — typically
     /// `r.data` (resource scan), `fe.value` (lateral unnest), or `rec.node`
     /// (recursive CTE). `path` is the chain of steps applied to it.
-    JsonPath { root: String, path: JsonPath },
+    JsonPath {
+        /// JSON root alias (e.g., `r.data`).
+        root: String,
+        /// Ordered navigation steps applied to `root`.
+        path: JsonPath,
+    },
 
     /// Bound query parameter, 1-based.
     ///
@@ -44,21 +48,36 @@ pub enum SqlExpr {
     ColRef(String),
 
     /// Type coercion. The dialect lowerer chooses the appropriate cast syntax.
-    Cast { inner: Box<SqlExpr>, ty: SqlType },
+    Cast {
+        /// Expression being coerced.
+        inner: Box<SqlExpr>,
+        /// Target SQL type.
+        ty: SqlType,
+    },
 
     /// Binary operator.
     BinOp {
+        /// Operator kind.
         op: BinOp,
+        /// Left-hand operand.
         lhs: Box<SqlExpr>,
+        /// Right-hand operand.
         rhs: Box<SqlExpr>,
     },
 
     /// Unary operator.
-    UnaryOp { op: UnaryOp, inner: Box<SqlExpr> },
+    UnaryOp {
+        /// Operator kind.
+        op: UnaryOp,
+        /// Operand the operator is applied to.
+        inner: Box<SqlExpr>,
+    },
 
     /// `CASE WHEN .. THEN .. ... ELSE .. END`.
     Case {
+        /// `(condition, value)` pairs evaluated in order.
         arms: Vec<(SqlExpr, SqlExpr)>,
+        /// Optional default branch.
         else_: Option<Box<SqlExpr>>,
     },
 
@@ -87,14 +106,21 @@ pub enum SqlExpr {
 
     /// Names an inner expression for reuse (lowered as a CTE column reference
     /// when the same scalar appears in multiple projections).
-    Alias { name: String, inner: Box<SqlExpr> },
+    Alias {
+        /// Alias to assign to `inner`.
+        name: String,
+        /// Expression being aliased.
+        inner: Box<SqlExpr>,
+    },
 
     /// Extracts the id portion of a `Reference.reference` string. When
     /// `expected_type` is supplied, returns NULL unless the reference's type
     /// segment matches (e.g. `getReferenceKey(Patient)` over `Observation/123`
     /// returns NULL).
     ReferenceKey {
+        /// Reference string to inspect.
         reference: Box<SqlExpr>,
+        /// FHIR resource type the reference must match, when set.
         expected_type: Option<String>,
     },
 
@@ -105,8 +131,11 @@ pub enum SqlExpr {
     /// `column.type` is supplied so the dialect can pick decimal vs.
     /// date/dateTime/time logic.
     Boundary {
+        /// Whether to take the low or high boundary.
         side: BoundarySide,
+        /// Source value kind (decimal vs. date/dateTime/time).
         kind: BoundaryKind,
+        /// Expression whose boundary is being computed.
         source: Box<SqlExpr>,
     },
 
@@ -115,8 +144,11 @@ pub enum SqlExpr {
     /// JSON path) and tests `crit` against each element. The criterion is
     /// pre-lowered with `iter_alias.value` set as its path root.
     WhereExists {
+        /// Collection expression to iterate.
         focus: Box<SqlExpr>,
+        /// Iteration alias used by `predicate`.
         iter_alias: String,
+        /// Criterion evaluated against each element.
         predicate: Box<SqlExpr>,
         /// Mirrors `where(crit).empty()` — negate the EXISTS.
         negate: bool,
@@ -128,9 +160,13 @@ pub enum SqlExpr {
     /// row. Used when a column's path threads a `where()` call somewhere in
     /// the middle (e.g. `name.where(use='official').family`).
     WhereScalar {
+        /// Collection expression to iterate.
         focus: Box<SqlExpr>,
+        /// Iteration alias used by `predicate` and `projection`.
         iter_alias: String,
+        /// Filter applied to each iteration row.
         predicate: Box<SqlExpr>,
+        /// Scalar projection extracted from the surviving row.
         projection: Box<SqlExpr>,
     },
 
@@ -139,10 +175,15 @@ pub enum SqlExpr {
     /// separator-joined string. Lowers to `string_agg` (PG) /
     /// `group_concat` (SQLite) over a chained lateral unnest.
     JoinAggregate {
+        /// Outer collection expression to iterate.
         outer_focus: Box<SqlExpr>,
+        /// Outer iteration alias.
         outer_alias: String,
+        /// Field name to flatten on each outer row.
         inner_field: String,
+        /// Inner iteration alias.
         inner_alias: String,
+        /// Separator inserted between joined elements.
         separator: String,
     },
 
@@ -150,7 +191,12 @@ pub enum SqlExpr {
     /// values of a JSON path into a JSON array. Each `Field` step in `path`
     /// becomes a lateral unnest; the final element values feed into a
     /// `json_agg` / `json_group_array`.
-    CollectionAgg { root: String, path: JsonPath },
+    CollectionAgg {
+        /// JSON root alias for the aggregation source.
+        root: String,
+        /// Path navigation aggregated into an array.
+        path: JsonPath,
+    },
 
     /// Correlated scalar subquery used for `forEach: "<chain>[N]"` paths —
     /// FHIRPath indexes the FLATTENED iteration result, but SQLite forbids
@@ -159,8 +205,11 @@ pub enum SqlExpr {
     ///
     /// `(SELECT <projection> FROM <chain_sql> LIMIT 1 OFFSET <offset>)`.
     ScalarFromChain {
+        /// Pre-built `FROM`-clause SQL for the flattened chain.
         chain_sql: String,
+        /// Scalar projection extracted from the row at `offset`.
         projection: Box<SqlExpr>,
+        /// Zero-based index into the flattened chain.
         offset: i64,
     },
 }
@@ -168,16 +217,22 @@ pub enum SqlExpr {
 /// Selects between `lowBoundary()` and `highBoundary()` semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundarySide {
+    /// Low boundary (`lowBoundary()`).
     Low,
+    /// High boundary (`highBoundary()`).
     High,
 }
 
 /// Source value type for [`SqlExpr::Boundary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundaryKind {
+    /// FHIR `decimal`.
     Decimal,
+    /// FHIR `date`.
     Date,
+    /// FHIR `dateTime` (or `instant`).
     DateTime,
+    /// FHIR `time`.
     Time,
 }
 
@@ -207,9 +262,13 @@ pub enum LitValue {
 /// (`::text` / `CAST(.. AS TEXT)` etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlType {
+    /// SQL `text` / `TEXT`.
     Text,
+    /// SQL `bigint` / `INTEGER`.
     Integer,
+    /// SQL `numeric` / `REAL`.
     Decimal,
+    /// SQL `boolean` (projected as `'true'`/`'false'` text for the runner).
     Boolean,
     /// JSON value (PG: `jsonb`; SQLite: `json` returned by `json()` function).
     Json,
@@ -219,26 +278,42 @@ pub enum SqlType {
 /// polymorphic-field guards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonType {
+    /// JSON object.
     Object,
+    /// JSON array.
     Array,
+    /// JSON string.
     String,
+    /// JSON number.
     Number,
+    /// JSON boolean.
     Boolean,
+    /// JSON `null`.
     Null,
 }
 
 /// Binary operator for [`SqlExpr::BinOp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
+    /// `=` equality.
     Eq,
+    /// `!=` inequality.
     Neq,
+    /// `<` less than.
     Lt,
+    /// `<=` less than or equal.
     Lte,
+    /// `>` greater than.
     Gt,
+    /// `>=` greater than or equal.
     Gte,
+    /// `+` addition.
     Add,
+    /// `-` subtraction.
     Sub,
+    /// `*` multiplication.
     Mul,
+    /// `/` division.
     Div,
     /// `AND` with SQL three-valued logic.
     And,
@@ -270,14 +345,17 @@ pub enum UnaryOp {
 pub struct JsonPath(pub Vec<PathStep>);
 
 impl JsonPath {
+    /// Creates an empty path.
     pub fn new() -> Self {
         Self(Vec::new())
     }
 
+    /// Appends a navigation step to the end of the path.
     pub fn push(&mut self, step: PathStep) {
         self.0.push(step);
     }
 
+    /// Returns true when no steps have been added.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -311,7 +389,9 @@ pub enum PlanNode {
     /// Top-level scan over the `resources` table for a single resource type.
     /// The tenant predicate is injected by the emitter.
     Scan {
+        /// SQL alias for the scanned row (e.g., `r`).
         alias: String,
+        /// FHIR resource type to scan.
         resource_type: String,
     },
 
@@ -324,24 +404,34 @@ pub enum PlanNode {
     /// collection (FHIRPath `name[0]` style indexing applied to the result
     /// of an array-flattening navigation).
     LateralUnnest {
+        /// Plan whose rows are being unnested.
         parent: Box<PlanNode>,
+        /// JSON-array source expression.
         source: SqlExpr,
+        /// SQL alias bound to each iteration row.
         out_alias: String,
+        /// True for `forEachOrNull` (LEFT JOIN), false for `forEach` (INNER JOIN).
         left_join: bool,
+        /// Optional filter appended to the JOIN ON clause.
         on_filter: Option<SqlExpr>,
+        /// When set, restrict the unnest to the Nth element of the flattened collection.
         flat_index: Option<i64>,
     },
 
     /// `WHERE` filter applied to `parent`. Multiple `Filter` nodes compose
     /// AND-wise.
     Filter {
+        /// Plan whose rows are being filtered.
         parent: Box<PlanNode>,
+        /// Boolean predicate the rows must satisfy.
         predicate: SqlExpr,
     },
 
     /// Output projection.
     Project {
+        /// Plan supplying the rows to project.
         parent: Box<PlanNode>,
+        /// Output column definitions.
         columns: Vec<Column>,
     },
 
@@ -352,9 +442,13 @@ pub enum PlanNode {
 
     /// Recursive-CTE descent — used for SoF `repeat:` clauses.
     Recurse {
+        /// Plan producing the seed rows.
         parent: Box<PlanNode>,
+        /// Seed projection (currently unused; emitter walks `parent`).
         seed: SqlExpr,
+        /// Paths walked on each iteration.
         step_paths: Vec<JsonPath>,
+        /// CTE alias also used as the `node` column alias.
         out_alias: String,
     },
 }
@@ -362,12 +456,15 @@ pub enum PlanNode {
 /// Output column projected by a [`Project`](PlanNode::Project) node.
 #[derive(Debug, Clone)]
 pub struct Column {
+    /// Output column name.
     pub name: String,
+    /// Expression that produces the column's value.
     pub expr: SqlExpr,
     /// When true, lower to a JSON array via [`SqlExpr::JsonAgg`] over a lateral
     /// subquery. When false, lower to a scalar (with a defensive `LIMIT 1` if
     /// the underlying expression yields a row source).
     pub collection: bool,
+    /// SQL type the column is projected as.
     pub ty: SqlType,
 }
 
@@ -375,7 +472,9 @@ pub struct Column {
 /// with the scalar projection extracted from each row.
 #[derive(Debug, Clone)]
 pub struct SubQuery {
+    /// Plan producing the subquery's rows.
     pub plan: PlanNode,
+    /// Scalar projection extracted from each row.
     pub select_expr: SqlExpr,
 }
 

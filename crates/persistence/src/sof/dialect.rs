@@ -7,7 +7,6 @@
 //! function names) to two small implementations.
 
 #![allow(dead_code)] // Stage 1 scaffold; consumers land in stages 2–5.
-#![allow(missing_docs)] // Per-method docs land alongside their consumers in stages 2–5.
 
 use super::ir::{JsonType, SqlType};
 
@@ -50,8 +49,9 @@ pub trait Dialect: Send + Sync {
     /// String aggregate with separator (`string_agg` / `group_concat`).
     fn string_agg(&self, expr: &str, sep_param: &str) -> String;
 
-    /// SQL boolean literals.
+    /// SQL boolean literal for `true`.
     fn bool_true(&self) -> &'static str;
+    /// SQL boolean literal for `false`.
     fn bool_false(&self) -> &'static str;
 
     /// `LATERAL` keyword (PG) or empty (SQLite — uses correlated subqueries).

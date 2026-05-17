@@ -7,9 +7,6 @@
 //! Uses the search_index table to resolve chains efficiently via SQL subqueries
 //! instead of in-memory iteration.
 
-// Error enum variant fields are self-documenting
-#![allow(missing_docs)]
-
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -44,26 +41,40 @@ pub struct ParsedChain {
 #[derive(Debug, Clone)]
 pub enum ChainError {
     /// Chain exceeds maximum allowed depth.
-    MaxDepthExceeded { depth: usize, max: usize },
+    MaxDepthExceeded {
+        /// Depth of the chain that was rejected.
+        depth: usize,
+        /// Configured maximum forward-chain depth.
+        max: usize,
+    },
     /// Reference parameter not found in registry.
     UnknownReferenceParam {
+        /// Resource type the reference parameter was looked up against.
         resource_type: String,
+        /// Reference parameter name.
         param: String,
     },
     /// Cannot determine target type for reference.
     AmbiguousTargetType {
+        /// Resource type the reference parameter belongs to.
         resource_type: String,
+        /// Reference parameter name whose target is ambiguous.
         param: String,
     },
     /// Terminal parameter not found.
     UnknownTerminalParam {
+        /// Resource type the terminal parameter was looked up against.
         resource_type: String,
+        /// Terminal parameter name.
         param: String,
     },
     /// Chain is empty.
     EmptyChain,
     /// Invalid chain syntax.
-    InvalidSyntax { message: String },
+    InvalidSyntax {
+        /// Human-readable parser failure detail.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for ChainError {

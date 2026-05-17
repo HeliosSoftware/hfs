@@ -14,8 +14,6 @@
 //! Stages 4–5 add chained-call collection threading, repeat:, and boundary
 //! functions.
 
-#![allow(missing_docs)] // Per-field docs land alongside their consumers in stages 4–5.
-
 use helios_fhir::FhirVersion;
 use helios_sof::ConstantValue;
 use serde_json::Value;
