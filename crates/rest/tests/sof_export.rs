@@ -1053,7 +1053,7 @@ mod sof_export_tests {
     }
 
     #[tokio::test]
-    async fn test_export_failed_status_returns_303_then_500() {
+    async fn test_export_failed_status_returns_303_then_failed_manifest() {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
@@ -1094,13 +1094,31 @@ mod sof_export_tests {
             "expected absolute result URL, got: {loc}"
         );
 
-        // Result endpoint surfaces the OperationOutcome with 500.
+        // Result endpoint returns 200 with a Parameters manifest carrying
+        // `status=failed` and an `error` part wrapping the OperationOutcome.
+        // Spec: the manifest is the canonical channel for terminal states
+        // (success or failure); the status code enum includes `failed`.
         let result = server.get(loc).add_header(X_TENANT_ID, "test-tenant").await;
-        assert_eq!(result.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(result.status_code(), StatusCode::OK);
         let body: Value = result.json();
-        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        assert_eq!(body["resourceType"].as_str(), Some("Parameters"));
+        let params = body["parameter"].as_array().unwrap();
+        let status = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("status"))
+            .and_then(|p| p["valueCode"].as_str());
+        assert_eq!(status, Some("failed"));
+        let error_outcome = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("error"))
+            .and_then(|p| p.get("resource"))
+            .expect("manifest must include an `error` part with the OperationOutcome");
+        assert_eq!(
+            error_outcome["resourceType"].as_str(),
+            Some("OperationOutcome")
+        );
         assert!(
-            body["issue"][0]["diagnostics"]
+            error_outcome["issue"][0]["diagnostics"]
                 .as_str()
                 .unwrap_or("")
                 .contains("view runner exploded"),
@@ -1302,5 +1320,190 @@ mod sof_export_tests {
             .to_string();
         let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
         assert_eq!(manifest["resourceType"].as_str(), Some("Parameters"));
+    }
+
+    // =========================================================================
+    // 22. Unknown query parameter is rejected with 400 + OperationOutcome
+    //     (spec: "If server does not support a parameter, request should be
+    //     rejected with 400 Bad Request").
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_unknown_query_param_rejected() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let resp = server
+            .post("/ViewDefinition/$viewdefinition-export?bogus=1")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        assert_eq!(
+            body["issue"][0]["code"].as_str(),
+            Some("not-supported"),
+            "unknown query param must surface as not-supported: {body}"
+        );
+    }
+
+    // =========================================================================
+    // 23. Unknown body parameter is rejected with 400 + OperationOutcome.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_unknown_body_param_rejected() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "view", "part": [
+                    {"name": "viewResource", "resource": patient_view()}
+                ]},
+                {"name": "unknownThing", "valueString": "x"}
+            ]
+        });
+        let resp = server
+            .post("/ViewDefinition/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let outcome: Value = resp.json();
+        assert_eq!(
+            outcome["issue"][0]["code"].as_str(),
+            Some("not-supported"),
+            "{outcome}"
+        );
+    }
+
+    // =========================================================================
+    // 24. Body-form input parameters take effect: a `Parameters` body
+    //     supplying `_format=csv` and `clientTrackingId=body-tid` must drive
+    //     the completion manifest's `_format` and `clientTrackingId` even
+    //     when the query string is empty (spec parity).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_body_form_inputs_take_effect() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "view", "part": [
+                    {"name": "viewResource", "resource": patient_view()}
+                ]},
+                {"name": "_format", "valueCode": "csv"},
+                {"name": "clientTrackingId", "valueString": "body-tid"}
+            ]
+        });
+        let submit_resp = server
+            .post("/ViewDefinition/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(submit_resp.status_code(), StatusCode::ACCEPTED);
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        let params = manifest["parameter"].as_array().unwrap();
+        let fmt = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("_format"))
+            .and_then(|p| p["valueCode"].as_str());
+        assert_eq!(
+            fmt,
+            Some("csv"),
+            "body _format must be honoured: {manifest}"
+        );
+        let tid = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("clientTrackingId"))
+            .and_then(|p| p["valueString"].as_str());
+        assert_eq!(
+            tid,
+            Some("body-tid"),
+            "body clientTrackingId must be honoured: {manifest}"
+        );
+    }
+
+    // =========================================================================
+    // 25. Query string wins on conflict with body for the same input param.
+    //     `?_format=csv` plus a body `_format=ndjson` must produce a CSV
+    //     manifest (matches the precedence we document in the handler).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_query_wins_over_body_on_conflict() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "view", "part": [
+                    {"name": "viewResource", "resource": patient_view()}
+                ]},
+                {"name": "_format", "valueCode": "ndjson"}
+            ]
+        });
+        let submit_resp = server
+            .post("/ViewDefinition/$viewdefinition-export?_format=csv")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(submit_resp.status_code(), StatusCode::ACCEPTED);
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        let fmt = manifest["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"].as_str() == Some("_format"))
+            .and_then(|p| p["valueCode"].as_str());
+        assert_eq!(fmt, Some("csv"), "query _format must win: {manifest}");
+    }
+
+    // =========================================================================
+    // 26. Patient/Group reference validation: a `patient` referencing a
+    //     Patient that does not exist must yield 404 + OperationOutcome at
+    //     kick-off (spec SHOULD).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_unknown_patient_ref_returns_404() {
+        let (server, _backend) = create_test_server_with_export().await;
+        // Note: no `seed_patients` — the referenced Patient cannot exist.
+        let resp = server
+            .post("/ViewDefinition/$viewdefinition-export?patient=Patient/missing-1")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+        let body: Value = resp.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diag.contains("missing-1"),
+            "diagnostics must name the missing ref: {body}"
+        );
     }
 }

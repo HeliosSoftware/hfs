@@ -29,23 +29,47 @@
 //! - `404 Not Found` if the job ID is unknown or was cancelled
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::search::SearchProvider;
+use helios_persistence::tenant::TenantContext;
+use helios_persistence::types::{
+    SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
-
-use helios_persistence::tenant::TenantContext;
 
 use crate::error::RestError;
 use crate::export::controller::{ExportTask, JobStatus, NamedView};
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
 
+/// Top-level Parameters body parameter names recognised by the operation.
+/// Anything outside this list is rejected with 400 per the spec's
+/// "reject unsupported parameters" rule.
+const ALLOWED_BODY_PARAMS: &[&str] = &[
+    "view",
+    "viewResource", // back-compat single-view form
+    "_format",
+    "header",
+    "patient",
+    "group",
+    "_since",
+    "clientTrackingId",
+    "source",
+];
+
 /// Query parameters for `$viewdefinition-export`.
+///
+/// `deny_unknown_fields` enforces the spec's "reject unsupported parameters
+/// with 400 Bad Request" rule on the query string. Any parameter outside this
+/// struct (whether spec-defined-but-unsupported or simply unknown) surfaces
+/// as a serde error, which axum/serde maps to a 400 response.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExportQueryParams {
     /// Output format: `ndjson` (default), `csv`, `json`, or `parquet`.
     #[serde(rename = "_format")]
@@ -86,35 +110,49 @@ pub struct ExportQueryParams {
 /// Submit an export job. Accepts:
 /// - A bare `ViewDefinition` resource (single, unnamed view), or
 /// - A FHIR `Parameters` resource with one or more `view` parameters whose
-///   `part` entries supply `name`, `viewResource`, or `viewReference`.
+///   `part` entries supply `name`, `viewResource`, or `viewReference`, plus
+///   optional top-level filter parameters (`_format`, `header`, `patient`,
+///   `group`, `_since`, `clientTrackingId`). Query-string values take
+///   precedence over body values for the same parameter.
 pub async fn export_view_definition_handler<S>(
     tenant: TenantExtractor,
     State(state): State<AppState<S>>,
     headers: HeaderMap,
-    Query(params): Query<ExportQueryParams>,
-    axum::Json(body): axum::Json<Value>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    body: Option<axum::Json<Value>>,
 ) -> Result<Response, RestError>
 where
-    S: ResourceStorage + Send + Sync + 'static,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     if let Err(resp) = check_prefer_async(&headers) {
         return Ok(resp);
     }
-    if let Some(resp) = reject_unsupported_source(&params, Some(&body)) {
+    let params = match parse_export_query(raw_query.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return Ok(resp),
+    };
+    let body_value = body.map(|axum::Json(v)| v);
+
+    if let Some(b) = body_value.as_ref() {
+        if let Some(resp) = validate_unknown_body_params(b) {
+            return Ok(resp);
+        }
+    }
+    if let Some(resp) = reject_unsupported_source(&params, body_value.as_ref()) {
         return Ok(resp);
     }
+
+    let Some(body) = body_value else {
+        return Ok(missing_view_response());
+    };
     let views = extract_views_from_body(&state, &tenant, &body).await?;
     if views.is_empty() {
         return Ok(missing_view_response());
     }
 
-    let format = params
-        .format
-        .clone()
-        .unwrap_or_else(|| "ndjson".to_string())
-        .to_lowercase();
+    let inputs = merge_export_inputs(&params, Some(&body));
 
-    submit_export_job(&state, tenant.context().clone(), views, format, &params)
+    submit_export_job(&state, &tenant, views, inputs).await
 }
 
 /// Submit an export job for a stored ViewDefinition.
@@ -123,15 +161,27 @@ pub async fn export_stored_view_definition_handler<S>(
     State(state): State<AppState<S>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Query(params): Query<ExportQueryParams>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    body: Option<axum::Json<Value>>,
 ) -> Result<Response, RestError>
 where
-    S: ResourceStorage + Send + Sync + 'static,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     if let Err(resp) = check_prefer_async(&headers) {
         return Ok(resp);
     }
-    if let Some(resp) = reject_unsupported_source(&params, None) {
+    let params = match parse_export_query(raw_query.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return Ok(resp),
+    };
+    let body_value = body.map(|axum::Json(v)| v);
+
+    if let Some(b) = body_value.as_ref() {
+        if let Some(resp) = validate_unknown_body_params(b) {
+            return Ok(resp);
+        }
+    }
+    if let Some(resp) = reject_unsupported_source(&params, body_value.as_ref()) {
         return Ok(resp);
     }
 
@@ -154,22 +204,19 @@ where
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| id.clone());
-    let format = params
-        .format
-        .clone()
-        .unwrap_or_else(|| "ndjson".to_string())
-        .to_lowercase();
+
+    let inputs = merge_export_inputs(&params, body_value.as_ref());
 
     submit_export_job(
         &state,
-        tenant.context().clone(),
+        &tenant,
         vec![NamedView {
             name: view_name,
             view,
         }],
-        format,
-        &params,
+        inputs,
     )
+    .await
 }
 
 /// Returns `Err(Response)` with 400 + OperationOutcome if the spec-required
@@ -246,15 +293,14 @@ fn missing_view_response() -> Response {
 }
 
 /// Common submit logic: validate every view, dispatch to controller, return 202.
-fn submit_export_job<S>(
+async fn submit_export_job<S>(
     state: &AppState<S>,
-    tenant: TenantContext,
+    tenant: &TenantExtractor,
     views: Vec<NamedView>,
-    format: String,
-    params: &ExportQueryParams,
+    inputs: ExportInputs,
 ) -> Result<Response, RestError>
 where
-    S: ResourceStorage + Send + Sync + 'static,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     // Validate that each view has a `resource` field (basic check).
     for nv in &views {
@@ -269,6 +315,13 @@ where
             )
                 .into_response());
         }
+    }
+
+    // Spec SHOULD: if patient/group references don't resolve, return an
+    // OperationOutcome with details. We check relative `Patient/{id}` and
+    // `Group/{id}` references here; absolute external refs pass through.
+    if let Some(resp) = validate_patient_group_refs(state, tenant, &inputs).await? {
+        return Ok(resp);
     }
 
     // Require export controller to be configured
@@ -287,24 +340,22 @@ where
         }
     };
 
-    // Build filters (G4, G5). patient / group are comma-split per the spec's
-    // 0..* cardinality; multiple values match resources from any of the
-    // referenced compartments.
-    let since = params.since.as_deref().and_then(|s| s.parse().ok());
+    // Build filters (G4, G5). patient / group multiple values match resources
+    // from any of the referenced compartments.
     let filters = helios_persistence::core::sof_runner::ViewFilters {
-        limit: params.limit,
-        since,
-        patient: split_refs(params.patient.as_deref()),
-        group: split_refs(params.group.as_deref()),
+        limit: inputs.limit,
+        since: inputs.since,
+        patient: inputs.patient.clone(),
+        group: inputs.group.clone(),
     };
 
     let task = ExportTask {
         views,
-        tenant,
+        tenant: tenant.context().clone(),
         filters,
-        format,
-        header: params.header.unwrap_or(true),
-        client_tracking_id: params.client_tracking_id.clone(),
+        format: inputs.format.clone(),
+        header: inputs.header,
+        client_tracking_id: inputs.client_tracking_id.clone(),
     };
 
     let job_id = controller.submit(task);
@@ -328,7 +379,7 @@ where
         json!({"name": "status", "valueCode": "accepted"}),
         json!({"name": "location", "valueUri": location}),
     ];
-    if let Some(tid) = params.client_tracking_id.as_deref() {
+    if let Some(tid) = inputs.client_tracking_id.as_deref() {
         body_params.push(json!({"name": "clientTrackingId", "valueString": tid}));
     }
 
@@ -374,7 +425,10 @@ where
         )
             .into_response()),
 
-        Some(JobStatus::Running { percent, .. }) => {
+        Some(JobStatus::Running {
+            percent,
+            submitted_at,
+        }) => {
             let mut headers = HeaderMap::new();
             // Spec: `X-Progress` carries a completion percentage (e.g. `65%`).
             let progress_value = format!("{percent}%");
@@ -386,15 +440,28 @@ where
             // Spec: in-progress body is an optional `Parameters` resource
             // carrying spec-defined params only (no custom `progress` part —
             // that channel is the `X-Progress` header).
+            let mut params = vec![
+                json!({"name": "exportId", "valueString": job_id}),
+                json!({"name": "status", "valueCode": "in-progress"}),
+            ];
+            // Optional `estimatedTimeRemaining` (integer seconds).
+            // Only meaningful once the job has reported >0% progress; before
+            // then we can't compute a defensible estimate. Derived from
+            // elapsed and percent: total ≈ elapsed * 100 / percent.
+            if percent > 0 && percent < 100 {
+                let elapsed = (chrono::Utc::now() - submitted_at).num_seconds().max(0);
+                let estimate = elapsed * (100 - percent as i64) / percent as i64;
+                params.push(json!({
+                    "name": "estimatedTimeRemaining",
+                    "valueInteger": estimate
+                }));
+            }
             Ok((
                 StatusCode::ACCEPTED,
                 headers,
                 axum::Json(json!({
                     "resourceType": "Parameters",
-                    "parameter": [
-                        {"name": "exportId", "valueString": job_id},
-                        {"name": "status", "valueCode": "in-progress"}
-                    ]
+                    "parameter": params
                 })),
             )
                 .into_response())
@@ -459,15 +526,45 @@ where
         )
             .into_response()),
 
-        Some(JobStatus::Failed { message, .. }) => Ok((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({
+        Some(JobStatus::Failed {
+            message,
+            submitted_at,
+        }) => {
+            // Spec: status code enum includes `failed`. The canonical
+            // failure channel is the manifest with `status=failed`; we attach
+            // an `OperationOutcome` via the bulk-data-style `error` part so
+            // the failure diagnostic survives the round trip.
+            let now = chrono::Utc::now();
+            let duration_secs = (now - submitted_at).num_seconds().max(0);
+            let status_url = format!(
+                "{base}/export/{job_id}/status",
+                base = state.base_url().trim_end_matches('/'),
+            );
+            let outcome = json!({
                 "resourceType": "OperationOutcome",
-                "issue": [{"severity": "error", "code": "processing",
-                    "diagnostics": format!("Export job '{job_id}' failed: {message}")}]
-            })),
-        )
-            .into_response()),
+                "issue": [{
+                    "severity": "error",
+                    "code": "processing",
+                    "diagnostics": format!("Export job '{job_id}' failed: {message}")
+                }]
+            });
+            Ok((
+                StatusCode::OK,
+                axum::Json(json!({
+                    "resourceType": "Parameters",
+                    "parameter": [
+                        {"name": "exportId", "valueString": job_id},
+                        {"name": "status", "valueCode": "failed"},
+                        {"name": "location", "valueUri": status_url},
+                        {"name": "exportStartTime", "valueInstant": submitted_at.to_rfc3339()},
+                        {"name": "exportEndTime", "valueInstant": now.to_rfc3339()},
+                        {"name": "exportDuration", "valueInteger": duration_secs},
+                        {"name": "error", "resource": outcome}
+                    ]
+                })),
+            )
+                .into_response())
+        }
 
         Some(JobStatus::Completed {
             files,
@@ -513,36 +610,31 @@ fn build_completion_manifest(
     client_tracking_id: Option<&str>,
 ) -> Value {
     // Spec: one `output` per view, with `location` (1..*) repeating once per
-    // shard inside it. `files` is already in view-then-shard order, so we
-    // collapse runs of equal `view_name` into a single output entry.
-    let mut output: Vec<Value> = Vec::new();
+    // shard inside it. Group by `view_name` while preserving first-seen
+    // insertion order — this stays correct even if a controller emits files
+    // for a view non-contiguously.
+    let mut output_order: Vec<String> = Vec::new();
+    let mut locations_by_view: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for f in files {
-        let last_matches = output
-            .last()
-            .and_then(|o| o.get("part"))
-            .and_then(|p| p.as_array())
-            .and_then(|arr| arr.iter().find(|p| p["name"] == "name"))
-            .and_then(|p| p["valueString"].as_str())
-            == Some(f.view_name.as_str());
-        if last_matches {
-            // Append another `location` part to the in-progress output entry.
-            if let Some(parts) = output
-                .last_mut()
-                .and_then(|o| o.get_mut("part"))
-                .and_then(|p| p.as_array_mut())
-            {
-                parts.push(json!({"name": "location", "valueUri": f.url}));
-            }
-        } else {
-            output.push(json!({
-                "name": "output",
-                "part": [
-                    {"name": "name", "valueString": f.view_name},
-                    {"name": "location", "valueUri": f.url}
-                ]
-            }));
+        if !locations_by_view.contains_key(&f.view_name) {
+            output_order.push(f.view_name.clone());
         }
+        locations_by_view
+            .entry(f.view_name.clone())
+            .or_default()
+            .push(f.url.clone());
     }
+    let output: Vec<Value> = output_order
+        .into_iter()
+        .map(|name| {
+            let mut parts = vec![json!({"name": "name", "valueString": &name})];
+            for url in locations_by_view.remove(&name).unwrap_or_default() {
+                parts.push(json!({"name": "location", "valueUri": url}));
+            }
+            json!({"name": "output", "part": parts})
+        })
+        .collect();
 
     let status_url = format!(
         "{base}/export/{job_id}/status",
@@ -663,6 +755,270 @@ where
 // Helpers
 // ============================================================================
 
+/// Merged input parameters for a single export job. Built from the query
+/// string and (optionally) a `Parameters` body. Query string wins on conflict.
+#[derive(Debug, Clone)]
+struct ExportInputs {
+    format: String,
+    header: bool,
+    limit: Option<usize>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    patient: Vec<String>,
+    group: Vec<String>,
+    client_tracking_id: Option<String>,
+}
+
+/// Parses the raw query string into [`ExportQueryParams`], rejecting any
+/// keys outside the spec-defined parameter set. Returns a 400 OperationOutcome
+/// response on rejection.
+#[allow(clippy::result_large_err)]
+fn parse_export_query(raw: Option<&str>) -> Result<ExportQueryParams, Response> {
+    let raw = raw.unwrap_or("");
+    if raw.is_empty() {
+        return Ok(ExportQueryParams::default());
+    }
+    // Validate every key up-front so we can report the offender in the
+    // OperationOutcome rather than serde's "unknown field" string.
+    const ALLOWED_QUERY: &[&str] = &[
+        "_format",
+        "header",
+        "_limit",
+        "_since",
+        "patient",
+        "group",
+        "clientTrackingId",
+        "source",
+    ];
+    for (k, _) in url::form_urlencoded::parse(raw.as_bytes()) {
+        if !ALLOWED_QUERY.contains(&k.as_ref()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [{
+                        "severity": "error",
+                        "code": "not-supported",
+                        "diagnostics": format!(
+                            "unsupported query parameter '{k}' for $viewdefinition-export"
+                        )
+                    }]
+                })),
+            )
+                .into_response());
+        }
+    }
+    serde_urlencoded::from_str::<ExportQueryParams>(raw).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "invalid",
+                    "diagnostics": format!("invalid query string: {e}")
+                }]
+            })),
+        )
+            .into_response()
+    })
+}
+
+/// Rejects body parameters whose `name` is not in [`ALLOWED_BODY_PARAMS`].
+/// Returns `Some(400 response)` on the first offender.
+fn validate_unknown_body_params(body: &Value) -> Option<Response> {
+    let entries = body.get("parameter").and_then(|v| v.as_array())?;
+    for entry in entries {
+        let name = entry.get("name").and_then(|n| n.as_str())?;
+        if !ALLOWED_BODY_PARAMS.contains(&name) {
+            return Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "resourceType": "OperationOutcome",
+                        "issue": [{
+                            "severity": "error",
+                            "code": "not-supported",
+                            "diagnostics": format!(
+                                "unsupported body parameter '{name}' for $viewdefinition-export"
+                            )
+                        }]
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
+/// Merges query parameters and body parameters into a single [`ExportInputs`]
+/// view of the request. Query string values take precedence over body values
+/// for each scalar field; for the repeating `patient`/`group` lists, a
+/// non-empty query value replaces the body list entirely (lists do not merge).
+fn merge_export_inputs(query: &ExportQueryParams, body: Option<&Value>) -> ExportInputs {
+    let body_params = body
+        .and_then(|b| b.get("parameter"))
+        .and_then(|p| p.as_array());
+
+    // Body lookups
+    let body_format = find_body_value(body_params, "_format", "valueCode")
+        .or_else(|| find_body_value(body_params, "_format", "valueString"));
+    let body_header = body_params.and_then(|arr| {
+        arr.iter()
+            .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("header"))
+            .and_then(|p| p.get("valueBoolean"))
+            .and_then(|v| v.as_bool())
+    });
+    let body_since = find_body_value(body_params, "_since", "valueInstant")
+        .or_else(|| find_body_value(body_params, "_since", "valueDateTime"));
+    let body_tracking = find_body_value(body_params, "clientTrackingId", "valueString")
+        .or_else(|| find_body_value(body_params, "clientTrackingId", "valueId"));
+
+    // Repeating refs: collect every `patient`/`group` parameter's
+    // `valueReference.reference` (or `valueString` as a permissive fallback).
+    let body_patient = collect_body_refs(body_params, "patient");
+    let body_group = collect_body_refs(body_params, "group");
+
+    let format = query
+        .format
+        .clone()
+        .or(body_format)
+        .unwrap_or_else(|| "ndjson".to_string())
+        .to_lowercase();
+    let header = query.header.or(body_header).unwrap_or(true);
+    let since = query
+        .since
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| body_since.and_then(|s| s.parse().ok()));
+    let client_tracking_id = query.client_tracking_id.clone().or(body_tracking);
+
+    let query_patient = split_refs(query.patient.as_deref());
+    let query_group = split_refs(query.group.as_deref());
+    let patient = if query_patient.is_empty() {
+        body_patient
+    } else {
+        query_patient
+    };
+    let group = if query_group.is_empty() {
+        body_group
+    } else {
+        query_group
+    };
+
+    ExportInputs {
+        format,
+        header,
+        limit: query.limit,
+        since,
+        patient,
+        group,
+        client_tracking_id,
+    }
+}
+
+/// Returns the named body parameter's `value*` string (whatever the value
+/// type is — caller picks the field name to read).
+fn find_body_value(params: Option<&Vec<Value>>, name: &str, value_field: &str) -> Option<String> {
+    params?
+        .iter()
+        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some(name))
+        .and_then(|p| p.get(value_field))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Collects every occurrence of `name` in the body, reading the FHIR
+/// `Reference.reference` string. Falls back to `valueString` for permissive
+/// clients that send refs as bare strings.
+fn collect_body_refs(params: Option<&Vec<Value>>, name: &str) -> Vec<String> {
+    params
+        .map(|arr| {
+            arr.iter()
+                .filter(|p| p.get("name").and_then(|n| n.as_str()) == Some(name))
+                .filter_map(|p| {
+                    p.get("valueReference")
+                        .and_then(|r| r.get("reference"))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| p.get("valueString").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string())
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Validates that every relative `Patient/{id}` and `Group/{id}` reference
+/// in the inputs resolves to an existing resource. Returns 404 with an
+/// OperationOutcome listing the missing references. Absolute / external
+/// references are skipped (we can't reach them).
+async fn validate_patient_group_refs<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    inputs: &ExportInputs,
+) -> Result<Option<Response>, RestError>
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    let mut missing: Vec<String> = Vec::new();
+    for reference in inputs.patient.iter().chain(inputs.group.iter()) {
+        let (resource_type, id) = match parse_relative_compartment_ref(reference) {
+            Some(r) => r,
+            None => continue, // absolute / unparseable — skip
+        };
+        let exists = state
+            .storage()
+            .read(tenant.context(), resource_type, id)
+            .await
+            .map_err(|e| RestError::InternalError {
+                message: format!("failed to check {resource_type}/{id}: {e}"),
+            })?
+            .is_some();
+        if !exists {
+            missing.push(reference.clone());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "not-found",
+                    "diagnostics": format!(
+                        "one or more patient/group references could not be resolved: {}",
+                        missing.join(", ")
+                    )
+                }]
+            })),
+        )
+            .into_response(),
+    ))
+}
+
+/// Returns `(resource_type, id)` for relative refs of the form
+/// `Patient/{id}` or `Group/{id}`. Returns `None` for absolute URLs or
+/// any other shape.
+fn parse_relative_compartment_ref(reference: &str) -> Option<(&'static str, &str)> {
+    let trimmed = reference.trim();
+    for &t in ["Patient", "Group"].iter() {
+        let prefix = format!("{t}/");
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            let id = rest.split('/').next()?;
+            if id.is_empty() {
+                return None;
+            }
+            return Some((t, id));
+        }
+    }
+    None
+}
+
 /// Splits a comma-separated query value into trimmed, non-empty refs.
 fn split_refs(v: Option<&str>) -> Vec<String> {
     match v {
@@ -693,7 +1049,7 @@ async fn extract_views_from_body<S>(
     body: &Value,
 ) -> Result<Vec<NamedView>, RestError>
 where
-    S: ResourceStorage + Send + Sync + 'static,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     let rt = body
         .get("resourceType")
@@ -806,15 +1162,23 @@ where
 }
 
 /// Resolves a FHIR reference to a stored ViewDefinition for use in
-/// `$viewdefinition-export`. Mirrors the relative-only behavior of the
-/// `$viewdefinition-run` handler.
+/// `$viewdefinition-export`. Accepts:
+///
+/// - Relative: `ViewDefinition/{id}` — `storage.read(...)`.
+/// - Canonical: `http(s)://…` optionally with `…|version` — server registry
+///   lookup via `SearchProvider::search` on `url` (+ `version`); newest
+///   match by `meta.lastUpdated` wins.
+///
+/// Absolute external URL *fetch* is not supported; callers must register
+/// the artifact on this server first. The `$sql-on-fhir-capabilities`
+/// response advertises this via `supportsAbsoluteReference = false`.
 async fn resolve_view_reference_export<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     reference: &str,
 ) -> Result<Value, RestError>
 where
-    S: ResourceStorage + Send + Sync + 'static,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     let trimmed = reference.trim();
     if let Some(rest) = trimmed.strip_prefix("ViewDefinition/") {
@@ -837,9 +1201,67 @@ where
             })?;
         return Ok(stored.content().clone());
     }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return resolve_canonical_view_definition(state, tenant.context(), trimmed).await;
+    }
     Err(RestError::BadRequest {
         message: format!(
-            "viewReference '{reference}' uses an unsupported form; supported: 'ViewDefinition/{{id}}'"
+            "viewReference '{reference}' uses an unsupported form; supported: \
+             relative `ViewDefinition/{{id}}` or canonical `http(s)://…[|version]`"
         ),
     })
+}
+
+/// Resolves a canonical ViewDefinition URL (optionally with `|version`) via
+/// `SearchProvider::search` against the local registry. Picks the newest
+/// match by `meta.lastUpdated` when multiple resources share the same URL.
+async fn resolve_canonical_view_definition<S>(
+    state: &AppState<S>,
+    tenant: &TenantContext,
+    url: &str,
+) -> Result<Value, RestError>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
+    let (canonical, version) = match url.split_once('|') {
+        Some((u, v)) => (u.to_string(), Some(v.to_string())),
+        None => (url.to_string(), None),
+    };
+    let mut query = SearchQuery::new("ViewDefinition");
+    query.parameters.push(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: None,
+        values: vec![SearchValue::new(SearchPrefix::Eq, canonical)],
+        chain: Vec::new(),
+        components: Vec::new(),
+    });
+    if let Some(v) = version {
+        query.parameters.push(SearchParameter {
+            name: "version".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, v)],
+            chain: Vec::new(),
+            components: Vec::new(),
+        });
+    }
+    let result =
+        state
+            .storage()
+            .search(tenant, &query)
+            .await
+            .map_err(|e| RestError::InternalError {
+                message: format!("canonical lookup failed for ViewDefinition url={url}: {e}"),
+            })?;
+    let chosen = result
+        .resources
+        .items
+        .into_iter()
+        .max_by_key(|r| r.last_modified())
+        .ok_or_else(|| RestError::NotFound {
+            resource_type: "ViewDefinition".to_string(),
+            id: url.to_string(),
+        })?;
+    Ok(chosen.content().clone())
 }
