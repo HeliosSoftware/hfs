@@ -17,8 +17,6 @@
 //!   reference keys, `ofType(complex)`, `join(sep)`.
 //! - Stage 5: `lowBoundary` / `highBoundary`.
 
-#![allow(missing_docs)] // Per-field docs land alongside their consumers in stages 2–5.
-
 use std::collections::HashMap;
 
 use helios_fhir::FhirVersion;
@@ -74,6 +72,7 @@ pub struct CompileEnv {
 /// A `ViewDefinition.constant[]` entry resolved to a typed value.
 #[derive(Debug, Clone)]
 pub struct Constant {
+    /// Typed value parsed from the `ViewDefinition.constant[]` entry.
     pub value: LitValue,
     /// Set on first reference; subsequent `%name` references reuse the same
     /// parameter slot.
@@ -81,6 +80,9 @@ pub struct Constant {
 }
 
 impl CompileEnv {
+    /// Creates an env rooted at `root_alias` with no resource-type context.
+    /// Use [`Self::new_for_resource`] when cardinality lookups need the
+    /// ViewDefinition's resource type.
     pub fn new(root_alias: impl Into<String>) -> Self {
         Self {
             root_alias: root_alias.into(),
@@ -109,22 +111,12 @@ impl CompileEnv {
     }
 }
 
-/// Polymorphic-element root names per the FHIR spec.
-///
-/// When `<root>.ofType(T)` appears in a path, the compiler rewrites the
-/// terminal step from `<root>` to `<root><Type>` so that, e.g.,
-/// `value.ofType(Quantity)` reads `valueQuantity`. This list is intentionally
-/// narrow — covers what the SoF v2 conformance corpus exercises.
-const POLYMORPHIC_ROOTS: &[&str] = &[
-    "value",
-    "deceased",
-    "effective",
-    "onset",
-    "identified",
-    "born",
-    "multipleBirth",
-    "occurrence",
-];
+/// Root alias used by `compile_view` for the resource document
+/// (`{ROOT_ALIAS}.data` → `"r.data"`). Polymorphic-rewrite parent walks only
+/// proceed when the path's SQL root matches this alias, since paths rooted
+/// at sub-scope iter aliases (`w0.value`, `fe1.value`, …) navigate off an
+/// element whose FHIR type we don't track at compile time.
+const RESOURCE_ROOT: &str = "r.data";
 
 /// Parse `src` and compile it to [`SqlExpr`].
 ///
@@ -394,7 +386,7 @@ fn lower_invocation(
 
     let base_sql = lower_expression(base, env)?;
     match inv {
-        Invocation::Member(name) => extend_path(base_sql, PathStep::Field(name.clone())),
+        Invocation::Member(name) => extend_path(base_sql, PathStep::Field(name.clone()), env),
         Invocation::Function(name, args) => lower_function_call(&base_sql, name, args, env),
         Invocation::This => Ok(base_sql),
         Invocation::Index | Invocation::Total => Err(SofError::Uncompilable {
@@ -513,7 +505,7 @@ fn build_where_scalar(
     let is_ext = sugar_field.is_some();
     let mut focus = lower_expression(base, env)?;
     if let Some(field) = sugar_field {
-        focus = extend_path(focus, PathStep::Field(field))?;
+        focus = extend_path(focus, PathStep::Field(field), env)?;
     }
     finish_where_scalar(focus, crit_or_url, steps, is_ext, env)
 }
@@ -530,7 +522,7 @@ fn build_where_scalar_at_root(
         path: super::ir::JsonPath::new(),
     };
     if let Some(field) = sugar_field {
-        focus = extend_path(focus, PathStep::Field(field))?;
+        focus = extend_path(focus, PathStep::Field(field), env)?;
     }
     finish_where_scalar(focus, crit_or_url, steps, is_ext, env)
 }
@@ -582,9 +574,9 @@ fn finish_where_scalar(
     };
     for step in steps.into_iter().rev() {
         projection = match step {
-            PostStep::Field(name) => extend_path(projection, PathStep::Field(name))?,
-            PostStep::Index(n) => extend_path(projection, PathStep::Index(n))?,
-            PostStep::OfType(t) => extend_path(projection, PathStep::OfType(t))?,
+            PostStep::Field(name) => extend_path(projection, PathStep::Field(name), env)?,
+            PostStep::Index(n) => extend_path(projection, PathStep::Index(n), env)?,
+            PostStep::OfType(t) => extend_path(projection, PathStep::OfType(t), env)?,
         };
     }
     env.root_alias = prev_root;
@@ -723,7 +715,7 @@ fn lower_indexer(
             });
         }
     };
-    extend_path(base_sql, PathStep::Index(idx_n))
+    extend_path(base_sql, PathStep::Index(idx_n), env)
 }
 
 /// Extends an existing path-valued expression with another step. Returns
@@ -733,20 +725,27 @@ fn lower_indexer(
 /// - `WhereScalar { projection, .. }` — appends the step to the inner
 ///   projection so `extension(url).value.ofType(Coding).code` keeps lifting
 ///   into the same scalar subquery.
-fn extend_path(base: SqlExpr, step: PathStep) -> Result<SqlExpr, SofError> {
+///
+/// When `step` is an [`PathStep::OfType`] following a [`PathStep::Field`],
+/// the pair is collapsed to a single polymorphic-field step (e.g.
+/// `value.ofType(Quantity)` → `valueQuantity`) iff the FHIR
+/// `StructureDefinition`-derived [`super::lookup_field_type`] table
+/// confirms the typed-variant field exists. Parent-context resolution walks
+/// the existing path from `env.resource_type`; sub-scope paths (rooted at a
+/// `where`/`forEach` iter alias) fall back to a parent-free scan via
+/// [`super::field_exists_anywhere`].
+fn extend_path(base: SqlExpr, step: PathStep, env: &CompileEnv) -> Result<SqlExpr, SofError> {
     match base {
         SqlExpr::JsonPath { root, mut path } => {
-            // Polymorphic rewrite: `value.ofType(Quantity)` collapses
-            // `[..., Field("value"), OfType("Quantity")]` to
-            // `[..., Field("valueQuantity")]`.
             if let PathStep::OfType(type_name) = &step
                 && let Some(PathStep::Field(prev)) = path.0.last()
-                && POLYMORPHIC_ROOTS.contains(&prev.as_str())
             {
-                let last = path.0.len() - 1;
-                let rewritten = format!("{prev}{}", uppercase_first(type_name));
-                path.0[last] = PathStep::Field(rewritten);
-                return Ok(SqlExpr::JsonPath { root, path });
+                let variant = format!("{prev}{}", uppercase_first(type_name));
+                if polymorphic_variant_exists(&root, &path, &variant, env) {
+                    let last = path.0.len() - 1;
+                    path.0[last] = PathStep::Field(variant);
+                    return Ok(SqlExpr::JsonPath { root, path });
+                }
             }
             path.push(step);
             Ok(SqlExpr::JsonPath { root, path })
@@ -757,7 +756,7 @@ fn extend_path(base: SqlExpr, step: PathStep) -> Result<SqlExpr, SofError> {
             predicate,
             projection,
         } => {
-            let new_projection = extend_path(*projection, step)?;
+            let new_projection = extend_path(*projection, step, env)?;
             Ok(SqlExpr::WhereScalar {
                 focus,
                 iter_alias,
@@ -769,6 +768,55 @@ fn extend_path(base: SqlExpr, step: PathStep) -> Result<SqlExpr, SofError> {
             reason: format!("cannot extend non-path expression {other:?} with a path step"),
         }),
     }
+}
+
+/// Returns true when the FHIR field `variant` (e.g. `valueQuantity`) exists
+/// as a typed-variant of the polymorphic field that's the last segment in
+/// `path`. Resource-rooted paths consult the FIELD_TYPES table at the exact
+/// `(parent, variant)` pair; sub-scope paths scan for the variant name
+/// anywhere in the table.
+fn polymorphic_variant_exists(
+    root: &str,
+    path: &JsonPath,
+    variant: &str,
+    env: &CompileEnv,
+) -> bool {
+    match parent_type_of_last_field(root, path, env) {
+        Some(parent) => super::lookup_field_type(env.fhir_version, &parent, variant).is_some(),
+        None => super::field_exists_anywhere(env.fhir_version, variant),
+    }
+}
+
+/// Walks `path` from `env.resource_type` through the FIELD_TYPES table to
+/// determine the FHIR parent type of the last [`PathStep::Field`]. Returns
+/// `None` when the path's root isn't the resource document, the resource
+/// type is unset, or any intermediate segment can't be resolved (unknown
+/// field, type-filter step, etc.).
+fn parent_type_of_last_field(root: &str, path: &JsonPath, env: &CompileEnv) -> Option<String> {
+    if root != RESOURCE_ROOT || env.resource_type.is_empty() {
+        return None;
+    }
+    let last_field_pos = path
+        .0
+        .iter()
+        .rposition(|s| matches!(s, PathStep::Field(_)))?;
+    let mut parent = env.resource_type.clone();
+    for step in &path.0[..last_field_pos] {
+        match step {
+            PathStep::Field(name) => {
+                let (ty, _) = super::lookup_field_type(env.fhir_version, &parent, name)?;
+                parent = ty.to_string();
+            }
+            // Indexing into a collection returns an element of the same type.
+            PathStep::Index(_) => {}
+            // A surviving `OfType` step means the previous polymorphic-rewrite
+            // attempt didn't fire — treat the step as a type cast and adopt
+            // the casted type as the new parent.
+            PathStep::OfType(t) => parent = t.clone(),
+            PathStep::TypeFilter(_) => return None,
+        }
+    }
+    Some(parent)
 }
 
 fn uppercase_first(s: &str) -> String {
@@ -841,12 +889,12 @@ fn lower_function_call(
         }
         "ofType" if args.len() == 1 => {
             let ty = type_name_from_arg(&args[0])?;
-            extend_path(focus.clone(), PathStep::OfType(ty))
+            extend_path(focus.clone(), PathStep::OfType(ty), env)
         }
         "getResourceKey" if args.is_empty() => {
             // Per SoF v2: returns the resource's id. The focus is the
             // resource document; navigate `id` off it.
-            extend_path(focus.clone(), PathStep::Field("id".to_string()))
+            extend_path(focus.clone(), PathStep::Field("id".to_string()), env)
         }
         "getReferenceKey" if args.is_empty() => {
             // `Reference.reference` looks like `Type/id`; extract the id —
@@ -854,7 +902,8 @@ fn lower_function_call(
             // applies to both PG `regexp_replace` (POSIX) and SQLite's
             // built-in `instr`/`substr` shimmed via a registered UDF in
             // stage 6; for now both dialects use a SQL-only expression.
-            let reference = extend_path(focus.clone(), PathStep::Field("reference".to_string()))?;
+            let reference =
+                extend_path(focus.clone(), PathStep::Field("reference".to_string()), env)?;
             Ok(SqlExpr::ReferenceKey {
                 reference: Box::new(reference),
                 expected_type: None,
@@ -862,7 +911,8 @@ fn lower_function_call(
         }
         "getReferenceKey" if args.len() == 1 => {
             let expected = type_name_from_arg(&args[0])?;
-            let reference = extend_path(focus.clone(), PathStep::Field("reference".to_string()))?;
+            let reference =
+                extend_path(focus.clone(), PathStep::Field("reference".to_string()), env)?;
             Ok(SqlExpr::ReferenceKey {
                 reference: Box::new(reference),
                 expected_type: Some(expected),
@@ -900,7 +950,8 @@ fn lower_function_call(
             // or chained as `extension(...).extension(...)`.
             let alias = format!("w{}", env.next_where_alias);
             env.next_where_alias += 1;
-            let ext_focus = extend_path(focus.clone(), PathStep::Field("extension".to_string()))?;
+            let ext_focus =
+                extend_path(focus.clone(), PathStep::Field("extension".to_string()), env)?;
             let prev_root = env.root_alias.clone();
             env.root_alias = format!("{alias}.value");
             let url_path = SqlExpr::JsonPath {
@@ -1030,7 +1081,7 @@ fn lower_type_op(
                 reason: "'is' operator is not yet implemented in the in-DB runner".to_string(),
             })
         }
-        "as" => extend_path(base, PathStep::OfType(type_name)),
+        "as" => extend_path(base, PathStep::OfType(type_name), env),
         other => Err(SofError::Uncompilable {
             reason: format!("unsupported type operator '{other}'"),
         }),

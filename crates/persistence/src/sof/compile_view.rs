@@ -765,7 +765,8 @@ fn path_likely_multi_valued(path: &str, resource_type: &str, fhir_version: FhirV
         if seg.is_empty() || seg.chars().any(|c| !c.is_ascii_alphanumeric()) {
             return false;
         }
-        let Some((field_type, is_collection)) = lookup_field_type(fhir_version, &parent, seg)
+        let Some((field_type, is_collection)) =
+            super::lookup_field_type(fhir_version, &parent, seg)
         else {
             return false;
         };
@@ -778,32 +779,6 @@ fn path_likely_multi_valued(path: &str, resource_type: &str, fhir_version: FhirV
         parent = field_type.to_string();
     }
     false
-}
-
-/// Dispatches to the per-version field-type table in `helios-fhir`. Returns
-/// `(field_type, is_collection)` when the `(parent_type, field_name)` pair
-/// is known.
-fn lookup_field_type(
-    version: FhirVersion,
-    parent_type: &str,
-    field_name: &str,
-) -> Option<(&'static str, bool)> {
-    match version {
-        #[cfg(feature = "R4")]
-        FhirVersion::R4 => helios_fhir::r4::get_field_type(parent_type, field_name),
-        #[cfg(feature = "R4B")]
-        FhirVersion::R4B => helios_fhir::r4b::get_field_type(parent_type, field_name),
-        #[cfg(feature = "R5")]
-        FhirVersion::R5 => helios_fhir::r5::get_field_type(parent_type, field_name),
-        #[cfg(feature = "R6")]
-        FhirVersion::R6 => helios_fhir::r6::get_field_type(parent_type, field_name),
-        // The `FhirVersion` enum's variants are gated on `helios-fhir`'s own
-        // feature flags, which may not align with this crate's feature flags
-        // when an upstream consumer enables a version on `helios-fhir`
-        // directly. Fall back to "no info" rather than failing to compile.
-        #[allow(unreachable_patterns)]
-        _ => None,
-    }
 }
 
 /// Splits a forEach path source like `"name.where(use = X)"` into the base
