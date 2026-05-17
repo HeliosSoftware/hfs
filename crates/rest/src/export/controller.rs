@@ -56,8 +56,9 @@ pub struct CompletedFile {
 pub enum JobStatus {
     /// Job is still running.
     Running {
-        /// Human-readable progress description, e.g. `"running view"`.
-        progress: String,
+        /// Completion percentage (0..=100). Surfaced as the spec's
+        /// `X-Progress: {n}%` header on polling responses.
+        percent: u8,
         /// Time the job was submitted.
         submitted_at: DateTime<Utc>,
     },

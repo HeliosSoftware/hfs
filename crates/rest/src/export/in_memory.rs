@@ -90,7 +90,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         self.jobs.insert(
             job_id.clone(),
             JobStatus::Running {
-                progress: "starting".to_string(),
+                percent: 0,
                 submitted_at,
             },
         );
@@ -107,14 +107,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             // Acquire concurrency permit (blocks if too many jobs running)
             let _permit = semaphore.acquire().await;
 
-            // Update progress
-            jobs.insert(
-                jid.clone(),
-                JobStatus::Running {
-                    progress: "running view".to_string(),
-                    submitted_at,
-                },
-            );
+            let view_count = task.views.len().max(1) as u32;
 
             let format = task.format.to_lowercase();
             let ext = match format.as_str() {
@@ -129,8 +122,9 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
 
             // Spec: `view` is 1..* — run each ViewDefinition and produce its
             // own set of output shards. `output.name` in the manifest carries
-            // the per-view name.
-            for named in &task.views {
+            // the per-view name. Progress advances by `1/view_count` per view
+            // finished so the X-Progress percentage tracks real work.
+            for (view_idx, named) in task.views.iter().enumerate() {
                 let stream = match runner
                     .run_view(&task.tenant, named.view.clone(), task.filters.clone())
                     .await
@@ -164,15 +158,10 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
 
                 total_rows += rows.len();
 
+                // Spec: `output` is 0..*. Views with zero rows simply
+                // contribute no `output` entries rather than emitting an
+                // empty shard with a download URL pointing at zero bytes.
                 let ranges = planner::plan(rows.len(), shard_rows);
-                let ranges = if ranges.is_empty() {
-                    // Empty result set: still emit one empty shard so the
-                    // manifest contains at least one output entry per view.
-                    let empty: std::ops::Range<usize> = 0..0;
-                    vec![empty]
-                } else {
-                    ranges
-                };
 
                 for (shard_idx, range) in ranges.into_iter().enumerate() {
                     let shard_rows_slice = &rows[range.clone()];
@@ -231,6 +220,19 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                         row_count,
                     });
                 }
+
+                // After this view's shards are written, bump the percentage.
+                // Capped at 99 while running so callers don't see "100%" until
+                // the manifest is actually available at the result URL.
+                let views_done = (view_idx as u32) + 1;
+                let percent = ((views_done * 100) / view_count).min(99) as u8;
+                jobs.insert(
+                    jid.clone(),
+                    JobStatus::Running {
+                        percent,
+                        submitted_at,
+                    },
+                );
             }
 
             debug!(

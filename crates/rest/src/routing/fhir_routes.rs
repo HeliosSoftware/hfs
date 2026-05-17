@@ -300,14 +300,19 @@ where
             get(handlers::sof::sof_capabilities_handler::<S>),
         )
         // Anonymous run: POST /ViewDefinition/$viewdefinition-run
+        // GET is permitted per spec when the ViewDefinition is supplied via
+        // `viewReference` query parameter (no `viewResource`/`resource` body).
         .route(
             "/ViewDefinition/$viewdefinition-run",
-            post(handlers::sof::run_view_definition_handler::<S>),
+            post(handlers::sof::run_view_definition_handler::<S>)
+                .get(handlers::sof::run_view_definition_handler::<S>),
         )
         // Instance run: POST /ViewDefinition/{id}/$viewdefinition-run
+        // GET infers the ViewDefinition id from the URL path.
         .route(
             "/ViewDefinition/{id}/$viewdefinition-run",
-            post(handlers::sof::run_stored_view_definition_handler::<S>),
+            post(handlers::sof::run_stored_view_definition_handler::<S>)
+                .get(handlers::sof::run_stored_view_definition_handler::<S>),
         )
         // Export: POST /ViewDefinition/$viewdefinition-export
         .route(
@@ -319,38 +324,38 @@ where
             "/ViewDefinition/{id}/$viewdefinition-export",
             post(handlers::sof::export_stored_view_definition_handler::<S>),
         )
-        // Export status: GET /_operations/export/{job-id}
+        // Export status: GET /export/{job-id}/status
+        // (DELETE on the same URL cancels the job, per spec)
         .route(
-            "/_operations/export/{job_id}",
+            "/export/{job_id}/status",
             get(handlers::sof::get_export_status_handler::<S>)
                 .delete(handlers::sof::cancel_export_handler::<S>),
         )
-        // Export result: GET /_operations/export/{job-id}/$result
+        // Export result: GET /export/{job-id}/result
         // Reached via the 303 redirect from the status endpoint on completion.
-        // Registered before the download route so the literal `$result` path
+        // Registered before the download route so the literal `result` path
         // segment isn't captured by `{filename}`.
         .route(
-            "/_operations/export/{job_id}/$result",
+            "/export/{job_id}/result",
             get(handlers::sof::get_export_result_handler::<S>),
         )
-        // Export download: GET /_operations/export/{job-id}/{filename}
+        // Export download: GET /export/{job-id}/{filename}
         .route(
-            "/_operations/export/{job_id}/{filename}",
+            "/export/{job_id}/{filename}",
             get(handlers::sof::download_export_file_handler::<S>),
         )
-        // Raw SQL query (SQL-on-FHIR v2 spec: $sqlquery-run)
-        // System, type, and instance levels per the spec.
+        // SQL-on-FHIR v2 `$sqlquery-run` — system, type, and instance levels.
         .route(
             "/$sqlquery-run",
-            post(handlers::sof::sql_query_run_handler::<S>),
+            post(handlers::sof::sqlquery_run_handler::<S>),
         )
         .route(
             "/Library/$sqlquery-run",
-            post(handlers::sof::sql_query_run_handler::<S>),
+            post(handlers::sof::sqlquery_run_handler::<S>),
         )
         .route(
             "/Library/{id}/$sqlquery-run",
-            post(handlers::sof::sql_query_run_handler::<S>),
+            post(handlers::sof::sqlquery_run_instance_handler::<S>),
         )
 }
 

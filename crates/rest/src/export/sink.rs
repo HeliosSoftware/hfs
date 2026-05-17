@@ -41,7 +41,7 @@ pub trait ExportSink: Send + Sync + Clone + 'static {
 /// Writes export shards to a local filesystem directory.
 ///
 /// Shard files are stored at `{dir}/{job_id}/shard-0.{ext}`.
-/// Public URLs are `{base_url}/_operations/export/{job_id}/shard-0.{ext}`.
+/// Public URLs are `{base_url}/export/{job_id}/shard-0.{ext}`.
 #[derive(Clone)]
 pub struct FilesystemSink {
     dir: PathBuf,
@@ -79,10 +79,7 @@ impl ExportSink for FilesystemSink {
         std::fs::write(&path, data)
             .map_err(|e| ExportError::Sink(format!("failed to write shard: {e}")))?;
 
-        let url = format!(
-            "{base}/_operations/export/{job_id}/{filename}",
-            base = self.base_url,
-        );
+        let url = format!("{base}/export/{job_id}/{filename}", base = self.base_url,);
         Ok(url)
     }
 
@@ -124,10 +121,7 @@ impl ExportSink for InMemorySink {
         let filename = format!("shard-{shard_index}.{ext}");
         let key = format!("{job_id}/{filename}");
         self.data.insert(key, data);
-        let url = format!(
-            "{base}/_operations/export/{job_id}/{filename}",
-            base = self.base_url,
-        );
+        let url = format!("{base}/export/{job_id}/{filename}", base = self.base_url,);
         Ok(url)
     }
 

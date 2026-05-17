@@ -6,16 +6,16 @@
 //! |-------|--------|-------------|
 //! | `/ViewDefinition/$viewdefinition-export` | POST | Submit an export job |
 //! | `/ViewDefinition/{id}/$viewdefinition-export` | POST | Submit for stored view |
-//! | `/_operations/export/{job-id}` | GET | Poll for job status |
-//! | `/_operations/export/{job-id}/$result` | GET | Fetch completion manifest |
-//! | `/_operations/export/{job-id}` | DELETE | Cancel job |
-//! | `/_operations/export/{job-id}/{filename}` | GET | Download output file |
+//! | `/export/{job-id}/status` | GET | Poll for job status |
+//! | `/export/{job-id}/result` | GET | Fetch completion manifest |
+//! | `/export/{job-id}/status` | DELETE | Cancel job |
+//! | `/export/{job-id}/{filename}` | GET | Download output file |
 //!
 //! ## Submit response (202)
 //!
 //! ```text
 //! 202 Accepted
-//! Content-Location: /_operations/export/{job-id}
+//! Content-Location: /export/{job-id}/status
 //! ```
 //!
 //! Per spec, callers should send `Prefer: respond-async`; the server returns
@@ -24,7 +24,7 @@
 //! ## Poll response
 //!
 //! - `202 Accepted` + `X-Progress: running` while the job is running
-//! - `303 See Other` (Location: `…/$result`) when complete — clients fetch
+//! - `303 See Other` (Location: `…/result`) when complete — clients fetch
 //!   the final manifest from the separate result URL
 //! - `404 Not Found` if the job ID is unknown or was cancelled
 
@@ -71,6 +71,12 @@ pub struct ExportQueryParams {
     /// Client-supplied tracking identifier echoed in the completion manifest.
     #[serde(rename = "clientTrackingId")]
     pub client_tracking_id: Option<String>,
+
+    /// Spec input parameter `source` (external data source — e.g. URI or
+    /// bucket name). This server does not support external sources, so its
+    /// presence triggers a 400 per the spec's "reject unsupported parameters"
+    /// rule. Captured here so the handler can detect it on query strings.
+    pub source: Option<String>,
 }
 
 // ============================================================================
@@ -92,6 +98,9 @@ where
     S: ResourceStorage + Send + Sync + 'static,
 {
     if let Err(resp) = check_prefer_async(&headers) {
+        return Ok(resp);
+    }
+    if let Some(resp) = reject_unsupported_source(&params, Some(&body)) {
         return Ok(resp);
     }
     let views = extract_views_from_body(&state, &tenant, &body).await?;
@@ -120,6 +129,9 @@ where
     S: ResourceStorage + Send + Sync + 'static,
 {
     if let Err(resp) = check_prefer_async(&headers) {
+        return Ok(resp);
+    }
+    if let Some(resp) = reject_unsupported_source(&params, None) {
         return Ok(resp);
     }
 
@@ -185,6 +197,39 @@ fn check_prefer_async(headers: &HeaderMap) -> Result<(), Response> {
         })),
     )
         .into_response())
+}
+
+/// Returns `Some(400 response)` if the caller supplied the spec-defined
+/// `source` input parameter (in the query string or the Parameters body).
+/// This server does not support an external data source, so per the spec
+/// (*"If server does not support a parameter, request should be rejected
+/// with `400 Bad Request`"*) we reject the request rather than silently
+/// ignoring the parameter.
+fn reject_unsupported_source(params: &ExportQueryParams, body: Option<&Value>) -> Option<Response> {
+    let in_query = params.source.is_some();
+    let in_body = body
+        .and_then(|b| b.get("parameter"))
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .any(|p| p.get("name").and_then(|n| n.as_str()) == Some("source"))
+        })
+        .unwrap_or(false);
+
+    if !(in_query || in_body) {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{"severity": "error", "code": "not-supported",
+                    "diagnostics": "the `source` parameter is not supported by this server"}]
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// 422 response for bodies that don't supply at least one valid view.
@@ -263,13 +308,17 @@ where
     };
 
     let job_id = controller.submit(task);
-    let location = format!("/_operations/export/{job_id}");
+    // Spec: `Content-Location` must be the absolute URL of the status endpoint.
+    let location = format!(
+        "{base}/export/{job_id}/status",
+        base = state.base_url().trim_end_matches('/'),
+    );
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_LOCATION,
         HeaderValue::from_str(&location)
-            .unwrap_or_else(|_| HeaderValue::from_static("/_operations/export/unknown")),
+            .unwrap_or_else(|_| HeaderValue::from_static("/export/unknown/status")),
     );
 
     Ok((
@@ -286,7 +335,7 @@ where
 }
 
 // ============================================================================
-// Poll: GET /_operations/export/{job-id}
+// Poll: GET /export/{job-id}/status
 // ============================================================================
 
 /// Poll the status of an export job.
@@ -316,51 +365,52 @@ where
         )
             .into_response()),
 
-        Some(JobStatus::Running { progress, .. }) => {
+        Some(JobStatus::Running { percent, .. }) => {
             let mut headers = HeaderMap::new();
-            if let Ok(v) = HeaderValue::from_str(&progress) {
+            // Spec: `X-Progress` carries a completion percentage (e.g. `65%`).
+            let progress_value = format!("{percent}%");
+            if let Ok(v) = HeaderValue::from_str(&progress_value) {
                 headers.insert("x-progress", v);
             }
             // Spec SHOULD: include Retry-After during polling.
             headers.insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            // Spec: in-progress body is an optional `Parameters` resource
+            // carrying spec-defined params only (no custom `progress` part —
+            // that channel is the `X-Progress` header).
             Ok((
                 StatusCode::ACCEPTED,
                 headers,
                 axum::Json(json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "information", "code": "informational",
-                        "diagnostics": format!("Export job '{job_id}' is running: {progress}")}]
+                    "resourceType": "Parameters",
+                    "parameter": [
+                        {"name": "exportId", "valueString": job_id},
+                        {"name": "status", "valueCode": "in-progress"}
+                    ]
                 })),
             )
                 .into_response())
         }
 
-        Some(JobStatus::Failed { message, .. }) => Ok((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({
-                "resourceType": "OperationOutcome",
-                "issue": [{"severity": "error", "code": "processing",
-                    "diagnostics": format!("Export job '{job_id}' failed: {message}")}]
-            })),
-        )
-            .into_response()),
-
-        Some(JobStatus::Completed { .. }) => {
-            // Spec: completion sends a 303 See Other pointing to a separate
-            // result URL. The manifest itself is served by the result handler.
-            let result_url = format!("/_operations/export/{job_id}/$result");
+        // Spec: terminal states (success OR failure) both 303 to the result
+        // URL. The result handler serves the success manifest with 200, or
+        // a 500 + OperationOutcome on failure.
+        Some(JobStatus::Failed { .. }) | Some(JobStatus::Completed { .. }) => {
+            let result_url = format!(
+                "{base}/export/{job_id}/result",
+                base = state.base_url().trim_end_matches('/'),
+            );
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::LOCATION,
                 HeaderValue::from_str(&result_url)
-                    .unwrap_or_else(|_| HeaderValue::from_static("/_operations/export/")),
+                    .unwrap_or_else(|_| HeaderValue::from_static("/export/")),
             );
             Ok((StatusCode::SEE_OTHER, headers).into_response())
         }
     }
 }
 
-/// `GET /_operations/export/{job_id}/$result` — completion manifest.
+/// `GET /export/{job_id}/result` — completion manifest.
 ///
 /// Per spec, the result URL is distinct from the status URL: clients reach
 /// here after following the `303 See Other` redirect on a completed poll.
@@ -395,7 +445,7 @@ where
             axum::Json(json!({
                 "resourceType": "OperationOutcome",
                 "issue": [{"severity": "error", "code": "exception",
-                    "diagnostics": format!("Export job '{job_id}' has not yet completed; poll /_operations/export/{job_id} first")}]
+                    "diagnostics": format!("Export job '{job_id}' has not yet completed; poll /export/{job_id}/status first")}]
             })),
         )
             .into_response()),
@@ -416,23 +466,36 @@ where
             completed_at,
             format,
             client_tracking_id,
-        }) => Ok((
-            StatusCode::OK,
-            axum::Json(build_completion_manifest(
-                &job_id,
-                &files,
-                submitted_at,
-                completed_at,
-                &format,
-                client_tracking_id.as_deref(),
-            )),
-        )
-            .into_response()),
+        }) => {
+            // Spec: result URLs SHALL be valid for at least 24 hours and MAY
+            // carry an `Expires` header. Format is IMF-fixdate per RFC 7231.
+            let expires_at = completed_at + chrono::Duration::hours(24);
+            let expires_str = expires_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            let mut headers = HeaderMap::new();
+            if let Ok(v) = HeaderValue::from_str(&expires_str) {
+                headers.insert(header::EXPIRES, v);
+            }
+            Ok((
+                StatusCode::OK,
+                headers,
+                axum::Json(build_completion_manifest(
+                    state.base_url(),
+                    &job_id,
+                    &files,
+                    submitted_at,
+                    completed_at,
+                    &format,
+                    client_tracking_id.as_deref(),
+                )),
+            )
+                .into_response())
+        }
     }
 }
 
 /// Constructs the SQL-on-FHIR v2 completion manifest as a FHIR `Parameters` resource.
 fn build_completion_manifest(
+    base_url: &str,
     job_id: &str,
     files: &[crate::export::controller::CompletedFile],
     submitted_at: chrono::DateTime<chrono::Utc>,
@@ -440,22 +503,42 @@ fn build_completion_manifest(
     format: &str,
     client_tracking_id: Option<&str>,
 ) -> Value {
-    // One `output` parameter per shard, carrying the view name + location.
-    let output: Vec<Value> = files
-        .iter()
-        .map(|f| {
-            json!({
+    // Spec: one `output` per view, with `location` (1..*) repeating once per
+    // shard inside it. `files` is already in view-then-shard order, so we
+    // collapse runs of equal `view_name` into a single output entry.
+    let mut output: Vec<Value> = Vec::new();
+    for f in files {
+        let last_matches = output
+            .last()
+            .and_then(|o| o.get("part"))
+            .and_then(|p| p.as_array())
+            .and_then(|arr| arr.iter().find(|p| p["name"] == "name"))
+            .and_then(|p| p["valueString"].as_str())
+            == Some(f.view_name.as_str());
+        if last_matches {
+            // Append another `location` part to the in-progress output entry.
+            if let Some(parts) = output
+                .last_mut()
+                .and_then(|o| o.get_mut("part"))
+                .and_then(|p| p.as_array_mut())
+            {
+                parts.push(json!({"name": "location", "valueUri": f.url}));
+            }
+        } else {
+            output.push(json!({
                 "name": "output",
                 "part": [
                     {"name": "name", "valueString": f.view_name},
-                    {"name": "location", "valueUri": f.url},
-                    {"name": "rowCount", "valueInteger": f.row_count}
+                    {"name": "location", "valueUri": f.url}
                 ]
-            })
-        })
-        .collect();
+            }));
+        }
+    }
 
-    let status_url = format!("/_operations/export/{job_id}");
+    let status_url = format!(
+        "{base}/export/{job_id}/status",
+        base = base_url.trim_end_matches('/'),
+    );
     let duration_secs = (completed_at - submitted_at).num_seconds().max(0);
 
     let mut params: Vec<Value> = vec![
@@ -480,7 +563,7 @@ fn build_completion_manifest(
 }
 
 // ============================================================================
-// Cancel: DELETE /_operations/export/{job-id}
+// Cancel: DELETE /export/{job-id}/status
 // ============================================================================
 
 /// Cancel an export job.
@@ -524,7 +607,7 @@ where
 }
 
 // ============================================================================
-// Download: GET /_operations/export/{job-id}/{filename}
+// Download: GET /export/{job-id}/{filename}
 // ============================================================================
 
 /// Download a shard file from a completed export job.

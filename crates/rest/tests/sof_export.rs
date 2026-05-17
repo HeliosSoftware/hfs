@@ -1,8 +1,8 @@
 //! Handler-level tests for `$viewdefinition-export`.
 //!
 //! Tests the POST `/ViewDefinition/$viewdefinition-export`, GET/DELETE
-//! `/_operations/export/{job-id}`, and GET `/_operations/export/{job-id}/{file}`
-//! endpoints using an in-memory SQLite backend and InMemoryController.
+//! `/export/{job-id}/status`, and GET `/export/{job-id}/{file}` endpoints
+//! using an in-memory SQLite backend and InMemoryController.
 
 mod sof_export_tests {
     use axum::http::{HeaderName, StatusCode};
@@ -13,7 +13,9 @@ mod sof_export_tests {
     use helios_persistence::core::sof_runner::SofRunner;
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
-    use helios_rest::export::{InMemoryController, InMemorySink};
+    use helios_rest::export::{
+        ExportJobController, ExportTask, InMemoryController, InMemorySink, JobStatus,
+    };
     use serde_json::{Value, json};
     use std::sync::Arc;
 
@@ -138,8 +140,11 @@ mod sof_export_tests {
             .unwrap()
             .to_str()
             .unwrap();
+        // Spec: Content-Location is an absolute URL ending in /status.
         assert!(
-            location.starts_with("/_operations/export/"),
+            location.starts_with("http://")
+                && location.contains("/export/")
+                && location.ends_with("/status"),
             "unexpected location: {location}"
         );
     }
@@ -428,34 +433,36 @@ mod sof_export_tests {
             "export did not complete: {manifest}"
         );
 
-        // With shard_rows=1 and 3 patients we expect 3 output shards
+        // Spec: one `output` entry per view, with `location` (1..*) repeating
+        // once per shard inside it. shard_rows=1 + 3 patients = 3 locations.
         let params = manifest["parameter"].as_array().unwrap();
-        let output_count = params
+        let outputs: Vec<&Value> = params
             .iter()
             .filter(|p| p["name"].as_str() == Some("output"))
-            .count();
-        assert_eq!(
-            output_count, 3,
-            "expected 3 shards for 3 rows with shard_rows=1, got {output_count}: {manifest}"
-        );
-
-        // Each shard URL should have a distinct index (shard-0, shard-1, shard-2)
-        let urls: Vec<&str> = params
-            .iter()
-            .filter(|p| p["name"].as_str() == Some("output"))
-            .filter_map(|p| {
-                p["part"].as_array().and_then(|parts| {
-                    parts
-                        .iter()
-                        .find(|q| q["name"].as_str() == Some("location"))
-                        .and_then(|q| q["valueUri"].as_str())
-                })
-            })
             .collect();
-        for (i, url) in urls.iter().enumerate() {
+        assert_eq!(
+            outputs.len(),
+            1,
+            "expected one output entry per view, got {}: {manifest}",
+            outputs.len()
+        );
+        let locations: Vec<&str> = outputs[0]["part"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["name"].as_str() == Some("location"))
+            .filter_map(|p| p["valueUri"].as_str())
+            .collect();
+        assert_eq!(
+            locations.len(),
+            3,
+            "expected 3 location parts for 3 rows with shard_rows=1, got {}: {manifest}",
+            locations.len()
+        );
+        for (i, url) in locations.iter().enumerate() {
             assert!(
                 url.contains(&format!("shard-{i}")),
-                "shard {i} URL should contain 'shard-{i}', got: {url}"
+                "location {i} URL should contain 'shard-{i}', got: {url}"
             );
         }
     }
@@ -610,7 +617,8 @@ mod sof_export_tests {
             .and_then(|p| p["valueCode"].as_str());
         assert_eq!(status_code, Some("completed"));
 
-        // Spec-shaped output: each `output` has `part[name=location]` of type valueUri.
+        // Spec-shaped output: each `output` has `part[name=location]` of type valueUri,
+        // and only carries the spec-defined `name` / `location` parts (no extras).
         let output = params
             .iter()
             .find(|p| p["name"].as_str() == Some("output"))
@@ -623,6 +631,26 @@ mod sof_export_tests {
             has_location,
             "output.part missing 'location' with valueUri: {output}"
         );
+        for p in parts {
+            let part_name = p["name"].as_str().unwrap_or("");
+            assert!(
+                matches!(part_name, "name" | "location"),
+                "spec-conformant `output.part` only allows `name`/`location`, got `{part_name}`: {output}"
+            );
+        }
+
+        // Spec: `location` and `cancelUrl` must be absolute URLs.
+        for required in ["location", "cancelUrl"] {
+            let uri = params
+                .iter()
+                .find(|p| p["name"].as_str() == Some(required))
+                .and_then(|p| p["valueUri"].as_str())
+                .unwrap_or_else(|| panic!("missing {required}"));
+            assert!(
+                uri.starts_with("http://") || uri.starts_with("https://"),
+                "{required} must be absolute URL, got: {uri}"
+            );
+        }
     }
 
     // =========================================================================
@@ -797,7 +825,137 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 14. Multi-view export (T2.5): `view[]` with two named views
+    // 14. `source` parameter rejected with 400 (spec: unsupported params)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_source_param_rejected_in_query() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let resp = server
+            .post("/ViewDefinition/$viewdefinition-export?source=s3://bucket")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            resp.text()
+        );
+        let body: Value = resp.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        assert_eq!(
+            body["issue"][0]["code"].as_str(),
+            Some("not-supported"),
+            "expected not-supported code: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_source_param_rejected_in_body() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "view", "part": [
+                    {"name": "viewResource", "resource": patient_view()}
+                ]},
+                {"name": "source", "valueString": "s3://bucket"}
+            ]
+        });
+        let resp = server
+            .post("/ViewDefinition/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            resp.text()
+        );
+    }
+
+    // =========================================================================
+    // 15. In-progress poll body is `Parameters`, not OperationOutcome.
+    //     X-Progress is a percentage like "100%" (spec format).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_poll_body_is_parameters() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let submit_resp = server
+            .post("/ViewDefinition/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(submit_resp.status_code(), StatusCode::ACCEPTED);
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Poll repeatedly; capture either the in-progress (202) or completed (303)
+        // shape and assert each body shape conforms to the spec.
+        for _ in 0..40 {
+            let poll = server
+                .get(&location)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            match poll.status_code() {
+                StatusCode::ACCEPTED => {
+                    let body: Value = poll.json();
+                    assert_eq!(
+                        body["resourceType"].as_str(),
+                        Some("Parameters"),
+                        "in-progress body must be Parameters, got: {body}"
+                    );
+                    let params = body["parameter"].as_array().unwrap();
+                    let status = params
+                        .iter()
+                        .find(|p| p["name"].as_str() == Some("status"))
+                        .and_then(|p| p["valueCode"].as_str());
+                    assert_eq!(status, Some("in-progress"));
+                    assert!(
+                        params
+                            .iter()
+                            .any(|p| p["name"].as_str() == Some("exportId")),
+                        "in-progress body must include exportId: {body}"
+                    );
+                    // X-Progress must be a percentage ("0%".."99%").
+                    let xp = poll
+                        .headers()
+                        .get("x-progress")
+                        .expect("missing X-Progress")
+                        .to_str()
+                        .unwrap();
+                    assert!(
+                        xp.ends_with('%'),
+                        "X-Progress must be a percentage, got: {xp:?}"
+                    );
+                    let n: u32 = xp.trim_end_matches('%').parse().unwrap_or_else(|_| {
+                        panic!("X-Progress percent must parse as integer: {xp:?}")
+                    });
+                    assert!(n <= 99, "running percent must be <= 99, got {n}");
+                }
+                StatusCode::SEE_OTHER => return, // completed — test passes
+                other => panic!("unexpected poll status: {other}"),
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+        // It's fine if the job completed quickly and we never saw a 202.
+    }
+
+    // =========================================================================
+    // 16. Multi-view export (T2.5): `view[]` with two named views
     // =========================================================================
 
     #[tokio::test]
@@ -860,6 +1018,200 @@ mod sof_export_tests {
         assert!(
             output_names.contains(&"demographics2"),
             "manifest missing demographics2: {output_names:?}"
+        );
+    }
+
+    // =========================================================================
+    // 17. Failed jobs: status URL returns 303 → result URL returns 500.
+    //     Uses a test-only controller that always reports `Failed`.
+    // =========================================================================
+
+    struct FailingController {
+        tenant: String,
+        job_id: String,
+    }
+
+    impl ExportJobController for FailingController {
+        fn submit(&self, _task: ExportTask) -> String {
+            self.job_id.clone()
+        }
+        fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
+            if tenant_id != self.tenant || job_id != self.job_id {
+                return None;
+            }
+            Some(JobStatus::Failed {
+                message: "view runner exploded".to_string(),
+                submitted_at: chrono::Utc::now(),
+            })
+        }
+        fn cancel(&self, _t: &str, _j: &str) -> bool {
+            false
+        }
+        fn read_shard(&self, _t: &str, _j: &str, _f: &str) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_failed_status_returns_303_then_500() {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+
+        let controller = FailingController {
+            tenant: "test-tenant".to_string(),
+            job_id: "fail-1".to_string(),
+        };
+        let config = ServerConfig::for_testing();
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_export_controller(Arc::new(controller));
+        let app = helios_rest::routing::fhir_routes::create_routes(state);
+        let server = TestServer::new(app).expect("failed to create test server");
+
+        // Status endpoint must 303 to /export/fail-1/result, mirroring the
+        // success case (spec: terminal states both redirect to result URL).
+        let poll = server
+            .get("/export/fail-1/status")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(
+            poll.status_code(),
+            StatusCode::SEE_OTHER,
+            "failed status should 303, got: {} {}",
+            poll.status_code(),
+            poll.text()
+        );
+        let loc = poll
+            .headers()
+            .get("location")
+            .expect("303 missing Location")
+            .to_str()
+            .unwrap();
+        // Spec: Location is an absolute URL.
+        assert!(
+            loc.starts_with("http://") && loc.ends_with("/export/fail-1/result"),
+            "expected absolute result URL, got: {loc}"
+        );
+
+        // Result endpoint surfaces the OperationOutcome with 500.
+        let result = server.get(loc).add_header(X_TENANT_ID, "test-tenant").await;
+        assert_eq!(result.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body: Value = result.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        assert!(
+            body["issue"][0]["diagnostics"]
+                .as_str()
+                .unwrap_or("")
+                .contains("view runner exploded"),
+            "diagnostics must surface failure message: {body}"
+        );
+    }
+
+    // =========================================================================
+    // 18. Empty result set: manifest has zero `output` entries (spec: 0..*).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_empty_dataset_yields_no_outputs() {
+        // No `seed_patients` — the view will match zero rows.
+        let (server, _backend) = create_test_server_with_export().await;
+
+        let submit_resp = server
+            .post("/ViewDefinition/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(submit_resp.status_code(), StatusCode::ACCEPTED);
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        let params = manifest["parameter"].as_array().unwrap();
+        let output_count = params
+            .iter()
+            .filter(|p| p["name"].as_str() == Some("output"))
+            .count();
+        assert_eq!(
+            output_count, 0,
+            "empty dataset must produce zero output entries: {manifest}"
+        );
+    }
+
+    // =========================================================================
+    // 19. Result response carries an `Expires` header (IMF-fixdate).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_result_has_expires_header() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let submit_resp = server
+            .post("/ViewDefinition/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(submit_resp.status_code(), StatusCode::ACCEPTED);
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Poll until 303, then GET the result URL directly so we can read
+        // its response headers.
+        let result_url = loop {
+            let poll = server
+                .get(&location)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            if poll.status_code() == StatusCode::SEE_OTHER {
+                break poll
+                    .headers()
+                    .get("location")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        };
+
+        let result = server
+            .get(&result_url)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(result.status_code(), StatusCode::OK);
+        let expires = result
+            .headers()
+            .get("expires")
+            .expect("result response missing Expires header")
+            .to_str()
+            .unwrap();
+        // IMF-fixdate per RFC 7231: e.g. "Sun, 06 Nov 1994 08:49:37 GMT".
+        assert!(
+            expires.ends_with(" GMT"),
+            "Expires must be IMF-fixdate ending in GMT: {expires:?}"
+        );
+        let naive = chrono::NaiveDateTime::parse_from_str(expires, "%a, %d %b %Y %H:%M:%S GMT")
+            .unwrap_or_else(|e| panic!("Expires must parse as IMF-fixdate: {expires:?} — {e}"));
+        let parsed = naive.and_utc();
+        // Expiration must be ~24h in the future (allow a generous window).
+        let delta = parsed.signed_duration_since(chrono::Utc::now());
+        assert!(
+            delta.num_hours() >= 23 && delta.num_hours() <= 25,
+            "Expires must be ~24h ahead, got {} hours: {expires:?}",
+            delta.num_hours()
         );
     }
 }
