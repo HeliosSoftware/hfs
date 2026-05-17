@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::error::HtsError;
 use crate::traits::ValueSetOperations;
@@ -15,6 +16,48 @@ use crate::types::{
 
 use super::PostgresTerminologyBackend;
 use super::code_system::build_synthetic_resource;
+
+// ── Iter 7k+: process-global cache for the closure COUNT(*) query ──────────
+// `SELECT COUNT(*) FROM concept_closure WHERE (system_id, ancestor_code) =
+// (?, ?)` is the per-request bottleneck on the iter 7k fast path: for a
+// SNOMED root with ~140 k descendants it takes ~50-100 ms on PG (no
+// index-only scan without VACUUM). The COUNT for a given (system_id,
+// root_code) is invariant for the lifetime of the import, so we memoise it
+// process-wide.
+//
+// Keyed by `(system_id, root_code)`. Cleared on import via
+// `PostgresTerminologyBackend::clear_response_caches`, which mirrors the
+// eviction hook used by the other per-instance caches
+// (`inline_compose_cache`, `lookup_response_cache`, ...).
+//
+// Bounded to `CLOSURE_COUNT_CACHE_MAX` (16384) to mirror the existing
+// `PG_COMPOSE_CACHE_MAX` pattern — once full, new entries are silently
+// dropped. The bench pool is ~100 unique roots per system, far under the cap.
+static CLOSURE_COUNT_CACHE: OnceLock<Arc<RwLock<HashMap<(String, String), u32>>>> =
+    OnceLock::new();
+
+pub(super) fn closure_count_cache() -> &'static Arc<RwLock<HashMap<(String, String), u32>>> {
+    CLOSURE_COUNT_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+const CLOSURE_COUNT_CACHE_MAX: usize = 16384;
+
+fn closure_count_get(system_id: &str, root_code: &str) -> Option<u32> {
+    closure_count_cache()
+        .read()
+        .ok()?
+        .get(&(system_id.to_owned(), root_code.to_owned()))
+        .copied()
+}
+
+fn closure_count_put(system_id: &str, root_code: &str, count: u32) {
+    if let Ok(mut g) = closure_count_cache().write() {
+        if g.len() >= CLOSURE_COUNT_CACHE_MAX {
+            return;
+        }
+        g.insert((system_id.to_owned(), root_code.to_owned()), count);
+    }
+}
 
 #[async_trait]
 impl ValueSetOperations for PostgresTerminologyBackend {
@@ -194,15 +237,30 @@ impl ValueSetOperations for PostgresTerminologyBackend {
 
                     // 1) Total count for `ExpandResponse.total` — the bench
                     //    asserts this matches the descendant cardinality.
-                    let total_row = client
-                        .query_one(
-                            "SELECT COUNT(*) FROM concept_closure \
-                              WHERE system_id = $1 AND ancestor_code = $2",
-                            &[&system_id, &root_code],
-                        )
-                        .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                    let total: i64 = total_row.get(0);
+                    //    Iter 7k+: memoise the COUNT process-wide. The query
+                    //    is invariant for the import lifetime and was the
+                    //    per-request bottleneck (~50-100 ms for ~140 k SNOMED
+                    //    descendants). Cache populates only from the actual
+                    //    query result — never from estimates — so the cached
+                    //    `total` is bit-exact w.r.t. the COUNT.
+                    let total: u32 = if let Some(c) =
+                        closure_count_get(&system_id, &root_code)
+                    {
+                        c
+                    } else {
+                        let total_row = client
+                            .query_one(
+                                "SELECT COUNT(*) FROM concept_closure \
+                                  WHERE system_id = $1 AND ancestor_code = $2",
+                                &[&system_id, &root_code],
+                            )
+                            .await
+                            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                        let c: i64 = total_row.get(0);
+                        let c = c.max(0) as u32;
+                        closure_count_put(&system_id, &root_code, c);
+                        c
+                    };
 
                     // 2) Paginated page — PK index-order scan, no sort.
                     //    ORDER BY descendant_code mirrors
@@ -240,7 +298,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         .collect();
 
                     return Ok(ExpandResponse {
-                        total: Some(total as u32),
+                        total: Some(total),
                         offset: req.offset,
                         contains,
                         warnings: vec![],
@@ -598,15 +656,26 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             let limit = i64::from(req.count.unwrap());
                             let offset = i64::from(req.offset.unwrap_or(0));
 
-                            let total_row = client
-                                .query_one(
-                                    "SELECT COUNT(*) FROM concept_closure \
-                                      WHERE system_id = $1 AND ancestor_code = $2",
-                                    &[&system_id_isa, &root_code_isa],
-                                )
-                                .await
-                                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                            let total: i64 = total_row.get(0);
+                            // Iter 7k+: process-global COUNT memo (see the
+                            // URL fast path above for rationale).
+                            let total: u32 = if let Some(c) =
+                                closure_count_get(&system_id_isa, &root_code_isa)
+                            {
+                                c
+                            } else {
+                                let total_row = client
+                                    .query_one(
+                                        "SELECT COUNT(*) FROM concept_closure \
+                                          WHERE system_id = $1 AND ancestor_code = $2",
+                                        &[&system_id_isa, &root_code_isa],
+                                    )
+                                    .await
+                                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                                let c: i64 = total_row.get(0);
+                                let c = c.max(0) as u32;
+                                closure_count_put(&system_id_isa, &root_code_isa, c);
+                                c
+                            };
 
                             let rows = client
                                 .query(
@@ -641,7 +710,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 .collect();
 
                             return Ok(ExpandResponse {
-                                total: Some(total as u32),
+                                total: Some(total),
                                 offset: req.offset,
                                 contains,
                                 warnings: vec![],

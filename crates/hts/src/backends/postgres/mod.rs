@@ -179,6 +179,11 @@ impl PostgresTerminologyBackend {
         if let Ok(mut g) = self.translate_response_cache.write() {
             g.clear();
         }
+        // Iter 7k+: process-global closure COUNT(*) memo (see
+        // backends/postgres/value_set.rs::CLOSURE_COUNT_CACHE).
+        if let Ok(mut g) = self::value_set::closure_count_cache().write() {
+            g.clear();
+        }
     }
 
     /// Borrow the underlying `deadpool-postgres` connection pool.
