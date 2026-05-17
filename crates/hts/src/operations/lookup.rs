@@ -33,7 +33,9 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::error::HtsError;
-use crate::state::{AppState, LOOKUP_HANDLER_CACHE_MAX, LookupHandlerCache};
+use crate::state::{
+    AppState, LOOKUP_HANDLER_CACHE_MAX, LookupHandlerCache, NOT_FOUND_CACHE_MAX, NotFoundCache,
+};
 use crate::traits::{SupplementInfo, TerminologyBackend};
 use crate::types::{DesignationValue, LookupRequest, PropertyValue};
 
@@ -99,6 +101,25 @@ fn lookup_cache_put(cache: &LookupHandlerCache, key: String, value: Arc<Value>) 
     }
 }
 
+/// Iter 7i — Is this canonical request key in the negative cache (the last
+/// observation was `NotFound`)?
+fn lookup_not_found_contains(cache: &NotFoundCache, key: &str) -> bool {
+    cache.read().map(|g| g.contains(key)).unwrap_or(false)
+}
+
+/// Iter 7i — Mark this canonical request key as definitively unknown until
+/// the next bundle import wipes the cache. Bounded to
+/// [`NOT_FOUND_CACHE_MAX`] entries so an adversary probing many unique
+/// codes cannot grow the cache without bound.
+fn lookup_not_found_put(cache: &NotFoundCache, key: String) {
+    if let Ok(mut guard) = cache.write() {
+        if guard.len() >= NOT_FOUND_CACHE_MAX {
+            return;
+        }
+        guard.insert(key);
+    }
+}
+
 /// Core lookup logic shared by all four public handlers.
 ///
 /// Extracts `system`, `code`, and optional parameters (`version`,
@@ -130,17 +151,35 @@ async fn process_lookup<B: TerminologyBackend>(
     // is overwhelmingly favourable.
     let cache_key = build_lookup_cache_key(&params);
     if let Some(ref key) = cache_key {
+        // ── Iter 7i: positive cache first, then negative cache ──────────
+        // LK05's pool of nonexistent codes hits the same ~200 keys
+        // repeatedly across 50 VUs over 30 s. The positive cache always
+        // misses on these. Without the negative cache, each request paid
+        // for supplement resolution + backend lookup + the synthesized
+        // designation assembly. With it, a warm-hit on the negative cache
+        // returns NotFound in a few μs.
         if let Some(cached) = lookup_cache_get(&state.lookup_handler_cache, key) {
             return Ok((*cached).clone());
         }
+        if lookup_not_found_contains(&state.lookup_not_found_cache, key) {
+            // Reconstruct the same NotFound the slow path would have
+            // produced. Both backends (postgres/code_system.rs:1456 and
+            // sqlite/code_system.rs:1795) use the same `"Concept not found:
+            // {code}"` shape, so match that exactly to keep the cached
+            // negative response byte-identical to a fresh slow-path miss.
+            let code = find_str_param(&params, "code").unwrap_or_default();
+            return Err(HtsError::NotFound(format!("Concept not found: {code}")));
+        }
     }
     let result = process_lookup_inner(state, params).await;
-    if let (Ok(value), Some(key)) = (&result, cache_key) {
-        lookup_cache_put(
-            &state.lookup_handler_cache,
-            key,
-            Arc::new(value.clone()),
-        );
+    match (&result, cache_key) {
+        (Ok(value), Some(key)) => {
+            lookup_cache_put(&state.lookup_handler_cache, key, Arc::new(value.clone()));
+        }
+        (Err(HtsError::NotFound(_)), Some(key)) => {
+            lookup_not_found_put(&state.lookup_not_found_cache, key);
+        }
+        _ => {}
     }
     result
 }

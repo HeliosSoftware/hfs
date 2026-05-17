@@ -229,6 +229,22 @@ pub struct AppState<B: TerminologyBackend> {
     /// GET handlers, type-level and instance-level — they all funnel through
     /// `process_lookup`).  See [`LookupHandlerCache`].
     pub lookup_handler_cache: LookupHandlerCache,
+
+    /// Negative cache for `$lookup` requests that returned `NotFound`.
+    ///
+    /// Iter 7i — targets LK05 (PG ~50% of SQLite). The positive
+    /// [`LookupHandlerCache`] populates only on `Ok(_)`, so each not-found
+    /// request paid supplement-resolve + backend lookup + per-system
+    /// language fetch + Parameters builder anyway. This `HashSet<String>`
+    /// of canonical [`build_lookup_cache_key`] strings short-circuits ALL
+    /// of that — same key space as the positive cache, no risk of
+    /// stale-positive shadowing because the negative cache is only
+    /// consulted after the positive miss.
+    ///
+    /// Cleared together with the positive caches on bundle import via
+    /// [`AppState::clear_expand_cache`] — a newly-imported supplement
+    /// might define a previously-unknown code.
+    pub lookup_not_found_cache: NotFoundCache,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -251,6 +267,7 @@ impl<B: TerminologyBackend> AppState<B> {
             expand_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             inline_compose_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_handler_cache: Arc::new(RwLock::new(HashMap::new())),
+            lookup_not_found_cache: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -281,6 +298,9 @@ impl<B: TerminologyBackend> AppState<B> {
         }
         if let Ok(mut cache) = self.lookup_handler_cache.write() {
             cache.clear();
+        }
+        if let Ok(mut neg) = self.lookup_not_found_cache.write() {
+            neg.clear();
         }
     }
 
