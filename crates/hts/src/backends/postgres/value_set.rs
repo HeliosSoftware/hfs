@@ -13,9 +13,8 @@ use crate::types::{
     ValidateCodeResponse,
 };
 
+use super::PostgresTerminologyBackend;
 use super::code_system::build_synthetic_resource;
-use super::{HierarchyEdges, PostgresTerminologyBackend, hierarchy_cache};
-use std::sync::Arc;
 
 #[async_trait]
 impl ValueSetOperations for PostgresTerminologyBackend {
@@ -2617,95 +2616,19 @@ async fn pg_filter_property_ne(
         .collect())
 }
 
-/// Load every `(parent_code, child_code)` edge for `system_id` into a
-/// `HashMap<parent_code, Vec<child_code>>` and cache it in
-/// [`super::hierarchy_cache`]. Single-flight via `OnceCell` so a 50-VU
-/// stampede onto the first request runs one scan, not 50.
+/// Resolve `is-a` filter: the root code itself plus every descendant.
 ///
-/// For SNOMED this query returns ~1.2 M rows and takes ~1-2 s on the bench
-/// runner — paid exactly once per (server boot × system) — after which
-/// every is-a / descendent-of walk in process memory takes 10-50 ms instead
-/// of 400-700 ms per recursive-CTE call. The map sits at ~60 MB resident
-/// for SNOMED.
-async fn load_hierarchy_edges(
-    client: &tokio_postgres::Client,
-    system_id: &str,
-) -> Result<Arc<HierarchyEdges>, HtsError> {
-    let cell = {
-        let mut guard = hierarchy_cache()
-            .write()
-            .map_err(|e| HtsError::StorageError(format!("hierarchy_cache poisoned: {e}")))?;
-        guard
-            .entry(system_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
-            .clone()
-    };
-
-    let edges = cell
-        .get_or_try_init(|| async {
-            let started = std::time::Instant::now();
-            let rows = client
-                .query(
-                    "SELECT parent_code, child_code FROM concept_hierarchy WHERE system_id = $1",
-                    &[&system_id],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
-            for row in rows {
-                let parent: String = row.get(0);
-                let child: String = row.get(1);
-                children_of.entry(parent).or_default().push(child);
-            }
-            tracing::info!(
-                system_id,
-                edges = children_of.values().map(Vec::len).sum::<usize>(),
-                parents = children_of.len(),
-                ms = started.elapsed().as_millis(),
-                "HIER_LOAD: built in-memory hierarchy edge map"
-            );
-            Ok::<Arc<HierarchyEdges>, HtsError>(Arc::new(HierarchyEdges { children_of }))
-        })
-        .await?
-        .clone();
-
-    Ok(edges)
-}
-
-/// BFS descendants of `root_code` over the in-memory `children_of` map,
-/// including the root itself. Mirrors the FHIR `is-a` semantics (the root
-/// IS-A itself). Returns a `HashSet` so duplicate visits collapse cheaply
-/// — DAG-shaped hierarchies (a concept with multiple parents) would
-/// otherwise yield duplicates.
-fn bfs_descendants_inmem(edges: &HierarchyEdges, root_code: &str) -> HashSet<String> {
-    let mut out: HashSet<String> = HashSet::new();
-    out.insert(root_code.to_owned());
-    let mut frontier: Vec<String> = vec![root_code.to_owned()];
-    while let Some(code) = frontier.pop() {
-        if let Some(children) = edges.children_of.get(&code) {
-            for child in children {
-                if out.insert(child.clone()) {
-                    frontier.push(child.clone());
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Resolve `is-a` filter: the root code itself plus every descendant via
-/// `concept_hierarchy`. Iter 7f path: load the system's edges into process
-/// memory once (via [`load_hierarchy_edges`]), BFS in Rust, then issue a
-/// single batched `SELECT code, display FROM concepts WHERE code = ANY(...)`
-/// for the resulting code set. Replaces the per-request recursive CTE,
-/// which was the EX01/EX05 cold-miss bottleneck (~600 ms p99 cold-miss
-/// even when the in-memory `inline_compose_cache` was warming, because
-/// the bench hits ~100 distinct SNOMED roots per 30 s window).
+/// Queries the precomputed `concept_closure` table (PK
+/// `(system_id, ancestor_code, descendant_code)`) for an indexed range scan
+/// instead of a per-request recursive CTE on `concept_hierarchy`. Mirrors the
+/// SQLite is-a path.
 ///
-/// On any failure inside [`load_hierarchy_edges`] we propagate the error
-/// rather than falling back to the recursive CTE — a failure here would
-/// most likely be a transient pool error, and the OnceCell stays empty on
-/// `Err` so the next request retries cleanly.
+/// Assumes the closure has been built for `system_id` —
+/// `PostgresTerminologyBackend::new` runs `migrate_concept_closure_pg` before
+/// serving the first request, and the CLI bulk import runs the same migration
+/// at end-of-import. If a system somehow lacks closure rows (bypassed
+/// migration?), an empty result falls through here — same UX as an unknown
+/// root code.
 async fn pg_filter_is_a(
     client: &tokio_postgres::Client,
     system_url: &str,
@@ -2718,19 +2641,13 @@ async fn pg_filter_is_a(
         )));
     }
 
-    let edges = load_hierarchy_edges(client, system_id).await?;
-    let codes_set = bfs_descendants_inmem(&edges, root_code);
-    let codes: Vec<String> = codes_set.into_iter().collect();
-
-    if codes.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let rows = client
         .query(
-            "SELECT code, display FROM concepts \
-             WHERE system_id = $1 AND code = ANY($2::text[])",
-            &[&system_id, &codes],
+            "SELECT c.code, c.display
+               FROM concept_closure cc
+               JOIN concepts c ON c.system_id = $1 AND c.code = cc.descendant_code
+              WHERE cc.system_id = $1 AND cc.ancestor_code = $2",
+            &[&system_id, &root_code],
         )
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -3229,44 +3146,17 @@ async fn validate_fhir_vs(
             }))
         }
         FhirVsPattern::IsA(root_code) => {
-            // TODO: parity — SQLite uses a precomputed `concept_closure` table
-            // for O(1) ancestor lookup; PG has no closure table yet, so we
-            // walk `concept_hierarchy` with WITH RECURSIVE downward from the
-            // root. Membership = code == root OR descendant of root.
-            if root_code == code {
-                let row = client
-                    .query_opt(
-                        "SELECT code, display FROM concepts \
-                         WHERE system_id = $1 AND code = $2",
-                        &[&system_id, &code],
-                    )
-                    .await
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-                return Ok(row.map(|r| ExpansionContains {
-                    system: cs_url.to_owned(),
-                    version: None,
-                    code: r.get::<_, String>(0),
-                    display: r.get::<_, Option<String>>(1),
-                    is_abstract: None,
-                    inactive: None,
-                    designations: vec![],
-                    properties: vec![],
-                    extensions: vec![],
-                    contains: vec![],
-                }));
-            }
-
+            // Closure-table fast path: a single PK lookup decides membership.
+            // Same assumption as `pg_filter_is_a` — closure is built by the
+            // time we serve requests.
             let is_member: bool = client
                 .query_one(
-                    "WITH RECURSIVE descendants AS (
-                         SELECT child_code FROM concept_hierarchy
-                          WHERE system_id = $1 AND parent_code = $2
-                         UNION
-                         SELECT ch.child_code FROM concept_hierarchy ch
-                          JOIN descendants d ON ch.parent_code = d.child_code
-                          WHERE ch.system_id = $1
-                     )
-                     SELECT EXISTS(SELECT 1 FROM descendants WHERE child_code = $3)",
+                    "SELECT EXISTS(
+                         SELECT 1 FROM concept_closure
+                          WHERE system_id = $1
+                            AND ancestor_code = $2
+                            AND descendant_code = $3
+                     )",
                     &[&system_id, &root_code, &code],
                 )
                 .await

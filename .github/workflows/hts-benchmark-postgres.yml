@@ -188,17 +188,23 @@ jobs:
         run: |
           set -euo pipefail
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          # `-c shared_buffers=512MB -c work_mem=64MB` give the bench a fair
+          # `-c shared_buffers=1GB -c work_mem=64MB` give the bench a fair
           # chance against SQLite's in-process locality; the defaults are
           # tuned for tiny VPS instances and would penalise PG unfairly when
           # the benchmark loads SNOMED + LOINC + RxNorm into the same DB.
+          # Bumped from 512MB → 1GB (iter 7j) so the ~600 MB SNOMED
+          # `concept_closure` fits in cache; otherwise its index pages
+          # evict the hot LK/VC/EX working set and every PG test regresses
+          # 5-10% (the buffer-pressure regression that motivated reverting
+          # iter 7a). `--shm-size=2g` ensures the larger shmem segment fits.
           docker run -d \
             --name "$PG_CONTAINER" \
+            --shm-size=2g \
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_DB=postgres \
             -p 0:5432 \
             postgres:16 \
-            -c shared_buffers=512MB \
+            -c shared_buffers=1GB \
             -c work_mem=64MB \
             -c max_connections=100 >/dev/null
 

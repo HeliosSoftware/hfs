@@ -220,12 +220,20 @@ jobs:
         run: |
           set -euo pipefail
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          # `-c shared_buffers=1GB -c work_mem=64MB` give PG enough cache
+          # to hold the SNOMED `concept_closure` (added in iter 7j) without
+          # evicting the hot working set. `--shm-size=2g` ensures the
+          # larger shared-memory segment fits inside the container.
           docker run -d \
             --name "$PG_CONTAINER" \
+            --shm-size=2g \
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_DB=postgres \
             -p 0:5432 \
-            postgres:16 >/dev/null
+            postgres:16 \
+            -c shared_buffers=1GB \
+            -c work_mem=64MB \
+            -c max_connections=100 >/dev/null
 
           echo "Waiting for Postgres to accept connections..."
           PG_PORT=""
