@@ -12,21 +12,23 @@
 //! the supplied `Library.parameter` values to the SQL, runs the user's query,
 //! and serializes the result in the requested `_format`.
 //!
-//! ## Deviation: raw-bytes output for flat formats
+//! ## Output shape for flat formats
 //!
 //! The spec declares the operation's `return` parameter as `Binary | Parameters`
-//! (1..1) — strictly, flat formats (csv/json/ndjson/parquet) should be wrapped
-//! in a `Binary` resource with the encoded payload in `Binary.data`. HFS
-//! instead returns the raw payload bytes with the format's `Content-Type`,
-//! matching the convention used by `$viewdefinition-run` and by every other
-//! SoF reference implementation. `_format=fhir` still returns a `Parameters`
-//! resource as specified.
+//! (1..1). By default, flat formats (csv/json/ndjson/parquet) are returned as
+//! raw payload bytes with the format's `Content-Type` — matching `$viewdefinition-run`
+//! and every other SoF reference implementation. Callers that want a strictly
+//! spec-shaped response can ask for the `Binary` wrapper by setting
+//! `Accept: application/fhir+json`; in that case the bytes are base64-encoded
+//! into `Binary.data` and the response is a FHIR `Binary` resource.
+//! `_format=fhir` always returns a `Parameters` resource as specified.
 
 use axum::{
-    extract::{Path, State},
-    http::{StatusCode, header},
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use base64::Engine as _;
 use futures::Stream;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
@@ -39,7 +41,8 @@ use helios_sof::{
     ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableSchema, bind_supplied_params,
     extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library,
 };
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use std::time::Duration;
 use tracing::warn;
 
@@ -47,35 +50,55 @@ use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
 
+/// Query-string parameters accepted by `$sqlquery-run`. The spec ships every
+/// `in` parameter on the operation; we only honor the ones that make sense in
+/// a URL: `_format` and `header`. Everything else (Library, parameters,
+/// source) is body-only.
+#[derive(Debug, Default, Deserialize)]
+pub struct SqlQueryRunQuery {
+    /// `_format` URL fallback when the body omits it. Body wins on conflict.
+    #[serde(rename = "_format")]
+    pub format: Option<String>,
+    /// CSV `header` toggle from the URL. Body wins on conflict. Anything that
+    /// isn't `true`/`false`/`1`/`0` is treated as unspecified.
+    pub header: Option<String>,
+}
+
 /// `POST /$sqlquery-run` and `POST /Library/$sqlquery-run`.
 pub async fn sqlquery_run_handler<S>(
     State(state): State<AppState<S>>,
+    Query(query): Query<SqlQueryRunQuery>,
     tenant: TenantExtractor,
+    headers: HeaderMap,
     body: axum::extract::Json<Value>,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    run_sqlquery(state, tenant, body.0, None).await
+    run_sqlquery(state, tenant, body.0, query, &headers, None).await
 }
 
 /// `POST /Library/{id}/$sqlquery-run`.
 pub async fn sqlquery_run_instance_handler<S>(
     State(state): State<AppState<S>>,
     Path(id): Path<String>,
+    Query(query): Query<SqlQueryRunQuery>,
     tenant: TenantExtractor,
+    headers: HeaderMap,
     body: axum::extract::Json<Value>,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    run_sqlquery(state, tenant, body.0, Some(id)).await
+    run_sqlquery(state, tenant, body.0, query, &headers, Some(id)).await
 }
 
 async fn run_sqlquery<S>(
     state: AppState<S>,
     tenant: TenantExtractor,
     body: Value,
+    query: SqlQueryRunQuery,
+    headers: &HeaderMap,
     path_id: Option<String>,
 ) -> Result<Response, RestError>
 where
@@ -83,20 +106,24 @@ where
 {
     let params = extract_sqlquery_params_from_json(&body);
 
-    // _format is required (spec 1..1).
-    let format = params
-        .format
-        .clone()
-        .ok_or_else(|| RestError::BadRequest {
-            message: "_format is required; supported values: csv, json, ndjson, parquet, fhir"
-                .to_string(),
-        })?
-        .to_lowercase();
+    // _format precedence: body (Parameters) > query string > Accept header.
+    // Spec is `1..1`; failing all three is a 400.
+    let format = resolve_format(params.format.as_deref(), query.format.as_deref(), headers)?;
 
-    // Out of scope v1.
-    if params.source.is_some() {
-        return Err(RestError::UnprocessableEntity {
-            message: "the 'source' parameter (external data source) is not supported".to_string(),
+    // Spec: the `source` parameter is 0..1. We don't implement external data
+    // sources; ignore the value with a warning instead of failing the request.
+    if let Some(src) = &params.source {
+        warn!(
+            source = %src,
+            "$sqlquery-run: ignoring unsupported 'source' parameter; query will run \
+             against the SQLQuery Library's depends-on ViewDefinitions only"
+        );
+    }
+
+    // Mutual exclusion: queryResource and queryReference cannot both be supplied.
+    if params.query_reference.is_some() && params.query_resource.is_some() {
+        return Err(RestError::BadRequest {
+            message: "supply at most one of queryReference or queryResource".to_string(),
         });
     }
 
@@ -214,10 +241,88 @@ where
         }
     }
 
-    // Format output.
-    let include_header = params.header.unwrap_or(true);
-    let (content_type, body) = render_output(&format, include_header, &result)?;
+    // Format output. `header` precedence mirrors `_format`: body > query.
+    let include_header = params
+        .header
+        .or_else(|| parse_header_str(query.header.as_deref()))
+        .unwrap_or(true);
+    let wrap_in_binary = wants_fhir_binary(&format, headers);
+    let (content_type, body) = render_output(&format, include_header, &result, wrap_in_binary)?;
     Ok(build_response(content_type, body))
+}
+
+/// Resolves the output format. Spec precedence: body `_format` > URL `_format`
+/// > Accept header. Spec marks `_format` as `1..1`; failing all three is a 400.
+///
+/// Accept mapping mirrors `$viewdefinition-run`: `application/json` → `json`,
+/// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
+/// `application/octet-stream`/`application/parquet` → `parquet`,
+/// `application/fhir+json` → `fhir`.
+fn resolve_format(
+    body_format: Option<&str>,
+    query_format: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<String, RestError> {
+    if let Some(f) = body_format.or(query_format) {
+        return Ok(f.to_lowercase());
+    }
+    if let Some(accept) = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_lowercase)
+    {
+        let mapped = accept
+            .split(',')
+            .map(|s| s.split(';').next().unwrap_or("").trim())
+            .find_map(|mime| match mime {
+                "application/json" => Some("json"),
+                "application/x-ndjson" | "application/ndjson" => Some("ndjson"),
+                "text/csv" => Some("csv"),
+                "application/octet-stream" | "application/parquet" => Some("parquet"),
+                "application/fhir+json" | "application/fhir+xml" => Some("fhir"),
+                _ => None,
+            });
+        if let Some(f) = mapped {
+            return Ok(f.to_string());
+        }
+    }
+    Err(RestError::BadRequest {
+        message: "_format is required (or provide an Accept header with a supported MIME type); \
+                  supported values: csv, json, ndjson, parquet, fhir"
+            .to_string(),
+    })
+}
+
+/// Parses the query-string `header` value into a bool. Anything that isn't
+/// "true"/"1"/"false"/"0" (case-insensitive) is treated as unspecified so the
+/// body value or default wins.
+fn parse_header_str(s: Option<&str>) -> Option<bool> {
+    let s = s?.trim();
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// True when the caller asked for a `Binary`-wrapped flat-format response by
+/// setting `Accept: application/fhir+json`. `_format=fhir` is never wrapped
+/// (the response is already a FHIR resource).
+fn wants_fhir_binary(format: &str, headers: &HeaderMap) -> bool {
+    if format == "fhir" || format == "application/fhir+json" {
+        return false;
+    }
+    let Some(accept) = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_lowercase)
+    else {
+        return false;
+    };
+    accept
+        .split(',')
+        .map(|s| s.split(';').next().unwrap_or("").trim())
+        .any(|m| m == "application/fhir+json")
 }
 
 /// Sniff SQL to confirm a single `SELECT`/CTE statement. The spec doesn't
@@ -428,6 +533,7 @@ fn render_output(
     format: &str,
     include_header: bool,
     result: &QueryResult,
+    wrap_in_binary: bool,
 ) -> Result<(&'static str, Vec<u8>), RestError> {
     match format {
         "fhir" | "application/fhir+json" => {
@@ -458,7 +564,20 @@ fn render_output(
                     message: format!("output formatter failed: {e}"),
                 }
             })?;
-            Ok((content_type_for(ct), body))
+            let inner_ct = content_type_for(ct);
+            if wrap_in_binary {
+                let binary = json!({
+                    "resourceType": "Binary",
+                    "contentType": inner_ct,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&body),
+                });
+                let bytes = serde_json::to_vec(&binary).map_err(|e| RestError::InternalError {
+                    message: format!("failed to serialize Binary wrapper: {e}"),
+                })?;
+                Ok(("application/fhir+json", bytes))
+            } else {
+                Ok((inner_ct, body))
+            }
         }
     }
 }

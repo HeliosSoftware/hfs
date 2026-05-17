@@ -437,12 +437,19 @@ mod sof_sqlquery_tests {
     }
 
     #[tokio::test]
-    async fn source_parameter_returns_422() {
-        let (server, _) = create_test_server().await;
+    async fn source_parameter_is_ignored_with_warning() {
+        // Spec marks `source` as 0..1. We don't implement external data sources;
+        // when supplied, the value is logged and ignored — the request still runs
+        // against the SQLQuery Library's depends-on ViewDefinitions.
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", &vd_url, "t", vec![]);
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
-                {"name": "_format", "valueCode": "csv"},
+                {"name": "_format", "valueCode": "json"},
+                {"name": "queryResource", "resource": lib},
                 {"name": "source", "valueString": "http://example.org/data.ndjson"}
             ]
         });
@@ -455,7 +462,191 @@ mod sof_sqlquery_tests {
             )
             .json(&body)
             .await;
-        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        response.assert_status(StatusCode::OK);
+        let v: Value = response.json();
+        assert_eq!(v[0]["patient_id"], json!("p1"));
+    }
+
+    #[tokio::test]
+    async fn format_from_query_string() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib =
+            library_with_canonical_vd("SELECT patient_id, family FROM t", &vd_url, "t", vec![]);
+        // No `_format` in the body; only in the URL query.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "queryResource", "resource": lib}]
+        });
+        let response = server
+            .post("/$sqlquery-run?_format=csv")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/csv"), "got {ct}");
+        assert!(response.text().contains("p1,Smith"));
+    }
+
+    #[tokio::test]
+    async fn format_from_accept_header() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", &vd_url, "t", vec![]);
+        // No _format in body or URL; rely on Accept.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "queryResource", "resource": lib}]
+        });
+        let response = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .add_header(
+                HeaderName::from_static("accept"),
+                HeaderValue::from_static("application/x-ndjson"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("application/x-ndjson"), "got {ct}");
+    }
+
+    #[tokio::test]
+    async fn body_format_wins_over_query_string() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", &vd_url, "t", vec![]);
+        let body = run_body_inline(lib, "json", None);
+        // URL says csv, body says json — body wins.
+        let response = server
+            .post("/$sqlquery-run?_format=csv")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("application/json"), "got {ct}");
+    }
+
+    #[tokio::test]
+    async fn accept_fhir_json_wraps_flat_format_as_binary() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib =
+            library_with_canonical_vd("SELECT patient_id, family FROM t", &vd_url, "t", vec![]);
+        let body = run_body_inline(lib, "csv", None);
+        let response = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .add_header(
+                HeaderName::from_static("accept"),
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("application/fhir+json"), "got {ct}");
+        let v: Value = response.json();
+        assert_eq!(v["resourceType"], json!("Binary"));
+        assert!(
+            v["contentType"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("text/csv")
+        );
+        let data = v["data"].as_str().expect("Binary.data string");
+        let decoded = B64.decode(data).expect("Binary.data is valid base64");
+        let text = String::from_utf8(decoded).expect("decoded csv is utf8");
+        assert!(text.contains("p1,Smith"), "decoded csv: {text}");
+    }
+
+    #[tokio::test]
+    async fn both_query_resource_and_query_reference_returns_400() {
+        let (server, backend) = create_test_server().await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd("SELECT 1 FROM t", &vd_url, "t", vec![]);
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "queryResource", "resource": lib},
+                {"name": "queryReference", "valueReference": {"reference": "Library/other"}}
+            ]
+        });
+        let response = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn query_reference_value_string_is_ignored() {
+        // Spec types queryReference as Reference; only valueReference.reference
+        // is honored. A valueString must not be silently accepted — the request
+        // should fail because no Library source was supplied.
+        let (server, _) = create_test_server().await;
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "queryReference", "valueString": "Library/demo"}
+            ]
+        });
+        let response = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

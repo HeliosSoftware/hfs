@@ -85,6 +85,10 @@ dashmap = "6"
 # SQL-query-run: DDL validation
 sqlparser = "0.54"
 
+# Base64 (used to wrap $sqlquery-run flat output as Binary.data when the caller
+# asks for application/fhir+json)
+base64 = "0.22"
+
 # S3 export sink (optional — only when s3 feature is enabled)
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
@@ -98,9 +102,6 @@ axum-test = "18.0"
 
 # Temp files
 tempfile = "3"
-
-# Base64 (used by $sqlquery-run tests to encode SQL into Library.content[].data)
-base64 = "0.22"
 
 # Async test utilities
 tokio = { version = "1", features = ["full", "test-util"] }

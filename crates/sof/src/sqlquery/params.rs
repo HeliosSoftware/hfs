@@ -9,8 +9,9 @@ pub struct SqlQueryRunParams {
     pub format: Option<String>,
     /// `header` — CSV header control (default `true`).
     pub header: Option<bool>,
-    /// `queryReference` — `valueReference.reference` or `valueString`. May be a
-    /// relative `Library/{id}` or a canonical URL.
+    /// `queryReference` — extracted strictly from `valueReference.reference`
+    /// per the operation's `Reference` typing. May be a relative `Library/{id}`
+    /// or an absolute / canonical URL the server can resolve.
     pub query_reference: Option<String>,
     /// `queryResource` — inline `Library` resource carried in `parameter.resource`.
     pub query_resource: Option<Value>,
@@ -52,7 +53,7 @@ pub fn extract_sqlquery_params_from_json(body: &Value) -> SqlQueryRunParams {
             }
             "queryReference" => {
                 if out.query_reference.is_none() {
-                    out.query_reference = read_reference_or_string(p);
+                    out.query_reference = read_reference(p);
                 }
             }
             "queryResource" => {
@@ -89,15 +90,14 @@ fn read_str(p: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn read_reference_or_string(p: &Value) -> Option<String> {
-    if let Some(r) = p
-        .get("valueReference")
+/// Spec: `queryReference` is typed as `Reference`, so only
+/// `valueReference.reference` is honored. Other shapes (`valueString`,
+/// `valueUri`, `valueCanonical`) are ignored.
+fn read_reference(p: &Value) -> Option<String> {
+    p.get("valueReference")
         .and_then(|v| v.get("reference"))
         .and_then(|v| v.as_str())
-    {
-        return Some(r.to_string());
-    }
-    read_str(p, &["valueString", "valueUri", "valueCanonical"])
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -138,5 +138,20 @@ mod tests {
     fn non_parameters_body_returns_default() {
         let p = extract_sqlquery_params_from_json(&json!({"resourceType": "Bundle"}));
         assert!(p.format.is_none());
+    }
+
+    #[test]
+    fn query_reference_only_reads_value_reference() {
+        // valueString / valueUri / valueCanonical are NOT accepted — the spec
+        // types queryReference strictly as Reference.
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "queryReference", "valueString": "Library/foo"}
+            ]
+        });
+        let p = extract_sqlquery_params_from_json(&body);
+        assert!(p.query_reference.is_none());
     }
 }

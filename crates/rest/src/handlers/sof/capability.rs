@@ -12,13 +12,18 @@
 //! {
 //!   "resourceType": "Parameters",
 //!   "parameter": [
-//!     { "name": "supportsViewDefinitionRun",    "valueBoolean": true },
+//!     { "name": "supportsViewDefinitionRun",    "valueBoolean": true  },
 //!     { "name": "supportsViewDefinitionExport", "valueBoolean": false },
-//!     { "name": "supportsSqlQueryRun",          "valueBoolean": false },
+//!     { "name": "supportsSqlQueryRun",          "valueBoolean": true  },
 //!     { "name": "supportsInDbRunner",           "valueBoolean": false },
-//!     { "name": "supportedFormat",              "valueCode": "ndjson" },
-//!     { "name": "supportedFormat",              "valueCode": "json"   },
-//!     { "name": "supportedFormat",              "valueCode": "csv"    }
+//!     { "name": "supportsRelativeReference",    "valueBoolean": true  },
+//!     { "name": "supportsCanonicalReference",   "valueBoolean": true  },
+//!     { "name": "supportsAbsoluteReference",    "valueBoolean": false },
+//!     { "name": "supportedFormat",              "valueCode": "ndjson"  },
+//!     { "name": "supportedFormat",              "valueCode": "json"    },
+//!     { "name": "supportedFormat",              "valueCode": "csv"     },
+//!     { "name": "supportedFormat",              "valueCode": "parquet" },
+//!     { "name": "supportedFormat",              "valueCode": "fhir"    }
 //!   ]
 //! }
 //! ```
