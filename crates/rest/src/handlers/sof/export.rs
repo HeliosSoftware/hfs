@@ -321,14 +321,23 @@ where
             .unwrap_or_else(|_| HeaderValue::from_static("/export/unknown/status")),
     );
 
+    // Spec: kick-off body is a `Parameters` resource with `exportId`,
+    // `status=accepted`, `location`, and optionally `clientTrackingId`.
+    let mut body_params = vec![
+        json!({"name": "exportId", "valueString": job_id}),
+        json!({"name": "status", "valueCode": "accepted"}),
+        json!({"name": "location", "valueUri": location}),
+    ];
+    if let Some(tid) = params.client_tracking_id.as_deref() {
+        body_params.push(json!({"name": "clientTrackingId", "valueString": tid}));
+    }
+
     Ok((
         StatusCode::ACCEPTED,
         headers,
         axum::Json(json!({
-            "resourceType": "OperationOutcome",
-            "issue": [{"severity": "information", "code": "informational",
-                "diagnostics": format!("Export job submitted: {job_id}")
-            }]
+            "resourceType": "Parameters",
+            "parameter": body_params
         })),
     )
         .into_response())

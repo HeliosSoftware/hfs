@@ -314,12 +314,20 @@ where
             post(handlers::sof::run_stored_view_definition_handler::<S>)
                 .get(handlers::sof::run_stored_view_definition_handler::<S>),
         )
-        // Export: POST /ViewDefinition/$viewdefinition-export
+        // Export (system level): POST /$viewdefinition-export
+        // Spec defines this operation at all three levels (system, type,
+        // instance); system-level lets callers submit multi-view exports
+        // without nesting under /ViewDefinition.
+        .route(
+            "/$viewdefinition-export",
+            post(handlers::sof::export_view_definition_handler::<S>),
+        )
+        // Export (type level): POST /ViewDefinition/$viewdefinition-export
         .route(
             "/ViewDefinition/$viewdefinition-export",
             post(handlers::sof::export_view_definition_handler::<S>),
         )
-        // Export instance: POST /ViewDefinition/{id}/$viewdefinition-export
+        // Export (instance level): POST /ViewDefinition/{id}/$viewdefinition-export
         .route(
             "/ViewDefinition/{id}/$viewdefinition-export",
             post(handlers::sof::export_stored_view_definition_handler::<S>),

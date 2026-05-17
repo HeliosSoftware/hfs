@@ -1214,4 +1214,93 @@ mod sof_export_tests {
             delta.num_hours()
         );
     }
+
+    // =========================================================================
+    // 20. Kick-off response body is `Parameters` (spec):
+    //     exportId, status="accepted", location, optional clientTrackingId.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_kickoff_body_is_parameters() {
+        let (server, _backend) = create_test_server_with_export().await;
+
+        let resp = server
+            .post("/ViewDefinition/$viewdefinition-export?clientTrackingId=tracker-99")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+
+        let body: Value = resp.json();
+        assert_eq!(
+            body["resourceType"].as_str(),
+            Some("Parameters"),
+            "kick-off body must be Parameters, got: {body}"
+        );
+        let params = body["parameter"].as_array().unwrap();
+        let names: Vec<&str> = params.iter().filter_map(|p| p["name"].as_str()).collect();
+        for required in ["exportId", "status", "location"] {
+            assert!(
+                names.contains(&required),
+                "kick-off body missing '{required}': {body}"
+            );
+        }
+        // `status` must be the spec's "accepted" code.
+        let status_code = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("status"))
+            .and_then(|p| p["valueCode"].as_str());
+        assert_eq!(status_code, Some("accepted"));
+        // `location` must be the absolute status URL.
+        let loc = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("location"))
+            .and_then(|p| p["valueUri"].as_str())
+            .expect("missing location valueUri");
+        assert!(
+            loc.starts_with("http://") && loc.ends_with("/status"),
+            "kick-off location must be absolute status URL, got: {loc}"
+        );
+        // clientTrackingId echoed when supplied.
+        let tracking = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("clientTrackingId"))
+            .and_then(|p| p["valueString"].as_str());
+        assert_eq!(tracking, Some("tracker-99"));
+    }
+
+    // =========================================================================
+    // 21. System-level endpoint: POST /$viewdefinition-export (spec defines
+    //     this operation at system, type, AND instance levels).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_system_level_endpoint() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let resp = server
+            .post("/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::ACCEPTED,
+            "system-level kick-off failed: {}",
+            resp.text()
+        );
+        // The job should be drivable end-to-end via the same status URL.
+        let location = resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        assert_eq!(manifest["resourceType"].as_str(), Some("Parameters"));
+    }
 }
