@@ -186,10 +186,8 @@ where
 
 /// Builds the `rest[0].operation` list, including SOF operations.
 ///
-/// `viewdefinition-run` is always declared when SOF is enabled.
+/// `viewdefinition-run` and `sqlquery-run` are always declared when SOF is enabled.
 /// `viewdefinition-export` is declared only when an export controller is wired.
-/// `sqlquery-run` is declared only when the raw-SQL runner is wired AND the
-/// feature flag is enabled (matches what `/$sql-on-fhir-capabilities` reports).
 fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
     state: &AppState<S>,
 ) -> Vec<serde_json::Value> {
@@ -206,19 +204,16 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
             "name": "viewdefinition-run",
             "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run"
         }),
+        serde_json::json!({
+            "name": "sqlquery-run",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-run"
+        }),
     ];
 
     if state.export_controller().is_some() {
         ops.push(serde_json::json!({
             "name": "viewdefinition-export",
             "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-export"
-        }));
-    }
-
-    if state.raw_sql_runner().is_some() && state.config().sof_sql_query_enabled {
-        ops.push(serde_json::json!({
-            "name": "sqlquery-run",
-            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-run"
         }));
     }
 

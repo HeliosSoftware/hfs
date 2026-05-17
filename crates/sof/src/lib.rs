@@ -184,10 +184,16 @@ pub mod constants;
 pub mod data_source;
 pub mod params;
 pub mod parquet_schema;
+pub mod sqlquery;
 pub mod traits;
 
 pub use constants::{ConstantValue, parse_constant_from_json};
 pub use params::{ExtractedRunParams, body_has_view_definition, extract_run_params_from_json};
+pub use sqlquery::{
+    BoundParam, ColumnFhirType, DependsOnView, InMemorySqlEngine, LibraryParameter, QueryResult,
+    SqlQueryError, SqlQueryLibrary, SqlQueryRunParams, TableSchema, bind_supplied_params,
+    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library,
+};
 
 use chrono::{DateTime, Utc};
 use helios_fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};

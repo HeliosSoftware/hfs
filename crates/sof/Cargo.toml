@@ -57,6 +57,9 @@ zip = "2.2"
 futures = "0.3"
 tokio-stream = "0.1"
 bytes = "1.5"
+rusqlite = { version = "0.33", features = ["bundled", "serde_json"] }
+sqlparser = "0.54"
+base64 = "0.22"
 
 [dev-dependencies]
 axum-test = "18.0"

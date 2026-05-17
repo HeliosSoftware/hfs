@@ -36,10 +36,11 @@ use crate::state::AppState;
 ///
 /// Feature flags used at build time:
 /// - `$viewdefinition-run` — always enabled when the `sof` feature is active.
-/// - `$viewdefinition-export` — enabled in Phase 4 (not yet).
-/// - `$sql-query-run` — enabled in Phase 6 (not yet).
+/// - `$viewdefinition-export` — runtime-gated on whether an export controller is wired.
+/// - `$sqlquery-run` — always enabled (runs against an in-memory SQLite engine
+///   that materializes the SQLQuery Library's depends-on ViewDefinitions).
 /// - `supportsInDbRunner` — true when the wired `SofRunner` is not the in-process
-///   fallback (i.e. the backend has compiled an in-DB runner in Phase 3+).
+///   fallback (i.e. the backend has compiled an in-DB runner).
 pub async fn sof_capabilities_handler<S>(State(state): State<AppState<S>>) -> impl IntoResponse
 where
     S: ResourceStorage + Send + Sync + 'static,
@@ -61,18 +62,17 @@ where
 
     // Determine feature availability at runtime
     let supports_export = state.export_controller().is_some();
-    let supports_sql_query =
-        state.raw_sql_runner().is_some() && state.config().sof_sql_query_enabled;
 
     let mut params: Vec<serde_json::Value> = vec![
         bool_param("supportsViewDefinitionRun", true),
         bool_param("supportsViewDefinitionExport", supports_export),
-        bool_param("supportsSqlQueryRun", supports_sql_query),
+        bool_param("supportsSqlQueryRun", true),
         bool_param("supportsInDbRunner", supports_indb),
         // Spec SHALL: document which ViewDefinition reference formats are
-        // supported. We currently support only relative `ViewDefinition/{id}`.
+        // supported. We support relative `ViewDefinition/{id}` and resolve
+        // canonical URLs via the SearchProvider for `$sqlquery-run`.
         bool_param("supportsRelativeReference", true),
-        bool_param("supportsCanonicalReference", false),
+        bool_param("supportsCanonicalReference", true),
         bool_param("supportsAbsoluteReference", false),
     ];
 

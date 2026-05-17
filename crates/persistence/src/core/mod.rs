@@ -94,7 +94,6 @@ pub mod bulk_export;
 pub mod bulk_submit;
 pub mod capabilities;
 pub mod history;
-pub mod raw_sql;
 pub mod search;
 pub mod sof_runner;
 pub mod storage;
@@ -123,7 +122,6 @@ pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
-pub use raw_sql::{RawSqlError, RawSqlRunner, SqlRow, wrap_with_tenant_cte};
 pub use search::{
     ChainedSearchProvider, FullSearchProvider, IncludeProvider, MultiTypeSearchProvider,
     RevincludeProvider, SearchProvider, SearchResult, TerminologySearchProvider,

@@ -240,7 +240,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-stored-1", "Green").await;
 
         let response = server
-            .post("/ViewDefinition/some-view-id/$viewdefinition-run")
+            .post("/ViewDefinition/some-view-id/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -279,7 +279,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -310,7 +310,7 @@ mod sof_run_tests {
         seed_patient(&backend, "pt-lim-3", "Gamma").await;
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?_limit=1")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&_limit=1")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -354,7 +354,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -387,7 +387,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -421,7 +421,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -446,7 +446,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -519,7 +519,7 @@ mod sof_run_tests {
 
         let response = server
             .post(&format!(
-                "/ViewDefinition/$viewdefinition-run?_since={since_str}"
+                "/ViewDefinition/$viewdefinition-run?_format=ndjson&_since={since_str}"
             ))
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
@@ -579,7 +579,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?patient=Patient/p1")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&patient=Patient/p1")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -634,7 +634,7 @@ mod sof_run_tests {
         }
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?group=Group/g1")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&group=Group/g1")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -692,7 +692,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .add_header(
                 CONTENT_TYPE,
@@ -732,7 +732,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .json(&body)
             .await;
@@ -762,7 +762,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .json(&body)
             .await;
@@ -794,7 +794,7 @@ mod sof_run_tests {
         });
 
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run")
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .json(&body)
             .await;
@@ -871,7 +871,9 @@ mod sof_run_tests {
 
         // Filter by two distinct patient references.
         let response = server
-            .post("/ViewDefinition/$viewdefinition-run?patient=Patient/p1,Patient/p2")
+            .post(
+                "/ViewDefinition/$viewdefinition-run?_format=ndjson&patient=Patient/p1,Patient/p2",
+            )
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .json(&obs_view)
             .await;

@@ -403,43 +403,6 @@ where
             }
         };
         state = state.with_export_controller(controller);
-
-        // Wire raw SQL query runner when explicitly enabled + URL provided.
-        if config.sof_sql_query_enabled {
-            if let Some(ref url) = config.sof_readonly_url {
-                use helios_persistence::core::raw_sql::RawSqlRunner;
-                let is_pg = url.starts_with("postgres://") || url.starts_with("postgresql://");
-
-                // PostgreSQL raw runner (only when postgres feature is compiled in).
-                #[cfg(feature = "postgres")]
-                if is_pg {
-                    use helios_persistence::raw_sql::PgRawRunner;
-                    info!(url = %url, "Raw SQL runner: PgRawRunner");
-                    state = state.with_raw_sql_runner(
-                        Arc::new(PgRawRunner::new(url.clone())) as Arc<dyn RawSqlRunner>
-                    );
-                }
-
-                // SQLite raw runner (only when sqlite feature is compiled in).
-                #[cfg(feature = "sqlite")]
-                if !is_pg {
-                    use helios_persistence::raw_sql::SqliteRawRunner;
-                    info!(url = %url, "Raw SQL runner: SqliteRawRunner");
-                    state =
-                        state
-                            .with_raw_sql_runner(Arc::new(SqliteRawRunner::new(url.clone()))
-                                as Arc<dyn RawSqlRunner>);
-                }
-
-                if state.raw_sql_runner().is_none() {
-                    tracing::warn!(
-                        url = %url,
-                        "HFS_SOF_READONLY_URL set but no matching backend feature \
-                         is compiled in; $sqlquery-run will return 501"
-                    );
-                }
-            }
-        }
     }
     // Inject subscription engine if enabled
     #[cfg(feature = "subscriptions")]

@@ -407,24 +407,25 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_CONTROLLER", default_value = "memory")]
     pub export_controller: String,
 
-    /// Enable the `$sqlquery-run` operation.
-    /// Only takes effect when the backend advertises `BackendCapability::RawSqlQuery`.
-    #[arg(long, env = "HFS_SOF_SQL_QUERY_ENABLED", default_value = "false")]
-    pub sof_sql_query_enabled: bool,
+    /// Maximum rows returned by `$sqlquery-run`.
+    #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_ROWS", default_value = "100000")]
+    pub sof_sqlquery_max_rows: usize,
 
-    /// Read-only database URL for `$sqlquery-run`.
-    /// For Postgres: `postgres://readonly_user:pass@host/db`.
-    /// For SQLite: file path (e.g. `./fhir.db`).
-    #[arg(long, env = "HFS_SOF_READONLY_URL")]
-    pub sof_readonly_url: Option<String>,
+    /// Maximum rows materialized per depends-on ViewDefinition by `$sqlquery-run`.
+    #[arg(
+        long,
+        env = "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+        default_value = "1000000"
+    )]
+    pub sof_sqlquery_max_source_rows_per_vd: usize,
+
+    /// Maximum number of depends-on ViewDefinitions a single SQLQuery Library may declare.
+    #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_VDS", default_value = "16")]
+    pub sof_sqlquery_max_vds: usize,
 
     /// Hard timeout (seconds) for `$sqlquery-run` queries.
-    #[arg(long, env = "HFS_SOF_SQL_QUERY_TIMEOUT_SECS", default_value = "30")]
-    pub sof_sql_query_timeout_secs: u64,
-
-    /// Maximum rows returned by `$sqlquery-run`.
-    #[arg(long, env = "HFS_SOF_SQL_QUERY_MAX_ROWS", default_value = "100000")]
-    pub sof_sql_query_max_rows: usize,
+    #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
+    pub sof_sqlquery_timeout_secs: u64,
 
     /// URL of the Helios Terminology Server (HTS) for terminology operations.
     ///
@@ -488,10 +489,10 @@ impl Default for ServerConfig {
             export_max_concurrency: 4,
             export_shard_rows: 500_000,
             export_controller: "memory".to_string(),
-            sof_sql_query_enabled: false,
-            sof_readonly_url: None,
-            sof_sql_query_timeout_secs: 30,
-            sof_sql_query_max_rows: 100_000,
+            sof_sqlquery_max_rows: 100_000,
+            sof_sqlquery_max_source_rows_per_vd: 1_000_000,
+            sof_sqlquery_max_vds: 16,
+            sof_sqlquery_timeout_secs: 30,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
         }
@@ -592,10 +593,10 @@ impl ServerConfig {
             export_max_concurrency: 4,
             export_shard_rows: 500_000,
             export_controller: "memory".to_string(),
-            sof_sql_query_enabled: false,
-            sof_readonly_url: None,
-            sof_sql_query_timeout_secs: 30,
-            sof_sql_query_max_rows: 100_000,
+            sof_sqlquery_max_rows: 100_000,
+            sof_sqlquery_max_source_rows_per_vd: 1_000_000,
+            sof_sqlquery_max_vds: 16,
+            sof_sqlquery_timeout_secs: 30,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
         }

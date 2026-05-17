@@ -9,7 +9,6 @@ use std::sync::Arc;
 use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
 use helios_persistence::core::ResourceStorage;
-use helios_persistence::core::raw_sql::RawSqlRunner;
 use helios_persistence::core::sof_runner::SofRunner;
 
 use crate::config::ServerConfig;
@@ -55,9 +54,6 @@ pub struct AppState<S> {
     /// Export job controller (present when export is enabled).
     export_controller: Option<Arc<dyn ExportJobController>>,
 
-    /// Raw SQL query runner for `$sql-query-run` (present when enabled).
-    raw_sql_runner: Option<Arc<dyn RawSqlRunner>>,
-
     /// Optional audit sink for handler-level per-entry audit emission.
     audit_sink: Option<Arc<dyn AuditSink>>,
 
@@ -79,7 +75,6 @@ impl<S> Clone for AppState<S> {
             auth: self.auth.clone(),
             sof_runner: self.sof_runner.clone(),
             export_controller: self.export_controller.clone(),
-            raw_sql_runner: self.raw_sql_runner.clone(),
             audit_sink: self.audit_sink.clone(),
             audit_source_observer: self.audit_source_observer.clone(),
             #[cfg(feature = "subscriptions")]
@@ -103,7 +98,6 @@ impl<S: ResourceStorage> AppState<S> {
             auth: None,
             sof_runner: None,
             export_controller: None,
-            raw_sql_runner: None,
             audit_sink: None,
             audit_source_observer: "Device/hfs".to_string(),
             #[cfg(feature = "subscriptions")]
@@ -137,7 +131,6 @@ impl<S: ResourceStorage> AppState<S> {
             auth: auth_state,
             sof_runner: None,
             export_controller: None,
-            raw_sql_runner: None,
             audit_sink,
             audit_source_observer: audit_source_observer.into(),
             #[cfg(feature = "subscriptions")]
@@ -170,17 +163,6 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns the export job controller, if one has been configured.
     pub fn export_controller(&self) -> Option<&Arc<dyn ExportJobController>> {
         self.export_controller.as_ref()
-    }
-
-    /// Sets the raw SQL query runner on this application state.
-    pub fn with_raw_sql_runner(mut self, runner: Arc<dyn RawSqlRunner>) -> Self {
-        self.raw_sql_runner = Some(runner);
-        self
-    }
-
-    /// Returns the raw SQL query runner, if one has been configured.
-    pub fn raw_sql_runner(&self) -> Option<&Arc<dyn RawSqlRunner>> {
-        self.raw_sql_runner.as_ref()
     }
 
     /// Sets the subscription engine on this AppState.

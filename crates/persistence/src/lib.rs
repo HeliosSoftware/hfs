@@ -143,7 +143,6 @@ pub mod backends;
 pub mod composite;
 pub mod core;
 pub mod error;
-pub mod raw_sql;
 pub mod search;
 pub mod sof;
 pub mod strategy;

@@ -99,6 +99,9 @@ axum-test = "18.0"
 # Temp files
 tempfile = "3"
 
+# Base64 (used by $sqlquery-run tests to encode SQL into Library.content[].data)
+base64 = "0.22"
+
 # Async test utilities
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
