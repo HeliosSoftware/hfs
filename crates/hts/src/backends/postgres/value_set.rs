@@ -119,11 +119,134 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             // normal SNOMED hierarchy filter (mirrors sqlite's
             // `implicit_short_circuit` at backends/sqlite/value_set.rs).
             if let Some((cs_url, pattern)) = parse_fhir_vs_url(url) {
-                if resolve_system_id_pg(&client, &cs_url).await?.is_none() {
-                    return Err(HtsError::NotFound(format!(
-                        "A definition for the value Set '{url}' could not be found"
-                    )));
+                // Resolve once and keep the id around: the iter 7k fast path
+                // below needs it for the closure-table query, and the
+                // existing slow path needs the existence check to reject
+                // unknown CodeSystems before recurring into `compute_expansion`.
+                let system_id = match resolve_system_id_pg(&client, &cs_url).await? {
+                    Some(id) => id,
+                    None => {
+                        return Err(HtsError::NotFound(format!(
+                            "A definition for the value Set '{url}' could not be found"
+                        )));
+                    }
+                };
+
+                // ── Iter 7k: paginated closure-table fast path ─────────────
+                // For `?fhir_vs=isa/X` with a bounded `count` and no other
+                // request modifiers we can serve the page directly off the
+                // `concept_closure` table. This bypasses:
+                //   * `compute_expansion` / `apply_compose_filters_pg`
+                //   * `pg_filter_is_a`'s full descendant-set fetch (~140k rows
+                //     for a SNOMED root) and the `Vec<ExpansionContains>`
+                //     materialisation that follows
+                //   * the in-memory `inline_compose_cache` Arc allocation
+                //     (which only helps once warm, and at the cost of holding
+                //     a 140k-element Vec per distinct `?fhir_vs=isa/<code>`)
+                //
+                // The PK on `concept_closure(system_id, ancestor_code,
+                // descendant_code)` lets `WHERE (system_id, ancestor_code) =
+                // ($1, $2) ORDER BY descendant_code` run as an index-order
+                // range scan — no sort, no temp table. The JOIN to `concepts`
+                // picks up the display for the page rows only.
+                //
+                // Iter 7a-2 (commit b6072493 "drop paginated PG fast path;
+                // rely on closure-backed compute") removed this path with the
+                // assumption that closure-backed `pg_filter_is_a` would be
+                // fast enough. But `pg_filter_is_a` still returns the FULL
+                // descendant set, so EX01/EX05 remained materialisation-bound.
+                // This restores the paginated path on top of iter 7j's
+                // closure table — that's the combination SQLite uses via its
+                // `implicit_expansion_cache` table, and the reason SQLite
+                // gets 10k RPS on EX01 vs PG's 183 RPS at iter 7j.
+                //
+                // Gate (all must hold) — otherwise fall through to the
+                // existing closure-backed compute path which handles the
+                // rare/complex cases:
+                //   * pattern is `IsA(root)` (AllConcepts is the bare
+                //     `?fhir_vs` form, served via different SQL elsewhere);
+                //   * `count.is_some()` and `count > 0`;
+                //   * `filter.is_none()` (a free-text filter would have to
+                //     run over the full set);
+                //   * `hierarchical != Some(true)` (tree mode disables paging);
+                //   * no version pins (force/system-default/default-vs) and
+                //     no `tx_resources` (those can change resolution and
+                //     would diverge from the closure built at import time);
+                //   * `max_expansion_size` is not enforced (the closure
+                //     fast path skips the cap; matches the pattern's
+                //     bounded-page semantics — caller already requested
+                //     a page).
+                if matches!(pattern, FhirVsPattern::IsA(_))
+                    && req.count.filter(|&c| c > 0).is_some()
+                    && req.filter.is_none()
+                    && req.hierarchical != Some(true)
+                    && req.force_system_versions.is_empty()
+                    && req.system_version_defaults.is_empty()
+                    && req.default_value_set_versions.is_empty()
+                    && req.tx_resources.is_empty()
+                {
+                    let root_code = match &pattern {
+                        FhirVsPattern::IsA(c) => c.clone(),
+                        _ => unreachable!(),
+                    };
+                    let limit = i64::from(req.count.unwrap());
+                    let offset = i64::from(req.offset.unwrap_or(0));
+
+                    // 1) Total count for `ExpandResponse.total` — the bench
+                    //    asserts this matches the descendant cardinality.
+                    let total_row = client
+                        .query_one(
+                            "SELECT COUNT(*) FROM concept_closure \
+                              WHERE system_id = $1 AND ancestor_code = $2",
+                            &[&system_id, &root_code],
+                        )
+                        .await
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    let total: i64 = total_row.get(0);
+
+                    // 2) Paginated page — PK index-order scan, no sort.
+                    //    ORDER BY descendant_code mirrors
+                    //    `apply_compose_filters_pg`'s
+                    //    `out.sort_by(|a,b| a.code.cmp(&b.code))` so the
+                    //    serve order matches the cached path semantically.
+                    let rows = client
+                        .query(
+                            "SELECT cc.descendant_code, c.display
+                               FROM concept_closure cc
+                               JOIN concepts c
+                                 ON c.system_id = $1 AND c.code = cc.descendant_code
+                              WHERE cc.system_id = $1 AND cc.ancestor_code = $2
+                              ORDER BY cc.descendant_code
+                              LIMIT $3 OFFSET $4",
+                            &[&system_id, &root_code, &limit, &offset],
+                        )
+                        .await
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                    let contains: Vec<ExpansionContains> = rows
+                        .into_iter()
+                        .map(|r| ExpansionContains {
+                            system: cs_url.clone(),
+                            version: None,
+                            code: r.get(0),
+                            display: r.get(1),
+                            is_abstract: None,
+                            inactive: None,
+                            designations: vec![],
+                            properties: vec![],
+                            extensions: vec![],
+                            contains: vec![],
+                        })
+                        .collect();
+
+                    return Ok(ExpandResponse {
+                        total: Some(total as u32),
+                        offset: req.offset,
+                        contains,
+                        warnings: vec![],
+                    });
                 }
+
                 // Single-flight cache check — keyed by URL + version pins. EX01
                 // hits the same `?fhir_vs=isa/<code>` per pool entry hundreds
                 // of times during a 30s vu=50 run; cold-miss is a recursive
@@ -430,6 +553,97 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 total: Some(total),
                                 offset: req.offset,
                                 contains: page,
+                                warnings: vec![],
+                            });
+                        }
+                    }
+                }
+
+                // ── Iter 7k: paginated closure-table fast path (inline VS) ─
+                // Mirrors the URL `?fhir_vs=isa/X` fast path above for the
+                // narrow inline-VS shape that EX05 emits with a single is-a
+                // filter and no other constraints. The intersected
+                // multi-filter case (e.g. is-a AND property=) is harder to
+                // serve from the closure alone and falls through to the
+                // existing path; the conservative-scope conditions below
+                // capture only the single-filter pool entries — EX05 still
+                // only partially benefits.
+                //
+                // Conditions (all must hold; otherwise fall through):
+                //   * `compose.include` has exactly one entry with a `system`;
+                //   * that entry has exactly one `filter[]`: op=is-a on
+                //     property=concept with a non-empty `value`;
+                //   * no `concept[]`, no nested `valueSet[]` refs;
+                //   * no top-level `exclude[]`;
+                //   * no version pins (force/system-default/default-vs),
+                //     no `tx_resources`, no contained VS refs;
+                //   * `count.is_some()` and `count > 0`, `filter.is_none()`,
+                //     `hierarchical != Some(true)`;
+                //   * the include's `system` resolves to a known CodeSystem.
+                if req.count.filter(|&c| c > 0).is_some()
+                    && req.filter.is_none()
+                    && req.hierarchical != Some(true)
+                    && req.force_system_versions.is_empty()
+                    && req.system_version_defaults.is_empty()
+                    && req.default_value_set_versions.is_empty()
+                    && req.tx_resources.is_empty()
+                    && contained_vec.is_empty()
+                {
+                    if let Some((cs_url_isa, root_code_isa)) =
+                        extract_single_isa_include(compose_val)
+                    {
+                        if let Some(system_id_isa) =
+                            resolve_system_id_pg(&client, &cs_url_isa).await?
+                        {
+                            let limit = i64::from(req.count.unwrap());
+                            let offset = i64::from(req.offset.unwrap_or(0));
+
+                            let total_row = client
+                                .query_one(
+                                    "SELECT COUNT(*) FROM concept_closure \
+                                      WHERE system_id = $1 AND ancestor_code = $2",
+                                    &[&system_id_isa, &root_code_isa],
+                                )
+                                .await
+                                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                            let total: i64 = total_row.get(0);
+
+                            let rows = client
+                                .query(
+                                    "SELECT cc.descendant_code, c.display
+                                       FROM concept_closure cc
+                                       JOIN concepts c
+                                         ON c.system_id = $1
+                                        AND c.code = cc.descendant_code
+                                      WHERE cc.system_id = $1
+                                        AND cc.ancestor_code = $2
+                                      ORDER BY cc.descendant_code
+                                      LIMIT $3 OFFSET $4",
+                                    &[&system_id_isa, &root_code_isa, &limit, &offset],
+                                )
+                                .await
+                                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                            let contains: Vec<ExpansionContains> = rows
+                                .into_iter()
+                                .map(|r| ExpansionContains {
+                                    system: cs_url_isa.clone(),
+                                    version: None,
+                                    code: r.get(0),
+                                    display: r.get(1),
+                                    is_abstract: None,
+                                    inactive: None,
+                                    designations: vec![],
+                                    properties: vec![],
+                                    extensions: vec![],
+                                    contains: vec![],
+                                })
+                                .collect();
+
+                            return Ok(ExpandResponse {
+                                total: Some(total as u32),
+                                offset: req.offset,
+                                contains,
                                 warnings: vec![],
                             });
                         }
@@ -3072,6 +3286,72 @@ fn parse_fhir_vs_url(url: &str) -> Option<(String, FhirVsPattern)> {
         return Some((base.to_owned(), FhirVsPattern::IsA(code.to_owned())));
     }
     None
+}
+
+/// Recognise the narrow inline-compose shape that iter 7k's paginated
+/// closure-table fast path can serve directly: a single `include` with a
+/// single `is-a` filter on `property=concept` and nothing else.
+///
+/// Returns `Some((system_url, root_code))` only when the compose body matches
+/// EXACTLY:
+/// ```text
+/// {
+///   "include": [{
+///     "system": "<url>",
+///     "filter": [{
+///       "property": "concept",
+///       "op":       "is-a",
+///       "value":    "<root>",
+///     }],
+///   }],
+///   // no "exclude", no "concept", no nested "valueSet" refs
+/// }
+/// ```
+/// Anything else (multiple includes, multiple filters, AND-intersected
+/// property filters, concept lists, valueSet refs, an `exclude[]`) returns
+/// `None` so the caller falls through to the existing compute path.
+fn extract_single_isa_include(compose: &serde_json::Value) -> Option<(String, String)> {
+    // Reject any top-level `exclude` (even an empty one is fine, but a
+    // non-empty one would change the result).
+    if let Some(excl) = compose.get("exclude").and_then(|v| v.as_array()) {
+        if !excl.is_empty() {
+            return None;
+        }
+    }
+    let include = compose.get("include")?.as_array()?;
+    if include.len() != 1 {
+        return None;
+    }
+    let inc = &include[0];
+
+    // Bail on any nested valueSet refs or concept enumerations.
+    if let Some(vs_refs) = inc.get("valueSet").and_then(|v| v.as_array()) {
+        if !vs_refs.is_empty() {
+            return None;
+        }
+    }
+    if let Some(concepts) = inc.get("concept").and_then(|v| v.as_array()) {
+        if !concepts.is_empty() {
+            return None;
+        }
+    }
+
+    let system = inc.get("system")?.as_str()?;
+    if system.is_empty() {
+        return None;
+    }
+    let filters = inc.get("filter")?.as_array()?;
+    if filters.len() != 1 {
+        return None;
+    }
+    let f = &filters[0];
+    let prop = f.get("property")?.as_str()?;
+    let op = f.get("op")?.as_str()?;
+    let val = f.get("value")?.as_str()?;
+    if prop != "concept" || op != "is-a" || val.is_empty() {
+        return None;
+    }
+    Some((system.to_owned(), val.to_owned()))
 }
 
 /// Resolve the highest-versioned `code_systems.id` for a given canonical URL.
