@@ -13,8 +13,9 @@ use crate::types::{
     ValidateCodeResponse,
 };
 
-use super::PostgresTerminologyBackend;
 use super::code_system::build_synthetic_resource;
+use super::{HierarchyEdges, PostgresTerminologyBackend, hierarchy_cache};
+use std::sync::Arc;
 
 #[async_trait]
 impl ValueSetOperations for PostgresTerminologyBackend {
@@ -2616,9 +2617,95 @@ async fn pg_filter_property_ne(
         .collect())
 }
 
+/// Load every `(parent_code, child_code)` edge for `system_id` into a
+/// `HashMap<parent_code, Vec<child_code>>` and cache it in
+/// [`super::hierarchy_cache`]. Single-flight via `OnceCell` so a 50-VU
+/// stampede onto the first request runs one scan, not 50.
+///
+/// For SNOMED this query returns ~1.2 M rows and takes ~1-2 s on the bench
+/// runner — paid exactly once per (server boot × system) — after which
+/// every is-a / descendent-of walk in process memory takes 10-50 ms instead
+/// of 400-700 ms per recursive-CTE call. The map sits at ~60 MB resident
+/// for SNOMED.
+async fn load_hierarchy_edges(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+) -> Result<Arc<HierarchyEdges>, HtsError> {
+    let cell = {
+        let mut guard = hierarchy_cache()
+            .write()
+            .map_err(|e| HtsError::StorageError(format!("hierarchy_cache poisoned: {e}")))?;
+        guard
+            .entry(system_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone()
+    };
+
+    let edges = cell
+        .get_or_try_init(|| async {
+            let started = std::time::Instant::now();
+            let rows = client
+                .query(
+                    "SELECT parent_code, child_code FROM concept_hierarchy WHERE system_id = $1",
+                    &[&system_id],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+            for row in rows {
+                let parent: String = row.get(0);
+                let child: String = row.get(1);
+                children_of.entry(parent).or_default().push(child);
+            }
+            tracing::info!(
+                system_id,
+                edges = children_of.values().map(Vec::len).sum::<usize>(),
+                parents = children_of.len(),
+                ms = started.elapsed().as_millis(),
+                "HIER_LOAD: built in-memory hierarchy edge map"
+            );
+            Ok::<Arc<HierarchyEdges>, HtsError>(Arc::new(HierarchyEdges { children_of }))
+        })
+        .await?
+        .clone();
+
+    Ok(edges)
+}
+
+/// BFS descendants of `root_code` over the in-memory `children_of` map,
+/// including the root itself. Mirrors the FHIR `is-a` semantics (the root
+/// IS-A itself). Returns a `HashSet` so duplicate visits collapse cheaply
+/// — DAG-shaped hierarchies (a concept with multiple parents) would
+/// otherwise yield duplicates.
+fn bfs_descendants_inmem(edges: &HierarchyEdges, root_code: &str) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    out.insert(root_code.to_owned());
+    let mut frontier: Vec<String> = vec![root_code.to_owned()];
+    while let Some(code) = frontier.pop() {
+        if let Some(children) = edges.children_of.get(&code) {
+            for child in children {
+                if out.insert(child.clone()) {
+                    frontier.push(child.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Resolve `is-a` filter: the root code itself plus every descendant via
-/// `concept_hierarchy`. PG has no closure table yet (SQLite uses one for
-/// O(1) lookup) so we walk the hierarchy with a recursive CTE.
+/// `concept_hierarchy`. Iter 7f path: load the system's edges into process
+/// memory once (via [`load_hierarchy_edges`]), BFS in Rust, then issue a
+/// single batched `SELECT code, display FROM concepts WHERE code = ANY(...)`
+/// for the resulting code set. Replaces the per-request recursive CTE,
+/// which was the EX01/EX05 cold-miss bottleneck (~600 ms p99 cold-miss
+/// even when the in-memory `inline_compose_cache` was warming, because
+/// the bench hits ~100 distinct SNOMED roots per 30 s window).
+///
+/// On any failure inside [`load_hierarchy_edges`] we propagate the error
+/// rather than falling back to the recursive CTE — a failure here would
+/// most likely be a transient pool error, and the OnceCell stays empty on
+/// `Err` so the next request retries cleanly.
 async fn pg_filter_is_a(
     client: &tokio_postgres::Client,
     system_url: &str,
@@ -2631,20 +2718,19 @@ async fn pg_filter_is_a(
         )));
     }
 
+    let edges = load_hierarchy_edges(client, system_id).await?;
+    let codes_set = bfs_descendants_inmem(&edges, root_code);
+    let codes: Vec<String> = codes_set.into_iter().collect();
+
+    if codes.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let rows = client
         .query(
-            "WITH RECURSIVE descendants AS (
-                 SELECT $2::text AS code
-                 UNION
-                 SELECT ch.child_code FROM concept_hierarchy ch
-                  JOIN descendants d ON ch.parent_code = d.code
-                  WHERE ch.system_id = $1
-             )
-             SELECT c.code, c.display
-               FROM concepts c
-              WHERE c.system_id = $1
-                AND c.code IN (SELECT code FROM descendants)",
-            &[&system_id, &root_code],
+            "SELECT code, display FROM concepts \
+             WHERE system_id = $1 AND code = ANY($2::text[])",
+            &[&system_id, &codes],
         )
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;

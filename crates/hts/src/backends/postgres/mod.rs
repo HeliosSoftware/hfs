@@ -12,7 +12,7 @@ mod value_set;
 use async_trait::async_trait;
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio_postgres::NoTls;
 use tracing::info;
 
@@ -64,6 +64,45 @@ pub type SubsumesResponseCache = Arc<RwLock<HashMap<String, Arc<SubsumesResponse
 /// `$translate` response memo (CM01/CM02 hot path).
 /// Key = `"url|system|code|source|target|target_system|target_code|reverse|date"`.
 pub type TranslateResponseCache = Arc<RwLock<HashMap<String, Arc<TranslateResponse>>>>;
+
+/// All hierarchy edges for a single code system, loaded lazily on first use.
+///
+/// `children_of[parent_code] = Vec<child_code>`. Built by a single
+/// `SELECT parent_code, child_code FROM concept_hierarchy WHERE system_id = $1`
+/// per (backend, system_id). For SNOMED this is ~1.2M rows ≈ ~60 MB resident.
+///
+/// The `displays` map carries the same concept-code → display strings we'd
+/// otherwise re-query against `concepts`; it's populated lazily by callers
+/// (`pg_filter_is_a` batches one `SELECT code, display FROM concepts WHERE
+/// code = ANY($2)` and inserts into this map for future cold-misses on the
+/// same system).
+pub struct HierarchyEdges {
+    pub children_of: HashMap<String, Vec<String>>,
+}
+
+/// Per-`system_id` cache of `HierarchyEdges`, gated by a `OnceCell` so 50
+/// concurrent VUs racing onto the same fresh system share one load instead
+/// of issuing 50 parallel 1.2M-row scans.
+///
+/// Cleared by `clear_response_caches` on import/delete since a new bundle can
+/// add or remove edges.
+pub type HierarchyEdgeCache =
+    Arc<RwLock<HashMap<String, Arc<tokio::sync::OnceCell<Arc<HierarchyEdges>>>>>>;
+
+/// Process-global hierarchy edge cache. Threading a `&HierarchyEdgeCache` through
+/// the `compute_expansion → apply_compose_filters_pg → pg_filter_is_a` chain would
+/// touch every signature in `value_set.rs`; using a global lets us add the cache
+/// as a pure additive optimisation behind the existing free-function call graph.
+/// Keyed by `system_id` which is unique per-CodeSystem-version regardless of which
+/// PG backend instance loaded it, so the only multi-instance hazard is that
+/// `clear_response_caches` on one backend evicts entries another backend would
+/// have kept — degraded perf, never wrong results.
+static HIERARCHY_CACHE: OnceLock<HierarchyEdgeCache> = OnceLock::new();
+
+/// Returns the process-global `HierarchyEdgeCache`, initialising on first call.
+pub(super) fn hierarchy_cache() -> &'static HierarchyEdgeCache {
+    HIERARCHY_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
 
 /// Soft cap on cache entries. Once full, new entries are dropped silently
 /// (warm-set wins). 16384 mirrors SQLite's iter-9 cap-raise: each LK*/VC*
@@ -166,6 +205,9 @@ impl PostgresTerminologyBackend {
             g.clear();
         }
         if let Ok(mut g) = self.translate_response_cache.write() {
+            g.clear();
+        }
+        if let Ok(mut g) = hierarchy_cache().write() {
             g.clear();
         }
     }
