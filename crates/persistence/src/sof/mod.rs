@@ -1,17 +1,23 @@
 //! SQL-on-FHIR support for storage backends.
 //!
-//! This module contains:
-//! - [`compiler`] — legacy string-pattern ViewDefinition → SQL compiler
-//!   (active until the IR-based pipeline reaches feature parity in stage 2).
-//! - [`ir`], [`dialect`], [`emit`], [`compile_path`], [`compile_view`] — the
-//!   IR-based pipeline introduced as scaffolding in stage 1; consumers land
-//!   in stages 2–5.
+//! The ViewDefinition → SQL pipeline:
+//!
+//! 1. [`ir`] — `PlanNode` tree and value types (`LitValue`, `Expr`, …).
+//! 2. [`compile_path`] — FHIRPath expression → `Expr` lowering.
+//! 3. [`compile_view`] — ViewDefinition JSON → `PlanNode` (`build_plan`).
+//! 4. [`dialect`] — `SqliteDialect` / `PgDialect` implementations of the
+//!    `Dialect` trait (JSON accessors, parameter syntax, etc.).
+//! 5. [`emit`] — `PlanNode` → parameterised SQL (`emit_plan`).
+//! 6. [`compiler`] — public façade combining `build_plan` + `emit_plan` into
+//!    `compile_view_definition_dialect`, the entry point used by the runners.
+//!
+//! Backend runners:
 //! - [`sqlite`] — [`SqliteInDbRunner`] implementing [`SofRunner`] for SQLite.
 //! - [`postgres`] — [`PgInDbRunner`] implementing [`SofRunner`] for PostgreSQL.
 //!
 //! Inline `resource:` parameters on `$viewdefinition-run` are handled by the
 //! REST layer via the in-process `helios-sof` FHIRPath evaluator, so this
-//! module no longer needs a per-backend inline runner.
+//! module does not need a per-backend inline runner.
 
 pub mod compile_path;
 pub mod compile_view;
