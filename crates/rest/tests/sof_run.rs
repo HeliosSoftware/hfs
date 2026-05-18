@@ -371,6 +371,76 @@ mod sof_run_tests {
         assert_eq!(rows[0]["family"], "Black");
     }
 
+    /// Inline group filtering: a `group=Group/g1` ref resolves against a
+    /// `Group` resource in the inline bundle and its `member.entity`
+    /// Patient references join the effective patient-compartment set.
+    /// Pre-audit-#3 the filter returned 501 NotImplemented for any
+    /// non-empty group_refs (audit item #2). With #2/#3 fixed, group
+    /// resolution actually happens and the response is a 200 with only
+    /// the in-group patients.
+    #[tokio::test]
+    async fn test_inline_run_group_resolves_member_patients() {
+        let (server, _backend) = create_test_server().await;
+
+        let view = patient_view_definition();
+        let group = json!({
+            "resourceType": "Group",
+            "id": "g1",
+            "member": [
+                {"entity": {"reference": "Patient/p-in"}},
+            ]
+        });
+        let pt_in = json!({
+            "resourceType": "Patient",
+            "id": "p-in",
+            "name": [{"family": "Inside"}]
+        });
+        let pt_out = json!({
+            "resourceType": "Patient",
+            "id": "p-out",
+            "name": [{"family": "Outside"}]
+        });
+
+        let parameters_body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "viewResource", "resource": view},
+                {"name": "resource", "resource": group},
+                {"name": "resource", "resource": pt_in},
+                {"name": "resource", "resource": pt_out},
+                {"name": "group", "valueReference": {"reference": "Group/g1"}}
+            ]
+        });
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&parameters_body)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let body = response.text();
+        let families: Vec<String> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter_map(|row| row.get("family").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+
+        assert!(
+            families.contains(&"Inside".to_string()),
+            "expected Patient/p-in (Inside) in output, got {families:?}"
+        );
+        assert!(
+            !families.contains(&"Outside".to_string()),
+            "Patient/p-out (Outside) is not a Group/g1 member and should be excluded, got {families:?}"
+        );
+    }
+
     /// Compartment-aware patient filtering: an AllergyIntolerance whose
     /// `patient` reference matches is included; one whose reference doesn't
     /// is excluded. Pre-audit-item-#3 the filter only checked `subject` /

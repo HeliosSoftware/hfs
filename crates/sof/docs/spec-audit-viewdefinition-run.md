@@ -28,13 +28,22 @@ closed many gaps; those that remain are listed below.
   comma-splits at the consumption site via the shared `split_csv_refs`
   helper lifted into `helios_sof`.
 
-## 2. `group` refusal uses the wrong status code (sof-server)
+## 2. `group` refusal — **FIXED** (closed by #3 work)
 - **Spec:** servers refusing a parameter should return `400` with
-  `not-supported`. Recent commit `5abc11efc` set this precedent for
-  `source` in HFS REST.
-- **sof-server** still maps the "group filtering is not yet implemented"
-  path to `501 not-supported` via `ServerError::NotImplemented`.
-  Inconsistent with the `source` refusal policy.
+  `not-supported`.
+- **Before:** sof-server mapped the "group filtering is not yet
+  implemented" path to `501 not-supported` via
+  `ServerError::NotImplemented`. Inconsistent with the `source` refusal
+  policy set by commit `5abc11efc` for HFS REST.
+- **After:** the audit-item-#3 compartment fix replaced the unimplemented
+  group path with an actual implementation that resolves
+  `Group.member.entity` against the inline bundle and unions those
+  Patient references into the patient-compartment scan. `group` is no
+  longer refused — it's honored. The dead
+  `SofError::InvalidViewDefinition → ServerError::NotImplemented`
+  mapping in sof-server's filter wrapper was removed in the cleanup.
+  Spec's "SHOULD emit OperationOutcome when group target is absent"
+  remains as audit item #5.
 
 ## 3. Patient-compartment filter — **FIXED**
 - **Spec:** "Server SHALL NOT return resources from patient compartments
@@ -166,7 +175,7 @@ closed many gaps; those that remain are listed below.
 | 1 | Cardinality inconsistency between extractors | High (correctness) | sof-server (+HFS inline) | **fixed** `44bfce41a` |
 | 9 | 422 vs 400 on invalid VD | High (status-code spec) | sof-server | open |
 | 3 | Patient-compartment fidelity | High (security/leak) | sof-server (+HFS inline) | **fixed** (this commit) |
-| 2 | `group` 501 vs 400 | Medium (consistency) | sof-server | open |
+| 2 | `group` 501 vs 400 | Medium (consistency) | sof-server | **fixed** (this commit; via #3) |
 | 6 | System-level route | Medium | sof-server | open |
 | 11 | CapabilityStatement formats + refs block | Medium | sof-server | open |
 | 5 | Absent-target OperationOutcome | Medium (SHOULD) | both | open |

@@ -65,7 +65,7 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 /// | viewReference | Reference | in | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. (not yet supported) |
 /// | viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
 /// | patient | Reference | in | type, instance | 0 | * | Filter resources by patient. |
-/// | group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
+/// | group | Reference | in | type, instance | 0 | * | Filter resources by group (resolved via `Group.member.entity` against inline resources). |
 /// | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. Supports file://, http(s)://, s3://, gs://, and azure:// URLs. |
 /// | _limit | integer | in | type, instance | 0 | 1 | Limits the number of results. (1-10000) |
 /// | _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
@@ -130,10 +130,13 @@ pub async fn run_view_definition_handler(
         ));
     }
 
-    // Group filtering still isn't wired up at this layer; the shared filter
-    // returns InvalidViewDefinition when group_refs is non-empty, which we
-    // map below to NotImplemented for backwards-compat. Item #2 in the audit
-    // is the separate fix that turns this into 400 not-supported.
+    // Group filtering is wired through the compartment-aware filter (see
+    // helios_sof::compartment::resolve_group_members_to_patient_refs): each
+    // supplied `Group/{id}` is resolved against Group resources in the
+    // inline bundle, and its `member.entity` Patient references join the
+    // effective patient-compartment set. Unresolved groups simply produce
+    // no member refs — audit item #5 (SHOULD emit OperationOutcome) is a
+    // separate follow-up.
 
     // For backward compatibility, extract the legacy tuple format
     let view_def_json = extracted_params.view_definition;
@@ -737,10 +740,7 @@ fn filter_resources_by_patient_and_group(
         fhir_version,
         registry,
     )
-    .map_err(|e| match e {
-        SofError::InvalidViewDefinition(msg) => ServerError::NotImplemented(msg),
-        other => ServerError::from(other),
-    })
+    .map_err(ServerError::from)
 }
 
 /// Filter resources by their last updated time using the _since parameter
