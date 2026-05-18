@@ -395,7 +395,7 @@ mod sof_conformance_postgres_tests {
 
                 let view_body = normalise_view(&test.view);
                 let resp = server
-                    .post("/ViewDefinition/$viewdefinition-run")
+                    .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
                     .add_header(X_TENANT_ID, HeaderValue::from_str(&tenant_id).unwrap())
                     .add_header(
                         axum::http::HeaderName::from_static("content-type"),
