@@ -276,10 +276,14 @@ pub async fn run_view_definition_handler(
 
             // Apply filters
             if !patient_filter.is_empty() || !group_filter.is_empty() {
+                let registry =
+                    helios_sof::default_search_param_registry(source_fhir_version.unwrap());
                 source_resources = filter_resources_by_patient_and_group(
                     source_resources,
                     &patient_filter,
                     &group_filter,
+                    source_fhir_version.unwrap(),
+                    &registry,
                 )?;
             }
 
@@ -313,10 +317,14 @@ pub async fn run_view_definition_handler(
 
     // Apply filters to provided resources
     if !patient_filter.is_empty() || !group_filter.is_empty() {
+        let effective_version = source_fhir_version.unwrap_or_else(get_newest_enabled_fhir_version);
+        let registry = helios_sof::default_search_param_registry(effective_version);
         filtered_resources = filter_resources_by_patient_and_group(
             filtered_resources,
             &patient_filter,
             &group_filter,
+            effective_version,
+            &registry,
         )?;
     }
 
@@ -719,12 +727,19 @@ fn filter_resources_by_patient_and_group(
     resources: Vec<serde_json::Value>,
     patient_refs: &[String],
     group_refs: &[String],
+    fhir_version: helios_fhir::FhirVersion,
+    registry: &helios_fhir::search::SearchParameterRegistry,
 ) -> ServerResult<Vec<serde_json::Value>> {
-    sof_filter_resources_by_patient_and_group(resources, patient_refs, group_refs).map_err(|e| {
-        match e {
-            SofError::InvalidViewDefinition(msg) => ServerError::NotImplemented(msg),
-            other => ServerError::from(other),
-        }
+    sof_filter_resources_by_patient_and_group(
+        resources,
+        patient_refs,
+        group_refs,
+        fhir_version,
+        registry,
+    )
+    .map_err(|e| match e {
+        SofError::InvalidViewDefinition(msg) => ServerError::NotImplemented(msg),
+        other => ServerError::from(other),
     })
 }
 
@@ -776,6 +791,29 @@ mod tests {
         assert_eq!(operations[0]["name"], "viewdefinition-run");
     }
 
+    /// Helper: build a registry pre-populated with the Observation.subject
+    /// search-param def, so the patient-compartment scan can find Observations.
+    /// In production the registry is loaded from data/search-parameters-*.json
+    /// via `default_search_param_registry`; tests build a minimal one inline
+    /// so they don't depend on the on-disk spec file.
+    #[cfg(feature = "R4")]
+    fn registry_with_observation_subject() -> helios_fhir::search::SearchParameterRegistry {
+        use helios_fhir::search::{SearchParamType, SearchParameterDefinition};
+        let mut r = helios_fhir::search::SearchParameterRegistry::new();
+        r.register(
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Observation-subject",
+                "subject",
+                SearchParamType::Reference,
+                "Observation.subject",
+            )
+            .with_base(vec!["Observation"]),
+        )
+        .unwrap();
+        r
+    }
+
+    #[cfg(feature = "R4")]
     #[test]
     fn test_filter_resources_by_patient() {
         let resources = vec![
@@ -803,31 +841,43 @@ mod tests {
             }),
         ];
 
-        let filtered =
-            filter_resources_by_patient_and_group(resources, &["Patient/123".to_string()], &[])
-                .unwrap();
+        let registry = registry_with_observation_subject();
+        let filtered = filter_resources_by_patient_and_group(
+            resources,
+            &["Patient/123".to_string()],
+            &[],
+            helios_fhir::FhirVersion::R4,
+            &registry,
+        )
+        .unwrap();
 
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0]["id"], "123");
         assert_eq!(filtered[1]["id"], "obs1");
     }
 
+    #[cfg(feature = "R4")]
     #[test]
-    fn test_filter_resources_with_group_returns_error() {
+    fn test_filter_with_unresolvable_group_returns_empty() {
+        // With the new compartment-aware filter, an unresolved group_ref
+        // (no Group/test resource in the bundle) means no effective patient
+        // refs, so the filter returns empty rather than erroring out.
         let resources = vec![serde_json::json!({
             "resourceType": "Patient",
             "id": "123"
         })];
 
-        let result =
-            filter_resources_by_patient_and_group(resources, &[], &["Group/test".to_string()]);
+        let registry = helios_fhir::search::SearchParameterRegistry::new();
+        let filtered = filter_resources_by_patient_and_group(
+            resources,
+            &[],
+            &["Group/test".to_string()],
+            helios_fhir::FhirVersion::R4,
+            &registry,
+        )
+        .unwrap();
 
-        assert!(result.is_err());
-        if let Err(ServerError::NotImplemented(msg)) = result {
-            assert!(msg.contains("Group filtering is not yet implemented"));
-        } else {
-            panic!("Expected NotImplemented error");
-        }
+        assert!(filtered.is_empty());
     }
 
     #[test]

@@ -1,0 +1,181 @@
+# `$viewdefinition-run` — spec vs. implementation audit
+
+Compared against the SoF v2 OperationDefinition at
+https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-ViewDefinitionRun.html
+(version 2.1.0-pre).
+
+Two implementations:
+- **HFS REST** — storage-backed, `crates/rest/src/handlers/sof/run.rs`
+- **sof-server** — stateless, `crates/sof/src/handlers.rs` +
+  `crates/sof/src/models.rs`
+
+Recent commits (`5abc11efc`, `e1d9c3560`, `f71f7739d`, `44bfce41a`) have
+closed many gaps; those that remain are listed below.
+
+---
+
+## 1. `patient` / `group` cardinality is inconsistent across extractors — **FIXED in `44bfce41a`**
+- **Spec:** `patient` is `0..1`, `group` is **`0..*`**.
+- **`crates/sof/src/params.rs::extract_run_params_from_json`** (shared,
+  permissive) accumulates `patient: Vec<String>` and `group: Vec<String>` —
+  correct.
+- **`crates/sof/src/models.rs::ExtractedParameters`** (strict, used by
+  sof-server's POST path) used to keep only `Option<String>` for each —
+  last-writer-wins, dropping earlier entries silently. Now `Vec<String>`.
+- **HFS REST `execute_view_inline`** used `body_params.patient.first()` /
+  `.group.first()`. Now passes all refs through.
+- **sof-server query string** `RunQueryParams.group: Option<String>` now
+  comma-splits at the consumption site via the shared `split_csv_refs`
+  helper lifted into `helios_sof`.
+
+## 2. `group` refusal uses the wrong status code (sof-server)
+- **Spec:** servers refusing a parameter should return `400` with
+  `not-supported`. Recent commit `5abc11efc` set this precedent for
+  `source` in HFS REST.
+- **sof-server** still maps the "group filtering is not yet implemented"
+  path to `501 not-supported` via `ServerError::NotImplemented`.
+  Inconsistent with the `source` refusal policy.
+
+## 3. Patient-compartment filter — **FIXED**
+- **Spec:** "Server SHALL NOT return resources from patient compartments
+  outside provided list."
+- **Before:** `crates/sof/src/lib.rs::filter_resources_by_patient_and_group`
+  hard-coded a tiny allowlist (`Observation | Condition |
+  MedicationRequest | Procedure | Encounter`) plus a `.patient`
+  reference for everything else — leaked out-of-compartment resources
+  for types not in the allowlist and dropped in-compartment resources
+  for unrecognized types.
+- **After:** New `crates/sof/src/compartment.rs` drives the scan off
+  `helios_fhir::{r4,r4b,r5,r6}::get_compartment_params` (code-generated
+  from the spec `CompartmentDefinition-patient.json`) and the lifted
+  `helios_fhir::search::SearchParameterRegistry`. For each resource and
+  each requested patient ref, it enumerates the spec-defined search
+  params linking the resource to the Patient compartment, looks up the
+  FHIRPath expression in the registry, evaluates it, and matches the
+  resulting Reference against the requested patient set. Group filtering
+  resolves `member.entity` Patient references and unions them into the
+  effective patient set (no more 501).
+- **Refactor side-effect:** `SearchParameterRegistry` / loader / status
+  enums moved from `helios-persistence` to `helios-fhir` (foundational)
+  so `helios-sof` could use them without a circular dep. The persistence
+  search-extractor/writer/reindex stay in persistence (index-feed
+  concerns).
+
+## 4. `patient` query string is not comma-split (sof-server)
+- Spec cardinality is `0..1`, so this is technically fine, but it's
+  asymmetric with HFS REST's `split_csv_refs` handling and with `group`
+  (which is multi-valued by spec). Worth noting for future-proofing.
+
+## 5. No OperationOutcome warning when `patient` / `group` targets are absent
+- **Spec:** "Server SHOULD return OperationOutcome if requested patients
+  absent" (same for group).
+- Neither impl checks whether the patient/group ref resolves. Both
+  silently return an empty result set. SHOULD, not SHALL, but it's a
+  real omission.
+
+## 6. sof-server has no system-level endpoint
+- **Spec endpoints:**
+  - `[base]/$viewdefinition-run`
+  - `[base]/CanonicalResource/$viewdefinition-run`
+  - `[base]/CanonicalResource/[id]/$viewdefinition-run`
+- **HFS REST:** all three wired (per `5abc11efc`).
+- **sof-server:** only `/ViewDefinition/$viewdefinition-run`. No
+  `/$viewdefinition-run` system-level alias. Trivial fix in `server.rs`.
+
+## 7. sof-server doesn't support the instance-level form
+- Stateless → no stored ViewDefinitions to invoke by `{id}`. Acceptable
+  but the CapabilityStatement should flag this; currently it just lists
+  `viewdefinition-run` without scope context.
+
+## 8. Parquet MIME type (sof-server)
+- **Spec content-negotiation table:** parquet ↔
+  `application/octet-stream`.
+- **HFS REST:** ✓ `application/octet-stream` + Content-Disposition.
+- **sof-server:** returns `application/parquet` (non-standard). Minor
+  but a spec-conformant client checking the Accept-table won't match.
+
+## 9. 422 vs 400 on invalid ViewDefinition (sof-server)
+- **Spec status codes:** `422 Unprocessable Entity` for "invalid
+  ViewDefinition or processing failure".
+- **HFS REST:** maps `Uncompilable` / `InvalidViewDefinition` → 422
+  (correct, via `map_sof_error_to_rest`).
+- **sof-server:** `parse_view_definition_for_version`'s error path in
+  `handlers.rs` maps `SofError::InvalidViewDefinition` →
+  `ServerError::BadRequest` → **400**. Should be 422.
+
+## 10. sof-server's hard `_limit` cap (10000)
+- **Spec:** `_limit` is `integer`, no upper bound.
+- **sof-server `models.rs`** enforces `1..=10000` and returns `400` for
+  anything higher. Deployment policy, not a spec violation, but a
+  spec-conformant client gets refused instead of best-effort honoring.
+  HFS REST has no such cap.
+
+## 11. CapabilityStatement gaps (sof-server)
+- Advertises only `"format": ["json"]` despite serving CSV/NDJSON/Parquet
+  on `$viewdefinition-run`. Spec recommends documenting supported output
+  formats.
+- Doesn't advertise the SoF `supportsRelativeReference` /
+  `supportsCanonicalReference` / `supportsAbsoluteReference` capability
+  block (HFS does after `5abc11efc`). For sof-server these would all be
+  `false`, but the absence itself is a gap.
+
+## 12. Operation canonical URL casing
+- Both impls publish the URL as
+  `http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run`.
+- Standard FHIR convention puts no `$` in OperationDefinition `url` —
+  the `$` only appears in the invocation. The published spec
+  OperationDefinition JSON should be checked; if its `url` is
+  `…/OperationDefinition/ViewDefinitionRun` (no `$`), our advertised URL
+  is wrong. If the spec really uses `$`, ignore.
+
+## 13. `_format` value-set binding not enforced
+- **Spec:** `_format` is bound to `OutputFormatCodes` (extensible).
+- Both impls accept `csv | json | ndjson | parquet` plus various MIME
+  aliases via string match. Neither declares the binding nor validates
+  against the value set. Acceptable for extensible binding; conformance
+  audit tools may flag the missing declaration.
+
+## 14. `header` parameter on non-CSV formats (sof-server)
+- **Spec:** "Applies only when csv output is requested." No requirement
+  to reject it on other formats.
+- **sof-server** returns **400** when `header` is set with a non-CSV
+  `_format`. Stricter than the spec; the spec-aligned behavior is to
+  silently ignore it.
+
+## 15. HFS REST: `format_stream` re-runs format validation defensively
+- `format_stream` calls `parse_content_type` again and `expect`s
+  success; the upfront validation in `execute_view` is what makes that
+  safe.
+- Not a spec issue — minor code-quality observation.
+
+## 16. sof-server double-applies `_limit`
+- `run_view_definition_with_options` already honors `RunOptions.limit`,
+  then `apply_result_filtering` in `models.rs` truncates JSON/NDJSON/CSV
+  output again. Not a spec bug but:
+  - Inefficient (re-parses output).
+  - CSV-fragile (line-splits assume no embedded newlines in quoted
+    fields).
+  - JSON path re-serializes the whole record array.
+
+---
+
+## Severity quick-take
+
+| # | Item | Severity | Impl | Status |
+|---|------|----------|------|--------|
+| 1 | Cardinality inconsistency between extractors | High (correctness) | sof-server (+HFS inline) | **fixed** `44bfce41a` |
+| 9 | 422 vs 400 on invalid VD | High (status-code spec) | sof-server | open |
+| 3 | Patient-compartment fidelity | High (security/leak) | sof-server (+HFS inline) | **fixed** (this commit) |
+| 2 | `group` 501 vs 400 | Medium (consistency) | sof-server | open |
+| 6 | System-level route | Medium | sof-server | open |
+| 11 | CapabilityStatement formats + refs block | Medium | sof-server | open |
+| 5 | Absent-target OperationOutcome | Medium (SHOULD) | both | open |
+| 8 | Parquet MIME | Low | sof-server | open |
+| 14 | `header` rejection on non-CSV | Low | sof-server | open |
+| 16 | Double-applied `_limit` | Low (perf/CSV-fragile) | sof-server | open |
+| 7 | Instance-level not supported | Low (statelessness) | sof-server | open |
+| 10 | `_limit` 10000 cap | Low (policy) | sof-server | open |
+| 13 | Value-set binding declaration | Low (audit polish) | both | open |
+| 12 | Canonical URL casing | Low (verify first) | both | open |
+| 4 | `patient` query comma-split symmetry | Low | sof-server | open |
+| 15 | `format_stream` defensive re-validate | Trivial | HFS REST | open |

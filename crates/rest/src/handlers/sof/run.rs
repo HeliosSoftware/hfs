@@ -488,8 +488,15 @@ where
     };
 
     if !patient_refs.is_empty() || !group_refs.is_empty() {
-        resources = filter_resources_by_patient_and_group(resources, &patient_refs, &group_refs)
-            .map_err(map_sof_lib_error_to_rest)?;
+        let registry = helios_sof::default_search_param_registry(fhir_version);
+        resources = filter_resources_by_patient_and_group(
+            resources,
+            &patient_refs,
+            &group_refs,
+            fhir_version,
+            &registry,
+        )
+        .map_err(map_sof_lib_error_to_rest)?;
     }
 
     let since = params.since.as_deref().and_then(|s| s.parse().ok());

@@ -2977,12 +2977,14 @@ dependencies = [
  "helios-fhir-macro",
  "helios-fhirpath-support",
  "helios-serde-support",
+ "regex",
  "reqwest",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "serde_json",
  "time",
+ "tracing",
  "zip 0.6.6",
 ]
 

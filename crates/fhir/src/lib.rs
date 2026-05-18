@@ -1432,6 +1432,7 @@ pub mod r5;
 pub mod r6;
 
 pub mod parameters;
+pub mod search;
 
 // Re-export commonly used types from parameters module
 pub use parameters::{ParameterValueAccessor, VersionIndependentParameters};

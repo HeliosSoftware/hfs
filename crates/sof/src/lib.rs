@@ -180,6 +180,7 @@
 //! - `R5`: FHIR 5.0.0 support
 //! - `R6`: FHIR 6.0.0 support
 
+pub mod compartment;
 pub mod constants;
 pub mod data_source;
 pub mod params;
@@ -187,6 +188,10 @@ pub mod parquet_schema;
 pub mod sqlquery;
 pub mod traits;
 
+pub use compartment::{
+    default_registry as default_search_param_registry, load_registry_from,
+    resolve_group_members_to_patient_refs, resource_in_patient_compartment,
+};
 pub use constants::{ConstantValue, parse_constant_from_json};
 pub use params::{
     ExtractedRunParams, body_has_view_definition, extract_run_params_from_json, split_csv_refs,
@@ -1063,67 +1068,95 @@ pub fn create_bundle_from_resources_for_version(
     }
 }
 
-/// Filters raw FHIR resource JSON by patient and/or group references.
+/// Filters raw FHIR resource JSON by patient and/or group references using
+/// the FHIR `CompartmentDefinition-patient` spec data.
 ///
-/// Per the SQL-on-FHIR v2 `$viewdefinition-run` spec, `patient` is `0..1` and
-/// `group` is `0..*`; both arguments accept slices to keep the signature
-/// symmetric. Multiple values are unioned: a resource is included when it
-/// matches *any* supplied reference.
+/// Per the SQL-on-FHIR v2 `$viewdefinition-run` spec, `patient` is `0..1`
+/// and `group` is `0..*`; both arguments accept slices and multiple values
+/// are unioned. `group_refs` are resolved against any `Group` resources
+/// found in `resources` (the `member.entity` Patient references contribute
+/// to the effective patient-compartment set).
 ///
-/// The patient filter implements the standard patient-compartment projection
-/// (best-effort; see audit item #3 for the compartment-fidelity gap). The
-/// group filter currently returns [`SofError::InvalidViewDefinition`] when
-/// non-empty since group expansion is not supported on this stateless path.
+/// The compartment scan uses
+/// `helios_fhir::{r4,r4b,r5,r6}::get_compartment_params` to enumerate the
+/// spec-defined search parameters that link a resource type to the
+/// `Patient` compartment, then evaluates each parameter's FHIRPath
+/// expression against the resource and checks whether any resulting
+/// `Reference` matches the requested patient set. This replaces the prior
+/// hand-rolled `(subject|patient)` allowlist (audit item #3).
+///
+/// `registry` must already contain the SearchParameter definitions for the
+/// resource types being filtered (typically loaded from
+/// `data/search-parameters-{version}.json` plus any custom params).
 pub fn filter_resources_by_patient_and_group(
     resources: Vec<serde_json::Value>,
     patient_refs: &[String],
     group_refs: &[String],
+    fhir_version: FhirVersion,
+    registry: &helios_fhir::search::SearchParameterRegistry,
 ) -> Result<Vec<serde_json::Value>, SofError> {
-    let mut filtered = resources;
+    use std::collections::HashSet;
 
-    if !patient_refs.is_empty() {
-        let normalized: Vec<String> = patient_refs
-            .iter()
-            .map(|r| {
-                if r.starts_with("Patient/") {
-                    r.clone()
-                } else {
-                    format!("Patient/{}", r)
-                }
-            })
-            .collect();
-        filtered.retain(|resource| {
-            let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) else {
-                return false;
-            };
-            match resource_type {
-                "Patient" => resource
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .map(|id| normalized.contains(&format!("Patient/{}", id)))
-                    .unwrap_or(false),
-                "Observation" | "Condition" | "MedicationRequest" | "Procedure" | "Encounter" => {
-                    resource
-                        .get("subject")
-                        .and_then(|s| s.get("reference"))
-                        .and_then(|r| r.as_str())
-                        .map(|reference| normalized.iter().any(|n| n == reference))
-                        .unwrap_or(false)
-                }
-                _ => resource
-                    .get("patient")
-                    .and_then(|p| p.get("reference"))
-                    .and_then(|r| r.as_str())
-                    .map(|reference| normalized.iter().any(|n| n == reference))
-                    .unwrap_or(false),
-            }
-        });
+    if patient_refs.is_empty() && group_refs.is_empty() {
+        return Ok(resources);
     }
 
+    // Build the effective patient-compartment set: explicit patient refs +
+    // patient refs resolved from supplied groups. Both forms are
+    // canonicalised to `Patient/{id}` so downstream comparisons don't
+    // double-handle the prefix.
+    let mut targets: HashSet<String> = patient_refs
+        .iter()
+        .map(|r| {
+            if r.starts_with("Patient/") {
+                r.clone()
+            } else {
+                format!("Patient/{}", r)
+            }
+        })
+        .collect();
+
     if !group_refs.is_empty() {
-        return Err(SofError::InvalidViewDefinition(
-            "Group filtering is not yet implemented".to_string(),
+        targets.extend(compartment::resolve_group_members_to_patient_refs(
+            group_refs, &resources,
         ));
+    }
+
+    // No effective patient targets (e.g. group ref didn't resolve to any
+    // Patient members in the bundle) → empty result; mirrors bulk-export
+    // behavior for an empty Group.
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut filtered = Vec::with_capacity(resources.len());
+    for resource in resources.into_iter() {
+        // Group resources are first-class compartment members when their
+        // `Group/{id}` was requested directly (i.e. not via member
+        // resolution). Skip the FHIRPath scan for Group itself.
+        if resource.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
+            && resource
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|id| {
+                    group_refs
+                        .iter()
+                        .any(|g| g == &format!("Group/{}", id) || g == id)
+                })
+                .unwrap_or(false)
+        {
+            filtered.push(resource);
+            continue;
+        }
+
+        if compartment::resource_in_patient_compartment(
+            &resource,
+            &targets,
+            registry,
+            fhir_version,
+        )? {
+            filtered.push(resource);
+        }
     }
 
     Ok(filtered)
@@ -2004,6 +2037,17 @@ pub fn iter_ndjson_chunks<R: BufRead>(
 ///
 /// This is used internally for streaming/chunked processing where we have
 /// raw JSON that needs to be converted to typed resources for FHIRPath evaluation.
+/// Crate-internal entry point for the compartment filter to convert raw
+/// JSON to a typed `FhirResource` (matching the version the caller already
+/// negotiated). Wraps the private [`parse_json_to_fhir_resource`] without
+/// exposing it as a public stable API.
+pub(crate) fn parse_json_to_fhir_resource_pub(
+    json: serde_json::Value,
+    version: FhirVersion,
+) -> Result<helios_fhir::FhirResource, SofError> {
+    parse_json_to_fhir_resource(json, version)
+}
+
 fn parse_json_to_fhir_resource(
     json: serde_json::Value,
     version: FhirVersion,
