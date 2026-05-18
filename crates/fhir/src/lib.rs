@@ -1431,6 +1431,7 @@ pub mod r5;
 #[cfg(feature = "R6")]
 pub mod r6;
 
+pub mod compartment_expressions;
 pub mod parameters;
 pub mod search;
 

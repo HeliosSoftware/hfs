@@ -409,6 +409,13 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     // Generate the per-version field-type lookup used by FHIRPath type inference.
     generate_field_type_lookup(&version_path, &all_struct_defs)?;
 
+    // Refresh the compartment search-param FHIRPath expression table for
+    // this version, written to a separate file under
+    // `<output_path>/compartment_expressions/{ver}.rs` so the giant
+    // per-version source file stays untouched between regenerations that
+    // only need the spec-data join.
+    generate_compartment_expressions_file(output_path.as_ref(), &version_dir, version.as_str())?;
+
     Ok(())
 }
 
@@ -477,6 +484,45 @@ pub fn process_fhir_version(
             Ok(())
         }
         Some(specific_version) => process_single_version(&specific_version, output_path),
+    }
+}
+
+/// Regenerates only the compartment-expression tables under
+/// `<output_path>/compartment_expressions/{ver}.rs`, skipping the
+/// (expensive, large-diff) regeneration of the per-version `r4.rs` /
+/// `r4b.rs` / `r5.rs` / `r6.rs` source files.
+///
+/// Useful when only the upstream `CompartmentDefinition` or
+/// `search-parameters.json` data has changed. Same FHIR-version
+/// selection semantics as [`process_fhir_version`].
+pub fn regenerate_compartment_expressions(
+    version: Option<FhirVersion>,
+    output_path: impl AsRef<Path>,
+) -> io::Result<()> {
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+    let run = |ver: FhirVersion| -> io::Result<()> {
+        let version_dir = resources_dir.join(ver.as_str());
+        generate_compartment_expressions_file(output_path.as_ref(), &version_dir, ver.as_str())
+    };
+    match version {
+        None => {
+            for ver in [
+                #[cfg(feature = "R4")]
+                FhirVersion::R4,
+                #[cfg(feature = "R4B")]
+                FhirVersion::R4B,
+                #[cfg(feature = "R5")]
+                FhirVersion::R5,
+                #[cfg(feature = "R6")]
+                FhirVersion::R6,
+            ] {
+                if let Err(e) = run(ver) {
+                    eprintln!("Warning: Failed to process {:?}: {}", ver, e);
+                }
+            }
+            Ok(())
+        }
+        Some(v) => run(v),
     }
 }
 
@@ -1120,6 +1166,235 @@ fn generate_compartment_lookup(
     writeln!(file, "}}")?;
 
     Ok(())
+}
+
+/// Generates the `compartment_expressions/{ver}.rs` file that exposes
+/// [`get_compartment_param_expressions`][get_compartment_param_expressions].
+///
+/// For each `(compartment, resource_type, param_name)` triple from a
+/// FHIR `CompartmentDefinition`, joins against `search-parameters.json`
+/// (matching `code == param_name` and `resource_type ∈ base`) to attach
+/// the parameter's FHIRPath expression. The resulting static table lets
+/// callers walk a resource's compartment membership at runtime with no
+/// JSON parsing — see `helios_sof::compartment` for the consumer side.
+///
+/// Output file goes under `output_root/compartment_expressions/{ver_lower}.rs`.
+/// Re-running the generator overwrites the file with deterministic content
+/// (BTreeMap ordering, sorted entries).
+///
+/// [get_compartment_param_expressions]: ../../helios_fhir/compartment_expressions/index.html
+fn generate_compartment_expressions_file(
+    output_root: &Path,
+    version_dir: &Path,
+    version_name: &str,
+) -> io::Result<()> {
+    use std::collections::BTreeMap;
+    use std::io::Write;
+
+    // `(resource_type, code) → expression` from the spec's
+    // search-parameters bundle.
+    let sp_path = version_dir.join("search-parameters.json");
+    let sp_lookup = load_search_parameter_expressions(&sp_path)?;
+
+    // `compartment_code → resource_type → Vec<(param_name, expression)>`.
+    let mut table: BTreeMap<String, BTreeMap<String, Vec<(String, String)>>> = BTreeMap::new();
+
+    if let Ok(entries) = std::fs::read_dir(version_dir) {
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.path());
+        for entry in entries {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("compartmentdefinition-")
+                || !name.ends_with(".json")
+                || name.contains("example")
+            {
+                continue;
+            }
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            let json: serde_json::Value = match serde_json::from_reader(BufReader::new(file)) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(code) = json.get("code").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(resources) = json.get("resource").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for resource in resources {
+                let Some(rt) = resource.get("code").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(params) = resource.get("param").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                let mut joined = Vec::new();
+                for param_value in params {
+                    let Some(param_name) = param_value.as_str() else {
+                        continue;
+                    };
+                    if let Some(expression) =
+                        sp_lookup.get(&(rt.to_string(), param_name.to_string()))
+                    {
+                        joined.push((param_name.to_string(), expression.clone()));
+                    }
+                }
+                if !joined.is_empty() {
+                    table
+                        .entry(code.to_string())
+                        .or_default()
+                        .insert(rt.to_string(), joined);
+                }
+            }
+        }
+    }
+
+    let dir = output_root.join("compartment_expressions");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.rs", version_name.to_lowercase()));
+    let mut file = std::fs::File::create(&path)?;
+
+    writeln!(
+        file,
+        "//! Compartment search-param FHIRPath expression tables for FHIR {version_name}."
+    )?;
+    writeln!(file, "//!")?;
+    writeln!(
+        file,
+        "//! Generated by `cargo run -p helios-fhir-gen -- --all`. Source data:"
+    )?;
+    writeln!(
+        file,
+        "//! `crates/fhir-gen/resources/{version_name}/compartmentdefinition-*.json` joined"
+    )?;
+    writeln!(
+        file,
+        "//! against `search-parameters.json` from the same directory. Do not edit by"
+    )?;
+    writeln!(file, "//! hand — re-run the generator instead.")?;
+    writeln!(file)?;
+    writeln!(
+        file,
+        "/// Returns `(search-param-name, FHIRPath-expression)` pairs that link"
+    )?;
+    writeln!(
+        file,
+        "/// `resource_type` to the given `compartment_type`, per FHIR {version_name}'s"
+    )?;
+    writeln!(file, "/// `CompartmentDefinition` resources.")?;
+    writeln!(file, "///")?;
+    writeln!(
+        file,
+        "/// Returns an empty slice when the resource type is not a member of the"
+    )?;
+    writeln!(file, "/// compartment.")?;
+    writeln!(file, "pub fn get_compartment_param_expressions(")?;
+    writeln!(file, "    compartment_type: &str,")?;
+    writeln!(file, "    resource_type: &str,")?;
+    writeln!(file, ") -> &'static [(&'static str, &'static str)] {{")?;
+    writeln!(file, "    match compartment_type {{")?;
+
+    for (compartment, resources) in &table {
+        writeln!(file, "        \"{compartment}\" => match resource_type {{")?;
+        for (rt, entries) in resources {
+            writeln!(file, "            \"{rt}\" => &[")?;
+            for (name, expression) in entries {
+                writeln!(
+                    file,
+                    "                ({}, {}),",
+                    rust_raw_string_literal(name),
+                    rust_raw_string_literal(expression)
+                )?;
+            }
+            writeln!(file, "            ],")?;
+        }
+        writeln!(file, "            _ => &[],")?;
+        writeln!(file, "        }},")?;
+    }
+
+    writeln!(file, "        _ => &[],")?;
+    writeln!(file, "    }}")?;
+    writeln!(file, "}}")?;
+
+    Ok(())
+}
+
+/// Loads `(resource_type, code) → expression` mappings from a FHIR
+/// `search-parameters.json` Bundle. The same SearchParameter resource
+/// can appear under multiple bases, so the same `code` joins to each base
+/// independently.
+fn load_search_parameter_expressions(
+    path: &Path,
+) -> io::Result<std::collections::BTreeMap<(String, String), String>> {
+    use std::collections::BTreeMap;
+
+    let mut lookup = BTreeMap::new();
+    let Ok(file) = File::open(path) else {
+        return Ok(lookup);
+    };
+    let json: serde_json::Value = match serde_json::from_reader(BufReader::new(file)) {
+        Ok(v) => v,
+        Err(_) => return Ok(lookup),
+    };
+    let Some(entries) = json.get("entry").and_then(|v| v.as_array()) else {
+        return Ok(lookup);
+    };
+    for entry in entries {
+        let Some(resource) = entry.get("resource") else {
+            continue;
+        };
+        if resource.get("resourceType").and_then(|v| v.as_str()) != Some("SearchParameter") {
+            continue;
+        }
+        let Some(code) = resource.get("code").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(expression) = resource.get("expression").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(bases) = resource.get("base").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for base in bases {
+            if let Some(base_str) = base.as_str() {
+                lookup.insert(
+                    (base_str.to_string(), code.to_string()),
+                    expression.to_string(),
+                );
+            }
+        }
+    }
+    Ok(lookup)
+}
+
+/// Emits a Rust raw-string literal for `s`, choosing a `#`-count that
+/// avoids any closing-delimiter collision in the body (FHIRPath expressions
+/// contain quoted-string literals inside `.where(...)` calls).
+fn rust_raw_string_literal(s: &str) -> String {
+    let max_hash = s
+        .as_bytes()
+        .windows(2)
+        .filter(|w| w[0] == b'"')
+        .map(|w| {
+            let mut c = 0usize;
+            for &b in &w[1..] {
+                if b == b'#' {
+                    c += 1;
+                } else {
+                    break;
+                }
+            }
+            c
+        })
+        .max()
+        .unwrap_or(0);
+    let hashes = "#".repeat(max_hash + 1);
+    format!("r{hashes}\"{s}\"{hashes}")
 }
 
 /// Generates a Rust enum containing all FHIR resource types.

@@ -188,10 +188,7 @@ pub mod parquet_schema;
 pub mod sqlquery;
 pub mod traits;
 
-pub use compartment::{
-    default_registry as default_search_param_registry, load_registry_from,
-    resolve_group_members_to_patient_refs, resource_in_patient_compartment,
-};
+pub use compartment::{resolve_group_members_to_patient_refs, resource_in_patient_compartment};
 pub use constants::{ConstantValue, parse_constant_from_json};
 pub use params::{
     ExtractedRunParams, body_has_view_definition, extract_run_params_from_json, split_csv_refs,
@@ -1078,22 +1075,19 @@ pub fn create_bundle_from_resources_for_version(
 /// to the effective patient-compartment set).
 ///
 /// The compartment scan uses
-/// `helios_fhir::{r4,r4b,r5,r6}::get_compartment_params` to enumerate the
-/// spec-defined search parameters that link a resource type to the
-/// `Patient` compartment, then evaluates each parameter's FHIRPath
-/// expression against the resource and checks whether any resulting
-/// `Reference` matches the requested patient set. This replaces the prior
-/// hand-rolled `(subject|patient)` allowlist (audit item #3).
-///
-/// `registry` must already contain the SearchParameter definitions for the
-/// resource types being filtered (typically loaded from
-/// `data/search-parameters-{version}.json` plus any custom params).
+/// `helios_fhir::compartment_expressions::{r4,r4b,r5,r6}::get_compartment_param_expressions`
+/// — a compile-time join of `CompartmentDefinition-patient.json` against
+/// `search-parameters.json` — to enumerate the spec-defined `(name,
+/// FHIRPath-expression)` pairs that link a resource type to the `Patient`
+/// compartment. Each expression is evaluated against the resource and the
+/// resulting `Reference`(s) are matched against the requested patient set.
+/// This replaces the prior hand-rolled `(subject|patient)` allowlist
+/// (audit item #3) without any runtime data-file dependency.
 pub fn filter_resources_by_patient_and_group(
     resources: Vec<serde_json::Value>,
     patient_refs: &[String],
     group_refs: &[String],
     fhir_version: FhirVersion,
-    registry: &helios_fhir::search::SearchParameterRegistry,
 ) -> Result<Vec<serde_json::Value>, SofError> {
     use std::collections::HashSet;
 
@@ -1149,12 +1143,7 @@ pub fn filter_resources_by_patient_and_group(
             continue;
         }
 
-        if compartment::resource_in_patient_compartment(
-            &resource,
-            &targets,
-            registry,
-            fhir_version,
-        )? {
+        if compartment::resource_in_patient_compartment(&resource, &targets, fhir_version)? {
             filtered.push(resource);
         }
     }

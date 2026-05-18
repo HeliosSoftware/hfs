@@ -488,13 +488,11 @@ where
     };
 
     if !patient_refs.is_empty() || !group_refs.is_empty() {
-        let registry = helios_sof::default_search_param_registry(fhir_version);
         resources = filter_resources_by_patient_and_group(
             resources,
             &patient_refs,
             &group_refs,
             fhir_version,
-            &registry,
         )
         .map_err(map_sof_lib_error_to_rest)?;
     }
