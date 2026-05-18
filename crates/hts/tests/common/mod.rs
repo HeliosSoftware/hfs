@@ -54,24 +54,51 @@ fn cleanup_http_pg_container() {
     }
 }
 
+/// Start a labeled Postgres testcontainer, retrying transient failures.
+///
+/// Why: the testcontainers postgres image's wait-for-log strategy occasionally
+/// hits `EndOfStream` before the "ready" line on hosts where initdb emits a
+/// `locale: not found` warning during bootstrap. Retry a few times before
+/// giving up so a single unlucky first-caller doesn't fail an otherwise green
+/// suite.
+#[cfg(feature = "postgres")]
+async fn start_http_postgres_for_test()
+-> testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres> {
+    use testcontainers::{ImageExt, runners::AsyncRunner};
+    use testcontainers_modules::postgres::Postgres;
+
+    let mut last_err = None;
+    for attempt in 1..=3u32 {
+        match Postgres::default()
+            .with_label(HTTP_PG_LABEL_KEY, HTTP_PG_LABEL_VALUE)
+            .start()
+            .await
+        {
+            Ok(c) => return c,
+            Err(e) => {
+                eprintln!("postgres container start attempt {attempt}/3 failed: {e:?}");
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    panic!(
+        "Failed to start Postgres container for HTTP tests after 3 attempts: {:?}",
+        last_err.unwrap()
+    )
+}
+
 /// Returns the PostgreSQL URL for the shared HTTP-test container, starting it
 /// on the first call. Shared across all `TestAppPg` instances in a test binary.
 #[cfg(feature = "postgres")]
 pub async fn pg_http_url() -> &'static str {
     PG_HTTP_URL
         .get_or_init(|| async {
-            use testcontainers::{ImageExt, runners::AsyncRunner};
-            use testcontainers_modules::postgres::Postgres;
-
-            // Tag with a label so the `#[ctor::dtor]` below can find and
+            // Tag with a label so the `#[ctor::dtor]` above can find and
             // force-remove the container at process exit. Without this, the
             // static would hold the `ContainerAsync` until process exit, but
             // `Drop` is never called on statics → container leaks.
-            let container = Postgres::default()
-                .with_label(HTTP_PG_LABEL_KEY, HTTP_PG_LABEL_VALUE)
-                .start()
-                .await
-                .expect("Failed to start Postgres container for HTTP tests");
+            let container = start_http_postgres_for_test().await;
 
             let port = container
                 .get_host_port_ipv4(5432)
