@@ -371,6 +371,78 @@ mod sof_run_tests {
         assert_eq!(rows[0]["family"], "Black");
     }
 
+    /// Multiple `patient` entries in a Parameters body all flow into the
+    /// inline filter — previously the second entry was silently dropped.
+    /// Spec for `patient` is `0..1` but the strict extractor must still
+    /// surface every entry the client supplied (the shared permissive
+    /// extractor already did).
+    #[tokio::test]
+    async fn test_inline_run_applies_all_patient_refs() {
+        let (server, _backend) = create_test_server().await;
+
+        let view = patient_view_definition();
+        let pt_a = json!({
+            "resourceType": "Patient",
+            "id": "pt-a",
+            "name": [{ "family": "Alpha" }]
+        });
+        let pt_b = json!({
+            "resourceType": "Patient",
+            "id": "pt-b",
+            "name": [{ "family": "Beta" }]
+        });
+        let pt_c = json!({
+            "resourceType": "Patient",
+            "id": "pt-c",
+            "name": [{ "family": "Gamma" }]
+        });
+
+        let parameters_body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "viewResource", "resource": view},
+                {"name": "resource", "resource": pt_a},
+                {"name": "resource", "resource": pt_b},
+                {"name": "resource", "resource": pt_c},
+                {"name": "patient", "valueReference": {"reference": "Patient/pt-a"}},
+                {"name": "patient", "valueReference": {"reference": "Patient/pt-b"}}
+            ]
+        });
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&parameters_body)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+
+        let body = response.text();
+        let families: Vec<String> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter_map(|row| row.get("family").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+
+        assert!(
+            families.contains(&"Alpha".to_string()),
+            "expected pt-a (Alpha) in output, got {families:?}"
+        );
+        assert!(
+            families.contains(&"Beta".to_string()),
+            "expected pt-b (Beta) in output, got {families:?}"
+        );
+        assert!(
+            !families.contains(&"Gamma".to_string()),
+            "pt-c (Gamma) was not in the patient filter and should be excluded, got {families:?}"
+        );
+    }
+
     /// `?_limit=1` caps the number of output rows.
     #[tokio::test]
     async fn test_run_view_definition_limit() {

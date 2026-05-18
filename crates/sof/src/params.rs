@@ -49,6 +49,22 @@ pub struct ExtractedRunParams {
     pub compression: Option<String>,
 }
 
+/// Splits a comma-separated reference string into trimmed, non-empty
+/// entries. Used by both sof-server and HFS REST to lower a single
+/// `?group=Group/a,Group/b` query value into the spec's `0..*` shape.
+/// Returns an empty `Vec` when the input is `None` or yields no
+/// non-empty entries.
+pub fn split_csv_refs(value: Option<&str>) -> Vec<String> {
+    match value {
+        Some(s) => s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 /// Returns `true` when `body` carries a ViewDefinition the caller can run
 /// directly — either a bare `ViewDefinition` resource or a `Parameters` body
 /// with a `viewResource` or `viewReference` parameter.
@@ -392,6 +408,20 @@ mod tests {
         assert_eq!(p.row_group_size, Some(128));
         assert_eq!(p.page_size, Some(1024));
         assert_eq!(p.compression.as_deref(), Some("snappy"));
+    }
+
+    #[test]
+    fn split_csv_refs_trims_and_drops_empty() {
+        assert_eq!(split_csv_refs(None), Vec::<String>::new());
+        assert_eq!(split_csv_refs(Some("")), Vec::<String>::new());
+        assert_eq!(
+            split_csv_refs(Some("Group/a, Group/b ,,Group/c")),
+            vec![
+                "Group/a".to_string(),
+                "Group/b".to_string(),
+                "Group/c".to_string()
+            ]
+        );
     }
 
     #[test]

@@ -41,7 +41,7 @@ use helios_sof::{
     ContentType, ExtractedRunParams, RunOptions, body_has_view_definition,
     create_bundle_from_resources_for_version, extract_run_params_from_json,
     filter_resources_by_patient_and_group, filter_resources_by_since,
-    parse_view_definition_for_version, run_view_definition_with_options,
+    parse_view_definition_for_version, run_view_definition_with_options, split_csv_refs,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -89,18 +89,6 @@ pub struct RunQueryParams {
     /// External data source. HFS rejects this with 501 (storage-backed; the
     /// stateless `sof-server` is the right place for source-based ETL).
     pub source: Option<String>,
-}
-
-/// Splits a comma-separated query value into trimmed, non-empty references.
-fn split_refs(v: Option<&str>) -> Vec<String> {
-    match v {
-        Some(s) => s
-            .split(',')
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect(),
-        None => Vec::new(),
-    }
 }
 
 /// `POST` (or `GET`) `/ViewDefinition/$viewdefinition-run`
@@ -484,26 +472,24 @@ where
     let mut resources = body_params.inline_resources.clone();
 
     // Patient/group filtering: prefer the multi-valued body entries; fall
-    // back to a single comma-split query value. The in-process evaluator
-    // takes a single reference, so we only apply the first one for now.
-    let patient_ref = body_params
-        .patient
-        .first()
-        .cloned()
-        .or_else(|| split_refs(params.patient.as_deref()).into_iter().next());
-    let group_ref = body_params
-        .group
-        .first()
-        .cloned()
-        .or_else(|| split_refs(params.group.as_deref()).into_iter().next());
+    // back to comma-split query values. Spec is `patient` 0..1, `group`
+    // 0..* — pass all references through so the shared filter can union
+    // multiple group memberships once that path is implemented (today the
+    // filter still errors when group_refs is non-empty).
+    let patient_refs = if !body_params.patient.is_empty() {
+        body_params.patient.clone()
+    } else {
+        split_csv_refs(params.patient.as_deref())
+    };
+    let group_refs = if !body_params.group.is_empty() {
+        body_params.group.clone()
+    } else {
+        split_csv_refs(params.group.as_deref())
+    };
 
-    if patient_ref.is_some() || group_ref.is_some() {
-        resources = filter_resources_by_patient_and_group(
-            resources,
-            patient_ref.as_deref(),
-            group_ref.as_deref(),
-        )
-        .map_err(map_sof_lib_error_to_rest)?;
+    if !patient_refs.is_empty() || !group_refs.is_empty() {
+        resources = filter_resources_by_patient_and_group(resources, &patient_refs, &group_refs)
+            .map_err(map_sof_lib_error_to_rest)?;
     }
 
     let since = params.since.as_deref().and_then(|s| s.parse().ok());
@@ -754,12 +740,12 @@ fn build_filters(params: &RunQueryParams, body_extra: &ExtractedRunParams) -> Vi
     let patient = if !body_extra.patient.is_empty() {
         body_extra.patient.clone()
     } else {
-        split_refs(params.patient.as_deref())
+        split_csv_refs(params.patient.as_deref())
     };
     let group = if !body_extra.group.is_empty() {
         body_extra.group.clone()
     } else {
-        split_refs(params.group.as_deref())
+        split_csv_refs(params.group.as_deref())
     };
 
     ViewFilters {

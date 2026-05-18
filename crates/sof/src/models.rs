@@ -255,7 +255,13 @@ pub fn parse_content_type(
     ContentType::from_string(content_type_str)
 }
 
-/// Result type for parameter extraction
+/// Result type for parameter extraction.
+///
+/// `patient` and `group` are `Vec<String>` to match the SoF v2 spec
+/// (`patient` is `0..1`, `group` is `0..*`) and the shared permissive
+/// extractor in [`helios_sof::params`]. The strict path used to keep
+/// only `Option<String>` here, which silently dropped earlier entries
+/// when callers supplied multiple `group` references.
 #[derive(Debug, Default)]
 pub struct ExtractedParameters {
     pub view_definition: Option<serde_json::Value>,
@@ -263,8 +269,8 @@ pub struct ExtractedParameters {
     pub format: Option<String>,
     pub header: Option<bool>,
     pub view_reference: Option<String>,
-    pub patient: Option<String>,
-    pub group: Option<String>,
+    pub patient: Vec<String>,
+    pub group: Vec<String>,
     pub source: Option<String>,
     pub limit: Option<u32>,
     pub since: Option<String>,
@@ -347,32 +353,34 @@ fn process_parameter(
             }
         }
         "patient" => {
-            // Check for valueReference first
+            // Spec: patient is 0..1, but the strict extractor accumulates
+            // for parity with the shared permissive extractor and to keep
+            // the cardinality faithful when callers repeat the entry.
             if let Some(value_ref) = param_json.get("valueReference") {
                 if let Some(reference) = value_ref.get("reference") {
                     if let Some(ref_str) = reference.as_str() {
-                        result.patient = Some(ref_str.to_string());
+                        result.patient.push(ref_str.to_string());
                     }
                 }
             } else if let Some(value_str) = param_json.get("valueString") {
                 if let Some(ref_str) = value_str.as_str() {
-                    result.patient = Some(ref_str.to_string());
+                    result.patient.push(ref_str.to_string());
                 }
             } else if has_any_value_field(&param_json) {
                 return Err("patient parameter must use valueReference or valueString".to_string());
             }
         }
         "group" => {
-            // Check for valueReference first
+            // Spec: group is 0..*. Accumulate every entry.
             if let Some(value_ref) = param_json.get("valueReference") {
                 if let Some(reference) = value_ref.get("reference") {
                     if let Some(ref_str) = reference.as_str() {
-                        result.group = Some(ref_str.to_string());
+                        result.group.push(ref_str.to_string());
                     }
                 }
             } else if let Some(value_str) = param_json.get("valueString") {
                 if let Some(ref_str) = value_str.as_str() {
-                    result.group = Some(ref_str.to_string());
+                    result.group.push(ref_str.to_string());
                 }
             } else if has_any_value_field(&param_json) {
                 return Err("group parameter must use valueReference or valueString".to_string());
@@ -998,7 +1006,7 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
-            assert_eq!(extracted.patient, Some("Patient/456".to_string()));
+            assert_eq!(extracted.patient, vec!["Patient/456".to_string()]);
         }
     }
 
@@ -1018,7 +1026,37 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
-            assert_eq!(extracted.group, Some("Group/my-group".to_string()));
+            assert_eq!(extracted.group, vec!["Group/my-group".to_string()]);
+        }
+    }
+
+    #[test]
+    fn test_extract_multiple_group_parameters_accumulate() {
+        // Spec: group is 0..*. Strict extractor must accumulate every entry
+        // (previously dropped to last-wins via Option<String>).
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "group", "valueReference": {"reference": "Group/a"}},
+                {"name": "group", "valueReference": {"reference": "Group/b"}},
+                {"name": "group", "valueString": "Group/c"}
+            ]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let extracted = extract_all_parameters(run_params).unwrap();
+
+            assert_eq!(
+                extracted.group,
+                vec![
+                    "Group/a".to_string(),
+                    "Group/b".to_string(),
+                    "Group/c".to_string(),
+                ]
+            );
         }
     }
 
@@ -1079,7 +1117,7 @@ mod tests {
             let extracted = extract_all_parameters(run_params).unwrap();
 
             assert!(extracted.view_definition.is_some());
-            assert_eq!(extracted.patient, Some("Patient/123".to_string()));
+            assert_eq!(extracted.patient, vec!["Patient/123".to_string()]);
             assert_eq!(extracted.format, Some("csv".to_string()));
             assert_eq!(extracted.header, Some(false));
         }

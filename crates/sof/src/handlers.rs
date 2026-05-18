@@ -130,11 +130,10 @@ pub async fn run_view_definition_handler(
         ));
     }
 
-    if extracted_params.group.is_some() {
-        return Err(ServerError::NotImplemented(
-            "The group parameter is not yet implemented.".to_string(),
-        ));
-    }
+    // Group filtering still isn't wired up at this layer; the shared filter
+    // returns InvalidViewDefinition when group_refs is non-empty, which we
+    // map below to NotImplemented for backwards-compat. Item #2 in the audit
+    // is the separate fix that turns this into 400 not-supported.
 
     // For backward compatibility, extract the legacy tuple format
     let view_def_json = extracted_params.view_definition;
@@ -187,11 +186,20 @@ pub async fn run_view_definition_handler(
     // Apply patient and group filters from body parameters to resources if provided
     let mut filtered_resources = resources_json.unwrap_or_default();
 
-    // Merge filter parameters from body and query
-    let patient_filter = extracted_params
-        .patient
-        .or(validated_params.patient.clone());
-    let group_filter = extracted_params.group.or(validated_params.group.clone());
+    // Merge filter parameters from body and query. Body takes precedence
+    // when non-empty; otherwise comma-split the query value into the spec's
+    // 0..* shape so a `?group=Group/a,Group/b` GET works the same way as
+    // repeated body entries.
+    let patient_filter: Vec<String> = if !extracted_params.patient.is_empty() {
+        extracted_params.patient
+    } else {
+        helios_sof::split_csv_refs(validated_params.patient.as_deref())
+    };
+    let group_filter: Vec<String> = if !extracted_params.group.is_empty() {
+        extracted_params.group
+    } else {
+        helios_sof::split_csv_refs(validated_params.group.as_deref())
+    };
     let source_param = extracted_params.source.or(validated_params.source.clone());
 
     // Merge limit parameter - body takes precedence over query
@@ -259,19 +267,19 @@ pub async fn run_view_definition_handler(
         source_fhir_version = Some(loaded_bundle.version());
 
         // Apply filters to source bundle if needed
-        let loaded_bundle = if patient_filter.is_some()
-            || group_filter.is_some()
+        let loaded_bundle = if !patient_filter.is_empty()
+            || !group_filter.is_empty()
             || validated_params.since.is_some()
         {
             // Extract resources from source bundle for filtering
             let mut source_resources = extract_resources_from_bundle(&loaded_bundle)?;
 
             // Apply filters
-            if patient_filter.is_some() || group_filter.is_some() {
+            if !patient_filter.is_empty() || !group_filter.is_empty() {
                 source_resources = filter_resources_by_patient_and_group(
                     source_resources,
-                    patient_filter.as_deref(),
-                    group_filter.as_deref(),
+                    &patient_filter,
+                    &group_filter,
                 )?;
             }
 
@@ -304,11 +312,11 @@ pub async fn run_view_definition_handler(
     };
 
     // Apply filters to provided resources
-    if patient_filter.is_some() || group_filter.is_some() {
+    if !patient_filter.is_empty() || !group_filter.is_empty() {
         filtered_resources = filter_resources_by_patient_and_group(
             filtered_resources,
-            patient_filter.as_deref(),
-            group_filter.as_deref(),
+            &patient_filter,
+            &group_filter,
         )?;
     }
 
@@ -709,15 +717,15 @@ fn merge_bundles(
 /// * `Err(ServerError)` - If filtering fails
 fn filter_resources_by_patient_and_group(
     resources: Vec<serde_json::Value>,
-    patient_ref: Option<&str>,
-    group_ref: Option<&str>,
+    patient_refs: &[String],
+    group_refs: &[String],
 ) -> ServerResult<Vec<serde_json::Value>> {
-    sof_filter_resources_by_patient_and_group(resources, patient_ref, group_ref).map_err(
-        |e| match e {
+    sof_filter_resources_by_patient_and_group(resources, patient_refs, group_refs).map_err(|e| {
+        match e {
             SofError::InvalidViewDefinition(msg) => ServerError::NotImplemented(msg),
             other => ServerError::from(other),
-        },
-    )
+        }
+    })
 }
 
 /// Filter resources by their last updated time using the _since parameter
@@ -796,7 +804,8 @@ mod tests {
         ];
 
         let filtered =
-            filter_resources_by_patient_and_group(resources, Some("Patient/123"), None).unwrap();
+            filter_resources_by_patient_and_group(resources, &["Patient/123".to_string()], &[])
+                .unwrap();
 
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0]["id"], "123");
@@ -810,7 +819,8 @@ mod tests {
             "id": "123"
         })];
 
-        let result = filter_resources_by_patient_and_group(resources, None, Some("Group/test"));
+        let result =
+            filter_resources_by_patient_and_group(resources, &[], &["Group/test".to_string()]);
 
         assert!(result.is_err());
         if let Err(ServerError::NotImplemented(msg)) = result {

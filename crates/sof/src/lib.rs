@@ -188,7 +188,9 @@ pub mod sqlquery;
 pub mod traits;
 
 pub use constants::{ConstantValue, parse_constant_from_json};
-pub use params::{ExtractedRunParams, body_has_view_definition, extract_run_params_from_json};
+pub use params::{
+    ExtractedRunParams, body_has_view_definition, extract_run_params_from_json, split_csv_refs,
+};
 pub use sqlquery::{
     BoundParam, ColumnFhirType, DependsOnView, InMemorySqlEngine, LibraryParameter, QueryResult,
     SqlQueryError, SqlQueryLibrary, SqlQueryRunParams, TableSchema, bind_supplied_params,
@@ -1061,59 +1063,64 @@ pub fn create_bundle_from_resources_for_version(
     }
 }
 
-/// Filters raw FHIR resource JSON by an optional patient and/or group
-/// reference. The patient filter implements the standard patient-compartment
-/// projection used by `$viewdefinition-run`; the group filter currently
-/// returns [`SofError::InvalidViewDefinition`] since group expansion is not
-/// supported in this stateless path.
+/// Filters raw FHIR resource JSON by patient and/or group references.
+///
+/// Per the SQL-on-FHIR v2 `$viewdefinition-run` spec, `patient` is `0..1` and
+/// `group` is `0..*`; both arguments accept slices to keep the signature
+/// symmetric. Multiple values are unioned: a resource is included when it
+/// matches *any* supplied reference.
+///
+/// The patient filter implements the standard patient-compartment projection
+/// (best-effort; see audit item #3 for the compartment-fidelity gap). The
+/// group filter currently returns [`SofError::InvalidViewDefinition`] when
+/// non-empty since group expansion is not supported on this stateless path.
 pub fn filter_resources_by_patient_and_group(
     resources: Vec<serde_json::Value>,
-    patient_ref: Option<&str>,
-    group_ref: Option<&str>,
+    patient_refs: &[String],
+    group_refs: &[String],
 ) -> Result<Vec<serde_json::Value>, SofError> {
     let mut filtered = resources;
 
-    if let Some(patient_ref) = patient_ref {
-        let normalized_patient_ref = if patient_ref.starts_with("Patient/") {
-            patient_ref.to_string()
-        } else {
-            format!("Patient/{}", patient_ref)
-        };
-        let patient_ref_to_match = normalized_patient_ref.as_str();
-        filtered.retain(|resource| {
-            if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
-                match resource_type {
-                    "Patient" => {
-                        if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
-                            return format!("Patient/{}", id) == patient_ref_to_match;
-                        }
-                    }
-                    "Observation" | "Condition" | "MedicationRequest" | "Procedure"
-                    | "Encounter" => {
-                        if let Some(subject) = resource.get("subject") {
-                            if let Some(reference) =
-                                subject.get("reference").and_then(|r| r.as_str())
-                            {
-                                return reference == patient_ref_to_match;
-                            }
-                        }
-                    }
-                    _ => {
-                        if let Some(patient) = resource.get("patient") {
-                            if let Some(reference) =
-                                patient.get("reference").and_then(|r| r.as_str())
-                            {
-                                return reference == patient_ref_to_match;
-                            }
-                        }
-                    }
+    if !patient_refs.is_empty() {
+        let normalized: Vec<String> = patient_refs
+            .iter()
+            .map(|r| {
+                if r.starts_with("Patient/") {
+                    r.clone()
+                } else {
+                    format!("Patient/{}", r)
                 }
+            })
+            .collect();
+        filtered.retain(|resource| {
+            let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) else {
+                return false;
+            };
+            match resource_type {
+                "Patient" => resource
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .map(|id| normalized.contains(&format!("Patient/{}", id)))
+                    .unwrap_or(false),
+                "Observation" | "Condition" | "MedicationRequest" | "Procedure" | "Encounter" => {
+                    resource
+                        .get("subject")
+                        .and_then(|s| s.get("reference"))
+                        .and_then(|r| r.as_str())
+                        .map(|reference| normalized.iter().any(|n| n == reference))
+                        .unwrap_or(false)
+                }
+                _ => resource
+                    .get("patient")
+                    .and_then(|p| p.get("reference"))
+                    .and_then(|r| r.as_str())
+                    .map(|reference| normalized.iter().any(|n| n == reference))
+                    .unwrap_or(false),
             }
-            false
         });
     }
 
-    if group_ref.is_some() {
+    if !group_refs.is_empty() {
         return Err(SofError::InvalidViewDefinition(
             "Group filtering is not yet implemented".to_string(),
         ));
