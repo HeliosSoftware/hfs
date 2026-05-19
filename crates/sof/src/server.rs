@@ -29,7 +29,7 @@
 //! POST /ViewDefinition/$viewdefinition-run
 //!   Body: Parameters resource containing ViewDefinition and data
 //!   Query Parameters (except viewReference, viewResource, patient, group, resource):
-//!     _format: Output format - application/json, application/ndjson, text/csv, application/parquet
+//!     _format: Output format - application/json, application/x-ndjson, text/csv, application/octet-stream (parquet)
 //!     header: CSV header control - true (default), false (only applies to CSV format)
 //!     source: Data source (type: string) - Not yet supported
 //!     _limit: Limits the number of results (1-10000)

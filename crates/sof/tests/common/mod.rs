@@ -465,19 +465,37 @@ async fn run_view_definition_handler(
                 );
             };
 
+            // Per SoF v2 spec: parquet uses `application/octet-stream`
+            // (audit item #8). Production code does the same; mirroring
+            // here so integration tests exercise the right headers.
             let mime_type = match content_type {
                 ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
                 ContentType::Json => "application/json",
-                ContentType::NdJson => "application/ndjson",
-                ContentType::Parquet => "application/parquet",
+                ContentType::NdJson => "application/x-ndjson",
+                ContentType::Parquet => "application/octet-stream",
             };
 
-            (
-                axum::http::StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, mime_type)],
-                output,
-            )
-                .into_response()
+            if matches!(content_type, ContentType::Parquet) {
+                (
+                    axum::http::StatusCode::OK,
+                    [
+                        (axum::http::header::CONTENT_TYPE, mime_type),
+                        (
+                            axum::http::header::CONTENT_DISPOSITION,
+                            "attachment; filename=\"output.parquet\"",
+                        ),
+                    ],
+                    output,
+                )
+                    .into_response()
+            } else {
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, mime_type)],
+                    output,
+                )
+                    .into_response()
+            }
         }
         Err(e) => error_response(axum::http::StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
     }

@@ -60,7 +60,7 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 ///
 /// | Name | Type | Use | Scope | Min | Max | Documentation |
 /// |------|------|-----|-------|-----|-----|---------------|
-/// | _format | code | in | type, instance | 1 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/parquet` |
+/// | _format | code | in | type, instance | 1 | 1 | Output format - `application/json`, `application/x-ndjson`, `text/csv`, `application/octet-stream` (parquet) |
 /// | header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
 /// | viewReference | Reference | in | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. (not yet supported) |
 /// | viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
@@ -408,10 +408,19 @@ pub async fn run_view_definition_handler(
                 info!("Streaming single Parquet file ({} bytes)", file_size);
                 crate::streaming::stream_single_parquet_response(file_buffers[0].clone())
             } else {
-                // Small file, return directly
+                // Small file, return directly. Per SoF v2 spec Accept
+                // table, parquet uses `application/octet-stream`; we add
+                // Content-Disposition so browsers download as `.parquet`
+                // (audit item #8).
                 let mut response = (
                     StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/parquet")],
+                    [
+                        (header::CONTENT_TYPE, "application/octet-stream"),
+                        (
+                            header::CONTENT_DISPOSITION,
+                            "attachment; filename=\"output.parquet\"",
+                        ),
+                    ],
                     file_buffers[0].clone(),
                 )
                     .into_response();
@@ -432,20 +441,39 @@ pub async fn run_view_definition_handler(
         let filtered_output = apply_result_filtering(output, &validated_params)
             .map_err(|e| ServerError::InternalError(format!("Failed to apply filtering: {}", e)))?;
 
-        // Determine the MIME type for the response
+        // Determine the MIME type for the response. Per SoF v2 spec
+        // Accept table: parquet uses `application/octet-stream`
+        // (audit item #8).
         let mime_type = match validated_params.format {
             ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
             ContentType::Json => "application/json",
             ContentType::NdJson => "application/x-ndjson",
-            ContentType::Parquet => "application/parquet",
+            ContentType::Parquet => "application/octet-stream",
         };
 
-        let mut response = (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, mime_type)],
-            filtered_output,
-        )
-            .into_response();
+        let mut response = if matches!(validated_params.format, ContentType::Parquet) {
+            // Add Content-Disposition for parquet so browsers download as
+            // `.parquet` rather than rendering octet-stream as binary noise.
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, mime_type),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"output.parquet\"",
+                    ),
+                ],
+                filtered_output,
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime_type)],
+                filtered_output,
+            )
+                .into_response()
+        };
         attach_filter_warnings(response.headers_mut(), &filter_warnings);
         Ok(response)
     }

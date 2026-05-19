@@ -922,3 +922,72 @@ async fn test_instance_level_returns_400_with_stateless_explanation() {
         "error message must point at the supported alternative: {details}"
     );
 }
+
+/// Audit item #8: parquet output uses `application/octet-stream` per the
+/// SoF v2 spec Accept table, plus `Content-Disposition: attachment;
+/// filename="output.parquet"` so downloads land with the right
+/// extension. Pre-fix, sof-server returned `application/parquet`
+/// (non-standard).
+#[tokio::test]
+async fn test_parquet_response_uses_octet_stream_content_type() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_format", "valueCode": "application/octet-stream"},
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {"resourceType": "Patient", "id": "p1"}
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$viewdefinition-run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "parquet request must succeed; body: {}",
+        response.text()
+    );
+    let ct = response
+        .header("content-type")
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    assert_eq!(
+        ct, "application/octet-stream",
+        "parquet response must use application/octet-stream per spec, got {ct}"
+    );
+    let cd = response
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        cd.contains("filename=") && cd.contains(".parquet"),
+        "parquet response must include Content-Disposition naming a .parquet file, got '{cd}'"
+    );
+    // PAR1 magic bytes confirm we actually got parquet bytes.
+    let bytes = response.as_bytes();
+    assert!(
+        bytes.starts_with(b"PAR1"),
+        "response body must be a Parquet file (PAR1 magic), got first 8 bytes: {:?}",
+        &bytes[..bytes.len().min(8)]
+    );
+}

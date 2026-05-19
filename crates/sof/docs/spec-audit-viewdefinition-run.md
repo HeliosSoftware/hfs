@@ -144,12 +144,20 @@ closed many gaps; those that remain are listed below.
     supported scopes (system + type) and explicitly notes that
     `viewReference` and instance-level invocation are unavailable.
 
-## 8. Parquet MIME type (sof-server)
+## 8. Parquet MIME type — **FIXED**
 - **Spec content-negotiation table:** parquet ↔
   `application/octet-stream`.
-- **HFS REST:** ✓ `application/octet-stream` + Content-Disposition.
-- **sof-server:** returns `application/parquet` (non-standard). Minor
-  but a spec-conformant client checking the Accept-table won't match.
+- **Before:** sof-server returned `application/parquet` (non-standard)
+  on all three Parquet response paths (small file, large streaming
+  single, multi-file ZIP path returns `application/zip` and was
+  already correct).
+- **After:** all sof-server Parquet response paths emit
+  `Content-Type: application/octet-stream` plus
+  `Content-Disposition: attachment; filename="…parquet"`. Matches HFS
+  REST byte-for-byte. `ContentType::from_string` now accepts
+  `application/octet-stream` as the spec input for the `_format`
+  parameter; `application/parquet` is kept as a permissive
+  back-compat alias for clients that still send it.
 
 ## 9. 422 vs 400 on invalid ViewDefinition (sof-server)
 - **Spec status codes:** `422 Unprocessable Entity` for "invalid
@@ -227,7 +235,7 @@ closed many gaps; those that remain are listed below.
 | 6 | System-level route | Medium | sof-server | **fixed** (this commit) |
 | 11 | CapabilityStatement formats + refs block | Medium | sof-server | open |
 | 5 | Absent-target OperationOutcome | Medium (SHOULD) | both | **fixed** (inline paths; runner-path probe is follow-up) |
-| 8 | Parquet MIME | Low | sof-server | open |
+| 8 | Parquet MIME | Low | sof-server | **fixed** (this commit) |
 | 14 | `header` rejection on non-CSV | Low | sof-server | open |
 | 16 | Double-applied `_limit` | Low (perf/CSV-fragile) | sof-server | open |
 | 7 | Instance-level not supported | Low (statelessness) | sof-server | **fixed** (clarified; this commit) |

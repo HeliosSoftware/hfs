@@ -123,9 +123,15 @@ pub fn stream_single_parquet_response(
     // Create a stream that yields the data in chunks
     let stream = create_chunked_stream(parquet_data);
 
-    // Build the response with appropriate headers
+    // Build the response with appropriate headers. Per SoF v2 spec
+    // content-negotiation table, parquet uses `application/octet-stream`
+    // (audit item #8); Content-Disposition still names the file
+    // `.parquet` so downstream tools/browsers identify it correctly.
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, "application/parquet".parse().unwrap());
+    headers.insert(
+        header::CONTENT_TYPE,
+        "application/octet-stream".parse().unwrap(),
+    );
     headers.insert(
         header::CONTENT_DISPOSITION,
         "attachment; filename=\"data.parquet\"".parse().unwrap(),

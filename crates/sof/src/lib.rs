@@ -639,7 +639,8 @@ impl ContentType {
     /// - `"application/json"` → [`ContentType::Json`]
     /// - `"application/ndjson"` → [`ContentType::NdJson`]
     /// - `"application/x-ndjson"` → [`ContentType::NdJson`]
-    /// - `"application/parquet"` → [`ContentType::Parquet`]
+    /// - `"application/octet-stream"` → [`ContentType::Parquet`] (spec)
+    /// - `"application/parquet"` → [`ContentType::Parquet`] (permissive alias)
     ///
     /// # Arguments
     ///
@@ -697,7 +698,10 @@ impl ContentType {
             "text/csv" | "text/csv;header=true" => Ok(ContentType::CsvWithHeader),
             "application/json" => Ok(ContentType::Json),
             "application/ndjson" | "application/x-ndjson" => Ok(ContentType::NdJson),
-            "application/parquet" => Ok(ContentType::Parquet),
+            // Spec Accept-table value for parquet (audit item #8).
+            // `application/parquet` is kept as a permissive alias for
+            // backwards-compat with clients that still send it.
+            "application/octet-stream" | "application/parquet" => Ok(ContentType::Parquet),
             _ => Err(SofError::UnsupportedContentType(s.to_string())),
         }
     }
