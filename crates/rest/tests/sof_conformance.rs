@@ -408,7 +408,7 @@ mod sof_conformance_tests {
         // means more of the spec is now in-DB-compilable. This is intentionally
         // a one-way ratchet so unrelated changes that lose coverage get
         // caught in CI.
-        const PASS_FLOOR: usize = 125;
+        const PASS_FLOOR: usize = 126;
         assert!(
             passed >= PASS_FLOOR,
             "regression: only {passed} fixtures pass (floor: {PASS_FLOOR}). \

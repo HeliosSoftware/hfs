@@ -1523,17 +1523,49 @@ fn lower_boundary(
             )
         }
         BoundaryKind::DateTime => {
-            // Date-only inputs expand to the earliest (`+14:00`) or latest
-            // (`-12:00`) UTC offset of the day. Inputs that already include
-            // a time pass through unchanged.
-            let pad = match side {
+            // SoF v2 PR FHIR/sql-on-fhir-v2#357: a column whose type is
+            // `dateTime` may carry results from either a `date` or a
+            // `dateTime` source. FHIRPath `lowBoundary()`/`highBoundary()`
+            // preserves the source's precision, so the SQL emit dispatches
+            // on input length:
+            //
+            //   length 4  ("YYYY")        → date semantics: pad to "YYYY-01-01"
+            //                                                 or "YYYY-12-31"
+            //   length 7  ("YYYY-MM")     → date semantics: pad to month start
+            //                                                 or last day of month
+            //   length 10 ("YYYY-MM-DD")  → datetime semantics: append
+            //                                "T00:00:00.000+14:00" (low)
+            //                                or "T23:59:59.999-12:00" (high)
+            //
+            // Anything else (full datetime already present, malformed) returns
+            // NULL — matches the BoundaryKind::Date emit's behavior for
+            // off-spec inputs.
+            let pad_full_day = match side {
                 BoundarySide::Low => "'T00:00:00.000+14:00'",
                 BoundarySide::High => "'T23:59:59.999-12:00'",
+            };
+            let pad_month_only = match side {
+                BoundarySide::Low => "'-01-01'",
+                BoundarySide::High => "'-12-31'",
+            };
+            let day_pad = match side {
+                BoundarySide::Low => "'-01'".to_string(),
+                BoundarySide::High => format!(
+                    "'-' || CASE substr({src}, 6, 2) \
+                       WHEN '02' THEN '28' \
+                       WHEN '04' THEN '30' \
+                       WHEN '06' THEN '30' \
+                       WHEN '09' THEN '30' \
+                       WHEN '11' THEN '30' \
+                       ELSE '31' END"
+                ),
             };
             format!(
                 "CASE \
                    WHEN {src} IS NULL THEN NULL \
-                   WHEN length({src}) = 10 THEN {src} || {pad} \
+                   WHEN length({src}) = 10 THEN {src} || {pad_full_day} \
+                   WHEN length({src}) = 7 THEN {src} || {day_pad} \
+                   WHEN length({src}) = 4 THEN {src} || {pad_month_only} \
                    ELSE NULL END"
             )
         }
