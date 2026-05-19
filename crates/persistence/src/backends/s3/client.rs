@@ -117,8 +117,7 @@ pub trait S3Api: Send + Sync {
     ) -> Result<ObjectMetadata, S3ClientError>;
 
     /// Deletes the object at the given key. Succeeds even if the key does not
-    /// exist. Reserved for the Phase 2 `S3OutputStore` integration.
-    #[allow(dead_code)]
+    /// exist.
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3ClientError>;
 
     /// Lists objects whose keys start with `prefix`, with optional
