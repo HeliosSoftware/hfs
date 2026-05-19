@@ -4739,7 +4739,7 @@ fn call_function(
                     }
                     Ok(EvaluationResult::string(string_items.join(separator)))
                 }
-                EvaluationResult::Empty => Ok(EvaluationResult::string(String::new())), // {}.join(sep) -> ""
+                EvaluationResult::Empty => Ok(EvaluationResult::Empty), // {}.join(sep) -> {} per FHIRPath spec
                 EvaluationResult::String(s, _, _) => Ok(EvaluationResult::string(s.clone())), // Single string -> same string
                 _ => Err(EvaluationError::TypeError(
                     "join requires string items or a collection of strings".to_string(),
