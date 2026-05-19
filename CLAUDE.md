@@ -683,9 +683,10 @@ HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=false \
 cargo run --bin hfs --features postgres,s3
 ```
 
-The full stack (HFS + Postgres + MinIO + Keycloak) is described by
-`docker/bulk-export/docker-compose.yml`. See `.github/workflows/inferno-bulk-data.yml`
-for the manual conformance run.
+The full stack (HFS + Postgres + MinIO + Keycloak) is available as a local
+example in `docker/bulk-export/docker-compose.yml`; GitHub Actions does not use
+that compose file for bulk export tests. See `.github/workflows/inferno-bulk-data.yml`
+for the manual conformance workflow.
 
 ### Behavior notes
 
