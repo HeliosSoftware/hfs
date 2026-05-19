@@ -84,7 +84,9 @@ helios-persistence/
 │   │   ├── search.rs       # Search providers (basic, chained, include)
 │   │   ├── transaction.rs  # ACID transactions with bundle support
 │   │   ├── capabilities.rs # Runtime capability discovery
-│   │   ├── bulk_export.rs  # FHIR Bulk Data Export traits
+│   │   ├── bulk_export.rs  # FHIR Bulk Data Export job/data traits
+│   │   ├── bulk_export_output.rs # ExportOutputStore trait
+│   │   ├── bulk_export_worker.rs # Bulk export worker runtime and leasing traits
 │   │   └── bulk_submit.rs  # FHIR Bulk Submit traits
 │   ├── search/          # Search parameter infrastructure
 │   │   ├── registry.rs     # SearchParameterRegistry (in-memory cache)
@@ -152,10 +154,11 @@ helios-persistence/
 │   │       ├── config.rs         # S3BackendConfig, S3TenancyMode
 │   │       ├── client.rs         # S3Api trait and AwsS3Client implementation
 │   │       ├── keyspace.rs       # S3Keyspace key-path generation
-│   │       ├── models.rs         # HistoryIndexEvent, ExportJobState, SubmissionState
+│   │       ├── models.rs         # HistoryIndexEvent, SubmissionState
 │   │       ├── storage.rs        # ResourceStorage implementation
 │   │       ├── bundle.rs         # Batch/transaction bundle processing
-│   │       ├── bulk_export.rs    # BulkExportStorage implementation
+│   │       ├── bulk_export.rs    # ExportDataProvider implementation
+│   │       ├── output_store.rs   # S3OutputStore for bulk export files
 │   │       ├── bulk_submit.rs    # BulkSubmitProvider implementation
 │   │       └── tests.rs          # Integration tests
 │   ├── composite/       # Multi-backend coordination
@@ -369,10 +372,10 @@ The matrix below shows which FHIR operations each backend supports. This reflect
 | Single field                                                                | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | Multiple fields                                                             | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | **[Bulk Operations](https://hl7.org/fhir/uv/bulkdata/)**                    |
-| [Bulk Export](https://hl7.org/fhir/uv/bulkdata/export.html)                 | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
+| [Bulk Export](https://hl7.org/fhir/uv/bulkdata/export.html)                 | ✓      | ✓          | ○       | ○         | ○     | ○             | ◐   |
 | [Bulk Submit](https://hackmd.io/@argonaut/rJoqHZrPle)                       | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
 
-The S3 backend is intentionally storage-focused (CRUD/version/history/bulk) and does not act as a full FHIR search engine. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/bulk/history storage.
+The S3 backend is intentionally storage-focused (CRUD/version/history/bulk submit) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but job state belongs to SQLite or PostgreSQL. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
 ### Primary/Secondary Role Matrix
 
@@ -389,7 +392,7 @@ Backends can serve as primary (CRUD, versioning, transactions) or secondary (opt
 | Cassandra + Elasticsearch  | Cassandra  | Elasticsearch (search) | Planned                         | Write-heavy + search                    |
 | MongoDB alone              | MongoDB    | —                      | ✓ Implemented                   | Document-centric                        |
 | MongoDB + Elasticsearch    | MongoDB    | Elasticsearch (search) | ✓ Implemented                   | Document-centric + offloaded search     |
-| S3 alone                   | S3         | —                      | ✓ Implemented (storage-focused) | Archival/bulk/history storage           |
+| S3 alone                   | S3         | —                      | ✓ Implemented (storage-focused) | Archival/history storage                |
 | S3 + Elasticsearch         | S3         | Elasticsearch (search) | ✓ Implemented                   | Large-scale + search                    |
 
 ### Backend Selection Guide
@@ -600,13 +603,14 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### S3 + Elasticsearch
 
-S3 handles CRUD, versioning, history, and bulk operations. Elasticsearch handles all search operations. Combines S3's cost-effective, durable object storage with Elasticsearch's search capabilities for large-scale deployments.
+S3 handles CRUD, versioning, history, and bulk-submit artifacts. Elasticsearch handles all search operations. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
 
 - CRUD persistence via S3 objects (current pointer + immutable history versions)
 - Versioning (`vread`, optimistic locking via version checks)
 - Instance, type, and system history via immutable history objects
 - Batch bundles and best-effort transaction bundles
-- Bulk export (NDJSON parts + manifest in S3)
+- Bulk export data provider for system-level exports
+- Optional S3 bulk-export output files via `S3OutputStore`
 - Bulk submit with rollback change log
 - Full-text search with relevance scoring (`_text`, `_content`) via Elasticsearch
 - All FHIR search parameter types (string, token, date, number, quantity, reference, URI, composite)
@@ -758,7 +762,7 @@ let composite = CompositeStorage::new(config, backends)?
 
 ## S3 Backend
 
-The S3 backend is a storage-focused persistence backend using AWS S3 object storage. It handles CRUD, versioning/history, and bulk workflows but is intentionally not a FHIR search engine. For query-heavy deployments, compose S3 with a DB/search backend as the primary query engine.
+The S3 backend is a storage-focused persistence backend using AWS S3 object storage. It handles CRUD, versioning/history, and bulk-submit workflows but is intentionally not a FHIR search engine. For bulk export, S3 participates in two narrower roles: `S3Backend` can provide resource batches for system-level exports, and `S3OutputStore` can store finalized NDJSON output files. Bulk-export job state, progress, manifests, leases, and file metadata are not stored in S3; they live in SQLite or PostgreSQL.
 
 ### Scope
 
@@ -767,7 +771,8 @@ The S3 backend is a storage-focused persistence backend using AWS S3 object stor
 - Versioning (`vread`, `list_versions`, optimistic conflict checks)
 - Instance/type/system history via immutable history objects plus history index events
 - Batch bundles and best-effort transaction bundles (non-atomic with compensating rollback)
-- Bulk export (NDJSON objects + manifest/progress state in S3)
+- Bulk export resource data provider for system-level exports
+- Bulk export output storage through `S3OutputStore` when configured separately from job state
 - Bulk submit (ingest + raw artifact persistence + rollback change log)
 - Tenant isolation (`PrefixPerTenant` or `BucketPerTenant`)
 
@@ -776,7 +781,7 @@ The S3 backend is a storage-focused persistence backend using AWS S3 object stor
 ### Configuration
 
 ```rust
-use helios_persistence::backends::s3::S3BackendConfig;
+use helios_persistence::backends::s3::{S3BackendConfig, S3TenancyMode};
 
 let config = S3BackendConfig {
     tenancy_mode: S3TenancyMode::PrefixPerTenant {
@@ -785,8 +790,8 @@ let config = S3BackendConfig {
     prefix: None,
     region: None,
     validate_buckets_on_startup: true,
-    bulk_export_part_size: 10_000,
     bulk_submit_batch_size: 100,
+    ..Default::default()
 };
 ```
 
@@ -796,7 +801,6 @@ let config = S3BackendConfig {
 | `prefix` | `None` | Optional global key prefix applied before backend keys |
 | `region` | `None` | AWS region override (falls back to provider chain) |
 | `validate_buckets_on_startup` | `true` | Validate configured buckets with `HeadBucket` on startup |
-| `bulk_export_part_size` | `10000` | Max NDJSON lines per export output part |
 | `bulk_submit_batch_size` | `100` | Default ingestion batch size for bulk submit processing |
 
 ### Tenancy Modes
@@ -817,14 +821,13 @@ Resource objects:
 | Type history event | `.../history/type/{type}/{ts}_{id}_{version}_{suffix}.json` |
 | System history event | `.../history/system/{ts}_{type}_{id}_{version}_{suffix}.json` |
 
-Bulk export objects:
+Bulk export output objects:
 
 | Object | Key Pattern |
 |--------|-------------|
-| Job state | `.../bulk/export/jobs/{job_id}/state.json` |
-| Progress | `.../bulk/export/jobs/{job_id}/progress/{type}.json` |
-| Output | `.../bulk/export/jobs/{job_id}/output/{type}/part-{n}.ndjson` |
-| Manifest | `.../bulk/export/jobs/{job_id}/manifest.json` |
+| Finalized NDJSON part | `{tenant_id}/exports/{job_id}/{file_type}-{resource_type}-{part_index}-{fencing_token}.ndjson` |
+
+Bulk-export job state is deliberately not an S3 object model. SQLite and PostgreSQL store the job row, progress, leases/fencing tokens, file metadata, and raw manifest rows. `S3OutputStore` stores only finalized output parts and deletes every object under `{tenant_id}/exports/{job_id}/` during cancellation or retention cleanup. The REST layer assembles the client-facing manifest from the job store plus `ExportOutputStore::download_url`.
 
 Bulk submit objects:
 
@@ -1112,12 +1115,14 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] ReindexableStorage implementation
 
 ### Phase 5c: S3 Backend ✓
+
 - [x] S3BackendConfig with PrefixPerTenant and BucketPerTenant tenancy modes
 - [x] ResourceStorage implementation (CRUD via S3 objects)
 - [x] VersionedStorage implementation (vread, optimistic locking)
 - [x] History providers (instance, type, system via immutable history objects)
 - [x] Batch and best-effort transaction bundles
-- [x] BulkExportStorage implementation (NDJSON parts + manifest in S3)
+- [x] ExportDataProvider implementation for system-level bulk export
+- [x] S3OutputStore implementation for bulk-export NDJSON output files
 - [x] BulkSubmitProvider implementation (ingest, raw artifacts, rollback change log)
 
 ### Phase 5+: Additional Backends (Planned)
@@ -1167,7 +1172,7 @@ The composite storage layer enables polyglot persistence by coordinating multipl
 | PostgreSQL + Neo4j | PostgreSQL | Neo4j         | Planned       | Graph-heavy queries                     |
 | MongoDB-only       | MongoDB    | None          | ✓ Implemented | Document-centric primary                |
 | MongoDB + ES       | MongoDB    | Elasticsearch | ✓ Implemented | Document-centric + search               |
-| S3 alone           | S3         | —             | ✓ Implemented | Archival/bulk storage                   |
+| S3 alone           | S3         | —             | ✓ Implemented | Archival/history storage                |
 | S3 + ES            | S3         | Elasticsearch | ✓ Implemented | Large-scale + search                    |
 
 ### Quick Start
