@@ -396,6 +396,12 @@ where
         });
     }
 
+    // Audit item #10: enforce the same `_limit` bound as sof-server so
+    // both binaries reject the same out-of-range values consistently.
+    // The spec leaves `_limit` unbounded; this is a deployment-policy
+    // safety cap.
+    validate_limit(params.limit)?;
+
     if !body_params.inline_resources.is_empty() {
         return execute_view_inline(
             &state,
@@ -554,6 +560,26 @@ fn content_type_headers(ct: ContentType) -> (&'static str, &'static str) {
         ContentType::NdJson => ("application/x-ndjson", "ndjson"),
         ContentType::Parquet => ("application/octet-stream", "parquet"),
     }
+}
+
+/// Audit item #10: enforces the `1..=10000` `_limit` cap (matches
+/// sof-server). The spec leaves `_limit` unbounded; both binaries adopt
+/// the same deployment-policy safety cap so a client gets the same
+/// behavior regardless of which server is in front.
+fn validate_limit(limit: Option<usize>) -> Result<(), RestError> {
+    if let Some(n) = limit {
+        if n == 0 {
+            return Err(RestError::BadRequest {
+                message: "_limit parameter must be greater than 0".to_string(),
+            });
+        }
+        if n > 10000 {
+            return Err(RestError::BadRequest {
+                message: "_limit parameter cannot exceed 10000".to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Resolves the output format for a run. Spec precedence: `_format` parameter

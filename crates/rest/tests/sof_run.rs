@@ -1465,4 +1465,53 @@ mod sof_run_tests {
         assert_eq!(outcome["resourceType"], "OperationOutcome");
         assert_eq!(outcome["issue"][0]["code"], "not-supported");
     }
+
+    /// Audit item #10: HFS REST enforces the same `_limit` bounds as
+    /// sof-server (1..=10000). `_limit=0` rejected with 400.
+    #[tokio::test]
+    async fn test_run_view_definition_limit_zero_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&_limit=0")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body = response.text();
+        assert!(
+            body.contains("greater than 0"),
+            "error message must explain the lower bound: {body}"
+        );
+    }
+
+    /// Audit item #10: `_limit > 10000` rejected with 400 (matches
+    /// sof-server's safety cap). Spec leaves _limit unbounded; this is a
+    /// deployment-policy decision shared between both binaries.
+    #[tokio::test]
+    async fn test_run_view_definition_limit_exceeds_cap_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&_limit=10001")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body = response.text();
+        assert!(
+            body.contains("cannot exceed 10000"),
+            "error message must explain the upper bound: {body}"
+        );
+    }
 }

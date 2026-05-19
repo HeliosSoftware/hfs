@@ -174,12 +174,22 @@ closed many gaps; those that remain are listed below.
   surfaces as 422 (matches HFS REST and the spec). All other SoF errors
   raised during view execution were already 422.
 
-## 10. sof-server's hard `_limit` cap (10000)
+## 10. `_limit` cap — **FIXED** (unified across both binaries)
 - **Spec:** `_limit` is `integer`, no upper bound.
-- **sof-server `models.rs`** enforces `1..=10000` and returns `400` for
-  anything higher. Deployment policy, not a spec violation, but a
-  spec-conformant client gets refused instead of best-effort honoring.
-  HFS REST has no such cap.
+- **Before:** sof-server's `models.rs` enforced `1..=10000` (returning
+  400 for out-of-range values) as a deployment-policy safety cap. HFS
+  REST had no such cap, so the same `_limit=20000` request was
+  accepted on one binary and rejected on the other.
+- **After:** HFS REST's `execute_view` calls `validate_limit`
+  (`crates/rest/src/handlers/sof/run.rs`) which enforces the same
+  `1..=10000` bound and returns the same 400 with a matching error
+  message. Both binaries now behave identically for `_limit` validation.
+- **Spec note:** the cap is still a deployment-policy decision rather
+  than a spec requirement — the spec leaves `_limit` unbounded. The
+  cap protects both servers from clients requesting unreasonably
+  large pages (memory exhaustion, runaway queries). Raising it is a
+  one-line change in both `validate_limit` (rest) and the
+  corresponding sof-server validator.
 
 ## 11. CapabilityStatement gaps (sof-server)
 - Advertises only `"format": ["json"]` despite serving CSV/NDJSON/Parquet
@@ -245,7 +255,7 @@ closed many gaps; those that remain are listed below.
 | 14 | `header` rejection on non-CSV | Low | sof-server | open |
 | 16 | Double-applied `_limit` | Low (perf/CSV-fragile) | sof-server | open |
 | 7 | Instance-level not supported | Low (statelessness) | sof-server | **fixed** (clarified; this commit) |
-| 10 | `_limit` 10000 cap | Low (policy) | sof-server | open |
+| 10 | `_limit` 10000 cap | Low (policy) | both unified | **fixed** (this commit) |
 | 13 | Value-set binding declaration | Low (audit polish) | both | open |
 | 12 | Canonical URL casing | Low (verify first) | both | open |
 | 4 | `patient` query comma-split symmetry | Low | sof-server | open |
