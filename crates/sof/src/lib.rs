@@ -3316,6 +3316,24 @@ where
                     }
                 }
 
+                // Apply unionAll branches in the child's context
+                if let Some(union_selects) = select.union_all() {
+                    let mut union_combinations = Vec::new();
+                    for combo in &child_combinations {
+                        for union_select in union_selects {
+                            let select_combinations = expand_select_combinations(
+                                &child_context,
+                                union_select,
+                                std::slice::from_ref(combo),
+                                all_columns,
+                                variables,
+                            )?;
+                            union_combinations.extend(select_combinations);
+                        }
+                    }
+                    child_combinations = union_combinations;
+                }
+
                 // Add the processed combinations to our results
                 // (these may have been filtered by forEach, which is correct)
                 all_combinations.extend(child_combinations);
