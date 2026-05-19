@@ -89,6 +89,23 @@ where
         }));
     }
 
+    // Audit item #13: explicit declaration of the spec's
+    // OutputFormatCodes value-set binding (extensible). The codes
+    // accepted above (ndjson/json/csv/parquet/fhir) are exactly the
+    // canonical CodeSystem codes; this entry lets audit tools
+    // discover the binding without having to follow the
+    // CapabilityStatement → OperationDefinition link.
+    params.push(json!({
+        "name": "formatBinding",
+        "part": [
+            {
+                "name": "valueSet",
+                "valueUri": "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes"
+            },
+            {"name": "strength", "valueCode": "extensible"}
+        ]
+    }));
+
     json!({
         "resourceType": "Parameters",
         "parameter": params

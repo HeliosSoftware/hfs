@@ -1107,4 +1107,33 @@ async fn test_sof_capabilities_endpoint() {
             "supportedFormat must include {required}: {formats:?}"
         );
     }
+
+    // Audit item #13: the response must declare the spec's
+    // OutputFormatCodes value-set binding so audit tools can find
+    // it without dereferencing the OperationDefinition.
+    let binding = params
+        .iter()
+        .find(|p| p["name"] == "formatBinding")
+        .expect("formatBinding parameter must be present");
+    let binding_parts = binding["part"]
+        .as_array()
+        .expect("formatBinding must have part[]");
+    let value_set = binding_parts
+        .iter()
+        .find(|p| p["name"] == "valueSet")
+        .and_then(|p| p["valueUri"].as_str())
+        .expect("formatBinding.valueSet must be a uri");
+    assert_eq!(
+        value_set, "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes",
+        "binding must reference the spec's OutputFormatCodes value set"
+    );
+    let strength = binding_parts
+        .iter()
+        .find(|p| p["name"] == "strength")
+        .and_then(|p| p["valueCode"].as_str())
+        .expect("formatBinding.strength must be a code");
+    assert_eq!(
+        strength, "extensible",
+        "binding strength must match the spec's `extensible` declaration"
+    );
 }

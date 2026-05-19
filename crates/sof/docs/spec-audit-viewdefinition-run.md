@@ -229,12 +229,31 @@ closed many gaps; those that remain are listed below.
   emits these exact strings in both `/metadata` and
   `/$sql-on-fhir-capabilities` — no change required.
 
-## 13. `_format` value-set binding not enforced
-- **Spec:** `_format` is bound to `OutputFormatCodes` (extensible).
-- Both impls accept `csv | json | ndjson | parquet` plus various MIME
-  aliases via string match. Neither declares the binding nor validates
-  against the value set. Acceptable for extensible binding; conformance
-  audit tools may flag the missing declaration.
+## 13. `_format` value-set binding declaration — **FIXED**
+- **Spec:** `_format` is bound to
+  `https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes` with
+  `extensible` strength. The bound codes are `csv`, `ndjson`,
+  `parquet`, `json`, `fhir`.
+- **Before:** both impls accepted the spec codes plus a few permissive
+  MIME aliases, but neither declared the binding in their capability
+  advertisement. Conformance audit tools couldn't discover it without
+  dereferencing the OperationDefinition.
+- **After:** `/$sql-on-fhir-capabilities` on both binaries now
+  publishes an explicit `formatBinding` parameter:
+  ```json
+  {"name": "formatBinding", "part": [
+    {"name": "valueSet", "valueUri": "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes"},
+    {"name": "strength", "valueCode": "extensible"}
+  ]}
+  ```
+  Pairs with the existing `supportedFormat` codes which list exactly
+  the spec codes (sof-server: `ndjson`/`json`/`csv`/`parquet`;
+  HFS REST adds `fhir` for `$sqlquery-run` output).
+- **Validation policy:** spec strength is `extensible`, so we do not
+  hard-reject unknown codes — we accept what we know (the four
+  $viewdefinition-run codes plus permissive MIME aliases) and would
+  return 400 for an unrecognised value. The declaration tells audit
+  tools the binding exists; the strength tells them it's advisory.
 
 ## 14. `header` parameter on non-CSV formats (sof-server)
 - **Spec:** "Applies only when csv output is requested." No requirement
@@ -276,7 +295,7 @@ closed many gaps; those that remain are listed below.
 | 16 | Double-applied `_limit` | Low (perf/CSV-fragile) | sof-server | open |
 | 7 | Instance-level not supported | Low (statelessness) | sof-server | **fixed** (clarified; this commit) |
 | 10 | `_limit` 10000 cap | Low (policy) | both unified | **fixed** (this commit) |
-| 13 | Value-set binding declaration | Low (audit polish) | both | open |
+| 13 | Value-set binding declaration | Low (audit polish) | both | **fixed** (this commit) |
 | 12 | Canonical URL casing | Low (verify first) | both | **verified correct** (spec uses `$`; code already matches) |
 | 4 | `patient` query comma-split symmetry | Low | sof-server | open |
 | 15 | `format_stream` defensive re-validate | Trivial | HFS REST | open |

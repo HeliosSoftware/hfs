@@ -854,7 +854,23 @@ pub async fn sof_capabilities() -> ServerResult<impl IntoResponse> {
             {"name": "supportedFormat", "valueCode": "ndjson"},
             {"name": "supportedFormat", "valueCode": "json"},
             {"name": "supportedFormat", "valueCode": "csv"},
-            {"name": "supportedFormat", "valueCode": "parquet"}
+            {"name": "supportedFormat", "valueCode": "parquet"},
+            // Audit item #13: explicit declaration of the spec's
+            // OutputFormatCodes value-set binding (extensible).
+            // The bound codes (csv/ndjson/parquet/json/fhir) are listed
+            // at the canonical CodeSystem URL. The binding is
+            // `extensible`, so a client may use additional codes — but
+            // sof-server only accepts the four advertised above.
+            {
+                "name": "formatBinding",
+                "part": [
+                    {
+                        "name": "valueSet",
+                        "valueUri": "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes"
+                    },
+                    {"name": "strength", "valueCode": "extensible"}
+                ]
+            }
         ]
     });
     Ok((

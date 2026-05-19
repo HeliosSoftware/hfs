@@ -150,6 +150,52 @@ mod sof_capability_tests {
         assert!(formats.contains(&"csv"), "csv must be supported");
     }
 
+    /// Audit item #13: the spec binds `_format` to the
+    /// `OutputFormatCodes` value set with `extensible` strength.
+    /// `/$sql-on-fhir-capabilities` declares the binding so audit
+    /// tools can discover it without dereferencing the
+    /// OperationDefinition. Same shape sof-server publishes.
+    #[tokio::test]
+    async fn test_sof_capabilities_declares_format_binding() {
+        let server = create_test_server().await;
+
+        let response = server
+            .get("/$sql-on-fhir-capabilities")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        let body: Value = serde_json::from_str(&response.text()).expect("body must be valid JSON");
+        let params = body["parameter"].as_array().unwrap();
+
+        let binding = params
+            .iter()
+            .find(|p| p["name"] == "formatBinding")
+            .expect("formatBinding parameter must be present");
+        let parts = binding["part"]
+            .as_array()
+            .expect("formatBinding must have part[]");
+
+        let value_set = parts
+            .iter()
+            .find(|p| p["name"] == "valueSet")
+            .and_then(|p| p["valueUri"].as_str())
+            .expect("formatBinding.valueSet must be a uri");
+        assert_eq!(
+            value_set, "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes",
+            "binding must reference the spec's OutputFormatCodes value set"
+        );
+
+        let strength = parts
+            .iter()
+            .find(|p| p["name"] == "strength")
+            .and_then(|p| p["valueCode"].as_str())
+            .expect("formatBinding.strength must be a code");
+        assert_eq!(
+            strength, "extensible",
+            "binding strength must be `extensible` per spec"
+        );
+    }
+
     // =========================================================================
     // GET /metadata — SOF operation extensions
     // =========================================================================

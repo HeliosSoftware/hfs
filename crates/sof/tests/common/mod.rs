@@ -126,7 +126,17 @@ async fn sof_capabilities_handler() -> axum::response::Response {
             {"name": "supportedFormat", "valueCode": "ndjson"},
             {"name": "supportedFormat", "valueCode": "json"},
             {"name": "supportedFormat", "valueCode": "csv"},
-            {"name": "supportedFormat", "valueCode": "parquet"}
+            {"name": "supportedFormat", "valueCode": "parquet"},
+            {
+                "name": "formatBinding",
+                "part": [
+                    {
+                        "name": "valueSet",
+                        "valueUri": "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes"
+                    },
+                    {"name": "strength", "valueCode": "extensible"}
+                ]
+            }
         ]
     });
     (
