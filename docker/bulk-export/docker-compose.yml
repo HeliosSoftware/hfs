@@ -1,7 +1,8 @@
 # Multi-instance Bulk Data Export stack: HFS + PostgreSQL + MinIO + Keycloak.
 #
-# This is the substrate for Inferno Bulk Data Test Kit conformance runs and
-# for manual multi-instance smoke testing. Bring it up with:
+# This is a provided local example for manual multi-instance smoke testing and
+# trying Bulk Data clients such as Inferno. It is not used by the GitHub Actions
+# workflow tests. Bring it up with:
 #
 #     docker compose -f docker/bulk-export/docker-compose.yml up --build
 #
