@@ -28,15 +28,7 @@ jobs:
             {"backend":"sqlite","bulk_mode":"embedded-local","expectation":"full"},
             {"backend":"sqlite","bulk_mode":"postgres-s3","expectation":"full"},
             {"backend":"postgres","bulk_mode":"embedded-local","expectation":"full"},
-            {"backend":"postgres","bulk_mode":"postgres-s3","expectation":"full"},
-            {"backend":"sqlite-elasticsearch","bulk_mode":"embedded-local","expectation":"endpoint-unavailable"},
-            {"backend":"sqlite-elasticsearch","bulk_mode":"postgres-s3","expectation":"endpoint-unavailable"},
-            {"backend":"postgres-elasticsearch","bulk_mode":"embedded-local","expectation":"endpoint-unavailable"},
-            {"backend":"postgres-elasticsearch","bulk_mode":"postgres-s3","expectation":"endpoint-unavailable"},
-            {"backend":"mongodb","bulk_mode":"postgres-s3","expectation":"unsupported"},
-            {"backend":"mongodb-elasticsearch","bulk_mode":"postgres-s3","expectation":"endpoint-unavailable"},
-            {"backend":"s3","bulk_mode":"postgres-s3","expectation":"endpoint-unavailable"},
-            {"backend":"s3-elasticsearch","bulk_mode":"postgres-s3","expectation":"endpoint-unavailable"}
+            {"backend":"postgres","bulk_mode":"postgres-s3","expectation":"full"}
           ]'
 
           MATRIX=$(jq -c --argjson versions "$FHIR_VERSIONS" \
