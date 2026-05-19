@@ -287,14 +287,24 @@ closed many gaps; those that remain are listed below.
   of string-comparing the format. The `.expect` is gone.
 - Not a spec change — pure code-quality cleanup.
 
-## 16. sof-server double-applies `_limit`
-- `run_view_definition_with_options` already honors `RunOptions.limit`,
-  then `apply_result_filtering` in `models.rs` truncates JSON/NDJSON/CSV
-  output again. Not a spec bug but:
-  - Inefficient (re-parses output).
-  - CSV-fragile (line-splits assume no embedded newlines in quoted
-    fields).
-  - JSON path re-serializes the whole record array.
+## 16. sof-server double-applied `_limit` — **FIXED**
+- **Before:** `run_view_definition_with_options` honored
+  `RunOptions.limit` at the structured-row level (via
+  `apply_pagination_to_result`) before serialization, then sof-server's
+  handler called `apply_result_filtering(output, &validated_params)`
+  on the serialized bytes — which re-parsed, re-truncated, and
+  re-serialized. Identical end result, fragile in three ways:
+  - Inefficient (JSON path re-parsed + re-serialized the entire array).
+  - CSV-fragile (the line-split truncation assumed no embedded
+    newlines in quoted fields).
+  - NDJSON path re-parsed every line as JSON.
+- **After:** the `apply_result_filtering` call in the handler is
+  removed. The whole helper chain (`apply_result_filtering`,
+  `apply_json_filtering`, `apply_csv_filtering`,
+  `apply_pagination_to_records`, `apply_pagination_to_lines`) plus
+  their unit tests are deleted from `models.rs`. End-to-end `_limit`
+  behavior is still exercised by the existing HTTP-layer tests via
+  the row-level pass inside `helios_sof::run_view_definition_with_options`.
 
 ---
 
@@ -311,7 +321,7 @@ closed many gaps; those that remain are listed below.
 | 5 | Absent-target OperationOutcome | Medium (SHOULD) | both | **fixed** (inline paths; runner-path probe is follow-up) |
 | 8 | Parquet MIME | Low | sof-server | **fixed** (this commit) |
 | 14 | `header` rejection on non-CSV | Low | sof-server | **fixed** (this commit) |
-| 16 | Double-applied `_limit` | Low (perf/CSV-fragile) | sof-server | open |
+| 16 | Double-applied `_limit` | Low (perf/CSV-fragile) | sof-server | **fixed** (this commit) |
 | 7 | Instance-level not supported | Low (statelessness) | sof-server | **fixed** (clarified; this commit) |
 | 10 | `_limit` 10000 cap | Low (policy) | both unified | **fixed** (this commit) |
 | 13 | Value-set binding declaration | Low (audit polish) | both | **fixed** (this commit) |

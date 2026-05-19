@@ -649,154 +649,17 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
     Ok(result)
 }
 
-/// Apply filtering to output data based on validated parameters
-///
-/// This function applies post-processing filters like pagination to the
-/// transformed output data. It handles different output formats appropriately.
-///
-/// # Arguments
-/// * `output_data` - Raw output bytes from ViewDefinition execution
-/// * `params` - Validated query parameters containing filtering options
-///
-/// # Returns
-/// * `Ok(Vec<u8>)` - Filtered output data
-/// * `Err(String)` - Error message if filtering fails
-///
-/// # Supported Filters
-/// * Count limiting - Applied using `_limit` parameter
-/// * Format-aware - Handles CSV headers correctly during pagination
-///
-/// # Note
-/// The `_since` parameter is validated but not applied here as it requires
-/// filtering at the resource level before transformation.
-pub fn apply_result_filtering(
-    output_data: Vec<u8>,
-    params: &ValidatedRunParams,
-) -> Result<Vec<u8>, String> {
-    // Apply pagination and count limiting
-    // Note: _since filtering is applied at the resource level before ViewDefinition transformation
-
-    match params.format {
-        ContentType::Json | ContentType::NdJson => apply_json_filtering(output_data, params),
-        ContentType::Csv | ContentType::CsvWithHeader => apply_csv_filtering(output_data, params),
-        ContentType::Parquet => {
-            // Parquet filtering is not implemented in this scope
-            Ok(output_data)
-        }
-    }
-}
-
-/// Apply filtering to JSON/NDJSON output
-fn apply_json_filtering(
-    output_data: Vec<u8>,
-    params: &ValidatedRunParams,
-) -> Result<Vec<u8>, String> {
-    let output_str =
-        String::from_utf8(output_data).map_err(|e| format!("Invalid UTF-8 in output: {}", e))?;
-
-    if params.limit.is_none() {
-        return Ok(output_str.into_bytes());
-    }
-
-    match params.format {
-        ContentType::Json => {
-            // Parse as JSON array and apply pagination
-            let mut records: Vec<serde_json::Value> = serde_json::from_str(&output_str)
-                .map_err(|e| format!("Invalid JSON output: {}", e))?;
-
-            apply_pagination_to_records(&mut records, params);
-
-            let filtered_json = serde_json::to_string(&records)
-                .map_err(|e| format!("Failed to serialize filtered JSON: {}", e))?;
-            Ok(filtered_json.into_bytes())
-        }
-        ContentType::NdJson => {
-            // Parse as NDJSON and apply pagination
-            let mut records = Vec::new();
-            for line in output_str.lines() {
-                if !line.trim().is_empty() {
-                    let record: serde_json::Value = serde_json::from_str(line)
-                        .map_err(|e| format!("Invalid NDJSON line: {}", e))?;
-                    records.push(record);
-                }
-            }
-
-            apply_pagination_to_records(&mut records, params);
-
-            let filtered_ndjson = records
-                .iter()
-                .map(serde_json::to_string)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to serialize filtered NDJSON: {}", e))?
-                .join("\n");
-            Ok(filtered_ndjson.into_bytes())
-        }
-        _ => Ok(output_str.into_bytes()),
-    }
-}
-
-/// Apply filtering to CSV output
-fn apply_csv_filtering(
-    output_data: Vec<u8>,
-    params: &ValidatedRunParams,
-) -> Result<Vec<u8>, String> {
-    let output_str = String::from_utf8(output_data)
-        .map_err(|e| format!("Invalid UTF-8 in CSV output: {}", e))?;
-
-    if params.limit.is_none() {
-        return Ok(output_str.into_bytes());
-    }
-
-    let lines: Vec<&str> = output_str.lines().collect();
-    if lines.is_empty() {
-        return Ok(output_str.into_bytes());
-    }
-
-    // Check if we have headers based on the format
-    let has_header = matches!(params.format, ContentType::CsvWithHeader);
-    let header_offset = if has_header { 1 } else { 0 };
-
-    if lines.len() <= header_offset {
-        return Ok(output_str.into_bytes());
-    }
-
-    // Split into header and data lines
-    let (header_lines, data_lines) = if has_header {
-        (lines[0..1].to_vec(), lines[1..].to_vec())
-    } else {
-        (Vec::new(), lines)
-    };
-
-    // Apply pagination to data lines
-    let mut data_lines = data_lines;
-    apply_pagination_to_lines(&mut data_lines, params);
-
-    // Reconstruct CSV
-    let mut result_lines = header_lines;
-    result_lines.extend(data_lines);
-    let result = result_lines.join("\n");
-
-    // Add final newline if original had one
-    if output_str.ends_with('\n') && !result.ends_with('\n') {
-        Ok(format!("{}\n", result).into_bytes())
-    } else {
-        Ok(result.into_bytes())
-    }
-}
-
-/// Apply limit limiting to a vector of JSON records
-fn apply_pagination_to_records(records: &mut Vec<serde_json::Value>, params: &ValidatedRunParams) {
-    if let Some(limit) = params.limit {
-        records.truncate(limit);
-    }
-}
-
-/// Apply limit limiting to a vector of string lines
-fn apply_pagination_to_lines(lines: &mut Vec<&str>, params: &ValidatedRunParams) {
-    if let Some(limit) = params.limit {
-        lines.truncate(limit);
-    }
-}
+// Audit item #16: the previous `apply_result_filtering` /
+// `apply_json_filtering` / `apply_csv_filtering` /
+// `apply_pagination_to_records` / `apply_pagination_to_lines` helpers
+// re-parsed and re-truncated serialized output bytes even though
+// `helios_sof::run_view_definition_with_options` already applies
+// `_limit` at the structured-row level (via
+// `apply_pagination_to_result`) before serialization. The serialized-
+// byte pass was inefficient (re-parsed/re-serialized JSON every time),
+// CSV-fragile (line-splits assumed no embedded newlines in quoted
+// fields), and produced identical output to the row-level pass in
+// every case. All of it was removed.
 
 #[cfg(test)]
 mod tests {
@@ -911,57 +774,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_apply_csv_filtering() {
-        let csv_data = "id,name\n1,John\n2,Jane\n3,Bob\n4,Alice\n"
-            .as_bytes()
-            .to_vec();
-        let params = ValidatedRunParams {
-            format: ContentType::CsvWithHeader,
-            limit: Some(2),
-            since: None,
-            view_reference: None,
-            patient: None,
-            group: None,
-            source: None,
-            parquet_options: None,
-        };
-
-        let result = apply_csv_filtering(csv_data, &params).unwrap();
-        let result_str = String::from_utf8(result).unwrap();
-
-        assert!(result_str.contains("id,name"));
-        assert!(result_str.contains("1,John"));
-        assert!(result_str.contains("2,Jane"));
-        assert!(!result_str.contains("3,Bob"));
-        assert!(!result_str.contains("4,Alice"));
-    }
-
-    #[test]
-    fn test_apply_json_filtering() {
-        let json_data =
-            r#"[{"id":"1","name":"John"},{"id":"2","name":"Jane"},{"id":"3","name":"Bob"}]"#
-                .as_bytes()
-                .to_vec();
-        let params = ValidatedRunParams {
-            format: ContentType::Json,
-            limit: Some(2),
-            since: None,
-            view_reference: None,
-            patient: None,
-            group: None,
-            source: None,
-            parquet_options: None,
-        };
-
-        let result = apply_json_filtering(json_data, &params).unwrap();
-        let result_str = String::from_utf8(result).unwrap();
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result_str).unwrap();
-
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0]["id"], "1");
-        assert_eq!(parsed[1]["id"], "2");
-    }
+    // Audit item #16: `test_apply_csv_filtering` and
+    // `test_apply_json_filtering` were removed alongside the dead
+    // `apply_csv_filtering` / `apply_json_filtering` helpers. End-to-end
+    // `_limit` behavior is exercised by `test_run_view_definition_limit`
+    // (and equivalents) via the HTTP layer + the structured-row pass
+    // inside `helios_sof::run_view_definition_with_options`.
 
     #[test]
     fn test_extract_viewreference_parameter() {

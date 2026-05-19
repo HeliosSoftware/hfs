@@ -25,8 +25,8 @@ use tracing::{debug, info};
 use super::{
     error::{ServerError, ServerResult},
     models::{
-        RunParameters, RunQueryParams, apply_result_filtering, extract_all_parameters,
-        parse_content_type, validate_query_params,
+        RunParameters, RunQueryParams, extract_all_parameters, parse_content_type,
+        validate_query_params,
     },
 };
 
@@ -432,16 +432,19 @@ pub async fn run_view_definition_handler(
         }
     } else {
         // Standard processing
-        let output = run_view_definition_with_options(
+        // `run_view_definition_with_options` applies `_limit` at the
+        // structured-row level before serialization (via
+        // `apply_pagination_to_result`), so we don't need to re-truncate
+        // the serialized bytes here. Audit item #16 removed the
+        // duplicate `apply_result_filtering` pass that used to re-parse
+        // and re-serialize the output — it was inefficient and
+        // CSV-fragile (line-splits assumed no embedded newlines).
+        let filtered_output = run_view_definition_with_options(
             view_definition,
             bundle,
             validated_params.format,
             run_options,
         )?;
-
-        // Apply any additional filtering (already applied in run_view_definition_with_options, but kept for compatibility)
-        let filtered_output = apply_result_filtering(output, &validated_params)
-            .map_err(|e| ServerError::InternalError(format!("Failed to apply filtering: {}", e)))?;
 
         // Determine the MIME type for the response. Per SoF v2 spec
         // Accept table: parquet uses `application/octet-stream`
