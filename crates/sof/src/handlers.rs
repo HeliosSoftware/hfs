@@ -491,13 +491,24 @@ fn create_capability_statement() -> serde_json::Value {
             "url": "http://localhost:8080"
         },
         "fhirVersion": fhir_version,
-        "format": ["json"],
+        // Output formats the operation produces (audit item #11 partial
+        // closeout): sof-server emits CSV, JSON, NDJSON, and Parquet
+        // depending on the `_format` parameter.
+        "format": ["application/json", "application/x-ndjson", "text/csv", "application/octet-stream"],
         "rest": [{
             "mode": "server",
+            // System-level operation (audit item #6 + #7). sof-server is
+            // stateless, so:
+            // - System-level (`[base]/$viewdefinition-run`) and type-level
+            //   (`[base]/ViewDefinition/$viewdefinition-run`) are both
+            //   honored — they're aliases for the same handler.
+            // - Instance-level (`[base]/ViewDefinition/{id}/$viewdefinition-run`)
+            //   is rejected with a 400 because there's no resource store
+            //   to look up a stored ViewDefinition by id.
             "operation": [{
                 "name": "viewdefinition-run",
                 "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run",
-                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, and NDJSON output formats. This is a type-level operation invoked at /ViewDefinition/$viewdefinition-run"
+                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, NDJSON, and Parquet output. Invoked at the system level (POST /$viewdefinition-run) or type level (POST /ViewDefinition/$viewdefinition-run); the ViewDefinition must be supplied inline in the request body via 'viewResource' (no resource store, so 'viewReference' and instance-level URLs are not supported)."
             }]
         }]
     })
@@ -779,6 +790,28 @@ fn filter_resources_by_since(
     sof_filter_resources_by_since(resources, since).map_err(ServerError::from)
 }
 
+/// Handler for instance-level `$viewdefinition-run` URLs
+/// (`/ViewDefinition/{id}/$viewdefinition-run`).
+///
+/// sof-server is stateless: it has no resource store, so there is no
+/// stored `ViewDefinition/{id}` to invoke. Per the SoF v2 spec the
+/// instance-level form infers the ViewDefinition from the URL path; since
+/// sof-server can't resolve that, we return `400 Bad Request` with a
+/// `not-supported` OperationOutcome rather than `404 Not Found` (which
+/// would imply the id is wrong rather than the form being unsupported).
+///
+/// Audit item #7: makes the instance-level limitation explicit instead
+/// of leaving clients to discover it via a routing 404.
+pub async fn instance_level_not_supported() -> ServerResult<Response> {
+    Err(ServerError::BadRequest(
+        "Instance-level $viewdefinition-run (/ViewDefinition/{id}/$viewdefinition-run) is not \
+         supported by this stateless server — there is no resource store to look up a stored \
+         ViewDefinition by id. Use POST /ViewDefinition/$viewdefinition-run with a 'viewResource' \
+         parameter (or a bare ViewDefinition body) instead."
+            .to_string(),
+    ))
+}
+
 /// Simple health check endpoint
 pub async fn health_check() -> impl IntoResponse {
     info!("Handling Health Check request");
@@ -802,10 +835,69 @@ mod tests {
         assert_eq!(cap_stmt["kind"], "instance");
         assert_eq!(cap_stmt["fhirVersion"], get_fhir_version_string());
 
-        // Check that operation is listed at rest level (type-level operation)
+        // Audit item #6: the operation is published at the REST-system
+        // level (so it's reachable at both [base]/$viewdefinition-run and
+        // [base]/ViewDefinition/$viewdefinition-run).
         let operations = &cap_stmt["rest"][0]["operation"];
         assert!(operations.as_array().is_some());
         assert_eq!(operations[0]["name"], "viewdefinition-run");
+
+        // Audit item #7: the documentation makes the stateless scope
+        // explicit — no viewReference, no instance-level invocation.
+        let doc = operations[0]["documentation"]
+            .as_str()
+            .expect("documentation must be a string");
+        assert!(
+            doc.contains("system level") && doc.contains("type level"),
+            "doc must mention which scopes are supported: {doc}"
+        );
+        assert!(
+            doc.contains("viewResource"),
+            "doc must mention viewResource as the supply mechanism: {doc}"
+        );
+
+        // Audit item #11 partial: output formats are listed.
+        let formats: Vec<String> = cap_stmt["format"]
+            .as_array()
+            .expect("format must be an array")
+            .iter()
+            .filter_map(|f| f.as_str().map(String::from))
+            .collect();
+        for required in [
+            "application/json",
+            "application/x-ndjson",
+            "text/csv",
+            "application/octet-stream",
+        ] {
+            assert!(
+                formats.iter().any(|f| f == required),
+                "format must include {required}: {formats:?}"
+            );
+        }
+    }
+
+    /// Audit item #7: instance-level URLs return a clear 400 explaining
+    /// the stateless limitation, not a 404 or 501. The handler is
+    /// route-agnostic (no path extractor) — axum routes ALL instance
+    /// URLs to it, and we just return the canned response.
+    #[tokio::test]
+    async fn test_instance_level_returns_bad_request() {
+        let result = instance_level_not_supported().await;
+        match result {
+            Err(ServerError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains("Instance-level") && msg.contains("stateless"),
+                    "error message must explain the stateless limitation: {msg}"
+                );
+                assert!(
+                    msg.contains("viewResource"),
+                    "error message must point at the supported alternative: {msg}"
+                );
+            }
+            other => {
+                panic!("expected ServerError::BadRequest for instance-level URL, got {other:?}")
+            }
+        }
     }
 
     #[cfg(feature = "R4")]

@@ -29,13 +29,20 @@ fn create_test_app() -> Router {
 
     Router::new()
         .route("/metadata", get(capability_statement_handler))
+        // System-level alias (audit item #6).
+        .route(
+            "/$viewdefinition-run",
+            post(run_view_definition_handler).get(run_view_definition_get_handler),
+        )
         .route(
             "/ViewDefinition/$viewdefinition-run",
             post(run_view_definition_handler).get(run_view_definition_get_handler),
         )
+        // Instance-level: rejected with 400 because sof-server is
+        // stateless (audit item #7). Both GET and POST land here.
         .route(
             "/ViewDefinition/{id}/$viewdefinition-run",
-            get(run_view_definition_by_id_handler),
+            get(run_view_definition_by_id_handler).post(run_view_definition_by_id_handler),
         )
         .route("/health", get(health_check))
         .layer(CorsLayer::permissive())
@@ -46,6 +53,11 @@ async fn capability_statement_handler() -> axum::response::Response {
     // This is a simplified version for testing
     // In production, this would use the actual handler from helios_sof::server::handlers
 
+    // Stub mirroring the production CapabilityStatement structure (audit
+    // items #6, #7, #11). Real production wiring lives in
+    // `crates/sof/src/handlers.rs::create_capability_statement` and is
+    // exercised by the in-handler unit test there; this stub only needs to
+    // be shape-compatible for the integration smoke tests.
     let capability_statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
         "id": "sof-server",
@@ -64,7 +76,12 @@ async fn capability_statement_handler() -> axum::response::Response {
             "url": "http://localhost:8080"
         },
         "fhirVersion": "4.0.1",
-        "format": ["json", "xml"],
+        "format": [
+            "application/json",
+            "application/x-ndjson",
+            "text/csv",
+            "application/octet-stream"
+        ],
         "rest": [{
             "mode": "server",
             "resource": [{
@@ -78,7 +95,7 @@ async fn capability_statement_handler() -> axum::response::Response {
             "operation": [{
                 "name": "viewdefinition-run",
                 "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run",
-                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, and NDJSON output formats."
+                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, NDJSON, and Parquet output. Invoked at the system level (POST /$viewdefinition-run) or type level (POST /ViewDefinition/$viewdefinition-run); the ViewDefinition must be supplied inline in the request body via 'viewResource' (no resource store, so 'viewReference' and instance-level URLs are not supported)."
             }]
         }]
     });
@@ -551,16 +568,18 @@ async fn run_view_definition_get_handler(
 }
 
 async fn run_view_definition_by_id_handler(
-    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Path(_id): axum::extract::Path<String>,
     _query: axum::extract::Query<std::collections::HashMap<String, String>>,
     _headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
+    // Audit item #7: stateless server rejects instance-level URLs with
+    // 400 (not 404 or 501) and points at the supported alternative.
     error_response(
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        &format!(
-            "ViewDefinition lookup by ID '{}' is not implemented. Use POST /ViewDefinition/$viewdefinition-run with the ViewDefinition in the request body.",
-            id
-        ),
+        axum::http::StatusCode::BAD_REQUEST,
+        "Instance-level $viewdefinition-run (/ViewDefinition/{id}/$viewdefinition-run) is not \
+         supported by this stateless server — there is no resource store to look up a stored \
+         ViewDefinition by id. Use POST /ViewDefinition/$viewdefinition-run with a 'viewResource' \
+         parameter (or a bare ViewDefinition body) instead.",
     )
 }
 

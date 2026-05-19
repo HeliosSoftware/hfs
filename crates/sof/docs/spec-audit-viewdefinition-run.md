@@ -115,19 +115,34 @@ closed many gaps; those that remain are listed below.
   is a follow-up — would need a `SearchProvider::read` round-trip per
   patient/group ref before the runner starts streaming.
 
-## 6. sof-server has no system-level endpoint
+## 6. sof-server system-level endpoint — **FIXED**
 - **Spec endpoints:**
-  - `[base]/$viewdefinition-run`
-  - `[base]/CanonicalResource/$viewdefinition-run`
-  - `[base]/CanonicalResource/[id]/$viewdefinition-run`
-- **HFS REST:** all three wired (per `5abc11efc`).
-- **sof-server:** only `/ViewDefinition/$viewdefinition-run`. No
-  `/$viewdefinition-run` system-level alias. Trivial fix in `server.rs`.
+  - `[base]/$viewdefinition-run`                       (system level)
+  - `[base]/ViewDefinition/$viewdefinition-run`        (type level)
+  - `[base]/ViewDefinition/{id}/$viewdefinition-run`   (instance level)
+- **Before:** sof-server only routed the type-level URL.
+- **After:** `crates/sof/src/server.rs` now wires all three:
+  - System- and type-level both POST/GET to the same handler — they're
+    URL aliases for the same operation invocation.
+  - Instance-level routes to `instance_level_not_supported` (see #7).
+  - CapabilityStatement documentation describes both supported scopes
+    so clients can discover the alias without reading code.
 
-## 7. sof-server doesn't support the instance-level form
-- Stateless → no stored ViewDefinitions to invoke by `{id}`. Acceptable
-  but the CapabilityStatement should flag this; currently it just lists
-  `viewdefinition-run` without scope context.
+## 7. sof-server instance-level form — **FIXED** (clarified)
+- Stateless → no stored ViewDefinitions to invoke by `{id}`. This is
+  inherent to sof-server's design.
+- **Before:** the instance-level URL fell through to a routing 404 or
+  returned a misleading 501; the CapabilityStatement listed the
+  operation without scope context.
+- **After:**
+  - Instance-level URLs route to `instance_level_not_supported`, which
+    returns `400 Bad Request` with an OperationOutcome that explains
+    the stateless limitation and points at the supported alternative
+    (`POST /ViewDefinition/$viewdefinition-run` with inline
+    `viewResource`).
+  - The CapabilityStatement's `operation.documentation` enumerates the
+    supported scopes (system + type) and explicitly notes that
+    `viewReference` and instance-level invocation are unavailable.
 
 ## 8. Parquet MIME type (sof-server)
 - **Spec content-negotiation table:** parquet ↔
@@ -209,13 +224,13 @@ closed many gaps; those that remain are listed below.
 | 9 | 422 vs 400 on invalid VD | High (status-code spec) | sof-server | open |
 | 3 | Patient-compartment fidelity | High (security/leak) | sof-server (+HFS inline) | **fixed** (this commit) |
 | 2 | `group` 501 vs 400 | Medium (consistency) | sof-server | **fixed** (this commit; via #3) |
-| 6 | System-level route | Medium | sof-server | open |
+| 6 | System-level route | Medium | sof-server | **fixed** (this commit) |
 | 11 | CapabilityStatement formats + refs block | Medium | sof-server | open |
 | 5 | Absent-target OperationOutcome | Medium (SHOULD) | both | **fixed** (inline paths; runner-path probe is follow-up) |
 | 8 | Parquet MIME | Low | sof-server | open |
 | 14 | `header` rejection on non-CSV | Low | sof-server | open |
 | 16 | Double-applied `_limit` | Low (perf/CSV-fragile) | sof-server | open |
-| 7 | Instance-level not supported | Low (statelessness) | sof-server | open |
+| 7 | Instance-level not supported | Low (statelessness) | sof-server | **fixed** (clarified; this commit) |
 | 10 | `_limit` 10000 cap | Low (policy) | sof-server | open |
 | 13 | Value-set binding declaration | Low (audit polish) | both | open |
 | 12 | Canonical URL casing | Low (verify first) | both | open |

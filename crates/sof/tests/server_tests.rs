@@ -844,3 +844,81 @@ async fn test_since_parameter_wrong_value_type() {
             .contains("_since parameter must use valueInstant or valueDateTime")
     );
 }
+
+/// Audit item #6: `POST /$viewdefinition-run` (system-level) routes to the
+/// same handler as the type-level alias `POST /ViewDefinition/$viewdefinition-run`.
+#[tokio::test]
+async fn test_system_level_route_runs_view_definition() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_format", "valueCode": "ndjson"},
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {"resourceType": "Patient", "id": "p1"}
+            }
+        ]
+    });
+
+    // System-level URL — no /ViewDefinition prefix.
+    let response = server
+        .post("/$viewdefinition-run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "system-level POST /$viewdefinition-run must succeed; body: {}",
+        response.text()
+    );
+    let text = response.text();
+    assert!(
+        text.contains("\"id\":\"p1\""),
+        "response must contain the seeded Patient id: {text}"
+    );
+}
+
+/// Audit item #7: instance-level URLs are rejected with a clear 400
+/// explaining the stateless limitation, not a 404 or 501.
+#[tokio::test]
+async fn test_instance_level_returns_400_with_stateless_explanation() {
+    let server = common::test_server().await;
+
+    let response = server
+        .post("/ViewDefinition/some-id/$viewdefinition-run")
+        .add_header("Content-Type", "application/json")
+        .json(&json!({"resourceType": "Parameters"}))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::BAD_REQUEST,
+        "instance-level POST must return 400, not 404/501"
+    );
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    let details = json["issue"][0]["details"]["text"]
+        .as_str()
+        .expect("error must have text details");
+    assert!(
+        details.contains("Instance-level") && details.contains("stateless"),
+        "error message must explain stateless limitation: {details}"
+    );
+    assert!(
+        details.contains("viewResource"),
+        "error message must point at the supported alternative: {details}"
+    );
+}

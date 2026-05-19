@@ -315,9 +315,30 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
         // viewResource/resource body). sof-server is stateless and rejects
         // viewReference, so GET will normally surface a 400/501 — but the
         // route exists so clients can negotiate the method correctly.
+        //
+        // The SoF v2 OperationDefinition lists three valid endpoints:
+        //   - [base]/$viewdefinition-run                            (system-level)
+        //   - [base]/CanonicalResource/$viewdefinition-run          (type-level)
+        //   - [base]/CanonicalResource/[id]/$viewdefinition-run     (instance-level)
+        //
+        // sof-server is stateless, so instance-level (which infers the
+        // ViewDefinition from a stored {id}) is rejected with a clear 400
+        // by `instance_level_not_supported`. The system- and type-level
+        // endpoints both route to the same handler — they differ only in
+        // URL shape (the type-level path is `CanonicalResource =
+        // ViewDefinition`).
+        .route(
+            "/$viewdefinition-run",
+            post(handlers::run_view_definition_handler).get(handlers::run_view_definition_handler),
+        )
         .route(
             "/ViewDefinition/$viewdefinition-run",
             post(handlers::run_view_definition_handler).get(handlers::run_view_definition_handler),
+        )
+        .route(
+            "/ViewDefinition/{id}/$viewdefinition-run",
+            post(handlers::instance_level_not_supported)
+                .get(handlers::instance_level_not_supported),
         )
         // Health check endpoint
         .route("/health", get(handlers::health_check))
