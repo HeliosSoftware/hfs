@@ -1,5 +1,5 @@
-//! S3-specific persistence models for history indexing, bulk export job
-//! state, and bulk submission state.
+//! S3-specific persistence models for history indexing and bulk submission
+//! state.
 //!
 //! These types are serialised as JSON objects in S3 and are never exposed
 //! outside the `s3` backend module.
@@ -7,7 +7,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::core::bulk_export::{ExportManifest, ExportProgress, ExportRequest};
 use crate::core::bulk_submit::{SubmissionManifest, SubmissionSummary};
 use crate::core::history::HistoryMethod;
 
@@ -30,22 +29,6 @@ pub struct HistoryIndexEvent {
     pub method: HistoryMethod,
     /// True if this mutation is a logical delete (tombstone).
     pub deleted: bool,
-}
-
-/// Durable state of a bulk export job stored in S3.
-///
-/// Reserved for the Phase 2 `S3OutputStore` integration; the S3 backend is no
-/// longer a bulk-export *job-state* backend (job state lives in SQLite or
-/// PostgreSQL), so this type is currently unused.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportJobState {
-    /// The original export request parameters.
-    pub request: ExportRequest,
-    /// Current progress, including status and per-type counts.
-    pub progress: ExportProgress,
-    /// The completed manifest, populated once the job reaches `Complete`.
-    pub manifest: Option<ExportManifest>,
 }
 
 /// Durable state of a bulk submission stored in S3.
