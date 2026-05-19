@@ -10,6 +10,7 @@ mod sof_export_tests {
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::sqlite::SqliteBackend;
     use helios_persistence::core::ResourceStorage;
+    use helios_persistence::core::search::SearchProvider;
     use helios_persistence::core::sof_runner::SofRunner;
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
@@ -1094,12 +1095,12 @@ mod sof_export_tests {
             "expected absolute result URL, got: {loc}"
         );
 
-        // Result endpoint returns 200 with a Parameters manifest carrying
+        // Result endpoint returns 500 with a Parameters manifest carrying
         // `status=failed` and an `error` part wrapping the OperationOutcome.
-        // Spec: the manifest is the canonical channel for terminal states
-        // (success or failure); the status code enum includes `failed`.
+        // Spec status-code table: "500 Internal Server Error: Unexpected
+        // server error (at result URL indicates operation failure)".
         let result = server.get(loc).add_header(X_TENANT_ID, "test-tenant").await;
-        assert_eq!(result.status_code(), StatusCode::OK);
+        assert_eq!(result.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
         let body: Value = result.json();
         assert_eq!(body["resourceType"].as_str(), Some("Parameters"));
         let params = body["parameter"].as_array().unwrap();
@@ -1289,6 +1290,109 @@ mod sof_export_tests {
     }
 
     // =========================================================================
+    // 20b. Instance-level endpoint rejects any input parameter (spec scopes
+    //      every input parameter to system+type level only — the instance
+    //      URL `/ViewDefinition/{id}/$viewdefinition-export` identifies the
+    //      view entirely from the URL path).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_instance_level_rejects_query_params() {
+        let (server, backend) = create_test_server_with_export().await;
+        // Stash a ViewDefinition so the instance-level handler doesn't
+        // bail on a "stored view not found" 404 before reaching our check.
+        backend
+            .create(
+                &test_tenant(),
+                "ViewDefinition",
+                patient_view(),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed ViewDefinition");
+
+        // Find the stored id (auto-assigned).
+        let view_id = backend
+            .search(
+                &test_tenant(),
+                &helios_persistence::types::SearchQuery::new("ViewDefinition"),
+            )
+            .await
+            .expect("search ViewDefinition")
+            .resources
+            .items
+            .first()
+            .expect("no ViewDefinition returned")
+            .id()
+            .to_string();
+
+        let resp = server
+            .post(&format!(
+                "/ViewDefinition/{view_id}/$viewdefinition-export?_format=csv"
+            ))
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "instance-level _format must be rejected: {}",
+            resp.text()
+        );
+        let body: Value = resp.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diag.contains("instance-level") && diag.contains("_format"),
+            "diagnostics must name the offending param and scope: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_instance_level_rejects_body_params() {
+        let (server, backend) = create_test_server_with_export().await;
+        backend
+            .create(
+                &test_tenant(),
+                "ViewDefinition",
+                patient_view(),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed ViewDefinition");
+        let view_id = backend
+            .search(
+                &test_tenant(),
+                &helios_persistence::types::SearchQuery::new("ViewDefinition"),
+            )
+            .await
+            .expect("search ViewDefinition")
+            .resources
+            .items
+            .first()
+            .expect("no ViewDefinition returned")
+            .id()
+            .to_string();
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "_format", "valueCode": "csv"}]
+        });
+        let resp = server
+            .post(&format!("/ViewDefinition/{view_id}/$viewdefinition-export"))
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "instance-level body params must be rejected: {}",
+            resp.text()
+        );
+    }
+
+    // =========================================================================
     // 21. System-level endpoint: POST /$viewdefinition-export (spec defines
     //     this operation at system, type, AND instance levels).
     // =========================================================================
@@ -1344,6 +1448,31 @@ mod sof_export_tests {
             body["issue"][0]["code"].as_str(),
             Some("not-supported"),
             "unknown query param must surface as not-supported: {body}"
+        );
+    }
+
+    // =========================================================================
+    // 22b. `_limit` is not in the spec's input parameter table for
+    //      $viewdefinition-export (unlike $viewdefinition-run). It must be
+    //      rejected as an unsupported query parameter.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_limit_query_param_rejected() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let resp = server
+            .post("/ViewDefinition/$viewdefinition-export?_limit=100")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diag.contains("_limit"),
+            "diagnostics must name `_limit`: {body}"
         );
     }
 

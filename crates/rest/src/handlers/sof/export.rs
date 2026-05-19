@@ -78,10 +78,6 @@ pub struct ExportQueryParams {
     /// Include a CSV header row (default `true`, CSV format only).
     pub header: Option<bool>,
 
-    /// Maximum number of output rows.
-    #[serde(rename = "_limit")]
-    pub limit: Option<usize>,
-
     /// Include only resources modified at or after this instant (RFC 3339).
     #[serde(rename = "_since")]
     pub since: Option<String>,
@@ -170,20 +166,17 @@ where
     if let Err(resp) = check_prefer_async(&headers) {
         return Ok(resp);
     }
-    let params = match parse_export_query(raw_query.as_deref()) {
-        Ok(p) => p,
-        Err(resp) => return Ok(resp),
-    };
-    let body_value = body.map(|axum::Json(v)| v);
-
-    if let Some(b) = body_value.as_ref() {
-        if let Some(resp) = validate_unknown_body_params(b) {
-            return Ok(resp);
-        }
-    }
-    if let Some(resp) = reject_unsupported_source(&params, body_value.as_ref()) {
+    // Spec scopes every input parameter (`view`, `_format`, `header`,
+    // `patient`, `group`, `_since`, `clientTrackingId`, `source`) to
+    // "system, type" — none are defined at instance level, where the
+    // ViewDefinition is identified entirely by the URL path. Reject any
+    // attempt to supply them with 400 + OperationOutcome.
+    if let Some(resp) = reject_instance_level_params(raw_query.as_deref(), body.as_ref()) {
         return Ok(resp);
     }
+    // body and query are guaranteed empty of spec params at this point; we
+    // still drop the body so subsequent code doesn't peek at it by accident.
+    drop(body);
 
     // Fetch the stored ViewDefinition
     let stored = state
@@ -205,7 +198,7 @@ where
         .map(|s| s.to_string())
         .unwrap_or_else(|| id.clone());
 
-    let inputs = merge_export_inputs(&params, body_value.as_ref());
+    let inputs = merge_export_inputs(&ExportQueryParams::default(), None);
 
     submit_export_job(
         &state,
@@ -244,6 +237,72 @@ fn check_prefer_async(headers: &HeaderMap) -> Result<(), Response> {
         })),
     )
         .into_response())
+}
+
+/// Returns `Some(400 response)` if the caller supplied any input parameter
+/// (in the query string or the body) at instance level. Per the spec, every
+/// input parameter — `view`, `_format`, `header`, `patient`, `group`,
+/// `_since`, `clientTrackingId`, `source` — is scoped to "system, type"
+/// only. The instance-level URL `/ViewDefinition/{id}/$viewdefinition-export`
+/// identifies the view entirely from the URL path, so any body or query
+/// parameter is unsupported.
+fn reject_instance_level_params(
+    raw_query: Option<&str>,
+    body: Option<&axum::Json<Value>>,
+) -> Option<Response> {
+    let raw = raw_query.unwrap_or("");
+    if let Some((k, _)) = url::form_urlencoded::parse(raw.as_bytes()).next() {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [{
+                        "severity": "error",
+                        "code": "not-supported",
+                        "diagnostics": format!(
+                            "parameter '{k}' is not supported at the instance-level \
+                             $viewdefinition-export endpoint; spec scopes all input \
+                             parameters to system and type level only"
+                        )
+                    }]
+                })),
+            )
+                .into_response(),
+        );
+    }
+
+    let body_params = body
+        .as_ref()
+        .and_then(|axum::Json(v)| v.get("parameter"))
+        .and_then(|p| p.as_array());
+    if let Some(arr) = body_params {
+        if let Some(first) = arr.first() {
+            let name = first
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("(unnamed)");
+            return Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "resourceType": "OperationOutcome",
+                        "issue": [{
+                            "severity": "error",
+                            "code": "not-supported",
+                            "diagnostics": format!(
+                                "body parameter '{name}' is not supported at the \
+                                 instance-level $viewdefinition-export endpoint; spec \
+                                 scopes all input parameters to system and type level only"
+                            )
+                        }]
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
 }
 
 /// Returns `Some(400 response)` if the caller supplied the spec-defined
@@ -341,9 +400,11 @@ where
     };
 
     // Build filters (G4, G5). patient / group multiple values match resources
-    // from any of the referenced compartments.
+    // from any of the referenced compartments. Spec defines no `_limit` for
+    // `$viewdefinition-export` (unlike `$viewdefinition-run`); limit stays
+    // unset so exports are bounded only by the underlying data set.
     let filters = helios_persistence::core::sof_runner::ViewFilters {
-        limit: inputs.limit,
+        limit: None,
         since: inputs.since,
         patient: inputs.patient.clone(),
         group: inputs.group.clone(),
@@ -530,10 +591,12 @@ where
             message,
             submitted_at,
         }) => {
-            // Spec: status code enum includes `failed`. The canonical
-            // failure channel is the manifest with `status=failed`; we attach
-            // an `OperationOutcome` via the bulk-data-style `error` part so
-            // the failure diagnostic survives the round trip.
+            // Spec status-code table: "500 Internal Server Error: Unexpected
+            // server error (at result URL indicates operation failure)". The
+            // body is still the canonical failed Parameters manifest with
+            // `status=failed` and an OperationOutcome in the bulk-data-style
+            // `error` part — the 500 surfaces failure to clients that only
+            // inspect the status line.
             let now = chrono::Utc::now();
             let duration_secs = (now - submitted_at).num_seconds().max(0);
             let status_url = format!(
@@ -549,7 +612,7 @@ where
                 }]
             });
             Ok((
-                StatusCode::OK,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({
                     "resourceType": "Parameters",
                     "parameter": [
@@ -761,7 +824,6 @@ where
 struct ExportInputs {
     format: String,
     header: bool,
-    limit: Option<usize>,
     since: Option<chrono::DateTime<chrono::Utc>>,
     patient: Vec<String>,
     group: Vec<String>,
@@ -782,7 +844,6 @@ fn parse_export_query(raw: Option<&str>) -> Result<ExportQueryParams, Response> 
     const ALLOWED_QUERY: &[&str] = &[
         "_format",
         "header",
-        "_limit",
         "_since",
         "patient",
         "group",
@@ -909,7 +970,6 @@ fn merge_export_inputs(query: &ExportQueryParams, body: Option<&Value>) -> Expor
     ExportInputs {
         format,
         header,
-        limit: query.limit,
         since,
         patient,
         group,
@@ -1134,16 +1194,27 @@ where
             }
         }
 
-        let view = if let Some(r) = inline {
-            r
-        } else if let Some(reference) = reference {
-            resolve_view_reference_export(state, tenant, &reference).await?
-        } else {
-            return Err(RestError::BadRequest {
-                message:
-                    "each `view` parameter must contain a `viewResource` or `viewReference` part"
+        let view = match (inline, reference) {
+            (Some(_), Some(_)) => {
+                // Spec: `view.viewReference` and `view.viewResource` are XOR
+                // — exactly one of them must be present.
+                return Err(RestError::BadRequest {
+                    message: "each `view` parameter must contain exactly one of \
+                              `viewResource` or `viewReference` (not both)"
                         .to_string(),
-            });
+                });
+            }
+            (Some(r), None) => r,
+            (None, Some(reference)) => {
+                resolve_view_reference_export(state, tenant, &reference).await?
+            }
+            (None, None) => {
+                return Err(RestError::BadRequest {
+                    message:
+                        "each `view` parameter must contain a `viewResource` or `viewReference` part"
+                            .to_string(),
+                });
+            }
         };
 
         let resolved_name = name.unwrap_or_else(|| {
