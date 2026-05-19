@@ -159,14 +159,20 @@ closed many gaps; those that remain are listed below.
   parameter; `application/parquet` is kept as a permissive
   back-compat alias for clients that still send it.
 
-## 9. 422 vs 400 on invalid ViewDefinition (sof-server)
+## 9. 422 vs 400 on invalid ViewDefinition — **FIXED**
 - **Spec status codes:** `422 Unprocessable Entity` for "invalid
   ViewDefinition or processing failure".
 - **HFS REST:** maps `Uncompilable` / `InvalidViewDefinition` → 422
-  (correct, via `map_sof_error_to_rest`).
-- **sof-server:** `parse_view_definition_for_version`'s error path in
-  `handlers.rs` maps `SofError::InvalidViewDefinition` →
-  `ServerError::BadRequest` → **400**. Should be 422.
+  (correct, via `map_sof_error_to_rest`). Unchanged.
+- **Before:** sof-server's `parse_view_definition_for_version`
+  special-cased `SofError::InvalidViewDefinition → ServerError::BadRequest`
+  (400). The other run-time SoF errors flowed through the default
+  `From<SofError>` impl → `ProcessingError` → 422 correctly; only the
+  parse-time path returned 400.
+- **After:** the special case was removed; `parse_view_definition_for_version`
+  now uses the default `From<SofError>` impl, so an invalid ViewDefinition
+  surfaces as 422 (matches HFS REST and the spec). All other SoF errors
+  raised during view execution were already 422.
 
 ## 10. sof-server's hard `_limit` cap (10000)
 - **Spec:** `_limit` is `integer`, no upper bound.
@@ -229,7 +235,7 @@ closed many gaps; those that remain are listed below.
 | # | Item | Severity | Impl | Status |
 |---|------|----------|------|--------|
 | 1 | Cardinality inconsistency between extractors | High (correctness) | sof-server (+HFS inline) | **fixed** `44bfce41a` |
-| 9 | 422 vs 400 on invalid VD | High (status-code spec) | sof-server | open |
+| 9 | 422 vs 400 on invalid VD | High (status-code spec) | sof-server | **fixed** (this commit) |
 | 3 | Patient-compartment fidelity | High (security/leak) | sof-server (+HFS inline) | **fixed** (this commit) |
 | 2 | `group` 501 vs 400 | Medium (consistency) | sof-server | **fixed** (this commit; via #3) |
 | 6 | System-level route | Medium | sof-server | **fixed** (this commit) |

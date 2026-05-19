@@ -421,12 +421,15 @@ async fn run_view_definition_handler(
     };
 
     // Create ViewDefinition and Bundle
+    // Per SoF v2 spec: invalid ViewDefinition → 422 Unprocessable Entity
+    // (audit item #9). Production code does the same mapping; the test
+    // stub mirrors so integration tests see the right status.
     let view_definition =
         match serde_json::from_value::<helios_fhir::r4::ViewDefinition>(view_def_json) {
             Ok(vd) => SofViewDefinition::R4(vd),
             Err(e) => {
                 return error_response(
-                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                     &format!("Invalid ViewDefinition: {}", e),
                 );
             }

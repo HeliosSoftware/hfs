@@ -593,15 +593,18 @@ fn parse_view_definition(json: serde_json::Value) -> ServerResult<SofViewDefinit
     parse_view_definition_for_version(json, get_newest_enabled_fhir_version())
 }
 
-/// Parse a ViewDefinition from JSON using a specific FHIR version
+/// Parse a ViewDefinition from JSON using a specific FHIR version.
+///
+/// Per the SoF v2 spec, "invalid ViewDefinition or processing failure"
+/// maps to `422 Unprocessable Entity` (audit item #9). We let the
+/// default `From<SofError>` impl route `InvalidViewDefinition` through
+/// `ServerError::ProcessingError` so it surfaces as 422; the prior
+/// special-case to `BadRequest` (400) was the spec gap.
 fn parse_view_definition_for_version(
     json: serde_json::Value,
     version: helios_fhir::FhirVersion,
 ) -> ServerResult<SofViewDefinition> {
-    sof_parse_view_definition_for_version(json, version).map_err(|e| match e {
-        SofError::InvalidViewDefinition(msg) => ServerError::BadRequest(msg),
-        other => ServerError::from(other),
-    })
+    sof_parse_view_definition_for_version(json, version).map_err(ServerError::from)
 }
 
 /// Parse a Parameters resource from JSON
@@ -902,6 +905,42 @@ mod tests {
                 "format must include {required}: {formats:?}"
             );
         }
+    }
+
+    /// Audit item #9: an invalid ViewDefinition (e.g. missing the
+    /// required `resource` field) must surface as `422 Unprocessable
+    /// Entity` per the SoF v2 spec — not `400 Bad Request`. We assert
+    /// both the `ServerError` variant and the rendered HTTP status.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn test_invalid_view_definition_maps_to_422() {
+        use axum::response::IntoResponse;
+
+        // Type mismatch in the `select` array — serde rejects this
+        // because `select` must be an array of Select objects, not a
+        // string.
+        let bad_view = serde_json::json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "Patient",
+            "select": "not-an-array"
+        });
+
+        let err = parse_view_definition_for_version(bad_view, helios_fhir::FhirVersion::R4)
+            .expect_err("malformed ViewDefinition must error");
+        assert!(
+            matches!(err, ServerError::ProcessingError(_)),
+            "invalid ViewDefinition must map to ProcessingError (→ 422), got {err:?}"
+        );
+
+        // And render verifies the HTTP status — locks in the spec
+        // requirement at the response boundary, not just internally.
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid ViewDefinition response must be 422"
+        );
     }
 
     /// Audit item #7: instance-level URLs return a clear 400 explaining

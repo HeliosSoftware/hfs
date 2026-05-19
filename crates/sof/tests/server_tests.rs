@@ -991,3 +991,45 @@ async fn test_parquet_response_uses_octet_stream_content_type() {
         &bytes[..bytes.len().min(8)]
     );
 }
+
+/// Audit item #9: an invalid ViewDefinition body (well-formed Parameters
+/// wrapper, but the inner ViewDefinition has a type mismatch serde can't
+/// parse) must surface as `422 Unprocessable Entity`, not `400 Bad Request`.
+#[tokio::test]
+async fn test_invalid_view_definition_returns_422() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_format", "valueCode": "ndjson"},
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    // Type mismatch: select must be an array of Select objects,
+                    // not a string. Serde rejects deserialization.
+                    "select": "not-an-array"
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$viewdefinition-run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid ViewDefinition must be 422 (audit #9), got {} with body: {}",
+        response.status_code(),
+        response.text()
+    );
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+}
