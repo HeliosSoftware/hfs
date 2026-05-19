@@ -587,7 +587,7 @@ Parameter table:
 
 | Name | Type | Use | Scope | Min | Max | Documentation |
 |------|------|-----|-------|-----|-----|---------------|
-| _format | code | in | type, instance | 1 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/parquet` |
+| _format | code | in | type, instance | 0 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/parquet`. Defaults to `application/x-ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
 | header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
 | maxFileSize | integer | in | type, instance | 0 | 1 | Maximum Parquet file size in MB (10-10000). When exceeded, generates multiple files in a ZIP archive. |
 | rowGroupSize | integer | in | type, instance | 0 | 1 | Parquet row group size in MB (64-1024, default: 256) |
@@ -606,8 +606,8 @@ Parameter table:
 
 All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `resource` can be provided as POST query parameters:
 
-- **_format**: Output format (required if not in Accept header)
-  - `application/json` - JSON array output (default)
+- **_format**: Output format (optional; defaults to `application/x-ndjson` per SoF v2)
+  - `application/json` - JSON array output
   - `text/csv` - CSV output
   - `application/ndjson` - Newline-delimited JSON
   - `application/parquet` - Parquet file 

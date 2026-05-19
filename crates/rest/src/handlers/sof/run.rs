@@ -18,14 +18,14 @@
 //! | `viewResource` | Resource | The ViewDefinition to execute (Parameters form) |
 //! | `patient` | string | Restrict to this patient reference |
 //! | `group` | string | Restrict to this group reference |
-//! | `_format` | string | Output format: `ndjson`, `csv`, `json`, `parquet` (required; may also be supplied via `Accept`) |
+//! | `_format` | string | Output format: `ndjson`, `csv`, `json`, `parquet` (optional; defaults to `ndjson`; may also be supplied via `Accept`) |
 //! | `_limit` | integer | Maximum number of output rows |
 //! | `_since` | instant | Only include resources modified after this time |
 //!
 //! ## Response
 //!
 //! - `200 OK` — stream of output rows in the requested format
-//! - `400 Bad Request` — missing `_format`, unsupported format, or invalid parameters
+//! - `400 Bad Request` — unsupported `_format` value or invalid parameters
 //! - `422 Unprocessable Entity` — ViewDefinition could not be compiled or executed
 //! - `501 Not Implemented` — `source` parameter (storage-backed server)
 
@@ -59,8 +59,9 @@ use crate::state::AppState;
 /// merged in via [`merge_params`] and take precedence.
 #[derive(Debug, Default, Deserialize)]
 pub struct RunQueryParams {
-    /// Output format: `ndjson`, `csv`, `json`, `parquet`. Required by spec
-    /// (`1..1`) — but may also be supplied via the `Accept` header.
+    /// Output format: `ndjson`, `csv`, `json`, `parquet`. Optional per SoF
+    /// v2 PR #353 (`0..1`); defaults to `ndjson`. May also be supplied via
+    /// the `Accept` header (with `_format` taking precedence).
     #[serde(rename = "_format")]
     pub format: Option<String>,
 
@@ -377,9 +378,9 @@ where
         });
     }
 
-    // Resolve `_format`: spec says `1..1`. Precedence: `_format` (query or
-    // body, already merged) > `Accept` header. Missing both is a 400.
-    let format = resolve_format(params.format.as_deref(), headers)?;
+    // Resolve `_format`: SoF v2 PR #353 makes this `0..1`. Precedence:
+    // `_format` (query or body, already merged) > `Accept` header > `ndjson`.
+    let format = resolve_format(params.format.as_deref(), headers);
     let include_header = params
         .header
         .as_deref()
@@ -570,17 +571,18 @@ fn validate_limit(limit: Option<usize>) -> Result<(), RestError> {
     Ok(())
 }
 
-/// Resolves the output format for a run. Spec precedence: `_format` parameter
-/// (already merged from query and body upstream) > `Accept` header. Missing
-/// both is a 400 — `_format` is `1..1` in the operation definition.
+/// Resolves the output format for a run. Spec precedence (SoF v2 PR #353):
+/// `_format` parameter (already merged from query and body upstream) >
+/// `Accept` header > `ndjson` default. `_format` is `0..1` in the operation
+/// definition; absence is not an error.
 ///
 /// Accept-header values map: `application/json` → `json`,
 /// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
 /// `application/octet-stream`/`application/parquet` → `parquet`. Unknown or
-/// wildcard Accept values fall through to the 400.
-fn resolve_format(format_param: Option<&str>, headers: &HeaderMap) -> Result<String, RestError> {
+/// wildcard Accept values fall through to the `ndjson` default.
+fn resolve_format(format_param: Option<&str>, headers: &HeaderMap) -> String {
     if let Some(f) = format_param {
-        return Ok(f.to_lowercase());
+        return f.to_lowercase();
     }
     if let Some(accept) = headers
         .get(header::ACCEPT)
@@ -598,14 +600,10 @@ fn resolve_format(format_param: Option<&str>, headers: &HeaderMap) -> Result<Str
                 _ => None,
             });
         if let Some(f) = mapped {
-            return Ok(f.to_string());
+            return f.to_string();
         }
     }
-    Err(RestError::BadRequest {
-        message: "_format is required (or provide an Accept header with a supported MIME type); \
-                  supported formats: ndjson, json, csv, parquet"
-            .to_string(),
-    })
+    "ndjson".to_string()
 }
 
 /// Maps a `_format` string + header flag to a `ContentType` understood by the

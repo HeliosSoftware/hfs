@@ -398,10 +398,14 @@ mod sof_sqlquery_tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn missing_format_returns_400() {
+    async fn missing_format_defaults_to_ndjson() {
+        // SoF v2 PR #353: `_format` is `0..1` and defaults to `ndjson` when
+        // neither `_format` (body or query) nor a usable `Accept` header is
+        // supplied. Previously returned 400; now returns ndjson.
         let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
         let vd_url = seed_patient_view(&backend).await;
-        let lib = library_with_canonical_vd("SELECT 1", &vd_url, "t", vec![]);
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", &vd_url, "t", vec![]);
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [{"name": "queryResource", "resource": lib}]
@@ -415,7 +419,119 @@ mod sof_sqlquery_tests {
             )
             .json(&body)
             .await;
-        response.assert_status(StatusCode::BAD_REQUEST);
+        response.assert_status(StatusCode::OK);
+        let content_type = response
+            .header(axum::http::header::CONTENT_TYPE)
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/x-ndjson"),
+            "default _format should be ndjson, got Content-Type: {content_type}"
+        );
+    }
+
+    /// SoF v2 PR #353: `_limit` truncates the final result set silently;
+    /// returning fewer rows than the cap is not an error.
+    #[tokio::test]
+    async fn limit_in_body_truncates_silently() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        seed_patient(&backend, "p2", "Jones", false).await;
+        seed_patient(&backend, "p3", "Lee", true).await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd(
+            "SELECT patient_id FROM t ORDER BY patient_id",
+            &vd_url,
+            "t",
+            vec![],
+        );
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "queryResource", "resource": lib},
+                {"name": "_limit", "valueInteger": 2}
+            ]
+        });
+        let response = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(
+            rows.as_array().map(|a| a.len()),
+            Some(2),
+            "_limit=2 should cap at 2 rows, got {rows}"
+        );
+    }
+
+    /// `_limit` works from the URL query string too, and body wins on conflict.
+    #[tokio::test]
+    async fn limit_in_query_truncates_silently() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        seed_patient(&backend, "p2", "Jones", false).await;
+        seed_patient(&backend, "p3", "Lee", true).await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd(
+            "SELECT patient_id FROM t ORDER BY patient_id",
+            &vd_url,
+            "t",
+            vec![],
+        );
+        let body = run_body_inline(lib, "json", None);
+        let response = server
+            .post("/$sqlquery-run?_limit=1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(
+            rows.as_array().map(|a| a.len()),
+            Some(1),
+            "_limit=1 (query) should cap at 1 row, got {rows}"
+        );
+    }
+
+    /// Result set smaller than `_limit` returns all rows without erroring.
+    #[tokio::test]
+    async fn limit_larger_than_result_is_not_an_error() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", &vd_url, "t", vec![]);
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "queryResource", "resource": lib},
+                {"name": "_limit", "valueInteger": 100}
+            ]
+        });
+        let response = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows.as_array().map(|a| a.len()), Some(1));
     }
 
     #[tokio::test]

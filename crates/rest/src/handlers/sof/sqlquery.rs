@@ -10,7 +10,8 @@
 //! calls the wired `SofRunner` to produce a row stream, materializes the rows
 //! into a per-request in-memory SQLite database (one table per `label`), binds
 //! the supplied `Library.parameter` values to the SQL, runs the user's query,
-//! and serializes the result in the requested `_format`.
+//! truncates the result to a caller-supplied `_limit` (if any), and serializes
+//! the result in the requested `_format`.
 //!
 //! ## Output shape for flat formats
 //!
@@ -50,8 +51,8 @@ use crate::state::AppState;
 
 /// Query-string parameters accepted by `$sqlquery-run`. The spec ships every
 /// `in` parameter on the operation; we only honor the ones that make sense in
-/// a URL: `_format` and `header`. Everything else (Library, parameters,
-/// source) is body-only.
+/// a URL: `_format`, `header`, and `_limit`. Everything else (Library,
+/// parameters, source) is body-only.
 #[derive(Debug, Default, Deserialize)]
 pub struct SqlQueryRunQuery {
     /// `_format` URL fallback when the body omits it. Body wins on conflict.
@@ -60,6 +61,11 @@ pub struct SqlQueryRunQuery {
     /// CSV `header` toggle from the URL. Body wins on conflict. Anything that
     /// isn't `true`/`false`/`1`/`0` is treated as unspecified.
     pub header: Option<String>,
+    /// `_limit` URL fallback when the body omits it. Body wins on conflict.
+    /// Per SoF v2 PR #353 this is a soft cap on the final result set; rows
+    /// past the limit are dropped silently (not an error).
+    #[serde(rename = "_limit")]
+    pub limit: Option<u32>,
 }
 
 /// `POST /$sqlquery-run` and `POST /Library/$sqlquery-run`.
@@ -104,9 +110,10 @@ where
 {
     let params = extract_sqlquery_params_from_json(&body);
 
-    // _format precedence: body (Parameters) > query string > Accept header.
-    // Spec is `1..1`; failing all three is a 400.
-    let format = resolve_format(params.format.as_deref(), query.format.as_deref(), headers)?;
+    // _format precedence: body (Parameters) > query string > Accept header
+    // > `ndjson` default. SoF v2 PR #353 makes `_format` `0..1` defaulting
+    // to `ndjson`.
+    let format = resolve_format(params.format.as_deref(), query.format.as_deref(), headers);
 
     // Spec: the `source` parameter is 0..1. We don't implement external data
     // sources; ignore the value with a warning instead of failing the request.
@@ -220,6 +227,17 @@ where
         }
     };
 
+    // SoF v2 PR #353: apply caller-supplied `_limit` as a soft cap on the
+    // final result set, AFTER SQL evaluation (including any in-query LIMIT).
+    // Body wins over URL on conflict. Truncating to fewer rows than the cap
+    // is not an error per the PR's wording.
+    if let Some(user_limit) = params.limit.or(query.limit) {
+        let cap = user_limit as usize;
+        if result.rows.len() > cap {
+            result.rows.truncate(cap);
+        }
+    }
+
     // Refine output column types: when a result column name matches a column
     // we materialized from a depends-on ViewDefinition, prefer the VD-declared
     // FHIR type. Walk depends-on in declaration order so the lookup is
@@ -249,20 +267,21 @@ where
     Ok(build_response(content_type, body))
 }
 
-/// Resolves the output format. Spec precedence: body `_format` > URL `_format`
-/// > Accept header. Spec marks `_format` as `1..1`; failing all three is a 400.
+/// Resolves the output format. Precedence (SoF v2 PR #353): body `_format` >
+/// URL `_format` > Accept header > `ndjson` default. `_format` is `0..1`.
 ///
 /// Accept mapping mirrors `$viewdefinition-run`: `application/json` → `json`,
 /// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
 /// `application/octet-stream`/`application/parquet` → `parquet`,
-/// `application/fhir+json` → `fhir`.
+/// `application/fhir+json` → `fhir`. Unknown Accept values fall through to
+/// the `ndjson` default.
 fn resolve_format(
     body_format: Option<&str>,
     query_format: Option<&str>,
     headers: &HeaderMap,
-) -> Result<String, RestError> {
+) -> String {
     if let Some(f) = body_format.or(query_format) {
-        return Ok(f.to_lowercase());
+        return f.to_lowercase();
     }
     if let Some(accept) = headers
         .get(header::ACCEPT)
@@ -281,14 +300,10 @@ fn resolve_format(
                 _ => None,
             });
         if let Some(f) = mapped {
-            return Ok(f.to_string());
+            return f.to_string();
         }
     }
-    Err(RestError::BadRequest {
-        message: "_format is required (or provide an Accept header with a supported MIME type); \
-                  supported values: csv, json, ndjson, parquet, fhir"
-            .to_string(),
-    })
+    "ndjson".to_string()
 }
 
 /// Parses the query-string `header` value into a bool. Anything that isn't

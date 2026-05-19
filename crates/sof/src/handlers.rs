@@ -60,7 +60,7 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 ///
 /// | Name | Type | Use | Scope | Min | Max | Documentation |
 /// |------|------|-----|-------|-----|-----|---------------|
-/// | _format | code | in | type, instance | 1 | 1 | Output format - `application/json`, `application/x-ndjson`, `text/csv`, `application/octet-stream` (parquet) |
+/// | _format | code | in | type, instance | 0 | 1 | Output format - `application/json`, `application/x-ndjson`, `text/csv`, `application/octet-stream` (parquet). Defaults to `application/x-ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
 /// | header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
 /// | viewReference | Reference | in | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. (not yet supported) |
 /// | viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
@@ -85,21 +85,10 @@ pub async fn run_view_definition_handler(
     info!("Handling ViewDefinition/$viewdefinition-run request");
     debug!("Query params: {:?}", params);
 
-    // Enforce spec cardinality `_format = 1..1`: at least one of `_format`
-    // (query or body) or a usable `Accept` header must be present. Body is
-    // inspected permissively here so we can fail fast before parsing the
-    // typed Parameters resource.
+    // SoF v2 PR #353: `_format` is `0..1` and defaults to `ndjson` when neither
+    // `_format` (query or body) nor a usable `Accept` header is supplied. The
+    // default is applied downstream in `parse_content_type` / `validate_query_params`.
     let accept_header = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
-    let body_has_format = body
-        .as_ref()
-        .is_some_and(|Json(b)| helios_sof::extract_run_params_from_json(b).format.is_some());
-    if params.format.is_none() && accept_header.is_none() && !body_has_format {
-        return Err(ServerError::BadRequest(
-            "_format is required (or provide an Accept header with a supported MIME type); \
-             supported formats: json, ndjson, csv, parquet"
-                .to_string(),
-        ));
-    }
 
     // GET / bodyless requests can't carry viewResource or resource. With no
     // body to extract a ViewDefinition from and no viewReference support

@@ -180,6 +180,35 @@ mod sof_run_tests {
         );
     }
 
+    /// SoF v2 PR #353: `_format` is optional and defaults to `ndjson` when
+    /// neither `_format` nor a usable `Accept` header is supplied.
+    #[tokio::test]
+    async fn test_run_view_definition_no_format_defaults_to_ndjson() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-default", "Default").await;
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.contains("x-ndjson") || content_type.contains("ndjson"),
+            "default _format should be ndjson, got: {content_type}"
+        );
+    }
+
     /// `?_format=json` returns a JSON array instead of NDJSON.
     #[tokio::test]
     async fn test_run_view_definition_json_format() {

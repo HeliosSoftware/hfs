@@ -229,30 +229,40 @@ pub fn validate_query_params(
 
 /// Parse content type from Accept header and query parameters.
 ///
-/// Spec precedence: `_format` (query or body) > `Accept` header. When both are
-/// absent, this falls back to `application/json` as a placeholder so callers
-/// that intend to override from a body parameter (typically a `Parameters`
-/// resource with `_format`) can still drive the validation pass; the
-/// `_format = 1..1` rule is enforced at the handler entry point before
-/// dispatching here, so a true missing-format will already have errored.
+/// Spec precedence (SoF v2 PR #353): `_format` (query or body) > `Accept`
+/// header. `_format` is `0..1` and defaults to `ndjson`. When `_format` is
+/// missing and `Accept` is absent or maps to no known format (e.g. `*/*`,
+/// `application/fhir+json`), this returns `ContentType::NdJson` rather than
+/// erroring — clients can omit both and get a usable default.
+///
+/// When `_format` IS supplied, its value is honored verbatim; an unsupported
+/// value surfaces as `UnsupportedContentType` (→ 400) so client typos still
+/// fail loudly.
 pub fn parse_content_type(
     accept_header: Option<&str>,
     format_param: Option<&str>,
     header_param: Option<bool>,
 ) -> Result<ContentType, helios_sof::SofError> {
-    let content_type_str = format_param.or(accept_header).unwrap_or("application/json");
-
-    // Handle CSV header parameter
-    let content_type_str = if content_type_str == "text/csv" {
-        match header_param {
-            Some(false) => "text/csv;header=false",
-            Some(true) | None => "text/csv;header=true", // Default to true if not specified
+    let apply_csv_header = |s: &str| -> String {
+        if s == "text/csv" {
+            match header_param {
+                Some(false) => "text/csv;header=false".to_string(),
+                _ => "text/csv;header=true".to_string(),
+            }
+        } else {
+            s.to_string()
         }
-    } else {
-        content_type_str
     };
 
-    ContentType::from_string(content_type_str)
+    if let Some(fmt) = format_param {
+        return ContentType::from_string(&apply_csv_header(fmt));
+    }
+    if let Some(accept) = accept_header {
+        if let Ok(ct) = ContentType::from_string(&apply_csv_header(accept)) {
+            return Ok(ct);
+        }
+    }
+    Ok(ContentType::NdJson)
 }
 
 /// Result type for parameter extraction.
