@@ -212,14 +212,22 @@ closed many gaps; those that remain are listed below.
   - `supportedFormat` = `ndjson`, `json`, `csv`, `parquet` (the four
     output formats `$viewdefinition-run` actually emits)
 
-## 12. Operation canonical URL casing
-- Both impls publish the URL as
-  `http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run`.
-- Standard FHIR convention puts no `$` in OperationDefinition `url` —
-  the `$` only appears in the invocation. The published spec
-  OperationDefinition JSON should be checked; if its `url` is
-  `…/OperationDefinition/ViewDefinitionRun` (no `$`), our advertised URL
-  is wrong. If the spec really uses `$`, ignore.
+## 12. Operation canonical URL casing — **VERIFIED CORRECT** (no fix needed)
+- The audit's suspicion was that standard FHIR convention puts no `$`
+  in an OperationDefinition's `url` field (the `$` should only appear
+  in the invocation path).
+- Verified directly against the published SoF v2 spec OperationDefinition
+  JSON resources on build.fhir.org:
+  - `OperationDefinition-ViewDefinitionRun.json` → `url =
+    "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run"`
+  - `OperationDefinition-ViewDefinitionExport.json` → `url =
+    "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-export"`
+  - `OperationDefinition-SQLQueryRun.json` → `url =
+    "http://sql-on-fhir.org/OperationDefinition/$sqlquery-run"`
+- The spec deliberately uses the `$`-prefixed form (deviates from
+  standard FHIR convention but is what's published). Our code already
+  emits these exact strings in both `/metadata` and
+  `/$sql-on-fhir-capabilities` — no change required.
 
 ## 13. `_format` value-set binding not enforced
 - **Spec:** `_format` is bound to `OutputFormatCodes` (extensible).
@@ -269,6 +277,6 @@ closed many gaps; those that remain are listed below.
 | 7 | Instance-level not supported | Low (statelessness) | sof-server | **fixed** (clarified; this commit) |
 | 10 | `_limit` 10000 cap | Low (policy) | both unified | **fixed** (this commit) |
 | 13 | Value-set binding declaration | Low (audit polish) | both | open |
-| 12 | Canonical URL casing | Low (verify first) | both | open |
+| 12 | Canonical URL casing | Low (verify first) | both | **verified correct** (spec uses `$`; code already matches) |
 | 4 | `patient` query comma-split symmetry | Low | sof-server | open |
 | 15 | `format_stream` defensive re-validate | Trivial | HFS REST | open |
