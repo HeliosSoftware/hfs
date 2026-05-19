@@ -434,17 +434,11 @@ async fn run_view_definition_handler(
         }
     };
 
-    // Check if header parameter is being used with non-CSV format
-    if header_param.is_some() && format_from_body.is_none() {
-        // We have a header parameter but need to check if format is CSV
-        let test_format = format.or(accept).unwrap_or("application/json");
-        if test_format != "text/csv" {
-            return error_response(
-                axum::http::StatusCode::BAD_REQUEST,
-                "Header parameter only applies to CSV format",
-            );
-        }
-    }
+    // Per spec: "Applies only when csv output is requested" — so the
+    // `header` parameter is silently ignored for non-CSV formats rather
+    // than producing 400. This stub used to mirror an older
+    // (overly-strict) production behavior; aligned to the new lenient
+    // rule per audit item #14.
 
     let content_type = match parse_content_type(accept, format, header_param) {
         Ok(ct) => ct,

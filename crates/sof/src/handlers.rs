@@ -173,17 +173,19 @@ pub async fn run_view_definition_handler(
         )?;
         validated_params.format = content_type;
     } else if let Some(header_bool) = header_from_body {
-        // If only header is provided in body, update the format accordingly
-        let format_str = match validated_params.format {
-            ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
-            _ => {
-                return Err(ServerError::BadRequest(
-                    "Header parameter only applies to CSV format".to_string(),
-                ));
-            }
-        };
-        let content_type = parse_content_type(None, Some(format_str), Some(header_bool))?;
-        validated_params.format = content_type;
+        // If only header is provided in body, update the CSV header flag.
+        // Per spec: "Applies only when csv output is requested" — so when
+        // the format isn't CSV we silently ignore the parameter rather
+        // than rejecting (audit item #14: the spec gives no requirement
+        // to error on extraneous use).
+        if matches!(
+            validated_params.format,
+            ContentType::Csv | ContentType::CsvWithHeader
+        ) {
+            let content_type = parse_content_type(None, Some("text/csv"), Some(header_bool))?;
+            validated_params.format = content_type;
+        }
+        // else: non-CSV format → header is advisory only, ignore it.
     }
 
     // Apply patient and group filters from body parameters to resources if provided

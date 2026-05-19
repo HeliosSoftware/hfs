@@ -255,12 +255,20 @@ closed many gaps; those that remain are listed below.
   return 400 for an unrecognised value. The declaration tells audit
   tools the binding exists; the strength tells them it's advisory.
 
-## 14. `header` parameter on non-CSV formats (sof-server)
+## 14. `header` parameter on non-CSV formats — **FIXED**
 - **Spec:** "Applies only when csv output is requested." No requirement
   to reject it on other formats.
-- **sof-server** returns **400** when `header` is set with a non-CSV
-  `_format`. Stricter than the spec; the spec-aligned behavior is to
-  silently ignore it.
+- **Before:** sof-server returned 400 when `header` was supplied
+  alongside a non-CSV `_format` (handlers.rs body-only branch +
+  common.rs query-string check). Stricter than the spec.
+- **After:** the body-only branch now leaves `validated_params.format`
+  untouched when the negotiated format isn't CSV — the `header` value
+  is silently ignored. The common.rs stub mirrors the lenient
+  behavior. `parse_content_type` already handled this correctly
+  internally (it only applies `header_param` when content-type ==
+  `text/csv`), so the underlying mapping was already spec-aligned;
+  this commit removes the early-return that was rejecting before the
+  mapping ran.
 
 ## 15. HFS REST: `format_stream` re-runs format validation defensively
 - `format_stream` calls `parse_content_type` again and `expect`s
@@ -291,7 +299,7 @@ closed many gaps; those that remain are listed below.
 | 11 | CapabilityStatement formats + refs block | Medium | sof-server | **fixed** (this commit) |
 | 5 | Absent-target OperationOutcome | Medium (SHOULD) | both | **fixed** (inline paths; runner-path probe is follow-up) |
 | 8 | Parquet MIME | Low | sof-server | **fixed** (this commit) |
-| 14 | `header` rejection on non-CSV | Low | sof-server | open |
+| 14 | `header` rejection on non-CSV | Low | sof-server | **fixed** (this commit) |
 | 16 | Double-applied `_limit` | Low (perf/CSV-fragile) | sof-server | open |
 | 7 | Instance-level not supported | Low (statelessness) | sof-server | **fixed** (clarified; this commit) |
 | 10 | `_limit` 10000 cap | Low (policy) | both unified | **fixed** (this commit) |
