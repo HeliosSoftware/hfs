@@ -387,14 +387,15 @@ where
         .unwrap_or(true);
 
     // Validate the format value up front so unknown values fail with 400 on
-    // every path (inline + streaming), not only the inline one.
-    if parse_content_type(&format, include_header).is_none() {
-        return Err(RestError::BadRequest {
+    // every path (inline + streaming), not only the inline one. The
+    // resolved `ContentType` is threaded through downstream so we don't
+    // re-parse the format string later (audit item #15).
+    let content_type =
+        parse_content_type(&format, include_header).ok_or_else(|| RestError::BadRequest {
             message: format!(
                 "unsupported _format value '{format}'; supported: ndjson, json, csv, parquet"
             ),
-        });
-    }
+        })?;
 
     // Audit item #10: enforce the same `_limit` bound as sof-server so
     // both binaries reject the same out-of-range values consistently.
@@ -403,14 +404,7 @@ where
     validate_limit(params.limit)?;
 
     if !body_params.inline_resources.is_empty() {
-        return execute_view_inline(
-            &state,
-            &params,
-            &body_params,
-            view_json,
-            &format,
-            include_header,
-        );
+        return execute_view_inline(&state, &params, &body_params, view_json, content_type);
     }
 
     let runner = state
@@ -440,12 +434,12 @@ where
     let runner_label = runner.runner_name().to_string();
 
     // Streaming path for ndjson: forward rows incrementally.
-    if format == "ndjson" || format == "application/x-ndjson" {
+    if matches!(content_type, ContentType::NdJson) {
         return Ok(streaming_ndjson_response(stream, &runner_label));
     }
 
     // Buffered paths (csv, json array, parquet) — collect the stream first.
-    let (ct, body) = format_stream(stream, &format, include_header).await;
+    let (ct, body) = format_stream(stream, content_type).await;
     Ok(build_response(
         StatusCode::OK,
         ct,
@@ -464,8 +458,7 @@ fn execute_view_inline<S>(
     params: &RunQueryParams,
     body_params: &ExtractedRunParams,
     view_json: Value,
-    format: &str,
-    include_header: bool,
+    content_type: ContentType,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -517,11 +510,6 @@ where
     let bundle = create_bundle_from_resources_for_version(resources, fhir_version)
         .map_err(map_sof_lib_error_to_rest)?;
 
-    let content_type =
-        parse_content_type(format, include_header).ok_or_else(|| RestError::BadRequest {
-            message: format!("Unsupported _format value: {format}"),
-        })?;
-
     let options = RunOptions {
         since,
         limit: params.limit,
@@ -531,7 +519,7 @@ where
 
     debug!(
         runner = "in-process",
-        format = %format,
+        content_type = ?content_type,
         "dispatching $viewdefinition-run (inline)"
     );
 
@@ -710,20 +698,16 @@ fn streaming_ndjson_response(
 /// format. NDJSON has its own dedicated streaming path
 /// ([`streaming_ndjson_response`]); buffered formats (csv, json, parquet) drain
 /// here and pass through `helios_sof::format_output` so REST output matches
-/// `sof-server` / `pysof` byte-for-byte. The `format` string is validated by
-/// [`execute_view`] before reaching this function — unknown formats are a 400
-/// long before we open a row stream.
+/// `sof-server` / `pysof` byte-for-byte. Takes the already-validated
+/// `ContentType` so there's no re-parse-with-`expect` here (audit item #15).
 async fn format_stream(
     stream: helios_persistence::core::sof_runner::RowStream,
-    format: &str,
-    include_header: bool,
+    content_type: ContentType,
 ) -> (&'static str, Vec<u8>) {
     let rows = drain_stream(stream).await;
-    let content_type = parse_content_type(format, include_header)
-        .expect("format already validated by execute_view");
     let result = helios_sof::rows_to_processed_result(rows);
     let body = helios_sof::format_output(result, content_type, None).unwrap_or_else(|e| {
-        warn!(error = %e, format, "shared output formatter failed; returning empty body");
+        warn!(error = %e, ?content_type, "shared output formatter failed; returning empty body");
         Vec::new()
     });
     (content_type_headers(content_type).0, body)

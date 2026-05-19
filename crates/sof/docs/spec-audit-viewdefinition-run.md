@@ -270,11 +270,22 @@ closed many gaps; those that remain are listed below.
   this commit removes the early-return that was rejecting before the
   mapping ran.
 
-## 15. HFS REST: `format_stream` re-runs format validation defensively
-- `format_stream` calls `parse_content_type` again and `expect`s
-  success; the upfront validation in `execute_view` is what makes that
-  safe.
-- Not a spec issue — minor code-quality observation.
+## 15. HFS REST: `format_stream` re-runs format validation — **FIXED**
+- **Before:** `execute_view` validated the `_format` string and then
+  threw away the resulting `ContentType`; downstream `format_stream`
+  and `execute_view_inline` re-parsed the format string, with
+  `format_stream` using `.expect("format already validated by
+  execute_view")` to paper over the duplicate work. A future bug in
+  one parser-path branch would have panicked instead of producing a
+  clean error.
+- **After:** `execute_view` computes `ContentType` once at validation
+  time and threads it into both `execute_view_inline` (which no longer
+  takes `format` + `include_header` separately — the `include_header`
+  signal is encoded in the `ContentType` enum already via
+  `CsvWithHeader` vs `Csv`) and `format_stream`. The runner-path
+  NDJSON-vs-buffered branch matches on `ContentType::NdJson` instead
+  of string-comparing the format. The `.expect` is gone.
+- Not a spec change — pure code-quality cleanup.
 
 ## 16. sof-server double-applies `_limit`
 - `run_view_definition_with_options` already honors `RunOptions.limit`,
@@ -306,4 +317,4 @@ closed many gaps; those that remain are listed below.
 | 13 | Value-set binding declaration | Low (audit polish) | both | **fixed** (this commit) |
 | 12 | Canonical URL casing | Low (verify first) | both | **verified correct** (spec uses `$`; code already matches) |
 | 4 | `patient` query comma-split symmetry | Low | sof-server | open |
-| 15 | `format_stream` defensive re-validate | Trivial | HFS REST | open |
+| 15 | `format_stream` defensive re-validate | Trivial | HFS REST | **fixed** (this commit) |
