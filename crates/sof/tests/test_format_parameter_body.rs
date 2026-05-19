@@ -251,7 +251,7 @@ async fn test_format_parameter_valuestring_variant() {
 
     assert_eq!(response.status_code(), StatusCode::OK);
     let content_type = response.header("content-type");
-    assert_eq!(content_type.to_str().unwrap(), "application/ndjson");
+    assert_eq!(content_type.to_str().unwrap(), "application/x-ndjson");
 
     let ndjson_text = response.text();
     let lines: Vec<&str> = ndjson_text.trim().lines().collect();
@@ -409,7 +409,7 @@ async fn test_precedence_order_body_query_accept() {
     let content_type = response.header("content-type");
     assert_eq!(
         content_type.to_str().unwrap(),
-        "application/ndjson",
+        "application/x-ndjson",
         "Body _format parameter should have highest precedence"
     );
 }
