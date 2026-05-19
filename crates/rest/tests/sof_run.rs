@@ -371,6 +371,79 @@ mod sof_run_tests {
         assert_eq!(rows[0]["family"], "Black");
     }
 
+    /// Runner-path compartment fidelity (audit item #3 closeout for HFS
+    /// in-DB runner): an Appointment whose patient link is
+    /// `Appointment.participant.actor` (nested, not top-level
+    /// subject/patient) is correctly included via the search-index
+    /// EXISTS clause. The old hardcoded `subject.reference` /
+    /// `patient.reference` JSON-path filter could not see this case.
+    #[tokio::test]
+    async fn test_run_view_definition_appointment_compartment_runner() {
+        let (server, backend) = create_test_server_with_indb().await;
+
+        let tenant = test_tenant();
+        let appt_in = json!({
+            "resourceType": "Appointment",
+            "id": "appt-alice",
+            "status": "booked",
+            "participant": [
+                {"actor": {"reference": "Patient/alice"}, "status": "accepted"}
+            ]
+        });
+        let appt_out = json!({
+            "resourceType": "Appointment",
+            "id": "appt-bob",
+            "status": "booked",
+            "participant": [
+                {"actor": {"reference": "Patient/bob"}, "status": "accepted"}
+            ]
+        });
+        for (rt, res) in [("Appointment", appt_in), ("Appointment", appt_out)] {
+            backend
+                .create(&tenant, rt, res, FhirVersion::R4)
+                .await
+                .expect("failed to seed appointment");
+        }
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Appointment",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "appt_id", "type": "string"}
+            ]}]
+        });
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson&patient=Patient/alice")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&view)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+
+        let body = response.text();
+        let rows: Vec<Value> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "runner-path Patient compartment must include alice's Appointment via participant.actor; got {rows:?}"
+        );
+        assert_eq!(
+            rows[0]["appt_id"], "appt-alice",
+            "expected appt-alice (Patient/alice via participant.actor): {rows:?}"
+        );
+    }
+
     /// Audit item #5: a `patient` reference whose target Patient resource
     /// isn't in the supplied bundle SHOULD produce an OperationOutcome
     /// warning. We surface it as a `Warning:` HTTP header (RFC 7234 §5.5)
@@ -811,8 +884,18 @@ mod sof_run_tests {
 
     /// Creates a server with the SQLite in-DB runner wired in via `with_sof_runner`.
     /// The in-DB runner compiles `_since`, `patient`, and `group` filters to SQL.
+    ///
+    /// The compartment-aware filter (audit item #3) queries the populated
+    /// `search_index` table, so the SearchParameter spec data needs to be
+    /// loaded. Point `data_dir` at the workspace `data/` directory via the
+    /// crate-relative `CARGO_MANIFEST_DIR` so tests work regardless of CWD.
     async fn create_test_server_with_indb() -> (TestServer, Arc<SqliteBackend>) {
-        let backend = SqliteBackend::with_config(":memory:", Default::default())
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let backend_config = helios_persistence::backends::sqlite::SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        let backend = SqliteBackend::with_config(":memory:", backend_config)
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
         let backend = Arc::new(backend);
@@ -951,29 +1034,41 @@ mod sof_run_tests {
         );
     }
 
-    /// `group=Group/g1` restricts results to resources with `group.reference = "Group/g1"`.
+    /// `group=Group/g1` resolves `Group.member.entity` to Patient refs and
+    /// then applies the Patient-compartment filter. Mirrors what the inline
+    /// path does via `helios_sof::resolve_group_members_to_patient_refs`.
+    /// Pre-audit-#3 the runner just literally matched `Patient.group.reference`
+    /// (a non-spec field); this test exercises the new spec-correct path.
     #[tokio::test]
     async fn test_run_view_definition_group_filter() {
         let (server, backend) = create_test_server_with_indb().await;
 
         let tenant = test_tenant();
-        // Seed one patient with group.reference and one without
-        let with_group = json!({
+        // Seed two patients and a Group whose member.entity references one.
+        let p_in = json!({
             "resourceType": "Patient",
             "id": "p-grouped",
-            "active": true,
-            "group": { "reference": "Group/g1" }
+            "active": true
         });
-        let without_group = json!({
+        let p_out = json!({
             "resourceType": "Patient",
             "id": "p-ungrouped",
             "active": true
         });
-        for (rt, res) in [("Patient", with_group), ("Patient", without_group)] {
+        let group = json!({
+            "resourceType": "Group",
+            "id": "g1",
+            "type": "person",
+            "actual": true,
+            "member": [
+                {"entity": {"reference": "Patient/p-grouped"}}
+            ]
+        });
+        for (rt, res) in [("Patient", p_in), ("Patient", p_out), ("Group", group)] {
             backend
                 .create(&tenant, rt, res, FhirVersion::R4)
                 .await
-                .expect("failed to seed patient");
+                .expect("failed to seed resource");
         }
 
         let response = server
@@ -998,7 +1093,7 @@ mod sof_run_tests {
         assert_eq!(
             rows.len(),
             1,
-            "group filter must return only p-grouped; got {rows:?}"
+            "group filter must return only p-grouped (via member.entity); got {rows:?}"
         );
         assert_eq!(
             rows[0]["patient_id"], "p-grouped",

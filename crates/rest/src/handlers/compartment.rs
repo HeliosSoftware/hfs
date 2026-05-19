@@ -43,33 +43,11 @@ fn get_compartment_params_for_version(
     compartment_type: &str,
     resource_type: &str,
 ) -> Result<&'static [&'static str], String> {
-    match version {
-        #[cfg(feature = "R4")]
-        FhirVersion::R4 => Ok(helios_fhir::r4::get_compartment_params(
-            compartment_type,
-            resource_type,
-        )),
-        #[cfg(feature = "R4B")]
-        FhirVersion::R4B => Ok(helios_fhir::r4b::get_compartment_params(
-            compartment_type,
-            resource_type,
-        )),
-        #[cfg(feature = "R5")]
-        FhirVersion::R5 => Ok(helios_fhir::r5::get_compartment_params(
-            compartment_type,
-            resource_type,
-        )),
-        #[cfg(feature = "R6")]
-        FhirVersion::R6 => Ok(helios_fhir::r6::get_compartment_params(
-            compartment_type,
-            resource_type,
-        )),
-        #[allow(unreachable_patterns)]
-        _ => Err(format!(
-            "FHIR version {:?} is not enabled in this build",
-            version
-        )),
-    }
+    Ok(helios_fhir::compartment_params(
+        version,
+        compartment_type,
+        resource_type,
+    ))
 }
 
 /// Handler for compartment search.

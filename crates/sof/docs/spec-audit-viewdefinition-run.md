@@ -45,7 +45,7 @@ closed many gaps; those that remain are listed below.
   Spec's "SHOULD emit OperationOutcome when group target is absent"
   remains as audit item #5.
 
-## 3. Patient-compartment filter — **FIXED**
+## 3. Patient-compartment filter — **FIXED** (all three paths)
 - **Spec:** "Server SHALL NOT return resources from patient compartments
   outside provided list."
 - **Before:** `crates/sof/src/lib.rs::filter_resources_by_patient_and_group`
@@ -66,12 +66,25 @@ closed many gaps; those that remain are listed below.
   expression and matches the resulting `Reference`(s) against the
   requested patient set. Group filtering resolves `member.entity`
   Patient references and unions them in.
-- **Zero runtime data-file dependency:** the tables live in the
-  compiled `helios_fhir` binary, so `sof-server` (Docker image with
-  `include_data: false`) and any test invocation (regardless of CWD)
-  get spec-correct compartment filtering. The earlier
-  `default_search_param_registry`/`OnceLock`/`HFS_DATA_DIR` lazy-load
-  was deleted.
+- **Zero runtime data-file dependency for the inline path:** the tables
+  live in the compiled `helios_fhir` binary, so `sof-server` (Docker
+  image with `include_data: false`) and any test invocation (regardless
+  of CWD) get spec-correct compartment filtering on the inline path.
+  The earlier `default_search_param_registry`/`OnceLock`/`HFS_DATA_DIR`
+  lazy-load was deleted.
+- **Runner path (HFS in-DB SOF runner)** — separately fixed for both
+  SQLite and Postgres backends. The hand-rolled
+  `(subject|patient)` JSON-path WHERE clause was replaced with an
+  `EXISTS (SELECT 1 FROM search_index ...)` clause driven by the new
+  `helios_fhir::compartment_params(version, compartment, resource_type)`
+  helper. The runner reads pre-evaluated values populated by the
+  SearchParameter extractor at resource-write time — same source data
+  the compile-time `get_compartment_param_expressions` tables come
+  from, just baked into a different shape (DB index vs static table)
+  for the storage-backed case. Group filtering now does a spec-correct
+  Group→Patient member resolution (mirroring
+  `helios_sof::resolve_group_members_to_patient_refs` from the inline
+  path) before applying the patient compartment filter.
 - **Refactor side-effect:** `SearchParameterRegistry` / loader / status
   enums moved from `helios-persistence` to `helios-fhir` (foundational)
   so `helios-sof` could use them without a circular dep. The persistence

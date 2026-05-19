@@ -1438,6 +1438,43 @@ pub mod search;
 // Re-export commonly used types from parameters module
 pub use parameters::{ParameterValueAccessor, VersionIndependentParameters};
 
+/// Returns the search-parameter NAMES that link `resource_type` to the
+/// named compartment (e.g. `"Patient"`, `"Group"`, `"Encounter"`,
+/// `"Practitioner"`, `"RelatedPerson"`, `"Device"`), for the specified
+/// FHIR version.
+///
+/// Thin version-dispatching wrapper around the per-version code-generated
+/// `get_compartment_params`. Returns an empty slice when the resource
+/// type is not a member of the named compartment.
+///
+/// Used by:
+/// - REST compartment-search handler (`/Patient/{id}/Observation` style URLs)
+///   to know which search params to feed into the search-index query.
+/// - SoF in-DB runners to filter `$viewdefinition-run` results by patient /
+///   group membership.
+///
+/// Pair this with [`compartment_expressions`] when you need the FHIRPath
+/// expressions themselves (e.g. for in-process FHIRPath evaluation against
+/// raw JSON, as `helios_sof::compartment` does).
+#[allow(unreachable_patterns)]
+pub fn compartment_params(
+    version: FhirVersion,
+    compartment_type: &str,
+    resource_type: &str,
+) -> &'static [&'static str] {
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => r4::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => r4b::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => r5::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => r6::get_compartment_params(compartment_type, resource_type),
+        _ => &[],
+    }
+}
+
 // Internal helpers used by the derive macro; not part of the public API
 #[doc(hidden)]
 /// Multi-version FHIR resource container supporting version-agnostic operations.

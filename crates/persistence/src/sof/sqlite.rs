@@ -62,7 +62,7 @@ impl SofRunner for SqliteInDbRunner {
         &self,
         tenant: &TenantContext,
         view_definition: Value,
-        filters: ViewFilters,
+        mut filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
         // Compile synchronously (cheap, no I/O)
         let compiled = compile_view_definition_dialect(
@@ -84,6 +84,22 @@ impl SofRunner for SqliteInDbRunner {
             .unwrap_or("")
             .to_string();
 
+        // Spec-correct `group` handling: resolve each Group/{id} to its
+        // `member.entity` Patient references and fold them into the patient
+        // filter, mirroring the inline path's behavior. Group resolution
+        // is an extra DB read per group ref; once done we clear the
+        // group_refs so build_sqlite_sql doesn't double-apply.
+        if !filters.group.is_empty() {
+            let resolved =
+                resolve_group_refs_to_patient_refs(&self.pool, &tenant_id, &filters.group)?;
+            for p in resolved {
+                if !filters.patient.iter().any(|existing| existing == &p) {
+                    filters.patient.push(p);
+                }
+            }
+            filters.group.clear();
+        }
+
         let limit = filters.limit;
         let columns = compiled.columns.clone();
         let pool = self.pool.clone();
@@ -91,7 +107,13 @@ impl SofRunner for SqliteInDbRunner {
         // Inject runtime filter conditions (since, patient/group). The
         // compiled query already reserves `?3..?N` for ViewDefinition
         // constants; runtime filters allocate from the next free slot.
-        let (sql, extra_params) = build_sqlite_sql(&compiled.sql, &compiled.constants, &filters);
+        let (sql, extra_params) = build_sqlite_sql(
+            &compiled.sql,
+            &compiled.constants,
+            &filters,
+            self.fhir_version,
+            &resource_type,
+        );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
 
@@ -112,6 +134,55 @@ impl SofRunner for SqliteInDbRunner {
     }
 }
 
+/// Loads each `Group/{id}` from the `resources` table and extracts its
+/// `member.entity` Patient references via the shared
+/// [`helios_sof::resolve_group_members_to_patient_refs`]. Returns the
+/// union of those Patient refs across all supplied group refs. Unknown
+/// groups are silently skipped (matches the inline path; absent-target
+/// warning is audit item #5).
+fn resolve_group_refs_to_patient_refs(
+    pool: &Pool<SqliteConnectionManager>,
+    tenant_id: &str,
+    group_refs: &[String],
+) -> Result<Vec<String>, SofError> {
+    if group_refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = pool
+        .get()
+        .map_err(|e| SofError::Storage(format!("failed to get sqlite connection: {e}")))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT data FROM resources \
+             WHERE tenant_id = ?1 \
+               AND resource_type = 'Group' \
+               AND id = ?2 \
+               AND is_deleted = 0",
+        )
+        .map_err(|e| SofError::Storage(format!("prepare failed: {e}")))?;
+
+    let mut groups = Vec::with_capacity(group_refs.len());
+    for r in group_refs {
+        let id = r.strip_prefix("Group/").unwrap_or(r);
+        let res: rusqlite::Result<Vec<u8>> = stmt.query_row([tenant_id, id], |row| row.get(0));
+        match res {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(v) => groups.push(v),
+                Err(_) => continue,
+            },
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(e) => {
+                return Err(SofError::Storage(format!(
+                    "group lookup failed for {r}: {e}"
+                )));
+            }
+        }
+    }
+
+    let set = helios_sof::resolve_group_members_to_patient_refs(group_refs, &groups);
+    Ok(set.into_iter().collect())
+}
+
 // ============================================================================
 // SQL runtime-filter injection
 // ============================================================================
@@ -128,6 +199,8 @@ fn build_sqlite_sql(
     base_sql: &str,
     constants: &[super::ir::LitValue],
     filters: &ViewFilters,
+    fhir_version: FhirVersion,
+    resource_type: &str,
 ) -> (String, Vec<SqliteParam>) {
     let mut conditions: Vec<String> = Vec::new();
     let mut extra_params: Vec<SqliteParam> = constants
@@ -143,31 +216,26 @@ fn build_sqlite_sql(
         next_param += 1;
     }
 
-    if !filters.patient.is_empty() {
-        // Multi-value: OR across all patient references, each checked against
-        // both subject.reference and patient.reference paths.
-        let mut ors: Vec<String> = Vec::with_capacity(filters.patient.len());
-        for patient in &filters.patient {
-            let p = next_param;
-            ors.push(format!(
-                "(json_extract(r.data,'$.subject.reference')=?{p} \
-                 OR json_extract(r.data,'$.patient.reference')=?{p})"
-            ));
-            extra_params.push(SqliteParam::Text(patient.clone()));
-            next_param += 1;
-        }
-        conditions.push(format!("({})", ors.join(" OR ")));
+    if let Some(c) = compartment_filter_sql(
+        fhir_version,
+        "Patient",
+        resource_type,
+        &filters.patient,
+        &mut next_param,
+        &mut extra_params,
+    ) {
+        conditions.push(c);
     }
 
-    if !filters.group.is_empty() {
-        let mut ors: Vec<String> = Vec::with_capacity(filters.group.len());
-        for group in &filters.group {
-            let p = next_param;
-            ors.push(format!("json_extract(r.data,'$.group.reference')=?{p}"));
-            extra_params.push(SqliteParam::Text(group.clone()));
-            next_param += 1;
-        }
-        conditions.push(format!("({})", ors.join(" OR ")));
+    if let Some(c) = compartment_filter_sql(
+        fhir_version,
+        "Group",
+        resource_type,
+        &filters.group,
+        &mut next_param,
+        &mut extra_params,
+    ) {
+        conditions.push(c);
     }
 
     if conditions.is_empty() {
@@ -177,6 +245,98 @@ fn build_sqlite_sql(
     let joined = conditions.join(" AND ");
     let sql = inject_before_order_by(base_sql, &format!(" AND {joined}"));
     (sql, extra_params)
+}
+
+/// Builds a SQLite `WHERE` fragment that filters `r` to resources in the
+/// named compartment of any of `compartment_refs`. Drives the lookup off
+/// the spec's `CompartmentDefinition` via [`helios_fhir::compartment_params`]
+/// and queries the pre-populated `search_index` table — no FHIRPath
+/// evaluation at query time. Returns `None` when there are no compartment
+/// refs to filter by (skip the clause entirely).
+///
+/// Two cases:
+///
+/// 1. **Resource = compartment owner** (e.g. `compartment_type="Patient"`
+///    and `resource_type="Patient"`): match `r.id` against the id portion
+///    of each compartment ref.
+/// 2. **Other resource types**: look up
+///    [`helios_fhir::compartment_params`] to get the linking search-param
+///    names, then emit an `EXISTS (SELECT 1 FROM search_index …)` clause
+///    that joins on `(tenant_id, resource_type, resource_id)` and matches
+///    any of those param names against any of the compartment refs. If
+///    the resource type isn't in the compartment at all, emit `1=0` so
+///    the result set is empty (spec-correct).
+fn compartment_filter_sql(
+    fhir_version: FhirVersion,
+    compartment_type: &str,
+    resource_type: &str,
+    compartment_refs: &[String],
+    next_param: &mut usize,
+    extra_params: &mut Vec<SqliteParam>,
+) -> Option<String> {
+    if compartment_refs.is_empty() {
+        return None;
+    }
+
+    let canonical_prefix = format!("{}/", compartment_type);
+
+    // Case 1: the view's resource is the compartment owner itself.
+    if resource_type == compartment_type {
+        let mut ors: Vec<String> = Vec::with_capacity(compartment_refs.len());
+        for r in compartment_refs {
+            let id = r.strip_prefix(canonical_prefix.as_str()).unwrap_or(r);
+            let p = *next_param;
+            ors.push(format!("r.id = ?{p}"));
+            extra_params.push(SqliteParam::Text(id.to_string()));
+            *next_param += 1;
+        }
+        return Some(format!("({})", ors.join(" OR ")));
+    }
+
+    // Case 2: look up the search-param names that link `resource_type`
+    // to the compartment.
+    let names = helios_fhir::compartment_params(fhir_version, compartment_type, resource_type);
+    if names.is_empty() {
+        // Spec: "Server SHALL NOT return resources from patient compartments
+        // outside provided list." This resource type isn't a member of the
+        // compartment, so no rows can match.
+        return Some("1=0".to_string());
+    }
+
+    let mut name_placeholders = Vec::with_capacity(names.len());
+    for n in names {
+        let p = *next_param;
+        name_placeholders.push(format!("?{p}"));
+        extra_params.push(SqliteParam::Text((*n).to_string()));
+        *next_param += 1;
+    }
+
+    let mut ref_placeholders = Vec::with_capacity(compartment_refs.len());
+    for r in compartment_refs {
+        let canonical = if r.starts_with(canonical_prefix.as_str()) {
+            r.clone()
+        } else {
+            format!("{}{}", canonical_prefix, r)
+        };
+        let p = *next_param;
+        ref_placeholders.push(format!("?{p}"));
+        extra_params.push(SqliteParam::Text(canonical));
+        *next_param += 1;
+    }
+
+    // `?1` and `?2` are tenant_id and resource_type (bound by the outer
+    // query); we reuse them inside the EXISTS subquery so the search_index
+    // join stays tenant-isolated and resource-typed.
+    Some(format!(
+        "EXISTS (SELECT 1 FROM search_index si \
+         WHERE si.tenant_id = ?1 \
+           AND si.resource_type = ?2 \
+           AND si.resource_id = r.id \
+           AND si.param_name IN ({}) \
+           AND si.value_reference IN ({}))",
+        name_placeholders.join(","),
+        ref_placeholders.join(",")
+    ))
 }
 
 /// Inserts `extra` before the trailing `ORDER BY` in `sql`, or appends it.

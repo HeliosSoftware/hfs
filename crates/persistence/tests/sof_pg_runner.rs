@@ -353,6 +353,74 @@ mod sof_pg_runner_tests {
         assert_eq!(count, 2, "limit=2 must return exactly 2 rows");
     }
 
+    /// Runner-path compartment fidelity (audit item #3 closeout for the
+    /// Postgres in-DB runner): an Appointment whose patient link is
+    /// `Appointment.participant.actor` (nested, not top-level
+    /// subject/patient) is correctly included via the search-index
+    /// EXISTS clause. The old hardcoded `subject.reference` /
+    /// `patient.reference` JSONB filter could not see this case.
+    #[tokio::test]
+    async fn test_pg_appointment_compartment_runner() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+
+        let appt_in = json!({
+            "resourceType": "Appointment",
+            "id": "appt-alice",
+            "status": "booked",
+            "participant": [
+                {"actor": {"reference": "Patient/alice"}, "status": "accepted"}
+            ]
+        });
+        let appt_out = json!({
+            "resourceType": "Appointment",
+            "id": "appt-bob",
+            "status": "booked",
+            "participant": [
+                {"actor": {"reference": "Patient/bob"}, "status": "accepted"}
+            ]
+        });
+        for res in [appt_in, appt_out] {
+            backend
+                .create(&tenant, "Appointment", res, FhirVersion::R4)
+                .await
+                .expect("failed to seed appointment");
+        }
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Appointment",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "appt_id"}]}]
+        });
+
+        let runner = backend.sof_runner().expect("must have runner");
+        let mut stream = runner
+            .run_view(
+                &tenant,
+                view,
+                ViewFilters {
+                    patient: vec!["Patient/alice".to_string()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("run_view must succeed");
+
+        let mut ids = Vec::new();
+        while let Some(result) = stream.next().await {
+            let row = result.expect("row must not be an error");
+            if let Some(id) = row.get("appt_id").and_then(|v| v.as_str()) {
+                ids.push(id.to_string());
+            }
+        }
+        assert_eq!(
+            ids,
+            vec!["appt-alice".to_string()],
+            "patient compartment must include alice's Appointment via participant.actor"
+        );
+    }
+
     #[tokio::test]
     async fn test_pg_empty_table_returns_no_rows() {
         let backend = create_backend().await;
