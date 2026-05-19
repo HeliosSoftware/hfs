@@ -191,14 +191,26 @@ closed many gaps; those that remain are listed below.
   one-line change in both `validate_limit` (rest) and the
   corresponding sof-server validator.
 
-## 11. CapabilityStatement gaps (sof-server)
-- Advertises only `"format": ["json"]` despite serving CSV/NDJSON/Parquet
-  on `$viewdefinition-run`. Spec recommends documenting supported output
-  formats.
-- Doesn't advertise the SoF `supportsRelativeReference` /
-  `supportsCanonicalReference` / `supportsAbsoluteReference` capability
-  block (HFS does after `5abc11efc`). For sof-server these would all be
-  `false`, but the absence itself is a gap.
+## 11. CapabilityStatement gaps — **FIXED**
+- **`format` field**: closed in the audit #6/#7 fix.
+  `/metadata` now lists all four MIME types it actually serves
+  (`application/json`, `application/x-ndjson`, `text/csv`,
+  `application/octet-stream`).
+- **SoF `$sql-on-fhir-capabilities` endpoint**: sof-server now exposes
+  `GET /$sql-on-fhir-capabilities` returning a `Parameters` resource
+  that mirrors HFS REST's shape. For a stateless server the truthful
+  values are:
+  - `supportsViewDefinitionRun` = `true`
+  - `supportsViewDefinitionExport` / `supportsSqlQueryRun` /
+    `supportsInDbRunner` = `false` (no export controller, no
+    `$sqlquery-run` endpoint, in-process FHIRPath runner only)
+  - `supportsRelativeReference` / `supportsCanonicalReference` /
+    `supportsAbsoluteReference` = `false` (no resource store →
+    `viewReference` is rejected with 501; the capability block reflects
+    that truthfully so clients don't have to discover it via trial
+    and error)
+  - `supportedFormat` = `ndjson`, `json`, `csv`, `parquet` (the four
+    output formats `$viewdefinition-run` actually emits)
 
 ## 12. Operation canonical URL casing
 - Both impls publish the URL as
@@ -249,7 +261,7 @@ closed many gaps; those that remain are listed below.
 | 3 | Patient-compartment fidelity | High (security/leak) | sof-server (+HFS inline) | **fixed** (this commit) |
 | 2 | `group` 501 vs 400 | Medium (consistency) | sof-server | **fixed** (this commit; via #3) |
 | 6 | System-level route | Medium | sof-server | **fixed** (this commit) |
-| 11 | CapabilityStatement formats + refs block | Medium | sof-server | open |
+| 11 | CapabilityStatement formats + refs block | Medium | sof-server | **fixed** (this commit) |
 | 5 | Absent-target OperationOutcome | Medium (SHOULD) | both | **fixed** (inline paths; runner-path probe is follow-up) |
 | 8 | Parquet MIME | Low | sof-server | **fixed** (this commit) |
 | 14 | `header` rejection on non-CSV | Low | sof-server | open |

@@ -311,6 +311,16 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
     let mut app = Router::new()
         // FHIR endpoints
         .route("/metadata", get(handlers::capability_statement))
+        // SQL-on-FHIR capabilities (audit item #11): the spec-defined
+        // `GET /$sql-on-fhir-capabilities` endpoint returning a Parameters
+        // resource that enumerates which SoF features this server supports.
+        // sof-server is stateless so most of the reference-resolution
+        // capabilities are false; the truthful capability block lets
+        // clients negotiate without trial-and-error.
+        .route(
+            "/$sql-on-fhir-capabilities",
+            get(handlers::sof_capabilities),
+        )
         // Per spec, GET is permitted for simple invocations (no
         // viewResource/resource body). sof-server is stateless and rejects
         // viewReference, so GET will normally surface a 400/501 — but the

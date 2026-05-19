@@ -821,6 +821,49 @@ fn filter_resources_by_since(
     sof_filter_resources_by_since(resources, since).map_err(ServerError::from)
 }
 
+/// `GET /$sql-on-fhir-capabilities`
+///
+/// Returns a FHIR `Parameters` resource describing which SQL-on-FHIR
+/// features this server supports. Shape matches HFS REST's
+/// implementation so clients can use the same response decoder against
+/// either binary. Audit item #11.
+///
+/// sof-server is stateless, so:
+/// - `supportsViewDefinitionRun` = `true`
+/// - `supportsViewDefinitionExport` / `supportsSqlQueryRun` = `false`
+///   (no async export controller, no `$sqlquery-run` endpoint)
+/// - `supportsInDbRunner` = `false` (in-process FHIRPath evaluator only)
+/// - `supportsRelativeReference` / `supportsCanonicalReference` /
+///   `supportsAbsoluteReference` = `false` (no resource store, so
+///   `viewReference` in any shape is rejected with 501 — the
+///   capability block must reflect that truthfully).
+/// - `supportedFormat` = ndjson, json, csv, parquet (the formats the
+///   `$viewdefinition-run` handler actually emits).
+pub async fn sof_capabilities() -> ServerResult<impl IntoResponse> {
+    info!("Handling SQL-on-FHIR capabilities request");
+    let caps = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "supportsViewDefinitionRun", "valueBoolean": true},
+            {"name": "supportsViewDefinitionExport", "valueBoolean": false},
+            {"name": "supportsSqlQueryRun", "valueBoolean": false},
+            {"name": "supportsInDbRunner", "valueBoolean": false},
+            {"name": "supportsRelativeReference", "valueBoolean": false},
+            {"name": "supportsCanonicalReference", "valueBoolean": false},
+            {"name": "supportsAbsoluteReference", "valueBoolean": false},
+            {"name": "supportedFormat", "valueCode": "ndjson"},
+            {"name": "supportedFormat", "valueCode": "json"},
+            {"name": "supportedFormat", "valueCode": "csv"},
+            {"name": "supportedFormat", "valueCode": "parquet"}
+        ]
+    });
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/fhir+json")],
+        Json(caps),
+    ))
+}
+
 /// Handler for instance-level `$viewdefinition-run` URLs
 /// (`/ViewDefinition/{id}/$viewdefinition-run`).
 ///

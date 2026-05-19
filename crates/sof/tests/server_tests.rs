@@ -213,7 +213,11 @@ async fn test_run_view_definition_ndjson_output() {
 
     assert_eq!(response.status_code(), StatusCode::OK);
     let content_type = response.header("content-type");
-    assert_eq!(content_type.to_str().unwrap(), "application/ndjson");
+    // Production NDJSON content-type is `application/x-ndjson` (matches
+    // HFS REST; aligned in the audit #8 sweep). `application/ndjson`
+    // remains a permissive INPUT alias for back-compat, but the OUTPUT
+    // is always the dashed form.
+    assert_eq!(content_type.to_str().unwrap(), "application/x-ndjson");
 
     let ndjson_text = response.text();
     let lines: Vec<&str> = ndjson_text.trim().lines().collect();
@@ -1032,4 +1036,75 @@ async fn test_invalid_view_definition_returns_422() {
     );
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "OperationOutcome");
+}
+
+/// Audit item #11: sof-server publishes the spec-defined
+/// `GET /$sql-on-fhir-capabilities` endpoint with truthful capability
+/// flags (no reference resolution, no export, no $sqlquery-run; all
+/// four `$viewdefinition-run` output formats listed).
+#[tokio::test]
+async fn test_sof_capabilities_endpoint() {
+    let server = common::test_server().await;
+
+    let response = server.get("/$sql-on-fhir-capabilities").await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let content_type = response.header("content-type");
+    assert_eq!(content_type.to_str().unwrap(), "application/fhir+json");
+
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "Parameters");
+
+    let params = json["parameter"].as_array().expect("parameter array");
+
+    // Helper to extract a single boolean by name.
+    let bool_for = |name: &str| -> bool {
+        params
+            .iter()
+            .find(|p| p["name"] == name)
+            .and_then(|p| p["valueBoolean"].as_bool())
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+
+    assert!(
+        bool_for("supportsViewDefinitionRun"),
+        "$viewdefinition-run must be supported"
+    );
+    assert!(
+        !bool_for("supportsViewDefinitionExport"),
+        "stateless sof-server doesn't support $export"
+    );
+    assert!(
+        !bool_for("supportsSqlQueryRun"),
+        "sof-server doesn't expose $sqlquery-run"
+    );
+    assert!(
+        !bool_for("supportsInDbRunner"),
+        "sof-server uses the in-process FHIRPath runner only"
+    );
+    assert!(
+        !bool_for("supportsRelativeReference"),
+        "sof-server has no resource store"
+    );
+    assert!(
+        !bool_for("supportsCanonicalReference"),
+        "sof-server has no resource store"
+    );
+    assert!(
+        !bool_for("supportsAbsoluteReference"),
+        "sof-server has no resource store"
+    );
+
+    // All four $viewdefinition-run output formats must be advertised.
+    let formats: Vec<&str> = params
+        .iter()
+        .filter(|p| p["name"] == "supportedFormat")
+        .filter_map(|p| p["valueCode"].as_str())
+        .collect();
+    for required in ["ndjson", "json", "csv", "parquet"] {
+        assert!(
+            formats.contains(&required),
+            "supportedFormat must include {required}: {formats:?}"
+        );
+    }
 }

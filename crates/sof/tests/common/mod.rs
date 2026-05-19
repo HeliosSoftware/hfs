@@ -29,6 +29,7 @@ fn create_test_app() -> Router {
 
     Router::new()
         .route("/metadata", get(capability_statement_handler))
+        .route("/$sql-on-fhir-capabilities", get(sof_capabilities_handler))
         // System-level alias (audit item #6).
         .route(
             "/$viewdefinition-run",
@@ -104,6 +105,34 @@ async fn capability_statement_handler() -> axum::response::Response {
         axum::http::StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/fhir+json")],
         Json(capability_statement),
+    )
+        .into_response()
+}
+
+/// Stub for the `GET /$sql-on-fhir-capabilities` endpoint (audit item
+/// #11). Mirrors the shape sof-server's production handler emits so
+/// integration tests can exercise the same client-facing response.
+async fn sof_capabilities_handler() -> axum::response::Response {
+    let caps = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "supportsViewDefinitionRun", "valueBoolean": true},
+            {"name": "supportsViewDefinitionExport", "valueBoolean": false},
+            {"name": "supportsSqlQueryRun", "valueBoolean": false},
+            {"name": "supportsInDbRunner", "valueBoolean": false},
+            {"name": "supportsRelativeReference", "valueBoolean": false},
+            {"name": "supportsCanonicalReference", "valueBoolean": false},
+            {"name": "supportsAbsoluteReference", "valueBoolean": false},
+            {"name": "supportedFormat", "valueCode": "ndjson"},
+            {"name": "supportedFormat", "valueCode": "json"},
+            {"name": "supportedFormat", "valueCode": "csv"},
+            {"name": "supportedFormat", "valueCode": "parquet"}
+        ]
+    });
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/fhir+json")],
+        Json(caps),
     )
         .into_response()
 }
