@@ -371,6 +371,57 @@ mod sof_run_tests {
         assert_eq!(rows[0]["family"], "Black");
     }
 
+    /// Audit item #5: a `patient` reference whose target Patient resource
+    /// isn't in the supplied bundle SHOULD produce an OperationOutcome
+    /// warning. We surface it as a `Warning:` HTTP header (RFC 7234 §5.5)
+    /// so the absence signal reaches the client regardless of the
+    /// `_format` output.
+    #[tokio::test]
+    async fn test_inline_run_emits_warning_for_absent_patient_target() {
+        let (server, _backend) = create_test_server().await;
+
+        let view = patient_view_definition();
+        // Supply only Patient/bob, but request Patient/alice (absent).
+        let pt_bob = json!({
+            "resourceType": "Patient",
+            "id": "bob",
+            "name": [{"family": "Bob"}]
+        });
+
+        let parameters_body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "viewResource", "resource": view},
+                {"name": "resource", "resource": pt_bob},
+                {"name": "patient", "valueReference": {"reference": "Patient/alice"}}
+            ]
+        });
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&parameters_body)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let warning_headers: Vec<String> = response
+            .headers()
+            .get_all("warning")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(String::from))
+            .collect();
+        assert!(
+            warning_headers
+                .iter()
+                .any(|w| w.contains("Patient/alice") && w.contains("not found")),
+            "expected a Warning header for absent Patient/alice, got {warning_headers:?}"
+        );
+    }
+
     /// Inline group filtering: a `group=Group/g1` ref resolves against a
     /// `Group` resource in the inline bundle and its `member.entity`
     /// Patient references join the effective patient-compartment set.

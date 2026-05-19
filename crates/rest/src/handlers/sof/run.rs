@@ -487,14 +487,19 @@ where
         split_csv_refs(params.group.as_deref())
     };
 
+    // Track absent-target warnings (audit item #5) to surface as `Warning:`
+    // HTTP headers on the response.
+    let mut filter_warnings: Vec<String> = Vec::new();
     if !patient_refs.is_empty() || !group_refs.is_empty() {
-        resources = filter_resources_by_patient_and_group(
+        let outcome = filter_resources_by_patient_and_group(
             resources,
             &patient_refs,
             &group_refs,
             fhir_version,
         )
         .map_err(map_sof_lib_error_to_rest)?;
+        resources = outcome.resources;
+        filter_warnings.extend(outcome.warnings);
     }
 
     let since = params.since.as_deref().and_then(|s| s.parse().ok());
@@ -529,12 +534,13 @@ where
 
     let (ct_header, response_format) = content_type_headers(content_type);
 
-    Ok(build_response(
+    Ok(build_response_with_warnings(
         StatusCode::OK,
         ct_header,
         body,
         "in-process",
         response_format,
+        &filter_warnings,
     ))
 }
 
@@ -721,6 +727,21 @@ fn build_response(
     runner_label: &str,
     format: &str,
 ) -> Response {
+    build_response_with_warnings(status, content_type, body, runner_label, format, &[])
+}
+
+/// Like [`build_response`] but appends one `Warning:` header per
+/// absent-target message (RFC 7234 §5.5, warn-code 199). Audit item #5
+/// — surfaces `patient` / `group` absence to clients regardless of body
+/// format.
+fn build_response_with_warnings(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+    runner_label: &str,
+    format: &str,
+    warnings: &[String],
+) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(
@@ -732,6 +753,12 @@ fn build_response(
             header::CONTENT_DISPOSITION,
             HeaderValue::from_static("attachment; filename=\"output.parquet\""),
         );
+    }
+    for msg in warnings {
+        let safe = msg.replace('"', "'");
+        if let Ok(v) = HeaderValue::from_str(&format!("199 - \"{}\"", safe)) {
+            headers.append("warning", v);
+        }
     }
     (status, headers, body).into_response()
 }

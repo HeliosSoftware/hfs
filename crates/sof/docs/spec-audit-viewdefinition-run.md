@@ -83,12 +83,24 @@ closed many gaps; those that remain are listed below.
   asymmetric with HFS REST's `split_csv_refs` handling and with `group`
   (which is multi-valued by spec). Worth noting for future-proofing.
 
-## 5. No OperationOutcome warning when `patient` / `group` targets are absent
+## 5. Absent-target warning — **FIXED** (inline paths)
 - **Spec:** "Server SHOULD return OperationOutcome if requested patients
   absent" (same for group).
-- Neither impl checks whether the patient/group ref resolves. Both
-  silently return an empty result set. SHOULD, not SHALL, but it's a
-  real omission.
+- **Before:** neither impl checked whether the patient/group ref
+  resolved. Both silently returned an empty result set.
+- **After:** `filter_resources_by_patient_and_group` now returns a
+  `PatientGroupFilterOutcome { resources, warnings }`. For each
+  `patient` ref whose `Patient/{id}` isn't in the supplied bundle (and
+  each `group` ref whose `Group/{id}` isn't there), a warning string is
+  added. The sof-server handler and HFS REST inline path forward those
+  to the client as `Warning:` HTTP headers (RFC 7234 §5.5, warn-code
+  199 — Miscellaneous warning). The filter still runs and returns
+  partial results; the warning is advisory, not an error.
+- **Scope:** inline paths only (sof-server, HFS REST `execute_view_inline`).
+  The in-DB runner path on HFS doesn't yet probe storage for the
+  requested patient/group, so it can't emit the same warning. That gap
+  is a follow-up — would need a `SearchProvider::read` round-trip per
+  patient/group ref before the runner starts streaming.
 
 ## 6. sof-server has no system-level endpoint
 - **Spec endpoints:**
@@ -186,7 +198,7 @@ closed many gaps; those that remain are listed below.
 | 2 | `group` 501 vs 400 | Medium (consistency) | sof-server | **fixed** (this commit; via #3) |
 | 6 | System-level route | Medium | sof-server | open |
 | 11 | CapabilityStatement formats + refs block | Medium | sof-server | open |
-| 5 | Absent-target OperationOutcome | Medium (SHOULD) | both | open |
+| 5 | Absent-target OperationOutcome | Medium (SHOULD) | both | **fixed** (inline paths; runner-path probe is follow-up) |
 | 8 | Parquet MIME | Low | sof-server | open |
 | 14 | `header` rejection on non-CSV | Low | sof-server | open |
 | 16 | Double-applied `_limit` | Low (perf/CSV-fragile) | sof-server | open |

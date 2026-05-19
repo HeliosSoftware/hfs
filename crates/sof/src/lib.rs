@@ -1065,6 +1065,21 @@ pub fn create_bundle_from_resources_for_version(
     }
 }
 
+/// Result of applying the patient/group filter to a resource list.
+///
+/// `warnings` carries human-readable messages for SoF v2 audit item #5
+/// ("Server SHOULD return OperationOutcome if requested patients absent",
+/// same for `group`). Callers typically surface them as `Warning:` HTTP
+/// headers (RFC 7234 §5.5, warn-code 199) so clients see the absence
+/// signal regardless of output format (CSV/JSON/NDJSON/Parquet).
+#[derive(Debug, Default, Clone)]
+pub struct PatientGroupFilterOutcome {
+    /// Resources that survived the compartment filter.
+    pub resources: Vec<serde_json::Value>,
+    /// Warning messages for absent `patient` / `group` targets.
+    pub warnings: Vec<String>,
+}
+
 /// Filters raw FHIR resource JSON by patient and/or group references using
 /// the FHIR `CompartmentDefinition-patient` spec data.
 ///
@@ -1083,16 +1098,73 @@ pub fn create_bundle_from_resources_for_version(
 /// resulting `Reference`(s) are matched against the requested patient set.
 /// This replaces the prior hand-rolled `(subject|patient)` allowlist
 /// (audit item #3) without any runtime data-file dependency.
+///
+/// Returns a [`PatientGroupFilterOutcome`] containing the filtered
+/// resources plus any `Warning:`-header-bound messages for absent
+/// `patient` / `group` targets (audit item #5).
 pub fn filter_resources_by_patient_and_group(
     resources: Vec<serde_json::Value>,
     patient_refs: &[String],
     group_refs: &[String],
     fhir_version: FhirVersion,
-) -> Result<Vec<serde_json::Value>, SofError> {
+) -> Result<PatientGroupFilterOutcome, SofError> {
     use std::collections::HashSet;
 
     if patient_refs.is_empty() && group_refs.is_empty() {
-        return Ok(resources);
+        return Ok(PatientGroupFilterOutcome {
+            resources,
+            warnings: Vec::new(),
+        });
+    }
+
+    let mut warnings = Vec::new();
+
+    // Absent-target detection (audit item #5): a `patient` / `group`
+    // reference is "absent" when the target resource isn't in the
+    // supplied bundle. We emit a warning per missing reference; the
+    // filter still runs (partial results are fine — the warning is
+    // advisory, not an error).
+    for r in patient_refs {
+        let canonical = if r.starts_with("Patient/") {
+            r.clone()
+        } else {
+            format!("Patient/{}", r)
+        };
+        let id = canonical
+            .strip_prefix("Patient/")
+            .and_then(|s| s.split('/').next());
+        let found = id
+            .map(|id| {
+                resources.iter().any(|res| {
+                    res.get("resourceType").and_then(|v| v.as_str()) == Some("Patient")
+                        && res.get("id").and_then(|v| v.as_str()) == Some(id)
+                })
+            })
+            .unwrap_or(false);
+        if !found {
+            warnings.push(format!("{} not found in supplied resources", canonical));
+        }
+    }
+    for g in group_refs {
+        let canonical = if g.starts_with("Group/") {
+            g.clone()
+        } else {
+            format!("Group/{}", g)
+        };
+        let id = canonical
+            .strip_prefix("Group/")
+            .and_then(|s| s.split('/').next());
+        let found = id
+            .map(|id| {
+                resources.iter().any(|res| {
+                    res.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
+                        && res.get("id").and_then(|v| v.as_str()) == Some(id)
+                })
+            })
+            .unwrap_or(false);
+        if !found {
+            warnings.push(format!("{} not found in supplied resources", canonical));
+        }
     }
 
     // Build the effective patient-compartment set: explicit patient refs +
@@ -1120,7 +1192,10 @@ pub fn filter_resources_by_patient_and_group(
     // Patient members in the bundle) → empty result; mirrors bulk-export
     // behavior for an empty Group.
     if targets.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PatientGroupFilterOutcome {
+            resources: Vec::new(),
+            warnings,
+        });
     }
 
     let mut filtered = Vec::with_capacity(resources.len());
@@ -1148,7 +1223,10 @@ pub fn filter_resources_by_patient_and_group(
         }
     }
 
-    Ok(filtered)
+    Ok(PatientGroupFilterOutcome {
+        resources: filtered,
+        warnings,
+    })
 }
 
 /// Filters raw FHIR resource JSON by their `meta.lastUpdated` timestamp,

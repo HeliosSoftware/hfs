@@ -6,7 +6,7 @@
 use axum::{
     Json,
     extract::Query,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
@@ -188,6 +188,11 @@ pub async fn run_view_definition_handler(
 
     // Apply patient and group filters from body parameters to resources if provided
     let mut filtered_resources = resources_json.unwrap_or_default();
+    // Accumulates absent-target warnings from every filter pass below
+    // (audit item #5). Surfaced as `Warning:` HTTP headers at response
+    // construction time so clients see the absence signal regardless of
+    // output format.
+    let mut filter_warnings: Vec<String> = Vec::new();
 
     // Merge filter parameters from body and query. Body takes precedence
     // when non-empty; otherwise comma-split the query value into the spec's
@@ -279,12 +284,14 @@ pub async fn run_view_definition_handler(
 
             // Apply filters
             if !patient_filter.is_empty() || !group_filter.is_empty() {
-                source_resources = filter_resources_by_patient_and_group(
+                let outcome = filter_resources_by_patient_and_group(
                     source_resources,
                     &patient_filter,
                     &group_filter,
                     source_fhir_version.unwrap(),
                 )?;
+                source_resources = outcome.resources;
+                filter_warnings.extend(outcome.warnings);
             }
 
             if let Some(since) = validated_params.since {
@@ -318,12 +325,14 @@ pub async fn run_view_definition_handler(
     // Apply filters to provided resources
     if !patient_filter.is_empty() || !group_filter.is_empty() {
         let effective_version = source_fhir_version.unwrap_or_else(get_newest_enabled_fhir_version);
-        filtered_resources = filter_resources_by_patient_and_group(
+        let outcome = filter_resources_by_patient_and_group(
             filtered_resources,
             &patient_filter,
             &group_filter,
             effective_version,
         )?;
+        filtered_resources = outcome.resources;
+        filter_warnings.extend(outcome.warnings);
     }
 
     // Apply _since filter if provided
@@ -400,12 +409,14 @@ pub async fn run_view_definition_handler(
                 crate::streaming::stream_single_parquet_response(file_buffers[0].clone())
             } else {
                 // Small file, return directly
-                Ok((
+                let mut response = (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, "application/parquet")],
                     file_buffers[0].clone(),
                 )
-                    .into_response())
+                    .into_response();
+                attach_filter_warnings(response.headers_mut(), &filter_warnings);
+                Ok(response)
             }
         }
     } else {
@@ -429,12 +440,30 @@ pub async fn run_view_definition_handler(
             ContentType::Parquet => "application/parquet",
         };
 
-        Ok((
+        let mut response = (
             StatusCode::OK,
             [(header::CONTENT_TYPE, mime_type)],
             filtered_output,
         )
-            .into_response())
+            .into_response();
+        attach_filter_warnings(response.headers_mut(), &filter_warnings);
+        Ok(response)
+    }
+}
+
+/// Appends one `Warning:` header per absent-target message
+/// (RFC 7234 §5.5, warn-code 199 = Miscellaneous warning). Carries the
+/// `patient` / `group` absence signal from
+/// [`helios_sof::PatientGroupFilterOutcome::warnings`] to the client,
+/// regardless of response body format (audit item #5).
+fn attach_filter_warnings(headers: &mut HeaderMap, warnings: &[String]) {
+    for msg in warnings {
+        // Strip quotes from the message to keep the header value valid;
+        // ASCII control chars would also break `HeaderValue::from_str`.
+        let safe = msg.replace('"', "'");
+        if let Ok(v) = HeaderValue::from_str(&format!("199 - \"{}\"", safe)) {
+            headers.append("warning", v);
+        }
     }
 }
 
@@ -726,7 +755,7 @@ fn filter_resources_by_patient_and_group(
     patient_refs: &[String],
     group_refs: &[String],
     fhir_version: helios_fhir::FhirVersion,
-) -> ServerResult<Vec<serde_json::Value>> {
+) -> ServerResult<helios_sof::PatientGroupFilterOutcome> {
     sof_filter_resources_by_patient_and_group(resources, patient_refs, group_refs, fhir_version)
         .map_err(ServerError::from)
 }
@@ -807,7 +836,7 @@ mod tests {
             }),
         ];
 
-        let filtered = filter_resources_by_patient_and_group(
+        let outcome = filter_resources_by_patient_and_group(
             resources,
             &["Patient/123".to_string()],
             &[],
@@ -815,9 +844,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0]["id"], "123");
-        assert_eq!(filtered[1]["id"], "obs1");
+        assert_eq!(outcome.resources.len(), 2);
+        assert_eq!(outcome.resources[0]["id"], "123");
+        assert_eq!(outcome.resources[1]["id"], "obs1");
+        assert!(
+            outcome.warnings.is_empty(),
+            "Patient/123 is in the bundle; no absent-target warning expected"
+        );
     }
 
     #[cfg(feature = "R4")]
@@ -831,7 +864,7 @@ mod tests {
             "id": "123"
         })];
 
-        let filtered = filter_resources_by_patient_and_group(
+        let outcome = filter_resources_by_patient_and_group(
             resources,
             &[],
             &["Group/test".to_string()],
@@ -839,7 +872,13 @@ mod tests {
         )
         .unwrap();
 
-        assert!(filtered.is_empty());
+        assert!(outcome.resources.is_empty());
+        // Audit item #5: absent group target should produce a warning.
+        assert!(
+            outcome.warnings.iter().any(|w| w.contains("Group/test")),
+            "expected an absent-target warning for Group/test, got {:?}",
+            outcome.warnings
+        );
     }
 
     #[test]
