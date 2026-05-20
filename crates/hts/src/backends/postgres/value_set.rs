@@ -59,71 +59,92 @@ fn closure_count_put(system_id: &str, root_code: &str, count: u32) {
     }
 }
 
-// ── Iter 7m: process-global cache for `?fhir_vs=isa/X` paginated pages ─────
+// ── Iter 7n: process-global per-root prefix cache for `?fhir_vs=isa/X` ─────
 // EX01 issues `GET ?fhir_vs=isa/<root>&_count=N&_offset=M` against a fixed
-// pool of (root, count, offset) combos. The iter-7k closure fast path served
-// each request with two SQL round-trips while holding one of the pool's
-// connections — that capped EX01 at ~316 RPS at vu50 (16 conns × ~50 ms
-// hold). This cache lets a warm request skip pool acquisition entirely,
-// mirroring the `inline_compose_cache` warm-hit path. Per-key memory is
-// bounded by the requested page window (offset + count), so it stays small
-// even for SNOMED roots with ~140 k descendants — unlike caching the full
-// expansion, which iter 7k deliberately rejected.
+// pool of ~6.5k (root, count, offset) combos drawn from only ~100 distinct
+// roots. The iter-7k closure fast path served each request with two SQL
+// round-trips while holding a pool connection — capping EX01 at ~316 RPS at
+// vu50. Iter 7m cached each (root, count, offset) PAGE, but that still paid
+// ~6.5k cold DB queries to warm the pool; SQLite warms in ~100 because it
+// caches per ROOT.
 //
-// Keyed by `fnv64(url | value_set_version | count | offset)`. The value
-// stores the page's `(code, display)` rows plus the descendant `total`;
-// `ExpansionContains` structs are rebuilt on serve. Cleared on import via
-// `clear_response_caches`. Bounded to `CLOSURE_PAGE_CACHE_MAX`.
-pub(super) struct ClosurePage {
+// This cache mirrors SQLite: one entry per `(root, version)` holding a
+// bounded PREFIX of the root's descendant list (ordered by code). Every
+// (count, offset) combo for that root then slices the prefix in memory with
+// no pool connection. Caching only a prefix — not the full ~140k-descendant
+// list iter 7k rejected — keeps memory tiny: the EX01 pool never pages past
+// offset+count ≈ 1500, and [`CLOSURE_PREFIX_LEN`] gives generous headroom.
+//
+// Keyed by `fnv64(url | value_set_version)`. Cleared on import via
+// `clear_response_caches`. Bounded to `CLOSURE_PREFIX_CACHE_MAX`.
+pub(super) struct RootPrefix {
     system: String,
+    /// Total descendant count (closure rows for this ancestor).
     total: u32,
-    rows: Vec<(String, Option<String>)>,
+    /// First `<= CLOSURE_PREFIX_LEN` descendants as `(code, display)`,
+    /// ordered by code — the same order the cold SQL `ORDER BY` produces.
+    prefix: Vec<(String, Option<String>)>,
+    /// True when `prefix` holds *every* descendant (`total <= prefix.len()`).
+    complete: bool,
 }
 
-static CLOSURE_PAGE_CACHE: OnceLock<Arc<RwLock<HashMap<u64, Arc<ClosurePage>>>>> = OnceLock::new();
+/// How many leading descendants to cache per root. The EX01 benchmark pool
+/// never requests past `offset 500 + count 1000`; 4096 leaves headroom for
+/// other callers while keeping the cold prefix fetch and memory bounded.
+const CLOSURE_PREFIX_LEN: usize = 4096;
 
-pub(super) fn closure_page_cache() -> &'static Arc<RwLock<HashMap<u64, Arc<ClosurePage>>>> {
-    CLOSURE_PAGE_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+static CLOSURE_PREFIX_CACHE: OnceLock<Arc<RwLock<HashMap<u64, Arc<RootPrefix>>>>> =
+    OnceLock::new();
+
+pub(super) fn root_prefix_cache() -> &'static Arc<RwLock<HashMap<u64, Arc<RootPrefix>>>> {
+    CLOSURE_PREFIX_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
 }
 
-const CLOSURE_PAGE_CACHE_MAX: usize = 16384;
+const CLOSURE_PREFIX_CACHE_MAX: usize = 16384;
 
-fn closure_page_get(key: u64) -> Option<Arc<ClosurePage>> {
-    closure_page_cache().read().ok()?.get(&key).cloned()
+fn root_prefix_get(key: u64) -> Option<Arc<RootPrefix>> {
+    root_prefix_cache().read().ok()?.get(&key).cloned()
 }
 
-fn closure_page_put(key: u64, page: Arc<ClosurePage>) {
-    if let Ok(mut g) = closure_page_cache().write() {
-        if g.len() >= CLOSURE_PAGE_CACHE_MAX {
+fn root_prefix_put(key: u64, rp: Arc<RootPrefix>) {
+    if let Ok(mut g) = root_prefix_cache().write() {
+        if g.len() >= CLOSURE_PREFIX_CACHE_MAX {
             return;
         }
-        g.insert(key, page);
+        g.insert(key, rp);
     }
 }
 
-/// Cache key for a `?fhir_vs=isa/X` paginated page — folds the URL, the
-/// optional value-set version pin, and the page window (count, offset).
-fn build_closure_page_key(
-    url: &str,
-    value_set_version: Option<&str>,
-    count: u32,
-    offset: u32,
-) -> u64 {
-    let canonical = format!(
-        "closure-page|{url}|{}|{count}|{offset}",
-        value_set_version.unwrap_or(""),
-    );
+/// Cache key for a `?fhir_vs=isa/X` root prefix — folds the URL and the
+/// optional value-set version pin (count / offset are post-cache slicing
+/// knobs and are NOT part of the key).
+fn build_root_prefix_key(url: &str, value_set_version: Option<&str>) -> u64 {
+    let canonical = format!("root-prefix|{url}|{}", value_set_version.unwrap_or(""));
     fnv64(canonical.as_bytes())
 }
 
-/// Rebuild an [`ExpandResponse`] from a cached [`ClosurePage`]. The cached
-/// rows are already the requested window, so no further slicing is applied.
-fn serve_closure_page(page: &ClosurePage, offset: Option<u32>) -> ExpandResponse {
-    let contains = page
-        .rows
+/// Slice the `[offset, offset + count)` window out of a cached root prefix.
+/// Returns `None` when the window extends past the cached prefix and the
+/// prefix is not known-complete — the caller must then fall through to a DB
+/// query (the EX01 pool never triggers this).
+fn serve_root_prefix(
+    rp: &RootPrefix,
+    offset: u32,
+    count: u32,
+    req_offset: Option<u32>,
+) -> Option<ExpandResponse> {
+    let off = offset as usize;
+    let end = off.saturating_add(count as usize);
+    if !rp.complete && end > rp.prefix.len() {
+        return None;
+    }
+    let contains = rp
+        .prefix
         .iter()
+        .skip(off)
+        .take(count as usize)
         .map(|(code, display)| ExpansionContains {
-            system: page.system.clone(),
+            system: rp.system.clone(),
             version: None,
             code: code.clone(),
             display: display.clone(),
@@ -135,12 +156,12 @@ fn serve_closure_page(page: &ClosurePage, offset: Option<u32>) -> ExpandResponse
             contains: vec![],
         })
         .collect();
-    ExpandResponse {
-        total: Some(page.total),
-        offset,
+    Some(ExpandResponse {
+        total: Some(rp.total),
+        offset: req_offset,
         contains,
         warnings: vec![],
-    }
+    })
 }
 
 #[async_trait]
@@ -227,12 +248,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             }
         }
 
-        // ── Closure-page warm-hit fast path (EX01) ───────────────────────
-        // `?fhir_vs=isa/X` paginated pages are cached by (url, count,
-        // offset); a warm hit returns without ever acquiring a pool
-        // connection. The gate matches the iter-7k closure fast path that
-        // populates the cache, so a cached page is always semantically
-        // valid for the request being served.
+        // ── Root-prefix warm-hit fast path (EX01) ────────────────────────
+        // `?fhir_vs=isa/X` descendant prefixes are cached per root; a warm
+        // hit slices the requested (count, offset) window in memory and
+        // returns without ever acquiring a pool connection. The gate matches
+        // the iter-7k closure fast path that populates the cache, so a
+        // cached prefix is always semantically valid for the request.
         if let Some(url) = req.url.as_deref() {
             if let Some(count) = req.count.filter(|&c| c > 0) {
                 if req.filter.is_none()
@@ -242,14 +263,16 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     && req.default_value_set_versions.is_empty()
                     && req.tx_resources.is_empty()
                 {
-                    let page_key = build_closure_page_key(
-                        url,
-                        req.value_set_version.as_deref(),
-                        count,
-                        req.offset.unwrap_or(0),
-                    );
-                    if let Some(page) = closure_page_get(page_key) {
-                        return Ok(serve_closure_page(&page, req.offset));
+                    let key = build_root_prefix_key(url, req.value_set_version.as_deref());
+                    if let Some(rp) = root_prefix_get(key) {
+                        if let Some(resp) = serve_root_prefix(
+                            &rp,
+                            req.offset.unwrap_or(0),
+                            count,
+                            req.offset,
+                        ) {
+                            return Ok(resp);
+                        }
                     }
                 }
             }
@@ -344,20 +367,42 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         FhirVsPattern::IsA(c) => c.clone(),
                         _ => unreachable!(),
                     };
-                    let limit = i64::from(req.count.unwrap());
-                    let offset = i64::from(req.offset.unwrap_or(0));
 
-                    // 1) Total count for `ExpandResponse.total` — the bench
-                    //    asserts this matches the descendant cardinality.
-                    //    Iter 7k+: memoise the COUNT process-wide. The query
-                    //    is invariant for the import lifetime and was the
-                    //    per-request bottleneck (~50-100 ms for ~140 k SNOMED
-                    //    descendants). Cache populates only from the actual
-                    //    query result — never from estimates — so the cached
-                    //    `total` is bit-exact w.r.t. the COUNT.
-                    let total: u32 = if let Some(c) =
-                        closure_count_get(&system_id, &root_code)
-                    {
+                    // Iter 7n: fetch the root's descendant PREFIX once (PK
+                    // index-order scan, no sort — `ORDER BY descendant_code`
+                    // mirrors `apply_compose_filters_pg`'s code-sorted
+                    // output). One extra row probes whether the prefix holds
+                    // the whole expansion; if so we skip the COUNT(*)
+                    // entirely. Every (count, offset) combo for this root
+                    // then serves warm from the cached prefix.
+                    let prefix_limit = (CLOSURE_PREFIX_LEN as i64) + 1;
+                    let rows = client
+                        .query(
+                            "SELECT cc.descendant_code, c.display
+                               FROM concept_closure cc
+                               JOIN concepts c
+                                 ON c.system_id = $1 AND c.code = cc.descendant_code
+                              WHERE cc.system_id = $1 AND cc.ancestor_code = $2
+                              ORDER BY cc.descendant_code
+                              LIMIT $3",
+                            &[&system_id, &root_code, &prefix_limit],
+                        )
+                        .await
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                    let complete = rows.len() <= CLOSURE_PREFIX_LEN;
+                    let prefix: Vec<(String, Option<String>)> = rows
+                        .into_iter()
+                        .take(CLOSURE_PREFIX_LEN)
+                        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+                        .collect();
+
+                    // Total for `ExpandResponse.total`: free when the prefix
+                    // is complete; otherwise the process-wide memoised
+                    // COUNT(*) (invariant for the import lifetime).
+                    let total: u32 = if complete {
+                        prefix.len() as u32
+                    } else if let Some(c) = closure_count_get(&system_id, &root_code) {
                         c
                     } else {
                         let total_row = client
@@ -369,53 +414,31 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             .await
                             .map_err(|e| HtsError::StorageError(e.to_string()))?;
                         let c: i64 = total_row.get(0);
-                        let c = c.max(0) as u32;
-                        closure_count_put(&system_id, &root_code, c);
-                        c
+                        c.max(0) as u32
                     };
+                    closure_count_put(&system_id, &root_code, total);
 
-                    // 2) Paginated page — PK index-order scan, no sort.
-                    //    ORDER BY descendant_code mirrors
-                    //    `apply_compose_filters_pg`'s
-                    //    `out.sort_by(|a,b| a.code.cmp(&b.code))` so the
-                    //    serve order matches the cached path semantically.
-                    let rows = client
-                        .query(
-                            "SELECT cc.descendant_code, c.display
-                               FROM concept_closure cc
-                               JOIN concepts c
-                                 ON c.system_id = $1 AND c.code = cc.descendant_code
-                              WHERE cc.system_id = $1 AND cc.ancestor_code = $2
-                              ORDER BY cc.descendant_code
-                              LIMIT $3 OFFSET $4",
-                            &[&system_id, &root_code, &limit, &offset],
-                        )
-                        .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-                    // Iter 7m: stash the page so subsequent identical
-                    // (url, count, offset) requests serve from memory
-                    // without acquiring a pool connection.
-                    let page = Arc::new(ClosurePage {
+                    let rp = Arc::new(RootPrefix {
                         system: cs_url.clone(),
                         total,
-                        rows: rows
-                            .into_iter()
-                            .map(|r| {
-                                (r.get::<_, String>(0), r.get::<_, Option<String>>(1))
-                            })
-                            .collect(),
+                        prefix,
+                        complete,
                     });
-                    closure_page_put(
-                        build_closure_page_key(
-                            url,
-                            req.value_set_version.as_deref(),
-                            req.count.unwrap(),
-                            req.offset.unwrap_or(0),
-                        ),
-                        Arc::clone(&page),
+                    root_prefix_put(
+                        build_root_prefix_key(url, req.value_set_version.as_deref()),
+                        Arc::clone(&rp),
                     );
-                    return Ok(serve_closure_page(&page, req.offset));
+
+                    if let Some(resp) = serve_root_prefix(
+                        &rp,
+                        req.offset.unwrap_or(0),
+                        req.count.unwrap(),
+                        req.offset,
+                    ) {
+                        return Ok(resp);
+                    }
+                    // Requested window lies past the cached prefix — fall
+                    // through to the compute path below (EX01 never does).
                 }
 
                 // Single-flight cache check — keyed by URL + version pins. EX01
