@@ -33,9 +33,9 @@ use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    collect_canonical_params, extract_codeable_concept, extract_coding_full,
-    extract_parameter_array, find_resource_param, find_str_param, parse_query_string,
-    query_params_to_fhir_params,
+    collect_canonical_params, collect_resource_params, extract_codeable_concept,
+    extract_coding_full, extract_parameter_array, find_resource_param, find_str_param,
+    parse_query_string, query_params_to_fhir_params,
 };
 
 /// Identifies which FHIR `$validate-code` input form the operations layer is
@@ -3225,6 +3225,94 @@ fn apply_check_version_failure(
 /// `not-found / Unable_to_resolve_value_Set_` issue when an import cannot
 /// be resolved — this helper drives the early-exit detection in
 /// `process_vs_validate_code`.
+/// Inline-VS variant of [`detect_bad_vs_import`]. Takes the VS body directly
+/// (typically a tx-resource shadow) and walks its `compose.include[].valueSet[]`
+/// looking for unresolvable imports. An import is unresolvable when:
+///   1. The URL doesn't exist in the backend store, AND
+///   2. The URL isn't supplied as another `tx-resource` ValueSet in the request.
+///
+/// Returns the first unresolvable URL (formatted with `|version` when a pin is
+/// in effect) so the operations layer can emit the IG-spec
+/// `Unable_to_resolve_value_Set_` issue. Mirrors the detection logic of
+/// [`detect_bad_vs_import`] but skips the initial backend lookup of the main
+/// VS — the caller already has its body in hand.
+async fn detect_bad_vs_import_inline<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    vs_body: &Value,
+    tx_resources: &[Value],
+    default_vs_versions: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let includes = vs_body
+        .get("compose")
+        .and_then(|c| c.get("include"))
+        .and_then(|v| v.as_array())?;
+    for inc in includes {
+        let imports = match inc.get("valueSet").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        for imp in imports {
+            let canonical = match imp.as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            // `#fragment` refs are contained-VS — they're resolved against the
+            // VS's own `contained[]` array, not via search. Skip them.
+            if canonical.starts_with('#') {
+                continue;
+            }
+            let (bare_url, ver) = match canonical.split_once('|') {
+                Some((u, v)) => (u, Some(v.to_string())),
+                None => (canonical, None),
+            };
+            let (lookup_ver, reported) = match (ver, default_vs_versions.get(bare_url)) {
+                (Some(v), _) => {
+                    let r = format!("{bare_url}|{v}");
+                    (Some(v), r)
+                }
+                (None, Some(default_v)) => {
+                    let r = format!("{bare_url}|{default_v}");
+                    (Some(default_v.clone()), r)
+                }
+                (None, None) => (None, bare_url.to_string()),
+            };
+            let in_backend = crate::traits::ValueSetOperations::search(
+                backend,
+                ctx,
+                crate::types::ResourceSearchQuery {
+                    url: Some(bare_url.to_string()),
+                    version: lookup_ver.clone(),
+                    count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|hs| !hs.is_empty())
+            .unwrap_or(false);
+            if in_backend {
+                continue;
+            }
+            let in_tx = tx_resources.iter().any(|r| {
+                if r.get("resourceType").and_then(|v| v.as_str()) != Some("ValueSet") {
+                    return false;
+                }
+                if r.get("url").and_then(|v| v.as_str()) != Some(bare_url) {
+                    return false;
+                }
+                match lookup_ver.as_deref() {
+                    Some(want) => r.get("version").and_then(|v| v.as_str()) == Some(want),
+                    None => true,
+                }
+            });
+            if !in_tx {
+                return Some(reported);
+            }
+        }
+    }
+    None
+}
+
 async fn detect_bad_vs_import<B: TerminologyBackend>(
     backend: &B,
     ctx: &TenantContext,
@@ -3771,6 +3859,131 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     })?;
 
     let ctx = TenantContext::system();
+
+    // tx-resource fallback for URL-based requests: when the backend has NO
+    // stored ValueSet for this URL but the caller supplied one as a
+    // `tx-resource`, promote that body to the inline-VS validator. This is
+    // strictly a fallback — when the URL IS in the store, the backend path
+    // wins, preserving every existing passing URL-based test.
+    //
+    // Drives the IG `validation/validation-simple-*-bad-import`,
+    // `validation/validation-contained-good`, and `deprecated/withdrawn-validate`
+    // fixtures, which never store the test VS in the DB and rely on the
+    // tx-resource being used for resolution.
+    {
+        let bare_url = url.split_once('|').map(|(u, _)| u).unwrap_or(&url);
+        let pipe_ver = url.split_once('|').map(|(_, v)| v.to_string());
+        let want_ver = pipe_ver
+            .clone()
+            .or_else(|| find_str_param(&params, "valueSetVersion"));
+        let backend_has_vs = ValueSetOperations::search(
+            state.backend(),
+            &ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some(bare_url.to_string()),
+                version: want_ver.clone(),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|hs| !hs.is_empty())
+        .unwrap_or(false);
+        if !backend_has_vs {
+            let tx_resources = collect_resource_params(&params, "tx-resource");
+            let inline_match = tx_resources.into_iter().find(|r| {
+                if r.get("resourceType").and_then(|v| v.as_str()) != Some("ValueSet")
+                    || r.get("url").and_then(|v| v.as_str()) != Some(bare_url)
+                {
+                    return false;
+                }
+                match want_ver.as_deref() {
+                    Some(want) => r.get("version").and_then(|v| v.as_str()) == Some(want),
+                    None => true,
+                }
+            });
+            if let Some(vs) = inline_match {
+                // Before handing off to the inline-VS validator, run the
+                // bad-import detector against the tx-resource VS body. The
+                // IG `validation/validation-simple-*-bad-import` fixtures
+                // expect an `Unable_to_resolve_value_Set_` issue when the
+                // tx-resource VS imports a URL that isn't in the backend
+                // and isn't in the supplied tx-resources either.
+                // process_inline_vs_validate_code only does the
+                // expand-then-membership-check flow which silently drops
+                // unresolved imports, so we'd otherwise return a
+                // not-in-vs error instead of the IG-pinned not-found one.
+                let default_vs_pin_pairs: Vec<(String, String)> =
+                    collect_canonical_params(&params, "default-valueset-version");
+                let default_vs_pins: std::collections::HashMap<String, String> =
+                    default_vs_pin_pairs.iter().cloned().collect();
+                let tx_resources_for_detect = collect_resource_params(&params, "tx-resource");
+                if let Some(unresolved_vs_url) = detect_bad_vs_import_inline(
+                    state.backend(),
+                    &ctx,
+                    &vs,
+                    &tx_resources_for_detect,
+                    &default_vs_pins,
+                )
+                .await
+                {
+                    let cc_value = params
+                        .iter()
+                        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
+                        .and_then(|p| p.get("valueCodeableConcept"))
+                        .cloned();
+                    let req_path = if extract_codeable_concept(&params, "codeableConcept").is_some() {
+                        RequestPath::CodeableConcept
+                    } else if extract_coding_full(&params, "coding").is_some() {
+                        RequestPath::Coding
+                    } else {
+                        RequestPath::BareCode
+                    };
+                    let text = format!(
+                        "A definition for the value Set '{unresolved_vs_url}' could not be found"
+                    );
+                    let issue = ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "not-found".into(),
+                        tx_code: "not-found".into(),
+                        text,
+                        expression: None,
+                        location: None,
+                        message_id: Some("Unable_to_resolve_value_Set_".into()),
+                    };
+                    // Surface message via the response struct's `message`
+                    // field — build_validate_response emits it as the
+                    // top-level `message` Parameters entry. Setting it here
+                    // (rather than appending after) keeps single emission.
+                    let text_for_msg = format!(
+                        "A definition for the value Set '{unresolved_vs_url}' could not be found"
+                    );
+                    let value = build_validate_response(
+                        ValidateCodeResponse {
+                            result: false,
+                            message: Some(text_for_msg),
+                            display: None,
+                            system: None,
+                            cs_version: None,
+                            inactive: None,
+                            issues: vec![issue],
+                            caused_by_unknown_system: None,
+                            concept_status: None,
+                            normalized_code: None,
+                        },
+                        find_str_param(&params, "code").as_deref(),
+                        find_str_param(&params, "system").as_deref(),
+                        None,
+                        cc_value.as_ref(),
+                        None,
+                        req_path,
+                    );
+                    return Ok(value);
+                }
+                return process_inline_vs_validate_code(state, params, vs).await;
+            }
+        }
+    }
     // The IG `display/`, `language2/`, and parts of `validation/` test groups
     // pin the response display + invalid-display issue text against the
     // requested `displayLanguage` parameter. Pulled here so all three input
