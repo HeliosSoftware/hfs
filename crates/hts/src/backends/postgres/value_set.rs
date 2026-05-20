@@ -59,6 +59,90 @@ fn closure_count_put(system_id: &str, root_code: &str, count: u32) {
     }
 }
 
+// ── Iter 7m: process-global cache for `?fhir_vs=isa/X` paginated pages ─────
+// EX01 issues `GET ?fhir_vs=isa/<root>&_count=N&_offset=M` against a fixed
+// pool of (root, count, offset) combos. The iter-7k closure fast path served
+// each request with two SQL round-trips while holding one of the pool's
+// connections — that capped EX01 at ~316 RPS at vu50 (16 conns × ~50 ms
+// hold). This cache lets a warm request skip pool acquisition entirely,
+// mirroring the `inline_compose_cache` warm-hit path. Per-key memory is
+// bounded by the requested page window (offset + count), so it stays small
+// even for SNOMED roots with ~140 k descendants — unlike caching the full
+// expansion, which iter 7k deliberately rejected.
+//
+// Keyed by `fnv64(url | value_set_version | count | offset)`. The value
+// stores the page's `(code, display)` rows plus the descendant `total`;
+// `ExpansionContains` structs are rebuilt on serve. Cleared on import via
+// `clear_response_caches`. Bounded to `CLOSURE_PAGE_CACHE_MAX`.
+pub(super) struct ClosurePage {
+    system: String,
+    total: u32,
+    rows: Vec<(String, Option<String>)>,
+}
+
+static CLOSURE_PAGE_CACHE: OnceLock<Arc<RwLock<HashMap<u64, Arc<ClosurePage>>>>> = OnceLock::new();
+
+pub(super) fn closure_page_cache() -> &'static Arc<RwLock<HashMap<u64, Arc<ClosurePage>>>> {
+    CLOSURE_PAGE_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+const CLOSURE_PAGE_CACHE_MAX: usize = 16384;
+
+fn closure_page_get(key: u64) -> Option<Arc<ClosurePage>> {
+    closure_page_cache().read().ok()?.get(&key).cloned()
+}
+
+fn closure_page_put(key: u64, page: Arc<ClosurePage>) {
+    if let Ok(mut g) = closure_page_cache().write() {
+        if g.len() >= CLOSURE_PAGE_CACHE_MAX {
+            return;
+        }
+        g.insert(key, page);
+    }
+}
+
+/// Cache key for a `?fhir_vs=isa/X` paginated page — folds the URL, the
+/// optional value-set version pin, and the page window (count, offset).
+fn build_closure_page_key(
+    url: &str,
+    value_set_version: Option<&str>,
+    count: u32,
+    offset: u32,
+) -> u64 {
+    let canonical = format!(
+        "closure-page|{url}|{}|{count}|{offset}",
+        value_set_version.unwrap_or(""),
+    );
+    fnv64(canonical.as_bytes())
+}
+
+/// Rebuild an [`ExpandResponse`] from a cached [`ClosurePage`]. The cached
+/// rows are already the requested window, so no further slicing is applied.
+fn serve_closure_page(page: &ClosurePage, offset: Option<u32>) -> ExpandResponse {
+    let contains = page
+        .rows
+        .iter()
+        .map(|(code, display)| ExpansionContains {
+            system: page.system.clone(),
+            version: None,
+            code: code.clone(),
+            display: display.clone(),
+            is_abstract: None,
+            inactive: None,
+            designations: vec![],
+            properties: vec![],
+            extensions: vec![],
+            contains: vec![],
+        })
+        .collect();
+    ExpandResponse {
+        total: Some(page.total),
+        offset,
+        contains,
+        warnings: vec![],
+    }
+}
+
 #[async_trait]
 impl ValueSetOperations for PostgresTerminologyBackend {
     async fn expand(
@@ -140,6 +224,34 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         if let Some(k) = warm_cache_key {
             if let Some(arc) = cache_get_initialized(&self.inline_compose_cache, k) {
                 return Ok(serve_from_cached(&arc, &req));
+            }
+        }
+
+        // ── Closure-page warm-hit fast path (EX01) ───────────────────────
+        // `?fhir_vs=isa/X` paginated pages are cached by (url, count,
+        // offset); a warm hit returns without ever acquiring a pool
+        // connection. The gate matches the iter-7k closure fast path that
+        // populates the cache, so a cached page is always semantically
+        // valid for the request being served.
+        if let Some(url) = req.url.as_deref() {
+            if let Some(count) = req.count.filter(|&c| c > 0) {
+                if req.filter.is_none()
+                    && req.hierarchical != Some(true)
+                    && req.force_system_versions.is_empty()
+                    && req.system_version_defaults.is_empty()
+                    && req.default_value_set_versions.is_empty()
+                    && req.tx_resources.is_empty()
+                {
+                    let page_key = build_closure_page_key(
+                        url,
+                        req.value_set_version.as_deref(),
+                        count,
+                        req.offset.unwrap_or(0),
+                    );
+                    if let Some(page) = closure_page_get(page_key) {
+                        return Ok(serve_closure_page(&page, req.offset));
+                    }
+                }
             }
         }
 
@@ -281,28 +393,29 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         .await
                         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-                    let contains: Vec<ExpansionContains> = rows
-                        .into_iter()
-                        .map(|r| ExpansionContains {
-                            system: cs_url.clone(),
-                            version: None,
-                            code: r.get(0),
-                            display: r.get(1),
-                            is_abstract: None,
-                            inactive: None,
-                            designations: vec![],
-                            properties: vec![],
-                            extensions: vec![],
-                            contains: vec![],
-                        })
-                        .collect();
-
-                    return Ok(ExpandResponse {
-                        total: Some(total),
-                        offset: req.offset,
-                        contains,
-                        warnings: vec![],
+                    // Iter 7m: stash the page so subsequent identical
+                    // (url, count, offset) requests serve from memory
+                    // without acquiring a pool connection.
+                    let page = Arc::new(ClosurePage {
+                        system: cs_url.clone(),
+                        total,
+                        rows: rows
+                            .into_iter()
+                            .map(|r| {
+                                (r.get::<_, String>(0), r.get::<_, Option<String>>(1))
+                            })
+                            .collect(),
                     });
+                    closure_page_put(
+                        build_closure_page_key(
+                            url,
+                            req.value_set_version.as_deref(),
+                            req.count.unwrap(),
+                            req.offset.unwrap_or(0),
+                        ),
+                        Arc::clone(&page),
+                    );
+                    return Ok(serve_closure_page(&page, req.offset));
                 }
 
                 // Single-flight cache check — keyed by URL + version pins. EX01

@@ -184,6 +184,10 @@ impl PostgresTerminologyBackend {
         if let Ok(mut g) = self::value_set::closure_count_cache().write() {
             g.clear();
         }
+        // Iter 7m: process-global `?fhir_vs=isa/X` paginated-page cache.
+        if let Ok(mut g) = self::value_set::closure_page_cache().write() {
+            g.clear();
+        }
     }
 
     /// Borrow the underlying `deadpool-postgres` connection pool.
@@ -213,7 +217,13 @@ impl PostgresTerminologyBackend {
 fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
     let mut cfg = Config::new();
     cfg.url = Some(database_url.to_string());
-    cfg.pool = Some(deadpool_postgres::PoolConfig::new(16));
+    // 32 connections: warm requests bypass the pool entirely (see the
+    // closure-page / inline-compose warm-hit fast paths in value_set.rs), so
+    // the pool only gates *cold* expansions. 16 was too few to warm a
+    // ~6.5k-entry benchmark pool within a 30s vu50 stage; 32 doubles the
+    // cold-warming throughput while staying well under PG's
+    // `max_connections=100`.
+    cfg.pool = Some(deadpool_postgres::PoolConfig::new(32));
     cfg.create_pool(Some(Runtime::Tokio1), NoTls)
         .map_err(|e| HtsError::StorageError(format!("Failed to create PG pool: {e}")))
 }
