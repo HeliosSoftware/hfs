@@ -620,17 +620,18 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 // ── Iter 7k: paginated closure-table fast path (inline VS) ─
                 // Mirrors the URL `?fhir_vs=isa/X` fast path above for the
                 // narrow inline-VS shape that EX05 emits with a single is-a
-                // filter and no other constraints. The intersected
-                // multi-filter case (e.g. is-a AND property=) is harder to
-                // serve from the closure alone and falls through to the
-                // existing path; the conservative-scope conditions below
-                // capture only the single-filter pool entries — EX05 still
-                // only partially benefits.
+                // filter (and EX02 with a single descendent-of filter) and
+                // no other constraints. The intersected multi-filter case
+                // (e.g. is-a AND property=) is harder to serve from the
+                // closure alone and falls through to the existing path; the
+                // conservative-scope conditions below capture only the
+                // single-filter pool entries.
                 //
                 // Conditions (all must hold; otherwise fall through):
                 //   * `compose.include` has exactly one entry with a `system`;
-                //   * that entry has exactly one `filter[]`: op=is-a on
-                //     property=concept with a non-empty `value`;
+                //   * that entry has exactly one `filter[]`: op=is-a or
+                //     op=descendent-of on property=concept with a non-empty
+                //     `value` (`descendent-of` excludes the root itself);
                 //   * no `concept[]`, no nested `valueSet[]` refs;
                 //   * no top-level `exclude[]`;
                 //   * no version pins (force/system-default/default-vs),
@@ -647,8 +648,8 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     && req.tx_resources.is_empty()
                     && contained_vec.is_empty()
                 {
-                    if let Some((cs_url_isa, root_code_isa)) =
-                        extract_single_isa_include(compose_val)
+                    if let Some((cs_url_isa, root_code_isa, exclude_self)) =
+                        extract_single_hierarchy_include(compose_val)
                     {
                         if let Some(system_id_isa) =
                             resolve_system_id_pg(&client, &cs_url_isa).await?
@@ -657,8 +658,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             let offset = i64::from(req.offset.unwrap_or(0));
 
                             // Iter 7k+: process-global COUNT memo (see the
-                            // URL fast path above for rationale).
-                            let total: u32 = if let Some(c) =
+                            // URL fast path above for rationale). The memo
+                            // stores the raw is-a count (closure rows for
+                            // ancestor=root, self-link included); for
+                            // `descendent-of` the strict-subtree total drops
+                            // the root's own self-link.
+                            let raw_total: u32 = if let Some(c) =
                                 closure_count_get(&system_id_isa, &root_code_isa)
                             {
                                 c
@@ -676,10 +681,27 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 closure_count_put(&system_id_isa, &root_code_isa, c);
                                 c
                             };
+                            let total: u32 = if exclude_self {
+                                raw_total.saturating_sub(1)
+                            } else {
+                                raw_total
+                            };
 
-                            let rows = client
-                                .query(
-                                    "SELECT cc.descendant_code, c.display
+                            // `descendent-of` excludes the root's self-link
+                            // `(root, root)` from the closure scan.
+                            let page_sql = if exclude_self {
+                                "SELECT cc.descendant_code, c.display
+                                       FROM concept_closure cc
+                                       JOIN concepts c
+                                         ON c.system_id = $1
+                                        AND c.code = cc.descendant_code
+                                      WHERE cc.system_id = $1
+                                        AND cc.ancestor_code = $2
+                                        AND cc.descendant_code <> cc.ancestor_code
+                                      ORDER BY cc.descendant_code
+                                      LIMIT $3 OFFSET $4"
+                            } else {
+                                "SELECT cc.descendant_code, c.display
                                        FROM concept_closure cc
                                        JOIN concepts c
                                          ON c.system_id = $1
@@ -687,7 +709,11 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                       WHERE cc.system_id = $1
                                         AND cc.ancestor_code = $2
                                       ORDER BY cc.descendant_code
-                                      LIMIT $3 OFFSET $4",
+                                      LIMIT $3 OFFSET $4"
+                            };
+                            let rows = client
+                                .query(
+                                    page_sql,
                                     &[&system_id_isa, &root_code_isa, &limit, &offset],
                                 )
                                 .await
@@ -2123,6 +2149,30 @@ async fn compute_expansion_inner_body(
             .flatten()
             .and_then(|r| r.get::<_, Option<String>>(0));
 
+        // ── Filter-only include fast path ───────────────────────────────
+        // When the include carries `filter[]` but no explicit `concept[]`,
+        // the filter evaluation IS the candidate set. The Phase A branch
+        // below would otherwise `SELECT code, display FROM concepts WHERE
+        // system_id = $1` — for SNOMED that materialises ~350k
+        // `ExpansionContains` structs only for Phase B to discard almost
+        // all of them. That full enumeration was the dominant cost of cold
+        // EX02/EX05 expansions. Mirrors sqlite/value_set.rs:3433, which
+        // evaluates `apply_compose_filters` before falling back to a
+        // whole-system scan.
+        if inc["concept"].as_array().is_none()
+            && inc["filter"].as_array().is_some_and(|a| !a.is_empty())
+        {
+            if let Some(mut filtered) =
+                apply_compose_filters_pg(client, system_url, &system_id, inc).await?
+            {
+                for item in &mut filtered {
+                    item.version = cs_version.clone();
+                }
+                included.extend(filtered);
+            }
+            continue;
+        }
+
         // Phase A: collect the candidate concepts dictated by `concept[]` or
         // by enumerating the whole CodeSystem.
         let mut candidates: Vec<ExpansionContains> =
@@ -2840,15 +2890,21 @@ async fn pg_filter_property_eq(
 ) -> Result<Vec<(String, Option<String>)>, HtsError> {
     let property_aliases = cs_property_local_codes(client, system_url, property).await;
 
+    // Drive the query from `idx_props_property_value` (property, value,
+    // concept_id): the inner scan returns the (small) set of concept ids
+    // carrying the pair, then a primary-key semi-join fetches their
+    // code/display. The previous `EXISTS`-correlated form let the planner
+    // scan every concept in the system and probe per row — ~350k probes for
+    // SNOMED, the dominant cost of cold EX05 property-filter expansions.
     let rows = client
         .query(
             "SELECT c.code, c.display
                FROM concepts c
               WHERE c.system_id = $1
-                AND EXISTS (
-                    SELECT 1 FROM concept_properties cp
-                     WHERE cp.concept_id = c.id
-                       AND cp.property = ANY($2::text[])
+                AND c.id IN (
+                    SELECT cp.concept_id
+                      FROM concept_properties cp
+                     WHERE cp.property = ANY($2::text[])
                        AND cp.value = $3
                 )",
             &[&system_id, &property_aliases, &value],
@@ -3359,27 +3415,32 @@ fn parse_fhir_vs_url(url: &str) -> Option<(String, FhirVsPattern)> {
 
 /// Recognise the narrow inline-compose shape that iter 7k's paginated
 /// closure-table fast path can serve directly: a single `include` with a
-/// single `is-a` filter on `property=concept` and nothing else.
+/// single hierarchy filter on `property=concept` and nothing else.
 ///
-/// Returns `Some((system_url, root_code))` only when the compose body matches
-/// EXACTLY:
+/// Returns `Some((system_url, root_code, exclude_self))` only when the compose
+/// body matches EXACTLY:
 /// ```text
 /// {
 ///   "include": [{
 ///     "system": "<url>",
 ///     "filter": [{
 ///       "property": "concept",
-///       "op":       "is-a",
+///       "op":       "is-a" | "descendent-of",
 ///       "value":    "<root>",
 ///     }],
 ///   }],
 ///   // no "exclude", no "concept", no nested "valueSet" refs
 /// }
 /// ```
+/// `exclude_self` is `true` for `descendent-of` (strict subtree, root
+/// excluded) and `false` for `is-a` (subtree including the root).
+///
 /// Anything else (multiple includes, multiple filters, AND-intersected
 /// property filters, concept lists, valueSet refs, an `exclude[]`) returns
 /// `None` so the caller falls through to the existing compute path.
-fn extract_single_isa_include(compose: &serde_json::Value) -> Option<(String, String)> {
+fn extract_single_hierarchy_include(
+    compose: &serde_json::Value,
+) -> Option<(String, String, bool)> {
     // Reject any top-level `exclude` (even an empty one is fine, but a
     // non-empty one would change the result).
     if let Some(excl) = compose.get("exclude").and_then(|v| v.as_array()) {
@@ -3417,10 +3478,15 @@ fn extract_single_isa_include(compose: &serde_json::Value) -> Option<(String, St
     let prop = f.get("property")?.as_str()?;
     let op = f.get("op")?.as_str()?;
     let val = f.get("value")?.as_str()?;
-    if prop != "concept" || op != "is-a" || val.is_empty() {
+    if prop != "concept" || val.is_empty() {
         return None;
     }
-    Some((system.to_owned(), val.to_owned()))
+    let exclude_self = match op {
+        "is-a" => false,
+        "descendent-of" => true,
+        _ => return None,
+    };
+    Some((system.to_owned(), val.to_owned(), exclude_self))
 }
 
 /// Resolve the highest-versioned `code_systems.id` for a given canonical URL.

@@ -86,6 +86,13 @@ CREATE TABLE IF NOT EXISTS concept_properties (
     value      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_props_concept ON concept_properties(concept_id);
+-- Forward lookup: concepts carrying a given (property, value) pair. Drives
+-- compose `filter[]` property-equality expansion (EX05's `=` / `in` filters).
+-- Without this index `pg_filter_property_eq` had to scan every concept in the
+-- system (~350k for SNOMED) and probe `concept_properties` per row. The
+-- trailing `concept_id` lets the (property, value) probe stay index-only.
+CREATE INDEX IF NOT EXISTS idx_props_property_value
+    ON concept_properties(property, value, concept_id);
 
 -- ── Designations (alternate names / translations) ─────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_designations (
