@@ -932,12 +932,10 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                 format!("({inner_alias}.value #>> '{{}}')")
             };
             let agg = ctx.dialect.string_agg(&value_text, &sep_lit);
-            // Empty input collections must yield an empty string, not NULL,
-            // per the SoF v2 conformance corpus (`fn_join`, `fhirpath::string
-            // join` empty cases).
-            Ok(format!(
-                "coalesce((SELECT {agg} {unnest_outer}{unnest_inner}), '')"
-            ))
+            // Empty input collections yield NULL (empty output), not an empty
+            // string, per the FHIRPath spec (SoF v2 PR #349). `string_agg` /
+            // `group_concat` over zero rows already returns NULL.
+            Ok(format!("(SELECT {agg} {unnest_outer}{unnest_inner})"))
         }
         SqlExpr::WhereScalar {
             focus,

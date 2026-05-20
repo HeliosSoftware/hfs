@@ -461,7 +461,11 @@ mod sof_conformance_postgres_tests {
         // PostgreSQL; lowering this requires the same justification as the
         // SQLite floor (a fixture genuinely outside the in-DB runner's
         // coverage, listed in `KNOWN_SKIPS` with a reason).
-        const PG_PASS_FLOOR: usize = 126;
+        //
+        // 126 -> 124: SoF v2 PR #349 removed two `join()` fixtures from the
+        // upstream `fhirpath.json` corpus, shrinking the total fixture count
+        // (not a compiler regression).
+        const PG_PASS_FLOOR: usize = 124;
         assert!(
             passed >= PG_PASS_FLOOR,
             "regression: only {passed} fixtures pass (floor: {PG_PASS_FLOOR}). \
