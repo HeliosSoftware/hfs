@@ -15,8 +15,8 @@ use crate::types::{
     TranslationMatch,
 };
 
-use super::{PG_TRANSLATE_RESPONSE_CACHE_MAX, PostgresTerminologyBackend};
 use super::code_system::build_synthetic_resource;
+use super::{PG_TRANSLATE_RESPONSE_CACHE_MAX, PostgresTerminologyBackend};
 
 /// Build the $translate response cache key. Folds every TranslateRequest
 /// field that affects the output rows.

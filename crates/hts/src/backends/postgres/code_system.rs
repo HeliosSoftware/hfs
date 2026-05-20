@@ -7,20 +7,22 @@ use helios_persistence::tenant::TenantContext;
 use std::sync::Arc;
 
 use crate::error::HtsError;
-use crate::traits::{CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags, SupplementInfo};
+use crate::traits::{
+    CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags, SupplementInfo,
+};
 use crate::types::{
     DesignationValue, LookupRequest, LookupResponse, PropertyValue, ResourceSearchQuery,
     SubsumesRequest, SubsumesResponse, SubsumptionOutcome, ValidateCodeRequest,
     ValidateCodeResponse,
 };
 
-use super::{
-    PG_LOOKUP_RESPONSE_CACHE_MAX, PG_SUBSUMES_RESPONSE_CACHE_MAX, PostgresTerminologyBackend,
-    ResolvedMetaCache,
-};
 use super::value_set::{
     cs_content_for_url, cs_is_case_insensitive, cs_property_local_codes, cs_version_for_msg,
     detect_cs_version_mismatch, is_concept_abstract, is_concept_inactive,
+};
+use super::{
+    PG_LOOKUP_RESPONSE_CACHE_MAX, PG_SUBSUMES_RESPONSE_CACHE_MAX, PostgresTerminologyBackend,
+    ResolvedMetaCache,
 };
 
 /// Cache wrapper around [`resolve_code_system`]. The free function is
@@ -363,8 +365,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 Some(c) => Some(c),
                 None => {
                     if cs_is_case_insensitive(&client, &system).await {
-                        if let Some(c) =
-                            find_concept_by_system_id_ci(&client, sid, &req.code).await
+                        if let Some(c) = find_concept_by_system_id_ci(&client, sid, &req.code).await
                         {
                             if c.code != req.code {
                                 normalized_code = Some(c.code.clone());
@@ -386,9 +387,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 Some(c) => Some(c),
                 None => {
                     if cs_is_case_insensitive(&client, &system).await {
-                        if let Some(c) =
-                            find_concept_by_url_ci(&client, &system, &req.code).await
-                        {
+                        if let Some(c) = find_concept_by_url_ci(&client, &system, &req.code).await {
                             if c.code != req.code {
                                 normalized_code = Some(c.code.clone());
                             }
@@ -450,10 +449,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                         "Unknown code '{}' in the CodeSystem '{}' version '{}'",
                         req.code, system, v
                     ),
-                    None => format!(
-                        "Unknown code '{}' in the CodeSystem '{}'",
-                        req.code, system
-                    ),
+                    None => format!("Unknown code '{}' in the CodeSystem '{}'", req.code, system),
                 };
                 return Ok(ValidateCodeResponse {
                     result: false,
@@ -699,11 +695,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
     /// version also memoises across calls via `cs_exists_cache()` and
     /// the PG impl will gain the same cache once the PG backend grows a
     /// per-instance cache map (tracked under the Phase 2 work).
-    async fn code_system_exists(
-        &self,
-        _ctx: &TenantContext,
-        url: &str,
-    ) -> Result<bool, HtsError> {
+    async fn code_system_exists(&self, _ctx: &TenantContext, url: &str) -> Result<bool, HtsError> {
         let client = self
             .pool
             .get()
