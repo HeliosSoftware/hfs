@@ -33,6 +33,7 @@ use super::code_system::build_synthetic_resource;
 // Bounded to `CLOSURE_COUNT_CACHE_MAX` (16384) to mirror the existing
 // `PG_COMPOSE_CACHE_MAX` pattern — once full, new entries are silently
 // dropped. The bench pool is ~100 unique roots per system, far under the cap.
+#[allow(clippy::type_complexity)]
 static CLOSURE_COUNT_CACHE: OnceLock<Arc<RwLock<HashMap<(String, String), u32>>>> = OnceLock::new();
 
 pub(super) fn closure_count_cache() -> &'static Arc<RwLock<HashMap<(String, String), u32>>> {
@@ -92,6 +93,7 @@ pub(super) struct RootPrefix {
 /// other callers while keeping the cold prefix fetch and memory bounded.
 const CLOSURE_PREFIX_LEN: usize = 4096;
 
+#[allow(clippy::type_complexity)]
 static CLOSURE_PREFIX_CACHE: OnceLock<Arc<RwLock<HashMap<u64, Arc<RootPrefix>>>>> = OnceLock::new();
 
 pub(super) fn root_prefix_cache() -> &'static Arc<RwLock<HashMap<u64, Arc<RootPrefix>>>> {
@@ -2019,6 +2021,7 @@ async fn compute_expansion_with_contained(
 /// emits a warning and skips the nested ref. Mirrors
 /// `sqlite/value_set.rs:expand_includes_per_clause` (3220-3354) +
 /// `expand_vs_reference` (2944-3058).
+#[allow(clippy::too_many_arguments)]
 fn compute_expansion_inner<'a>(
     client: &'a tokio_postgres::Client,
     compose_json: Option<&'a str>,
@@ -2041,6 +2044,7 @@ fn compute_expansion_inner<'a>(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn compute_expansion_inner_body(
     client: &tokio_postgres::Client,
     compose_json: Option<&str>,
@@ -2694,6 +2698,7 @@ async fn compute_expansion_inner_body(
 ///   `contained[]` array. The matched contained VS's compose is then
 ///   expanded recursively — same code path as a stored VS reference but
 ///   without a DB lookup.
+#[allow(clippy::too_many_arguments)]
 async fn pg_expand_vs_reference(
     client: &tokio_postgres::Client,
     ref_url: &str,
@@ -3817,10 +3822,10 @@ pub(super) async fn cs_is_case_insensitive(
         Ok(r) => r,
         Err(_) => return false,
     };
-    match row.and_then(|r| r.get::<_, Option<String>>(0)) {
-        Some(s) if s.eq_ignore_ascii_case("false") => true,
-        _ => false,
-    }
+    matches!(
+        row.and_then(|r| r.get::<_, Option<String>>(0)),
+        Some(s) if s.eq_ignore_ascii_case("false")
+    )
 }
 
 /// `true` when the code exists in the named CodeSystem (any version).
