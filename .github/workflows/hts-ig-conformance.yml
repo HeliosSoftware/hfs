@@ -32,6 +32,22 @@ on:
           - all
           - sqlite
           - postgres
+  schedule:
+    # Nightly IG conformance run at 03:00 UTC. Offset from hts.yml (05:00) and
+    # ci-extended.yml (07:00) so the three nightly suites don't contend for
+    # self-hosted runners. Scheduled/push runs carry no `backend` input, so
+    # the setup job's `inputs.backend || 'all'` fallback exercises all backends.
+    - cron: "0 3 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "crates/hts/**"
+      - ".github/workflows/hts-ig-conformance.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/hts/**"
+      - ".github/workflows/hts-ig-conformance.yml"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
