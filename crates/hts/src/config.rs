@@ -5,7 +5,7 @@
 //! ingestion), plus the [`HtsConfig`] and [`ImportArgs`] structs that clap
 //! populates from flags and `HTS_*` environment variables.
 //!
-//! Running `hts` with no subcommand is equivalent to `hts serve` for
+//! Running `hts` with no subcommand is equivalent to `hts run` for
 //! backwards-compatible behaviour.
 
 use std::fmt;
@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 /// Top-level CLI for the Helios Terminology Server.
 ///
 /// When no subcommand is provided the server starts with default settings,
-/// preserving backwards-compatible behaviour (`hts` == `hts serve`).
+/// preserving backwards-compatible behaviour (`hts` == `hts run`).
 #[derive(Parser, Debug)]
 #[command(
     name = "hts",

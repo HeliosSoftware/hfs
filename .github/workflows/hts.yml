@@ -147,7 +147,7 @@ jobs:
           HTS_SERVER_PORT="${{ env.HTS_PORT }}" \
           HTS_DATABASE_URL="./data/hts-${{ matrix.label }}.db" \
           HTS_LOG_LEVEL="warn" \
-            ./hts serve > "/tmp/hts-${{ matrix.label }}.log" 2>&1 &
+            ./hts run > "/tmp/hts-${{ matrix.label }}.log" 2>&1 &
 
           echo "HTS_PID=$!" >> "$GITHUB_ENV"
           echo "Started HTS server (PID=$!)"
