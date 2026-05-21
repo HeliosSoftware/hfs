@@ -3,10 +3,11 @@ name: HTS Terminology Server CI
 on:
   workflow_dispatch:
   schedule:
-    # Nightly conformance run at 07:00 UTC — catches regressions even when no
+    # Nightly conformance run at 05:00 UTC — catches regressions even when no
     # HTS code changed (tx.fhir.org behaviour drift, transitive dependency
-    # bumps, UTG package updates).
-    - cron: "0 7 * * *"
+    # bumps, UTG package updates). Offset from ci-extended.yml's 07:00 UTC
+    # weekday run so the two don't contend for self-hosted runners.
+    - cron: "0 5 * * *"
   push:
     branches: [main]
     paths:
