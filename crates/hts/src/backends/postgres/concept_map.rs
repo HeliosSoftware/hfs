@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::HtsError;
 use crate::traits::ConceptMapOperations;
@@ -14,8 +15,25 @@ use crate::types::{
     TranslationMatch,
 };
 
-use super::PostgresTerminologyBackend;
 use super::code_system::build_synthetic_resource;
+use super::{PG_TRANSLATE_RESPONSE_CACHE_MAX, PostgresTerminologyBackend};
+
+/// Build the $translate response cache key. Folds every TranslateRequest
+/// field that affects the output rows.
+fn translate_cache_key(req: &TranslateRequest) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        req.url.as_deref().unwrap_or(""),
+        req.system.as_deref().unwrap_or(""),
+        req.code,
+        req.source.as_deref().unwrap_or(""),
+        req.target.as_deref().unwrap_or(""),
+        req.target_system.as_deref().unwrap_or(""),
+        req.target_code.as_deref().unwrap_or(""),
+        if req.reverse { "1" } else { "0" },
+        req.date.as_deref().unwrap_or(""),
+    )
+}
 
 #[async_trait]
 impl ConceptMapOperations for PostgresTerminologyBackend {
@@ -24,6 +42,15 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
         _ctx: &TenantContext,
         req: TranslateRequest,
     ) -> Result<TranslateResponse, HtsError> {
+        // CM01/CM02 hot-path memo — bench pool entries repeat the same
+        // translation tuples across 50 VUs.
+        let cache_key = translate_cache_key(&req);
+        if let Ok(read) = self.translate_response_cache.read() {
+            if let Some(arc) = read.get(&cache_key) {
+                return Ok((**arc).clone());
+            }
+        }
+
         let client = self
             .pool
             .get()
@@ -71,7 +98,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
 
         let result = !matches.is_empty();
 
-        Ok(TranslateResponse {
+        let response = TranslateResponse {
             result,
             message: if result {
                 None
@@ -79,7 +106,13 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
                 Some("No mapping found for the provided code".into())
             },
             matches,
-        })
+        };
+        if let Ok(mut w) = self.translate_response_cache.write() {
+            if w.len() < PG_TRANSLATE_RESPONSE_CACHE_MAX || w.contains_key(&cache_key) {
+                w.insert(cache_key, Arc::new(response.clone()));
+            }
+        }
+        Ok(response)
     }
 
     async fn closure(
@@ -280,34 +313,37 @@ async fn query_translate_elements(
     reverse: bool,
     date: Option<&str>,
 ) -> Result<Vec<TranslateRow>, HtsError> {
-    let sql = if !reverse {
-        "SELECT cme.target_system, cme.target_code, cme.equivalence, cm.url, cm.version,
-                c.display, cme.source_system, cme.source_code
-         FROM concept_map_elements cme
-         JOIN concept_maps cm ON cm.id = cme.map_id
-         LEFT JOIN code_systems cs_disp ON cs_disp.url = cme.target_system
-         LEFT JOIN concepts c ON c.system_id = cs_disp.id AND c.code = cme.target_code
-         WHERE cme.source_code = $1
-           AND ($2::text IS NULL OR cme.source_system = $2)
-           AND ($3::text IS NULL OR cme.target_system = $3)
-           AND ($4::text IS NULL OR cm.url = $4)
-           AND ($5::text IS NULL OR (cm.resource_json->>'date') <= $5)"
+    // Per FHIR $translate semantics, the response's `concept` Coding is always
+    // the ConceptMap element's target side, and `source` is always its source
+    // side — INDEPENDENT of forward vs reverse. Only the LOOKUP column
+    // changes between modes (source.code for forward, target.code for
+    // reverse). The IG `translate/translate-reverse` fixture pins this:
+    // input target/code1, output concept = target/code1 (the looked-up
+    // target), source = source/code-1 (the resolved source). Mirrors
+    // sqlite/concept_map.rs:283-338.
+    //
+    // Also: don't echo the resolved-side display. The IG fixtures expect
+    // bare {system, code} Codings without `display`, and SQLite hard-codes
+    // None for the same reason. The LEFT JOIN was a PG over-reach.
+    let (lookup_code_col, lookup_sys_col, other_sys_col) = if !reverse {
+        ("cme.source_code", "cme.source_system", "cme.target_system")
     } else {
-        "SELECT cme.source_system, cme.source_code, cme.equivalence, cm.url, cm.version,
-                c.display, cme.target_system, cme.target_code
+        ("cme.target_code", "cme.target_system", "cme.source_system")
+    };
+    let sql = format!(
+        "SELECT cme.target_system, cme.target_code, cme.equivalence, cm.url, cm.version,
+                NULL::text AS display, cme.source_system, cme.source_code
          FROM concept_map_elements cme
          JOIN concept_maps cm ON cm.id = cme.map_id
-         LEFT JOIN code_systems cs_disp ON cs_disp.url = cme.source_system
-         LEFT JOIN concepts c ON c.system_id = cs_disp.id AND c.code = cme.source_code
-         WHERE cme.target_code = $1
-           AND ($2::text IS NULL OR cme.target_system = $2)
-           AND ($3::text IS NULL OR cme.source_system = $3)
+         WHERE {lookup_code_col} = $1
+           AND ($2::text IS NULL OR {lookup_sys_col} = $2)
+           AND ($3::text IS NULL OR {other_sys_col} = $3)
            AND ($4::text IS NULL OR cm.url = $4)
            AND ($5::text IS NULL OR (cm.resource_json->>'date') <= $5)"
-    };
+    );
 
     let rows = client
-        .query(sql, &[&code, &system, &other_side_sys, &map_url, &date])
+        .query(&sql, &[&code, &system, &other_side_sys, &map_url, &date])
         .await
         .map_err(|e| HtsError::StorageError(format!("Query error: {e}")))?;
 

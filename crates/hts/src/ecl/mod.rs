@@ -42,14 +42,23 @@
 //! }
 //! ```
 
+// Parser is dialect-independent (pure syntax → AST) and stays available
+// to every backend. The evaluator currently translates the AST into
+// rusqlite queries, so it is gated on the `sqlite` feature; a future
+// Postgres-backed evaluator (Phase 2 hierarchy/closure port) will reuse
+// the same parser AST.
+#[cfg(feature = "sqlite")]
 pub mod evaluator;
 pub mod parser;
 
+#[cfg(feature = "sqlite")]
 pub use evaluator::ResolvedConcept;
 pub use parser::{ConceptOperator, EclExpr, FocusConcept};
 
+#[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 
+#[cfg(feature = "sqlite")]
 use crate::error::HtsError;
 
 /// Parse an ECL string and evaluate it against the given code system.
@@ -60,6 +69,7 @@ use crate::error::HtsError;
 ///
 /// - Returns `HtsError::InvalidRequest` if the ECL expression cannot be parsed.
 /// - Returns `HtsError::StorageError` if a database query fails.
+#[cfg(feature = "sqlite")]
 pub fn parse_and_evaluate(
     conn: &Connection,
     system_id: &str,
