@@ -184,8 +184,8 @@ impl PostgresTerminologyBackend {
         if let Ok(mut g) = self::value_set::closure_count_cache().write() {
             g.clear();
         }
-        // Iter 7m: process-global `?fhir_vs=isa/X` paginated-page cache.
-        if let Ok(mut g) = self::value_set::closure_page_cache().write() {
+        // Iter 7n: process-global `?fhir_vs=isa/X` per-root prefix cache.
+        if let Ok(mut g) = self::value_set::root_prefix_cache().write() {
             g.clear();
         }
     }

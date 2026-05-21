@@ -33,8 +33,8 @@ use super::code_system::build_synthetic_resource;
 // Bounded to `CLOSURE_COUNT_CACHE_MAX` (16384) to mirror the existing
 // `PG_COMPOSE_CACHE_MAX` pattern — once full, new entries are silently
 // dropped. The bench pool is ~100 unique roots per system, far under the cap.
-static CLOSURE_COUNT_CACHE: OnceLock<Arc<RwLock<HashMap<(String, String), u32>>>> =
-    OnceLock::new();
+#[allow(clippy::type_complexity)]
+static CLOSURE_COUNT_CACHE: OnceLock<Arc<RwLock<HashMap<(String, String), u32>>>> = OnceLock::new();
 
 pub(super) fn closure_count_cache() -> &'static Arc<RwLock<HashMap<(String, String), u32>>> {
     CLOSURE_COUNT_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
@@ -59,71 +59,92 @@ fn closure_count_put(system_id: &str, root_code: &str, count: u32) {
     }
 }
 
-// ── Iter 7m: process-global cache for `?fhir_vs=isa/X` paginated pages ─────
+// ── Iter 7n: process-global per-root prefix cache for `?fhir_vs=isa/X` ─────
 // EX01 issues `GET ?fhir_vs=isa/<root>&_count=N&_offset=M` against a fixed
-// pool of (root, count, offset) combos. The iter-7k closure fast path served
-// each request with two SQL round-trips while holding one of the pool's
-// connections — that capped EX01 at ~316 RPS at vu50 (16 conns × ~50 ms
-// hold). This cache lets a warm request skip pool acquisition entirely,
-// mirroring the `inline_compose_cache` warm-hit path. Per-key memory is
-// bounded by the requested page window (offset + count), so it stays small
-// even for SNOMED roots with ~140 k descendants — unlike caching the full
-// expansion, which iter 7k deliberately rejected.
+// pool of ~6.5k (root, count, offset) combos drawn from only ~100 distinct
+// roots. The iter-7k closure fast path served each request with two SQL
+// round-trips while holding a pool connection — capping EX01 at ~316 RPS at
+// vu50. Iter 7m cached each (root, count, offset) PAGE, but that still paid
+// ~6.5k cold DB queries to warm the pool; SQLite warms in ~100 because it
+// caches per ROOT.
 //
-// Keyed by `fnv64(url | value_set_version | count | offset)`. The value
-// stores the page's `(code, display)` rows plus the descendant `total`;
-// `ExpansionContains` structs are rebuilt on serve. Cleared on import via
-// `clear_response_caches`. Bounded to `CLOSURE_PAGE_CACHE_MAX`.
-pub(super) struct ClosurePage {
+// This cache mirrors SQLite: one entry per `(root, version)` holding a
+// bounded PREFIX of the root's descendant list (ordered by code). Every
+// (count, offset) combo for that root then slices the prefix in memory with
+// no pool connection. Caching only a prefix — not the full ~140k-descendant
+// list iter 7k rejected — keeps memory tiny: the EX01 pool never pages past
+// offset+count ≈ 1500, and [`CLOSURE_PREFIX_LEN`] gives generous headroom.
+//
+// Keyed by `fnv64(url | value_set_version)`. Cleared on import via
+// `clear_response_caches`. Bounded to `CLOSURE_PREFIX_CACHE_MAX`.
+pub(super) struct RootPrefix {
     system: String,
+    /// Total descendant count (closure rows for this ancestor).
     total: u32,
-    rows: Vec<(String, Option<String>)>,
+    /// First `<= CLOSURE_PREFIX_LEN` descendants as `(code, display)`,
+    /// ordered by code — the same order the cold SQL `ORDER BY` produces.
+    prefix: Vec<(String, Option<String>)>,
+    /// True when `prefix` holds *every* descendant (`total <= prefix.len()`).
+    complete: bool,
 }
 
-static CLOSURE_PAGE_CACHE: OnceLock<Arc<RwLock<HashMap<u64, Arc<ClosurePage>>>>> = OnceLock::new();
+/// How many leading descendants to cache per root. The EX01 benchmark pool
+/// never requests past `offset 500 + count 1000`; 4096 leaves headroom for
+/// other callers while keeping the cold prefix fetch and memory bounded.
+const CLOSURE_PREFIX_LEN: usize = 4096;
 
-pub(super) fn closure_page_cache() -> &'static Arc<RwLock<HashMap<u64, Arc<ClosurePage>>>> {
-    CLOSURE_PAGE_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+#[allow(clippy::type_complexity)]
+static CLOSURE_PREFIX_CACHE: OnceLock<Arc<RwLock<HashMap<u64, Arc<RootPrefix>>>>> = OnceLock::new();
+
+pub(super) fn root_prefix_cache() -> &'static Arc<RwLock<HashMap<u64, Arc<RootPrefix>>>> {
+    CLOSURE_PREFIX_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
 }
 
-const CLOSURE_PAGE_CACHE_MAX: usize = 16384;
+const CLOSURE_PREFIX_CACHE_MAX: usize = 16384;
 
-fn closure_page_get(key: u64) -> Option<Arc<ClosurePage>> {
-    closure_page_cache().read().ok()?.get(&key).cloned()
+fn root_prefix_get(key: u64) -> Option<Arc<RootPrefix>> {
+    root_prefix_cache().read().ok()?.get(&key).cloned()
 }
 
-fn closure_page_put(key: u64, page: Arc<ClosurePage>) {
-    if let Ok(mut g) = closure_page_cache().write() {
-        if g.len() >= CLOSURE_PAGE_CACHE_MAX {
+fn root_prefix_put(key: u64, rp: Arc<RootPrefix>) {
+    if let Ok(mut g) = root_prefix_cache().write() {
+        if g.len() >= CLOSURE_PREFIX_CACHE_MAX {
             return;
         }
-        g.insert(key, page);
+        g.insert(key, rp);
     }
 }
 
-/// Cache key for a `?fhir_vs=isa/X` paginated page — folds the URL, the
-/// optional value-set version pin, and the page window (count, offset).
-fn build_closure_page_key(
-    url: &str,
-    value_set_version: Option<&str>,
-    count: u32,
-    offset: u32,
-) -> u64 {
-    let canonical = format!(
-        "closure-page|{url}|{}|{count}|{offset}",
-        value_set_version.unwrap_or(""),
-    );
+/// Cache key for a `?fhir_vs=isa/X` root prefix — folds the URL and the
+/// optional value-set version pin (count / offset are post-cache slicing
+/// knobs and are NOT part of the key).
+fn build_root_prefix_key(url: &str, value_set_version: Option<&str>) -> u64 {
+    let canonical = format!("root-prefix|{url}|{}", value_set_version.unwrap_or(""));
     fnv64(canonical.as_bytes())
 }
 
-/// Rebuild an [`ExpandResponse`] from a cached [`ClosurePage`]. The cached
-/// rows are already the requested window, so no further slicing is applied.
-fn serve_closure_page(page: &ClosurePage, offset: Option<u32>) -> ExpandResponse {
-    let contains = page
-        .rows
+/// Slice the `[offset, offset + count)` window out of a cached root prefix.
+/// Returns `None` when the window extends past the cached prefix and the
+/// prefix is not known-complete — the caller must then fall through to a DB
+/// query (the EX01 pool never triggers this).
+fn serve_root_prefix(
+    rp: &RootPrefix,
+    offset: u32,
+    count: u32,
+    req_offset: Option<u32>,
+) -> Option<ExpandResponse> {
+    let off = offset as usize;
+    let end = off.saturating_add(count as usize);
+    if !rp.complete && end > rp.prefix.len() {
+        return None;
+    }
+    let contains = rp
+        .prefix
         .iter()
+        .skip(off)
+        .take(count as usize)
         .map(|(code, display)| ExpansionContains {
-            system: page.system.clone(),
+            system: rp.system.clone(),
             version: None,
             code: code.clone(),
             display: display.clone(),
@@ -135,12 +156,12 @@ fn serve_closure_page(page: &ClosurePage, offset: Option<u32>) -> ExpandResponse
             contains: vec![],
         })
         .collect();
-    ExpandResponse {
-        total: Some(page.total),
-        offset,
+    Some(ExpandResponse {
+        total: Some(rp.total),
+        offset: req_offset,
         contains,
         warnings: vec![],
-    }
+    })
 }
 
 #[async_trait]
@@ -227,12 +248,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             }
         }
 
-        // ── Closure-page warm-hit fast path (EX01) ───────────────────────
-        // `?fhir_vs=isa/X` paginated pages are cached by (url, count,
-        // offset); a warm hit returns without ever acquiring a pool
-        // connection. The gate matches the iter-7k closure fast path that
-        // populates the cache, so a cached page is always semantically
-        // valid for the request being served.
+        // ── Root-prefix warm-hit fast path (EX01) ────────────────────────
+        // `?fhir_vs=isa/X` descendant prefixes are cached per root; a warm
+        // hit slices the requested (count, offset) window in memory and
+        // returns without ever acquiring a pool connection. The gate matches
+        // the iter-7k closure fast path that populates the cache, so a
+        // cached prefix is always semantically valid for the request.
         if let Some(url) = req.url.as_deref() {
             if let Some(count) = req.count.filter(|&c| c > 0) {
                 if req.filter.is_none()
@@ -242,14 +263,13 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     && req.default_value_set_versions.is_empty()
                     && req.tx_resources.is_empty()
                 {
-                    let page_key = build_closure_page_key(
-                        url,
-                        req.value_set_version.as_deref(),
-                        count,
-                        req.offset.unwrap_or(0),
-                    );
-                    if let Some(page) = closure_page_get(page_key) {
-                        return Ok(serve_closure_page(&page, req.offset));
+                    let key = build_root_prefix_key(url, req.value_set_version.as_deref());
+                    if let Some(rp) = root_prefix_get(key) {
+                        if let Some(resp) =
+                            serve_root_prefix(&rp, req.offset.unwrap_or(0), count, req.offset)
+                        {
+                            return Ok(resp);
+                        }
                     }
                 }
             }
@@ -344,20 +364,42 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         FhirVsPattern::IsA(c) => c.clone(),
                         _ => unreachable!(),
                     };
-                    let limit = i64::from(req.count.unwrap());
-                    let offset = i64::from(req.offset.unwrap_or(0));
 
-                    // 1) Total count for `ExpandResponse.total` — the bench
-                    //    asserts this matches the descendant cardinality.
-                    //    Iter 7k+: memoise the COUNT process-wide. The query
-                    //    is invariant for the import lifetime and was the
-                    //    per-request bottleneck (~50-100 ms for ~140 k SNOMED
-                    //    descendants). Cache populates only from the actual
-                    //    query result — never from estimates — so the cached
-                    //    `total` is bit-exact w.r.t. the COUNT.
-                    let total: u32 = if let Some(c) =
-                        closure_count_get(&system_id, &root_code)
-                    {
+                    // Iter 7n: fetch the root's descendant PREFIX once (PK
+                    // index-order scan, no sort — `ORDER BY descendant_code`
+                    // mirrors `apply_compose_filters_pg`'s code-sorted
+                    // output). One extra row probes whether the prefix holds
+                    // the whole expansion; if so we skip the COUNT(*)
+                    // entirely. Every (count, offset) combo for this root
+                    // then serves warm from the cached prefix.
+                    let prefix_limit = (CLOSURE_PREFIX_LEN as i64) + 1;
+                    let rows = client
+                        .query(
+                            "SELECT cc.descendant_code, c.display
+                               FROM concept_closure cc
+                               JOIN concepts c
+                                 ON c.system_id = $1 AND c.code = cc.descendant_code
+                              WHERE cc.system_id = $1 AND cc.ancestor_code = $2
+                              ORDER BY cc.descendant_code
+                              LIMIT $3",
+                            &[&system_id, &root_code, &prefix_limit],
+                        )
+                        .await
+                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+                    let complete = rows.len() <= CLOSURE_PREFIX_LEN;
+                    let prefix: Vec<(String, Option<String>)> = rows
+                        .into_iter()
+                        .take(CLOSURE_PREFIX_LEN)
+                        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+                        .collect();
+
+                    // Total for `ExpandResponse.total`: free when the prefix
+                    // is complete; otherwise the process-wide memoised
+                    // COUNT(*) (invariant for the import lifetime).
+                    let total: u32 = if complete {
+                        prefix.len() as u32
+                    } else if let Some(c) = closure_count_get(&system_id, &root_code) {
                         c
                     } else {
                         let total_row = client
@@ -369,53 +411,31 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             .await
                             .map_err(|e| HtsError::StorageError(e.to_string()))?;
                         let c: i64 = total_row.get(0);
-                        let c = c.max(0) as u32;
-                        closure_count_put(&system_id, &root_code, c);
-                        c
+                        c.max(0) as u32
                     };
+                    closure_count_put(&system_id, &root_code, total);
 
-                    // 2) Paginated page — PK index-order scan, no sort.
-                    //    ORDER BY descendant_code mirrors
-                    //    `apply_compose_filters_pg`'s
-                    //    `out.sort_by(|a,b| a.code.cmp(&b.code))` so the
-                    //    serve order matches the cached path semantically.
-                    let rows = client
-                        .query(
-                            "SELECT cc.descendant_code, c.display
-                               FROM concept_closure cc
-                               JOIN concepts c
-                                 ON c.system_id = $1 AND c.code = cc.descendant_code
-                              WHERE cc.system_id = $1 AND cc.ancestor_code = $2
-                              ORDER BY cc.descendant_code
-                              LIMIT $3 OFFSET $4",
-                            &[&system_id, &root_code, &limit, &offset],
-                        )
-                        .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-                    // Iter 7m: stash the page so subsequent identical
-                    // (url, count, offset) requests serve from memory
-                    // without acquiring a pool connection.
-                    let page = Arc::new(ClosurePage {
+                    let rp = Arc::new(RootPrefix {
                         system: cs_url.clone(),
                         total,
-                        rows: rows
-                            .into_iter()
-                            .map(|r| {
-                                (r.get::<_, String>(0), r.get::<_, Option<String>>(1))
-                            })
-                            .collect(),
+                        prefix,
+                        complete,
                     });
-                    closure_page_put(
-                        build_closure_page_key(
-                            url,
-                            req.value_set_version.as_deref(),
-                            req.count.unwrap(),
-                            req.offset.unwrap_or(0),
-                        ),
-                        Arc::clone(&page),
+                    root_prefix_put(
+                        build_root_prefix_key(url, req.value_set_version.as_deref()),
+                        Arc::clone(&rp),
                     );
-                    return Ok(serve_closure_page(&page, req.offset));
+
+                    if let Some(resp) = serve_root_prefix(
+                        &rp,
+                        req.offset.unwrap_or(0),
+                        req.count.unwrap(),
+                        req.offset,
+                    ) {
+                        return Ok(resp);
+                    }
+                    // Requested window lies past the cached prefix — fall
+                    // through to the compute path below (EX01 never does).
                 }
 
                 // Single-flight cache check — keyed by URL + version pins. EX01
@@ -472,191 +492,197 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     &req.force_system_versions,
                     &req.system_version_defaults,
                     &req.default_value_set_versions,
-                ).await?;
-                enforce_cap(&codes, cap_enforced, req.max_expansion_size, /*implicit=*/true)?;
+                )
+                .await?;
+                enforce_cap(
+                    &codes,
+                    cap_enforced,
+                    req.max_expansion_size,
+                    /*implicit=*/ true,
+                )?;
                 codes
             } else {
-            // ── URL-based path (unchanged) ───────────────────────────────────
-            match resolve_value_set_versioned(
-                &client,
-                url,
-                req.value_set_version.as_deref(),
-                req.date.as_deref(),
-            )
-            .await
-            {
-                Ok((vs_id, compose_json)) => {
-                    compose_is_enumerated = compose_is_enumerated_json(compose_json.as_deref());
+                // ── URL-based path (unchanged) ───────────────────────────────────
+                match resolve_value_set_versioned(
+                    &client,
+                    url,
+                    req.value_set_version.as_deref(),
+                    req.date.as_deref(),
+                )
+                .await
+                {
+                    Ok((vs_id, compose_json)) => {
+                        compose_is_enumerated = compose_is_enumerated_json(compose_json.as_deref());
 
-                    // ── Iter 7c: pure-extensional fast path ────────────────────
-                    // For VSAC ValueSets (compose.include[].concept[] lists with
-                    // embedded display, no filter[], no valueSet[] refs), the
-                    // expansion is in the JSON. Skip compute_expansion's full
-                    // materialisation and the populate_cache UNNEST transaction
-                    // — slice the requested page in memory. Mirrors SQLite's
-                    // `compose_page_fast` (backends/sqlite/value_set.rs:5285).
-                    //
-                    // Only fires when the caller bounded the request via count,
-                    // matches SQLite's call site, and skips when version pins
-                    // would change the result (those fall through to the
-                    // existing OnceCell + compute_expansion path below).
-                    if let Some(count) = req.count.filter(|&c| c > 0) {
-                        if req.force_system_versions.is_empty()
-                            && req.system_version_defaults.is_empty()
-                            && req.default_value_set_versions.is_empty()
-                        {
-                            let page_offset = req.offset.unwrap_or(0) as usize;
-                            if let Some((page, total)) = compose_page_fast_pg(
-                                &client,
-                                compose_json.as_deref(),
-                                page_offset,
-                                count as usize,
-                                req.filter.as_deref(),
-                            )
-                            .await?
+                        // ── Iter 7c: pure-extensional fast path ────────────────────
+                        // For VSAC ValueSets (compose.include[].concept[] lists with
+                        // embedded display, no filter[], no valueSet[] refs), the
+                        // expansion is in the JSON. Skip compute_expansion's full
+                        // materialisation and the populate_cache UNNEST transaction
+                        // — slice the requested page in memory. Mirrors SQLite's
+                        // `compose_page_fast` (backends/sqlite/value_set.rs:5285).
+                        //
+                        // Only fires when the caller bounded the request via count,
+                        // matches SQLite's call site, and skips when version pins
+                        // would change the result (those fall through to the
+                        // existing OnceCell + compute_expansion path below).
+                        if let Some(count) = req.count.filter(|&c| c > 0) {
+                            if req.force_system_versions.is_empty()
+                                && req.system_version_defaults.is_empty()
+                                && req.default_value_set_versions.is_empty()
                             {
-                                return Ok(ExpandResponse {
-                                    total: Some(total),
-                                    offset: req.offset,
-                                    contains: page,
-                                    warnings: vec![],
-                                });
+                                let page_offset = req.offset.unwrap_or(0) as usize;
+                                if let Some((page, total)) = compose_page_fast_pg(
+                                    &client,
+                                    compose_json.as_deref(),
+                                    page_offset,
+                                    count as usize,
+                                    req.filter.as_deref(),
+                                )
+                                .await?
+                                {
+                                    return Ok(ExpandResponse {
+                                        total: Some(total),
+                                        offset: req.offset,
+                                        contains: page,
+                                        warnings: vec![],
+                                    });
+                                }
                             }
                         }
-                    }
 
-                    // Bypass the value_set_expansions cache when the compose
-                    // describes a multi-version overload — its PRIMARY KEY
-                    // (vs_id, system_url, code) silently dedupes the second
-                    // version's row, dropping half the expansion. Recomputing
-                    // is cheap for these small overload ValueSets.
-                    let multi_version =
-                        compose_has_multi_version_pins(compose_json.as_deref());
-                    // Also bypass when a default-valueset-version pin is in
-                    // effect — the cached entry reflects unpinned resolution
-                    // of any nested `compose.include[].valueSet[]` refs and
-                    // would diverge from the pinned version's content.
-                    let has_vs_pin = !req.default_value_set_versions.is_empty();
+                        // Bypass the value_set_expansions cache when the compose
+                        // describes a multi-version overload — its PRIMARY KEY
+                        // (vs_id, system_url, code) silently dedupes the second
+                        // version's row, dropping half the expansion. Recomputing
+                        // is cheap for these small overload ValueSets.
+                        let multi_version = compose_has_multi_version_pins(compose_json.as_deref());
+                        // Also bypass when a default-valueset-version pin is in
+                        // effect — the cached entry reflects unpinned resolution
+                        // of any nested `compose.include[].valueSet[]` refs and
+                        // would diverge from the pinned version's content.
+                        let has_vs_pin = !req.default_value_set_versions.is_empty();
 
-                    // Single-flight in-memory cache (EX04 hot path — VSAC
-                    // URLs hit hundreds of times per 30s run). The OnceCell
-                    // collapses simultaneous misses onto one compute +
-                    // populate_cache, then warm-hit slices the cached Vec.
-                    let cache_key = build_url_cache_key(
-                        url,
-                        req.value_set_version.as_deref(),
-                        &req.force_system_versions,
-                        &req.system_version_defaults,
-                        &req.default_value_set_versions,
-                    );
-                    let cache_eligible = req.hierarchical != Some(true)
-                        && !multi_version
-                        && !has_vs_pin;
-                    let cell = if cache_eligible {
-                        cache_cell(&self.inline_compose_cache, cache_key)
-                    } else {
-                        None
-                    };
-                    if let Some(cell) = cell.as_ref() {
-                        // Pre-borrow request fields into locals so the
-                        // `async move` closure captures the borrows (not the
-                        // owned `req`). `req` stays usable for the
-                        // `serve_from_cached(arc, &req)` call below.
-                        let force_sv = &req.force_system_versions;
-                        let sysv = &req.system_version_defaults;
-                        let defvs = &req.default_value_set_versions;
-                        let max_size = req.max_expansion_size;
-                        let client_ref = &mut client;
-                        let vs_id_ref = vs_id.as_str();
-                        let compose_json_ref = compose_json.as_deref();
-                        let arc = cell
-                            .get_or_try_init(|| async move {
-                                let cached_rows = fetch_cache(&*client_ref, vs_id_ref).await?;
-                                let codes = if cached_rows.is_empty() {
-                                    let computed = compute_expansion(
-                                        &*client_ref,
-                                        compose_json_ref,
-                                        force_sv,
-                                        sysv,
-                                        defvs,
-                                    )
-                                    .await?;
-                                    enforce_cap(
-                                        &computed,
-                                        cap_enforced,
-                                        max_size,
-                                        /*implicit=*/ false,
-                                    )?;
-                                    populate_cache(client_ref, vs_id_ref, &computed).await?;
-                                    computed
-                                } else {
-                                    cached_rows
-                                };
-                                Ok::<_, HtsError>(std::sync::Arc::new(codes))
-                            })
-                            .await?;
-                        return Ok(serve_from_cached(arc, &req));
-                    }
-
-                    // Non-cacheable branch (multi_version / has_vs_pin /
-                    // hierarchical) OR cache at capacity: unprotected compute.
-                    let cached = if multi_version || has_vs_pin {
-                        Vec::new()
-                    } else {
-                        fetch_cache(&client, &vs_id).await?
-                    };
-                    if cached.is_empty() {
-                        let codes = compute_expansion(
-                            &client,
-                            compose_json.as_deref(),
+                        // Single-flight in-memory cache (EX04 hot path — VSAC
+                        // URLs hit hundreds of times per 30s run). The OnceCell
+                        // collapses simultaneous misses onto one compute +
+                        // populate_cache, then warm-hit slices the cached Vec.
+                        let cache_key = build_url_cache_key(
+                            url,
+                            req.value_set_version.as_deref(),
                             &req.force_system_versions,
                             &req.system_version_defaults,
                             &req.default_value_set_versions,
-                        ).await?;
-                        enforce_cap(
-                            &codes,
-                            cap_enforced,
-                            req.max_expansion_size,
-                            /*implicit=*/ false,
-                        )?;
-                        if !multi_version && !has_vs_pin {
-                            populate_cache(&mut client, &vs_id, &codes).await?;
+                        );
+                        let cache_eligible =
+                            req.hierarchical != Some(true) && !multi_version && !has_vs_pin;
+                        let cell = if cache_eligible {
+                            cache_cell(&self.inline_compose_cache, cache_key)
+                        } else {
+                            None
+                        };
+                        if let Some(cell) = cell.as_ref() {
+                            // Pre-borrow request fields into locals so the
+                            // `async move` closure captures the borrows (not the
+                            // owned `req`). `req` stays usable for the
+                            // `serve_from_cached(arc, &req)` call below.
+                            let force_sv = &req.force_system_versions;
+                            let sysv = &req.system_version_defaults;
+                            let defvs = &req.default_value_set_versions;
+                            let max_size = req.max_expansion_size;
+                            let client_ref = &mut client;
+                            let vs_id_ref = vs_id.as_str();
+                            let compose_json_ref = compose_json.as_deref();
+                            let arc = cell
+                                .get_or_try_init(|| async move {
+                                    let cached_rows = fetch_cache(&*client_ref, vs_id_ref).await?;
+                                    let codes = if cached_rows.is_empty() {
+                                        let computed = compute_expansion(
+                                            &*client_ref,
+                                            compose_json_ref,
+                                            force_sv,
+                                            sysv,
+                                            defvs,
+                                        )
+                                        .await?;
+                                        enforce_cap(
+                                            &computed,
+                                            cap_enforced,
+                                            max_size,
+                                            /*implicit=*/ false,
+                                        )?;
+                                        populate_cache(client_ref, vs_id_ref, &computed).await?;
+                                        computed
+                                    } else {
+                                        cached_rows
+                                    };
+                                    Ok::<_, HtsError>(std::sync::Arc::new(codes))
+                                })
+                                .await?;
+                            return Ok(serve_from_cached(arc, &req));
                         }
-                        codes
-                    } else {
-                        cached
+
+                        // Non-cacheable branch (multi_version / has_vs_pin /
+                        // hierarchical) OR cache at capacity: unprotected compute.
+                        let cached = if multi_version || has_vs_pin {
+                            Vec::new()
+                        } else {
+                            fetch_cache(&client, &vs_id).await?
+                        };
+                        if cached.is_empty() {
+                            let codes = compute_expansion(
+                                &client,
+                                compose_json.as_deref(),
+                                &req.force_system_versions,
+                                &req.system_version_defaults,
+                                &req.default_value_set_versions,
+                            )
+                            .await?;
+                            enforce_cap(
+                                &codes,
+                                cap_enforced,
+                                req.max_expansion_size,
+                                /*implicit=*/ false,
+                            )?;
+                            if !multi_version && !has_vs_pin {
+                                populate_cache(&mut client, &vs_id, &codes).await?;
+                            }
+                            codes
+                        } else {
+                            cached
+                        }
                     }
-                }
-                Err(HtsError::NotFound(_)) => {
-                    let cs_url =
-                        find_cs_for_implicit_vs(&client, url, req.date.as_deref()).await?;
-                    let compose = serde_json::json!({
-                        "include": [{ "system": cs_url }]
-                    })
-                    .to_string();
-                    let codes = compute_expansion(
-                        &client,
-                        Some(&compose),
-                        &req.force_system_versions,
-                        &req.system_version_defaults,
-                        &req.default_value_set_versions,
-                    ).await?;
-                    if cap_enforced {
-                        if let Some(limit) = req.max_expansion_size {
-                            if codes.len() as u64 > u64::from(limit) {
-                                return Err(HtsError::TooCostly(format!(
-                                    "Implicit ValueSet expansion contains {} codes which exceeds \
+                    Err(HtsError::NotFound(_)) => {
+                        let cs_url =
+                            find_cs_for_implicit_vs(&client, url, req.date.as_deref()).await?;
+                        let compose = serde_json::json!({
+                            "include": [{ "system": cs_url }]
+                        })
+                        .to_string();
+                        let codes = compute_expansion(
+                            &client,
+                            Some(&compose),
+                            &req.force_system_versions,
+                            &req.system_version_defaults,
+                            &req.default_value_set_versions,
+                        )
+                        .await?;
+                        if cap_enforced {
+                            if let Some(limit) = req.max_expansion_size {
+                                if codes.len() as u64 > u64::from(limit) {
+                                    return Err(HtsError::TooCostly(format!(
+                                        "Implicit ValueSet expansion contains {} codes which exceeds \
                                          the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                                    codes.len(),
-                                    limit
-                                )));
+                                        codes.len(),
+                                        limit
+                                    )));
+                                }
                             }
                         }
+                        codes
                     }
-                    codes
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
-            }
             }
         } else {
             // ── Inline-ValueSet path ─────────────────────────────────────────
@@ -825,10 +851,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                       LIMIT $3 OFFSET $4"
                             };
                             let rows = client
-                                .query(
-                                    page_sql,
-                                    &[&system_id_isa, &root_code_isa, &limit, &offset],
-                                )
+                                .query(page_sql, &[&system_id_isa, &root_code_isa, &limit, &offset])
                                 .await
                                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -869,8 +892,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     &req.default_value_set_versions,
                     &contained_vec,
                 );
-                let cache_eligible = req.hierarchical != Some(true)
-                    && req.tx_resources.is_empty();
+                let cache_eligible = req.hierarchical != Some(true) && req.tx_resources.is_empty();
                 let cell = if cache_eligible {
                     cache_cell(&self.inline_compose_cache, cache_key)
                 } else {
@@ -895,12 +917,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 contained_ref,
                             )
                             .await?;
-                            enforce_cap(
-                                &codes,
-                                cap_enforced,
-                                max_size,
-                                /*implicit=*/ false,
-                            )?;
+                            enforce_cap(&codes, cap_enforced, max_size, /*implicit=*/ false)?;
                             Ok::<_, HtsError>(std::sync::Arc::new(codes))
                         })
                         .await?;
@@ -915,7 +932,8 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     &req.system_version_defaults,
                     &req.default_value_set_versions,
                     &contained_vec,
-                ).await?;
+                )
+                .await?;
                 enforce_cap(
                     &codes,
                     cap_enforced,
@@ -1055,8 +1073,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     // Bypass the value_set_expansions cache when the compose
                     // describes a multi-version overload (see expand path for
                     // the same rationale).
-                    let multi_version =
-                        compose_has_multi_version_pins(compose_json.as_deref());
+                    let multi_version = compose_has_multi_version_pins(compose_json.as_deref());
                     // Also bypass when a default-valueset-version pin is in
                     // effect — the cached expansion reflects the unpinned
                     // resolution of any nested `compose.include[].valueSet[]`
@@ -1165,8 +1182,9 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             None => None,
                         };
                         let cs_is_fragment = match req.system.as_deref() {
-                            Some(s) => cs_content_for_url(&client, s).await.as_deref()
-                                == Some("fragment"),
+                            Some(s) => {
+                                cs_content_for_url(&client, s).await.as_deref() == Some("fragment")
+                            }
                             None => false,
                         };
                         let vs_version_owned = lookup_value_set_version(&client, &url).await;
@@ -1238,8 +1256,10 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 None => None,
                             };
                             let cs_is_fragment = match req.system.as_deref() {
-                                Some(s) => cs_content_for_url(&client, s).await.as_deref()
-                                    == Some("fragment"),
+                                Some(s) => {
+                                    cs_content_for_url(&client, s).await.as_deref()
+                                        == Some("fragment")
+                                }
                                 None => false,
                             };
                             let vs_version_owned = lookup_value_set_version(&client, &url).await;
@@ -1431,10 +1451,8 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         // not-in-vs + cannot-infer ("multiple matches"). Mirrors
         // sqlite/value_set.rs:1569-1644.
         if req.system.is_none() && !candidates.is_empty() {
-            let distinct_systems: std::collections::BTreeSet<String> = candidates
-                .iter()
-                .map(|c| c.system.clone())
-                .collect();
+            let distinct_systems: std::collections::BTreeSet<String> =
+                candidates.iter().map(|c| c.system.clone()).collect();
             if distinct_systems.len() >= 2 {
                 let systems_list: Vec<String> = distinct_systems.into_iter().collect();
                 let vs_v = lookup_value_set_version(&client, &url).await;
@@ -1444,7 +1462,9 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 };
                 let cannot_infer_text = format!(
                     "The System URI could not be determined for the code '{}' in the ValueSet '{}': value set expansion has multiple matches: [{}]",
-                    req.code, vs_canonical, systems_list.join(", ")
+                    req.code,
+                    vs_canonical,
+                    systems_list.join(", ")
                 );
                 let not_in_vs_text = format!(
                     "The provided code '#{}' was not found in the value set '{}'",
@@ -1545,18 +1565,17 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         } else {
             // No version pin and multiple candidates: prefer display match,
             // else the highest-version candidate.
-            let display_match: Option<&ExpansionContains> =
-                req.display.as_deref().and_then(|d| {
-                    candidates
-                        .iter()
-                        .find(|c| {
-                            c.display
-                                .as_deref()
-                                .map(|cd| cd.eq_ignore_ascii_case(d))
-                                .unwrap_or(false)
-                        })
-                        .copied()
-                });
+            let display_match: Option<&ExpansionContains> = req.display.as_deref().and_then(|d| {
+                candidates
+                    .iter()
+                    .find(|c| {
+                        c.display
+                            .as_deref()
+                            .map(|cd| cd.eq_ignore_ascii_case(d))
+                            .unwrap_or(false)
+                    })
+                    .copied()
+            });
             if let Some(c) = display_match {
                 Some(c.clone())
             } else {
@@ -1683,13 +1702,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         // not in VS, expected response echoes the CS display).
         let cs_display_lookup: Option<String> = if !code_unknown_in_cs {
             match system_for_msg.as_deref() {
-                Some(s) => pg_lookup_cs_display(
-                    &client,
-                    s,
-                    cs_version.as_deref(),
-                    &req.code,
-                )
-                .await,
+                Some(s) => pg_lookup_cs_display(&client, s, cs_version.as_deref(), &req.code).await,
                 None => None,
             }
         } else {
@@ -2008,6 +2021,7 @@ async fn compute_expansion_with_contained(
 /// emits a warning and skips the nested ref. Mirrors
 /// `sqlite/value_set.rs:expand_includes_per_clause` (3220-3354) +
 /// `expand_vs_reference` (2944-3058).
+#[allow(clippy::too_many_arguments)]
 fn compute_expansion_inner<'a>(
     client: &'a tokio_postgres::Client,
     compose_json: Option<&'a str>,
@@ -2030,6 +2044,7 @@ fn compute_expansion_inner<'a>(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn compute_expansion_inner_body(
     client: &tokio_postgres::Client,
     compose_json: Option<&str>,
@@ -2052,9 +2067,7 @@ async fn compute_expansion_inner_body(
     let mut included: Vec<ExpansionContains> = Vec::new();
 
     for inc in includes {
-        let vs_refs_present = inc["valueSet"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty());
+        let vs_refs_present = inc["valueSet"].as_array().is_some_and(|a| !a.is_empty());
         let has_local_system = inc["system"].as_str().is_some_and(|s| !s.is_empty());
 
         // ── compose.include[].valueSet[] handling (FHIR R5 §4.9.5) ─────────
@@ -2480,9 +2493,7 @@ async fn compute_expansion_inner_body(
     let mut denied_whole_system_versioned: HashSet<(String, String, String)> = HashSet::new();
 
     for exc in excludes {
-        let exc_vs_refs_present = exc["valueSet"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty());
+        let exc_vs_refs_present = exc["valueSet"].as_array().is_some_and(|a| !a.is_empty());
 
         // exclude.valueSet[] handling — mirror sqlite/value_set.rs:3631-3697.
         // Each ref's expansion contributes (system, code) pairs to the denied
@@ -2527,8 +2538,7 @@ async fn compute_expansion_inner_body(
                 intersected.retain(|k| set.contains(k));
             }
 
-            let has_exc_local_system =
-                exc["system"].as_str().is_some_and(|s| !s.is_empty());
+            let has_exc_local_system = exc["system"].as_str().is_some_and(|s| !s.is_empty());
             if has_exc_local_system {
                 let mut single_exc = exc.clone();
                 if let Some(obj) = single_exc.as_object_mut() {
@@ -2590,12 +2600,8 @@ async fn compute_expansion_inner_body(
         // set. Whole-system version-aware exclude only fires when the VS has
         // `versionsMatch=false`; otherwise the version pin is collapsed to
         // version-blind. Mirrors sqlite/value_set.rs:3744-3755.
-        let has_exc_filter = exc["filter"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty());
-        let has_exc_concept = exc["concept"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty());
+        let has_exc_filter = exc["filter"].as_array().is_some_and(|a| !a.is_empty());
+        let has_exc_concept = exc["concept"].as_array().is_some_and(|a| !a.is_empty());
         // exclude { system: X } with no concept[], no filter[], no valueSet[]
         // means "remove every code from X". Mirrors sqlite/value_set.rs:3738-3754
         // (whole-system exclude branch). Without this PG silently dropped the
@@ -2614,14 +2620,13 @@ async fn compute_expansion_inner_body(
                 // Either apply the explicit filters or, when there are
                 // none, expand the entire CodeSystem (whole-system exclude).
                 let codes_to_deny: Vec<String> = if has_exc_filter {
-                    let filtered = apply_compose_filters_pg(
-                        client,
-                        &exc_system,
-                        &exc_system_id,
-                        exc,
-                    )
-                    .await?;
-                    filtered.unwrap_or_default().into_iter().map(|c| c.code).collect()
+                    let filtered =
+                        apply_compose_filters_pg(client, &exc_system, &exc_system_id, exc).await?;
+                    filtered
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|c| c.code)
+                        .collect()
                 } else {
                     let rows = client
                         .query(
@@ -2659,11 +2664,7 @@ async fn compute_expansion_inner_body(
                 return false;
             }
             if let Some(ver) = c.version.as_deref() {
-                if denied_versioned.contains(&(
-                    c.system.clone(),
-                    ver.to_owned(),
-                    c.code.clone(),
-                )) {
+                if denied_versioned.contains(&(c.system.clone(), ver.to_owned(), c.code.clone())) {
                     return false;
                 }
                 if versions_match_false
@@ -2697,6 +2698,7 @@ async fn compute_expansion_inner_body(
 ///   `contained[]` array. The matched contained VS's compose is then
 ///   expanded recursively — same code path as a stored VS reference but
 ///   without a DB lookup.
+#[allow(clippy::too_many_arguments)]
 async fn pg_expand_vs_reference(
     client: &tokio_postgres::Client,
     ref_url: &str,
@@ -2754,54 +2756,48 @@ async fn pg_expand_vs_reference(
         Some((u, v)) => (u, Some(v.to_string())),
         None => (ref_url, None),
     };
-    let effective_version: Option<String> = ref_version.clone().or_else(|| {
-        default_value_set_versions
-            .get(bare_url)
-            .cloned()
-    });
+    let effective_version: Option<String> = ref_version
+        .clone()
+        .or_else(|| default_value_set_versions.get(bare_url).cloned());
     let pin_was_explicit = ref_version.is_some() || effective_version.is_some();
 
-    let result = match resolve_value_set_versioned(
-        client,
-        bare_url,
-        effective_version.as_deref(),
-        None,
-    )
-    .await
-    {
-        Ok((_ref_vs_id, ref_compose)) => {
-            // Recurse — the bypass for the cache mirrors compute_expansion's
-            // own multi-version handling implicitly; for ref expansion the
-            // cache is fine but we pay re-compute cost here for simplicity.
-            compute_expansion_inner(
-                client,
-                ref_compose.as_deref(),
-                force_system_versions,
-                system_version_defaults,
-                default_value_set_versions,
-                contained,
-                depth + 1,
-                visited,
-            )
+    let result =
+        match resolve_value_set_versioned(client, bare_url, effective_version.as_deref(), None)
             .await
-        }
-        Err(e) => {
-            // Explicit version pin that doesn't resolve must surface as a
-            // hard NotFound (mirrors SQLite valueset-version/expand-indirect-
-            // expand-zero-pinned-wrong fixture). Otherwise, warn and
-            // contribute an empty set so a missing optional ref doesn't
-            // collapse the whole expansion.
-            if pin_was_explicit && matches!(e, HtsError::NotFound(_)) {
-                Err(e)
-            } else {
-                tracing::warn!(
-                    ref_url,
-                    "Referenced ValueSet not found; excluded from expansion"
-                );
-                Ok(vec![])
+        {
+            Ok((_ref_vs_id, ref_compose)) => {
+                // Recurse — the bypass for the cache mirrors compute_expansion's
+                // own multi-version handling implicitly; for ref expansion the
+                // cache is fine but we pay re-compute cost here for simplicity.
+                compute_expansion_inner(
+                    client,
+                    ref_compose.as_deref(),
+                    force_system_versions,
+                    system_version_defaults,
+                    default_value_set_versions,
+                    contained,
+                    depth + 1,
+                    visited,
+                )
+                .await
             }
-        }
-    };
+            Err(e) => {
+                // Explicit version pin that doesn't resolve must surface as a
+                // hard NotFound (mirrors SQLite valueset-version/expand-indirect-
+                // expand-zero-pinned-wrong fixture). Otherwise, warn and
+                // contribute an empty set so a missing optional ref doesn't
+                // collapse the whole expansion.
+                if pin_was_explicit && matches!(e, HtsError::NotFound(_)) {
+                    Err(e)
+                } else {
+                    tracing::warn!(
+                        ref_url,
+                        "Referenced ValueSet not found; excluded from expansion"
+                    );
+                    Ok(vec![])
+                }
+            }
+        };
 
     visited.remove(ref_url);
     result
@@ -2897,9 +2893,7 @@ async fn apply_compose_filters_pg(
         let value = f["value"].as_str().unwrap_or("");
 
         let matches: Vec<(String, Option<String>)> = match op {
-            "=" => {
-                pg_filter_property_eq(client, system_url, system_id, property, value).await?
-            }
+            "=" => pg_filter_property_eq(client, system_url, system_id, property, value).await?,
             // Single-value `in` reduces to equality. Multi-value (comma-
             // separated) `in` is a TODO: parity gap.
             "in" if !value.contains(',') => {
@@ -2921,9 +2915,7 @@ async fn apply_compose_filters_pg(
             // Single-value `not-in` reduces to `!=`; both return concepts
             // whose property is NOT this value (concepts without the
             // property pass). Drives notSelectable-prop-out* IG fixtures.
-            "!=" => {
-                pg_filter_property_ne(client, system_url, system_id, property, value).await?
-            }
+            "!=" => pg_filter_property_ne(client, system_url, system_id, property, value).await?,
             "not-in" if !value.contains(',') => {
                 pg_filter_property_ne(client, system_url, system_id, property, value).await?
             }
@@ -3551,9 +3543,7 @@ fn parse_fhir_vs_url(url: &str) -> Option<(String, FhirVsPattern)> {
 /// Anything else (multiple includes, multiple filters, AND-intersected
 /// property filters, concept lists, valueSet refs, an `exclude[]`) returns
 /// `None` so the caller falls through to the existing compute path.
-fn extract_single_hierarchy_include(
-    compose: &serde_json::Value,
-) -> Option<(String, String, bool)> {
+fn extract_single_hierarchy_include(compose: &serde_json::Value) -> Option<(String, String, bool)> {
     // Reject any top-level `exclude` (even an empty one is fine, but a
     // non-empty one would change the result).
     if let Some(excl) = compose.get("exclude").and_then(|v| v.as_array()) {
@@ -3724,10 +3714,7 @@ async fn validate_fhir_vs(
 
 /// Highest stored ValueSet version for a URL, used to format `url|version`
 /// in IG-spec not-found messages.
-async fn lookup_value_set_version(
-    client: &tokio_postgres::Client,
-    url: &str,
-) -> Option<String> {
+async fn lookup_value_set_version(client: &tokio_postgres::Client, url: &str) -> Option<String> {
     client
         .query_opt(
             "SELECT version FROM value_sets \
@@ -3835,18 +3822,14 @@ pub(super) async fn cs_is_case_insensitive(
         Ok(r) => r,
         Err(_) => return false,
     };
-    match row.and_then(|r| r.get::<_, Option<String>>(0)) {
-        Some(s) if s.eq_ignore_ascii_case("false") => true,
-        _ => false,
-    }
+    matches!(
+        row.and_then(|r| r.get::<_, Option<String>>(0)),
+        Some(s) if s.eq_ignore_ascii_case("false")
+    )
 }
 
 /// `true` when the code exists in the named CodeSystem (any version).
-async fn is_code_in_cs(
-    client: &tokio_postgres::Client,
-    system_url: &str,
-    code: &str,
-) -> bool {
+async fn is_code_in_cs(client: &tokio_postgres::Client, system_url: &str, code: &str) -> bool {
     client
         .query_one(
             "SELECT EXISTS(

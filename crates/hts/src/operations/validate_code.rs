@@ -3932,7 +3932,8 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                         .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
                         .and_then(|p| p.get("valueCodeableConcept"))
                         .cloned();
-                    let req_path = if extract_codeable_concept(&params, "codeableConcept").is_some() {
+                    let req_path = if extract_codeable_concept(&params, "codeableConcept").is_some()
+                    {
                         RequestPath::CodeableConcept
                     } else if extract_coding_full(&params, "coding").is_some() {
                         RequestPath::Coding

@@ -309,8 +309,7 @@ pub async fn build_concept_closure_pg(
     )
     .await?;
 
-    let insert_sql =
-        "INSERT INTO concept_closure (system_id, ancestor_code, descendant_code)
+    let insert_sql = "INSERT INTO concept_closure (system_id, ancestor_code, descendant_code)
          SELECT $1, anc, des
          FROM UNNEST($2::text[], $3::text[]) AS t(anc, des)
          ON CONFLICT DO NOTHING";

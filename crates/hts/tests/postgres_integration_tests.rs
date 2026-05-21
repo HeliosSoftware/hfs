@@ -1611,7 +1611,7 @@ async fn translate_reverse_mode() {
     let base = base_url!("tr-rev");
     seed_concept_map(&backend, &base).await;
 
-    // Reverse: look up target "200" → should find source "100"
+    // Reverse: look up target "200" → resolve source "100".
     let resp = ConceptMapOperations::translate(
         &backend,
         &ctx(),
@@ -1627,7 +1627,10 @@ async fn translate_reverse_mode() {
 
     assert!(resp.result, "Reverse translation should succeed");
     assert_eq!(resp.matches.len(), 1);
-    assert_eq!(resp.matches[0].concept_code, "100");
+    // `concept_*` reflects the target side (the looked-up code), `source_*`
+    // reflects the resolved source side — independent of forward vs reverse.
+    assert_eq!(resp.matches[0].concept_code, "200");
+    assert_eq!(resp.matches[0].source_code.as_deref(), Some("100"));
 }
 
 #[tokio::test]
