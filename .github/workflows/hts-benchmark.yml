@@ -3,6 +3,13 @@ name: HTS Terminology Benchmark
 # ──────────────────────────────────────────────────────────────────────────────
 # Manual trigger only — benchmarks are expensive and require licensed data.
 #
+# Runs the k6 preflight + benchmark scenarios (HealthSamurai/tx-benchmark)
+# against HTS. The `backend` input selects which storage backend(s) to
+# exercise:
+#   • sqlite   — default-feature build, file-backed DB.
+#   • postgres — `--features postgres,R4` build, ephemeral postgres:16 container.
+#   • all      — both, as parallel matrix legs (default).
+#
 # Terminology data is loaded from two locations:
 #   1. FHIR IG packages pulled directly from packages.fhir.org at the exact
 #      versions the benchmark corpus specifies (these differ from the latest
@@ -14,12 +21,25 @@ name: HTS Terminology Benchmark
 # Prerequisites on the self-hosted runner:
 #   • HTS_LICENSED_S3_URI secret: s3://bucket/path/ — REQUIRED.
 #   • AWS_ROLE_ARN / AWS_REGION secrets (or vars) for OIDC role assumption.
-#   • k6 and bun are auto-installed if not already present.
+#   • k6 is auto-installed if not already present.
+#   • Docker is required for the postgres backend (postgres:16 container).
+#     The runner talks to a REMOTE Docker daemon — DOCKER_HOST (TCP endpoint)
+#     and DOCKER_HOST_IP (IP to reach published container ports) secrets wire
+#     it up. Same pattern as .github/workflows/audit-events.yml.
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch:
     inputs:
+      backend:
+        description: "Storage backend(s) to benchmark"
+        type: choice
+        required: false
+        default: all
+        options:
+          - all
+          - sqlite
+          - postgres
       vus:
         description: "Virtual users per scenario (comma-separated)"
         required: false
@@ -33,22 +53,60 @@ on:
         required: false
         default: "all"
 
+# Self-hosted runner has finite Docker port and disk capacity; superseded
+# runs on the same branch yield to fresh ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
-  HTS_PORT: 8092
   # S3 prefix (s3://bucket/path/) containing licensed terminology
   # distributions (SNOMED RF2, LOINC, RxNorm, etc.).
   HTS_LICENSED_S3_URI: ${{ secrets.HTS_LICENSED_S3_URI }}
+  # Remote Docker daemon wiring — only consumed by the postgres backend.
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
-  # Compile a debug binary — shared with the benchmark job via artifact
+  # Resolve the `backend` input into a job matrix. Each leg carries the HTS
+  # server port — distinct per backend so sqlite (8092) and postgres (8098)
+  # can run concurrently on the same self-hosted runner.
+  # ────────────────────────────────────────────────────────────────────────────
+  setup:
+    name: Resolve backend matrix
+    runs-on: [self-hosted, Linux]
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Resolve matrix from backend input
+        id: matrix
+        run: |
+          case "${{ inputs.backend || 'all' }}" in
+            sqlite)
+              MATRIX='{"include":[{"backend":"sqlite","port":8092}]}' ;;
+            postgres)
+              MATRIX='{"include":[{"backend":"postgres","port":8098}]}' ;;
+            *)
+              MATRIX='{"include":[{"backend":"sqlite","port":8092},{"backend":"postgres","port":8098}]}' ;;
+          esac
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Backend matrix: $MATRIX"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Compile a debug binary per backend — shared with the benchmark job via
+  # artifact. The postgres binary is built with `--features postgres,R4`.
   # ────────────────────────────────────────────────────────────────────────────
   build:
-    name: Build HTS binary
+    name: Build HTS binary (${{ matrix.backend }})
+    needs: setup
     runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -69,22 +127,32 @@ jobs:
             > ~/.cargo/config.toml
 
       - name: Build debug binary
-        run: cargo build -p helios-hts
+        run: |
+          if [ "${{ matrix.backend }}" = "postgres" ]; then
+            cargo build -p helios-hts \
+              --no-default-features \
+              --features "postgres,R4"
+          else
+            cargo build -p helios-hts
+          fi
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: hts-bench-binary-${{ github.run_id }}
+          name: hts-bench-binary-${{ matrix.backend }}-${{ github.run_id }}
           path: target/debug/hts
           retention-days: 1
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Run preflight + benchmark
+  # Run preflight + benchmark per backend.
   # ────────────────────────────────────────────────────────────────────────────
   benchmark:
-    name: Benchmark
+    name: Benchmark (${{ matrix.backend }})
+    needs: [setup, build]
     runs-on: [self-hosted, Linux]
-    needs: build
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     permissions:
       id-token: write
       contents: read
@@ -104,11 +172,96 @@ jobs:
       - name: Download HTS binary
         uses: actions/download-artifact@v8
         with:
-          name: hts-bench-binary-${{ github.run_id }}
+          name: hts-bench-binary-${{ matrix.backend }}-${{ github.run_id }}
           path: .
 
       - name: Make binary executable
         run: chmod +x ./hts
+
+      # ── Postgres: remote Docker host discovery ───────────────────────────
+      # The container binds to `-p 0:5432` so the remote Docker daemon picks
+      # a free host-side port; we read it back via `docker port` and connect
+      # via `$DOCKER_HOST_IP:$PG_PORT`. Same pattern as audit-events.yml.
+      - name: Determine runner / Docker host IP
+        if: matrix.backend == 'postgres'
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      # ── Backend env wiring ───────────────────────────────────────────────
+      # `hts` reads HTS_STORAGE_BACKEND + HTS_DATABASE_URL from the env via
+      # clap (see crates/hts/src/config.rs), so both `hts import` and the
+      # server pick them up without any per-call `--database-url` flag.
+      # For postgres, HTS_DATABASE_URL is filled in once the container's
+      # host-side port is known (see "Start ephemeral Postgres").
+      - name: Configure backend env
+        run: |
+          echo "HTS_STORAGE_BACKEND=${{ matrix.backend }}" >> "$GITHUB_ENV"
+          if [ "${{ matrix.backend }}" = "sqlite" ]; then
+            DB_PATH="$GITHUB_WORKSPACE/bench.db"
+            rm -f "$DB_PATH"
+            echo "HTS_DATABASE_URL=$DB_PATH" >> "$GITHUB_ENV"
+            echo "SQLite DB: $DB_PATH"
+          else
+            PG_CONTAINER="hts-bench-pg-${{ github.run_id }}"
+            echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+            echo "Container name: $PG_CONTAINER"
+          fi
+
+      - name: Start ephemeral Postgres
+        if: matrix.backend == 'postgres'
+        run: |
+          set -euo pipefail
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          # `-c shared_buffers=1GB -c work_mem=64MB` give the bench a fair
+          # chance against SQLite's in-process locality; the defaults are
+          # tuned for tiny VPS instances and would penalise PG unfairly when
+          # the benchmark loads SNOMED + LOINC + RxNorm into the same DB.
+          # 1GB shared_buffers lets the ~600 MB SNOMED `concept_closure` fit
+          # in cache; otherwise its index pages evict the hot LK/VC/EX
+          # working set and every PG test regresses 5-10%. `--shm-size=2g`
+          # ensures the larger shmem segment fits.
+          docker run -d \
+            --name "$PG_CONTAINER" \
+            --shm-size=2g \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=postgres \
+            -p 0:5432 \
+            postgres:16 \
+            -c shared_buffers=1GB \
+            -c work_mem=64MB \
+            -c max_connections=100 >/dev/null
+
+          echo "Waiting for Postgres to accept connections..."
+          PG_PORT=""
+          for i in $(seq 1 30); do
+            if docker exec "$PG_CONTAINER" pg_isready -U postgres -d postgres >/dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if [ -n "$PG_PORT" ] && timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "Postgres ready on $DOCKER_HOST_IP:$PG_PORT after $((i * 2))s"
+                break
+              fi
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: Postgres did not become reachable within 60s"
+              docker logs "$PG_CONTAINER" | tail -100 || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          {
+            echo "PG_PORT=$PG_PORT"
+            echo "HTS_DATABASE_URL=postgresql://postgres:postgres@$DOCKER_HOST_IP:$PG_PORT/postgres"
+          } >> "$GITHUB_ENV"
 
       # ── AWS (for syncing licensed terminology from S3) ───────────────────
 
@@ -146,9 +299,8 @@ jobs:
 
       - name: Prepare terminology database
         run: |
-          DB_PATH="$GITHUB_WORKSPACE/bench.db"
-          rm -f "$DB_PATH"
-          echo "HTS_DB=$DB_PATH" >> "$GITHUB_ENV"
+          # HTS_STORAGE_BACKEND + HTS_DATABASE_URL already exported by the
+          # backend-env steps, so `hts import` needs no --database-url flag.
 
           # ── Source 1: FHIR IG packages from packages.fhir.org at the
           # exact benchmark-pinned versions (older than the latest bundled
@@ -176,8 +328,7 @@ jobs:
               -o "$FILE"
 
             echo "Importing ${PKG} ${VER}..."
-            ./hts import "$FILE" \
-              --database-url "$DB_PATH" --batch-size 500 || true
+            ./hts import "$FILE" --batch-size 500 || true
           done
 
           # ── Supplement: VSAC ValueSets not covered by us.nlm.vsac@0.17.0
@@ -187,8 +338,7 @@ jobs:
           SUPPLEMENT="$GITHUB_WORKSPACE/crates/hts/terminology-data/vsac-supplement.bundle.json"
           if [ -f "$SUPPLEMENT" ]; then
             echo "Importing VSAC supplement..."
-            ./hts import "$SUPPLEMENT" \
-              --database-url "$DB_PATH" --batch-size 500 || true
+            ./hts import "$SUPPLEMENT" --batch-size 500 || true
           fi
 
           # ── Source 2: licensed distributions from S3 (SNOMED, LOINC, ...)
@@ -208,32 +358,31 @@ jobs:
           ls -lh "$LICENSED_DIR"
 
           echo "Importing licensed terminology (directory auto-detects SNOMED RF2 / LOINC / RxNorm)..."
-          ./hts import "$LICENSED_DIR" \
-            --database-url "$DB_PATH" --batch-size 500
+          ./hts import "$LICENSED_DIR" --batch-size 500
 
       # ── Server ───────────────────────────────────────────────────────────
 
-      - name: Kill any leftover process on port ${{ env.HTS_PORT }}
-        run: fuser -k "${{ env.HTS_PORT }}/tcp" 2>/dev/null || true
+      - name: Kill any leftover process on port ${{ matrix.port }}
+        run: fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
 
       - name: Start HTS server
         run: |
-          HTS_SERVER_PORT="${{ env.HTS_PORT }}" \
-          HTS_DATABASE_URL="$HTS_DB" \
+          # HTS_DATABASE_URL + HTS_STORAGE_BACKEND already exported.
+          HTS_SERVER_PORT="${{ matrix.port }}" \
           HTS_LOG_LEVEL="info" \
-            ./hts > /tmp/hts-bench.log 2>&1 &
+            ./hts > "/tmp/hts-bench-${{ matrix.backend }}.log" 2>&1 &
 
           echo "HTS_PID=$!" >> "$GITHUB_ENV"
 
           echo "Waiting for HTS to become ready..."
           for i in $(seq 1 30); do
-            if curl -sf "http://localhost:${{ env.HTS_PORT }}/health" > /dev/null 2>&1; then
+            if curl -sf "http://localhost:${{ matrix.port }}/health" > /dev/null 2>&1; then
               echo "HTS ready after $((i * 2))s"
               break
             fi
             if [ "$i" -eq 30 ]; then
               echo "ERROR: HTS did not start within 60s"
-              cat /tmp/hts-bench.log
+              cat "/tmp/hts-bench-${{ matrix.backend }}.log"
               exit 1
             fi
             sleep 2
@@ -253,10 +402,10 @@ jobs:
           mkdir -p "results/${{ github.run_id }}/hts"
 
           k6 run \
-            --env BASE_URL="http://localhost:${{ env.HTS_PORT }}" \
+            --env BASE_URL="http://localhost:${{ matrix.port }}" \
             --env SERVER_NAME=hts \
             --env RUN_ID="${{ github.run_id }}" \
-            preflight/run.js 2>&1 | tee /tmp/preflight-stdout.txt
+            preflight/run.js 2>&1 | tee "/tmp/preflight-stdout-${{ matrix.backend }}.txt"
 
           # Extract passing test IDs for the benchmark step
           PREFLIGHT_JSON="results/${{ github.run_id }}/hts/preflight.json"
@@ -309,7 +458,7 @@ jobs:
             for VU in "${VUS_LIST[@]}"; do
               echo "--- $TEST  VUs=$VU ---"
               k6 run \
-                --env BASE_URL="http://localhost:${{ env.HTS_PORT }}" \
+                --env BASE_URL="http://localhost:${{ matrix.port }}" \
                 --env SERVER_NAME=hts \
                 --env RUN_ID="${{ github.run_id }}" \
                 --env TEST_ID="$TEST" \
@@ -329,19 +478,20 @@ jobs:
           RESULTS_DIR="results/${{ github.run_id }}/hts"
 
           {
-            echo "## HTS Benchmark — \`${{ github.ref_name }}\`"
+            echo "## HTS Benchmark — \`${{ github.ref_name }}\` (${{ matrix.backend }})"
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| **Commit** | \`$(echo '${{ github.sha }}' | cut -c1-7)\` |"
-            echo "| **Duration** | ${{ inputs.duration || '30s' }} per scenario |"
-            echo "| **VUs** | ${{ inputs.vus || '1,10,50' }} |"
+            echo "| **Commit**  | \`$(echo '${{ github.sha }}' | cut -c1-7)\` |"
+            echo "| **Backend** | \`${{ matrix.backend }}\` |"
+            echo "| **Duration**| ${{ inputs.duration || '30s' }} per scenario |"
+            echo "| **VUs**     | ${{ inputs.vus || '1,10,50' }} |"
             echo ""
 
             # Preflight table from stdout
             echo "### Preflight"
             echo '```'
-            cat /tmp/preflight-stdout.txt | grep -E '✓|✗|~|Preflight' || true
+            cat "/tmp/preflight-stdout-${{ matrix.backend }}.txt" | grep -E '✓|✗|~|Preflight' || true
             echo '```'
             echo ""
 
@@ -385,7 +535,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: hts-benchmark-${{ github.run_id }}
+          name: hts-benchmark-${{ matrix.backend }}-${{ github.run_id }}
           path: tx-benchmark/results/
           retention-days: 90
 
@@ -393,8 +543,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: hts-bench-server-log-${{ github.run_id }}
-          path: /tmp/hts-bench.log
+          name: hts-bench-server-log-${{ matrix.backend }}-${{ github.run_id }}
+          path: /tmp/hts-bench-${{ matrix.backend }}.log
           retention-days: 7
           if-no-files-found: ignore
 
@@ -403,5 +553,14 @@ jobs:
       - name: Stop HTS server
         if: always()
         run: |
-          kill "$HTS_PID" 2>/dev/null || true
-          fuser -k "${{ env.HTS_PORT }}/tcp" 2>/dev/null || true
+          if [ -n "${HTS_PID:-}" ]; then
+            kill "$HTS_PID" 2>/dev/null || true
+          fi
+          fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+
+      - name: Stop ephemeral Postgres
+        if: always() && matrix.backend == 'postgres'
+        run: |
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          fi
