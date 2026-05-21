@@ -565,11 +565,43 @@ jobs:
             Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
           }
 
+  # Release-only conformance gate: run the HTS and extended-CI suites as
+  # reusable sub-workflows against the exact tagged commit, so a release is
+  # built and published only if this commit itself passes conformance.
+  hts-conformance:
+    name: HTS conformance
+    needs: [test-rust]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/hts.yml
+
+  hts-ig-conformance:
+    name: HTS IG conformance
+    needs: [test-rust]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/hts-ig-conformance.yml
+    secrets: inherit
+
+  ci-extended:
+    name: Extended CI
+    needs: [test-rust]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/ci-extended.yml
+    secrets: inherit
+
   build:
     name: Build Release
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 1440
-    needs: [coverage, security, test-python, test-fhirpath]
+    needs:
+      [
+        coverage,
+        security,
+        test-python,
+        test-fhirpath,
+        hts-conformance,
+        hts-ig-conformance,
+        ci-extended,
+      ]
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false

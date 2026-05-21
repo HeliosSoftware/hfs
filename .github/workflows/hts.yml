@@ -2,22 +2,13 @@ name: HTS Terminology Server CI
 
 on:
   workflow_dispatch:
+  workflow_call: # invoked by ci.yml as a release conformance gate
   schedule:
     # Nightly conformance run at 05:00 UTC — catches regressions even when no
     # HTS code changed (tx.fhir.org behaviour drift, transitive dependency
     # bumps, UTG package updates). Offset from ci-extended.yml's 07:00 UTC
     # weekday run so the two don't contend for self-hosted runners.
     - cron: "0 5 * * *"
-  push:
-    branches: [main]
-    paths:
-      - "crates/hts/**"
-      - ".github/workflows/hts.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "crates/hts/**"
-      - ".github/workflows/hts.yml"
 
 env:
   CARGO_TERM_COLOR: always
