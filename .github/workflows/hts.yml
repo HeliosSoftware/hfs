@@ -2,6 +2,21 @@ name: HTS Terminology Server CI
 
 on:
   workflow_dispatch:
+  schedule:
+    # Nightly conformance run at 07:00 UTC — catches regressions even when no
+    # HTS code changed (tx.fhir.org behaviour drift, transitive dependency
+    # bumps, UTG package updates).
+    - cron: "0 7 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "crates/hts/**"
+      - ".github/workflows/hts.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/hts/**"
+      - ".github/workflows/hts.yml"
 
 env:
   CARGO_TERM_COLOR: always
