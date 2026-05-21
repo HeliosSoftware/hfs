@@ -440,7 +440,7 @@ where
     }
 
     // Buffered paths (csv, json array, parquet) — collect the stream first.
-    let (ct, body) = format_stream(stream, content_type).await;
+    let (ct, body) = format_stream(stream, content_type).await?;
     Ok(build_response(
         StatusCode::OK,
         ct,
@@ -659,12 +659,28 @@ fn streaming_ndjson_response(
                 Ok(r) => match serde_json::to_vec(&r) {
                     Ok(v) => v,
                     Err(e) => {
+                        // Abort the body: an unserializable row is a server
+                        // fault, and silently dropping it would hand the
+                        // client a clean — but lossy — 200.
                         warn!(error = %e, "ndjson row serialization failed");
-                        continue;
+                        let _ = tx
+                            .send(Err(std::io::Error::other(format!(
+                                "ndjson row serialization failed: {e}"
+                            ))))
+                            .await;
+                        break;
                     }
                 },
                 Err(e) => {
+                    // Yield an error into the body so hyper aborts the
+                    // chunked transfer (no terminating chunk). Without this
+                    // the client sees a cleanly-ended, silently-truncated 200.
                     warn!(error = %e, "row error while streaming ndjson");
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!(
+                            "row error while streaming ndjson: {e}"
+                        ))))
+                        .await;
                     break;
                 }
             };
@@ -698,33 +714,38 @@ fn streaming_ndjson_response(
 /// here and pass through `helios_sof::format_output` so REST output matches
 /// `sof-server` / `pysof` byte-for-byte. Takes the already-validated
 /// `ContentType` so there's no re-parse-with-`expect` here (audit item #15).
+///
+/// A mid-stream row error or a formatter failure propagates as a `RestError`
+/// (the response status is not yet committed on the buffered path), so the
+/// client gets a real error status instead of a silently truncated `200`.
 async fn format_stream(
     stream: helios_persistence::core::sof_runner::RowStream,
     content_type: ContentType,
-) -> (&'static str, Vec<u8>) {
-    let rows = drain_stream(stream).await;
+) -> Result<(&'static str, Vec<u8>), RestError> {
+    let rows = drain_stream(stream).await?;
     let result = helios_sof::rows_to_processed_result(rows);
-    let body = helios_sof::format_output(result, content_type, None).unwrap_or_else(|e| {
-        warn!(error = %e, ?content_type, "shared output formatter failed; returning empty body");
-        Vec::new()
-    });
-    (content_type_headers(content_type).0, body)
+    let body =
+        helios_sof::format_output(result, content_type, None).map_err(map_sof_lib_error_to_rest)?;
+    Ok((content_type_headers(content_type).0, body))
 }
 
-/// Drains a [`RowStream`] into a `Vec<Value>`, stopping at the first stream
-/// error after logging it. Used by the buffered output paths.
-async fn drain_stream(mut stream: helios_persistence::core::sof_runner::RowStream) -> Vec<Value> {
+/// Drains a [`RowStream`] into a `Vec<Value>`. A mid-stream error aborts the
+/// drain and propagates as a `RestError` so the buffered output paths return a
+/// proper error status rather than a silently truncated `200`.
+async fn drain_stream(
+    mut stream: helios_persistence::core::sof_runner::RowStream,
+) -> Result<Vec<Value>, RestError> {
     let mut rows = Vec::new();
     while let Some(result) = stream.next().await {
         match result {
             Ok(row) => rows.push(row),
             Err(e) => {
                 warn!(error = %e, "row error while collecting stream");
-                break;
+                return Err(map_sof_error_to_rest(e));
             }
         }
     }
-    rows
+    Ok(rows)
 }
 
 /// Builds the final `Response` with `X-HFS-Runner` and optional Content-Disposition.
@@ -811,5 +832,59 @@ fn map_sof_error_to_rest(e: SofError) -> RestError {
                 message: other.to_string(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios_persistence::core::sof_runner::RowStream;
+    use serde_json::json;
+
+    fn row_stream(rows: Vec<Result<Value, SofError>>) -> RowStream {
+        Box::pin(futures::stream::iter(rows))
+    }
+
+    #[tokio::test]
+    async fn streaming_ndjson_aborts_on_row_error() {
+        let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
+        let response = streaming_ndjson_response(stream, "test-runner");
+        assert_eq!(response.status(), StatusCode::OK);
+        // A mid-stream error must abort the chunked body, not end it cleanly:
+        // collecting an aborted body fails.
+        let collected = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(
+            collected.is_err(),
+            "expected the aborted chunked body to fail collection"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_ndjson_completes_on_clean_stream() {
+        let stream = row_stream(vec![Ok(json!({ "a": 1 })), Ok(json!({ "a": 2 }))]);
+        let response = streaming_ndjson_response(stream, "test-runner");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a clean stream should produce a collectable body");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+        assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n");
+    }
+
+    #[tokio::test]
+    async fn drain_stream_errors_on_row_error() {
+        let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
+        assert!(
+            drain_stream(stream).await.is_err(),
+            "a mid-stream row error must propagate instead of truncating"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_stream_collects_clean_stream() {
+        let stream = row_stream(vec![Ok(json!({ "a": 1 })), Ok(json!({ "a": 2 }))]);
+        let rows = drain_stream(stream)
+            .await
+            .expect("clean stream should drain");
+        assert_eq!(rows.len(), 2);
     }
 }
