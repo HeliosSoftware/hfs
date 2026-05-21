@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use mongodb::{Client, Database, bson::doc, options::ClientOptions};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 
 use helios_fhir::FhirVersion;
 
@@ -28,6 +29,9 @@ use super::schema;
 /// Advanced search/composite behavior remains in later phases.
 pub struct MongoBackend {
     config: MongoBackendConfig,
+    /// Lazily initialized MongoDB client. MongoDB clients own their connection
+    /// pools, so each backend instance must reuse one client.
+    client: OnceCell<Client>,
     /// Search parameter registry (in-memory cache of active parameters).
     search_registry: Arc<RwLock<SearchParameterRegistry>>,
     /// Extractor for deriving searchable values from resources.
@@ -120,6 +124,7 @@ impl MongoBackend {
 
         Ok(Self {
             config,
+            client: OnceCell::new(),
             search_registry,
             search_extractor,
         })
@@ -299,7 +304,7 @@ impl MongoBackend {
     }
 
     /// Creates a MongoDB client from backend configuration.
-    pub(crate) async fn get_client(&self) -> StorageResult<Client> {
+    async fn create_client(&self) -> StorageResult<Client> {
         let mut client_options = ClientOptions::parse(&self.config.connection_string)
             .await
             .map_err(|e| {
@@ -321,6 +326,14 @@ impl MongoBackend {
                 source: None,
             })
         })
+    }
+
+    /// Returns the shared MongoDB client for this backend.
+    pub(crate) async fn get_client(&self) -> StorageResult<Client> {
+        self.client
+            .get_or_try_init(|| self.create_client())
+            .await
+            .cloned()
     }
 
     /// Returns the configured MongoDB database handle.
