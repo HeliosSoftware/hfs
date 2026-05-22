@@ -549,7 +549,7 @@ cargo build --bin hfs --features mongodb --release
 
 # Start MongoDB (example using Docker)
 docker run -d --name mongo -p 27017:27017 \
-  mongo:8.3
+  mongo:8.0
 
 # Start the server
 HFS_STORAGE_BACKEND=mongodb \
@@ -582,7 +582,7 @@ cargo build --bin hfs --features mongodb,elasticsearch --release
 
 # Start MongoDB (example using Docker)
 docker run -d --name mongo -p 27017:27017 \
-  mongo:8.3
+  mongo:8.0
 
 # Start Elasticsearch (example using Docker)
 docker run -d --name es -p 9200:9200 \
