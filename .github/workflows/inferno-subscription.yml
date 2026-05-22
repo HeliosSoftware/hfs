@@ -269,7 +269,7 @@ jobs:
         run: |
           MONGO_CONTAINER="mongo-inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$MONGO_CONTAINER" --memory=2g -p 0:27017 mongo:8.0 \
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 \
             --replSet rs0 --bind_ip_all --wiredTigerCacheSizeGB 0.5
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
