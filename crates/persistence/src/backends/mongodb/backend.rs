@@ -19,6 +19,13 @@ use crate::search::{SearchParameterExtractor, SearchParameterLoader, SearchParam
 
 use super::schema;
 
+/// Upper bound for selecting a usable server before an operation gives up.
+const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Connections idle longer than this are closed rather than reused, so a
+/// connection silently dropped by a NAT/firewall is never handed to a request.
+const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
+
 /// MongoDB backend for FHIR resource storage.
 ///
 /// The Phase 4 implementation provides backend wiring, schema bootstrap,
@@ -318,6 +325,14 @@ impl MongoBackend {
         client_options.connect_timeout =
             Some(Duration::from_millis(self.config.connect_timeout_ms));
         client_options.app_name = Some("helios-persistence".to_string());
+
+        // Fail fast when no healthy server can be selected. `connect_timeout`
+        // only covers new TCP handshakes; this caps requests once server
+        // monitoring has marked the server unavailable.
+        client_options.server_selection_timeout = Some(SERVER_SELECTION_TIMEOUT);
+        // Recycle idle connections so stale ones (e.g. silently dropped by a
+        // NAT/firewall on a long-lived network path) are not handed out.
+        client_options.max_idle_time = Some(MAX_CONNECTION_IDLE_TIME);
 
         Client::with_options(client_options).map_err(|e| {
             StorageError::Backend(BackendError::Internal {
