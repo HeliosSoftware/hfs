@@ -8,6 +8,8 @@
 
 #![cfg(feature = "mongodb")]
 
+use std::sync::Arc;
+
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
 use helios_persistence::core::{
@@ -233,6 +235,21 @@ async fn search_index_entry_count(
         .expect("failed to count search_index entries")
 }
 
+async fn mongodb_total_created_connections(connection_string: &str) -> Option<i64> {
+    let client = Client::with_uri_str(connection_string).await.ok()?;
+    let status = client
+        .database("admin")
+        .run_command(doc! { "serverStatus": 1_i32 })
+        .await
+        .ok()?;
+    let connections = status.get_document("connections").ok()?;
+
+    connections
+        .get_i64("totalCreated")
+        .or_else(|_| connections.get_i32("totalCreated").map(i64::from))
+        .ok()
+}
+
 #[tokio::test]
 async fn mongodb_integration_create_read_update_delete() {
     let Some(backend) = create_backend("crud").await else {
@@ -288,6 +305,97 @@ async fn mongodb_integration_create_read_update_delete() {
         read_after_delete,
         Err(StorageError::Resource(ResourceError::Gone { .. }))
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
+    let Some(connection_string) = test_mongo_url() else {
+        eprintln!(
+            "Skipping mongodb_integration_reuses_client_pool_under_concurrent_read_search (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let config = MongoBackendConfig {
+        connection_string: connection_string.clone(),
+        database_name: build_test_database_name("client_pool_reuse"),
+        max_connections: 8,
+        ..Default::default()
+    };
+    let backend = MongoBackend::new(config).expect("failed to create MongoBackend");
+    backend
+        .initialize()
+        .await
+        .expect("failed to initialize MongoDB schema");
+
+    let tenant = create_tenant("tenant-client-pool");
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-client-pool",
+                "identifier": [{
+                    "system": "http://hospital.org/mrn",
+                    "value": "MRN-CLIENT-POOL"
+                }],
+                "name": [{ "family": "Pool" }],
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let Some(before) = mongodb_total_created_connections(&connection_string).await else {
+        eprintln!(
+            "Skipping mongodb_integration_reuses_client_pool_under_concurrent_read_search (serverStatus unavailable)"
+        );
+        return;
+    };
+
+    let backend = Arc::new(backend);
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let backend = backend.clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..20 {
+                backend
+                    .read(&tenant, "Patient", "patient-client-pool")
+                    .await
+                    .unwrap();
+
+                let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                    name: "identifier".to_string(),
+                    param_type: SearchParamType::Token,
+                    modifier: None,
+                    values: vec![SearchValue::eq("http://hospital.org/mrn|MRN-CLIENT-POOL")],
+                    chain: vec![],
+                    components: vec![],
+                });
+                backend.search(&tenant, &query).await.unwrap();
+            }
+        }));
+    }
+
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    let Some(after) = mongodb_total_created_connections(&connection_string).await else {
+        eprintln!(
+            "Skipping mongodb_integration_reuses_client_pool_under_concurrent_read_search (serverStatus unavailable)"
+        );
+        return;
+    };
+
+    let created_during_test = after - before;
+    assert!(
+        created_during_test <= 50,
+        "MongoDB backend should reuse one client pool; created {} connections during concurrent read/search",
+        created_during_test
+    );
 }
 
 #[tokio::test]
