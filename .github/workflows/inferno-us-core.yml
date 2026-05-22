@@ -243,7 +243,7 @@ jobs:
         run: |
           MONGO_CONTAINER="mongo-${{ matrix.suite_id }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
 
@@ -683,6 +683,31 @@ jobs:
           path: ${{ env.HFS_LOG }}
           retention-days: 30
           if-no-files-found: ignore
+
+      # Diagnostics: capture why mongod died (host-OOM vs cgroup-OOM vs crash)
+      # without needing shell access to the Docker host. Runs before Cleanup
+      # removes the container.
+      - name: Diagnose MongoDB failure
+        if: failure() && matrix.backend == 'mongodb'
+        run: |
+          echo "::group::MongoDB container state (OOMKilled / exit code)"
+          docker inspect "${MONGO_CONTAINER:-none}" \
+            --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}} Error={{.State.Error}} FinishedAt={{.State.FinishedAt}}' 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::mongod logs (last 60 lines)"
+          docker logs "${MONGO_CONTAINER:-none}" --tail 60 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::Host OOM-killer (kernel ring buffer)"
+          docker run --rm --privileged busybox dmesg 2>/dev/null \
+            | grep -iE "out of memory|killed process|oom" | tail -25 || true
+          echo "(end of OOM grep — empty means no OOM lines found)"
+          echo "::endgroup::"
+          echo "::group::Docker host memory + containers"
+          docker run --rm busybox sh -c \
+            'grep -E "MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree" /proc/meminfo' 2>&1 || true
+          docker info --format 'MemTotal={{.MemTotal}} Containers={{.Containers}} Running={{.ContainersRunning}}' 2>&1 || true
+          docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}' 2>&1 || true
+          echo "::endgroup::"
 
       - name: Cleanup
         if: always()

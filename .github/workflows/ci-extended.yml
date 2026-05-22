@@ -5,6 +5,7 @@ on:
     # Run nightly at 2am Eastern (7am UTC) on weekdays
     - cron: '0 7 * * 1-5'
   workflow_dispatch:  # Allow manual trigger too
+  workflow_call:      # invoked by ci.yml as a release conformance gate
 
 env:
   CARGO_TERM_COLOR: always

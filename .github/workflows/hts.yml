@@ -2,6 +2,13 @@ name: HTS Terminology Server CI
 
 on:
   workflow_dispatch:
+  workflow_call: # invoked by ci.yml as a release conformance gate
+  schedule:
+    # Nightly conformance run at 05:00 UTC — catches regressions even when no
+    # HTS code changed (tx.fhir.org behaviour drift, transitive dependency
+    # bumps, UTG package updates). Offset from ci-extended.yml's 07:00 UTC
+    # weekday run so the two don't contend for self-hosted runners.
+    - cron: "0 5 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -93,9 +100,9 @@ jobs:
           - label: R4
             utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r4.tgz
             tx_base: https://tx.fhir.org/r4
-          #          - label: R5
-          #  utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r5.tgz
-          #  tx_base: https://tx.fhir.org/r5
+          - label: R5
+            utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r5.tgz
+            tx_base: https://tx.fhir.org/r5
 
     steps:
       - name: Checkout code
@@ -147,7 +154,7 @@ jobs:
           HTS_SERVER_PORT="${{ env.HTS_PORT }}" \
           HTS_DATABASE_URL="./data/hts-${{ matrix.label }}.db" \
           HTS_LOG_LEVEL="warn" \
-            ./hts serve > "/tmp/hts-${{ matrix.label }}.log" 2>&1 &
+            ./hts run > "/tmp/hts-${{ matrix.label }}.log" 2>&1 &
 
           echo "HTS_PID=$!" >> "$GITHUB_ENV"
           echo "Started HTS server (PID=$!)"
@@ -166,6 +173,18 @@ jobs:
             fi
             sleep 2
           done
+
+      - name: Seed $translate ConceptMap (${{ matrix.label }})
+        run: |
+          # UTG packages ship CodeSystems and ValueSets but no ConceptMaps, so
+          # the $translate suite (§6) seeds its own. The v2-0001 and
+          # v3-AdministrativeGender CodeSystems it maps between already came in
+          # via the UTG import above.
+          curl -sf --max-time 30 \
+            -X POST "http://localhost:${{ env.HTS_PORT }}/import" \
+            -H "Content-Type: application/fhir+json" \
+            -d '{"resourceType":"Bundle","type":"collection","entry":[{"resource":{"resourceType":"ConceptMap","id":"cm-administrative-gender-v2","url":"http://terminology.hl7.org/ConceptMap/cm-administrative-gender-v2","version":"1.0.0","name":"HtsAdministrativeGenderV2","status":"active","group":[{"source":"http://terminology.hl7.org/CodeSystem/v2-0001","target":"http://terminology.hl7.org/CodeSystem/v3-AdministrativeGender","element":[{"code":"M","target":[{"code":"M","equivalence":"equivalent"}]},{"code":"F","target":[{"code":"F","equivalence":"equivalent"}]},{"code":"A","target":[{"code":"UN","equivalence":"wider"}]}]}]}}]}'
+          echo "Seeded cm-administrative-gender-v2 ConceptMap"
 
       - name: Run terminology integration tests (${{ matrix.label }})
         env:
@@ -550,7 +569,9 @@ jobs:
 
           # ═══════════════════════════════════════════════════════════════════
           # §6  $translate (ConceptMap)
-          # UTG ships cm-administrative-gender-v2: v2-0001 ↔ v3-AdministrativeGender
+          # Uses cm-administrative-gender-v2 (v2-0001 → v3-AdministrativeGender),
+          # seeded by the "Seed $translate ConceptMap" step — UTG packages ship
+          # CodeSystems and ValueSets but no ConceptMaps.
           # ═══════════════════════════════════════════════════════════════════
           section "\$translate (ConceptMap)"
 
@@ -565,13 +586,12 @@ jobs:
           fi
           echo "  tx.fhir.org translate available: $TX_TRANSLATE_AVAILABLE"
 
-          # Test 33–35: translate M/F using each of the two known systems.
-          # When tx.fhir.org is available we compare against it as source of truth.
-          # When it is unavailable we only hard-assert that HTS returns a valid
-          # boolean — we do NOT assert true/false because the actual source system
-          # of cm-administrative-gender-v2 in the UTG package may be
-          # http://hl7.org/fhir/administrative-gender (FHIR core), which is
-          # distinct from both v2-0001 and v3-AdministrativeGender.
+          # Translate M/F using each of the two known systems. When tx.fhir.org
+          # is available we compare against it as source of truth; when it is
+          # unavailable we only hard-assert that HTS returns a valid boolean.
+          # The seeded ConceptMap maps from v2-0001, so a forward translate with
+          # system=v2-0001 matches while system=v3-AdministrativeGender does not —
+          # both are valid boolean results, hence the boolean-only assertion.
           for CODE in M F; do
             for SYS in "$CS_V2_0001" "$CS_GENDER"; do
               TRANS_BODY='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$SYS"'"},{"name":"code","valueCode":"'"$CODE"'"}]}'

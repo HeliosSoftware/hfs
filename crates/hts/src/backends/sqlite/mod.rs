@@ -227,6 +227,18 @@ impl SqliteTerminologyBackend {
             )
         });
 
+        // Create and WAL-initialize the database file with a single connection
+        // before building the pool. `Pool::build()` eagerly opens `max_size`
+        // connections at once; against a not-yet-existent file that is a
+        // concurrent-create race which logs spurious SQLITE_IOERR ("disk I/O
+        // error") from r2d2's connection-retry path. Once the file exists in
+        // WAL mode, the concurrent opens below are safe.
+        rusqlite::Connection::open(db_path)
+            .and_then(|c| c.execute_batch("PRAGMA journal_mode=WAL;"))
+            .map_err(|e| {
+                HtsError::StorageError(format!("Failed to initialize SQLite database: {e}"))
+            })?;
+
         // Pool size sized for the benchmark's 50-VU sustained load plus
         // background implicit-cache populate threads (uncapped fan-out across
         // ~100 distinct `?fhir_vs=isa/<X>` URLs in EX01). At max_size=20,

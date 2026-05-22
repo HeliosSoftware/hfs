@@ -1,40 +1,45 @@
-name: Tx Ecosystem IG conformance (PostgreSQL)
+name: HTS Terminology IG Conformance
 
-# Parallel companion to `tx-ecosystem.yml` (which exercises the SQLite
-# backend). This workflow runs the HL7 FHIR Terminology Ecosystem IG test
-# bench against a freshly built HTS binary linked against the `postgres`
-# feature, backed by an ephemeral postgres:16 container.
+# ──────────────────────────────────────────────────────────────────────────────
+# Runs the HL7 FHIR Terminology Ecosystem IG test bench
+# (https://github.com/HL7/fhir-tx-ecosystem-ig) against a freshly built HTS
+# binary loaded with UTG + the tx-source corpora shipped in that repo.
 #
-# # Why a separate workflow?
+# The `backend` input selects which storage backend(s) to exercise:
+#   • sqlite   — default-feature build, file-backed DB.
+#   • postgres — `--features postgres` build, ephemeral postgres:16 container.
+#   • all      — both (default).
 #
-# - The SQLite workflow is the established 100%-pass baseline and benchmark
-#   reference; it must not regress. Touching it to add a backend matrix
-#   would double its run time and entangle Postgres parity-porting noise
-#   with SQLite conformance signal.
-# - This file is dispatched manually (`workflow_dispatch`) so the user
-#   chooses when to surface Postgres status without affecting the SQLite
-#   CI cadence.
+# Each selected backend is run for FHIR R4 and R5. The job fails if any
+# tx-ecosystem test fails. Pass/fail counts are published to the step
+# summary and failing-test JSONs are uploaded as artifacts for offline triage.
 #
-# # Assertion strategy during Phase 2 parity-porting
-#
-# Currently uses a SOFT assertion: the job fails only if the validator
-# could not run against the server at all (e.g. server didn't start, the
-# CapabilityStatement was unparseable). Test-failure counts are surfaced
-# in the step summary and as per-failing-test JSON artifacts but do NOT
-# fail the job. Flip to a hard assertion (delete the soft-check step and
-# uncomment the hard-check step) once Postgres reaches parity with the
-# SQLite leg's 100% pass rate.
-#
-# # Postgres lifecycle
-#
-# Each matrix leg starts its own postgres:16 container via `docker run`
-# on a free host port. `services:` blocks are avoided because they
-# require `container:` on the job, which would break the host-side
-# clang/lld linker config the self-hosted runner relies on. The same
-# pattern is used by the integration tests in `crates/hts/tests/`.
+# Postgres prerequisites on the self-hosted runner:
+#   • Docker — the runner talks to a REMOTE Docker daemon. DOCKER_HOST (TCP
+#     endpoint) and DOCKER_HOST_IP (IP to reach published container ports)
+#     secrets wire it up. Same pattern as .github/workflows/audit-events.yml.
+# ──────────────────────────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch:
+    inputs:
+      backend:
+        description: "Storage backend(s) to test"
+        type: choice
+        required: false
+        default: all
+        options:
+          - all
+          - sqlite
+          - postgres
+  workflow_call: # invoked by ci.yml as a release conformance gate
+  schedule:
+    # Nightly IG conformance run at 03:00 UTC. Offset from hts.yml (05:00) and
+    # ci-extended.yml (07:00) so the three nightly suites don't contend for
+    # self-hosted runners. Scheduled and workflow_call runs carry no `backend`
+    # input, so the setup job's `inputs.backend || 'all'` fallback exercises
+    # all backends.
+    - cron: "0 3 * * *"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -46,17 +51,43 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
-  HTS_PORT: 8097
+  # Remote Docker daemon wiring — only consumed by the postgres backend.
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Fast feedback — compile + integration tests with the postgres feature.
-  # `cargo test -p helios-hts --features postgres,R4` runs the testcontainers-
-  # based integration suite under `crates/hts/tests/postgres_*.rs`.
-  # ─────────────────────────────────────────────────────────────────────────────
-  check:
-    name: Check helios-hts (postgres)
+  # ────────────────────────────────────────────────────────────────────────────
+  # Resolve the `backend` input into a JSON array consumed as a matrix
+  # dimension by the downstream jobs.
+  # ────────────────────────────────────────────────────────────────────────────
+  setup:
+    name: Resolve backend matrix
     runs-on: [self-hosted, Linux]
+    outputs:
+      backends: ${{ steps.matrix.outputs.backends }}
+    steps:
+      - name: Resolve backends from input
+        id: matrix
+        run: |
+          case "${{ inputs.backend || 'all' }}" in
+            sqlite)   BACKENDS='["sqlite"]' ;;
+            postgres) BACKENDS='["postgres"]' ;;
+            *)        BACKENDS='["sqlite","postgres"]' ;;
+          esac
+          echo "backends=$BACKENDS" >> "$GITHUB_OUTPUT"
+          echo "Backends: $BACKENDS"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Fast feedback — compile (and, for sqlite, test) helios-hts per backend.
+  # ────────────────────────────────────────────────────────────────────────────
+  check:
+    name: Check helios-hts (${{ matrix.backend }})
+    needs: setup
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: ${{ fromJSON(needs.setup.outputs.backends) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -76,28 +107,32 @@ jobs:
           printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=lld"]\n' \
             > ~/.cargo/config.toml
 
-      - name: cargo test (R4 + postgres)
-        # testcontainers auto-starts a postgres container per test binary.
+      - name: cargo check / test (${{ matrix.backend }})
         run: |
-          cargo test -p helios-hts \
-            --no-default-features \
-            --features "postgres,R4"
+          if [ "${{ matrix.backend }}" = "postgres" ]; then
+            # `cargo check` (not test): many `#[cfg(test)]` blocks in src/ and
+            # tests/ reference SqliteTerminologyBackend without a feature gate
+            # and fail to compile under `--features postgres`. End-to-end PG
+            # coverage comes from the tx-ecosystem-test job below.
+            cargo check -p helios-hts \
+              --no-default-features \
+              --features "postgres,R4"
+          else
+            cargo test -p helios-hts
+          fi
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Release binaries (R4 and R5) built against the postgres backend.
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # Release binaries — one per (backend × FHIR version).
+  # ────────────────────────────────────────────────────────────────────────────
   build:
-    name: Build HTS binary (${{ matrix.label }} / postgres)
+    name: Build HTS binary (${{ matrix.backend }} / ${{ matrix.label }})
+    needs: [setup, check]
     runs-on: [self-hosted, Linux]
-    needs: check
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - label: R4
-            cargo_features: "postgres,R4"
-          - label: R5
-            cargo_features: "postgres,R5"
+        backend: ${{ fromJSON(needs.setup.outputs.backends) }}
+        label: [R4, R5]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -116,29 +151,31 @@ jobs:
           printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]\n' \
             > ~/.cargo/config.toml
 
-      - name: cargo build (${{ matrix.label }})
+      - name: cargo build (${{ matrix.backend }} / ${{ matrix.label }})
         run: |
           cargo build -p helios-hts \
             --no-default-features \
-            --features "${{ matrix.cargo_features }}"
+            --features "${{ matrix.backend }},${{ matrix.label }}"
 
       - name: Upload HTS binary
         uses: actions/upload-artifact@v7
         with:
-          name: hts-binary-pg-${{ matrix.label }}
+          name: hts-binary-${{ matrix.backend }}-${{ matrix.label }}
           path: target/debug/hts
           retention-days: 1
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Run the HL7 Tx Ecosystem IG test bench against the PG-backed HTS server.
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # Run the HL7 Tx Ecosystem IG test bench per (backend × FHIR version).
+  # ────────────────────────────────────────────────────────────────────────────
   tx-ecosystem-test:
-    name: Tx Ecosystem tests — FHIR ${{ matrix.label }} (postgres)
+    name: IG conformance — ${{ matrix.backend }} / FHIR ${{ matrix.label }}
+    needs: [setup, build]
     runs-on: [self-hosted, Linux]
-    needs: build
     strategy:
       fail-fast: false
       matrix:
+        backend: ${{ fromJSON(needs.setup.outputs.backends) }}
+        label: [R4, R5]
         include:
           - label: R4
             utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r4.tgz
@@ -154,57 +191,98 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Download HTS binary (${{ matrix.label }})
+      - name: Download HTS binary (${{ matrix.backend }} / ${{ matrix.label }})
         uses: actions/download-artifact@v8
         with:
-          name: hts-binary-pg-${{ matrix.label }}
+          name: hts-binary-${{ matrix.backend }}-${{ matrix.label }}
           path: .
 
       - name: Make binary executable
         run: chmod +x ./hts
 
+      # ── Postgres: remote Docker host discovery ───────────────────────────
+      # The container binds to `-p 0:5432` so the remote Docker daemon picks
+      # a free host-side port; we read it back via `docker port` and connect
+      # via `$DOCKER_HOST_IP:$PG_PORT`. Same pattern as audit-events.yml.
+      - name: Determine runner / Docker host IP
+        if: matrix.backend == 'postgres'
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
       # ── Backend env wiring ───────────────────────────────────────────────
       # `hts` reads HTS_STORAGE_BACKEND + HTS_DATABASE_URL from the env via
-      # clap (see crates/hts/src/config.rs:59,63,352,356), so we export both
-      # here and drop the per-call `--database-url` flag from every `./hts
-      # import` line below. A free host port keeps two parallel matrix legs
-      # (R4 + R5) from clashing on 5432 if scheduled to the same runner.
+      # clap, so both `hts import` and the server pick them up without any
+      # per-call `--database-url` flag. For postgres, HTS_DATABASE_URL is
+      # filled in once the container's host-side port is known.
       - name: Configure backend env
         run: |
-          PG_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
-          PG_CONTAINER="hts-tx-pg-${{ github.run_id }}-${{ matrix.label }}"
-          {
-            echo "PG_PORT=$PG_PORT"
-            echo "PG_CONTAINER=$PG_CONTAINER"
-            echo "HTS_STORAGE_BACKEND=postgres"
-            echo "HTS_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:$PG_PORT/postgres"
-          } >> "$GITHUB_ENV"
-          echo "Postgres leg: container=$PG_CONTAINER port=$PG_PORT"
+          echo "HTS_STORAGE_BACKEND=${{ matrix.backend }}" >> "$GITHUB_ENV"
+          if [ "${{ matrix.backend }}" = "sqlite" ]; then
+            # Distinct port from the postgres leg so both can share a runner.
+            echo "HTS_PORT=8096" >> "$GITHUB_ENV"
+            mkdir -p ./data
+            DB_PATH="./data/hts-${{ matrix.label }}.db"
+            rm -f "$DB_PATH"
+            echo "HTS_DATABASE_URL=$DB_PATH" >> "$GITHUB_ENV"
+            echo "SQLite DB: $DB_PATH"
+          else
+            echo "HTS_PORT=8097" >> "$GITHUB_ENV"
+            PG_CONTAINER="hts-ig-pg-${{ github.run_id }}-${{ matrix.label }}"
+            echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+            echo "Container name: $PG_CONTAINER"
+          fi
 
       - name: Start ephemeral Postgres
+        if: matrix.backend == 'postgres'
         run: |
           set -euo pipefail
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          # `-c shared_buffers=1GB -c work_mem=64MB` give PG enough cache to
+          # hold the SNOMED `concept_closure` without evicting the hot
+          # working set. `--shm-size=2g` ensures the larger shared-memory
+          # segment fits inside the container.
           docker run -d \
             --name "$PG_CONTAINER" \
+            --shm-size=2g \
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_DB=postgres \
-            -p "$PG_PORT:5432" \
-            postgres:16 >/dev/null
+            -p 0:5432 \
+            postgres:16 \
+            -c shared_buffers=1GB \
+            -c work_mem=64MB \
+            -c max_connections=100 >/dev/null
 
           echo "Waiting for Postgres to accept connections..."
+          PG_PORT=""
           for i in $(seq 1 30); do
             if docker exec "$PG_CONTAINER" pg_isready -U postgres -d postgres >/dev/null 2>&1; then
-              echo "Postgres ready after $((i * 2))s"
-              break
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if [ -n "$PG_PORT" ] && timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "Postgres ready on $DOCKER_HOST_IP:$PG_PORT after $((i * 2))s"
+                break
+              fi
             fi
             if [ "$i" -eq 30 ]; then
-              echo "ERROR: Postgres did not become ready within 60s"
+              echo "ERROR: Postgres did not become reachable within 60s"
               docker logs "$PG_CONTAINER" | tail -100 || true
               exit 1
             fi
             sleep 2
           done
+
+          {
+            echo "PG_PORT=$PG_PORT"
+            echo "HTS_DATABASE_URL=postgresql://postgres:postgres@$DOCKER_HOST_IP:$PG_PORT/postgres"
+          } >> "$GITHUB_ENV"
 
       - name: Checkout HL7/fhir-tx-ecosystem-ig
         uses: actions/checkout@v5
@@ -235,6 +313,8 @@ jobs:
         run: |
           set +e
           echo "Downloading ${{ matrix.core_url }}"
+          # -L follows the 302 redirect from packages2.fhir.org/packages/...
+          # to the actual .tgz under /web/.
           curl -fsSL --max-time 300 "${{ matrix.core_url }}" -o core.tgz
           CODE=$?
           if [ "$CODE" -eq 0 ] && [ -s core.tgz ]; then
@@ -252,7 +332,8 @@ jobs:
       # loaded successfully, and the step summary will flag what's missing.
       #
       # HTS_STORAGE_BACKEND + HTS_DATABASE_URL come from the env exported by
-      # the "Configure backend env" step above; clap picks them up.
+      # the backend-env steps above; clap picks them up, so no per-call
+      # `--database-url` flag is needed.
       - name: Import UTG terminology
         run: |
           set +e
@@ -322,6 +403,7 @@ jobs:
       - name: Import NDC subset
         run: |
           set +e
+          # NDC importer reads a product.txt file directly.
           NDC_FILE=$(find tx-ecosystem-ig/tx-source/ndc -maxdepth 2 -name product.txt 2>/dev/null | head -1)
           if [ -z "$NDC_FILE" ]; then
             echo "No product.txt found under tx-source/ndc — skipping NDC import"
@@ -347,6 +429,11 @@ jobs:
           python3 - <<'PY'
           import json, os
           base = 'tx-ecosystem-ig/tests'
+          # Drive imports from the test-cases.json setup arrays — that's the
+          # authoritative list of fixture files each suite needs loaded
+          # before its tests run. Globbing for `valueset-*` / `codesystem-*`
+          # misses suites that use shorthand names (e.g. `tho/cs-act-class.json`,
+          # `tho/vs-act-class.json`, `errors/cs1.json`, `icd-11/vs1.json`).
           paths = set()
           with open(os.path.join(base, 'test-cases.json')) as f:
               cases = json.load(f)
@@ -356,9 +443,15 @@ jobs:
           # Skip ConceptMap-novs.json — it shares a `url=.../ConceptMap/full`
           # with ConceptMap-full.json, and our schema does INSERT-OR-REPLACE
           # on (url) which causes the second file to wipe the first's
-          # element rows via CASCADE.
+          # element rows via CASCADE. Picking `-full` consistently keeps
+          # the translate/translate-1 test fixture in place.
           paths = {p for p in paths
                    if os.path.basename(p) != 'ConceptMap-novs.json'}
+          # Sort for deterministic import order. Without this, iteration
+          # order varies across runners, and same-URL-different-version pairs
+          # (e.g. codesystem-version-1.json + -2.json) silently flip which one
+          # "wins" the import — leading to non-reproducible 404 churn in the
+          # version test suite.
           paths = sorted(paths)
           entries = []
           missing = []
@@ -390,12 +483,12 @@ jobs:
       - name: Kill any leftover process on port ${{ env.HTS_PORT }}
         run: fuser -k "${{ env.HTS_PORT }}/tcp" 2>/dev/null || true
 
-      - name: Start HTS server (${{ matrix.label }})
+      - name: Start HTS server (${{ matrix.backend }} / ${{ matrix.label }})
         run: |
           # HTS_DATABASE_URL + HTS_STORAGE_BACKEND already exported.
           HTS_SERVER_PORT="${{ env.HTS_PORT }}" \
           HTS_LOG_LEVEL="warn" \
-            ./hts run > "/tmp/hts-pg-${{ matrix.label }}.log" 2>&1 &
+            ./hts run > "/tmp/hts-${{ matrix.backend }}-${{ matrix.label }}.log" 2>&1 &
 
           echo "HTS_PID=$!" >> "$GITHUB_ENV"
           echo "Started HTS server (PID=$!)"
@@ -408,33 +501,37 @@ jobs:
             if [ "$i" -eq 30 ]; then
               echo "ERROR: server did not start within 60 s"
               echo "--- server log ---"
-              cat "/tmp/hts-pg-${{ matrix.label }}.log" || true
+              cat "/tmp/hts-${{ matrix.backend }}-${{ matrix.label }}.log" || true
               exit 1
             fi
             sleep 2
           done
 
       # ── Run the IG test bench ──────────────────────────────────────────────
-      - name: Run txtests (${{ matrix.label }})
+      - name: Run txtests (${{ matrix.backend }} / ${{ matrix.label }})
         run: |
           set +e
           mkdir -p tx-test-output
           java -jar validator.jar txTests \
             -tx "http://localhost:${{ env.HTS_PORT }}" \
             -output ./tx-test-output \
-            2>&1 | tee "/tmp/txtests-pg-${{ matrix.label }}.log"
+            2>&1 | tee "/tmp/txtests-${{ matrix.backend }}-${{ matrix.label }}.log"
+          # Capture exit code so the summary step runs before we assert on it.
           echo "TXTESTS_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
 
       - name: Summarize results
         if: always()
         run: |
           set +e
+          BACKEND="${{ matrix.backend }}"
           LABEL="${{ matrix.label }}"
-          LOG="/tmp/txtests-pg-${LABEL}.log"
+          LOG="/tmp/txtests-${BACKEND}-${LABEL}.log"
           OUTPUT_DIR="tx-test-output"
           REPORT_JSON="${OUTPUT_DIR}/report.json"
 
           # The validator writes per-failing-test JSON diffs to OUTPUT_DIR/actual/.
+          # `$versions.json` is metadata (always written) — exclude it from the
+          # failure count.
           if [ -d "${OUTPUT_DIR}/actual" ]; then
             FAILED=$(find "${OUTPUT_DIR}/actual" -maxdepth 1 -type f -name '*.json' \
                        -not -name '$versions.json' -size +0c 2>/dev/null | wc -l | tr -d ' ')
@@ -442,6 +539,8 @@ jobs:
             FAILED=0
           fi
 
+          # Pull totals from the validator's own TestReport when available;
+          # fall back to log parsing for older validator releases.
           TOTAL="unknown"
           PASSED="unknown"
           SKIPPED=0
@@ -453,8 +552,13 @@ jobs:
             TC=$(jq -r '(.test // []) | length' "$REPORT_JSON" 2>/dev/null)
             if [ -n "$TC" ] && [ "$TC" -gt 0 ] 2>/dev/null; then
               TOTAL="$TC"
+              # Per-test result lives at .test[].action[].operation.result.
+              # `skip` is the validator's own decision to not run a test
+              # (e.g. tests with `mode: tx.fhir.org` are gated to that server only)
+              # — it is NOT a server failure and must not be counted as one.
               JFAIL=$(jq -r '[.test[]? | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip")))] | length' "$REPORT_JSON" 2>/dev/null)
               JSKIP=$(jq -r '[.test[]? | select(all(.action[]?; .operation.result == "skip" or .operation.result == "pass")) | select(any(.action[]?; .operation.result == "skip"))] | length' "$REPORT_JSON" 2>/dev/null)
+              # Prefer the report's own pass/fail count; fall back to the file count.
               if [ -n "$JFAIL" ] && [ "$JFAIL" -ge "$FAILED" ] 2>/dev/null; then
                 FAILED="$JFAIL"
               fi
@@ -468,12 +572,15 @@ jobs:
           fi
           if [ "$TOTAL" != "unknown" ] && [ "$TOTAL" -gt 0 ] 2>/dev/null; then
             PASSED=$((TOTAL - FAILED - SKIPPED))
+            # Pass rate is computed against the applicable population
+            # (excludes skipped tests that the validator gated to other servers).
             APPLICABLE=$((TOTAL - SKIPPED))
             if [ "$APPLICABLE" -gt 0 ] 2>/dev/null; then
               PASS_RATE=$(awk -v p="$PASSED" -v t="$APPLICABLE" 'BEGIN{ printf "%.1f%%", (p*100)/t }')
             fi
           fi
 
+          # Validator + Java versions for the metadata table.
           VALIDATOR_VERSION=$(grep -m1 -oE 'FHIR Validation tool Version [^ ]+' "$LOG" 2>/dev/null \
                               | sed 's/FHIR Validation tool Version //')
           [ -z "$VALIDATOR_VERSION" ] && VALIDATOR_VERSION="unknown"
@@ -481,6 +588,9 @@ jobs:
                          | sed -E 's/^[[:space:]]+Java:[[:space:]]+([^[:space:]]+).*/\1/')
           [ -z "$JAVA_VERSION" ] && JAVA_VERSION="unknown"
 
+          # Surface early validator failures (e.g. server returned unparseable
+          # CapabilityStatement) — otherwise users see "Total=unknown" with no
+          # explanation.
           VALIDATOR_ERROR=""
           if [ "$TOTAL" = "unknown" ] || [ "$TOTAL" = "0" ]; then
             VALIDATOR_ERROR=$(grep -m1 -E '^Exception running' "$LOG" 2>/dev/null)
@@ -489,24 +599,23 @@ jobs:
             fi
           fi
 
-          # Status badge (PG-aware: parity-porting is in progress, so a
-          # nonzero FAILED count is the expected steady state, not :x:).
+          # Status badge
           if [ "${TXTESTS_EXIT:-1}" = "0" ] && [ "$FAILED" = "0" ]; then
-            STATUS=":white_check_mark: parity reached"
+            STATUS=":white_check_mark: passed"
           elif [ "$TOTAL" = "unknown" ] || [ "$TOTAL" = "0" ]; then
             STATUS=":x: validator did not run"
           else
-            STATUS=":hourglass: ${FAILED} failing (parity-porting)"
+            STATUS=":x: ${FAILED} failing"
           fi
 
           {
-            echo "## Tx Ecosystem IG — FHIR ${LABEL} (postgres) — ${STATUS}"
+            echo "## HTS IG Conformance — FHIR ${LABEL} (${BACKEND}) — ${STATUS}"
             echo ""
             echo "| | |"
             echo "|---|---|"
             echo "| **Branch**       | \`${{ github.ref_name }}\` |"
             echo "| **Commit**       | \`$(echo '${{ github.sha }}' | cut -c1-7)\` |"
-            echo "| **Backend**      | \`postgres\` |"
+            echo "| **Backend**      | \`${BACKEND}\` |"
             echo "| **Server**       | ${SERVER_VERSION} |"
             echo "| **Validator**    | ${VALIDATOR_VERSION} |"
             echo "| **Java**         | ${JAVA_VERSION} |"
@@ -530,7 +639,7 @@ jobs:
               echo "$VALIDATOR_ERROR"
               echo '```'
               echo ""
-              echo "> See the \`txtests-log-pg-${LABEL}\` artifact for the full validator output and stack trace."
+              echo "> See the \`txtests-log-${BACKEND}-${LABEL}\` artifact for the full validator output and stack trace."
               echo ""
             fi
 
@@ -551,7 +660,7 @@ jobs:
                 fi
               done
               if [ "$i" -gt 50 ]; then
-                echo "| … | _and $((i - 50)) more (see \`tx-test-output-pg-${LABEL}\` artifact)_ |"
+                echo "| … | _and $((i - 50)) more (see \`tx-test-output-${BACKEND}-${LABEL}\` artifact)_ |"
               fi
               echo ""
             fi
@@ -568,19 +677,17 @@ jobs:
             echo "| IG fixtures  | ${FIXTURES_IMPORT_EXIT:-?} |"
             echo ""
             echo "> Import exit codes: 0 = success, 2 = success-with-warnings, 1 = fatal, skip = not attempted."
-            echo "> Per-test JSON diffs and the full validator log are published as artifacts \`tx-test-output-pg-${LABEL}\` and \`txtests-log-pg-${LABEL}\`."
-            echo ""
-            echo "> :information_source: This run targets the **Postgres** backend, which is being brought to parity with SQLite. Test-pass-count failures do NOT fail the job; only \"validator never ran\" does. See \`tx-ecosystem.yml\` for the SQLite baseline."
+            echo "> Per-test JSON diffs and the full validator log are published as artifacts \`tx-test-output-${BACKEND}-${LABEL}\` and \`txtests-log-${BACKEND}-${LABEL}\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "=== Tx Ecosystem IG — FHIR ${LABEL} (postgres) ==="
+          echo "=== HTS IG Conformance — FHIR ${LABEL} (${BACKEND}) ==="
           echo "Total=${TOTAL} Failed=${FAILED} Passed=${PASSED} PassRate=${PASS_RATE}"
 
       - name: Upload failing-test JSON diffs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: tx-test-output-pg-${{ matrix.label }}
+          name: tx-test-output-${{ matrix.backend }}-${{ matrix.label }}
           path: tx-test-output
           retention-days: 7
           if-no-files-found: ignore
@@ -589,8 +696,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: txtests-log-pg-${{ matrix.label }}
-          path: /tmp/txtests-pg-${{ matrix.label }}.log
+          name: txtests-log-${{ matrix.backend }}-${{ matrix.label }}
+          path: /tmp/txtests-${{ matrix.backend }}-${{ matrix.label }}.log
           retention-days: 7
           if-no-files-found: ignore
 
@@ -598,44 +705,35 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: hts-server-log-pg-${{ matrix.label }}
-          path: /tmp/hts-pg-${{ matrix.label }}.log
+          name: hts-server-log-${{ matrix.backend }}-${{ matrix.label }}
+          path: /tmp/hts-${{ matrix.backend }}-${{ matrix.label }}.log
           retention-days: 7
           if-no-files-found: ignore
 
-      # ── Soft assertion (Phase 2 parity-porting) ────────────────────────────
-      # Don't enforce test-pass count yet — Postgres backend is still being
-      # ported. Fail only when the validator could not run anything against
-      # the server (e.g. server didn't start, CapabilityStatement unparseable,
-      # connection refused). Catches "regression broke the server" while
-      # tolerating "this terminology operation isn't ported yet".
-      #
-      # When PG reaches parity, replace this step with the same hard
-      # assertion the SQLite workflow uses (see `tx-ecosystem.yml`).
-      - name: Assert validator ran (soft check)
+      - name: Assert all tx-ecosystem tests passed
         run: |
           set -e
+          # Count true failures (actions with result != "pass" AND result != "skip")
+          # from the validator's TestReport. Skips are tx.fhir.org-only fixtures
+          # that the validator correctly declines to run against any other server
+          # — they are not failures.
           REPORT="tx-test-output/report.json"
           if [ ! -s "$REPORT" ]; then
-            echo "tx-test-output/report.json missing or empty — server likely didn't start"
-            echo "--- server log ---"
-            cat "/tmp/hts-pg-${{ matrix.label }}.log" 2>/dev/null || echo "(no log)"
-            exit 1
-          fi
-          TOTAL=$(jq -r '(.test // []) | length' "$REPORT" 2>/dev/null)
-          if [ -z "$TOTAL" ] || [ "$TOTAL" = "0" ]; then
-            echo "Validator did not run any tests against Postgres — failing soft check"
-            echo "--- server log ---"
-            cat "/tmp/hts-pg-${{ matrix.label }}.log" 2>/dev/null || echo "(no log)"
+            echo "tx-test-output/report.json missing or empty — failing job"
             exit 1
           fi
           FAILED=$(jq -r '[.test[]? | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip")))] | length' "$REPORT")
-          echo "PG soft check passed: validator ran ${TOTAL} tests, ${FAILED} currently failing"
-          echo "(See the step summary + the tx-test-output-pg-${{ matrix.label }} artifact for details.)"
+          if [ "$FAILED" -gt 0 ]; then
+            echo "$FAILED tx-ecosystem tests failed — failing job"
+            exit 1
+          fi
+          # Validator exit codes: 0 = all pass; non-zero = something didn't pass.
+          # We tolerate non-zero IFF the only non-passes are skips (handled above).
+          echo "All applicable tx-ecosystem tests passed (validator exit ${TXTESTS_EXIT:-?}; skips ignored)"
 
       - name: Dump server log on failure
         if: failure()
-        run: cat "/tmp/hts-pg-${{ matrix.label }}.log" 2>/dev/null || echo "(no server log found)"
+        run: cat "/tmp/hts-${{ matrix.backend }}-${{ matrix.label }}.log" 2>/dev/null || echo "(no server log found)"
 
       - name: Stop HTS server
         if: always()
@@ -646,7 +744,7 @@ jobs:
           fi
 
       - name: Stop ephemeral Postgres
-        if: always()
+        if: always() && matrix.backend == 'postgres'
         run: |
           if [ -n "${PG_CONTAINER:-}" ]; then
             docker rm -f "$PG_CONTAINER" 2>/dev/null || true
@@ -656,11 +754,14 @@ jobs:
         if: always()
         run: |
           rm -f \
+            "./data/hts-${{ matrix.label }}.db" \
             "./utg.tgz" \
+            "./core.tgz" \
             "./validator.jar" \
             "./hts" \
-            "/tmp/hts-pg-${{ matrix.label }}.log" \
-            "/tmp/txtests-pg-${{ matrix.label }}.log" \
+            "./tx-fixtures.json" \
+            "/tmp/hts-${{ matrix.backend }}-${{ matrix.label }}.log" \
+            "/tmp/txtests-${{ matrix.backend }}-${{ matrix.label }}.log" \
             "tx-ecosystem-ig/tx-source/snomed-subset-rf2.zip" \
             "tx-ecosystem-ig/tx-source/loinc-subset.zip"
           rm -rf ./tx-test-output ./tx-ecosystem-ig
