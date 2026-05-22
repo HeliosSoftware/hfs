@@ -108,7 +108,7 @@ use tracing::{info, warn};
 mod error;
 mod handlers;
 mod models;
-mod streaming;
+mod parquet_zip;
 
 /// Server configuration options
 #[derive(Debug, Clone)]

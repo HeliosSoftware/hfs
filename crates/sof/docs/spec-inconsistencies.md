@@ -24,8 +24,8 @@ pt-1,1990-01-15,Smith,John
 **Inconsistency:** The parameter type `Binary` implies a FHIR resource wrapper (`{"resourceType":"Binary","contentType":"...","data":"<base64>"}`), but every worked example returns the unwrapped payload directly.
 
 **Our behavior:** Raw bytes with the matching `Content-Type` (`text/csv`, `application/json`, `application/x-ndjson`, `application/octet-stream`).
-- `crates/sof/src/handlers.rs:417` (sof-server)
-- `crates/rest/src/handlers/sof/run.rs:752` (HFS REST)
+- `crates/sof/src/handlers.rs` (`run_view_definition_handler`) — sof-server
+- `crates/rest/src/handlers/sof/run.rs` (`build_response_with_warnings`) — HFS REST
 
 **Rationale:** Matches the spec's own examples and the behavior of reference implementations (Pathling, sof-js). A wrapped `Binary` would require clients to base64-decode before parsing CSV/NDJSON, which no spec example demonstrates.
 
@@ -33,7 +33,7 @@ pt-1,1990-01-15,Smith,John
 
 ---
 
-## D — `resource 0..* Resource` — Bundle unwrap unspecified
+## B — `resource 0..* Resource` — Bundle unwrap unspecified
 
 **Spec text (parameter table):**
 
@@ -68,7 +68,7 @@ pt-1,1990-01-15,Smith,John
 
 ---
 
-## E — Return type shape diverges between `$viewdefinition-run` and `$sqlquery-run`
+## C — Return type shape diverges between `$viewdefinition-run` and `$sqlquery-run`
 
 **Spec text:**
 
@@ -91,7 +91,7 @@ Either way, the supported `_format` set and the return type matrix should be ide
 
 ---
 
-## F — Streaming guidance present for `$viewdefinition-run`, absent for `$sqlquery-run` and `$viewdefinition-export`
+## D — Streaming guidance present for `$viewdefinition-run`, absent for `$sqlquery-run` and `$viewdefinition-export`
 
 **Spec text:**
 
@@ -105,27 +105,28 @@ Either way, the supported `_format` set and the return type matrix should be ide
 
 2. **The guidance is attached to only one of three sibling ops.** `$sqlquery-run` is the op most likely to produce unbounded result sets — it executes arbitrary SQL, with no `_limit` or `_since` to constrain output (`$viewdefinition-run` has both) — yet it gets no streaming guidance. `$viewdefinition-export` exists precisely for large extracts and has its own async-bulk contract, but the relationship between the three delivery models is never stated.
 
-**Our behavior (divergent across ops and across binaries):**
+**Our behavior:** Exactly one path uses chunked transfer encoding — HFS REST's NDJSON `$viewdefinition-run`. Every other response, across both binaries and all three operations, is fully buffered and sent with `Content-Length`.
 
 | Op | Binary | Format | Production | Framing |
 |----|--------|--------|-----------|---------|
 | `$viewdefinition-run` | HFS REST | NDJSON | incremental off the row stream | `Transfer-Encoding: chunked` |
 | `$viewdefinition-run` | HFS REST | CSV / JSON / parquet | fully buffered | `Content-Length` |
-| `$viewdefinition-run` | sof-server | parquet >10 MB, multi-file parquet ZIP | buffered file, then chunked send | `Transfer-Encoding: chunked` |
-| `$viewdefinition-run` | sof-server | NDJSON / CSV / JSON / small parquet | fully buffered | `Content-Length` |
+| `$viewdefinition-run` | sof-server | all formats (incl. single- & multi-file parquet) | fully buffered | `Content-Length` |
 | `$sqlquery-run` | HFS REST | all formats | fully buffered (SQL engine materializes the result set first) | `Content-Length` |
 | `$viewdefinition-export` | HFS REST | all formats (shard download) | buffered shards | `Content-Length` |
 
+*Legend — **Production**: how the output is built (fully buffered in memory vs. emitted row-incrementally as rows arrive). **Framing**: the resulting HTTP message-framing mechanism that delimits the response body — `Content-Length` (size known upfront) vs. `Transfer-Encoding: chunked` (size unknown, body sent as length-prefixed chunks). Framing is a consequence of Production, not of the `_format`.*
+
 No code sets `Transfer-Encoding: chunked` explicitly — Axum/hyper apply it automatically whenever the response body is a stream (`Body::from_stream`) with no known `Content-Length`.
 
-- HFS REST `$viewdefinition-run`: NDJSON streamed via `streaming_ndjson_response` — `crates/rest/src/handlers/sof/run.rs:439`, `run.rs:650-693`; other formats drained and buffered via `format_stream` — `run.rs:701`.
+- HFS REST `$viewdefinition-run`: NDJSON streamed via `streaming_ndjson_response`; other formats drained and buffered via `format_stream` — `crates/rest/src/handlers/sof/run.rs`.
 - HFS REST `$sqlquery-run`: every format buffered — `crates/rest/src/handlers/sof/sqlquery.rs:440-518` (`render_output` / `build_response`).
 - HFS REST `$viewdefinition-export`: async-bulk (`Prefer: respond-async` check at `crates/rest/src/handlers/sof/export.rs:225`); shard downloads served buffered — `export.rs:778` (`download_export_file_handler`).
-- sof-server: large single parquet (>10 MB) and multi-file parquet ZIPs streamed — `crates/sof/src/handlers.rs:394-400`, `crates/sof/src/streaming.rs:120`, `streaming.rs:154` (`should_use_streaming`).
+- sof-server: every format fully buffered, including single-file parquet and multi-file parquet (the latter bundled into an in-memory ZIP archive) — `crates/sof/src/handlers.rs` (parquet response paths), `crates/sof/src/parquet_zip.rs` (`create_zip_from_buffers`).
 
-The two binaries pick **opposite** formats to stream — HFS REST streams NDJSON, sof-server streams large parquet — which underscores point 1 above: chunked framing is a transport decision driven by buffering strategy, not by the format. (Compare entry D, which records a similar sof-server vs. HFS REST asymmetry for Bundle unwrap.)
+This underscores point 1 above: chunked framing is decoupled from the `_format`. The same format proves it — NDJSON is streamed by HFS REST but fully buffered by sof-server — so framing follows the server's production strategy, never the format. Framing is decided only by how the handler hands the body to Axum: a streaming body (`Body::from_stream`) with no `Content-Length` yields `chunked`; a sized buffer yields `Content-Length`. The one chunked path (HFS REST NDJSON) is *forced* onto streaming because incremental production means the size is unknown until the last row. (Compare entry B, which records a similar sof-server vs. HFS REST asymmetry for Bundle unwrap.)
 
-**Rationale for the asymmetry:** HFS REST's `$viewdefinition-run` runs against persistent storage and can pull rows lazily from a query stream, so NDJSON — the format that needs no global state — is emitted incrementally. `$sqlquery-run` executes through a SQL engine that materializes the full result set before formatting, so there is nothing to stream incrementally regardless of format. sof-server is the stateless path where the practical pressure is large parquet files, so that is what it streams.
+**Rationale:** HFS REST's `$viewdefinition-run` runs against persistent storage via an in-DB runner that pulls rows lazily from a query cursor, so NDJSON — which needs no global state — is produced incrementally; that is the only genuinely streamable path in any SoF operation. sof-server uses the in-process evaluator, which materializes the full result set before formatting, so every format is buffered. `$sqlquery-run` likewise materializes its result set first. Chunked framing therefore appears exactly where — and only where — the server cannot know the response size in advance.
 
 **Recommendation:** File a clarification with the SOF working group asking it to:
 
@@ -138,7 +139,7 @@ Note that entry A of this document already shows `Transfer-Encoding: chunked` on
 
 ---
 
-## G — `Accept: application/octet-stream` semantics undefined on both ops
+## E — `Accept: application/octet-stream` semantics undefined on both ops
 
 **Spec text:** Both operations declare `return Binary` but neither specifies how a client signals "give me the raw payload" vs. "give me a FHIR `Binary` resource envelope with base64-encoded `data`". The OperationDefinition pages do not mention the `Accept` header at all; only the worked examples imply the answer (raw bytes — see entry A).
 

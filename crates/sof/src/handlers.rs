@@ -385,39 +385,49 @@ pub async fn run_view_definition_handler(
             max_file_size_bytes,
         )?;
 
-        // If multiple files, stream them as a ZIP archive
+        // Multi-file output is bundled into a ZIP archive; a single file is
+        // returned as-is. Both are fully materialised in memory before the
+        // response starts, so both carry a `Content-Length` — no chunked
+        // transfer encoding, the size is already known (see
+        // `docs/spec-inconsistencies.md`, entry F).
         if file_buffers.len() > 1 {
             info!(
                 "Generating ZIP archive with {} Parquet files",
                 file_buffers.len()
             );
-            crate::streaming::stream_parquet_zip_response(file_buffers, "data")
+            let zip = crate::parquet_zip::create_zip_from_buffers(file_buffers, "data")?;
+            let mut response = (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/zip"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"data.zip\"",
+                    ),
+                ],
+                zip,
+            )
+                .into_response();
+            attach_filter_warnings(response.headers_mut(), &filter_warnings);
+            Ok(response)
         } else {
-            // Single file - check if we should stream it
-            let file_size = file_buffers[0].len();
-            if crate::streaming::should_use_streaming(file_size) {
-                info!("Streaming single Parquet file ({} bytes)", file_size);
-                crate::streaming::stream_single_parquet_response(file_buffers[0].clone())
-            } else {
-                // Small file, return directly. Per SoF v2 spec Accept
-                // table, parquet uses `application/octet-stream`; we add
-                // Content-Disposition so browsers download as `.parquet`
-                // (audit item #8).
-                let mut response = (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, "application/octet-stream"),
-                        (
-                            header::CONTENT_DISPOSITION,
-                            "attachment; filename=\"output.parquet\"",
-                        ),
-                    ],
-                    file_buffers[0].clone(),
-                )
-                    .into_response();
-                attach_filter_warnings(response.headers_mut(), &filter_warnings);
-                Ok(response)
-            }
+            // Per SoF v2 spec Accept table, parquet uses
+            // `application/octet-stream`; Content-Disposition makes browsers
+            // download as `.parquet` (audit item #8).
+            let mut response = (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"output.parquet\"",
+                    ),
+                ],
+                file_buffers.into_iter().next().unwrap_or_default(),
+            )
+                .into_response();
+            attach_filter_warnings(response.headers_mut(), &filter_warnings);
+            Ok(response)
         }
     } else {
         // Standard processing
