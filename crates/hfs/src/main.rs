@@ -35,7 +35,7 @@ use tracing::info;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 
 #[cfg(feature = "mongodb")]
-use helios_persistence::backends::mongodb::MongoBackend;
+use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
 fn is_database_audit_dedicated(config: &AuditConfig, backend_kind: BackendKind) -> bool {
     match backend_kind {
         BackendKind::Sqlite | BackendKind::Postgres => config.database_url.is_some(),
@@ -68,6 +68,48 @@ fn is_postgres_url(url: &str) -> bool {
 #[cfg(feature = "mongodb")]
 fn is_mongodb_url(url: &str) -> bool {
     url.starts_with("mongodb://") || url.starts_with("mongodb+srv://")
+}
+
+#[cfg(feature = "mongodb")]
+fn build_mongodb_config(config: &ServerConfig, search_offloaded: bool) -> MongoBackendConfig {
+    build_mongodb_config_with_env(config, search_offloaded, |name| std::env::var(name).ok())
+}
+
+#[cfg(feature = "mongodb")]
+fn build_mongodb_config_with_env<F>(
+    config: &ServerConfig,
+    search_offloaded: bool,
+    env: F,
+) -> MongoBackendConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mongo_specific_url = env("HFS_MONGODB_URL").or_else(|| env("HFS_MONGODB_URI"));
+    let connection_string = match config.database_url.as_deref() {
+        Some(url) if is_mongodb_url(url) => url.to_string(),
+        Some(_) => mongo_specific_url.unwrap_or_else(|| "mongodb://localhost:27017".to_string()),
+        None => mongo_specific_url
+            .or_else(|| env("HFS_DATABASE_URL").filter(|url| is_mongodb_url(url)))
+            .unwrap_or_else(|| "mongodb://localhost:27017".to_string()),
+    };
+
+    let database_name = env("HFS_MONGODB_DATABASE").unwrap_or_else(|| "helios".to_string());
+    let max_connections = env("HFS_MONGODB_MAX_CONNECTIONS")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(10);
+    let connect_timeout_ms = env("HFS_MONGODB_CONNECT_TIMEOUT_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5000);
+
+    MongoBackendConfig {
+        connection_string,
+        database_name,
+        max_connections,
+        connect_timeout_ms,
+        fhir_version: config.default_fhir_version,
+        data_dir: config.data_dir.clone(),
+        search_offloaded,
+    }
 }
 
 fn validate_shared_sqlite_audit_path(path: &str, dedicated: bool) -> anyhow::Result<()> {
@@ -231,8 +273,6 @@ async fn create_audit_mongodb_storage(
     audit_config: &AuditConfig,
     dedicated: bool,
 ) -> anyhow::Result<Arc<dyn ResourceStorage>> {
-    use helios_persistence::backends::mongodb::MongoBackendConfig;
-
     let backend = if dedicated {
         let connection_string = match audit_config.database_url.as_deref() {
             Some(url) => {
@@ -287,14 +327,8 @@ async fn create_audit_mongodb_storage(
             search_offloaded: false,
         };
         MongoBackend::new(config)?
-    } else if let Some(ref url) = server_config.database_url {
-        if is_mongodb_url(url) {
-            MongoBackend::from_connection_string(url)?
-        } else {
-            MongoBackend::from_env()?
-        }
     } else {
-        MongoBackend::from_env()?
+        MongoBackend::new(build_mongodb_config(server_config, false))?
     };
 
     backend.init_schema().await?;
@@ -418,20 +452,13 @@ async fn start_mongodb(
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
-    let backend = if let Some(ref url) = config.database_url {
-        if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
-            info!(url = %url, "Initializing MongoDB backend from connection string");
-            MongoBackend::from_connection_string(url)?
-        } else {
-            info!(
-                "Initializing MongoDB backend from environment variables (database_url is not MongoDB URI)"
-            );
-            MongoBackend::from_env()?
-        }
-    } else {
-        info!("Initializing MongoDB backend from environment variables");
-        MongoBackend::from_env()?
-    };
+    let backend_config = build_mongodb_config(&config, false);
+    info!(
+        url = %backend_config.connection_string,
+        database = %backend_config.database_name,
+        "Initializing MongoDB backend"
+    );
+    let backend = MongoBackend::new(backend_config)?;
 
     backend.init_schema().await?;
 
@@ -1108,26 +1135,17 @@ async fn start_mongodb_elasticsearch(
     use helios_persistence::core::BackendKind;
 
     // Create MongoDB backend
-    let backend = if let Some(ref url) = config.database_url {
-        if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
-            info!(url = %url, "Initializing MongoDB backend from connection string");
-            MongoBackend::from_connection_string(url)?
-        } else {
-            info!(
-                "Initializing MongoDB backend from environment variables (database_url is not MongoDB URI)"
-            );
-            MongoBackend::from_env()?
-        }
-    } else {
-        info!("Initializing MongoDB backend from environment variables");
-        MongoBackend::from_env()?
-    };
+    let backend_config = build_mongodb_config(&config, true);
+    info!(
+        url = %backend_config.connection_string,
+        database = %backend_config.database_name,
+        "Initializing MongoDB backend"
+    );
+    let backend = MongoBackend::new(backend_config)?;
 
     backend.init_schema().await?;
 
     // Offload search to Elasticsearch
-    let mut backend = backend;
-    backend.set_search_offloaded(true);
     let mongo = Arc::new(backend);
     info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
 
@@ -1564,6 +1582,74 @@ mod tests {
         let registry = build_search_registry(FhirVersion::R4, None);
         // Registry should be a valid Arc<RwLock<…>> and not panic when read.
         let _guard = registry.read();
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_overlays_env_with_mongo_database_url() {
+        use helios_fhir::FhirVersion;
+
+        let data_dir = std::path::PathBuf::from("/tmp/hfs-data");
+        let config = ServerConfig {
+            database_url: Some("mongodb://mongo.example:27017/?replicaSet=rs0".to_string()),
+            default_fhir_version: FhirVersion::R4,
+            data_dir: Some(data_dir.clone()),
+            ..Default::default()
+        };
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_DATABASE" => Some("inferno_suite".to_string()),
+            "HFS_MONGODB_MAX_CONNECTIONS" => Some("24".to_string()),
+            "HFS_MONGODB_CONNECT_TIMEOUT_MS" => Some("7500".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(
+            mongo_config.connection_string,
+            "mongodb://mongo.example:27017/?replicaSet=rs0"
+        );
+        assert_eq!(mongo_config.database_name, "inferno_suite");
+        assert_eq!(mongo_config.max_connections, 24);
+        assert_eq!(mongo_config.connect_timeout_ms, 7500);
+        assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
+        assert_eq!(mongo_config.data_dir, Some(data_dir));
+        assert!(!mongo_config.search_offloaded);
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_ignores_non_mongo_database_url() {
+        let config = ServerConfig {
+            database_url: Some("postgres://localhost/hfs".to_string()),
+            ..Default::default()
+        };
+
+        let mongo_config = build_mongodb_config_with_env(&config, true, |name| match name {
+            "HFS_DATABASE_URL" => Some("postgres://localhost/hfs".to_string()),
+            "HFS_MONGODB_DATABASE" => Some("mongo_db".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(mongo_config.connection_string, "mongodb://localhost:27017");
+        assert_eq!(mongo_config.database_name, "mongo_db");
+        assert!(mongo_config.search_offloaded);
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_uses_mongo_specific_url_before_database_url_fallback() {
+        let config = ServerConfig::default();
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_URI" => Some("mongodb://mongo-specific:27017".to_string()),
+            "HFS_DATABASE_URL" => Some("mongodb://database-url:27017".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(
+            mongo_config.connection_string,
+            "mongodb://mongo-specific:27017"
+        );
     }
 
     // ── ServerConfig validation is exercised at startup ──────────

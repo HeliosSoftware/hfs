@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use mongodb::{Client, Database, bson::doc, options::ClientOptions};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 
 use helios_fhir::FhirVersion;
 
@@ -17,6 +18,13 @@ use crate::error::{BackendError, StorageError, StorageResult};
 use crate::search::{SearchParameterExtractor, SearchParameterLoader, SearchParameterRegistry};
 
 use super::schema;
+
+/// Upper bound for selecting a usable server before an operation gives up.
+const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Connections idle longer than this are closed rather than reused, so a
+/// connection silently dropped by a NAT/firewall is never handed to a request.
+const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 
 /// MongoDB backend for FHIR resource storage.
 ///
@@ -28,6 +36,9 @@ use super::schema;
 /// Advanced search/composite behavior remains in later phases.
 pub struct MongoBackend {
     config: MongoBackendConfig,
+    /// Lazily initialized MongoDB client. MongoDB clients own their connection
+    /// pools, so each backend instance must reuse one client.
+    client: OnceCell<Client>,
     /// Search parameter registry (in-memory cache of active parameters).
     search_registry: Arc<RwLock<SearchParameterRegistry>>,
     /// Extractor for deriving searchable values from resources.
@@ -120,6 +131,7 @@ impl MongoBackend {
 
         Ok(Self {
             config,
+            client: OnceCell::new(),
             search_registry,
             search_extractor,
         })
@@ -299,7 +311,7 @@ impl MongoBackend {
     }
 
     /// Creates a MongoDB client from backend configuration.
-    pub(crate) async fn get_client(&self) -> StorageResult<Client> {
+    async fn create_client(&self) -> StorageResult<Client> {
         let mut client_options = ClientOptions::parse(&self.config.connection_string)
             .await
             .map_err(|e| {
@@ -314,6 +326,14 @@ impl MongoBackend {
             Some(Duration::from_millis(self.config.connect_timeout_ms));
         client_options.app_name = Some("helios-persistence".to_string());
 
+        // Fail fast when no healthy server can be selected. `connect_timeout`
+        // only covers new TCP handshakes; this caps requests once server
+        // monitoring has marked the server unavailable.
+        client_options.server_selection_timeout = Some(SERVER_SELECTION_TIMEOUT);
+        // Recycle idle connections so stale ones (e.g. silently dropped by a
+        // NAT/firewall on a long-lived network path) are not handed out.
+        client_options.max_idle_time = Some(MAX_CONNECTION_IDLE_TIME);
+
         Client::with_options(client_options).map_err(|e| {
             StorageError::Backend(BackendError::Internal {
                 backend_name: "mongodb".to_string(),
@@ -321,6 +341,14 @@ impl MongoBackend {
                 source: None,
             })
         })
+    }
+
+    /// Returns the shared MongoDB client for this backend.
+    pub(crate) async fn get_client(&self) -> StorageResult<Client> {
+        self.client
+            .get_or_try_init(|| self.create_client())
+            .await
+            .cloned()
     }
 
     /// Returns the configured MongoDB database handle.
