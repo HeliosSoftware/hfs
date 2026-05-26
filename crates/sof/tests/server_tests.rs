@@ -274,6 +274,45 @@ async fn test_run_view_definition_error_no_view() {
     assert_eq!(json["resourceType"], "OperationOutcome");
 }
 
+/// A bare `ViewDefinition` body (no `Parameters` wrapper) is a valid shortcut
+/// shape: callers piping a stored ViewDefinition straight to the server
+/// shouldn't have to build a Parameters envelope. Other operation parameters
+/// must come from the query string in this shape.
+#[tokio::test]
+async fn test_run_view_definition_bare_body() {
+    let server = common::test_server().await;
+
+    let bare_view = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "column": [
+                {"name": "id", "path": "id"},
+                {"name": "gender", "path": "gender"}
+            ]
+        }]
+    });
+
+    // No `Parameters` wrapper, no `resource` entries. The view runs
+    // against zero input resources — what matters is that the body
+    // shape (`resourceType=ViewDefinition`, not `Parameters`) is
+    // accepted instead of being rejected with `400 Bad Request +
+    // "Request body must be a Parameters resource"`.
+    let response = server
+        .post("/ViewDefinition/$viewdefinition-run")
+        .add_query_param("_format", "application/json")
+        .json(&bare_view)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "bare ViewDefinition body must be accepted: {:?}",
+        response.text()
+    );
+}
+
 #[tokio::test]
 async fn test_run_view_definition_unsupported_format() {
     let server = common::test_server().await;

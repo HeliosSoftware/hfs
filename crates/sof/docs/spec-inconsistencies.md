@@ -176,3 +176,10 @@ Other spec ambiguities surfaced during audit but **not** classified as inconsist
 - R4-only build exposing type+instance routes (spec's R4 OperationDefinition restricts to system-level).
 - GET requests carrying `viewResource`/`resource` body (spec text reserves these for POST).
 - `$viewdefinition-export` adds `status: in-progress` to its polling Parameters body — the spec's status-polling parameter table lists only `exportId` and `estimatedTimeRemaining`. Additive, no behavioral impact for spec-compliant clients.
+- sof-server and HFS REST both accept a bare `ViewDefinition` body as a shortcut for a `Parameters` body containing a single `viewResource` entry. Spec examples only show the `Parameters` shape; we accept either because the bare form is a common ergonomic convenience for CLI/pipe callers and unambiguous to detect (`resourceType=ViewDefinition`).
+
+## Resolved spec deviations
+
+Items that previously appeared above but have been brought into alignment with the spec:
+
+- **Absent `patient` / `group` targets now return `400 Bad Request` with an `OperationOutcome` (`code = not-found`).** Earlier the implementation surfaced absence as `200 OK` with one `Warning: 199 - "..."` header per missing reference, citing the spec's "SHOULD return OperationOutcome" language and RFC 7234 §5.5 as motivation. The spec's error table is explicit (`Referenced patient/group not found (400)`), so the warning-header path was retired. Carrier: `SofError::ReferencedResourceNotFound`, mapped to 400 by both binaries.

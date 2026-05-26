@@ -487,19 +487,17 @@ where
         split_csv_refs(params.group.as_deref())
     };
 
-    // Track absent-target warnings (audit item #5) to surface as `Warning:`
-    // HTTP headers on the response.
-    let mut filter_warnings: Vec<String> = Vec::new();
+    // Per SoF v2 spec: absent `patient` / `group` targets are a hard 400
+    // (mapped from `SofError::ReferencedResourceNotFound` by
+    // `map_sof_lib_error_to_rest`), not a "200 + Warning: 199" path.
     if !patient_refs.is_empty() || !group_refs.is_empty() {
-        let outcome = filter_resources_by_patient_and_group(
+        resources = filter_resources_by_patient_and_group(
             resources,
             &patient_refs,
             &group_refs,
             fhir_version,
         )
         .map_err(map_sof_lib_error_to_rest)?;
-        resources = outcome.resources;
-        filter_warnings.extend(outcome.warnings);
     }
 
     let since = params.since.as_deref().and_then(|s| s.parse().ok());
@@ -529,13 +527,12 @@ where
 
     let (ct_header, response_format) = content_type_headers(content_type);
 
-    Ok(build_response_with_warnings(
+    Ok(build_response(
         StatusCode::OK,
         ct_header,
         body,
         "in-process",
         response_format,
-        &filter_warnings,
     ))
 }
 
@@ -634,6 +631,12 @@ fn map_sof_lib_error_to_rest(e: helios_sof::SofError) -> RestError {
             RestError::UnprocessableEntity { message: msg }
         }
         LibErr::UnsupportedContentType(msg) => RestError::BadRequest { message: msg },
+        // Per SoF v2 spec error table: a `patient` / `group` reference that
+        // doesn't resolve against the supplied / queryable resources is a
+        // `400 Bad Request`. (No `RestError::NotFound`-with-400 variant
+        // exists, so the OperationOutcome's `code = invalid`; the
+        // 400/spec-status is what matters.)
+        LibErr::ReferencedResourceNotFound(msg) => RestError::BadRequest { message: msg },
         other => {
             warn!(error = %other, "in-process SOF evaluator error");
             RestError::InternalError {
@@ -748,28 +751,16 @@ async fn drain_stream(
     Ok(rows)
 }
 
-/// Builds the final `Response` with `X-HFS-Runner` and optional Content-Disposition.
+/// Builds the final `Response` with `X-HFS-Runner` and an optional
+/// `Content-Disposition` attachment header for parquet. Absent
+/// `patient` / `group` targets are surfaced as a 400 + OperationOutcome
+/// upstream, not as `Warning: 199` headers on this response.
 fn build_response(
     status: StatusCode,
     content_type: &'static str,
     body: Vec<u8>,
     runner_label: &str,
     format: &str,
-) -> Response {
-    build_response_with_warnings(status, content_type, body, runner_label, format, &[])
-}
-
-/// Like [`build_response`] but appends one `Warning:` header per
-/// absent-target message (RFC 7234 §5.5, warn-code 199). Audit item #5
-/// — surfaces `patient` / `group` absence to clients regardless of body
-/// format.
-fn build_response_with_warnings(
-    status: StatusCode,
-    content_type: &'static str,
-    body: Vec<u8>,
-    runner_label: &str,
-    format: &str,
-    warnings: &[String],
 ) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -782,12 +773,6 @@ fn build_response_with_warnings(
             header::CONTENT_DISPOSITION,
             HeaderValue::from_static("attachment; filename=\"output.parquet\""),
         );
-    }
-    for msg in warnings {
-        let safe = msg.replace('"', "'");
-        if let Ok(v) = HeaderValue::from_str(&format!("199 - \"{}\"", safe)) {
-            headers.append("warning", v);
-        }
     }
     (status, headers, body).into_response()
 }
