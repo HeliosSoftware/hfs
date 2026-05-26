@@ -24,11 +24,25 @@ jobs:
       - id: gen
         run: |
           FHIR_VERSIONS='["R4","R4B","R5"]'
+          # Expectations:
+          # - SQLite/PostgreSQL primary stores, including Elasticsearch composites,
+          #   must pass the full system/patient/group export lifecycle.
+          # - MongoDB primary stores are future bulk-export work.
+          # - S3 primary stores are a special case; the full lifecycle needs
+          #   patient/group compartment export, which S3 primary does not provide.
           ROWS='[
             {"backend":"sqlite","bulk_mode":"embedded-local","expectation":"full"},
             {"backend":"sqlite","bulk_mode":"postgres-s3","expectation":"full"},
             {"backend":"postgres","bulk_mode":"embedded-local","expectation":"full"},
-            {"backend":"postgres","bulk_mode":"postgres-s3","expectation":"full"}
+            {"backend":"postgres","bulk_mode":"postgres-s3","expectation":"full"},
+            {"backend":"sqlite-elasticsearch","bulk_mode":"embedded-local","expectation":"full"},
+            {"backend":"sqlite-elasticsearch","bulk_mode":"postgres-s3","expectation":"full"},
+            {"backend":"postgres-elasticsearch","bulk_mode":"embedded-local","expectation":"full"},
+            {"backend":"postgres-elasticsearch","bulk_mode":"postgres-s3","expectation":"full"},
+            {"backend":"mongodb","bulk_mode":"postgres-s3","expectation":"unsupported"},
+            {"backend":"mongodb-elasticsearch","bulk_mode":"postgres-s3","expectation":"unsupported"},
+            {"backend":"s3","bulk_mode":"postgres-s3","expectation":"unsupported"},
+            {"backend":"s3-elasticsearch","bulk_mode":"postgres-s3","expectation":"unsupported"}
           ]'
 
           MATRIX=$(jq -c --argjson versions "$FHIR_VERSIONS" \
