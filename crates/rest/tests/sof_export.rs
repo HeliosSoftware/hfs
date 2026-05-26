@@ -1030,6 +1030,12 @@ mod sof_export_tests {
     struct FailingController {
         tenant: String,
         job_id: String,
+        // Captured once at construction so successive polls of the result URL
+        // report a stable `exportEndTime` / `exportDuration`. Mirrors how the
+        // real `InMemoryController` records `failed_at` at the failure
+        // transition rather than on every read.
+        submitted_at: chrono::DateTime<chrono::Utc>,
+        failed_at: chrono::DateTime<chrono::Utc>,
     }
 
     impl ExportJobController for FailingController {
@@ -1042,7 +1048,8 @@ mod sof_export_tests {
             }
             Some(JobStatus::Failed {
                 message: "view runner exploded".to_string(),
-                submitted_at: chrono::Utc::now(),
+                submitted_at: self.submitted_at,
+                failed_at: self.failed_at,
             })
         }
         fn cancel(&self, _t: &str, _j: &str) -> bool {
@@ -1060,9 +1067,13 @@ mod sof_export_tests {
         backend.init_schema().expect("failed to init schema");
         let backend = Arc::new(backend);
 
+        let submitted_at = chrono::Utc::now() - chrono::Duration::seconds(7);
+        let failed_at = chrono::Utc::now() - chrono::Duration::seconds(2);
         let controller = FailingController {
             tenant: "test-tenant".to_string(),
             job_id: "fail-1".to_string(),
+            submitted_at,
+            failed_at,
         };
         let config = ServerConfig::for_testing();
         let state = helios_rest::AppState::new(Arc::clone(&backend), config)
@@ -1633,6 +1644,268 @@ mod sof_export_tests {
         assert!(
             diag.contains("missing-1"),
             "diagnostics must name the missing ref: {body}"
+        );
+    }
+
+    // =========================================================================
+    // 27. `_format` validation: unknown formats must be rejected at submit
+    //     time rather than silently downgraded to NDJSON by the serializer.
+    //     Spec: "If server does not support a parameter, request should be
+    //     rejected with 400 Bad Request".
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_unknown_format_returns_400() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let resp = server
+            .post("/ViewDefinition/$viewdefinition-export?_format=xml")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "unknown _format must 400, got: {} {}",
+            resp.status_code(),
+            resp.text()
+        );
+        let body: Value = resp.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        assert_eq!(body["issue"][0]["code"].as_str(), Some("not-supported"));
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diag.contains("xml") && diag.contains("ndjson"),
+            "diagnostics must name the bad value and list supported formats: {body}"
+        );
+    }
+
+    // =========================================================================
+    // 28. Duplicate view names: two `view` parts with the same name would
+    //     silently collapse into one `output` entry in the manifest. The
+    //     handler rejects this at submit time so callers don't lose shards.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_duplicate_view_names_returns_400() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        // Both views are explicitly named "demographics".
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "view", "part": [
+                    {"name": "name", "valueString": "demographics"},
+                    {"name": "viewResource", "resource": patient_view()}
+                ]},
+                {"name": "view", "part": [
+                    {"name": "name", "valueString": "demographics"},
+                    {"name": "viewResource", "resource": patient_view()}
+                ]}
+            ]
+        });
+
+        let resp = server
+            .post("/ViewDefinition/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "duplicate view names must 400, got: {} {}",
+            resp.status_code(),
+            resp.text()
+        );
+        let payload: Value = resp.json();
+        assert_eq!(payload["resourceType"].as_str(), Some("OperationOutcome"));
+        assert_eq!(payload["issue"][0]["code"].as_str(), Some("invalid"));
+        let diag = payload["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diag.contains("demographics"),
+            "diagnostics must name the duplicate: {payload}"
+        );
+    }
+
+    // =========================================================================
+    // 29. Failed job manifest reports a stable `exportEndTime` / `exportDuration`
+    //     across multiple polls of the result URL. Captured once at the failure
+    //     transition (`JobStatus::Failed.failed_at`), not recomputed per poll.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_failed_manifest_export_end_time_is_stable() {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+
+        // FailingController stores submitted_at/failed_at once at construction,
+        // mirroring how the real InMemoryController records `failed_at` at the
+        // transition into Failed.
+        let submitted_at = chrono::Utc::now() - chrono::Duration::seconds(7);
+        let failed_at = chrono::Utc::now() - chrono::Duration::seconds(2);
+        let controller = FailingController {
+            tenant: "test-tenant".to_string(),
+            job_id: "stable-fail".to_string(),
+            submitted_at,
+            failed_at,
+        };
+        let config = ServerConfig::for_testing();
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_export_controller(Arc::new(controller));
+        let app = helios_rest::routing::fhir_routes::create_routes(state);
+        let server = TestServer::new(app).expect("failed to create test server");
+
+        let fetch = || async {
+            let r = server
+                .get("/export/stable-fail/result")
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            assert_eq!(r.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body: Value = r.json();
+            let params = body["parameter"].as_array().unwrap().clone();
+            let pick = |name: &str, field: &str| -> Option<String> {
+                params
+                    .iter()
+                    .find(|p| p["name"].as_str() == Some(name))
+                    .and_then(|p| p[field].as_str())
+                    .map(|s| s.to_string())
+            };
+            let end_time = pick("exportEndTime", "valueInstant").expect("exportEndTime missing");
+            let duration = params
+                .iter()
+                .find(|p| p["name"].as_str() == Some("exportDuration"))
+                .and_then(|p| p["valueInteger"].as_i64())
+                .expect("exportDuration missing");
+            (end_time, duration)
+        };
+
+        let (end_a, dur_a) = fetch().await;
+        // Sleep across a second boundary so a clock-recomputed value would shift.
+        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+        let (end_b, dur_b) = fetch().await;
+
+        assert_eq!(
+            end_a, end_b,
+            "exportEndTime must be stable across polls (got {end_a} then {end_b})"
+        );
+        assert_eq!(
+            dur_a, dur_b,
+            "exportDuration must be stable across polls (got {dur_a} then {dur_b})"
+        );
+        // Sanity: the duration matches the (failed_at - submitted_at) window
+        // we constructed (5s). Allow ±1s for clock granularity in formatting.
+        assert!(
+            (4..=6).contains(&dur_a),
+            "expected ~5s duration, got {dur_a}"
+        );
+    }
+
+    // =========================================================================
+    // 30. Cancel after completion is a no-op: the cancel call returns 202
+    //     (the job exists) but does not overwrite the `Completed` state, so
+    //     the result URL keeps serving the manifest.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_cancel_after_completion_preserves_completed_state() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let submit_resp = server
+            .post("/ViewDefinition/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(submit_resp.status_code(), StatusCode::ACCEPTED);
+        let status_url = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Drive the job to completion and capture the manifest.
+        let manifest_before = poll_to_manifest(&server, &status_url, "test-tenant").await;
+        let export_id_before = manifest_before["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"].as_str() == Some("exportId"))
+            .and_then(|p| p["valueString"].as_str())
+            .expect("manifest missing exportId")
+            .to_string();
+
+        // DELETE on a completed job: cancel returns true (job found) so the
+        // handler responds 202, but the controller MUST NOT overwrite the
+        // Completed state with Cancelled.
+        let cancel = server
+            .delete(&status_url)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(
+            cancel.status_code(),
+            StatusCode::ACCEPTED,
+            "cancel of completed job should still 202 (job exists), got: {} {}",
+            cancel.status_code(),
+            cancel.text()
+        );
+
+        // Status URL must still 303 to the result URL (terminal state).
+        let poll = server
+            .get(&status_url)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(
+            poll.status_code(),
+            StatusCode::SEE_OTHER,
+            "completed job should still 303 after spurious cancel: {} {}",
+            poll.status_code(),
+            poll.text()
+        );
+        let result_url = poll
+            .headers()
+            .get("location")
+            .expect("303 missing Location")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Result URL must still serve the same Completed manifest.
+        let result_after = server
+            .get(&result_url)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(result_after.status_code(), StatusCode::OK);
+        let manifest_after: Value = result_after.json();
+        let status_after = manifest_after["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"].as_str() == Some("status"))
+            .and_then(|p| p["valueCode"].as_str());
+        assert_eq!(
+            status_after,
+            Some("completed"),
+            "manifest status must remain `completed` after cancel: {manifest_after}"
+        );
+        let export_id_after = manifest_after["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"].as_str() == Some("exportId"))
+            .and_then(|p| p["valueString"].as_str())
+            .expect("manifest missing exportId after cancel");
+        assert_eq!(
+            export_id_after, export_id_before,
+            "exportId must be unchanged after spurious cancel"
         );
     }
 }
