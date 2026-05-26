@@ -105,8 +105,13 @@ where
 
     let candidates: Vec<_> = result.resources.items.into_iter().collect();
     if candidates.is_empty() {
-        return Err(RestError::UnprocessableEntity {
-            message: format!("could not resolve canonical {resource_type} '{url}'"),
+        // SoF v2 spec maps "Library or ViewDefinition not found" to 404.
+        // Use the full canonical URL (including any |version) as the
+        // identifier in the NotFound payload so the client sees what we
+        // tried to resolve.
+        return Err(RestError::NotFound {
+            resource_type: resource_type.to_string(),
+            id: url.to_string(),
         });
     }
     let chosen = candidates

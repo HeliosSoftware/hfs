@@ -23,6 +23,27 @@
 //! `Accept: application/fhir+json`; in that case the bytes are base64-encoded
 //! into `Binary.data` and the response is a FHIR `Binary` resource.
 //! `_format=fhir` always returns a `Parameters` resource as specified.
+//!
+//! ## Type fidelity under `_format=fhir`
+//!
+//! The spec defines a SQL-type → FHIR-`value[X]` mapping (e.g. DATE →
+//! `valueDate`, TIMESTAMP → `valueDateTime`). The engine is in-memory
+//! SQLite, which has only five storage classes (INTEGER, REAL, TEXT, BLOB,
+//! NULL) and no native DATE/TIMESTAMP types. We recover the spec-mandated
+//! FHIR types by looking up each output column name against the
+//! depends-on ViewDefinitions' `select.column.type` declarations and
+//! preferring that type when one is found.
+//!
+//! For output columns produced by SQL expressions that do **not** match a
+//! VD-declared column (e.g. `SELECT date('now') AS today FROM t` or
+//! `SELECT COUNT(*) AS n FROM t`), the column type falls back to whatever
+//! SQLite's storage class implies: INTEGER → `valueInteger`, REAL →
+//! `valueDecimal`, TEXT → `valueString`, BLOB → `valueBase64Binary`. The
+//! spec's `date()` → `valueDate` / `datetime()` → `valueDateTime`
+//! mappings are therefore not preserved for synthesised string columns;
+//! they surface as `valueString`. Authors who need precise FHIR typing on
+//! computed columns should declare the column in a depends-on
+//! ViewDefinition projection, or accept the `valueString` fallback.
 
 use axum::{
     extract::{Path, Query, State},
@@ -115,14 +136,18 @@ where
     // to `ndjson`.
     let format = resolve_format(params.format.as_deref(), query.format.as_deref(), headers);
 
-    // Spec: the `source` parameter is 0..1. We don't implement external data
-    // sources; ignore the value with a warning instead of failing the request.
-    if let Some(src) = &params.source {
-        warn!(
-            source = %src,
-            "$sqlquery-run: ignoring unsupported 'source' parameter; query will run \
-             against the SQLQuery Library's depends-on ViewDefinitions only"
-        );
+    // Spec: the `source` parameter is 0..1 and points at an external data
+    // source containing the ViewDefinition tables. We don't implement
+    // external sources, so a request that supplies one is asking for
+    // behavior we can't honor — reject with 400 per the spec's mapping of
+    // "unknown parameter / value type mismatch".
+    if params.source.is_some() {
+        return Err(RestError::BadRequest {
+            message: "the 'source' parameter is not supported by this server; \
+                      the query will only run against the SQLQuery Library's \
+                      depends-on ViewDefinitions"
+                .to_string(),
+        });
     }
 
     // Mutual exclusion: queryResource and queryReference cannot both be supplied.
@@ -273,8 +298,10 @@ where
 /// Accept mapping mirrors `$viewdefinition-run`: `application/json` → `json`,
 /// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
 /// `application/octet-stream`/`application/parquet` → `parquet`,
-/// `application/fhir+json` → `fhir`. Unknown Accept values fall through to
-/// the `ndjson` default.
+/// `application/fhir+json` → `fhir`. `application/fhir+xml` is **not**
+/// mapped — the FHIR formatter only emits JSON, and routing xml-asking
+/// clients to a JSON response was misleading. Unknown Accept values fall
+/// through to the `ndjson` default.
 fn resolve_format(
     body_format: Option<&str>,
     query_format: Option<&str>,
@@ -296,7 +323,7 @@ fn resolve_format(
                 "application/x-ndjson" | "application/ndjson" => Some("ndjson"),
                 "text/csv" => Some("csv"),
                 "application/octet-stream" | "application/parquet" => Some("parquet"),
-                "application/fhir+json" | "application/fhir+xml" => Some("fhir"),
+                "application/fhir+json" => Some("fhir"),
                 _ => None,
             });
         if let Some(f) = mapped {
@@ -528,8 +555,13 @@ fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
         SqlQueryError::MissingDependsOnLabel => RestError::UnprocessableEntity {
             message: "depends-on entry missing label".into(),
         },
-        SqlQueryError::UnknownCanonical(s) => RestError::UnprocessableEntity {
-            message: format!("could not resolve canonical URL: {s}"),
+        // Spec: "Library or ViewDefinition not found" → 404. (Currently
+        // unreached because canonical resolution lives in `references.rs`
+        // which raises NotFound directly, but kept consistent for any
+        // future engine-level resolver path.)
+        SqlQueryError::UnknownCanonical(s) => RestError::NotFound {
+            resource_type: "Resource".to_string(),
+            id: s,
         },
         SqlQueryError::TooManyDependsOn { count, max } => RestError::UnprocessableEntity {
             message: format!("too many depends-on ViewDefinitions: {count} (max {max})"),

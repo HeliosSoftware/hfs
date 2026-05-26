@@ -18,7 +18,7 @@
 //!     { "name": "supportsInDbRunner",           "valueBoolean": false },
 //!     { "name": "supportsRelativeReference",    "valueBoolean": true  },
 //!     { "name": "supportsCanonicalReference",   "valueBoolean": true  },
-//!     { "name": "supportsAbsoluteReference",    "valueBoolean": false },
+//!     { "name": "supportsAbsoluteReference",    "valueBoolean": true  },
 //!     { "name": "supportedFormat",              "valueCode": "ndjson"  },
 //!     { "name": "supportedFormat",              "valueCode": "json"    },
 //!     { "name": "supportedFormat",              "valueCode": "csv"     },
@@ -74,11 +74,15 @@ where
         bool_param("supportsSqlQueryRun", true),
         bool_param("supportsInDbRunner", supports_indb),
         // Spec SHALL: document which ViewDefinition reference formats are
-        // supported. We support relative `ViewDefinition/{id}` and resolve
-        // canonical URLs via the SearchProvider for `$sqlquery-run`.
+        // supported. We support:
+        // - relative `ViewDefinition/{id}` via storage read
+        // - canonical URLs via SearchProvider `url=` lookup
+        // - absolute URLs — the canonical resolver treats any non-relative
+        //   reference as a canonical-URL lookup, so absolute http(s) URLs
+        //   that match a registered canonical are resolved successfully.
         bool_param("supportsRelativeReference", true),
         bool_param("supportsCanonicalReference", true),
-        bool_param("supportsAbsoluteReference", false),
+        bool_param("supportsAbsoluteReference", true),
     ];
 
     // Supported output formats (G2: includes parquet; fhir included for $sqlquery-run).

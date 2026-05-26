@@ -275,7 +275,16 @@ impl InMemorySqlEngine {
         let mut rows_iter = stmt.raw_query();
         while let Some(row) = rows_iter.next()? {
             if rows_out.len() >= max_rows {
-                return Err(SqlQueryError::RowCapExceeded { max: max_rows });
+                // SoF v2: the server's hard cap silently truncates the
+                // result set instead of erroring (spec PR #353: "Servers
+                // MAY enforce a maximum value, silently capping
+                // client-supplied limits at a smaller server-defined
+                // maximum"). Caller-supplied `_limit` is also a silent
+                // cap and is enforced at the handler. Source-row caps
+                // applied during `insert_rows` remain hard errors
+                // because truncating a depends-on table would silently
+                // change query semantics (JOINs, aggregates).
+                break;
             }
             let mut row_vals: Vec<Option<Value>> = Vec::with_capacity(columns.len());
             for (i, _) in columns.iter().enumerate() {
@@ -438,6 +447,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SqlQueryError::RowCapExceeded { max: 3 }));
+    }
+
+    #[tokio::test]
+    async fn execute_select_silently_truncates_at_max_rows() {
+        // SoF v2 PR #353: the server's hard cap silently truncates the
+        // result set; it must not error.
+        let mut engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[("n", ColumnFhirType::Integer)]);
+        engine.create_table("t", &s).unwrap();
+        let rows = stream::iter((1..=10).map(|i| Ok(json!({"n": i}))));
+        engine
+            .insert_rows("t", &s, Box::pin(rows), 100)
+            .await
+            .unwrap();
+        let result = engine
+            .execute_select("SELECT n FROM t ORDER BY n", &[], 4)
+            .unwrap();
+        assert_eq!(result.rows.len(), 4);
+        assert_eq!(result.rows[0][0], Some(Value::Number(1.into())));
+        assert_eq!(result.rows[3][0], Some(Value::Number(4.into())));
     }
 
     #[test]

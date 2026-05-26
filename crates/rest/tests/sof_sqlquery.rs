@@ -553,10 +553,11 @@ mod sof_sqlquery_tests {
     }
 
     #[tokio::test]
-    async fn source_parameter_is_ignored_with_warning() {
-        // Spec marks `source` as 0..1. We don't implement external data sources;
-        // when supplied, the value is logged and ignored — the request still runs
-        // against the SQLQuery Library's depends-on ViewDefinitions.
+    async fn source_parameter_returns_400() {
+        // Spec marks `source` as 0..1 — an external data source containing
+        // ViewDefinition tables. We don't implement external sources, so a
+        // request that supplies one is asking for behavior we can't honor.
+        // Per the spec's error mapping, return 400 BadRequest.
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "p1", "Smith", true).await;
         let vd_url = seed_patient_view(&backend).await;
@@ -578,9 +579,7 @@ mod sof_sqlquery_tests {
             )
             .json(&body)
             .await;
-        response.assert_status(StatusCode::OK);
-        let v: Value = response.json();
-        assert_eq!(v[0]["patient_id"], json!("p1"));
+        response.assert_status(StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -832,7 +831,10 @@ mod sof_sqlquery_tests {
     }
 
     #[tokio::test]
-    async fn unknown_view_definition_returns_404_or_422() {
+    async fn unknown_view_definition_returns_404() {
+        // Spec: "Library or ViewDefinition not found" → 404. Both the
+        // relative `ViewDefinition/{id}` and the canonical-URL lookup
+        // paths now return 404 consistently.
         let (server, _) = create_test_server().await;
         let lib = library_with_canonical_vd(
             "SELECT 1 FROM t",
@@ -850,11 +852,31 @@ mod sof_sqlquery_tests {
             )
             .json(&body)
             .await;
-        let status = response.status_code();
-        assert!(
-            status == StatusCode::NOT_FOUND || status == StatusCode::UNPROCESSABLE_ENTITY,
-            "expected 404 or 422, got {status}"
+        response.assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unknown_canonical_view_definition_returns_404() {
+        // Same expectation when the depends-on resource is an unresolved
+        // canonical URL rather than a relative reference.
+        let (server, _) = create_test_server().await;
+        let lib = library_with_canonical_vd(
+            "SELECT 1 FROM t",
+            "http://example.org/ViewDefinition/never-registered",
+            "t",
+            vec![],
         );
+        let body = run_body_inline(lib, "json", None);
+        let response = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

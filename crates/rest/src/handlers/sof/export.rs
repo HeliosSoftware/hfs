@@ -1297,8 +1297,10 @@ where
 ///   match by `meta.lastUpdated` wins.
 ///
 /// Absolute external URL *fetch* is not supported; callers must register
-/// the artifact on this server first. The `$sql-on-fhir-capabilities`
-/// response advertises this via `supportsAbsoluteReference = false`.
+/// the artifact on this server first. An absolute URL that matches a
+/// registered resource's canonical is resolved successfully — that's why
+/// `$sql-on-fhir-capabilities` advertises
+/// `supportsAbsoluteReference = true`.
 async fn resolve_view_reference_export<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,

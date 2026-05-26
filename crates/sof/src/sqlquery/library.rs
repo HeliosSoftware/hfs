@@ -208,8 +208,10 @@ fn extract_parameters(library_json: &Value) -> Result<Vec<LibraryParameter>, Sql
     let mut out = Vec::new();
     for p in arr {
         if p.get("use").and_then(|v| v.as_str()) != Some("in") {
-            // Profile: parameters are input-only. Anything else is silently
-            // skipped — the spec doesn't define `out` semantics for SQLQuery.
+            // SQLQuery profile only defines `use=in` parameters. `out` (and
+            // any other value) has no defined semantics for $sqlquery-run,
+            // so silently skip rather than reject — keeps us forward-
+            // compatible with future profile additions.
             continue;
         }
         let name = p.get("name").and_then(|v| v.as_str()).ok_or_else(|| {

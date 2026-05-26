@@ -1217,10 +1217,11 @@ mod sof_run_tests {
     }
 
     /// A canonical viewReference that does not match any stored
-    /// ViewDefinition resolves with 422 (`processing`), distinguishing
-    /// "couldn't resolve" from the previous "rejected unconditionally".
+    /// ViewDefinition resolves with 404. SoF v2 maps "Library or
+    /// ViewDefinition not found" to 404, and we normalised the canonical
+    /// resolver to match the relative-reference path.
     #[tokio::test]
-    async fn test_run_view_definition_unknown_canonical_reference_422() {
+    async fn test_run_view_definition_unknown_canonical_reference_404() {
         let (server, _backend) = create_test_server().await;
 
         let body = json!({
@@ -1241,7 +1242,7 @@ mod sof_run_tests {
             )
             .json(&body)
             .await;
-        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        response.assert_status(StatusCode::NOT_FOUND);
     }
 
     // =========================================================================
