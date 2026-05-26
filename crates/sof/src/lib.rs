@@ -576,6 +576,13 @@ pub enum SofError {
     /// This error occurs when converting data to Parquet format fails.
     #[error("Parquet conversion error: {0}")]
     ParquetConversionError(String),
+
+    /// A `patient` / `group` reference supplied to `$viewdefinition-run` does
+    /// not resolve against the supplied resources. Per the SoF v2 spec, this
+    /// is a `400 Bad Request` (mapped to OperationOutcome `not-found` /
+    /// `invalid`), not a silent empty-result.
+    #[error("Referenced resource not found: {0}")]
+    ReferencedResourceNotFound(String),
 }
 
 /// Supported output content types for ViewDefinition transformations.
@@ -1069,21 +1076,6 @@ pub fn create_bundle_from_resources_for_version(
     }
 }
 
-/// Result of applying the patient/group filter to a resource list.
-///
-/// `warnings` carries human-readable messages for SoF v2 audit item #5
-/// ("Server SHOULD return OperationOutcome if requested patients absent",
-/// same for `group`). Callers typically surface them as `Warning:` HTTP
-/// headers (RFC 7234 §5.5, warn-code 199) so clients see the absence
-/// signal regardless of output format (CSV/JSON/NDJSON/Parquet).
-#[derive(Debug, Default, Clone)]
-pub struct PatientGroupFilterOutcome {
-    /// Resources that survived the compartment filter.
-    pub resources: Vec<serde_json::Value>,
-    /// Warning messages for absent `patient` / `group` targets.
-    pub warnings: Vec<String>,
-}
-
 /// Filters raw FHIR resource JSON by patient and/or group references using
 /// the FHIR `CompartmentDefinition-patient` spec data.
 ///
@@ -1103,31 +1095,29 @@ pub struct PatientGroupFilterOutcome {
 /// This replaces the prior hand-rolled `(subject|patient)` allowlist
 /// (audit item #3) without any runtime data-file dependency.
 ///
-/// Returns a [`PatientGroupFilterOutcome`] containing the filtered
-/// resources plus any `Warning:`-header-bound messages for absent
-/// `patient` / `group` targets (audit item #5).
+/// **Absent-target handling (SoF v2 spec):** any `patient` / `group` reference
+/// that does not resolve against the supplied resources is a hard error,
+/// returned as [`SofError::ReferencedResourceNotFound`]. Callers surface this
+/// as `400 Bad Request` + an `OperationOutcome` per the spec's error table.
+/// Previously this path emitted a `Warning: 199` HTTP header and continued
+/// with a (possibly empty) result; the warning-header behavior was
+/// removed to align with the spec.
 pub fn filter_resources_by_patient_and_group(
     resources: Vec<serde_json::Value>,
     patient_refs: &[String],
     group_refs: &[String],
     fhir_version: FhirVersion,
-) -> Result<PatientGroupFilterOutcome, SofError> {
+) -> Result<Vec<serde_json::Value>, SofError> {
     use std::collections::HashSet;
 
     if patient_refs.is_empty() && group_refs.is_empty() {
-        return Ok(PatientGroupFilterOutcome {
-            resources,
-            warnings: Vec::new(),
-        });
+        return Ok(resources);
     }
 
-    let mut warnings = Vec::new();
-
-    // Absent-target detection (audit item #5): a `patient` / `group`
-    // reference is "absent" when the target resource isn't in the
-    // supplied bundle. We emit a warning per missing reference; the
-    // filter still runs (partial results are fine — the warning is
-    // advisory, not an error).
+    // Absent-target detection: any `patient` / `group` reference that
+    // isn't represented by a resource in the supplied bundle is a hard
+    // error per the SoF v2 spec error table.
+    let mut absent: Vec<String> = Vec::new();
     for r in patient_refs {
         let canonical = if r.starts_with("Patient/") {
             r.clone()
@@ -1146,7 +1136,7 @@ pub fn filter_resources_by_patient_and_group(
             })
             .unwrap_or(false);
         if !found {
-            warnings.push(format!("{} not found in supplied resources", canonical));
+            absent.push(canonical);
         }
     }
     for g in group_refs {
@@ -1167,8 +1157,14 @@ pub fn filter_resources_by_patient_and_group(
             })
             .unwrap_or(false);
         if !found {
-            warnings.push(format!("{} not found in supplied resources", canonical));
+            absent.push(canonical);
         }
+    }
+    if !absent.is_empty() {
+        return Err(SofError::ReferencedResourceNotFound(format!(
+            "{} not found in supplied resources",
+            absent.join(", ")
+        )));
     }
 
     // Build the effective patient-compartment set: explicit patient refs +
@@ -1192,14 +1188,11 @@ pub fn filter_resources_by_patient_and_group(
         ));
     }
 
-    // No effective patient targets (e.g. group ref didn't resolve to any
-    // Patient members in the bundle) → empty result; mirrors bulk-export
-    // behavior for an empty Group.
+    // No effective patient targets (e.g. supplied Group resolved to zero
+    // Patient members). The targets themselves are present (they got past
+    // the absent-target check above), so this is an empty-but-valid result.
     if targets.is_empty() {
-        return Ok(PatientGroupFilterOutcome {
-            resources: Vec::new(),
-            warnings,
-        });
+        return Ok(Vec::new());
     }
 
     let mut filtered = Vec::with_capacity(resources.len());
@@ -1227,10 +1220,7 @@ pub fn filter_resources_by_patient_and_group(
         }
     }
 
-    Ok(PatientGroupFilterOutcome {
-        resources: filtered,
-        warnings,
-    })
+    Ok(filtered)
 }
 
 /// Filters raw FHIR resource JSON by their `meta.lastUpdated` timestamp,

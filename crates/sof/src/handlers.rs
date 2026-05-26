@@ -6,7 +6,7 @@
 use axum::{
     Json,
     extract::Query,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
@@ -25,8 +25,8 @@ use tracing::{debug, info};
 use super::{
     error::{ServerError, ServerResult},
     models::{
-        RunParameters, RunQueryParams, extract_all_parameters, parse_content_type,
-        validate_query_params,
+        ExtractedParameters, RunParameters, RunQueryParams, extract_all_parameters,
+        parse_content_type, validate_query_params,
     },
 };
 
@@ -52,6 +52,15 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 /// * `params` - Query parameters for filtering, pagination, and output format
 /// * `headers` - HTTP headers including Accept for content negotiation
 /// * `body` - FHIR Parameters resource containing ViewDefinition and resources
+///
+/// # Body shapes
+///
+/// The request body may be either:
+/// - A FHIR `Parameters` resource (full form, recommended), or
+/// - A bare `ViewDefinition` resource (shortcut — equivalent to a Parameters
+///   body with a single `viewResource` entry). Other operation parameters
+///   (`patient`, `group`, `_format`, `_limit`, `_since`, `header`, `source`)
+///   must come from the query string when this shape is used.
 ///
 /// # Parameters (in specification order)
 ///
@@ -106,11 +115,27 @@ pub async fn run_view_definition_handler(
     let validated_params =
         validate_query_params(&params, accept_header).map_err(ServerError::BadRequest)?;
 
-    // Parse the Parameters resource using version detection
-    let parameters = parse_parameters(body)?;
-
-    // Extract all parameters including filters
-    let extracted_params = extract_all_parameters(parameters).map_err(ServerError::BadRequest)?;
+    // sof-server accepts two body shapes — match the HFS REST handler:
+    //   - A FHIR `Parameters` resource carrying `viewResource`, optional
+    //     `resource` entries, and operation parameters (`_format`, `_limit`,
+    //     `_since`, `patient`, `group`, `header`, `source`).
+    //   - A bare `ViewDefinition` resource — equivalent to a `Parameters`
+    //     body with a single `viewResource` entry and no others.
+    // The bare-ViewDefinition shortcut keeps the CLI/server ergonomic for
+    // callers that just want to pipe a ViewDefinition without building a
+    // Parameters wrapper. Other parameters (filters, limits, format) must
+    // come from the query string when this shape is used.
+    let is_bare_view_definition =
+        body.get("resourceType").and_then(|v| v.as_str()) == Some("ViewDefinition");
+    let extracted_params = if is_bare_view_definition {
+        ExtractedParameters {
+            view_definition: Some(body),
+            ..Default::default()
+        }
+    } else {
+        let parameters = parse_parameters(body)?;
+        extract_all_parameters(parameters).map_err(ServerError::BadRequest)?
+    };
 
     // Check for not-yet-implemented parameters
     if extracted_params.view_reference.is_some() {
@@ -123,9 +148,11 @@ pub async fn run_view_definition_handler(
     // helios_sof::compartment::resolve_group_members_to_patient_refs): each
     // supplied `Group/{id}` is resolved against Group resources in the
     // inline bundle, and its `member.entity` Patient references join the
-    // effective patient-compartment set. Unresolved groups simply produce
-    // no member refs — audit item #5 (SHOULD emit OperationOutcome) is a
-    // separate follow-up.
+    // effective patient-compartment set. Absent `patient` / `group`
+    // references are rejected by `filter_resources_by_patient_and_group`
+    // with `SofError::ReferencedResourceNotFound`, which the error mapper
+    // surfaces as `400 Bad Request` + `OperationOutcome.issue.code =
+    // not-found` per the SoF v2 spec error table.
 
     // For backward compatibility, extract the legacy tuple format
     let view_def_json = extracted_params.view_definition;
@@ -179,11 +206,6 @@ pub async fn run_view_definition_handler(
 
     // Apply patient and group filters from body parameters to resources if provided
     let mut filtered_resources = resources_json.unwrap_or_default();
-    // Accumulates absent-target warnings from every filter pass below
-    // (audit item #5). Surfaced as `Warning:` HTTP headers at response
-    // construction time so clients see the absence signal regardless of
-    // output format.
-    let mut filter_warnings: Vec<String> = Vec::new();
 
     // Merge filter parameters from body and query. Body takes precedence
     // when non-empty; otherwise comma-split the query value into the spec's
@@ -275,14 +297,12 @@ pub async fn run_view_definition_handler(
 
             // Apply filters
             if !patient_filter.is_empty() || !group_filter.is_empty() {
-                let outcome = filter_resources_by_patient_and_group(
+                source_resources = filter_resources_by_patient_and_group(
                     source_resources,
                     &patient_filter,
                     &group_filter,
                     source_fhir_version.unwrap(),
                 )?;
-                source_resources = outcome.resources;
-                filter_warnings.extend(outcome.warnings);
             }
 
             if let Some(since) = validated_params.since {
@@ -316,14 +336,12 @@ pub async fn run_view_definition_handler(
     // Apply filters to provided resources
     if !patient_filter.is_empty() || !group_filter.is_empty() {
         let effective_version = source_fhir_version.unwrap_or_else(get_newest_enabled_fhir_version);
-        let outcome = filter_resources_by_patient_and_group(
+        filtered_resources = filter_resources_by_patient_and_group(
             filtered_resources,
             &patient_filter,
             &group_filter,
             effective_version,
         )?;
-        filtered_resources = outcome.resources;
-        filter_warnings.extend(outcome.warnings);
     }
 
     // Apply _since filter if provided
@@ -396,7 +414,7 @@ pub async fn run_view_definition_handler(
                 file_buffers.len()
             );
             let zip = crate::parquet_zip::create_zip_from_buffers(file_buffers, "data")?;
-            let mut response = (
+            Ok((
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "application/zip"),
@@ -407,14 +425,12 @@ pub async fn run_view_definition_handler(
                 ],
                 zip,
             )
-                .into_response();
-            attach_filter_warnings(response.headers_mut(), &filter_warnings);
-            Ok(response)
+                .into_response())
         } else {
             // Per SoF v2 spec Accept table, parquet uses
             // `application/octet-stream`; Content-Disposition makes browsers
             // download as `.parquet` (audit item #8).
-            let mut response = (
+            Ok((
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "application/octet-stream"),
@@ -425,9 +441,7 @@ pub async fn run_view_definition_handler(
                 ],
                 file_buffers.into_iter().next().unwrap_or_default(),
             )
-                .into_response();
-            attach_filter_warnings(response.headers_mut(), &filter_warnings);
-            Ok(response)
+                .into_response())
         }
     } else {
         // Standard processing
@@ -455,7 +469,7 @@ pub async fn run_view_definition_handler(
             ContentType::Parquet => "application/octet-stream",
         };
 
-        let mut response = if matches!(validated_params.format, ContentType::Parquet) {
+        let response = if matches!(validated_params.format, ContentType::Parquet) {
             // Add Content-Disposition for parquet so browsers download as
             // `.parquet` rather than rendering octet-stream as binary noise.
             (
@@ -478,24 +492,7 @@ pub async fn run_view_definition_handler(
             )
                 .into_response()
         };
-        attach_filter_warnings(response.headers_mut(), &filter_warnings);
         Ok(response)
-    }
-}
-
-/// Appends one `Warning:` header per absent-target message
-/// (RFC 7234 §5.5, warn-code 199 = Miscellaneous warning). Carries the
-/// `patient` / `group` absence signal from
-/// [`helios_sof::PatientGroupFilterOutcome::warnings`] to the client,
-/// regardless of response body format (audit item #5).
-fn attach_filter_warnings(headers: &mut HeaderMap, warnings: &[String]) {
-    for msg in warnings {
-        // Strip quotes from the message to keep the header value valid;
-        // ASCII control chars would also break `HeaderValue::from_str`.
-        let safe = msg.replace('"', "'");
-        if let Ok(v) = HeaderValue::from_str(&format!("199 - \"{}\"", safe)) {
-            headers.append("warning", v);
-        }
     }
 }
 
@@ -801,7 +798,7 @@ fn filter_resources_by_patient_and_group(
     patient_refs: &[String],
     group_refs: &[String],
     fhir_version: helios_fhir::FhirVersion,
-) -> ServerResult<helios_sof::PatientGroupFilterOutcome> {
+) -> ServerResult<Vec<serde_json::Value>> {
     sof_filter_resources_by_patient_and_group(resources, patient_refs, group_refs, fhir_version)
         .map_err(ServerError::from)
 }
@@ -1058,7 +1055,7 @@ mod tests {
             }),
         ];
 
-        let outcome = filter_resources_by_patient_and_group(
+        let filtered = filter_resources_by_patient_and_group(
             resources,
             &["Patient/123".to_string()],
             &[],
@@ -1066,40 +1063,43 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.resources.len(), 2);
-        assert_eq!(outcome.resources[0]["id"], "123");
-        assert_eq!(outcome.resources[1]["id"], "obs1");
-        assert!(
-            outcome.warnings.is_empty(),
-            "Patient/123 is in the bundle; no absent-target warning expected"
-        );
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0]["id"], "123");
+        assert_eq!(filtered[1]["id"], "obs1");
     }
 
+    /// Absent `patient` / `group` references are a hard 400 per the SoF v2
+    /// spec error table — not the previous "200 + Warning: 199" path. We
+    /// assert both the `ServerError` variant and the rendered HTTP status.
     #[cfg(feature = "R4")]
     #[test]
-    fn test_filter_with_unresolvable_group_returns_empty() {
-        // With the new compartment-aware filter, an unresolved group_ref
-        // (no Group/test resource in the bundle) means no effective patient
-        // refs, so the filter returns empty rather than erroring out.
+    fn test_filter_with_unresolvable_group_returns_bad_request() {
         let resources = vec![serde_json::json!({
             "resourceType": "Patient",
             "id": "123"
         })];
 
-        let outcome = filter_resources_by_patient_and_group(
+        let err = filter_resources_by_patient_and_group(
             resources,
             &[],
             &["Group/test".to_string()],
             helios_fhir::FhirVersion::R4,
         )
-        .unwrap();
-
-        assert!(outcome.resources.is_empty());
-        // Audit item #5: absent group target should produce a warning.
-        assert!(
-            outcome.warnings.iter().any(|w| w.contains("Group/test")),
-            "expected an absent-target warning for Group/test, got {:?}",
-            outcome.warnings
+        .expect_err("absent Group target must error");
+        match &err {
+            ServerError::ReferencedResourceNotFound(msg) => {
+                assert!(
+                    msg.contains("Group/test"),
+                    "error must name the absent reference: {msg}"
+                );
+            }
+            other => panic!("expected ReferencedResourceNotFound, got {other:?}"),
+        }
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "absent reference must surface as 400"
         );
     }
 

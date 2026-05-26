@@ -162,8 +162,12 @@ async fn run_view_definition_handler(
         return error_response(axum::http::StatusCode::BAD_REQUEST, &e);
     }
 
-    // Basic parameter parsing
-    if body["resourceType"] != "Parameters" {
+    // sof-server accepts two body shapes:
+    //   - A FHIR `Parameters` resource (full form), or
+    //   - A bare `ViewDefinition` resource (shortcut — equivalent to a
+    //     Parameters body with a single `viewResource` entry).
+    let is_bare_view_definition = body["resourceType"] == "ViewDefinition";
+    if !is_bare_view_definition && body["resourceType"] != "Parameters" {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
             "Request body must be a Parameters resource",
@@ -178,7 +182,10 @@ async fn run_view_definition_handler(
     let mut patient_filter = None;
     let mut count_from_body = None;
 
-    if let Some(parameters) = body["parameter"].as_array() {
+    if is_bare_view_definition {
+        // Body itself is the ViewDefinition; no resources, no operation params.
+        view_def_json = body.as_object().cloned();
+    } else if let Some(parameters) = body["parameter"].as_array() {
         for param in parameters {
             match param["name"].as_str() {
                 Some("viewResource") => {

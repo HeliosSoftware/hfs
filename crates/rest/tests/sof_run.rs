@@ -473,13 +473,12 @@ mod sof_run_tests {
         );
     }
 
-    /// Audit item #5: a `patient` reference whose target Patient resource
-    /// isn't in the supplied bundle SHOULD produce an OperationOutcome
-    /// warning. We surface it as a `Warning:` HTTP header (RFC 7234 §5.5)
-    /// so the absence signal reaches the client regardless of the
-    /// `_format` output.
+    /// Spec error table: a `patient` reference whose target Patient resource
+    /// isn't in the supplied bundle is a `400 Bad Request` with an
+    /// OperationOutcome — not a `200` plus a `Warning:` header (the prior
+    /// behavior we've now retired to align with the spec).
     #[tokio::test]
-    async fn test_inline_run_emits_warning_for_absent_patient_target() {
+    async fn test_inline_run_rejects_absent_patient_target_with_400() {
         let (server, _backend) = create_test_server().await;
 
         let view = patient_view_definition();
@@ -509,18 +508,16 @@ mod sof_run_tests {
             .json(&parameters_body)
             .await;
 
-        response.assert_status(StatusCode::OK);
-        let warning_headers: Vec<String> = response
-            .headers()
-            .get_all("warning")
-            .iter()
-            .filter_map(|v| v.to_str().ok().map(String::from))
-            .collect();
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        let diagnostics = body["issue"][0]["diagnostics"]
+            .as_str()
+            .or_else(|| body["issue"][0]["details"]["text"].as_str())
+            .unwrap_or_default();
         assert!(
-            warning_headers
-                .iter()
-                .any(|w| w.contains("Patient/alice") && w.contains("not found")),
-            "expected a Warning header for absent Patient/alice, got {warning_headers:?}"
+            diagnostics.contains("Patient/alice"),
+            "OperationOutcome must name the absent reference: {body}"
         );
     }
 
@@ -628,11 +625,15 @@ mod sof_run_tests {
             "id": "ai-other",
             "patient": {"reference": "Patient/xyz"}
         });
+        // Patient/abc must be present in the bundle: absent `patient`
+        // references are now a hard 400 per the SoF v2 spec error table.
+        let pt_abc = json!({"resourceType": "Patient", "id": "abc"});
 
         let parameters_body = json!({
             "resourceType": "Parameters",
             "parameter": [
                 {"name": "viewResource", "resource": view},
+                {"name": "resource", "resource": pt_abc},
                 {"name": "resource", "resource": ai_match},
                 {"name": "resource", "resource": ai_other},
                 {"name": "patient", "valueReference": {"reference": "Patient/abc"}}
