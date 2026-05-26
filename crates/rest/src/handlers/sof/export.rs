@@ -62,6 +62,12 @@ const ALLOWED_BODY_PARAMS: &[&str] = &[
     "source",
 ];
 
+/// Output formats this server can serialize. The spec binds `_format` to
+/// the extensible `OutputFormatCodes` value set; we reject anything outside
+/// this list with 400 per the spec's "reject unsupported parameters" rule
+/// rather than silently downgrading the output to NDJSON.
+const SUPPORTED_FORMATS: &[&str] = &["ndjson", "csv", "json", "parquet"];
+
 /// Query parameters for `$viewdefinition-export`.
 ///
 /// `deny_unknown_fields` enforces the spec's "reject unsupported parameters
@@ -361,6 +367,56 @@ async fn submit_export_job<S>(
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
+    // Reject unsupported `_format` values up-front. The serializer in the
+    // controller falls back to NDJSON on unknown formats; without this guard
+    // the kick-off would 202-accept the job and the completion manifest would
+    // echo the bogus format while the files are actually NDJSON.
+    if !SUPPORTED_FORMATS.contains(&inputs.format.as_str()) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "not-supported",
+                    "diagnostics": format!(
+                        "unsupported `_format` value '{}'; supported: {}",
+                        inputs.format,
+                        SUPPORTED_FORMATS.join(", ")
+                    )
+                }]
+            })),
+        )
+            .into_response());
+    }
+
+    // Spec implies one `output` per submitted view. The completion manifest
+    // groups files by view name, so two views with the same name would
+    // silently collapse into a single `output` entry. Detect collisions at
+    // submit time and reject.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for nv in &views {
+        if !seen.insert(nv.name.as_str()) {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [{
+                        "severity": "error",
+                        "code": "invalid",
+                        "diagnostics": format!(
+                            "duplicate view name '{}'; each submitted view must have a unique \
+                             name (set `view.part[name=name].valueString` or \
+                             `ViewDefinition.name` to disambiguate)",
+                            nv.name
+                        )
+                    }]
+                })),
+            )
+                .into_response());
+        }
+    }
+
     // Validate that each view has a `resource` field (basic check).
     for nv in &views {
         if nv.view.get("resource").and_then(|v| v.as_str()).is_none() {
@@ -590,6 +646,7 @@ where
         Some(JobStatus::Failed {
             message,
             submitted_at,
+            failed_at,
         }) => {
             // Spec status-code table: "500 Internal Server Error: Unexpected
             // server error (at result URL indicates operation failure)". The
@@ -597,8 +654,7 @@ where
             // `status=failed` and an OperationOutcome in the bulk-data-style
             // `error` part — the 500 surfaces failure to clients that only
             // inspect the status line.
-            let now = chrono::Utc::now();
-            let duration_secs = (now - submitted_at).num_seconds().max(0);
+            let duration_secs = (failed_at - submitted_at).num_seconds().max(0);
             let status_url = format!(
                 "{base}/export/{job_id}/status",
                 base = state.base_url().trim_end_matches('/'),
@@ -620,7 +676,7 @@ where
                         {"name": "status", "valueCode": "failed"},
                         {"name": "location", "valueUri": status_url},
                         {"name": "exportStartTime", "valueInstant": submitted_at.to_rfc3339()},
-                        {"name": "exportEndTime", "valueInstant": now.to_rfc3339()},
+                        {"name": "exportEndTime", "valueInstant": failed_at.to_rfc3339()},
                         {"name": "exportDuration", "valueInteger": duration_secs},
                         {"name": "error", "resource": outcome}
                     ]

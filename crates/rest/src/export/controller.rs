@@ -81,6 +81,10 @@ pub enum JobStatus {
         message: String,
         /// Time the job was submitted.
         submitted_at: DateTime<Utc>,
+        /// Time the worker recorded the failure. Captured once at the
+        /// transition into `Failed` so successive polls of the result URL
+        /// report a stable `exportEndTime` / `exportDuration`.
+        failed_at: DateTime<Utc>,
     },
     /// Job was cancelled by the caller.
     Cancelled,

@@ -137,6 +137,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                             JobStatus::Failed {
                                 message: e.to_string(),
                                 submitted_at,
+                                failed_at: Utc::now(),
                             },
                         );
                         return;
@@ -176,6 +177,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                                 JobStatus::Failed {
                                     message: e.to_string(),
                                     submitted_at,
+                                    failed_at: Utc::now(),
                                 },
                             );
                             return;
@@ -207,6 +209,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                                 JobStatus::Failed {
                                     message: e.to_string(),
                                     submitted_at,
+                                    failed_at: Utc::now(),
                                 },
                             );
                             return;
