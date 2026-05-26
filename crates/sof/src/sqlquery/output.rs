@@ -13,6 +13,11 @@ use super::{ColumnFhirType, QueryResult, SqlQueryError};
 /// Render a `QueryResult` as a FHIR `Parameters` resource per the SoF v2 spec.
 /// One top-level `parameter` per row (name `row`), with one `part` per
 /// non-NULL column. NULL columns are omitted entirely.
+///
+/// Empty result sets emit a bare `{ "resourceType": "Parameters" }` with
+/// the `parameter` key omitted, matching FHIR's JSON convention for empty
+/// repeating elements (and the upstream sof-js reference test's
+/// expectation).
 pub fn format_fhir_parameters(result: &QueryResult) -> Result<Vec<u8>, SqlQueryError> {
     let mut row_params: Vec<Value> = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
@@ -32,10 +37,11 @@ pub fn format_fhir_parameters(result: &QueryResult) -> Result<Vec<u8>, SqlQueryE
         }
         row_params.push(json!({ "name": "row", "part": parts }));
     }
-    let body = json!({
-        "resourceType": "Parameters",
-        "parameter": row_params,
-    });
+    let body = if row_params.is_empty() {
+        json!({ "resourceType": "Parameters" })
+    } else {
+        json!({ "resourceType": "Parameters", "parameter": row_params })
+    };
     serde_json::to_vec(&body).map_err(|e| SqlQueryError::MalformedLibrary(e.to_string()))
 }
 
@@ -295,6 +301,21 @@ mod tests {
         let part = &v["parameter"][0]["part"];
         assert_eq!(part.as_array().unwrap().len(), 1);
         assert_eq!(part[0]["name"], json!("a"));
+    }
+
+    #[test]
+    fn empty_result_omits_parameter_key() {
+        // SoF v2: "Zero-row results return empty Parameters resource".
+        // The FHIR JSON convention is to omit empty repeating elements;
+        // sof-js asserts `body.parameter === undefined`.
+        let result = qr(&[("id", ColumnFhirType::String("id".into()))], Vec::new());
+        let bytes = format_fhir_parameters(&result).unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["resourceType"], json!("Parameters"));
+        assert!(
+            v.get("parameter").is_none(),
+            "empty result must omit the 'parameter' key, got {v}"
+        );
     }
 
     #[test]
