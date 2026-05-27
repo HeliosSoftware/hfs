@@ -139,12 +139,10 @@ where
         formats.push("application/fhir+xml");
     }
 
-    let mut operations = vec![
-        serde_json::json!({
-            "name": "versions",
-            "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
-        })
-    ];
+    let mut operations = vec![serde_json::json!({
+        "name": "versions",
+        "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
+    })];
 
     let mut statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
