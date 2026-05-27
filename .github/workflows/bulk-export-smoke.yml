@@ -13,6 +13,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+  HFS_S3_EXPORT_BUCKET: ${{ secrets.HFS_S3_EXPORT_BUCKET || vars.HFS_S3_EXPORT_BUCKET }}
 
 jobs:
   matrix-setup:
@@ -24,25 +25,23 @@ jobs:
       - id: gen
         run: |
           FHIR_VERSIONS='["R4","R4B","R5"]'
-          # Expectations:
-          # - SQLite/PostgreSQL primary stores, including Elasticsearch composites,
-          #   must pass the full system/patient/group export lifecycle.
-          # - MongoDB primary stores are future bulk-export work.
-          # - S3 primary stores are a special case; the full lifecycle needs
-          #   patient/group compartment export, which S3 primary does not provide.
+          # backend follows the persistence Primary/Secondary Role Matrix.
+          # export_topology is the bulk-export job/output topology:
+          # - embedded-local: SQLite job state + local filesystem output
+          # - postgres-s3: PostgreSQL job state + AWS S3 output
+          # - none: storage configuration exists, but bulk export is not wired
+          #   for that HFS runtime mode in the current Discussion #104 scope
           ROWS='[
-            {"backend":"sqlite","bulk_mode":"embedded-local","expectation":"full"},
-            {"backend":"sqlite","bulk_mode":"postgres-s3","expectation":"full"},
-            {"backend":"postgres","bulk_mode":"embedded-local","expectation":"full"},
-            {"backend":"postgres","bulk_mode":"postgres-s3","expectation":"full"},
-            {"backend":"sqlite-elasticsearch","bulk_mode":"embedded-local","expectation":"full"},
-            {"backend":"sqlite-elasticsearch","bulk_mode":"postgres-s3","expectation":"full"},
-            {"backend":"postgres-elasticsearch","bulk_mode":"embedded-local","expectation":"full"},
-            {"backend":"postgres-elasticsearch","bulk_mode":"postgres-s3","expectation":"full"},
-            {"backend":"mongodb","bulk_mode":"postgres-s3","expectation":"unsupported"},
-            {"backend":"mongodb-elasticsearch","bulk_mode":"postgres-s3","expectation":"unsupported"},
-            {"backend":"s3","bulk_mode":"postgres-s3","expectation":"unsupported"},
-            {"backend":"s3-elasticsearch","bulk_mode":"postgres-s3","expectation":"unsupported"}
+            {"backend":"sqlite","export_topology":"embedded-local","expectation":"full"},
+            {"backend":"sqlite","export_topology":"postgres-s3","expectation":"full"},
+            {"backend":"postgres","export_topology":"embedded-local","expectation":"full"},
+            {"backend":"postgres","export_topology":"postgres-s3","expectation":"full"},
+            {"backend":"sqlite-elasticsearch","export_topology":"none","expectation":"endpoint-unavailable"},
+            {"backend":"postgres-elasticsearch","export_topology":"none","expectation":"endpoint-unavailable"},
+            {"backend":"mongodb","export_topology":"none","expectation":"endpoint-unavailable"},
+            {"backend":"mongodb-elasticsearch","export_topology":"none","expectation":"endpoint-unavailable"},
+            {"backend":"s3","export_topology":"none","expectation":"endpoint-unavailable"},
+            {"backend":"s3-elasticsearch","export_topology":"none","expectation":"endpoint-unavailable"}
           ]'
 
           MATRIX=$(jq -c --argjson versions "$FHIR_VERSIONS" \
@@ -85,7 +84,7 @@ jobs:
           retention-days: 1
 
   bulk-export-smoke:
-    name: Smoke (${{ matrix.fhir_version }} / ${{ matrix.backend }} / ${{ matrix.bulk_mode }})
+    name: Smoke (${{ matrix.fhir_version }} / ${{ matrix.backend }} / ${{ matrix.export_topology }})
     needs: [matrix-setup, build]
     runs-on: [self-hosted, Linux]
     strategy:
@@ -94,7 +93,10 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.matrix-setup.outputs.smoke-matrix) }}
     env:
-      RESULTS_DIR: bulk-export-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}/${{ matrix.bulk_mode }}
+      RESULTS_DIR: bulk-export-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}/${{ matrix.export_topology }}
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -126,7 +128,7 @@ jobs:
       - name: Start Elasticsearch
         if: contains(matrix.backend, 'elasticsearch')
         run: |
-          ES_CONTAINER="es-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}"
+          ES_CONTAINER="es-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.export_topology }}"
           docker rm -f "$ES_CONTAINER" 2>/dev/null || true
           docker run -d --name "$ES_CONTAINER" -p 0:9200 \
             -e "discovery.type=single-node" \
@@ -150,9 +152,9 @@ jobs:
           exit 1
 
       - name: Start PostgreSQL
-        if: contains(matrix.backend, 'postgres') || matrix.bulk_mode == 'postgres-s3'
+        if: contains(matrix.backend, 'postgres') || matrix.export_topology == 'postgres-s3'
         run: |
-          PG_CONTAINER="pg-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}"
+          PG_CONTAINER="pg-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.export_topology }}"
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
@@ -181,7 +183,7 @@ jobs:
       - name: Start MongoDB replica set
         if: contains(matrix.backend, 'mongodb')
         run: |
-          MONGO_CONTAINER="mongo-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}"
+          MONGO_CONTAINER="mongo-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.export_topology }}"
           docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
@@ -205,9 +207,9 @@ jobs:
           exit 1
 
       - name: Start MinIO
-        if: matrix.bulk_mode == 'postgres-s3' || startsWith(matrix.backend, 's3')
+        if: startsWith(matrix.backend, 's3')
         run: |
-          MINIO_CONTAINER="minio-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}"
+          MINIO_CONTAINER="minio-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.export_topology }}"
           docker rm -f "$MINIO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MINIO_CONTAINER" -p 0:9000 -p 0:9001 \
             -e MINIO_ROOT_USER=hfs-minio \
@@ -219,11 +221,10 @@ jobs:
             MINIO_PORT=$(docker port "$MINIO_CONTAINER" 9000 2>/dev/null | head -1 | sed 's/.*://')
             if [ -n "$MINIO_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$MINIO_PORT/minio/health/live" >/dev/null 2>&1; then
               echo "MINIO_PORT=$MINIO_PORT" >> "$GITHUB_ENV"
-              echo "MINIO_ENDPOINT=http://$DOCKER_HOST_IP:$MINIO_PORT" >> "$GITHUB_ENV"
               docker run --rm --network "container:$MINIO_CONTAINER" \
                 --entrypoint /bin/sh \
                 minio/mc:latest \
-                -c 'mc alias set local http://127.0.0.1:9000 hfs-minio hfs-minio-secret && mc mb -p local/hfs-export || true && mc mb -p local/hfs-primary || true'
+                -c 'mc alias set local http://127.0.0.1:9000 hfs-minio hfs-minio-secret && mc mb -p local/hfs-primary || true'
               echo "MinIO is ready on port $MINIO_PORT"
               exit 0
             fi
@@ -234,46 +235,88 @@ jobs:
           docker logs "$MINIO_CONTAINER"
           exit 1
 
+      - name: Validate S3 export bucket configuration
+        if: matrix.export_topology == 'postgres-s3'
+        run: |
+          if [ -z "${HFS_S3_EXPORT_BUCKET:-}" ]; then
+            echo "::error::postgres-s3 export topology requires HFS_S3_EXPORT_BUCKET to be configured"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        if: matrix.export_topology == 'postgres-s3'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install AWS CLI
+        if: matrix.export_topology == 'postgres-s3'
+        run: |
+          if ! command -v aws &>/dev/null; then
+            if ! /tmp/aws-bin/aws --version &>/dev/null; then
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -qo /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
+              rm -rf /tmp/awscliv2.zip /tmp/aws
+            fi
+            echo "/tmp/aws-bin" >> "$GITHUB_PATH"
+          fi
+          aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
+      - name: Verify S3 export bucket access
+        if: matrix.export_topology == 'postgres-s3'
+        run: |
+          aws s3api head-bucket --bucket "$HFS_S3_EXPORT_BUCKET"
+
       - name: Start HFS server
         run: |
           mkdir -p "$RESULTS_DIR"
           HFS_PORT=$((18100 + ${{ strategy['job-index'] }}))
           HFS_LOG="$RESULTS_DIR/hfs.log"
+          HFS_DEFAULT_TENANT="bulk-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy['job-index'] }}"
           echo "HFS_PORT=$HFS_PORT" >> "$GITHUB_ENV"
           echo "HFS_LOG=$HFS_LOG" >> "$GITHUB_ENV"
+          echo "HFS_DEFAULT_TENANT=$HFS_DEFAULT_TENANT" >> "$GITHUB_ENV"
 
           COMMON_ENV=(
             HFS_BASE_URL="http://localhost:$HFS_PORT"
             HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}"
-            HFS_BULK_EXPORT_ENABLED=true
+            HFS_DEFAULT_TENANT="$HFS_DEFAULT_TENANT"
             HFS_BULK_EXPORT_BATCH_SIZE=1
             HFS_BULK_EXPORT_FILE_URL_TTL=3600
             HFS_BULK_EXPORT_OUTPUT_TTL=3600
-            AWS_ACCESS_KEY_ID=hfs-minio
-            AWS_SECRET_ACCESS_KEY=hfs-minio-secret
-            AWS_REGION=us-east-1
           )
 
           BULK_ENV=()
-          if [ "${{ matrix.bulk_mode }}" = "embedded-local" ]; then
+          if [ "${{ matrix.export_topology }}" = "embedded-local" ]; then
             BULK_ENV=(
+              HFS_BULK_EXPORT_ENABLED=true
               HFS_BULK_EXPORT_BACKEND=embedded
               HFS_BULK_EXPORT_OUTPUT_BACKEND=local-fs
               HFS_BULK_EXPORT_OUTPUT_DIR="$RESULTS_DIR/export-output"
               HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=true
             )
             echo "EXPECT_REQUIRES_ACCESS_TOKEN=true" >> "$GITHUB_ENV"
-          else
+          elif [ "${{ matrix.export_topology }}" = "postgres-s3" ]; then
             BULK_ENV=(
+              HFS_BULK_EXPORT_ENABLED=true
               HFS_BULK_EXPORT_BACKEND=postgres-s3
               HFS_BULK_EXPORT_DATABASE_URL="${PG_URL:-}"
               HFS_BULK_EXPORT_OUTPUT_BACKEND=s3
-              HFS_BULK_EXPORT_S3_BUCKET=hfs-export
-              HFS_BULK_EXPORT_S3_ENDPOINT="${MINIO_ENDPOINT:-}"
-              HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE=true
+              HFS_BULK_EXPORT_S3_BUCKET="$HFS_S3_EXPORT_BUCKET"
+              HFS_BULK_EXPORT_S3_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
               HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=false
             )
             echo "EXPECT_REQUIRES_ACCESS_TOKEN=false" >> "$GITHUB_ENV"
+          elif [ "${{ matrix.export_topology }}" = "none" ]; then
+            BULK_ENV=(
+              HFS_BULK_EXPORT_ENABLED=false
+            )
+            echo "EXPECT_REQUIRES_ACCESS_TOKEN=false" >> "$GITHUB_ENV"
+          else
+            echo "Unknown export_topology: ${{ matrix.export_topology }}"
+            exit 1
           fi
 
           case "${{ matrix.backend }}" in
@@ -323,6 +366,9 @@ jobs:
               ;;
             s3)
               env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                AWS_ACCESS_KEY_ID=hfs-minio \
+                AWS_SECRET_ACCESS_KEY=hfs-minio-secret \
+                AWS_REGION=us-east-1 \
                 HFS_STORAGE_BACKEND=s3 \
                 HFS_S3_BUCKET=hfs-primary \
                 HFS_S3_PREFIX="ci/bulk-export-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ strategy['job-index'] }}/" \
@@ -331,6 +377,9 @@ jobs:
               ;;
             s3-elasticsearch)
               env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                AWS_ACCESS_KEY_ID=hfs-minio \
+                AWS_SECRET_ACCESS_KEY=hfs-minio-secret \
+                AWS_REGION=us-east-1 \
                 HFS_STORAGE_BACKEND=s3-elasticsearch \
                 HFS_S3_BUCKET=hfs-primary \
                 HFS_S3_PREFIX="ci/bulk-export-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ strategy['job-index'] }}/" \
@@ -367,7 +416,7 @@ jobs:
           BASE_URL="http://localhost:$HFS_PORT" \
           FHIR_VERSION="${{ matrix.fhir_version }}" \
           RESULTS_DIR="$RESULTS_DIR" \
-          SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}" \
+          SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.export_topology }}" \
           BULK_EXPORT_EXPECTATION="${{ matrix.expectation }}" \
           EXPECT_REQUIRES_ACCESS_TOKEN="$EXPECT_REQUIRES_ACCESS_TOKEN" \
           ./crates/hfs/tests/bulk_export/run_external_bulk_export_smoke.sh
@@ -387,6 +436,13 @@ jobs:
             kill -9 "$HFS_PID" 2>/dev/null || true
           fi
           rm -f /tmp/hfs-bulk-export-smoke-${{ strategy['job-index'] }}.pid
+
+      - name: Cleanup S3 export output
+        if: always() && matrix.export_topology == 'postgres-s3'
+        run: |
+          if [ -n "${HFS_S3_EXPORT_BUCKET:-}" ] && [ -n "${HFS_DEFAULT_TENANT:-}" ]; then
+            aws s3 rm "s3://$HFS_S3_EXPORT_BUCKET/$HFS_DEFAULT_TENANT/exports/" --recursive || true
+          fi
 
       - name: Collect backend container logs
         if: always()
@@ -420,8 +476,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bulk-export-smoke-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.bulk_mode }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: bulk-export-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}/${{ matrix.bulk_mode }}/
+          name: bulk-export-smoke-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.export_topology }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bulk-export-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}/${{ matrix.export_topology }}/
           retention-days: 30
 
       - name: Cleanup containers
