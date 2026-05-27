@@ -141,13 +141,9 @@ where
 
     let mut operations = vec![
         serde_json::json!({
-            "name": "validate",
-            "definition": "http://hl7.org/fhir/OperationDefinition/Resource-validate"
-        }),
-        serde_json::json!({
             "name": "versions",
             "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
-        }),
+        })
     ];
 
     let mut statement = serde_json::json!({
