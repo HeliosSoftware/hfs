@@ -30,6 +30,10 @@ jobs:
           # Job-state DB is derived from backend (Postgres backends use Postgres
           # for jobs; everything else uses the embedded SQLite job store), so it
           # isn't a matrix dimension.
+          # s3-elasticsearch is local-output only: its primary store points at
+          # MinIO via AWS_* env creds, which would collide with the real-AWS
+          # credentials the s3 output store needs (one SDK credential chain per
+          # process). The S3 output path is already covered by sqlite/postgres.
           ROWS='[
             {"backend":"sqlite","output":"local","expectation":"full"},
             {"backend":"sqlite","output":"s3","expectation":"full"},
@@ -44,7 +48,6 @@ jobs:
             {"backend":"mongodb-elasticsearch","output":"local","expectation":"full"},
             {"backend":"mongodb-elasticsearch","output":"s3","expectation":"full"},
             {"backend":"s3-elasticsearch","output":"local","expectation":"full"},
-            {"backend":"s3-elasticsearch","output":"s3","expectation":"full"},
             {"backend":"s3","output":"none","expectation":"endpoint-unavailable"}
           ]'
 
