@@ -324,47 +324,39 @@ impl PatientExportProvider for MongoBackend {
             return ndjson_from_docs(docs, batch_size);
         }
 
-        // Other types: locate via the search_index (subject/patient -> Patient/<pid>).
-        let search_idx: Collection<Document> = db.collection(MongoBackend::SEARCH_INDEX_COLLECTION);
+        // Other types: filter directly on the resource payload using dot
+        // notation on `data.subject.reference` / `data.patient.reference`.
+        // This is robust whether or not the local search_index is populated
+        // (mongodb-elasticsearch offloads search, leaving search_index empty).
         let refs: Vec<String> = patient_ids.iter().map(|p| format!("Patient/{p}")).collect();
-        let idx_cursor = search_idx
-            .find(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "param_name": { "$in": vec!["subject", "patient"] },
-                "value_reference": { "$in": &refs },
-            })
-            .await
-            .map_err(|e| internal_error(format!("compartment index lookup: {e}")))?;
-        let idx_docs = collect_cursor(idx_cursor).await?;
-        let mut resource_ids: Vec<String> = idx_docs
-            .iter()
-            .filter_map(|d| d.get_str("resource_id").ok().map(|s| s.to_string()))
-            .collect();
-        resource_ids.sort();
-        resource_ids.dedup();
-        if resource_ids.is_empty() {
-            return Ok(NdjsonBatch::empty());
-        }
-
         let mut filter = doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "is_deleted": false,
-            "id": { "$in": resource_ids },
+            "$or": vec![
+                doc! { "data.subject.reference": { "$in": &refs } },
+                doc! { "data.patient.reference": { "$in": &refs } },
+            ],
         };
         if let Some(since) = request.since {
             filter.insert("last_updated", doc! { "$gte": chrono_to_bson(since) });
         }
         if let Some((cur_dt, cur_id)) = cursor.and_then(parse_cursor) {
+            // Combine compartment-match $or with cursor keyset $or via $and.
+            let compartment = filter
+                .remove("$or")
+                .expect("compartment $or was inserted above");
             filter.insert(
-                "$or",
+                "$and",
                 vec![
-                    doc! { "last_updated": { "$gt": chrono_to_bson(cur_dt) } },
-                    doc! {
-                        "last_updated": chrono_to_bson(cur_dt),
-                        "id": { "$gt": cur_id },
-                    },
+                    doc! { "$or": compartment },
+                    doc! { "$or": vec![
+                        doc! { "last_updated": { "$gt": chrono_to_bson(cur_dt) } },
+                        doc! {
+                            "last_updated": chrono_to_bson(cur_dt),
+                            "id": { "$gt": cur_id },
+                        },
+                    ]},
                 ],
             );
         }
