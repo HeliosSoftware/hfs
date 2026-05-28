@@ -23,3 +23,35 @@ pub trait JtiCache: Send + Sync + 'static {
         expires_at: DateTime<Utc>,
     ) -> Result<bool, AuthError>;
 }
+
+/// JTI cache implementation which never treats tokens as replays.
+///
+/// This is intended for deployments where JWT IDs identify reusable bearer
+/// access tokens rather than one-time client assertions.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DisabledJtiCache;
+
+#[async_trait]
+impl JtiCache for DisabledJtiCache {
+    async fn check_and_store(
+        &self,
+        _jti: &str,
+        _expires_at: DateTime<Utc>,
+    ) -> Result<bool, AuthError> {
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn disabled_cache_never_reports_replay() {
+        let cache = DisabledJtiCache;
+        let expires = Utc::now();
+
+        assert!(!cache.check_and_store("same-jti", expires).await.unwrap());
+        assert!(!cache.check_and_store("same-jti", expires).await.unwrap());
+    }
+}

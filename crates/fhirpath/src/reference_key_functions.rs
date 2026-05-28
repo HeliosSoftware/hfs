@@ -93,7 +93,7 @@ pub fn get_reference_key_function(
             _ => {
                 return Err(EvaluationError::TypeError(format!(
                     "getReferenceKey type filter must be a string or type, got: {:?}",
-                    &args[0]
+                    args[0]
                 )));
             }
         }

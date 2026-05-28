@@ -91,6 +91,8 @@
 
 pub mod backend;
 pub mod bulk_export;
+pub mod bulk_export_output;
+pub mod bulk_export_worker;
 pub mod bulk_submit;
 pub mod capabilities;
 pub mod history;
@@ -102,9 +104,17 @@ pub mod versioned;
 // Re-export main types
 pub use backend::{Backend, BackendCapability, BackendConfig, BackendKind, BackendPoolStats};
 pub use bulk_export::{
-    BulkExportStorage, ExportDataProvider, ExportJobId, ExportLevel, ExportManifest,
-    ExportOutputFile, ExportProgress, ExportRequest, ExportStatus, GroupExportProvider,
-    NdjsonBatch, PatientExportProvider, TypeExportProgress, TypeFilter,
+    BulkExportStorage, ExpiredExportRef, ExportDataProvider, ExportFileMetadata, ExportJobId,
+    ExportJobMetadata, ExportLevel, ExportManifest, ExportOutputFile, ExportProgress,
+    ExportRequest, ExportStatus, GroupExportProvider, NdjsonBatch, PatientExportProvider,
+    RawExportManifest, RawManifestEntry, StartExportInput, TypeExportProgress, TypeFilter,
+};
+pub use bulk_export_output::{
+    DownloadUrl, ExportOutputStore, ExportPartKey, ExportPartWriter, FinalizedPart,
+};
+pub use bulk_export_worker::{
+    BulkExportJobStore, DefaultExportWorker, ExportClaimStrategy, ExportJobLease,
+    ExportResourceProvider, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
 };
 pub use bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,

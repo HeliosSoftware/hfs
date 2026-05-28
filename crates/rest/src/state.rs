@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
-use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::{BulkExportJobStore, ExportOutputStore, ResourceStorage};
 
-use crate::config::ServerConfig;
+use crate::bulk_export_auth::ExportFileAuth;
+use crate::config::{BulkExportConfig, ServerConfig};
 use crate::middleware::auth::AuthMiddlewareState;
 
 /// Shared application state for the REST API.
@@ -55,6 +56,18 @@ pub struct AppState<S> {
     /// Optional subscription engine for FHIR topic-based subscriptions.
     #[cfg(feature = "subscriptions")]
     subscription_engine: Option<Arc<helios_subscriptions::SubscriptionEngine>>,
+
+    /// Bulk export job-state store (claim + worker storage + lifecycle).
+    bulk_export_jobs: Option<Arc<dyn BulkExportJobStore>>,
+
+    /// Bulk export output store (NDJSON files).
+    bulk_export_output: Option<Arc<dyn ExportOutputStore>>,
+
+    /// Bulk export download authorizer.
+    bulk_export_file_auth: Option<Arc<dyn ExportFileAuth>>,
+
+    /// Bulk export configuration.
+    bulk_export_config: Arc<BulkExportConfig>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -69,6 +82,10 @@ impl<S> Clone for AppState<S> {
             audit_source_observer: self.audit_source_observer.clone(),
             #[cfg(feature = "subscriptions")]
             subscription_engine: self.subscription_engine.clone(),
+            bulk_export_jobs: self.bulk_export_jobs.clone(),
+            bulk_export_output: self.bulk_export_output.clone(),
+            bulk_export_file_auth: self.bulk_export_file_auth.clone(),
+            bulk_export_config: Arc::clone(&self.bulk_export_config),
         }
     }
 }
@@ -81,6 +98,7 @@ impl<S: ResourceStorage> AppState<S> {
     /// * `storage` - The storage backend (wrapped in Arc)
     /// * `config` - Server configuration
     pub fn new(storage: Arc<S>, config: ServerConfig) -> Self {
+        let bulk_export_config = Arc::new(config.bulk_export.clone());
         Self {
             storage,
             config: Arc::new(config),
@@ -90,6 +108,10 @@ impl<S: ResourceStorage> AppState<S> {
             audit_source_observer: "Device/hfs".to_string(),
             #[cfg(feature = "subscriptions")]
             subscription_engine: None,
+            bulk_export_jobs: None,
+            bulk_export_output: None,
+            bulk_export_file_auth: None,
+            bulk_export_config,
         }
     }
 
@@ -112,6 +134,7 @@ impl<S: ResourceStorage> AppState<S> {
         audit_sink: Option<Arc<dyn AuditSink>>,
         audit_source_observer: impl Into<String>,
     ) -> Self {
+        let bulk_export_config = Arc::new(config.bulk_export.clone());
         Self {
             storage,
             config: Arc::new(config),
@@ -121,7 +144,44 @@ impl<S: ResourceStorage> AppState<S> {
             audit_source_observer: audit_source_observer.into(),
             #[cfg(feature = "subscriptions")]
             subscription_engine: None,
+            bulk_export_jobs: None,
+            bulk_export_output: None,
+            bulk_export_file_auth: None,
+            bulk_export_config,
         }
+    }
+
+    /// Wires the bulk-export job store, output store, and file authorizer.
+    pub fn with_bulk_export(
+        mut self,
+        jobs: Arc<dyn BulkExportJobStore>,
+        output: Arc<dyn ExportOutputStore>,
+        file_auth: Arc<dyn ExportFileAuth>,
+    ) -> Self {
+        self.bulk_export_jobs = Some(jobs);
+        self.bulk_export_output = Some(output);
+        self.bulk_export_file_auth = Some(file_auth);
+        self
+    }
+
+    /// Returns the bulk-export job store, if configured.
+    pub fn bulk_export_jobs(&self) -> Option<&Arc<dyn BulkExportJobStore>> {
+        self.bulk_export_jobs.as_ref()
+    }
+
+    /// Returns the bulk-export output store, if configured.
+    pub fn bulk_export_output(&self) -> Option<&Arc<dyn ExportOutputStore>> {
+        self.bulk_export_output.as_ref()
+    }
+
+    /// Returns the bulk-export download authorizer, if configured.
+    pub fn bulk_export_file_auth(&self) -> Option<&Arc<dyn ExportFileAuth>> {
+        self.bulk_export_file_auth.as_ref()
+    }
+
+    /// Returns the bulk-export configuration.
+    pub fn bulk_export_config(&self) -> &BulkExportConfig {
+        &self.bulk_export_config
     }
 
     /// Sets the subscription engine on this AppState.

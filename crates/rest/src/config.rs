@@ -237,6 +237,195 @@ impl MultitenancyConfig {
     }
 }
 
+/// Configuration for the bulk data export subsystem.
+#[derive(Debug, Clone)]
+pub struct BulkExportConfig {
+    /// Master switch — when `false`, the `$export` endpoints return `501`.
+    pub enabled: bool,
+    /// Output store: `local-fs` or `s3`.
+    pub output_backend: String,
+    /// Local-FS output root directory.
+    pub output_dir: Option<String>,
+    /// S3 bucket for output (required when `output_backend = s3`).
+    pub s3_bucket: Option<String>,
+    /// Manifest access-token posture: `auto`, `true`, or `false`.
+    pub requires_access_token: String,
+    /// Pre-signed download-URL lifetime, in seconds.
+    pub file_url_ttl_secs: u64,
+    /// How long output files are retained after job completion, in seconds.
+    pub output_ttl_secs: u64,
+    /// Maximum jobs this pod runs concurrently.
+    pub worker_concurrency: u32,
+    /// When `true`, this pod does not run in-process workers.
+    pub disable_local_worker: bool,
+    /// Cap on simultaneous in-flight jobs per tenant.
+    pub max_concurrent_per_tenant: u32,
+    /// Resources per `fetch_export_batch` call.
+    pub batch_size: u32,
+    /// Initial lease length issued at claim, in seconds.
+    pub lease_duration_secs: u64,
+    /// Worker heartbeat cadence, in seconds.
+    pub heartbeat_interval_secs: u64,
+    /// How often the cleanup task scans for expired outputs, in seconds.
+    pub cleanup_interval_secs: u64,
+    /// Group export `_since` toggle (`include` / `exclude`).
+    ///
+    /// When `exclude`, patients whose `Group.member.period.start` is *after*
+    /// the request's `_since` are filtered out of the export — implementing
+    /// the IG's optional "do not return resources from before the patient
+    /// joined the cohort" behavior.
+    pub since_newly_added: String,
+}
+
+impl Default for BulkExportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            output_backend: "local-fs".to_string(),
+            output_dir: None,
+            s3_bucket: None,
+            requires_access_token: "auto".to_string(),
+            file_url_ttl_secs: 3600,
+            output_ttl_secs: 86400,
+            worker_concurrency: 2,
+            disable_local_worker: false,
+            max_concurrent_per_tenant: 4,
+            batch_size: 1000,
+            lease_duration_secs: 60,
+            heartbeat_interval_secs: 20,
+            cleanup_interval_secs: 300,
+            since_newly_added: "include".to_string(),
+        }
+    }
+}
+
+impl BulkExportConfig {
+    /// Loads bulk-export configuration from `HFS_BULK_EXPORT_*` env vars.
+    pub fn from_env() -> Self {
+        fn env_bool(key: &str, default: bool) -> bool {
+            std::env::var(key)
+                .map(|s| {
+                    let s = s.to_lowercase();
+                    s == "true" || s == "1"
+                })
+                .unwrap_or(default)
+        }
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        fn env_u32(key: &str, default: u32) -> u32 {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        let d = Self::default();
+        Self {
+            enabled: env_bool("HFS_BULK_EXPORT_ENABLED", d.enabled),
+            output_backend: std::env::var("HFS_BULK_EXPORT_OUTPUT_BACKEND")
+                .unwrap_or(d.output_backend),
+            output_dir: std::env::var("HFS_BULK_EXPORT_OUTPUT_DIR").ok(),
+            s3_bucket: std::env::var("HFS_BULK_EXPORT_S3_BUCKET").ok(),
+            requires_access_token: std::env::var("HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN")
+                .unwrap_or(d.requires_access_token),
+            file_url_ttl_secs: env_u64("HFS_BULK_EXPORT_FILE_URL_TTL", d.file_url_ttl_secs),
+            output_ttl_secs: env_u64("HFS_BULK_EXPORT_OUTPUT_TTL", d.output_ttl_secs),
+            worker_concurrency: env_u32("HFS_BULK_EXPORT_WORKER_CONCURRENCY", d.worker_concurrency),
+            disable_local_worker: env_bool(
+                "HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER",
+                d.disable_local_worker,
+            ),
+            max_concurrent_per_tenant: env_u32(
+                "HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT",
+                d.max_concurrent_per_tenant,
+            ),
+            batch_size: env_u32("HFS_BULK_EXPORT_BATCH_SIZE", d.batch_size),
+            lease_duration_secs: env_u64("HFS_BULK_EXPORT_LEASE_DURATION", d.lease_duration_secs),
+            heartbeat_interval_secs: env_u64(
+                "HFS_BULK_EXPORT_HEARTBEAT_INTERVAL",
+                d.heartbeat_interval_secs,
+            ),
+            cleanup_interval_secs: env_u64(
+                "HFS_BULK_EXPORT_CLEANUP_INTERVAL",
+                d.cleanup_interval_secs,
+            ),
+            since_newly_added: std::env::var("HFS_BULK_EXPORT_SINCE_NEWLY_ADDED")
+                .unwrap_or(d.since_newly_added),
+        }
+    }
+
+    /// Validates the bulk-export configuration.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if !matches!(self.output_backend.as_str(), "local-fs" | "s3") {
+            errors.push(format!(
+                "HFS_BULK_EXPORT_OUTPUT_BACKEND '{}' invalid (expected local-fs|s3)",
+                self.output_backend
+            ));
+        }
+        if self.output_backend == "s3" && self.s3_bucket.is_none() {
+            errors.push("HFS_BULK_EXPORT_S3_BUCKET is required when OUTPUT_BACKEND=s3".to_string());
+        }
+        if !matches!(
+            self.requires_access_token.as_str(),
+            "auto" | "true" | "false"
+        ) {
+            errors.push(format!(
+                "HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN '{}' invalid (expected auto|true|false)",
+                self.requires_access_token
+            ));
+        }
+        // local-fs has no pre-signed-URL capability.
+        if self.output_backend == "local-fs" && self.requires_access_token == "false" {
+            errors.push(
+                "HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=false is invalid with OUTPUT_BACKEND=local-fs"
+                    .to_string(),
+            );
+        }
+        if self.file_url_ttl_secs == 0 {
+            errors.push("HFS_BULK_EXPORT_FILE_URL_TTL must be > 0".to_string());
+        }
+        if self.output_ttl_secs == 0 {
+            errors.push("HFS_BULK_EXPORT_OUTPUT_TTL must be > 0".to_string());
+        }
+        if self.worker_concurrency == 0 {
+            errors.push("HFS_BULK_EXPORT_WORKER_CONCURRENCY must be >= 1".to_string());
+        }
+        if self.max_concurrent_per_tenant == 0 {
+            errors.push("HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT must be >= 1".to_string());
+        }
+        if self.batch_size == 0 {
+            errors.push("HFS_BULK_EXPORT_BATCH_SIZE must be >= 1".to_string());
+        }
+        if self.heartbeat_interval_secs == 0 {
+            errors.push("HFS_BULK_EXPORT_HEARTBEAT_INTERVAL must be > 0".to_string());
+        }
+        if self.lease_duration_secs <= self.heartbeat_interval_secs {
+            errors.push(
+                "HFS_BULK_EXPORT_LEASE_DURATION must be greater than HEARTBEAT_INTERVAL"
+                    .to_string(),
+            );
+        }
+        if !matches!(self.since_newly_added.as_str(), "include" | "exclude") {
+            errors.push(format!(
+                "HFS_BULK_EXPORT_SINCE_NEWLY_ADDED '{}' invalid (expected include|exclude)",
+                self.since_newly_added
+            ));
+        }
+        if self.cleanup_interval_secs == 0 {
+            errors.push("HFS_BULK_EXPORT_CLEANUP_INTERVAL must be > 0".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
 /// Server configuration for the FHIR REST API.
 ///
 /// This struct can be constructed from environment variables using [`ServerConfig::from_env`],
@@ -383,6 +572,10 @@ pub struct ServerConfig {
     /// Multitenancy configuration (loaded from environment variables).
     #[arg(skip)]
     pub multitenancy: MultitenancyConfig,
+
+    /// Bulk data export configuration (loaded from environment variables).
+    #[arg(skip)]
+    pub bulk_export: BulkExportConfig,
 }
 
 impl ServerConfig {
@@ -422,6 +615,7 @@ impl Default for ServerConfig {
             elasticsearch_password: None,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
+            bulk_export: BulkExportConfig::default(),
         }
     }
 }
@@ -436,6 +630,8 @@ impl ServerConfig {
         let mut config = Self::try_parse().unwrap_or_default();
         // Load multitenancy config from environment
         config.multitenancy = MultitenancyConfig::from_env();
+        // Load bulk export config from environment
+        config.bulk_export = BulkExportConfig::from_env();
         config
     }
 
@@ -471,6 +667,10 @@ impl ServerConfig {
 
         if self.default_page_size > self.max_page_size {
             errors.push("Default page size cannot exceed max page size".to_string());
+        }
+
+        if let Err(mut bulk_errors) = self.bulk_export.validate() {
+            errors.append(&mut bulk_errors);
         }
 
         if errors.is_empty() {
@@ -513,6 +713,7 @@ impl ServerConfig {
             elasticsearch_password: None,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
+            bulk_export: BulkExportConfig::default(),
         }
     }
 
@@ -998,6 +1199,56 @@ mod tests {
             ..Default::default()
         };
         assert!(config.storage_backend_mode().is_err());
+    }
+
+    // ── BulkExportConfig::validate ────────────────────────────────
+
+    #[test]
+    fn test_bulk_export_config_default_is_valid() {
+        assert!(BulkExportConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_export_config_s3_output_requires_bucket() {
+        let cfg = BulkExportConfig {
+            output_backend: "s3".to_string(),
+            s3_bucket: None,
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("S3_BUCKET")));
+    }
+
+    #[test]
+    fn test_bulk_export_config_local_fs_requires_access_token() {
+        let cfg = BulkExportConfig {
+            output_backend: "local-fs".to_string(),
+            requires_access_token: "false".to_string(),
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("local-fs")));
+    }
+
+    #[test]
+    fn test_bulk_export_config_lease_must_exceed_heartbeat() {
+        let cfg = BulkExportConfig {
+            lease_duration_secs: 10,
+            heartbeat_interval_secs: 20,
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("LEASE_DURATION")));
+    }
+
+    #[test]
+    fn test_bulk_export_config_invalid_since_newly_added() {
+        let cfg = BulkExportConfig {
+            since_newly_added: "maybe".to_string(),
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("SINCE_NEWLY_ADDED")));
     }
 
     // ── display for StorageBackendMode ────────────────────────────

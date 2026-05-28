@@ -61,7 +61,8 @@ Work that is currently underway or planned for the near term.
 |------|------|--------|
 | **Standards** | [Terminology — PostgreSQL backend](https://github.com/HeliosSoftware/hfs/discussions/54) | 🟡 In progress |
 | **Standards** | FHIR Validation engine | 🔵 Design |
-| **Standards** | Bulk Data API — Import and export (`$export` / `$import` operations) | 🔵 Design |
+| **Standards** | Bulk Data API — `$export` (system / patient / group), pre-signed S3 downloads | ✅ Shipped |
+| **Standards** | Bulk Data API — `$bulk-submit` (ingestion) | 🔵 Design |
 | **Analytics** | [SQL on FHIR](https://sql-on-fhir.org/ig/latest/) — HFS integration and operations update | 🟡 In progress |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
@@ -182,7 +183,7 @@ Devitt's book defines nine key questions organizations must answer before choosi
 | Gap | Book Reference | Current Status |
 |-----|---------------|----------------|
 | **No patient-level access control** | Ch. 3 "Authorization" — SMART scopes are parsed but `patient/*` and `user/*` contexts are not enforced. Search results are not filtered by patient compartment. | 🔭 Later |
-| **Bulk Data API not exposed via REST** | Appendix I "Bulk data processing" — persistence-layer traits exist across all backends but no `$export`/`$import` REST endpoints. The book notes bulk ingestion is important for hybrid architectures (Ch. 8). | 🗺️ Next |
+| **Bulk Data API — `$export`** | Appendix I "Bulk data processing" — `$export` (system / patient / group) is now exposed via the REST layer with an embedded SQLite-backed worker pool by default and an optional Postgres + S3 multi-instance topology. `$bulk-submit` (ingestion) remains pending. | ✅ Shipped (export) / 🗺️ Next (submit) |
 
 #### Moderate
 

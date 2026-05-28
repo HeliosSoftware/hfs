@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use clap::Parser;
 use helios_audit::{
     AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };
@@ -30,6 +29,15 @@ use helios_rest::{
     AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth, init_logging,
 };
 use tracing::info;
+
+use helios_persistence::backends::local_fs::LocalFsOutputStore;
+use helios_persistence::core::{
+    BulkExportJobStore, DefaultExportWorker, ExportOutputStore, WorkerId,
+};
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+use helios_rest::bulk_export_auth::BearerScopeAuth;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+use helios_rest::create_app_with_auth_and_bulk_export;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
@@ -461,10 +469,30 @@ async fn start_mongodb(
     let backend = MongoBackend::new(backend_config)?;
 
     backend.init_schema().await?;
-
+    let backend = Arc::new(backend);
     let serve_audit_state = audit_state.clone();
+
+    // MongoDB primary; embedded SQLite sidecar for job state.
+    #[cfg(feature = "sqlite")]
+    {
+        let jobs = build_embedded_job_store(&config)?;
+        if let Some(bundle) = build_bulk_export(&config, backend.clone(), jobs).await? {
+            let app = create_app_with_auth_and_bulk_export(
+                backend,
+                config.clone(),
+                auth_config,
+                auth_state,
+                audit_state,
+                bundle,
+            );
+            return serve(app, &config, serve_audit_state).await;
+        }
+    }
+
     let app = create_app_with_auth(
-        backend,
+        Arc::try_unwrap(backend).unwrap_or_else(|_| {
+            unreachable!("backend Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
@@ -553,9 +581,19 @@ async fn init_auth_with_audit(
                  Build with: cargo build -p helios-hfs --features redis"
             );
         }
-        _ => {
+        "memory" => {
             info!("Using in-memory JTI cache");
             Arc::new(InMemoryJtiCache::new())
+        }
+        "disabled" | "none" => {
+            info!("JTI replay cache is DISABLED");
+            Arc::new(helios_auth::DisabledJtiCache)
+        }
+        other => {
+            anyhow::bail!(
+                "Invalid HFS_AUTH_JTI_BACKEND '{}'. Valid values: memory, redis, disabled",
+                other
+            );
         }
     };
 
@@ -665,7 +703,10 @@ async fn init_audit(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = ServerConfig::parse();
+    // Use `from_env()` (not `parse()`) so `multitenancy` and `bulk_export`
+    // sub-structs — both `#[arg(skip)]` for clap — are populated from
+    // their `HFS_*` environment variables.
+    let config = ServerConfig::from_env();
     init_logging(&config.log_level);
 
     if let Err(errors) = config.validate() {
@@ -766,16 +807,251 @@ async fn start_sqlite(
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
-    let backend = create_sqlite_backend(&config)?;
     let serve_audit_state = audit_state.clone();
+    let backend = Arc::new(create_sqlite_backend(&config)?);
+
+    if let Some(bundle) = build_bulk_export(&config, backend.clone(), backend.clone()).await? {
+        let app = create_app_with_auth_and_bulk_export(
+            backend,
+            config.clone(),
+            auth_config,
+            auth_state,
+            audit_state,
+            bundle,
+        );
+        return serve(app, &config, serve_audit_state).await;
+    }
+
     let app = create_app_with_auth(
-        backend,
+        Arc::try_unwrap(backend).unwrap_or_else(|_| {
+            unreachable!("backend Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
     );
     serve(app, &config, serve_audit_state).await
+}
+
+/// Constructs an embedded SQLite job store for backends that can't host job
+/// state themselves (MongoDB, S3). Path resolution, in priority order:
+///
+/// 1. `${HFS_BULK_EXPORT_OUTPUT_DIR}/bulk_export.db` — co-located with local
+///    output, so single-instance dev / CI runs keep job state next to data.
+/// 2. `${HFS_DATA_DIR}/bulk_export.db` — when explicitly configured.
+/// 3. `${TMPDIR}/hfs-bulk-export-{pid}.db` — last-resort fallback that's
+///    unique per process so parallel HFS instances (e.g. CI smoke jobs running
+///    with `max-parallel`) don't race on a single file. Job state is ephemeral
+///    in this mode — fine for tests; production deployments should configure
+///    one of the persistent options above.
+///
+/// Isolated from FHIR resource data either way.
+#[cfg(feature = "sqlite")]
+fn build_embedded_job_store(config: &ServerConfig) -> anyhow::Result<Arc<dyn BulkExportJobStore>> {
+    let job_db = config
+        .bulk_export
+        .output_dir
+        .clone()
+        .map(|d| format!("{d}/bulk_export.db"))
+        .or_else(|| {
+            config
+                .data_dir
+                .as_ref()
+                .map(|d| format!("{}/bulk_export.db", d.display()))
+        })
+        .unwrap_or_else(|| {
+            let mut path = std::env::temp_dir();
+            path.push(format!("hfs-bulk-export-{}.db", std::process::id()));
+            path.to_string_lossy().into_owned()
+        });
+    if let Some(parent) = std::path::Path::new(&job_db).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "create bulk export job DB directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    let job_backend = SqliteBackend::with_config(
+        &job_db,
+        SqliteBackendConfig {
+            fhir_version: config.default_fhir_version,
+            data_dir: config.data_dir.clone(),
+            ..Default::default()
+        },
+    )?;
+    job_backend.init_schema()?;
+    Ok(Arc::new(job_backend))
+}
+
+/// Builds the bulk-export subsystem (output store + file auth + worker pool)
+/// from a caller-supplied job store and resource data provider. Returns `None`
+/// when bulk export is disabled.
+///
+/// The job store is supplied by the caller so it reuses the same backend
+/// instance (and connection pool) that holds the FHIR resources. This means
+/// pure-SQLite deployments share `./data/hfs.db` between resources and job
+/// state, and Postgres deployments share the configured `HFS_DATABASE_URL`.
+/// Backends that can't host transactional job state (MongoDB, S3) use a
+/// sidecar SQLite via [`build_embedded_job_store`].
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn build_bulk_export<Dp>(
+    config: &ServerConfig,
+    data: Arc<Dp>,
+    jobs: Arc<dyn BulkExportJobStore>,
+) -> anyhow::Result<Option<helios_rest::BulkExportBundle>>
+where
+    Dp: helios_persistence::core::ExportResourceProvider + 'static,
+{
+    let cfg = config.bulk_export.clone();
+    info!(
+        "Bulk export config: enabled={} output_backend={} requires_access_token={}",
+        cfg.enabled, cfg.output_backend, cfg.requires_access_token
+    );
+    if !cfg.enabled {
+        return Ok(None);
+    }
+
+    // --- Output store ---------------------------------------------------
+    let output: Arc<dyn ExportOutputStore> = match cfg.output_backend.as_str() {
+        "local-fs" => {
+            let output_dir = cfg
+                .output_dir
+                .clone()
+                .or_else(|| {
+                    config
+                        .data_dir
+                        .as_ref()
+                        .map(|d| format!("{}/exports", d.display()))
+                })
+                .unwrap_or_else(|| "./data/exports".to_string());
+            Arc::new(LocalFsOutputStore::new(output_dir, config.base_url.clone()))
+        }
+        "s3" => {
+            #[cfg(feature = "s3")]
+            {
+                use helios_persistence::backends::s3::{
+                    AccessTokenMode, AwsS3Client, AwsS3ClientOptions, S3OutputStore,
+                };
+                let bucket = cfg.s3_bucket.clone().ok_or_else(|| {
+                    anyhow::anyhow!("HFS_BULK_EXPORT_S3_BUCKET is required for OUTPUT_BACKEND=s3")
+                })?;
+                let region = std::env::var("HFS_BULK_EXPORT_S3_REGION")
+                    .ok()
+                    .or_else(|| std::env::var("HFS_S3_REGION").ok());
+                let sdk_config = AwsS3Client::load_sdk_config(region.as_deref()).await;
+                let client = Arc::new(AwsS3Client::from_sdk_config_with_options(
+                    &sdk_config,
+                    AwsS3ClientOptions {
+                        endpoint_url: std::env::var("HFS_BULK_EXPORT_S3_ENDPOINT").ok(),
+                        force_path_style: parse_env_bool(
+                            "HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE",
+                            false,
+                        ),
+                    },
+                ));
+                Arc::new(S3OutputStore::new(
+                    client,
+                    bucket,
+                    config.base_url.clone(),
+                    AccessTokenMode::parse(&cfg.requires_access_token),
+                    std::time::Duration::from_secs(cfg.file_url_ttl_secs),
+                ))
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!(
+                    "HFS_BULK_EXPORT_OUTPUT_BACKEND=s3 requires the 's3' feature. \
+                     Build with: cargo build -p helios-hfs --features s3"
+                );
+            }
+        }
+        other => anyhow::bail!("invalid HFS_BULK_EXPORT_OUTPUT_BACKEND '{other}'"),
+    };
+
+    spawn_export_workers(jobs.clone(), data, output.clone(), &cfg);
+
+    Ok(Some(helios_rest::BulkExportBundle {
+        jobs,
+        output,
+        file_auth: Arc::new(BearerScopeAuth),
+    }))
+}
+
+/// Spawns the in-process export worker pool and the periodic cleanup task.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn spawn_export_workers<Dp>(
+    jobs: Arc<dyn BulkExportJobStore>,
+    data: Arc<Dp>,
+    output: Arc<dyn ExportOutputStore>,
+    cfg: &helios_rest::config::BulkExportConfig,
+) where
+    Dp: helios_persistence::core::ExportResourceProvider + 'static,
+{
+    if cfg.disable_local_worker {
+        info!("Bulk export in-process worker pool is disabled");
+        return;
+    }
+    let lease = std::time::Duration::from_secs(cfg.lease_duration_secs);
+    for i in 0..cfg.worker_concurrency {
+        let jobs = jobs.clone();
+        let data = data.clone();
+        let output = output.clone();
+        let worker_id = WorkerId::new(format!("hfs-worker-{i}"));
+        let exclude_newly_added = cfg.since_newly_added.eq_ignore_ascii_case("exclude");
+        tokio::spawn(async move {
+            let worker = DefaultExportWorker::new(jobs.clone(), data, output, worker_id.clone())
+                .with_exclude_since_newly_added(exclude_newly_added);
+            loop {
+                match jobs.claim_next(&worker_id, lease).await {
+                    Ok(Some(claimed)) => {
+                        if let Err(e) = worker.run_job(claimed).await {
+                            tracing::error!("export worker job failed: {e}");
+                        }
+                    }
+                    Ok(None) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("export worker claim failed: {e}");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    // Periodic cleanup of expired job output.
+    let cleanup_jobs = jobs.clone();
+    let cleanup_output = output.clone();
+    let interval = std::time::Duration::from_secs(cfg.cleanup_interval_secs);
+    let output_ttl = std::time::Duration::from_secs(cfg.output_ttl_secs);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match cleanup_jobs
+                .list_expired_exports(chrono::Utc::now(), output_ttl, 100)
+                .await
+            {
+                Ok(expired) => {
+                    for job in expired {
+                        let _ = cleanup_output
+                            .delete_job_outputs(&job.tenant, &job.job_id)
+                            .await;
+                        let _ = cleanup_jobs.delete_export(&job.tenant, &job.job_id).await;
+                    }
+                }
+                Err(e) => tracing::error!("export cleanup scan failed: {e}"),
+            }
+        }
+    });
+    info!(
+        "Bulk export worker pool started ({} workers)",
+        cfg.worker_concurrency
+    );
 }
 
 /// Fallback when sqlite feature is not enabled.
@@ -891,14 +1167,30 @@ async fn start_sqlite_elasticsearch(
     // Create composite storage with full primary capabilities
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(sqlite)
+        .with_full_primary(sqlite.clone())
         .start_sync_workers();
 
     info!("Composite storage initialized: SQLite (primary) + Elasticsearch (search)");
 
     let serve_audit_state = audit_state.clone();
+    let composite = Arc::new(composite);
+
+    if let Some(bundle) = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await? {
+        let app = create_app_with_auth_and_bulk_export(
+            composite,
+            config.clone(),
+            auth_config,
+            auth_state,
+            audit_state,
+            bundle,
+        );
+        return serve(app, &config, serve_audit_state).await;
+    }
+
     let app = create_app_with_auth(
-        composite,
+        Arc::try_unwrap(composite).unwrap_or_else(|_| {
+            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
@@ -945,10 +1237,25 @@ async fn start_postgres(
     };
 
     backend.init_schema().await?;
+    let backend = Arc::new(backend);
 
     let serve_audit_state = audit_state.clone();
+    if let Some(bundle) = build_bulk_export(&config, backend.clone(), backend.clone()).await? {
+        let app = create_app_with_auth_and_bulk_export(
+            backend,
+            config.clone(),
+            auth_config,
+            auth_state,
+            audit_state,
+            bundle,
+        );
+        return serve(app, &config, serve_audit_state).await;
+    }
+
     let app = create_app_with_auth(
-        backend,
+        Arc::try_unwrap(backend).unwrap_or_else(|_| {
+            unreachable!("backend Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
@@ -1087,14 +1394,30 @@ async fn start_postgres_elasticsearch(
     // Create composite storage with full primary capabilities
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(pg)
+        .with_full_primary(pg.clone())
         .start_sync_workers();
 
     info!("Composite storage initialized: PostgreSQL (primary) + Elasticsearch (search)");
 
     let serve_audit_state = audit_state.clone();
+    let composite = Arc::new(composite);
+
+    if let Some(bundle) = build_bulk_export(&config, pg.clone(), pg.clone()).await? {
+        let app = create_app_with_auth_and_bulk_export(
+            composite,
+            config.clone(),
+            auth_config,
+            auth_state,
+            audit_state,
+            bundle,
+        );
+        return serve(app, &config, serve_audit_state).await;
+    }
+
     let app = create_app_with_auth(
-        composite,
+        Arc::try_unwrap(composite).unwrap_or_else(|_| {
+            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
@@ -1225,13 +1548,35 @@ async fn start_mongodb_elasticsearch(
     // Create composite storage with full primary capabilities
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(mongo);
+        .with_full_primary(mongo.clone())
+        .start_sync_workers();
 
     info!("Composite storage initialized: MongoDB (primary) + Elasticsearch (search)");
 
     let serve_audit_state = audit_state.clone();
+    let composite = Arc::new(composite);
+
+    // MongoDB primary; embedded SQLite sidecar for job state.
+    #[cfg(feature = "sqlite")]
+    {
+        let jobs = build_embedded_job_store(&config)?;
+        if let Some(bundle) = build_bulk_export(&config, mongo.clone(), jobs).await? {
+            let app = create_app_with_auth_and_bulk_export(
+                composite,
+                config.clone(),
+                auth_config,
+                auth_state,
+                audit_state,
+                bundle,
+            );
+            return serve(app, &config, serve_audit_state).await;
+        }
+    }
+
     let app = create_app_with_auth(
-        composite,
+        Arc::try_unwrap(composite).unwrap_or_else(|_| {
+            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
@@ -1267,6 +1612,11 @@ async fn start_s3(
     let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
     let region = std::env::var("HFS_S3_REGION").ok();
     let prefix = std::env::var("HFS_S3_PREFIX").ok();
+    let endpoint_url = std::env::var("HFS_S3_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let force_path_style = parse_env_bool("HFS_S3_FORCE_PATH_STYLE", false);
+    let allow_http = parse_env_bool("HFS_S3_ALLOW_HTTP", true);
     let validate_buckets = std::env::var("HFS_S3_VALIDATE_BUCKETS")
         .map(|s| s.to_lowercase() != "false" && s != "0")
         .unwrap_or(true);
@@ -1275,6 +1625,7 @@ async fn start_s3(
         bucket = %bucket,
         region = ?region,
         prefix = ?prefix,
+        endpoint_url = ?endpoint_url,
         validate_buckets = validate_buckets,
         "Initializing S3 backend"
     );
@@ -1285,6 +1636,9 @@ async fn start_s3(
         },
         region,
         prefix,
+        endpoint_url,
+        force_path_style,
+        allow_http,
         validate_buckets_on_startup: validate_buckets,
         ..Default::default()
     };
@@ -1372,6 +1726,11 @@ async fn start_s3_elasticsearch(
     let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
     let region = std::env::var("HFS_S3_REGION").ok();
     let prefix = std::env::var("HFS_S3_PREFIX").ok();
+    let endpoint_url = std::env::var("HFS_S3_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let force_path_style = parse_env_bool("HFS_S3_FORCE_PATH_STYLE", false);
+    let allow_http = parse_env_bool("HFS_S3_ALLOW_HTTP", true);
     let validate_buckets = std::env::var("HFS_S3_VALIDATE_BUCKETS")
         .map(|s| s.to_lowercase() != "false" && s != "0")
         .unwrap_or(true);
@@ -1380,6 +1739,7 @@ async fn start_s3_elasticsearch(
         bucket = %bucket,
         region = ?region,
         prefix = ?prefix,
+        endpoint_url = ?endpoint_url,
         validate_buckets = validate_buckets,
         "Initializing S3 backend (primary)"
     );
@@ -1390,6 +1750,9 @@ async fn start_s3_elasticsearch(
         },
         region,
         prefix,
+        endpoint_url,
+        force_path_style,
+        allow_http,
         validate_buckets_on_startup: validate_buckets,
         ..Default::default()
     };
@@ -1472,14 +1835,35 @@ async fn start_s3_elasticsearch(
 
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(s3)
+        .with_full_primary(s3.clone())
         .start_sync_workers();
 
     info!("Composite storage initialized: S3 (primary) + Elasticsearch (search)");
 
     let serve_audit_state = audit_state.clone();
+    let composite = Arc::new(composite);
+
+    // S3 primary; embedded SQLite sidecar for job state.
+    #[cfg(feature = "sqlite")]
+    {
+        let jobs = build_embedded_job_store(&config)?;
+        if let Some(bundle) = build_bulk_export(&config, s3.clone(), jobs).await? {
+            let app = create_app_with_auth_and_bulk_export(
+                composite,
+                config.clone(),
+                auth_config,
+                auth_state,
+                audit_state,
+                bundle,
+            );
+            return serve(app, &config, serve_audit_state).await;
+        }
+    }
+
     let app = create_app_with_auth(
-        composite,
+        Arc::try_unwrap(composite).unwrap_or_else(|_| {
+            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,

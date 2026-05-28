@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
-use helios_persistence::core::bulk_export::{BulkExportStorage, ExportRequest};
+use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
 use helios_persistence::core::bulk_submit::{
     BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry, SubmissionId,
 };
@@ -185,15 +185,15 @@ async fn test_aws_bundle_bulk_export_and_submit() {
     assert_eq!(bundle.entries.len(), 1);
     assert_eq!(bundle.entries[0].status, 201);
 
-    let job_id = backend
-        .start_export(
-            &tenant,
-            ExportRequest::system().with_types(vec!["Patient".to_string()]),
-        )
+    // S3 no longer implements `BulkExportStorage` (job state lives in
+    // SQLite/Postgres); only `ExportDataProvider` remains. Verify the data
+    // feed instead of the removed kick-off/manifest path.
+    let request = ExportRequest::system().with_types(vec!["Patient".to_string()]);
+    let batch = backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 100)
         .await
         .unwrap();
-    let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
-    assert!(!manifest.output.is_empty());
+    assert!(!batch.lines.is_empty());
 
     let submission_id = SubmissionId::new("aws-client", format!("sub-{}", Uuid::new_v4()));
     backend

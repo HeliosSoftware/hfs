@@ -8,10 +8,12 @@ use helios_fhir::FhirVersion;
 use serde_json::json;
 
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
-use helios_persistence::core::ResourceStorage;
 use helios_persistence::core::history::{
     HistoryMethod, HistoryParams, InstanceHistoryProvider, SystemHistoryProvider,
     TypeHistoryProvider,
+};
+use helios_persistence::core::{
+    ExportLevel, ExportRequest, PatientExportProvider, ResourceStorage,
 };
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -1645,6 +1647,86 @@ async fn test_search_reference_subject() {
     let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
     assert!(ids.contains(&"obs-1"));
     assert!(ids.contains(&"obs-2"));
+}
+
+#[tokio::test]
+async fn test_patient_compartment_export_observation_without_since() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-1"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-2"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-1",
+                "subject": {"reference": "Patient/patient-1"},
+                "status": "final"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-2",
+                "subject": {"reference": "Patient/patient-2"},
+                "status": "final"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let request = ExportRequest::new(ExportLevel::Patient);
+    let batch = backend
+        .fetch_patient_compartment_batch(
+            &tenant,
+            &request,
+            "Observation",
+            &["patient-1".to_string()],
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+
+    assert!(batch.is_last);
+    assert_eq!(batch.lines.len(), 1);
+    let observation: serde_json::Value = serde_json::from_str(&batch.lines[0]).unwrap();
+    assert_eq!(observation["id"], "obs-1");
 }
 
 #[tokio::test]

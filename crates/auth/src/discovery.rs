@@ -27,12 +27,22 @@ pub struct SmartConfiguration {
     pub response_types_supported: Vec<String>,
     pub grant_types_supported: Vec<String>,
     pub token_endpoint_auth_methods_supported: Vec<String>,
+    pub code_challenge_methods_supported: Vec<String>,
+    pub token_endpoint_auth_signing_alg_values_supported: Vec<String>,
     pub capabilities: Vec<String>,
 }
 
 impl SmartConfiguration {
     /// Build the SMART configuration document from `AuthConfig`.
     pub fn from_config(config: &AuthConfig) -> Self {
+        let mut response_types_supported = vec!["token".to_string()];
+        let mut grant_types_supported = vec!["client_credentials".to_string()];
+
+        if config.smart_authorize_endpoint.is_some() {
+            response_types_supported.push("code".to_string());
+            grant_types_supported.push("authorization_code".to_string());
+        }
+
         Self {
             issuer: config.expected_issuer.clone(),
             jwks_uri: config
@@ -50,9 +60,14 @@ impl SmartConfiguration {
                 "system/*.rs".to_string(),
                 "system/*.r".to_string(),
             ],
-            response_types_supported: vec!["token".to_string()],
-            grant_types_supported: vec!["client_credentials".to_string()],
+            response_types_supported,
+            grant_types_supported,
             token_endpoint_auth_methods_supported: vec!["private_key_jwt".to_string()],
+            code_challenge_methods_supported: vec!["S256".to_string()],
+            token_endpoint_auth_signing_alg_values_supported: vec![
+                "RS384".to_string(),
+                "ES384".to_string(),
+            ],
             capabilities: vec![
                 "permission-v2".to_string(),
                 "client-confidential-asymmetric".to_string(),
@@ -78,6 +93,7 @@ mod tests {
         assert!(smart.issuer.is_none());
         assert!(smart.token_endpoint.is_none());
         assert!(smart.capabilities.contains(&"permission-v2".to_string()));
+        assert_eq!(smart.code_challenge_methods_supported, vec!["S256"]);
     }
 
     #[test]
@@ -85,6 +101,7 @@ mod tests {
         let config = AuthConfig {
             expected_issuer: Some("https://idp.example.com".to_string()),
             smart_token_endpoint: Some("https://idp.example.com/token".to_string()),
+            smart_authorize_endpoint: Some("https://idp.example.com/authorize".to_string()),
             smart_jwks_url: Some("https://idp.example.com/.well-known/jwks.json".to_string()),
             ..AuthConfig::default()
         };
@@ -95,6 +112,12 @@ mod tests {
             smart.token_endpoint.as_deref(),
             Some("https://idp.example.com/token")
         );
+        assert!(
+            smart
+                .grant_types_supported
+                .contains(&"authorization_code".to_string())
+        );
+        assert!(smart.response_types_supported.contains(&"code".to_string()));
         assert_eq!(
             smart.jwks_uri.as_deref(),
             Some("https://idp.example.com/.well-known/jwks.json")
@@ -112,6 +135,10 @@ mod tests {
 
         assert!(json["capabilities"].is_array());
         assert!(json["scopes_supported"].is_array());
+        assert_eq!(
+            json["code_challenge_methods_supported"],
+            serde_json::json!(["S256"])
+        );
         // Fields that are None should be omitted
         assert!(json.get("authorization_endpoint").is_none());
     }

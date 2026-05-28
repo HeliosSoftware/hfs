@@ -19,7 +19,7 @@ use crate::backends::s3::client::{
     ListObjectItem, ListObjectsResult, ObjectData, ObjectMetadata, S3Api, S3ClientError,
 };
 use crate::backends::s3::config::{S3BackendConfig, S3TenancyMode};
-use crate::core::bulk_export::{BulkExportStorage, ExportDataProvider, ExportRequest};
+use crate::core::bulk_export::{ExportDataProvider, ExportRequest};
 use crate::core::bulk_submit::{
     BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
     StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus,
@@ -30,8 +30,8 @@ use crate::core::history::{
 use crate::core::transaction::{BundleEntry, BundleMethod, BundleProvider};
 use crate::core::{ResourceStorage, VersionedStorage};
 use crate::error::{
-    BulkExportError, BulkSubmitError, ConcurrencyError, ResourceError, SearchError, StorageError,
-    TenantError, TransactionError,
+    BulkSubmitError, ConcurrencyError, ResourceError, SearchError, StorageError, TenantError,
+    TransactionError,
 };
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use crate::types::{CursorValue, PageCursor, Pagination, PaginationMode};
@@ -734,47 +734,14 @@ async fn bundle_transaction_reports_rollback_failure() {
     }
 }
 
-#[tokio::test]
-async fn bulk_export_start_manifest_and_delete() {
-    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
-    let backend = make_prefix_backend(mock);
-    let tenant = tenant("tenant-a");
-
-    backend
-        .create(
-            &tenant,
-            "Patient",
-            json!({"resourceType":"Patient","id":"e1"}),
-            FhirVersion::default(),
-        )
-        .await
-        .unwrap();
-
-    let request = ExportRequest::system().with_types(vec!["Patient".to_string()]);
-    let job_id = backend.start_export(&tenant, request).await.unwrap();
-
-    let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
-    assert_eq!(
-        progress.status,
-        crate::core::bulk_export::ExportStatus::Complete
-    );
-
-    let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
-    assert!(!manifest.output.is_empty());
-    assert!(manifest.output[0].url.starts_with("s3://"));
-
-    backend.delete_export(&tenant, &job_id).await.unwrap();
-    let deleted = backend.get_export_status(&tenant, &job_id).await;
-    assert!(matches!(
-        deleted,
-        Err(StorageError::BulkExport(
-            BulkExportError::JobNotFound { .. }
-        ))
-    ));
-}
+// `bulk_export_start_manifest_and_delete` was removed: S3 no longer
+// implements `BulkExportStorage` (job state lives in SQLite or PostgreSQL).
+// The remaining bulk-export surface on the S3 backend is the
+// `ExportDataProvider` data-feed, exercised by
+// `bulk_export_fetch_batch_cursor` below.
 
 #[tokio::test]
-async fn bulk_export_invalid_format_and_fetch_batch_cursor() {
+async fn bulk_export_fetch_batch_cursor() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
     let backend = make_prefix_backend(mock);
     let tenant = tenant("tenant-a");
@@ -790,22 +757,6 @@ async fn bulk_export_invalid_format_and_fetch_batch_cursor() {
             .await
             .unwrap();
     }
-
-    let invalid = backend
-        .start_export(
-            &tenant,
-            ExportRequest {
-                output_format: "application/json".to_string(),
-                ..ExportRequest::system()
-            },
-        )
-        .await;
-    assert!(matches!(
-        invalid,
-        Err(StorageError::BulkExport(
-            BulkExportError::UnsupportedFormat { .. }
-        ))
-    ));
 
     let request = ExportRequest::system();
     let batch1 = backend

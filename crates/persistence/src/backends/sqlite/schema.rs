@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -263,6 +263,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             4 => migrate_v4_to_v5(conn)?,
             5 => migrate_v5_to_v6(conn)?,
             6 => migrate_v6_to_v7(conn)?,
+            7 => migrate_v7_to_v8(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -829,6 +830,128 @@ fn migrate_v6_to_v7(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 7 to version 8.
+///
+/// Adds bulk-export worker/lease support:
+/// - lease columns + `owner_subject`/`request_url`/`fhir_version` on `bulk_export_jobs`
+/// - `part_index`/`fencing_token` on `bulk_export_files`, with a backfill of
+///   `part_index` and a unique index for idempotent upserts
+fn migrate_v7_to_v8(conn: &Connection) -> StorageResult<()> {
+    // Columns that may already exist if the table was created fresh — guard
+    // with PRAGMA table_info since SQLite has no `ADD COLUMN IF NOT EXISTS`.
+    let job_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(bulk_export_jobs)")
+            .map_err(|e| migration_err(format!("pragma bulk_export_jobs: {e}")))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| migration_err(format!("pragma rows: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    let job_adds = [
+        (
+            "worker_id",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN worker_id TEXT",
+        ),
+        (
+            "lease_expiry",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN lease_expiry TEXT",
+        ),
+        (
+            "fencing_token",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "heartbeat_at",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN heartbeat_at TEXT",
+        ),
+        (
+            "owner_subject",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN owner_subject TEXT",
+        ),
+        (
+            "request_url",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN request_url TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "fhir_version",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN fhir_version TEXT NOT NULL DEFAULT '4.0'",
+        ),
+    ];
+    for (col, sql) in &job_adds {
+        if !job_columns.iter().any(|c| c == col) {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("add {col}: {e}")))?;
+        }
+    }
+
+    let file_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(bulk_export_files)")
+            .map_err(|e| migration_err(format!("pragma bulk_export_files: {e}")))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| migration_err(format!("pragma rows: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    let file_adds = [
+        (
+            "part_index",
+            "ALTER TABLE bulk_export_files ADD COLUMN part_index INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "fencing_token",
+            "ALTER TABLE bulk_export_files ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0",
+        ),
+    ];
+    for (col, sql) in &file_adds {
+        if !file_columns.iter().any(|c| c == col) {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("add {col}: {e}")))?;
+        }
+    }
+
+    // Backfill part_index: 0-based sequential per (job_id, file_type, resource_type)
+    // ordered by id, so the unique index below builds without collisions on
+    // pre-existing rows.
+    conn.execute(
+        "UPDATE bulk_export_files SET part_index = (
+            SELECT COUNT(*) FROM bulk_export_files f2
+            WHERE f2.job_id = bulk_export_files.job_id
+              AND f2.file_type = bulk_export_files.file_type
+              AND f2.resource_type = bulk_export_files.resource_type
+              AND f2.id < bulk_export_files.id
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("backfill part_index: {e}")))?;
+
+    let indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_export_jobs_claim
+         ON bulk_export_jobs(tenant_id, status, lease_expiry)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_export_files_part
+         ON bulk_export_files(job_id, file_type, resource_type, part_index)",
+    ];
+    for index_sql in &indexes {
+        conn.execute(index_sql, [])
+            .map_err(|e| migration_err(format!("create index: {e}")))?;
+    }
+
+    Ok(())
+}
+
+fn migration_err(message: String) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+        backend_name: "sqlite".to_string(),
+        message,
+        source: None,
+    })
+}
+
 /// Drop all tables (for testing).
 #[cfg(test)]
 #[allow(dead_code)]
@@ -988,5 +1111,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 7); // 3 export + 4 submit tables
+    }
+
+    #[test]
+    fn test_migration_v7_to_v8_backfills_duplicate_file_rows() {
+        // Build a v6/v7-era schema (bulk tables without the v8 lease/part columns).
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema_v1(&conn).unwrap();
+        let _ = get_schema_version(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        migrate_v3_to_v4(&conn).unwrap();
+        migrate_v4_to_v5(&conn).unwrap();
+        migrate_v5_to_v6(&conn).unwrap();
+        migrate_v6_to_v7(&conn).unwrap();
+        set_schema_version(&conn, 7).unwrap();
+
+        // Seed a job and THREE output files for the same (job, file_type,
+        // resource_type) — all default part_index would collide.
+        conn.execute(
+            "INSERT INTO bulk_export_jobs
+             (id, tenant_id, status, level, request_json, transaction_time, created_at)
+             VALUES ('j1', 't1', 'complete', 'system', '{}', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO bulk_export_files
+                 (job_id, resource_type, file_type, file_path, resource_count, byte_count)
+                 VALUES ('j1', 'Patient', 'output', ?1, 10, 100)",
+                rusqlite::params![format!("/exports/j1/Patient-{i}.ndjson")],
+            )
+            .unwrap();
+        }
+
+        // Run the v7 -> v8 migration.
+        migrate_v7_to_v8(&conn).unwrap();
+
+        // The backfill must have produced distinct 0-based part_index values
+        // per group, so the unique index built without a collision.
+        let mut stmt = conn
+            .prepare(
+                "SELECT part_index FROM bulk_export_files
+                 WHERE job_id = 'j1' ORDER BY part_index",
+            )
+            .unwrap();
+        let part_indexes: Vec<i64> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(part_indexes, vec![0, 1, 2]);
+
+        // The unique index exists.
+        let idx_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='idx_export_files_part'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 1);
+
+        // Re-running the migration is a no-op (idempotent).
+        migrate_v7_to_v8(&conn).unwrap();
+
+        // New lease columns are present on bulk_export_jobs.
+        let has_worker_id: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('bulk_export_jobs')
+                 WHERE name='worker_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_worker_id, 1);
     }
 }

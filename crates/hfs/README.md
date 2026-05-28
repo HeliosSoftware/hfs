@@ -355,4 +355,3 @@ Use the `X-Tenant-ID` header to isolate data between tenants:
 curl -H "X-Tenant-ID: clinic-a" http://localhost:8080/Patient
 curl -H "X-Tenant-ID: clinic-b" http://localhost:8080/Patient
 ```
-
