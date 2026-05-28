@@ -1548,7 +1548,8 @@ async fn start_mongodb_elasticsearch(
     // Create composite storage with full primary capabilities
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(mongo.clone());
+        .with_full_primary(mongo.clone())
+        .start_sync_workers();
 
     info!("Composite storage initialized: MongoDB (primary) + Elasticsearch (search)");
 
