@@ -469,10 +469,30 @@ async fn start_mongodb(
     let backend = MongoBackend::new(backend_config)?;
 
     backend.init_schema().await?;
-
+    let backend = Arc::new(backend);
     let serve_audit_state = audit_state.clone();
+
+    // MongoDB primary; embedded SQLite sidecar for job state.
+    #[cfg(feature = "sqlite")]
+    {
+        let jobs = build_embedded_job_store(&config)?;
+        if let Some(bundle) = build_bulk_export(&config, backend.clone(), jobs).await? {
+            let app = create_app_with_auth_and_bulk_export(
+                backend,
+                config.clone(),
+                auth_config,
+                auth_state,
+                audit_state,
+                bundle,
+            );
+            return serve(app, &config, serve_audit_state).await;
+        }
+    }
+
     let app = create_app_with_auth(
-        backend,
+        Arc::try_unwrap(backend).unwrap_or_else(|_| {
+            unreachable!("backend Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
@@ -814,6 +834,38 @@ async fn start_sqlite(
     serve(app, &config, serve_audit_state).await
 }
 
+/// Constructs an embedded SQLite job store for backends that can't host job
+/// state themselves (MongoDB, S3). Lives at `${HFS_DATA_DIR}/bulk_export.db`
+/// (or `./data/bulk_export.db` by default) — isolated from FHIR resource data.
+#[cfg(feature = "sqlite")]
+fn build_embedded_job_store(config: &ServerConfig) -> anyhow::Result<Arc<dyn BulkExportJobStore>> {
+    let job_db = config
+        .data_dir
+        .as_ref()
+        .map(|d| format!("{}/bulk_export.db", d.display()))
+        .unwrap_or_else(|| "./data/bulk_export.db".to_string());
+    if let Some(parent) = std::path::Path::new(&job_db).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "create bulk export job DB directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    let job_backend = SqliteBackend::with_config(
+        &job_db,
+        SqliteBackendConfig {
+            fhir_version: config.default_fhir_version,
+            data_dir: config.data_dir.clone(),
+            ..Default::default()
+        },
+    )?;
+    job_backend.init_schema()?;
+    Ok(Arc::new(job_backend))
+}
+
 /// Builds the bulk-export subsystem (output store + file auth + worker pool)
 /// from a caller-supplied job store and resource data provider. Returns `None`
 /// when bulk export is disabled.
@@ -822,6 +874,8 @@ async fn start_sqlite(
 /// instance (and connection pool) that holds the FHIR resources. This means
 /// pure-SQLite deployments share `./data/hfs.db` between resources and job
 /// state, and Postgres deployments share the configured `HFS_DATABASE_URL`.
+/// Backends that can't host transactional job state (MongoDB, S3) use a
+/// sidecar SQLite via [`build_embedded_job_store`].
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 async fn build_bulk_export<Dp>(
     config: &ServerConfig,
@@ -1473,13 +1527,34 @@ async fn start_mongodb_elasticsearch(
     // Create composite storage with full primary capabilities
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(mongo);
+        .with_full_primary(mongo.clone());
 
     info!("Composite storage initialized: MongoDB (primary) + Elasticsearch (search)");
 
     let serve_audit_state = audit_state.clone();
+    let composite = Arc::new(composite);
+
+    // MongoDB primary; embedded SQLite sidecar for job state.
+    #[cfg(feature = "sqlite")]
+    {
+        let jobs = build_embedded_job_store(&config)?;
+        if let Some(bundle) = build_bulk_export(&config, mongo.clone(), jobs).await? {
+            let app = create_app_with_auth_and_bulk_export(
+                composite,
+                config.clone(),
+                auth_config,
+                auth_state,
+                audit_state,
+                bundle,
+            );
+            return serve(app, &config, serve_audit_state).await;
+        }
+    }
+
     let app = create_app_with_auth(
-        composite,
+        Arc::try_unwrap(composite).unwrap_or_else(|_| {
+            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
@@ -1720,14 +1795,35 @@ async fn start_s3_elasticsearch(
 
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(s3)
+        .with_full_primary(s3.clone())
         .start_sync_workers();
 
     info!("Composite storage initialized: S3 (primary) + Elasticsearch (search)");
 
     let serve_audit_state = audit_state.clone();
+    let composite = Arc::new(composite);
+
+    // S3 primary; embedded SQLite sidecar for job state.
+    #[cfg(feature = "sqlite")]
+    {
+        let jobs = build_embedded_job_store(&config)?;
+        if let Some(bundle) = build_bulk_export(&config, s3.clone(), jobs).await? {
+            let app = create_app_with_auth_and_bulk_export(
+                composite,
+                config.clone(),
+                auth_config,
+                auth_state,
+                audit_state,
+                bundle,
+            );
+            return serve(app, &config, serve_audit_state).await;
+        }
+    }
+
     let app = create_app_with_auth(
-        composite,
+        Arc::try_unwrap(composite).unwrap_or_else(|_| {
+            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
