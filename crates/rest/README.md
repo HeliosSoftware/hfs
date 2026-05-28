@@ -13,6 +13,7 @@ This crate provides a complete implementation of the [FHIR RESTful API](https://
 - **Batch/Transaction**: Bundle processing with atomic transaction support
 - **Content Negotiation**: JSON format support with proper MIME types
 - **Multi-Tenant**: Built-in tenant isolation for multi-tenant deployments
+- **Bulk Data Export**: Asynchronous [FHIR Bulk Data Access](https://hl7.org/fhir/uv/bulkdata/export.html) `$export` (system / Patient / Group) with poll, manifest, download, and cancel
 
 ## Quick Start
 
@@ -69,6 +70,17 @@ cargo run --bin rest-server -- --port 3000 --log-level debug
 | history (type) | GET | `/[type]/_history` |
 | history (system) | GET | `/_history` |
 | batch/transaction | POST | `/` |
+| bulk export (system) | GET/POST | `/$export` |
+| bulk export (patient) | GET/POST | `/Patient/$export` |
+| bulk export (group) | GET/POST | `/Group/[id]/$export` |
+| export status / manifest | GET | `/export-status/[job_id]` |
+| export cancel + delete | DELETE | `/export-status/[job_id]` |
+| export file download | GET | `/export-file/[job_id]/[type]-[part]` |
+
+All `$export` kick-offs require `Prefer: respond-async` and return `202 Accepted`
+with a `Content-Location` status URL. See [Bulk Data Export](#bulk-data-export)
+for configuration; the storage-layer job/output internals are documented in the
+[helios-persistence README](../persistence/README.md).
 
 ## Configuration
 
@@ -87,6 +99,38 @@ The server is configured via environment variables:
 | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode |
 | `HFS_TENANT_STRICT_VALIDATION` | false | Error on tenant mismatch |
 | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name (future) |
+
+### Bulk Data Export
+
+The `$export` subsystem is configured via `HFS_BULK_EXPORT_*` environment
+variables. Job state reuses the same storage backend that holds FHIR resources
+(SQLite or PostgreSQL) — there is no separate job-store connection to configure.
+Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, and
+`postgres-elasticsearch` backends.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_BULK_EXPORT_ENABLED` | `true` | Master switch — when `false`, all `$export` endpoints return `501`. |
+| `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Output store: `local-fs` or `s3`. |
+| `HFS_BULK_EXPORT_OUTPUT_DIR` | `${HFS_DATA_DIR}/exports` | Local-FS output root. |
+| `HFS_BULK_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
+| `HFS_BULK_EXPORT_S3_ENDPOINT` | *(AWS)* | S3-compatible endpoint URL (e.g. MinIO). |
+| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers. |
+| `HFS_BULK_EXPORT_S3_REGION` | *(falls back to `HFS_S3_REGION`, then AWS chain)* | AWS region override for export output. |
+| `HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: `auto` / `true` / `false`. **`false` is invalid with `local-fs`** (no pre-signed URLs). |
+| `HFS_BULK_EXPORT_FILE_URL_TTL` | `3600` | Pre-signed download-URL lifetime, seconds. |
+| `HFS_BULK_EXPORT_OUTPUT_TTL` | `86400` | Output retention after job completion, seconds. |
+| `HFS_BULK_EXPORT_WORKER_CONCURRENCY` | `2` | In-process worker pool size. |
+| `HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers (use a separate exporter deployment). |
+| `HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-job cap (kick-off returns `429` if exceeded). |
+| `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per export batch. |
+| `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length, seconds. Must be greater than the heartbeat interval. |
+| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
+| `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
+| `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group-export `_since` toggle: `include` or `exclude`. |
+
+A runnable multi-instance stack (HFS + PostgreSQL + MinIO + Keycloak) is provided
+as a compose example in [`docker/bulk-export/`](../../docker/bulk-export/README.md).
 
 ## Multi-Tenancy
 

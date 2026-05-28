@@ -259,6 +259,8 @@ AWS_REGION=us-east-1 \
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel |
 | `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers |
 | `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow subscription deliveries to private or loopback endpoints; intended for local development and CI only |
+| `HFS_BULK_EXPORT_ENABLED` | `true` | Enable the [Bulk Data Export](crates/rest/README.md#bulk-data-export) `$export` operation; when `false`, all `$export` endpoints return `501` |
+| `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Bulk export output store: `local-fs` or `s3`. See the [rest crate README](crates/rest/README.md#bulk-data-export) for the full `HFS_BULK_EXPORT_*` table |
 
 For detailed backend setup instructions (building from source, Docker commands, and search offloading architecture), see the [persistence crate documentation](crates/persistence/README.md#building--running-storage-backends).
 
@@ -352,7 +354,7 @@ Helper macros for code generation used by other components.
 Common types and traits for FHIRPath evaluation.
 
 ### 11. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
-Storage backend abstraction supporting multiple database technologies optimized for different FHIR workloads.
+Storage backend abstraction supporting multiple database technologies optimized for different FHIR workloads. Also hosts the [Bulk Data Export](crates/persistence/README.md) job-state stores, worker runtime, and output stores backing the server's `$export` operation (REST endpoints and `HFS_BULK_EXPORT_*` configuration live in [`helios-rest`](crates/rest/README.md#bulk-data-export)).
 
 ### 12. [`helios-audit`](crates/audit) - BALP Audit Logging
 [IHE BALP](https://profiles.ihe.net/ITI/BALP/)-compliant `AuditEvent` logging for REST, auth, persistence, and lifecycle events. Supports file, database, and AWS CloudWatch Logs sinks. See the [helios-audit README](crates/audit/README.md) for full configuration details.
@@ -391,6 +393,7 @@ Storage backend abstraction supporting multiple database technologies optimized 
 - Search with chained parameters
 - History and versioning
 - Batch/transaction support
+- Asynchronous [Bulk Data Export](crates/rest/README.md#bulk-data-export) (`$export`) at system, Patient, and Group level
 - Optional BALP-compliant `AuditEvent` logging for REST and auth interactions
 
 # Development

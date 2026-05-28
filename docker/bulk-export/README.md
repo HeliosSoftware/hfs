@@ -67,7 +67,6 @@ The response includes a `Content-Location` header for polling the export job.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HFS_BULK_EXPORT_ENABLED` | `true` | Master switch. When `false`, all `$export` endpoints return `501`. |
-| `HFS_BULK_EXPORT_BACKEND` | `embedded` | Job-state backend: `embedded` or `postgres-s3`. |
 | `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Output store: `local-fs` or `s3`. |
 | `HFS_BULK_EXPORT_OUTPUT_DIR` | `${HFS_DATA_DIR}/exports` | Local filesystem output root. |
 | `HFS_BULK_EXPORT_S3_BUCKET` | none | S3 bucket. Required when `OUTPUT_BACKEND=s3`. |
@@ -84,4 +83,3 @@ The response includes a `Content-Location` header for polling the export job.
 | `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds. |
 | `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup task scan interval in seconds. |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group-export `_since` toggle: `include` or `exclude`. |
-| `HFS_BULK_EXPORT_DATABASE_URL` | from `HFS_DATABASE_URL` | PostgreSQL URL for the `postgres-s3` job store. |
