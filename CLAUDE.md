@@ -278,9 +278,12 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 |----------|---------|-------------|
 | `HFS_S3_BUCKET` | `hfs` | S3 bucket name (prefix-per-tenant mode) |
 | `HFS_S3_REGION` | (AWS chain) | AWS region override |
+| `HFS_S3_ENDPOINT` | (AWS) | S3-compatible endpoint URL (e.g. MinIO `http://localhost:9000`) |
+| `HFS_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing (required by MinIO and most S3-compatible providers) |
+| `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure `http://` endpoint URLs (only relevant when `HFS_S3_ENDPOINT` is set) |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket existence on startup |
 
-Standard AWS credential chain applies (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, instance profiles, etc.). For S3-compatible endpoints (e.g., MinIO), configure `S3BackendConfig` directly with `endpoint_url` and `force_path_style`.
+Standard AWS credential chain applies (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, instance profiles, etc.). For S3-compatible endpoints (e.g., MinIO), set `HFS_S3_ENDPOINT` and `HFS_S3_FORCE_PATH_STYLE=true`. Note: one HFS process shares a single AWS credential chain, so a MinIO-backed primary store and a real-AWS bulk-export output store cannot be combined in the same process.
 
 ### Multi-tenancy
 ```bash
