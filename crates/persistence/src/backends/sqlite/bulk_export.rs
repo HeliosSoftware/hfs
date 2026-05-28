@@ -1318,60 +1318,54 @@ impl PatientExportProvider for SqliteBackend {
             });
         }
 
-        // For other resources, we need to use the search index to find resources
-        // that reference these patients via subject/patient parameters
+        // For other resource types, find resources whose payload references one
+        // of the patients via `subject.reference` or `patient.reference`. We
+        // read the JSON payload directly (json_extract over the `data` column)
+        // rather than the search_index, so this is correct even when search is
+        // offloaded to a secondary backend (sqlite-elasticsearch), which leaves
+        // the local search_index empty.
         let patient_refs: Vec<String> = patient_ids
             .iter()
             .map(|id| format!("Patient/{}", id))
             .collect();
-        let since_value = request.since.map(|s| s.to_rfc3339());
-        let patient_ref_param_start = if since_value.is_some() { 4 } else { 3 };
-        let placeholders: Vec<String> = (0..patient_refs.len())
-            .map(|i| format!("?{}", i + patient_ref_param_start))
-            .collect();
-
-        let mut query = format!(
-            "SELECT DISTINCT r.id, r.data, r.last_updated
-             FROM resources r
-             INNER JOIN search_index si ON r.tenant_id = si.tenant_id
-                AND r.resource_type = si.resource_type
-                AND r.id = si.resource_id
-             WHERE r.tenant_id = ?1
-                AND r.resource_type = ?2
-                AND r.is_deleted = 0
-                AND si.param_name IN ('subject', 'patient')
-                AND si.value_reference IN ({})",
-            placeholders.join(",")
-        );
 
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
         ];
-        if since_value.is_some() {
-            params_vec.push(Box::new(since_value.clone().unwrap()));
+        let mut query = "SELECT id, data, last_updated FROM resources \
+             WHERE tenant_id = ? AND resource_type = ? AND is_deleted = 0"
+            .to_string();
+
+        if let Some(since) = request.since {
+            query.push_str(" AND last_updated >= ?");
+            params_vec.push(Box::new(since.to_rfc3339()));
+        }
+
+        let placeholders: Vec<&str> = patient_refs.iter().map(|_| "?").collect();
+        let in_list = placeholders.join(",");
+        query.push_str(&format!(
+            " AND (json_extract(data, '$.subject.reference') IN ({in_list}) \
+               OR json_extract(data, '$.patient.reference') IN ({in_list}))"
+        ));
+        // The IN-list params appear twice (subject + patient), so bind twice.
+        for patient_ref in &patient_refs {
+            params_vec.push(Box::new(patient_ref.clone()));
         }
         for patient_ref in &patient_refs {
             params_vec.push(Box::new(patient_ref.clone()));
         }
 
-        if request.since.is_some() {
-            query = query.replace(
-                "r.is_deleted = 0",
-                "r.is_deleted = 0 AND r.last_updated >= ?3",
-            );
-        }
-
         if let Some(cursor) = cursor {
             let parts: Vec<&str> = cursor.splitn(2, '|').collect();
             if parts.len() == 2 {
-                query.push_str(" AND (r.last_updated, r.id) > (?, ?)");
+                query.push_str(" AND (last_updated, id) > (?, ?)");
                 params_vec.push(Box::new(parts[0].to_string()));
                 params_vec.push(Box::new(parts[1].to_string()));
             }
         }
 
-        query.push_str(" ORDER BY r.last_updated, r.id");
+        query.push_str(" ORDER BY last_updated, id");
         query.push_str(&format!(" LIMIT {}", batch_size + 1));
 
         let params_slice: Vec<&dyn rusqlite::ToSql> =
@@ -1840,6 +1834,60 @@ mod tests {
 
         // Drop reference to silence the unused-import allowance.
         let _ = ExportPartWriter::new(Box::pin(Vec::<u8>::new()));
+    }
+
+    #[tokio::test]
+    async fn test_patient_compartment_uses_resource_payload_not_search_index() {
+        // Regression: when search is offloaded (sqlite-elasticsearch), the local
+        // search_index is empty, so compartment lookups must read the resource
+        // payload directly. Here we force-offload to guarantee no search_index
+        // rows exist, then confirm the Observation is still found via its
+        // subject.reference.
+        let mut backend = SqliteBackend::in_memory().unwrap();
+        backend.init_schema().unwrap();
+        backend.set_search_offloaded(true);
+        let tenant = create_test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": "o1", "status": "final",
+                    "subject": {"reference": "Patient/p1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let request = ExportRequest::patient();
+        let batch = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &request,
+                "Observation",
+                &["p1".to_string()],
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "Observation should be found via subject.reference"
+        );
+        assert!(batch.lines[0].contains("\"o1\""));
     }
 
     #[tokio::test]

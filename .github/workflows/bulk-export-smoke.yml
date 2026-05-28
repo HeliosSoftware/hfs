@@ -379,6 +379,8 @@ jobs:
                 AWS_REGION=us-east-1 \
                 HFS_STORAGE_BACKEND=s3 \
                 HFS_S3_BUCKET=hfs-primary \
+                HFS_S3_ENDPOINT="http://$DOCKER_HOST_IP:$MINIO_PORT" \
+                HFS_S3_FORCE_PATH_STYLE=true \
                 HFS_S3_PREFIX="ci/bulk-export-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ strategy['job-index'] }}/" \
                 HFS_S3_VALIDATE_BUCKETS=false \
                 ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
@@ -390,6 +392,8 @@ jobs:
                 AWS_REGION=us-east-1 \
                 HFS_STORAGE_BACKEND=s3-elasticsearch \
                 HFS_S3_BUCKET=hfs-primary \
+                HFS_S3_ENDPOINT="http://$DOCKER_HOST_IP:$MINIO_PORT" \
+                HFS_S3_FORCE_PATH_STYLE=true \
                 HFS_S3_PREFIX="ci/bulk-export-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ strategy['job-index'] }}/" \
                 HFS_S3_VALIDATE_BUCKETS=false \
                 HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \

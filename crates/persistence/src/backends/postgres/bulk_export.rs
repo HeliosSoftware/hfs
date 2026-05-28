@@ -1238,22 +1238,23 @@ impl PatientExportProvider for PostgresBackend {
             });
         }
 
-        // For other resources, use search index to find resources referencing these patients
+        // For other resource types, find resources whose JSONB payload
+        // references one of the patients via `subject.reference` or
+        // `patient.reference`. We read the payload directly rather than the
+        // search_index, so this is correct even when search is offloaded to a
+        // secondary backend (postgres-elasticsearch), which leaves the local
+        // search_index empty.
         let patient_refs: Vec<String> = patient_ids
             .iter()
             .map(|id| format!("Patient/{}", id))
             .collect();
 
-        let mut sql = "SELECT DISTINCT r.id, r.data, r.last_updated
-             FROM resources r
-             INNER JOIN search_index si ON r.tenant_id = si.tenant_id
-                AND r.resource_type = si.resource_type
-                AND r.id = si.resource_id
-             WHERE r.tenant_id = $1
-                AND r.resource_type = $2
-                AND r.is_deleted = FALSE
-                AND si.param_name IN ('subject', 'patient')
-                AND si.value_reference = ANY($3::text[])"
+        let mut sql = "SELECT id, data, last_updated FROM resources
+             WHERE tenant_id = $1
+                AND resource_type = $2
+                AND is_deleted = FALSE
+                AND ((data #>> '{subject,reference}') = ANY($3::text[])
+                  OR (data #>> '{patient,reference}') = ANY($3::text[]))"
             .to_string();
 
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
@@ -1264,7 +1265,7 @@ impl PatientExportProvider for PostgresBackend {
         let mut param_idx = 4;
 
         if let Some(since) = request.since {
-            sql.push_str(&format!(" AND r.last_updated >= ${}", param_idx));
+            sql.push_str(&format!(" AND last_updated >= ${}", param_idx));
             params.push(Box::new(since));
             param_idx += 1;
         }
@@ -1274,7 +1275,7 @@ impl PatientExportProvider for PostgresBackend {
             if parts.len() == 2 {
                 if let Ok(dt) = DateTime::parse_from_rfc3339(parts[0]) {
                     sql.push_str(&format!(
-                        " AND (r.last_updated, r.id) > (${}, ${})",
+                        " AND (last_updated, id) > (${}, ${})",
                         param_idx,
                         param_idx + 1
                     ));
@@ -1285,7 +1286,7 @@ impl PatientExportProvider for PostgresBackend {
         }
 
         sql.push_str(&format!(
-            " ORDER BY r.last_updated, r.id LIMIT {}",
+            " ORDER BY last_updated, id LIMIT {}",
             batch_size + 1
         ));
 

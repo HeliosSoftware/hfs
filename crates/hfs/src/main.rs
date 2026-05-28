@@ -1612,6 +1612,11 @@ async fn start_s3(
     let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
     let region = std::env::var("HFS_S3_REGION").ok();
     let prefix = std::env::var("HFS_S3_PREFIX").ok();
+    let endpoint_url = std::env::var("HFS_S3_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let force_path_style = parse_env_bool("HFS_S3_FORCE_PATH_STYLE", false);
+    let allow_http = parse_env_bool("HFS_S3_ALLOW_HTTP", true);
     let validate_buckets = std::env::var("HFS_S3_VALIDATE_BUCKETS")
         .map(|s| s.to_lowercase() != "false" && s != "0")
         .unwrap_or(true);
@@ -1620,6 +1625,7 @@ async fn start_s3(
         bucket = %bucket,
         region = ?region,
         prefix = ?prefix,
+        endpoint_url = ?endpoint_url,
         validate_buckets = validate_buckets,
         "Initializing S3 backend"
     );
@@ -1630,6 +1636,9 @@ async fn start_s3(
         },
         region,
         prefix,
+        endpoint_url,
+        force_path_style,
+        allow_http,
         validate_buckets_on_startup: validate_buckets,
         ..Default::default()
     };
@@ -1717,6 +1726,11 @@ async fn start_s3_elasticsearch(
     let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
     let region = std::env::var("HFS_S3_REGION").ok();
     let prefix = std::env::var("HFS_S3_PREFIX").ok();
+    let endpoint_url = std::env::var("HFS_S3_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let force_path_style = parse_env_bool("HFS_S3_FORCE_PATH_STYLE", false);
+    let allow_http = parse_env_bool("HFS_S3_ALLOW_HTTP", true);
     let validate_buckets = std::env::var("HFS_S3_VALIDATE_BUCKETS")
         .map(|s| s.to_lowercase() != "false" && s != "0")
         .unwrap_or(true);
@@ -1725,6 +1739,7 @@ async fn start_s3_elasticsearch(
         bucket = %bucket,
         region = ?region,
         prefix = ?prefix,
+        endpoint_url = ?endpoint_url,
         validate_buckets = validate_buckets,
         "Initializing S3 backend (primary)"
     );
@@ -1735,6 +1750,9 @@ async fn start_s3_elasticsearch(
         },
         region,
         prefix,
+        endpoint_url,
+        force_path_style,
+        allow_http,
         validate_buckets_on_startup: validate_buckets,
         ..Default::default()
     };
