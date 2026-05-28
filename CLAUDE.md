@@ -636,7 +636,6 @@ All kick-offs require `Prefer: respond-async`. The default response is
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HFS_BULK_EXPORT_ENABLED` | `true` | Master switch — when `false`, all `$export` endpoints return `501`. |
-| `HFS_BULK_EXPORT_BACKEND` | `embedded` | Job-state backend: `embedded` (SQLite) or `postgres-s3`. |
 | `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Output store: `local-fs` or `s3`. |
 | `HFS_BULK_EXPORT_OUTPUT_DIR` | `${HFS_DATA_DIR}/exports` | Local-FS output root. |
 | `HFS_BULK_EXPORT_S3_BUCKET` | (none) | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
@@ -653,7 +652,13 @@ All kick-offs require `Prefer: respond-async`. The default response is
 | `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
 | `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group-export `_since` toggle (`include` / `exclude`). |
-| `HFS_BULK_EXPORT_DATABASE_URL` | (from `HFS_DATABASE_URL`) | Postgres URL for the `postgres-s3` job store. |
+
+Job-state storage reuses the same backend (and connection pool) that holds the
+FHIR resources — pure-SQLite deployments share `./data/hfs.db`, Postgres
+deployments share `HFS_DATABASE_URL`. There is no separate job-store config.
+Bulk export is currently available on `sqlite`, `postgres`, `sqlite-elasticsearch`,
+and `postgres-elasticsearch` backends; other backends return `501` until their
+job-state implementations land.
 
 ### Single-instance recipe (zero-config)
 
@@ -661,9 +666,9 @@ All kick-offs require `Prefer: respond-async`. The default response is
 cargo run --bin hfs
 ```
 
-This starts HFS with embedded bulk export: SQLite job state at
-`./data/bulk_export.db`, NDJSON output under `./data/exports/`, and an
-in-process worker pool. Kick off:
+This starts HFS with bulk export enabled, job state stored in the same SQLite
+database as the FHIR resources (`./data/hfs.db`), NDJSON output under
+`./data/exports/`, and an in-process worker pool. Kick off:
 
 ```
 curl -H 'Prefer: respond-async' http://localhost:8080/Patient/\$export
@@ -674,7 +679,6 @@ curl -H 'Prefer: respond-async' http://localhost:8080/Patient/\$export
 ```
 HFS_STORAGE_BACKEND=postgres \
 HFS_DATABASE_URL=postgresql://hfs:hfs@localhost/hfs \
-HFS_BULK_EXPORT_BACKEND=postgres-s3 \
 HFS_BULK_EXPORT_OUTPUT_BACKEND=s3 \
 HFS_BULK_EXPORT_S3_BUCKET=hfs-export \
 HFS_BULK_EXPORT_S3_ENDPOINT=http://localhost:9000 \

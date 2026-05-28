@@ -242,8 +242,6 @@ impl MultitenancyConfig {
 pub struct BulkExportConfig {
     /// Master switch — when `false`, the `$export` endpoints return `501`.
     pub enabled: bool,
-    /// Job-state backend: `embedded` (SQLite) or `postgres-s3` (PostgreSQL).
-    pub backend: String,
     /// Output store: `local-fs` or `s3`.
     pub output_backend: String,
     /// Local-FS output root directory.
@@ -283,7 +281,6 @@ impl Default for BulkExportConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            backend: "embedded".to_string(),
             output_backend: "local-fs".to_string(),
             output_dir: None,
             s3_bucket: None,
@@ -328,7 +325,6 @@ impl BulkExportConfig {
         let d = Self::default();
         Self {
             enabled: env_bool("HFS_BULK_EXPORT_ENABLED", d.enabled),
-            backend: std::env::var("HFS_BULK_EXPORT_BACKEND").unwrap_or(d.backend),
             output_backend: std::env::var("HFS_BULK_EXPORT_OUTPUT_BACKEND")
                 .unwrap_or(d.output_backend),
             output_dir: std::env::var("HFS_BULK_EXPORT_OUTPUT_DIR").ok(),
@@ -364,12 +360,6 @@ impl BulkExportConfig {
     /// Validates the bulk-export configuration.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        if !matches!(self.backend.as_str(), "embedded" | "postgres-s3") {
-            errors.push(format!(
-                "HFS_BULK_EXPORT_BACKEND '{}' invalid (expected embedded|postgres-s3)",
-                self.backend
-            ));
-        }
         if !matches!(self.output_backend.as_str(), "local-fs" | "s3") {
             errors.push(format!(
                 "HFS_BULK_EXPORT_OUTPUT_BACKEND '{}' invalid (expected local-fs|s3)",
@@ -1216,16 +1206,6 @@ mod tests {
     #[test]
     fn test_bulk_export_config_default_is_valid() {
         assert!(BulkExportConfig::default().validate().is_ok());
-    }
-
-    #[test]
-    fn test_bulk_export_config_invalid_backend() {
-        let cfg = BulkExportConfig {
-            backend: "unknown".to_string(),
-            ..BulkExportConfig::default()
-        };
-        let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("HFS_BULK_EXPORT_BACKEND")));
     }
 
     #[test]

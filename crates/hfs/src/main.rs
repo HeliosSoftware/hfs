@@ -790,7 +790,7 @@ async fn start_sqlite(
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
 
-    if let Some(bundle) = build_bulk_export(&config, backend.clone()).await? {
+    if let Some(bundle) = build_bulk_export(&config, backend.clone(), backend.clone()).await? {
         let app = create_app_with_auth_and_bulk_export(
             backend,
             config.clone(),
@@ -814,25 +814,27 @@ async fn start_sqlite(
     serve(app, &config, serve_audit_state).await
 }
 
-/// Builds the bulk-export subsystem (job store + output store + file auth) for
-/// a given resource-store data provider, spawning the in-process worker pool
-/// and cleanup task. Returns `None` when bulk export is disabled.
+/// Builds the bulk-export subsystem (output store + file auth + worker pool)
+/// from a caller-supplied job store and resource data provider. Returns `None`
+/// when bulk export is disabled.
 ///
-/// Supports both the `embedded` backend (a dedicated SQLite job store + local
-/// filesystem output) and the `postgres-s3` backend (a PostgreSQL job store +
-/// S3 output).
+/// The job store is supplied by the caller so it reuses the same backend
+/// instance (and connection pool) that holds the FHIR resources. This means
+/// pure-SQLite deployments share `./data/hfs.db` between resources and job
+/// state, and Postgres deployments share the configured `HFS_DATABASE_URL`.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 async fn build_bulk_export<Dp>(
     config: &ServerConfig,
     data: Arc<Dp>,
+    jobs: Arc<dyn BulkExportJobStore>,
 ) -> anyhow::Result<Option<helios_rest::BulkExportBundle>>
 where
     Dp: helios_persistence::core::ExportResourceProvider + 'static,
 {
     let cfg = config.bulk_export.clone();
     info!(
-        "Bulk export config: enabled={} backend={} output_backend={} requires_access_token={}",
-        cfg.enabled, cfg.backend, cfg.output_backend, cfg.requires_access_token
+        "Bulk export config: enabled={} output_backend={} requires_access_token={}",
+        cfg.enabled, cfg.output_backend, cfg.requires_access_token
     );
     if !cfg.enabled {
         return Ok(None);
@@ -893,72 +895,6 @@ where
             }
         }
         other => anyhow::bail!("invalid HFS_BULK_EXPORT_OUTPUT_BACKEND '{other}'"),
-    };
-
-    // --- Job store ------------------------------------------------------
-    let jobs: Arc<dyn BulkExportJobStore> = match cfg.backend.as_str() {
-        "embedded" => {
-            #[cfg(feature = "sqlite")]
-            {
-                let job_db = config
-                    .bulk_export
-                    .output_dir
-                    .as_ref()
-                    .map(|d| format!("{d}/bulk_export.db"))
-                    .unwrap_or_else(|| "./data/bulk_export.db".to_string());
-                if let Some(parent) = std::path::Path::new(&job_db).parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        anyhow::anyhow!(
-                            "create bulk export job DB directory {}: {e}",
-                            parent.display()
-                        )
-                    })?;
-                }
-                let job_backend = SqliteBackend::with_config(
-                    &job_db,
-                    SqliteBackendConfig {
-                        fhir_version: config.default_fhir_version,
-                        data_dir: config.data_dir.clone(),
-                        ..Default::default()
-                    },
-                )?;
-                job_backend.init_schema()?;
-                Arc::new(job_backend)
-            }
-            #[cfg(not(feature = "sqlite"))]
-            {
-                anyhow::bail!(
-                    "HFS_BULK_EXPORT_BACKEND=embedded requires the 'sqlite' feature. \
-                     Build with: cargo build -p helios-hfs --features sqlite"
-                );
-            }
-        }
-        "postgres-s3" => {
-            #[cfg(feature = "postgres")]
-            {
-                use helios_persistence::backends::postgres::PostgresBackend;
-                let url = std::env::var("HFS_BULK_EXPORT_DATABASE_URL")
-                    .ok()
-                    .or_else(|| config.database_url.clone())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "HFS_BULK_EXPORT_DATABASE_URL (or HFS_DATABASE_URL) is required \
-                             for HFS_BULK_EXPORT_BACKEND=postgres-s3"
-                        )
-                    })?;
-                let pg = PostgresBackend::from_connection_string(&url).await?;
-                pg.init_schema().await?;
-                Arc::new(pg)
-            }
-            #[cfg(not(feature = "postgres"))]
-            {
-                anyhow::bail!(
-                    "HFS_BULK_EXPORT_BACKEND=postgres-s3 requires the 'postgres' feature. \
-                     Build with: cargo build -p helios-hfs --features postgres,s3"
-                );
-            }
-        }
-        other => anyhow::bail!("invalid HFS_BULK_EXPORT_BACKEND '{other}'"),
     };
 
     spawn_export_workers(jobs.clone(), data, output.clone(), &cfg);
@@ -1156,14 +1092,30 @@ async fn start_sqlite_elasticsearch(
     // Create composite storage with full primary capabilities
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(sqlite)
+        .with_full_primary(sqlite.clone())
         .start_sync_workers();
 
     info!("Composite storage initialized: SQLite (primary) + Elasticsearch (search)");
 
     let serve_audit_state = audit_state.clone();
+    let composite = Arc::new(composite);
+
+    if let Some(bundle) = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await? {
+        let app = create_app_with_auth_and_bulk_export(
+            composite,
+            config.clone(),
+            auth_config,
+            auth_state,
+            audit_state,
+            bundle,
+        );
+        return serve(app, &config, serve_audit_state).await;
+    }
+
     let app = create_app_with_auth(
-        composite,
+        Arc::try_unwrap(composite).unwrap_or_else(|_| {
+            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
@@ -1213,7 +1165,7 @@ async fn start_postgres(
     let backend = Arc::new(backend);
 
     let serve_audit_state = audit_state.clone();
-    if let Some(bundle) = build_bulk_export(&config, backend.clone()).await? {
+    if let Some(bundle) = build_bulk_export(&config, backend.clone(), backend.clone()).await? {
         let app = create_app_with_auth_and_bulk_export(
             backend,
             config.clone(),
@@ -1367,14 +1319,30 @@ async fn start_postgres_elasticsearch(
     // Create composite storage with full primary capabilities
     let composite = CompositeStorage::new(composite_config, backends)?
         .with_search_providers(search_providers)
-        .with_full_primary(pg)
+        .with_full_primary(pg.clone())
         .start_sync_workers();
 
     info!("Composite storage initialized: PostgreSQL (primary) + Elasticsearch (search)");
 
     let serve_audit_state = audit_state.clone();
+    let composite = Arc::new(composite);
+
+    if let Some(bundle) = build_bulk_export(&config, pg.clone(), pg.clone()).await? {
+        let app = create_app_with_auth_and_bulk_export(
+            composite,
+            config.clone(),
+            auth_config,
+            auth_state,
+            audit_state,
+            bundle,
+        );
+        return serve(app, &config, serve_audit_state).await;
+    }
+
     let app = create_app_with_auth(
-        composite,
+        Arc::try_unwrap(composite).unwrap_or_else(|_| {
+            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
+        }),
         config.clone(),
         auth_config,
         auth_state,
