@@ -835,14 +835,24 @@ async fn start_sqlite(
 }
 
 /// Constructs an embedded SQLite job store for backends that can't host job
-/// state themselves (MongoDB, S3). Lives at `${HFS_DATA_DIR}/bulk_export.db`
-/// (or `./data/bulk_export.db` by default) — isolated from FHIR resource data.
+/// state themselves (MongoDB, S3). Co-located with the bulk-export output
+/// directory when set (`${HFS_BULK_EXPORT_OUTPUT_DIR}/bulk_export.db`), so
+/// parallel server instances using different output dirs (e.g. CI smoke jobs)
+/// don't collide on a single SQLite file. Falls back to `${HFS_DATA_DIR}` or
+/// `./data` if no output dir is configured. Isolated from FHIR resource data.
 #[cfg(feature = "sqlite")]
 fn build_embedded_job_store(config: &ServerConfig) -> anyhow::Result<Arc<dyn BulkExportJobStore>> {
     let job_db = config
-        .data_dir
-        .as_ref()
-        .map(|d| format!("{}/bulk_export.db", d.display()))
+        .bulk_export
+        .output_dir
+        .clone()
+        .map(|d| format!("{d}/bulk_export.db"))
+        .or_else(|| {
+            config
+                .data_dir
+                .as_ref()
+                .map(|d| format!("{}/bulk_export.db", d.display()))
+        })
         .unwrap_or_else(|| "./data/bulk_export.db".to_string());
     if let Some(parent) = std::path::Path::new(&job_db).parent()
         && !parent.as_os_str().is_empty()
