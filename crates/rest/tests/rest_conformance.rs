@@ -1004,3 +1004,200 @@ mod delete_history {
         response.assert_status(StatusCode::NOT_FOUND);
     }
 }
+
+// =============================================================================
+// History reads: instance / type / system history + vread
+// =============================================================================
+
+mod history_reads {
+    use super::*;
+
+    /// Creates a Patient and updates it twice, yielding versions 1, 2, 3.
+    async fn seed_versioned_patient(server: &TestServer, id: &str) {
+        let create = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{"family": "V1"}]
+        });
+        server
+            .put(&format!("/Patient/{id}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&create)
+            .await;
+
+        for family in ["V2", "V3"] {
+            let update = json!({
+                "resourceType": "Patient",
+                "id": id,
+                "name": [{"family": family}]
+            });
+            server
+                .put(&format!("/Patient/{id}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&update)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_instance_history_returns_all_versions() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-inst").await;
+
+        let response = server
+            .get("/Patient/hist-inst/_history")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let bundle: Value = response.json();
+        assert_eq!(bundle["resourceType"], "Bundle");
+        assert_eq!(bundle["type"], "history");
+        assert_eq!(bundle["total"], 3);
+
+        let entries = bundle["entry"].as_array().expect("entry array");
+        assert_eq!(entries.len(), 3);
+
+        // Each entry carries request + response metadata with a weak ETag.
+        for entry in entries {
+            assert!(entry["request"]["method"].is_string());
+            assert!(
+                entry["response"]["etag"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("W/\"")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_instance_history_not_found() {
+        let (server, _backend) = create_test_server().await;
+
+        let response = server
+            .get("/Patient/does-not-exist/_history")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_instance_history_count_limits_entries() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-count").await;
+
+        let response = server
+            .get("/Patient/hist-count/_history?_count=1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let bundle: Value = response.json();
+        let entries = bundle["entry"].as_array().expect("entry array");
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected _count=1 to return a single entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_instance_history_invalid_since_is_bad_request() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-since").await;
+
+        let response = server
+            .get("/Patient/hist-since/_history?_since=not-a-date")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_type_history_returns_bundle() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-type-a").await;
+        seed_versioned_patient(&server, "hist-type-b").await;
+
+        let response = server
+            .get("/Patient/_history")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let bundle: Value = response.json();
+        assert_eq!(bundle["type"], "history");
+        let entries = bundle["entry"].as_array().expect("entry array");
+        // Two resources × three versions each.
+        assert!(
+            entries.len() >= 6,
+            "expected >= 6 entries, got {}",
+            entries.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_system_history_returns_bundle() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-sys").await;
+
+        let response = server
+            .get("/_history")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let bundle: Value = response.json();
+        assert_eq!(bundle["resourceType"], "Bundle");
+        assert_eq!(bundle["type"], "history");
+        assert!(!bundle["entry"].as_array().expect("entry array").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_vread_returns_specific_version() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "vread-test").await;
+
+        // Version 1 was the original ("V1"); version 3 is current ("V3").
+        let v1 = server
+            .get("/Patient/vread-test/_history/1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        v1.assert_status_ok();
+        let v1_body: Value = v1.json();
+        assert_eq!(v1_body["resourceType"], "Patient");
+        assert_eq!(v1_body["id"], "vread-test");
+        assert_eq!(v1_body["name"][0]["family"], "V1");
+
+        let v3 = server
+            .get("/Patient/vread-test/_history/3")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        v3.assert_status_ok();
+        let v3_body: Value = v3.json();
+        assert_eq!(v3_body["name"][0]["family"], "V3");
+    }
+
+    #[tokio::test]
+    async fn test_vread_unknown_version_not_found() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "vread-missing").await;
+
+        let response = server
+            .get("/Patient/vread-missing/_history/999")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::NOT_FOUND);
+    }
+}

@@ -23,83 +23,799 @@ on:
   workflow_dispatch:
     inputs:
       kit_ref:
-        description: "bulk-data-test-kit ref (branch / tag) to clone"
+        description: "bulk-data-test-kit ref (branch / tag) to test"
         required: false
         default: "main"
 
-jobs:
-  inferno-bulk-data:
-    runs-on: [self-hosted, Linux]
-    timeout-minutes: 60
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  HFS_PORT: 18098
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+  SUITE_ID: bulk_data_v200
+  SMART_GROUP_ID: bulk_data_v200-bulk_data_smart_backend_services_v200
+  EXPORT_GROUP_ID: bulk_data_v200-bulk_data_export_tests_v200
+  GROUP_ID: inferno-bulk-group
+  RESULTS_DIR: inferno-bulk-data-results
 
+jobs:
+  build:
+    name: Build HFS with Bulk Data support
+    runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout HFS
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Bring up the bulk-export stack
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD
         run: |
-          docker compose \
-            -f docker/bulk-export/docker-compose.yml \
-            -p hfs-bulk-${{ github.run_id }} \
-            up --build -d
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
 
-      - name: Wait for HFS to be ready
-        run: |
-          for i in $(seq 1 60); do
-            if curl -fsS http://localhost:8080/health > /dev/null; then
-              echo "HFS is up"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "HFS did not become ready in time"
-          docker compose -f docker/bulk-export/docker-compose.yml \
-            -p hfs-bulk-${{ github.run_id }} logs --tail=200
-          exit 1
+      - name: Build HFS
+        run: cargo build -p helios-hfs --no-default-features --features R4,postgres,s3
 
-      - name: Clone Inferno Bulk Data Test Kit
-        run: |
-          git clone --depth 1 --branch "${{ github.event.inputs.kit_ref }}" \
-            https://github.com/inferno-framework/bulk-data-test-kit.git inferno-kit
+      - name: Upload HFS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-bulk-data-inferno-binary
+          path: target/debug/hfs
+          retention-days: 1
 
-      - name: Inspect available suites
+  inferno-stack-up:
+    name: Start Shared Inferno Bulk Data Stack
+    runs-on: [self-hosted, Linux]
+    outputs:
+      port: ${{ steps.up.outputs.port }}
+      project: ${{ steps.up.outputs.project }}
+    steps:
+      - name: Checkout bulk-data-test-kit
+        uses: actions/checkout@v5
+        with:
+          repository: inferno-framework/bulk-data-test-kit
+          ref: ${{ github.event.inputs.kit_ref }}
+          path: inferno-kit
+
+      - name: Prepare CI compose override
         working-directory: inferno-kit
         run: |
-          # Read the actual suite ids from kit source — do NOT guess.
-          # The first implementation pass should use these to set the
-          # SUITE_ID env var below.
-          grep -RhoE 'id\s+:[a-z0-9_]+' lib/ | sort -u || true
-          ls lib/ || true
+          PROJECT="inferno-bulk-data-${{ github.run_id }}-${{ github.run_attempt }}"
+          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          INFERNO_PORT=$((24000 + (${{ github.run_id }} % 20000) + ${{ github.run_attempt }}))
+          INFERNO_BASE_URL="http://$INFERNO_HOST:$INFERNO_PORT"
 
-      - name: Run the Bulk Data IG v2.0.0 suite
+          mkdir -p ci-images/nginx
+          cat > ci-images/nginx/Dockerfile <<'EOF'
+          FROM nginx
+          COPY config/nginx.conf /etc/nginx/nginx.conf
+          EOF
+          cat > docker-compose.override.yml <<EOF
+          services:
+            inferno:
+              environment:
+                INFERNO_HOST: "$INFERNO_BASE_URL"
+            worker:
+              environment:
+                INFERNO_HOST: "$INFERNO_BASE_URL"
+            nginx:
+              image: !reset null
+              build:
+                context: .
+                dockerfile: ci-images/nginx/Dockerfile
+              volumes: !override []
+              ports: !override
+                - "$INFERNO_PORT:80"
+            redis:
+              ports: !override []
+          EOF
+
+      - name: Run setup.sh under shared compose project
         working-directory: inferno-kit
         env:
-          # The actual suite id must be filled in once read from the kit
-          # source above (e.g. `bulk_data_v200`). Until then this step is a
-          # placeholder that surfaces the real id in CI logs.
-          SUITE_ID: bulk_data_v200
-          INFERNO_HOST: http://host.docker.internal:8080
+          COMPOSE_PROJECT_NAME: inferno-bulk-data-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          if [ -f docker-compose.yml ]; then
-            docker compose up --build -d
-            sleep 10
-            # The kit ships a CLI runner under `bin/run` for headless mode;
-            # the exact invocation depends on the suite's required inputs
-            # (Bearer token, Group id, etc.) and should be filled in when
-            # this workflow is first wired up against a real HFS deployment.
-            docker compose run --rm \
-              -e SUITE_ID=$SUITE_ID \
-              -e INFERNO_HOST=$INFERNO_HOST \
-              inferno bin/inferno suite execute --suite "$SUITE_ID" || EXIT=$?
-            docker compose down
-            exit ${EXIT:-0}
+          if [ -x ./setup.sh ]; then
+            ./setup.sh
           else
-            echo "bulk-data-test-kit does not ship docker-compose.yml; consult kit README"
+            echo "No setup.sh found in test-kit checkout"
             exit 1
           fi
 
-      - name: Tear down stack
+      - name: Bring up shared Inferno stack
+        id: up
+        working-directory: inferno-kit
+        run: |
+          PROJECT="inferno-bulk-data-${{ github.run_id }}-${{ github.run_attempt }}"
+          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          INFERNO_PORT=$((24000 + (${{ github.run_id }} % 20000) + ${{ github.run_attempt }}))
+          INFERNO_BASE_URL="http://$INFERNO_HOST:$INFERNO_PORT"
+
+          for attempt in 1 2 3 4 5; do
+            if docker compose -p "$PROJECT" up -d; then
+              break
+            fi
+
+            if [ "$attempt" -eq 5 ]; then
+              echo "Failed to start Inferno stack after $attempt attempts"
+              docker compose -p "$PROJECT" ps || true
+              docker compose -p "$PROJECT" logs --tail 200 || true
+              exit 1
+            fi
+
+            echo "Inferno port $INFERNO_PORT was not usable; retrying with another port"
+            docker compose -p "$PROJECT" down -v --remove-orphans || true
+            INFERNO_PORT=$((INFERNO_PORT + attempt))
+            INFERNO_BASE_URL="http://$INFERNO_HOST:$INFERNO_PORT"
+            sed -i "s#INFERNO_HOST: .*#INFERNO_HOST: \"$INFERNO_BASE_URL\"#" docker-compose.override.yml
+            sed -i "s#- \".*:80\"#- \"$INFERNO_PORT:80\"#" docker-compose.override.yml
+          done
+
+          echo "Waiting for Inferno test kit to respond on $INFERNO_BASE_URL..."
+          for i in {1..60}; do
+            if curl -sf "$INFERNO_BASE_URL/api/test_suites" > /dev/null 2>&1; then
+              echo "Inferno is ready"
+              echo "port=$INFERNO_PORT" >> "$GITHUB_OUTPUT"
+              echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Attempt $i/60: Inferno not ready yet..."
+            sleep 2
+          done
+
+          echo "Inferno is not reachable at $INFERNO_BASE_URL"
+          docker compose -p "$PROJECT" ps
+          docker compose -p "$PROJECT" logs --tail 200
+          exit 1
+
+  inferno-bulk-data-test:
+    name: Inferno Bulk Data v2.0.0 Tests
+    needs: [build, inferno-stack-up]
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      INFERNO_PORT: ${{ needs.inferno-stack-up.outputs.port }}
+      INFERNO_COMPOSE_PROJECT: ${{ needs.inferno-stack-up.outputs.project }}
+    steps:
+      - name: Checkout HFS
+        uses: actions/checkout@v5
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-bulk-data-inferno-binary
+          path: target/debug
+
+      - name: Make HFS binary executable
+        run: chmod +x target/debug/hfs
+
+      - name: Determine runner and Docker host IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "HFS_BASE_URL=http://$RUNNER_IP:$HFS_PORT" >> "$GITHUB_ENV"
+          echo "INFERNO_BASE_URL=http://$EFFECTIVE_DOCKER_HOST_IP:$INFERNO_PORT" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      - name: Prepare results directory
+        run: mkdir -p "$RESULTS_DIR/container-logs"
+
+      - name: Start PostgreSQL
+        run: |
+          PG_CONTAINER="pg-inferno-bulk-data-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PG_CONTAINER" -p 0:5432 \
+            -e POSTGRES_USER=helios \
+            -e POSTGRES_PASSWORD=helios \
+            -e POSTGRES_DB=helios \
+            postgres:16
+
+          echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..30}; do
+            if docker exec "$PG_CONTAINER" pg_isready -U helios > /dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PostgreSQL is ready on port $PG_PORT"
+                echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: PostgreSQL not ready yet..."
+            sleep 2
+          done
+
+          echo "PostgreSQL failed to start"
+          docker logs "$PG_CONTAINER"
+          exit 1
+
+      - name: Start MinIO
+        run: |
+          MINIO_CONTAINER="minio-inferno-bulk-data-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$MINIO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MINIO_CONTAINER" -p 0:9000 -p 0:9001 \
+            -e MINIO_ROOT_USER=hfs-minio \
+            -e MINIO_ROOT_PASSWORD=hfs-minio-secret \
+            minio/minio:latest server /data --console-address ":9001"
+
+          echo "MINIO_CONTAINER=$MINIO_CONTAINER" >> "$GITHUB_ENV"
+
+          echo "Waiting for MinIO to be ready..."
+          MINIO_READY=0
+          for i in {1..30}; do
+            MINIO_PORT=$(docker port "$MINIO_CONTAINER" 9000 | head -1 | sed 's/.*://')
+            if [ -n "$MINIO_PORT" ]; then
+              if curl -sf "http://$DOCKER_HOST_IP:$MINIO_PORT/minio/health/live" > /dev/null 2>&1; then
+                echo "MinIO is ready on port $MINIO_PORT"
+                echo "MINIO_PORT=$MINIO_PORT" >> "$GITHUB_ENV"
+                MINIO_READY=1
+                break
+              fi
+            fi
+            echo "Attempt $i/30: MinIO not ready yet..."
+            sleep 2
+          done
+
+          if [ "$MINIO_READY" -ne 1 ]; then
+            echo "MinIO failed to become ready"
+            docker logs "$MINIO_CONTAINER"
+            exit 1
+          fi
+
+          docker run --rm --network "container:$MINIO_CONTAINER" \
+            --entrypoint /bin/sh \
+            minio/mc:latest \
+            -c 'mc alias set local http://127.0.0.1:9000 hfs-minio hfs-minio-secret && mc mb -p local/hfs-export'
+
+      - name: Generate Keycloak realm for Inferno client
+        run: |
+          INFERNO_JWKS_URL="$INFERNO_BASE_URL/custom/bulk_data_v200/.well-known/jwks.json"
+          jq --arg jwks_url "$INFERNO_JWKS_URL" '
+            .clients += [{
+              "clientId": "inferno-bulk-data-client",
+              "name": "Inferno Bulk Data Backend Services Client",
+              "description": "CI client registered for the Inferno Bulk Data Test Kit private_key_jwt flow",
+              "enabled": true,
+              "publicClient": false,
+              "bearerOnly": false,
+              "clientAuthenticatorType": "client-jwt",
+              "serviceAccountsEnabled": true,
+              "standardFlowEnabled": false,
+              "implicitFlowEnabled": false,
+              "directAccessGrantsEnabled": false,
+              "authorizationServicesEnabled": false,
+              "protocol": "openid-connect",
+              "defaultClientScopes": ["system/*.cruds"],
+              "optionalClientScopes": ["system/Patient.rs", "system/Observation.r"],
+              "attributes": {
+                "use.jwks.url": "true",
+                "jwks.url": $jwks_url,
+                "token.endpoint.auth.signing.alg": "ES384",
+                "token.endpoint.auth.signing.max.exp": "600"
+              }
+            }]
+          ' docker/keycloak/realm.json > "$RESULTS_DIR/keycloak-realm.json"
+
+      - name: Start Keycloak
+        run: |
+          KC_CONTAINER="kc-inferno-bulk-data-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$KC_CONTAINER" 2>/dev/null || true
+
+          docker create --name "$KC_CONTAINER" -p 0:8080 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            -e KC_HEALTH_ENABLED=true \
+            --entrypoint /bin/sh \
+            quay.io/keycloak/keycloak:26.1 \
+            -ec 'mkdir -p /opt/keycloak/data/import && cp /tmp/realm.json /opt/keycloak/data/import/realm.json && exec /opt/keycloak/bin/kc.sh start-dev --import-realm' > /dev/null
+
+          docker cp "$RESULTS_DIR/keycloak-realm.json" "$KC_CONTAINER":/tmp/realm.json
+          docker start "$KC_CONTAINER" > /dev/null
+          echo "KC_CONTAINER=$KC_CONTAINER" >> "$GITHUB_ENV"
+
+      - name: Wait for Keycloak
+        run: |
+          echo "Waiting for Keycloak to be ready..."
+          for i in {1..60}; do
+            KEYCLOAK_PORT=$(docker port "$KC_CONTAINER" 8080 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$KEYCLOAK_PORT" ]; then
+              if curl -sf "http://$DOCKER_HOST_IP:$KEYCLOAK_PORT/realms/fhir" > /dev/null 2>&1; then
+                echo "Keycloak is ready on port $KEYCLOAK_PORT"
+                echo "KEYCLOAK_PORT=$KEYCLOAK_PORT" >> "$GITHUB_ENV"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/60: Keycloak not ready yet..."
+            sleep 2
+          done
+
+          echo "Keycloak failed to start"
+          docker logs "$KC_CONTAINER"
+          exit 1
+
+      - name: Start HFS server
+        run: |
+          HFS_LOG="$RESULTS_DIR/hfs.log"
+          PG_URL="postgresql://helios:helios@$DOCKER_HOST_IP:$PG_PORT/helios"
+          AUTH_JWKS_URL="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT/realms/fhir/protocol/openid-connect/certs"
+          AUTH_ISSUER="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT/realms/fhir"
+          AUTH_TOKEN_ENDPOINT="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT/realms/fhir/protocol/openid-connect/token"
+          AUTH_AUTHORIZE_ENDPOINT="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT/realms/fhir/protocol/openid-connect/auth"
+          MINIO_ENDPOINT="http://$DOCKER_HOST_IP:$MINIO_PORT"
+
+          echo "HFS_LOG=$HFS_LOG" >> "$GITHUB_ENV"
+          echo "PG_URL=$PG_URL" >> "$GITHUB_ENV"
+
+          HFS_BASE_URL="$HFS_BASE_URL" \
+          HFS_DEFAULT_FHIR_VERSION=R4 \
+          HFS_STORAGE_BACKEND=postgres \
+          HFS_DATABASE_URL="$PG_URL" \
+          HFS_PG_HOST="$DOCKER_HOST_IP" \
+          HFS_PG_PORT="$PG_PORT" \
+          HFS_PG_DBNAME=helios \
+          HFS_PG_USER=helios \
+          HFS_PG_PASSWORD=helios \
+          HFS_AUTH_ENABLED=true \
+          HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+          HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+          HFS_AUTH_JTI_BACKEND=disabled \
+          HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+          HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+          HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+          HFS_BULK_EXPORT_ENABLED=true \
+          HFS_BULK_EXPORT_BACKEND=postgres-s3 \
+          HFS_BULK_EXPORT_DATABASE_URL="$PG_URL" \
+          HFS_BULK_EXPORT_OUTPUT_BACKEND=s3 \
+          HFS_BULK_EXPORT_S3_BUCKET=hfs-export \
+          HFS_BULK_EXPORT_S3_ENDPOINT="$MINIO_ENDPOINT" \
+          HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE=true \
+          HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=true \
+          HFS_BULK_EXPORT_FILE_URL_TTL=3600 \
+          HFS_BULK_EXPORT_OUTPUT_TTL=3600 \
+          HFS_BULK_EXPORT_BATCH_SIZE=100 \
+          AWS_ACCESS_KEY_ID=hfs-minio \
+          AWS_SECRET_ACCESS_KEY=hfs-minio-secret \
+          AWS_REGION=us-east-1 \
+          ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+
+          echo $! > /tmp/hfs-inferno-bulk-data.pid
+          echo "HFS_PID=$(cat /tmp/hfs-inferno-bulk-data.pid)" >> "$GITHUB_ENV"
+
+      - name: Wait for HFS to be ready
+        run: |
+          echo "Waiting for HFS to start..."
+          for i in {1..30}; do
+            if ! kill -0 "$HFS_PID" 2>/dev/null; then
+              echo "HFS process ($HFS_PID) exited"
+              cat "$HFS_LOG"
+              exit 1
+            fi
+            if curl -sf "http://localhost:$HFS_PORT/health" > /dev/null 2>&1; then
+              echo "HFS is ready"
+              exit 0
+            fi
+            echo "Attempt $i/30: HFS not ready yet..."
+            sleep 2
+          done
+
+          echo "HFS failed to start"
+          tail -50 "$HFS_LOG"
+          exit 1
+
+      - name: Sanity-check SMART discovery
+        run: |
+          curl -sf "$HFS_BASE_URL/.well-known/smart-configuration" \
+            | tee "$RESULTS_DIR/smart-configuration.json"
+
+      - name: Seed Bulk Data resources
+        run: |
+          token() {
+            KEYCLOAK_URL="http://$DOCKER_HOST_IP:$KEYCLOAK_PORT" ./docker/keycloak/get-token.sh
+          }
+
+          put_resource() {
+            local resource_type="$1"
+            local id="$2"
+            local file="$3"
+            local access_token
+            access_token="$(token)"
+            local status
+            status="$(curl -sS -o "$RESULTS_DIR/${resource_type}-${id}-response.json" -w "%{http_code}" \
+              -X PUT "$HFS_BASE_URL/$resource_type/$id" \
+              -H "Authorization: Bearer $access_token" \
+              -H "Content-Type: application/fhir+json; fhirVersion=4.0" \
+              -H "Accept: application/fhir+json; fhirVersion=4.0" \
+              --data-binary @"$file")"
+            if [ "$status" != "200" ] && [ "$status" != "201" ]; then
+              echo "::error::PUT $resource_type/$id returned HTTP $status"
+              cat "$RESULTS_DIR/${resource_type}-${id}-response.json"
+              exit 1
+            fi
+          }
+
+          cat > "$RESULTS_DIR/patient-a.json" <<'EOF'
+          {
+            "resourceType": "Patient",
+            "id": "inferno-bulk-patient-a",
+            "name": [{ "family": "Bulk", "given": ["Alpha"] }],
+            "gender": "female",
+            "birthDate": "1980-01-01"
+          }
+          EOF
+
+          cat > "$RESULTS_DIR/patient-b.json" <<'EOF'
+          {
+            "resourceType": "Patient",
+            "id": "inferno-bulk-patient-b",
+            "name": [{ "family": "Bulk", "given": ["Beta"] }],
+            "gender": "male",
+            "birthDate": "1981-02-02"
+          }
+          EOF
+
+          cat > "$RESULTS_DIR/observation-a.json" <<'EOF'
+          {
+            "resourceType": "Observation",
+            "id": "inferno-bulk-observation-a",
+            "status": "final",
+            "category": [{
+              "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }]
+            }],
+            "code": {
+              "coding": [{
+                "system": "http://loinc.org",
+                "code": "8867-4",
+                "display": "Heart rate"
+              }],
+              "text": "Heart rate"
+            },
+            "subject": { "reference": "Patient/inferno-bulk-patient-a" },
+            "effectiveDateTime": "2024-01-01T00:00:00Z",
+            "valueQuantity": {
+              "value": 72,
+              "unit": "beats/minute",
+              "system": "http://unitsofmeasure.org",
+              "code": "/min"
+            }
+          }
+          EOF
+
+          cat > "$RESULTS_DIR/group.json" <<EOF
+          {
+            "resourceType": "Group",
+            "id": "$GROUP_ID",
+            "type": "person",
+            "actual": true,
+            "name": "Inferno Bulk Data CI Group",
+            "member": [
+              { "entity": { "reference": "Patient/inferno-bulk-patient-a" } },
+              { "entity": { "reference": "Patient/inferno-bulk-patient-b" } }
+            ]
+          }
+          EOF
+
+          put_resource Patient inferno-bulk-patient-a "$RESULTS_DIR/patient-a.json"
+          put_resource Patient inferno-bulk-patient-b "$RESULTS_DIR/patient-b.json"
+          put_resource Observation inferno-bulk-observation-a "$RESULTS_DIR/observation-a.json"
+          put_resource Group "$GROUP_ID" "$RESULTS_DIR/group.json"
+
+      - name: Sanity-check shared Inferno stack
+        run: |
+          if ! curl -sf "$INFERNO_BASE_URL/api/test_suites" > "$RESULTS_DIR/test-suites.json"; then
+            echo "Shared Inferno stack not reachable at $INFERNO_BASE_URL"
+            exit 1
+          fi
+
+      - name: Create Inferno test session
+        run: |
+          for attempt in $(seq 1 5); do
+            SESSION_RESPONSE=$(curl -s -X POST "$INFERNO_BASE_URL/api/test_sessions?test_suite_id=$SUITE_ID")
+            SESSION_ID=$(echo "$SESSION_RESPONSE" | jq -r '.id' 2>/dev/null) || true
+
+            if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ]; then
+              break
+            fi
+            echo "Attempt $attempt/5: Failed to create test session: $SESSION_RESPONSE"
+            sleep $((attempt * 3))
+          done
+
+          if [ -z "${SESSION_ID:-}" ] || [ "$SESSION_ID" = "null" ]; then
+            echo "Failed to create test session after 5 attempts"
+            echo "$SESSION_RESPONSE"
+            exit 1
+          fi
+
+          echo "SESSION_ID=$SESSION_ID" >> "$GITHUB_ENV"
+          echo "$SESSION_RESPONSE" > "$RESULTS_DIR/session.json"
+
+      - name: Run Inferno Bulk Data suite
+        run: |
+          SMART_AUTH_INFO="$(jq -nc '{
+            auth_type: "backend_services",
+            use_discovery: "true",
+            requested_scopes: "system/*.cruds",
+            client_id: "inferno-bulk-data-client",
+            encryption_algorithm: "ES384"
+          }')"
+
+          # The bulk_data_v200 suite contains two sequential groups that must each be
+          # run as a separate test_run: the SMART Backend Services group establishes the
+          # bearer token, and the Export Tests group consumes it from session state.
+          for GROUP_PAIR in "smart:$SMART_GROUP_ID" "export:$EXPORT_GROUP_ID"; do
+            LABEL="${GROUP_PAIR%%:*}"
+            GROUP_ID_VAL="${GROUP_PAIR##*:}"
+
+            echo "--- Starting group: $LABEL ($GROUP_ID_VAL) ---"
+
+            RUN_PAYLOAD="$(jq -n \
+              --arg session_id "$SESSION_ID" \
+              --arg group_id "$GROUP_ID_VAL" \
+              --arg bulk_server_url "$HFS_BASE_URL" \
+              --arg smart_auth_info "$SMART_AUTH_INFO" \
+              --arg fhir_group_id "$GROUP_ID" \
+              '{
+                test_session_id: $session_id,
+                test_group_id: $group_id,
+                inputs: [
+                  {name: "bulk_server_url", value: $bulk_server_url},
+                  {name: "smart_auth_info", value: $smart_auth_info},
+                  {name: "group_id", value: $fhir_group_id},
+                  {name: "bulk_timeout", value: "600"},
+                  {name: "lines_to_validate", value: "100"},
+                  {name: "since_timestamp", value: "2000-01-01T00:00:00.000Z"}
+                ]
+              }')"
+
+            echo "$RUN_PAYLOAD" > "$RESULTS_DIR/run-payload-$LABEL.json"
+
+            RUN_ID=""
+            RUN_RESPONSE=""
+            for attempt in $(seq 1 5); do
+              RUN_RESPONSE=$(curl -s -X POST "$INFERNO_BASE_URL/api/test_runs" \
+                -H "Content-Type: application/json" \
+                -d "$RUN_PAYLOAD")
+              RUN_ID=$(echo "$RUN_RESPONSE" | jq -r '.id' 2>/dev/null) || true
+              if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then break; fi
+              echo "Attempt $attempt/5: Failed to start $LABEL run: $RUN_RESPONSE"
+              sleep $((attempt * 3))
+            done
+
+            if [ -z "${RUN_ID:-}" ] || [ "$RUN_ID" = "null" ]; then
+              echo "Failed to start $LABEL run after 5 attempts"
+              echo "$RUN_RESPONSE"
+              exit 1
+            fi
+
+            echo "$RUN_RESPONSE" > "$RESULTS_DIR/run-$LABEL.json"
+            echo "$LABEL run started: $RUN_ID"
+
+            MAX_POLLS=150
+            API_ERRORS=0
+            RUN_STATUS=""
+            for i in $(seq 1 $MAX_POLLS); do
+              STATUS_RESPONSE=$(curl -s "$INFERNO_BASE_URL/api/test_runs/$RUN_ID")
+              RUN_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status' 2>/dev/null) || true
+
+              if [ -z "$RUN_STATUS" ] || [ "$RUN_STATUS" = "null" ]; then
+                API_ERRORS=$((API_ERRORS + 1))
+                echo "Poll $i/$MAX_POLLS [$LABEL]: WARNING - non-JSON response (error $API_ERRORS)"
+                if [ "$API_ERRORS" -ge 5 ]; then
+                  echo "::error::Inferno API failed $API_ERRORS consecutive times for $LABEL"
+                  tail -50 "$HFS_LOG"
+                  exit 1
+                fi
+                sleep 10
+                continue
+              fi
+              API_ERRORS=0
+
+              RESULTS=$(curl -s "$INFERNO_BASE_URL/api/test_runs/$RUN_ID/results")
+              TOTAL=$(echo "$RESULTS" | jq '[.[] | select(.test_id)] | length' 2>/dev/null) || TOTAL="?"
+              PASS=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "pass")] | length' 2>/dev/null) || PASS="?"
+              FAIL=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "fail")] | length' 2>/dev/null) || FAIL="?"
+              SKIP=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "skip")] | length' 2>/dev/null) || SKIP="?"
+              ERROR=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "error")] | length' 2>/dev/null) || ERROR="?"
+              OMIT=$(echo "$RESULTS" | jq '[.[] | select(.test_id and .result == "omit")] | length' 2>/dev/null) || OMIT="?"
+
+              echo "Poll $i/$MAX_POLLS [$LABEL]: Status=$RUN_STATUS Total=$TOTAL Pass=$PASS Fail=$FAIL Skip=$SKIP Error=$ERROR Omit=$OMIT"
+
+              if [ "$RUN_STATUS" = "done" ]; then
+                echo "$RESULTS" > "$RESULTS_DIR/results-$LABEL.json"
+                break
+              fi
+
+              sleep 10
+            done
+
+            if [ "$RUN_STATUS" != "done" ]; then
+              echo "::error::Inferno $LABEL group timed out"
+              exit 1
+            fi
+
+            if [ "$LABEL" = "smart" ]; then
+              SMART_AUTH_INFO="$(jq -r '
+                [.[] | .outputs[]? | select(.name == "smart_auth_info") | .value | select(contains("\"access_token\""))]
+                | last // empty
+              ' "$RESULTS_DIR/results-smart.json")"
+
+              if [ -z "$SMART_AUTH_INFO" ]; then
+                echo "::error::SMART group did not produce access-token auth info for export tests"
+                jq -r '.[] | select(.result == "fail" or .result == "error") | "  \(.test_id): \(.result) - \(.result_message // "No message")"' "$RESULTS_DIR/results-smart.json"
+                exit 1
+              fi
+            fi
+          done
+
+          # Merge results from both groups for downstream steps
+          jq -s 'add' \
+            "$RESULTS_DIR/results-smart.json" \
+            "$RESULTS_DIR/results-export.json" \
+            > "$RESULTS_DIR/results.json"
+
+      - name: Check test results
+        run: |
+          if [ ! -f "$RESULTS_DIR/results.json" ]; then
+            echo "::error::No results file found"
+            exit 1
+          fi
+
+          RESULTS=$(cat "$RESULTS_DIR/results.json")
+          LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
+          OMIT_EXPR='(.test_id | test("(bulk_data_server_tls_version_stu2|smart_backend_services_token_tls_version|bulk_file_server_tls_version)$"))'
+
+          FAILURES=$(echo "$RESULTS" | jq "$LATEST | [.[] | select((.result == \"fail\" or .result == \"error\") and ($OMIT_EXPR | not))] | length")
+          OMITTED_COUNT=$(echo "$RESULTS" | jq "$LATEST | [.[] | select($OMIT_EXPR)] | length")
+
+          echo "Failures (excluding $OMITTED_COUNT known omitted tests): $FAILURES"
+
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "::error::$FAILURES Inferno Bulk Data test(s) failed"
+            echo "$RESULTS" | jq -r "$LATEST | .[] | select((.result == \"fail\" or .result == \"error\") and ($OMIT_EXPR | not)) | \"  \(.test_id): \(.result) - \(.result_message // \"No message\" | .[0:300])\""
+            exit 1
+          fi
+
+      - name: Generate test summary
         if: always()
         run: |
-          docker compose -f docker/bulk-export/docker-compose.yml \
-            -p hfs-bulk-${{ github.run_id }} down -v
+          echo "## Inferno Bulk Data v2.0.0 Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RESULTS_DIR/results.json" ]; then
+            RESULTS=$(cat "$RESULTS_DIR/results.json")
+            LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
+            OMIT_EXPR='(.test_id | test("(bulk_data_server_tls_version_stu2|smart_backend_services_token_tls_version|bulk_file_server_tls_version)$"))'
+
+            TOTAL=$(echo "$RESULTS" | jq "$LATEST | length")
+            PASS=$(echo "$RESULTS" | jq "$LATEST | [.[] | select(.result == \"pass\")] | length")
+            FAIL=$(echo "$RESULTS" | jq "$LATEST | [.[] | select(.result == \"fail\" and ($OMIT_EXPR | not))] | length")
+            ERROR=$(echo "$RESULTS" | jq "$LATEST | [.[] | select(.result == \"error\" and ($OMIT_EXPR | not))] | length")
+            SKIP=$(echo "$RESULTS" | jq "$LATEST | [.[] | select(.result == \"skip\")] | length")
+            OMIT=$(echo "$RESULTS" | jq "$LATEST | [.[] | select(.result == \"omit\")] | length")
+            KNOWN=$(echo "$RESULTS" | jq "$LATEST | [.[] | select($OMIT_EXPR)] | length")
+
+            echo "| Status | Count |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Pass | $PASS |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Fail | $FAIL |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Error | $ERROR |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Skip | $SKIP |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Omit | $OMIT |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Known omitted | $KNOWN |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Total | $TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+
+            if [ "$KNOWN" -gt 0 ]; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "### Known Omitted Tests" >> "$GITHUB_STEP_SUMMARY"
+              echo "$RESULTS" | jq -r "$LATEST | .[] | select($OMIT_EXPR) | \"- \(.test_id): \(.result) - \(.result_message // \"No message\" | .[0:200])\"" >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            if [ "$FAIL" -gt 0 ] || [ "$ERROR" -gt 0 ]; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "### Failed/Error Tests" >> "$GITHUB_STEP_SUMMARY"
+              echo "$RESULTS" | jq -r "$LATEST | .[] | select((.result == \"fail\" or .result == \"error\") and ($OMIT_EXPR | not)) | \"- \(.test_id): \(.result) - \(.result_message // \"No message\" | .[0:200])\"" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "No results file found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Collect container logs
+        if: always()
+        run: |
+          mkdir -p "$RESULTS_DIR/container-logs"
+
+          for name in "$PG_CONTAINER" "$MINIO_CONTAINER" "$KC_CONTAINER"; do
+            if [ -n "${name:-}" ]; then
+              docker logs "$name" > "$RESULTS_DIR/container-logs/$name.log" 2>&1 || true
+              docker inspect "$name" > "$RESULTS_DIR/container-logs/$name.inspect.json" 2>&1 || true
+            fi
+          done
+
+          PROJECT="${INFERNO_COMPOSE_PROJECT:-inferno-bulk-data-${{ github.run_id }}-${{ github.run_attempt }}}"
+          echo "$PROJECT" > "$RESULTS_DIR/container-logs/inferno-project.txt"
+          IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
+          for id in $IDS; do
+            NAME=$(docker inspect -f '{{.Name}}' "$id" | sed 's#^/##')
+            docker logs "$id" > "$RESULTS_DIR/container-logs/inferno-$NAME.log" 2>&1 || true
+            docker inspect "$id" > "$RESULTS_DIR/container-logs/inferno-$NAME.inspect.json" 2>&1 || true
+          done
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: inferno-bulk-data-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: inferno-bulk-data-results/
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Stopping HFS..."
+          if [ -f /tmp/hfs-inferno-bulk-data.pid ]; then
+            kill "$(cat /tmp/hfs-inferno-bulk-data.pid)" 2>/dev/null || true
+            rm -f /tmp/hfs-inferno-bulk-data.pid
+          fi
+
+          echo "Stopping PostgreSQL..."
+          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
+
+          echo "Stopping MinIO..."
+          docker rm -f "${MINIO_CONTAINER:-none}" 2>/dev/null || true
+
+          echo "Stopping Keycloak..."
+          docker rm -f "${KC_CONTAINER:-none}" 2>/dev/null || true
+
+          echo "Cleanup complete"
+
+  inferno-stack-down:
+    name: Stop Shared Inferno Bulk Data Stack
+    needs: [inferno-stack-up, inferno-bulk-data-test]
+    if: always() && needs.inferno-stack-up.result != 'skipped'
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Tear down Inferno stack by compose project label
+        run: |
+          PROJECT="${{ needs.inferno-stack-up.outputs.project }}"
+          if [ -z "$PROJECT" ]; then
+            PROJECT="inferno-bulk-data-${{ github.run_id }}-${{ github.run_attempt }}"
+          fi
+          echo "Tearing down compose project: $PROJECT"
+
+          IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
+          if [ -n "$IDS" ]; then
+            docker rm -f $IDS
+          fi
+
+          NETS=$(docker network ls --filter "label=com.docker.compose.project=$PROJECT" -q)
+          if [ -n "$NETS" ]; then
+            docker network rm $NETS || true
+          fi
+
+          VOLS=$(docker volume ls --filter "label=com.docker.compose.project=$PROJECT" -q)
+          if [ -n "$VOLS" ]; then
+            docker volume rm $VOLS || true
+          fi
+
+          echo "Inferno Bulk Data stack teardown complete"

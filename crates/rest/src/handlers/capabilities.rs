@@ -142,7 +142,7 @@ where
     }
 
     // Standard operations, extended with SOF operations
-    let operations = build_rest_operations(state);
+    let mut operations = build_rest_operations(state);
 
     // Optional SOF extension block on the rest[0] element
     let sof_extension = build_sof_rest_extension(state);
@@ -160,8 +160,7 @@ where
             { "code": "batch" },
             { "code": "history-system" },
             { "code": "search-system" }
-        ],
-        "operation": operations
+        ]
     });
 
     // Inject the SOF extension array when present
@@ -169,7 +168,7 @@ where
         rest_entry["extension"] = ext;
     }
 
-    serde_json::json!({
+    let mut statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
         "status": "active",
         "date": chrono::Utc::now().to_rfc3339(),
@@ -181,7 +180,28 @@ where
             "url": base_url
         },
         "rest": [rest_entry]
-    })
+    });
+
+    // Advertise Bulk Data Export operations when enabled.
+    if state.bulk_export_config().enabled {
+        operations.push(serde_json::json!({
+            "name": "export",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"
+        }));
+        operations.push(serde_json::json!({
+            "name": "patient-export",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
+        }));
+        operations.push(serde_json::json!({
+            "name": "group-export",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"
+        }));
+        statement["instantiates"] =
+            serde_json::json!(["http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"]);
+    }
+
+    statement["rest"][0]["operation"] = serde_json::Value::Array(operations);
+    statement
 }
 
 /// Builds the `rest[0].operation` list, including SOF operations.
@@ -247,7 +267,7 @@ fn build_sof_rest_extension<S: ResourceStorage + Send + Sync + 'static>(
 
 /// Builds the capability entry for a resource type.
 fn build_resource_capability(resource_type: &str) -> serde_json::Value {
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "type": resource_type,
         "profile": format!("http://hl7.org/fhir/StructureDefinition/{}", resource_type),
         "interaction": [
@@ -271,7 +291,26 @@ fn build_resource_capability(resource_type: &str) -> serde_json::Value {
         "searchInclude": ["*"],
         "searchRevInclude": ["*"],
         "searchParam": build_common_search_params()
-    })
+    });
+    // Bulk Data Access IG: per-resource `$export` operation entries on Patient
+    // and Group, in addition to the system-level `$export` advertised at
+    // `rest[0].operation`.
+    match resource_type {
+        "Patient" => {
+            entry["operation"] = serde_json::json!([{
+                "name": "export",
+                "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
+            }]);
+        }
+        "Group" => {
+            entry["operation"] = serde_json::json!([{
+                "name": "export",
+                "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"
+            }]);
+        }
+        _ => {}
+    }
+    entry
 }
 
 /// Builds common search parameters supported by all resources.

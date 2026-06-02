@@ -1,0 +1,100 @@
+# Multi-instance Bulk Data Export stack: HFS + PostgreSQL + MinIO + Keycloak.
+#
+# This is a provided local example for manual multi-instance smoke testing and
+# trying Bulk Data clients such as Inferno. It is not used by the GitHub Actions
+# workflow tests. Bring it up with:
+#
+#     docker compose -f docker/bulk-export/docker-compose.yml up --build
+#
+# Then point a Bulk Data client (Inferno or curl) at http://localhost:8080.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: hfs
+      POSTGRES_PASSWORD: hfs
+      POSTGRES_DB: hfs
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hfs"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: hfs-minio
+      MINIO_ROOT_PASSWORD: hfs-minio-secret
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  # Creates the export bucket on startup.
+  minio-bootstrap:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 hfs-minio hfs-minio-secret &&
+        mc mb -p local/hfs-export || true
+      "
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.1
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    volumes:
+      - ../keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
+    ports:
+      - "8180:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080; echo OK >&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  hfs:
+    build:
+      context: ../..
+      args:
+        BINARY_NAME: hfs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+    environment:
+      HFS_SERVER_HOST: 0.0.0.0
+      HFS_SERVER_PORT: 8080
+      HFS_BASE_URL: http://localhost:8080
+      HFS_STORAGE_BACKEND: postgres
+      HFS_DATABASE_URL: postgresql://hfs:hfs@postgres/hfs
+      # Bulk export wired to Postgres job state + S3 (MinIO) output.
+      HFS_BULK_EXPORT_ENABLED: "true"
+      HFS_BULK_EXPORT_BACKEND: postgres-s3
+      HFS_BULK_EXPORT_DATABASE_URL: postgresql://hfs:hfs@postgres/hfs
+      HFS_BULK_EXPORT_OUTPUT_BACKEND: s3
+      HFS_BULK_EXPORT_S3_BUCKET: hfs-export
+      HFS_BULK_EXPORT_S3_ENDPOINT: http://minio:9000
+      HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE: "true"
+      HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN: "false"
+      AWS_ACCESS_KEY_ID: hfs-minio
+      AWS_SECRET_ACCESS_KEY: hfs-minio-secret
+      AWS_REGION: us-east-1
+    ports:
+      - "8080:8080"

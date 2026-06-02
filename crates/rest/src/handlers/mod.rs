@@ -16,6 +16,7 @@
 //! - [`health`] - Health check endpoint
 
 pub mod batch;
+pub mod bulk_export;
 pub mod capabilities;
 pub mod compartment;
 pub mod create;
@@ -53,6 +54,10 @@ pub(crate) fn extract_patient_from_resource(
 
 // Re-export handlers for convenience
 pub use batch::batch_handler;
+pub use bulk_export::{
+    export_cancel_handler, export_download_handler, export_status_handler,
+    group_export_kickoff_handler, patient_export_kickoff_handler, system_export_kickoff_handler,
+};
 pub use capabilities::capabilities_handler;
 pub use compartment::compartment_search_handler;
 pub use create::create_handler;

@@ -12,6 +12,7 @@ use axum::{
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
+    SystemHistoryProvider, TypeHistoryProvider,
 };
 use tower::ServiceExt;
 
@@ -58,7 +59,12 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -77,7 +83,12 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -95,7 +106,12 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -118,7 +134,12 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -180,7 +201,12 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -198,6 +224,30 @@ where
         )
         .route("/_history", get(handlers::history_system_handler::<S>))
         .route("/", post(handlers::batch_handler::<S>))
+        // Bulk Data Export ($export) — operation routes precede the catch-all.
+        .route(
+            "/$export",
+            get(handlers::system_export_kickoff_handler::<S>)
+                .post(handlers::system_export_kickoff_handler::<S>),
+        )
+        .route(
+            "/Patient/$export",
+            get(handlers::patient_export_kickoff_handler::<S>)
+                .post(handlers::patient_export_kickoff_handler::<S>),
+        )
+        .route(
+            "/Group/{id}/$export",
+            get(handlers::group_export_kickoff_handler::<S>)
+                .post(handlers::group_export_kickoff_handler::<S>),
+        )
+        .route(
+            "/export-status/{job_id}",
+            get(handlers::export_status_handler::<S>).delete(handlers::export_cancel_handler::<S>),
+        )
+        .route(
+            "/export-file/{job_id}/{part}",
+            get(handlers::export_download_handler::<S>),
+        )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))
         .route("/{resource_type}", post(handlers::create_handler::<S>))

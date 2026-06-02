@@ -547,6 +547,13 @@ pub enum BulkExportError {
         /// Configured concurrency cap.
         max_concurrent: u32,
     },
+
+    /// The worker lease for this job was lost (reclaimed by another worker).
+    #[error("export job {job_id} lease lost (reclaimed by another worker)")]
+    LeaseLost {
+        /// Identifier of the job whose lease was lost.
+        job_id: String,
+    },
 }
 
 /// Errors related to bulk submit operations.

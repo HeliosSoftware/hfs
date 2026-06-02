@@ -78,6 +78,9 @@ parking_lot = "0.12"
 # Error handling
 anyhow = "1.0"
 async-trait = "0.1"
+
+# Time (used by the bulk-export cleanup task)
+chrono = "0.4"
 serde_json = "1"
 
 # Vendor OpenSSL when cross-compiling for Linux ARM64 (the macOS runner

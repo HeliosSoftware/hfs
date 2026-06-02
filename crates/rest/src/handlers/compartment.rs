@@ -14,41 +14,12 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor, build_search_query_from_map};
 use crate::state::AppState;
-
-/// Returns compartment search parameters for a specific FHIR version.
-///
-/// This function dispatches to the version-specific generated compartment lookup
-/// functions in the helios_fhir crate. The compartment definitions are generated
-/// from the official FHIR CompartmentDefinition resources.
-///
-/// # Arguments
-///
-/// * `version` - The FHIR version to use for lookup
-/// * `compartment_type` - The compartment type (e.g., "Patient", "Encounter")
-/// * `resource_type` - The target resource type (e.g., "Observation")
-///
-/// # Returns
-///
-/// A static slice of search parameter names that link the resource to the compartment.
-/// Returns an empty slice if the resource is not a member of the compartment.
-fn get_compartment_params_for_version(
-    version: FhirVersion,
-    compartment_type: &str,
-    resource_type: &str,
-) -> Result<&'static [&'static str], String> {
-    Ok(helios_fhir::compartment_params(
-        version,
-        compartment_type,
-        resource_type,
-    ))
-}
 
 /// Handler for compartment search.
 ///
@@ -89,8 +60,7 @@ where
     // Get the reference parameters for this compartment/target combination
     let fhir_version = version.storage_version();
     let ref_params =
-        get_compartment_params_for_version(fhir_version, &compartment_type, &target_type)
-            .map_err(|message| RestError::InternalError { message })?;
+        helios_fhir::get_compartment_params(fhir_version, &compartment_type, &target_type);
 
     // Check if the resource type is a member of the compartment
     if ref_params.is_empty() {
@@ -276,13 +246,13 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_fhir::FhirVersion;
 
     #[test]
     fn test_get_compartment_params_patient_observation() {
         // Test that Patient compartment includes Observation with subject and performer params
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Patient", "Observation")
-                .unwrap();
+            helios_fhir::get_compartment_params(FhirVersion::default(), "Patient", "Observation");
         assert!(!params.is_empty());
         assert!(params.contains(&"subject"));
     }
@@ -291,8 +261,7 @@ mod tests {
     fn test_get_compartment_params_patient_immunization() {
         // Test that Patient compartment includes Immunization with patient param
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Patient", "Immunization")
-                .unwrap();
+            helios_fhir::get_compartment_params(FhirVersion::default(), "Patient", "Immunization");
         assert!(!params.is_empty());
         assert!(params.contains(&"patient"));
     }
@@ -301,8 +270,7 @@ mod tests {
     fn test_get_compartment_params_encounter_procedure() {
         // Test that Encounter compartment includes Procedure with encounter param
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Encounter", "Procedure")
-                .unwrap();
+            helios_fhir::get_compartment_params(FhirVersion::default(), "Encounter", "Procedure");
         assert!(!params.is_empty());
         assert!(params.contains(&"encounter"));
     }
@@ -311,8 +279,7 @@ mod tests {
     fn test_get_compartment_params_unknown() {
         // Test that unknown resource types return an empty slice
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Patient", "UnknownType")
-                .unwrap();
+            helios_fhir::get_compartment_params(FhirVersion::default(), "Patient", "UnknownType");
         assert!(params.is_empty());
     }
 
@@ -320,12 +287,11 @@ mod tests {
     fn test_get_compartment_params_multiple() {
         // Test that some resources have multiple compartment params
         // AllergyIntolerance in Patient compartment has: patient, recorder, asserter
-        let params = get_compartment_params_for_version(
+        let params = helios_fhir::get_compartment_params(
             FhirVersion::default(),
             "Patient",
             "AllergyIntolerance",
-        )
-        .unwrap();
+        );
         assert!(
             params.len() >= 2,
             "Expected multiple params for AllergyIntolerance"

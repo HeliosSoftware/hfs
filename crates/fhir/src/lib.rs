@@ -1981,6 +1981,40 @@ pub fn field_types(
     }
 }
 
+/// Returns the compartment search parameters for a given FHIR version.
+///
+/// This is a version-agnostic dispatch over the per-version
+/// `helios_fhir::{r4,r4b,r5,r6}::get_compartment_params` functions, which are
+/// generated from the official FHIR `CompartmentDefinition` resources.
+///
+/// # Arguments
+///
+/// * `version` - The FHIR version to use for lookup
+/// * `compartment_type` - The compartment type (e.g., "Patient", "Encounter")
+/// * `resource_type` - The target resource type (e.g., "Observation")
+///
+/// # Returns
+///
+/// A static slice of search parameter names that link the resource to the
+/// compartment. Returns an empty slice if the resource is not a member of the
+/// compartment.
+pub fn get_compartment_params(
+    version: FhirVersion,
+    compartment_type: &str,
+    resource_type: &str,
+) -> &'static [&'static str] {
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => r4::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => r4b::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => r5::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => r6::get_compartment_params(compartment_type, resource_type),
+    }
+}
+
 /// Implements `Display` trait for user-friendly output formatting.
 ///
 /// This enables `FhirVersion` to be used in string formatting operations

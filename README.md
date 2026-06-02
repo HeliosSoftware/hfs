@@ -226,22 +226,105 @@ AWS_REGION=us-east-1 \
 
 ### Environment Variables
 
+**Server**
+
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `s3`, or `s3-elasticsearch` |
+| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch` |
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
+| `HFS_BASE_URL` | `http://localhost:8080` | Base URL used in `Location` headers and Bundle links |
 | `HFS_DATABASE_URL` | `fhir.db` | Database URL (SQLite path or PostgreSQL connection string) |
+| `HFS_DATA_DIR` | `./data` | Directory containing FHIR data files (search parameters) |
 | `HFS_DEFAULT_FHIR_VERSION` | `R4` | FHIR version (R4, R4B, R5, R6) |
 | `HFS_LOG_LEVEL` | `info` | Log level (error, warn, info, debug, trace) |
+
+**Limits & behavior**
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_MAX_BODY_SIZE` | `10485760` | Max request body size (bytes) |
+| `HFS_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
+| `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
+| `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
+| `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
+| `HFS_RETURN_GONE` | `true` | Return `410 Gone` for deleted resources (vs `404`) |
+| `HFS_REQUIRE_IF_MATCH` | `false` | Require `If-Match` header for updates |
+
+**CORS**
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_ENABLE_CORS` | `true` | Enable CORS |
+| `HFS_CORS_ORIGINS` | `*` | Allowed origins |
+| `HFS_CORS_METHODS` | `GET,POST,PUT,PATCH,DELETE,OPTIONS` | Allowed methods |
+| `HFS_CORS_HEADERS` | `Content-Type,Authorization,Accept,…` | Allowed headers |
+
+**Multi-tenancy**
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_DEFAULT_TENANT` | `default` | Default tenant ID for requests without an `X-Tenant-ID` header |
+| `HFS_TENANT_ROUTING_MODE` | `header_only` | Tenant routing: `header_only`, `url_path`, or `both` |
+| `HFS_TENANT_STRICT_VALIDATION` | `false` | Error if URL and header tenant disagree |
+| `HFS_JWT_TENANT_CLAIM` | `tenant_id` | JWT claim name for tenant |
+
+**Terminology**
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_TERMINOLOGY_SERVER` | *(none)* | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions (`memberOf`, `subsumes`) |
+
+**Elasticsearch**
+
+| Variable | Default | Description |
+|---|---|---|
 | `HFS_ELASTICSEARCH_NODES` | `http://localhost:9200` | Comma-separated ES node URLs |
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | ES index name prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | *(none)* | ES basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | ES basic auth password |
+
+**PostgreSQL** (used to assemble a connection when `HFS_DATABASE_URL` is not set)
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_PG_HOST` | `localhost` | PostgreSQL host |
+| `HFS_PG_PORT` | `5432` | PostgreSQL port |
+| `HFS_PG_DBNAME` | `helios` | Database name |
+| `HFS_PG_USER` | `helios` | Database user |
+| `HFS_PG_PASSWORD` | *(none)* | Database password |
+| `HFS_PG_MAX_CONNECTIONS` | `10` | Connection pool size |
+
+**MongoDB**
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_MONGODB_URL` / `HFS_MONGODB_URI` | *(none)* | MongoDB connection string |
+| `HFS_MONGODB_DATABASE` | `helios` | Database name |
+| `HFS_MONGODB_MAX_CONNECTIONS` | `10` | Connection pool size |
+| `HFS_MONGODB_CONNECT_TIMEOUT_MS` | `5000` | Connection timeout (ms) |
+
+**S3**
+
+| Variable | Default | Description |
+|---|---|---|
 | `HFS_S3_BUCKET` | `hfs` | S3 bucket name (prefix-per-tenant mode) |
 | `HFS_S3_REGION` | *(AWS provider chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix prepended to all S3 object keys |
+| `HFS_S3_ENDPOINT` | *(AWS)* | S3-compatible endpoint URL (e.g. MinIO `http://localhost:9000`) |
+| `HFS_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing (required by MinIO and most S3-compatible providers) |
+| `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure `http://` endpoint URLs (only relevant when `HFS_S3_ENDPOINT` is set) |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
+
+**Authentication & SMART-on-FHIR**
+
+JWT/bearer auth (`HFS_AUTH_*`, e.g. `HFS_AUTH_ENABLED`, `HFS_AUTH_JWKS_URL`, `HFS_AUTH_ISSUER`, `HFS_AUTH_AUDIENCE`) and SMART configuration endpoints (`HFS_SMART_*`) plus `HFS_OUTBOUND_BEARER_TOKEN` are documented in the [helios-auth README](crates/auth/README.md).
+
+**Audit, subscriptions & bulk export**
+
+| Variable | Default | Description |
+|---|---|---|
 | `HFS_AUDIT_BACKEND` | `none` | [Audit backend](crates/audit/README.md#audit-sinks): `none`, `file`, `database`, or `cloudwatch` |
 | `HFS_AUDIT_FILE_PATH` | *(none)* | Required when `HFS_AUDIT_BACKEND=file`; NDJSON file path for persisted `AuditEvent` logs |
 | `HFS_AUDIT_DATABASE_URL` | *(none)* | Optional dedicated audit database URL/path (SQLite/PostgreSQL/MongoDB families) |
@@ -259,6 +342,10 @@ AWS_REGION=us-east-1 \
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel |
 | `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers |
 | `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow subscription deliveries to private or loopback endpoints; intended for local development and CI only |
+| `HFS_BULK_EXPORT_ENABLED` | `true` | Enable the [Bulk Data Export](crates/rest/README.md#bulk-data-export) `$export` operation; when `false`, all `$export` endpoints return `501` |
+| `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Bulk export output store: `local-fs` or `s3`. See the [rest crate README](crates/rest/README.md#bulk-data-export) for the full `HFS_BULK_EXPORT_*` table |
+
+The SMTP delivery channel (`HFS_SUBSCRIPTION_SMTP_*`) and delivery-retry tuning (`HFS_SUBSCRIPTION_HANDSHAKE_*`) are documented in the [helios-subscriptions README](crates/subscriptions/README.md).
 
 For detailed backend setup instructions (building from source, Docker commands, and search offloading architecture), see the [persistence crate documentation](crates/persistence/README.md#building--running-storage-backends).
 
@@ -352,7 +439,7 @@ Helper macros for code generation used by other components.
 Common types and traits for FHIRPath evaluation.
 
 ### 11. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
-Storage backend abstraction supporting multiple database technologies optimized for different FHIR workloads.
+Storage backend abstraction supporting multiple database technologies optimized for different FHIR workloads. Also hosts the [Bulk Data Export](crates/persistence/README.md) job-state stores, worker runtime, and output stores backing the server's `$export` operation (REST endpoints and `HFS_BULK_EXPORT_*` configuration live in [`helios-rest`](crates/rest/README.md#bulk-data-export)).
 
 ### 12. [`helios-audit`](crates/audit) - BALP Audit Logging
 [IHE BALP](https://profiles.ihe.net/ITI/BALP/)-compliant `AuditEvent` logging for REST, auth, persistence, and lifecycle events. Supports file, database, and AWS CloudWatch Logs sinks. See the [helios-audit README](crates/audit/README.md) for full configuration details.
@@ -391,6 +478,7 @@ Storage backend abstraction supporting multiple database technologies optimized 
 - Search with chained parameters
 - History and versioning
 - Batch/transaction support
+- Asynchronous [Bulk Data Export](crates/rest/README.md#bulk-data-export) (`$export`) at system, Patient, and Group level
 - Optional BALP-compliant `AuditEvent` logging for REST and auth interactions
 
 # Development

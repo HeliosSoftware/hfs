@@ -36,7 +36,7 @@ pub mod scope;
 pub use config::AuthConfig;
 pub use discovery::SmartConfiguration;
 pub use error::{AuthError, FhirOperation};
-pub use jti::{JtiCache, memory::InMemoryJtiCache};
+pub use jti::{DisabledJtiCache, JtiCache, memory::InMemoryJtiCache};
 pub use jwks::JwksCache;
 pub use outbound::{
     NoOpOutboundAuthProvider, OutboundAuthProvider, StaticBearerOutboundAuthProvider,

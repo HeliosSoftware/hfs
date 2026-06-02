@@ -101,14 +101,6 @@ impl S3Backend {
             .map_err(|e| self.map_client_error(e))
     }
 
-    /// Deletes the object at `key`. Succeeds silently if the key does not exist.
-    pub(crate) async fn delete_object(&self, bucket: &str, key: &str) -> StorageResult<()> {
-        self.client
-            .delete_object(bucket, key)
-            .await
-            .map_err(|e| self.map_client_error(e))
-    }
-
     /// Downloads and deserialises a JSON object, returning `None` if not found.
     pub(crate) async fn get_json_object<T: DeserializeOwned>(
         &self,

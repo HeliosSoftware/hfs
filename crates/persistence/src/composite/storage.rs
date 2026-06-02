@@ -46,9 +46,11 @@ use crate::core::history::HistoryParams;
 use crate::core::{
     BundleEntry, BundleProvider, BundleResult, CapabilityProvider, ChainedSearchProvider,
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
-    ConditionalUpdateResult, IncludeProvider, InstanceHistoryProvider, PatchFormat,
+    ConditionalUpdateResult, ExportDataProvider, ExportRequest, GroupExportProvider,
+    IncludeProvider, InstanceHistoryProvider, NdjsonBatch, PatchFormat, PatientExportProvider,
     ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, StorageCapabilities,
-    TerminologySearchProvider, TextSearchProvider, VersionedStorage,
+    SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider, TypeHistoryProvider,
+    VersionedStorage,
 };
 use crate::error::{BackendError, StorageError, StorageResult, TransactionError};
 use crate::tenant::TenantContext;
@@ -77,8 +79,14 @@ pub type DynVersionedStorage = Arc<dyn VersionedStorage + Send + Sync>;
 /// A dynamically typed instance history provider.
 pub type DynInstanceHistoryProvider = Arc<dyn InstanceHistoryProvider + Send + Sync>;
 
+/// A dynamically typed system history provider (also covers Type + Instance).
+pub type DynSystemHistoryProvider = Arc<dyn SystemHistoryProvider + Send + Sync>;
+
 /// A dynamically typed bundle provider.
 pub type DynBundleProvider = Arc<dyn BundleProvider + Send + Sync>;
+
+/// A dynamically typed group export provider (also covers Patient + System).
+pub type DynGroupExportProvider = Arc<dyn GroupExportProvider + Send + Sync>;
 
 /// Composite storage that coordinates multiple backends.
 ///
@@ -126,8 +134,14 @@ pub struct CompositeStorage {
     /// Primary as InstanceHistoryProvider (if supported).
     history_provider: Option<DynInstanceHistoryProvider>,
 
+    /// Primary as SystemHistoryProvider (if supported) — covers Type + System history.
+    system_history_provider: Option<DynSystemHistoryProvider>,
+
     /// Primary as BundleProvider (if supported).
     bundle_provider: Option<DynBundleProvider>,
+
+    /// Primary as GroupExportProvider (if supported) — covers all export levels.
+    export_provider: Option<DynGroupExportProvider>,
 }
 
 /// Health status for a backend.
@@ -284,7 +298,9 @@ impl CompositeStorage {
             conditional_storage: None,
             versioned_storage: None,
             history_provider: None,
+            system_history_provider: None,
             bundle_provider: None,
+            export_provider: None,
         })
     }
 
@@ -335,7 +351,10 @@ impl CompositeStorage {
             + ConditionalStorage
             + VersionedStorage
             + InstanceHistoryProvider
+            + TypeHistoryProvider
+            + SystemHistoryProvider
             + BundleProvider
+            + GroupExportProvider
             + Send
             + Sync
             + 'static,
@@ -343,7 +362,9 @@ impl CompositeStorage {
         self.conditional_storage = Some(primary.clone() as DynConditionalStorage);
         self.versioned_storage = Some(primary.clone() as DynVersionedStorage);
         self.history_provider = Some(primary.clone() as DynInstanceHistoryProvider);
-        self.bundle_provider = Some(primary as DynBundleProvider);
+        self.system_history_provider = Some(primary.clone() as DynSystemHistoryProvider);
+        self.bundle_provider = Some(primary.clone() as DynBundleProvider);
+        self.export_provider = Some(primary as DynGroupExportProvider);
         self
     }
 
@@ -1395,6 +1416,69 @@ impl InstanceHistoryProvider for CompositeStorage {
 }
 
 #[async_trait]
+impl TypeHistoryProvider for CompositeStorage {
+    async fn history_type(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        params: &HistoryParams,
+    ) -> StorageResult<crate::core::HistoryPage> {
+        let provider = self.system_history_provider.as_ref().ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "TypeHistoryProvider".to_string(),
+            })
+        })?;
+
+        provider.history_type(tenant, resource_type, params).await
+    }
+
+    async fn history_type_count(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        let provider = self.system_history_provider.as_ref().ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "TypeHistoryProvider".to_string(),
+            })
+        })?;
+
+        provider.history_type_count(tenant, resource_type).await
+    }
+}
+
+#[async_trait]
+impl SystemHistoryProvider for CompositeStorage {
+    async fn history_system(
+        &self,
+        tenant: &TenantContext,
+        params: &HistoryParams,
+    ) -> StorageResult<crate::core::HistoryPage> {
+        let provider = self.system_history_provider.as_ref().ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "SystemHistoryProvider".to_string(),
+            })
+        })?;
+
+        provider.history_system(tenant, params).await
+    }
+
+    async fn history_system_count(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        let provider = self.system_history_provider.as_ref().ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "SystemHistoryProvider".to_string(),
+            })
+        })?;
+
+        provider.history_system_count(tenant).await
+    }
+}
+
+#[async_trait]
 impl BundleProvider for CompositeStorage {
     async fn process_transaction(
         &self,
@@ -2003,6 +2087,130 @@ impl CapabilityProvider for CompositeStorage {
     }
 
     // resource_capabilities uses the default implementation that returns Option<ResourceCapabilities>
+}
+
+/// Returns an `UnsupportedCapability` error for export operations when the
+/// primary backend does not implement the export provider traits.
+fn export_unsupported() -> StorageError {
+    StorageError::Backend(BackendError::UnsupportedCapability {
+        backend_name: "composite".to_string(),
+        capability: "bulk-export".to_string(),
+    })
+}
+
+#[async_trait]
+impl ExportDataProvider for CompositeStorage {
+    async fn list_export_types(
+        &self,
+        tenant: &TenantContext,
+        request: &ExportRequest,
+    ) -> StorageResult<Vec<String>> {
+        match &self.export_provider {
+            Some(p) => p.list_export_types(tenant, request).await,
+            None => Err(export_unsupported()),
+        }
+    }
+
+    async fn count_export_resources(
+        &self,
+        tenant: &TenantContext,
+        request: &ExportRequest,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        match &self.export_provider {
+            Some(p) => {
+                p.count_export_resources(tenant, request, resource_type)
+                    .await
+            }
+            None => Err(export_unsupported()),
+        }
+    }
+
+    async fn fetch_export_batch(
+        &self,
+        tenant: &TenantContext,
+        request: &ExportRequest,
+        resource_type: &str,
+        cursor: Option<&str>,
+        batch_size: u32,
+    ) -> StorageResult<NdjsonBatch> {
+        match &self.export_provider {
+            Some(p) => {
+                p.fetch_export_batch(tenant, request, resource_type, cursor, batch_size)
+                    .await
+            }
+            None => Err(export_unsupported()),
+        }
+    }
+}
+
+#[async_trait]
+impl PatientExportProvider for CompositeStorage {
+    async fn list_patient_ids(
+        &self,
+        tenant: &TenantContext,
+        request: &ExportRequest,
+        cursor: Option<&str>,
+        batch_size: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        match &self.export_provider {
+            Some(p) => {
+                p.list_patient_ids(tenant, request, cursor, batch_size)
+                    .await
+            }
+            None => Err(export_unsupported()),
+        }
+    }
+
+    async fn fetch_patient_compartment_batch(
+        &self,
+        tenant: &TenantContext,
+        request: &ExportRequest,
+        resource_type: &str,
+        patient_ids: &[String],
+        cursor: Option<&str>,
+        batch_size: u32,
+    ) -> StorageResult<NdjsonBatch> {
+        match &self.export_provider {
+            Some(p) => {
+                p.fetch_patient_compartment_batch(
+                    tenant,
+                    request,
+                    resource_type,
+                    patient_ids,
+                    cursor,
+                    batch_size,
+                )
+                .await
+            }
+            None => Err(export_unsupported()),
+        }
+    }
+}
+
+#[async_trait]
+impl GroupExportProvider for CompositeStorage {
+    async fn get_group_members(
+        &self,
+        tenant: &TenantContext,
+        group_id: &str,
+    ) -> StorageResult<Vec<String>> {
+        match &self.export_provider {
+            Some(p) => p.get_group_members(tenant, group_id).await,
+            None => Err(export_unsupported()),
+        }
+    }
+
+    async fn resolve_group_patient_ids(
+        &self,
+        tenant: &TenantContext,
+        group_id: &str,
+    ) -> StorageResult<Vec<String>> {
+        match &self.export_provider {
+            Some(p) => p.resolve_group_patient_ids(tenant, group_id).await,
+            None => Err(export_unsupported()),
+        }
+    }
 }
 
 #[cfg(test)]

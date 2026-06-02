@@ -117,7 +117,7 @@ All configuration is via environment variables. Auth is a runtime toggle — no 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_AUTH_JTI_BACKEND` | `memory` | JTI cache backend (`memory` or `redis`) |
+| `HFS_AUTH_JTI_BACKEND` | `memory` | JTI cache backend (`memory`, `redis`, or `disabled`) |
 | `HFS_AUTH_REDIS_URL` | *(none)* | Redis URL (required for `redis` backend) |
 | `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Min seconds between JWKS refreshes |
 

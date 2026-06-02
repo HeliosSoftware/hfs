@@ -138,6 +138,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
+pub mod bulk_export_auth;
 pub mod config;
 pub mod error;
 pub mod export;
@@ -163,6 +164,7 @@ use std::sync::Arc;
 use axum::{Router, extract::DefaultBodyLimit};
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
+    SystemHistoryProvider, TypeHistoryProvider,
 };
 use tower::ServiceBuilder;
 use tower_http::{
@@ -196,7 +198,12 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -234,7 +241,12 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -246,6 +258,17 @@ where
         None,
         None,
     )
+}
+
+/// The bulk-export job store, output store, and download authorizer, wired
+/// into [`AppState`] by [`create_app_with_auth_and_bulk_export`].
+pub struct BulkExportBundle {
+    /// Job-state store (claim + worker storage + lifecycle).
+    pub jobs: Arc<dyn helios_persistence::core::BulkExportJobStore>,
+    /// Output store for NDJSON parts.
+    pub output: Arc<dyn helios_persistence::core::ExportOutputStore>,
+    /// Download authorizer.
+    pub file_auth: Arc<dyn bulk_export_auth::ExportFileAuth>,
 }
 
 /// Creates the Axum application with custom configuration and optional authentication.
@@ -267,7 +290,82 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        Arc::new(storage),
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        None,
+    )
+}
+
+/// Like [`create_app_with_auth`], but also wires the bulk-export subsystem
+/// (job store, output store, download authorizer) into the application state.
+pub fn create_app_with_auth_and_bulk_export<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: BulkExportBundle,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        Some(bulk_export),
+    )
+}
+
+/// Internal app builder shared by [`create_app_with_auth`] and
+/// [`create_app_with_auth_and_bulk_export`].
+fn build_app<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -280,8 +378,8 @@ where
         info!("Authentication is ENABLED");
     }
 
-    // Wrap storage in Arc so we can share it with the SofRunner
-    let storage_arc = Arc::new(storage);
+    // Storage arrives pre-wrapped in an Arc so we can share it with the SofRunner.
+    let storage_arc = storage;
 
     let (app_audit_sink, app_audit_source_observer) = audit_state
         .as_ref()
@@ -404,6 +502,13 @@ where
         };
         state = state.with_export_controller(controller);
     }
+
+    // Wire the bulk-export subsystem if provided.
+    let state = match bulk_export {
+        Some(b) => state.with_bulk_export(b.jobs, b.output, b.file_auth),
+        None => state,
+    };
+
     // Inject subscription engine if enabled
     #[cfg(feature = "subscriptions")]
     let state = {
