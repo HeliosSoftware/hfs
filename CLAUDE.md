@@ -713,6 +713,96 @@ for the manual conformance workflow.
 
 ---
 
+## Bulk Data Submit ($bulk-submit)
+
+HFS implements the [FHIR Bulk Data Submit](https://build.fhir.org/ig/HL7/bulk-data/branches/argo25/en/submit.html)
+operation (Argo25 branch) as the **Data Consumer**: a Data Provider POSTs
+`$bulk-submit` referencing a Bulk Export Manifest, and HFS **asynchronously
+fetches** the manifest + NDJSON files and **ingests** them, exposing results via a
+status manifest. The synchronous ingestion engine (`BulkSubmitProvider`) is reused;
+an async worker/lease/fencing layer (mirroring `$export`) drives fetch + ingest.
+
+### Endpoints
+
+| Operation | Method | URL | Response |
+|-----------|--------|-----|----------|
+| kick-off | POST | `/$bulk-submit` | **200** sync-accept (queues ingestion); `429` if blocking; `4XX`+OperationOutcome on validation error |
+| status kick-off | POST | `/$bulk-submit-status` | **202** + `Content-Location` poll URL |
+| poll / manifest | GET | `/bulk-submit-status/{poll_token}` | `202` in-progress (`X-Progress`, `Retry-After`); `200` + status manifest when done; `404` after delete |
+| cancel | DELETE | `/bulk-submit-status/{poll_token}` | `202`; subsequent poll → `404` |
+| HFS-served artifact | GET | `/bulk-submit-file/{poll_token}/{part}` | `200` `application/fhir+ndjson` |
+
+All surfaces require the **`system/bulk-submit`** SMART scope when auth is enabled;
+status/cancel/file additionally enforce submission ownership (`owner_subject`) or a
+system wildcard scope.
+
+### Kick-off `Parameters`
+
+`submitter` (Identifier, required) · `submissionId` (string, required) ·
+`submissionStatus` (Coding `http://hl7.org/fhir/event-status`:
+`in-progress`(default)|`completed`|`stopped`) · `manifestUrl` · `replacesManifestUrl`
+· `outputFormat` · `fhirBaseUrl` (required when `manifestUrl` present) ·
+`fileRequestHeader` (part) · `oauthMetadataUrl` · `fileEncryptionKey` (part) ·
+`metadata` / `import` (parts). At least one of `submissionStatus` / `manifestUrl`
+must be populated.
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_BULK_SUBMIT_ENABLED` | `true` | Master switch — `false` → endpoints `501`. |
+| `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` | Status-artifact store: `local-fs` or `s3`. |
+| `HFS_BULK_SUBMIT_OUTPUT_DIR` | `${HFS_DATA_DIR}/submit` | Local-FS artifact root. |
+| `HFS_BULK_SUBMIT_S3_BUCKET` | (none) | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
+| `HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture (`false` invalid with `local-fs`). |
+| `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit worker count. |
+| `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers. |
+| `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-submission cap (`429`). |
+| `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Ingestion batch size. |
+| `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Manifest lease length, seconds (> heartbeat). |
+| `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
+| `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval, seconds. |
+| `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention, seconds. |
+| `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact URL lifetime, seconds. |
+| `HFS_BULK_SUBMIT_CLIENT_ID` | (none) | OAuth client_id for fetching protected provider files. |
+| `HFS_BULK_SUBMIT_PRIVATE_KEY` | (none) | PEM key for the `private_key_jwt` client assertion. |
+| `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | `ES384` or `RS384`. |
+| `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | **Read** scope requested for file-retrieval tokens (never `system/bulk-submit`). |
+
+Job state reuses the same backend as the FHIR resources (sqlite shares
+`./data/hfs.db`; postgres shares `HFS_DATABASE_URL`). **Bulk submit is available on
+`sqlite` and `postgres` (and their `-elasticsearch` composites);** other backends
+return `501`.
+
+### Behavior notes
+
+- **Data Consumer role:** HFS *fetches* the provider's `manifestUrl` + files; it
+  does not receive pushed data inline.
+- **`requiresAccessToken` files:** HFS acquires a **read-scoped** token via SMART
+  Backend Services (`client_credentials` + `private_key_jwt`) when
+  `HFS_BULK_SUBMIT_CLIENT_ID`/`PRIVATE_KEY` are set; otherwise such fetches record a
+  manifest-level error.
+- **`deleted` files** (transaction Bundles / resource refs) are applied as deletes.
+- **Partial success** stays `200` with a populated `error[]` array of
+  OperationOutcome NDJSON; per-resource issues carry the `artifact-relatedArtifact`
+  extension.
+- **`import` directives:** ingestion is upsert-by-id (last-write-wins), matching the
+  `replace` directive; `merge` semantics are a documented follow-up.
+- **`fileEncryptionKey` (JWE):** decryption of `dir` + `A128GCM`/`A256GCM` compact
+  JWE files is supported when built with the **`bulk-submit-jwe`** feature
+  (`cargo build -p helios-hfs --features bulk-submit-jwe`), treating
+  `fileEncryptionKey.value` as the base64url symmetric key. Without the feature —
+  or for other JWE algorithms — encrypted files record a `not-supported`
+  manifest-level error while unencrypted manifests proceed.
+- **`import` `merge`:** ingestion is upsert-by-id (last-write-wins), which matches
+  the `replace` directive; `merge` semantics are a documented follow-up.
+- **Status `link` / pagination:** HFS returns a single, non-paginated status
+  manifest (the `link` array is always present and empty).
+- **Cleanup:** a periodic task removes status artifacts for submissions whose
+  `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.
+
+---
+
 ## Docker
 
 Generic Dockerfile supporting all server binaries via `BINARY_NAME` build arg:
