@@ -40,19 +40,6 @@ operation contracts:
 - SQL-on-FHIR (ViewDefinition): https://sql-on-fhir.org/ig/latest/
 - CapabilityStatement: https://hl7.org/fhir/capabilitystatement.html
 
-### 1.2 Capability status legend
-
-Each functional requirement is tagged with the current server status, so the
-wireframe reflects reality. Design SHOULD render every area, but flows tagged
-*Stubbed* or *Planned* may be shown as "coming soon" affordances or designed
-ahead of the backend.
-
-- **Live** — implemented in `hfs` today and exercisable over HTTP.
-- **Partial** — infrastructure exists; completeness varies by storage backend.
-- **Stubbed** — route exists but returns `501 Not Implemented`.
-- **Planned** — not in `hfs` today; the UI should target it (see §13).
-- **Conditional** — present only when a feature/config switch is enabled.
-
 ---
 
 ## 2. Goals and non-goals
@@ -104,7 +91,7 @@ Design implication: most screens have a **"raw" mode** (P1/P2) and a
 
 These apply to the whole application and frame every screen.
 
-### 4.1 Server & capability discovery — **Live**
+### 4.1 Server & capability discovery
 - On load, the UI MUST fetch `GET /metadata` (CapabilityStatement) and
   `GET /$versions` to discover: supported FHIR versions, default version,
   enabled resource types and their interactions, advertised search parameters,
@@ -117,7 +104,7 @@ These apply to the whole application and frame every screen.
 - The UI MUST surface `GET /health`, `GET /_liveness`, `GET /_readiness` status
   (primarily for P2) — e.g. a status indicator with backend name and timestamp.
 
-### 4.2 FHIR version selection — **Live**
+### 4.2 FHIR version selection
 - A global control lets the user pick the active FHIR version among those the
   server enables (R4 / R4B / R5 / R6). The default comes from `$versions`.
 - The selected version MUST flow into requests via the `fhirVersion` media-type
@@ -125,7 +112,7 @@ These apply to the whole application and frame every screen.
 - Resource type lists, search parameters, and forms MUST reflect the active
   version (these differ across versions).
 
-### 4.3 Multi-tenancy — **Live**
+### 4.3 Multi-tenancy
 - A global tenant selector MUST be present. Behavior depends on the server's
   routing mode (`header_only`, `url_path`, `both`):
   - **header_only:** send `X-Tenant-ID: <tenant>` on every request.
@@ -137,7 +124,7 @@ These apply to the whole application and frame every screen.
 - Where the server returns tenant-aware base URLs (in CapabilityStatement and
   Bundle links), the UI MUST use them for follow-up navigation.
 
-### 4.4 Authentication & authorization (SMART on FHIR) — **Conditional / Live**
+### 4.4 Authentication & authorization (SMART on FHIR)
 - The UI MUST read `GET /.well-known/smart-configuration` to detect whether auth
   is enabled and to obtain `authorization_endpoint`, `token_endpoint`,
   `scopes_supported`, and capabilities.
@@ -151,7 +138,7 @@ These apply to the whole application and frame every screen.
 - Exempt endpoints (`/metadata`, `/health`, `/_liveness`, `/_readiness`,
   `/.well-known/smart-configuration`, `/$versions`) are reachable without auth.
 
-### 4.5 Content negotiation & format control — **Live**
+### 4.5 Content negotiation & format control
 - The UI defaults to `application/fhir+json`. When the server advertises XML
   (`feature=xml`), a per-view toggle MAY let P1 users view/edit
   `application/fhir+xml`.
@@ -159,18 +146,18 @@ These apply to the whole application and frame every screen.
   explicitly. NDJSON is used by Bulk Export (§8).
 - The UI MUST display the negotiated `Content-Type` (including `fhirVersion`).
 
-### 4.6 Request/response transparency (developer mode) — **Live**
+### 4.6 Request/response transparency (developer mode)
 - For P1/P2, the UI SHOULD expose, per request: method, full URL (incl. query
   string), request headers/body, response status, response headers (notably
   `ETag`, `Location`, `Content-Location`, `Last-Modified`), and timing.
 - A "copy as cURL" affordance SHOULD be available for any request the UI makes.
 
-### 4.7 Prefer header control — **Live**
+### 4.7 Prefer header control
 - Write screens SHOULD let advanced users choose `Prefer: return=minimal |
   representation | OperationOutcome` and `Prefer: handling=strict | lenient`.
   Sensible defaults: `return=representation`, `handling=lenient`.
 
-### 4.8 Error handling — **Live**
+### 4.8 Error handling
 - All server errors are returned as FHIR `OperationOutcome`. The UI MUST parse
   and present issues legibly: severity, code, human-readable details, and the
   FHIRPath `expression` (path) when present.
@@ -219,7 +206,7 @@ server capabilities detailed in §6–§13.
 The server exposes the standard FHIR REST interactions. The editor and detail
 screens MUST support all of them.
 
-### 6.1 Read — **Live**
+### 6.1 Read
 - `GET /{type}/{id}` — read current version. Render in friendly form (P3) and
   raw JSON/XML (P1). Show `ETag`, `Last-Modified`.
 - `HEAD /{type}/{id}` — headers only (developer utility).
@@ -230,7 +217,7 @@ screens MUST support all of them.
 - Subsetting: support `_summary` (`true|false|text|data|count`) and `_elements`
   on read; show a "SUBSETTED" indicator when the server tags the result.
 
-### 6.2 Create — **Live**
+### 6.2 Create
 - `POST /{type}` — create with server-assigned id. Show resulting `201 Created`
   with `Location` and `ETag`.
 - **Conditional create** via `If-None-Exist: <search params>` — the UI MUST let
@@ -238,7 +225,7 @@ screens MUST support all of them.
 - Note: `AuditEvent` is immutable and cannot be created/updated/deleted through
   these interactions — the UI MUST disable write actions for it.
 
-### 6.3 Update — **Live**
+### 6.3 Update
 - `PUT /{type}/{id}` — update or create (updateCreate/upsert). Show `200` vs
   `201`.
 - **Optimistic locking** via `If-Match: W/"<versionId>"` — the editor SHOULD send
@@ -247,7 +234,7 @@ screens MUST support all of them.
 - **Conditional update** via `PUT /{type}?<search params>`; handle `412` on
   multiple matches.
 
-### 6.4 Patch — **Live**
+### 6.4 Patch
 - `PATCH /{type}/{id}` with selectable patch format:
   - JSON Patch (RFC 6902) — `application/json-patch+json`
   - JSON Merge Patch (RFC 7386) — `application/merge-patch+json`
@@ -256,12 +243,12 @@ screens MUST support all of them.
   op builder for JSON Patch; a diff/merge editor for Merge Patch). Support
   `If-Match`.
 
-### 6.5 Delete — **Live**
+### 6.5 Delete
 - `DELETE /{type}/{id}` — soft delete; history preserved. Show `204`/`200`.
 - **Conditional delete** via `DELETE /{type}?<search params>` (single-match
   per capability). The UI MUST confirm destructive actions and show what matched.
 
-### 6.6 Response/Prefer handling — **Live**
+### 6.6 Response/Prefer handling
 - Honor §4.7 `Prefer` controls; when `return=minimal`, present a confirmation
   with headers only; when `return=OperationOutcome`, show the outcome.
 
@@ -273,13 +260,13 @@ Search is central for P1, P3, and P4. Two entry points: the **Search Builder**
 (assisted) and a **raw query** input (developer). Both target
 `GET /{type}?...` and `POST /{type}/_search` (form-encoded).
 
-### 7.1 Parameter types — **Live**
+### 7.1 Parameter types
 Support building and editing all FHIR search parameter types the server
 advertises per type: **token, string, reference, date, quantity, number, uri,
 composite, special** (`_id`, `_lastUpdated`, `_tag`, `_profile`, `_security`,
 `_text`, `_content`).
 
-### 7.2 Modifiers — **Live (most)**
+### 7.2 Modifiers
 Expose type-appropriate modifiers in the builder:
 - String: `:exact`, `:contains`
 - Token/uri: `:text`, `:above`, `:below`, `:in`, `:not-in`, `:ofType`,
@@ -291,11 +278,11 @@ Expose type-appropriate modifiers in the builder:
   server** — see §11. The UI SHOULD indicate when a terminology server is
   required and whether one is configured.
 
-### 7.3 Prefixes — **Live**
+### 7.3 Prefixes
 For number/date/quantity values, expose prefixes: `eq, ne, gt, lt, ge, le, sa,
 eb, ap`.
 
-### 7.4 Result controls — **Live**
+### 7.4 Result controls
 - `_count` (default 20, server max 1000), pagination via `_offset`
   (offset-based) and `_cursor` (opaque cursor; used in `next`/`previous`
   Bundle links — the UI MUST follow these links rather than reconstruct them).
@@ -304,12 +291,12 @@ eb, ap`.
 - `_total` (`accurate|estimate|none`) — show `Bundle.total` when present.
 - `_summary` and `_elements` for subsetting result entries.
 
-### 7.5 Includes — **Live**
+### 7.5 Includes
 - `_include` and `_revinclude`, including wildcard `*` and `:iterate`.
 - Included resources arrive as Bundle entries with `search.mode=include`; the UI
   MUST visually distinguish match vs include entries.
 
-### 7.6 Chained & reverse-chained search — **Partial**
+### 7.6 Chained & reverse-chained search
 - Forward chaining (`subject.name=...`) and `_has` reverse chaining are
   supported with backend-dependent completeness. The builder SHOULD allow
   composing chains and `_has`, while signaling these may not be fully supported
@@ -324,7 +311,7 @@ eb, ap`.
 - Show the exact query string used, with "copy as cURL" and "open as raw query".
 - `_summary=count` SHOULD render as a count-only result.
 
-### 7.8 Compartment search — **Live**
+### 7.8 Compartment search
 - `GET /{compartmentType}/{id}/{targetType}` (e.g. `Patient/123/Observation`).
 - Surface in §9 Compartments and as a "related resources" affordance on a
   resource detail view; the server validates compartment membership.
@@ -333,12 +320,12 @@ eb, ap`.
 
 ## 8. History & versioning
 
-### 8.1 Versioning model — **Live**
+### 8.1 Versioning model
 - All resources are versioned; `meta.versionId` drives weak ETags
   (`W/"<versionId>"`). The UI MUST display the current version and use it for
   optimistic locking on write.
 
-### 8.2 History interactions — **Live**
+### 8.2 History interactions
 
 History is implemented end-to-end. Every version is written to a
 `resource_history` table; the backends implement the history-provider traits
@@ -347,16 +334,16 @@ working retrieval, pagination, and `_since` filtering; and the REST read
 handlers are now wired to those providers (`CompositeStorage` delegates type/
 system history to its primary, so the `-elasticsearch` variants work too).
 
-Current per-endpoint status:
+Per-endpoint behavior:
 
-| Endpoint | HTTP method | Status |
-|----------|-------------|--------|
-| Instance history `/{type}/{id}/_history` | GET | **Live** — returns a `type: history` Bundle (404 if the resource never existed) |
-| Type history `/{type}/_history` | GET | **Live** — `type: history` Bundle across the type |
-| System history `/_history` | GET | **Live** — `type: history` Bundle across all types |
-| Version read (vread) `/{type}/{id}/_history/{vid}` | GET | **Live** — returns the resource at that version (404 if the version is unknown) |
-| Delete instance history `/{type}/{id}/_history` (R6 Trial Use) | DELETE | **Live** |
-| Delete a version `/{type}/{id}/_history/{vid}` (R6 Trial Use) | DELETE | **Live** |
+| Endpoint | HTTP method | Behavior |
+|----------|-------------|----------|
+| Instance history `/{type}/{id}/_history` | GET | Returns a `type: history` Bundle (404 if the resource never existed) |
+| Type history `/{type}/_history` | GET | `type: history` Bundle across the type |
+| System history `/_history` | GET | `type: history` Bundle across all types |
+| Version read (vread) `/{type}/{id}/_history/{vid}` | GET | Returns the resource at that version (404 if the version is unknown) |
+| Delete instance history `/{type}/{id}/_history` (R6 Trial Use) | DELETE | Deletes the instance's history |
+| Delete a version `/{type}/{id}/_history/{vid}` (R6 Trial Use) | DELETE | Deletes a single version |
 
 Supported query params on the read endpoints: `_count` (capped at the server
 max page size) and `_since` (an RFC3339 instant; a malformed value returns
@@ -378,7 +365,7 @@ resource body.
 
 ---
 
-## 9. Compartments — **Live**
+## 9. Compartments
 
 - A patient-centric (and general compartment) navigation: given a resource
   (e.g. a Patient), browse all related resources by target type via
@@ -387,7 +374,7 @@ resource body.
 
 ---
 
-## 10. Batch & transaction — **Live**
+## 10. Batch & transaction
 
 - `POST /` with a Bundle of `type: batch` or `type: transaction`.
 - **Batch:** entries processed independently; partial success allowed.
@@ -405,7 +392,7 @@ resource body.
 
 ---
 
-## 11. Terminology integration — **Conditional**
+## 11. Terminology integration
 
 - The server can delegate terminology-dependent search modifiers
   (`:in`, `:not-in`, `:above`, `:below`) and FHIRPath terminology functions to an
@@ -423,7 +410,7 @@ resource body.
 
 ---
 
-## 12. Capability, conformance & metadata — **Live**
+## 12. Capability, conformance & metadata
 
 A dedicated area (and underpinning for §4.1) that exposes:
 - **CapabilityStatement** (`GET /metadata`): rendered human-readably (per-resource
@@ -437,7 +424,7 @@ A dedicated area (and underpinning for §4.1) that exposes:
 
 ---
 
-## 13. SQL-on-FHIR (ViewDefinition & SQLQuery) — **Live (on `feat/sof-integration`)**
+## 13. SQL-on-FHIR (ViewDefinition & SQLQuery)
 
 > SQL-on-FHIR is integrated directly into the `hfs` server on the
 > `feat/sof-integration` branch (richer than the standalone `helios-sof` /
@@ -446,7 +433,7 @@ A dedicated area (and underpinning for §4.1) that exposes:
 > or absolute URL) and/or against inline resources. The UI MUST adapt via the
 > `$sql-on-fhir-capabilities` endpoint, mirroring §4.1.
 
-### 13.1 SoF capability discovery — **Live (branch)**
+### 13.1 SoF capability discovery
 - `GET /$sql-on-fhir-capabilities` returns a `Parameters` resource declaring
   which SoF features are available. The UI MUST read these flags and adapt:
   - `supportsViewDefinitionRun` (always true when SoF is enabled)
@@ -459,7 +446,7 @@ A dedicated area (and underpinning for §4.1) that exposes:
 - These same SoF operations are also advertised on the main CapabilityStatement
   (`rest[0].operation` + a SoF extension block), so §12 MUST surface them.
 
-### 13.2 `$viewdefinition-run` (synchronous tabular run) — **Live (branch)**
+### 13.2 `$viewdefinition-run` (synchronous tabular run)
 Invocable at three levels:
 - System: `POST|GET /$viewdefinition-run`
 - Type (anonymous): `POST|GET /ViewDefinition/$viewdefinition-run`
@@ -473,7 +460,7 @@ ViewDefinition), `viewReference` (relative/canonical/absolute), `resource`
 (inline resources), `patient` (filter by patient reference), `_limit`
 (1–10000), `_since`.
 
-### 13.3 `$sqlquery-run` (SQL over views) — **Live (branch)**
+### 13.3 `$sqlquery-run` (SQL over views)
 - System: `POST /$sqlquery-run`
 - Type: `POST /Library/$sqlquery-run`
 - Instance: `POST /Library/{id}/$sqlquery-run`
@@ -482,7 +469,7 @@ ViewDefinition), `viewReference` (relative/canonical/absolute), `resource`
   be `fhir`-formatted. The UI MUST let users author/select a SQLQuery Library and
   run it, then preview/download results.
 
-### 13.4 `$viewdefinition-export` (asynchronous tabular export) — **Conditional (branch)**
+### 13.4 `$viewdefinition-export` (asynchronous tabular export)
 Available only when an export controller is wired (`supportsViewDefinitionExport`).
 - Kick-off: `POST /$viewdefinition-export` (system),
   `POST /ViewDefinition/$viewdefinition-export` (type),
@@ -512,14 +499,14 @@ Available only when an export controller is wired (`supportsViewDefinitionExport
 
 ---
 
-## 14. Bulk Data Export (`$export`) — **Conditional / Live**
+## 14. Bulk Data Export (`$export`)
 
 Available when `HFS_BULK_EXPORT_ENABLED=true` (default) and on supported
 backends (sqlite, postgres, and their `-elasticsearch` variants today; others
 return `501`). The UI MUST detect availability via CapabilityStatement
 (`instantiates` bulk-data, `$export` operations) and adapt.
 
-### 14.1 Kick-off — **Live**
+### 14.1 Kick-off
 - System: `GET|POST /$export`
 - Patient: `GET|POST /Patient/$export`
 - Group: `GET|POST /Group/{id}/$export`
@@ -541,25 +528,25 @@ return `501`). The UI MUST detect availability via CapabilityStatement
 - Per-tenant concurrency cap: kick-off may return `429` when exceeded — the UI
   MUST surface this and the active-job count.
 
-### 14.2 Monitor — **Live**
+### 14.2 Monitor
 - `GET /export-status/{job_id}` returns progress and, on completion, the manifest
   (`transactionTime`, `request`, `output[]`, `error[]`).
 - The UI MUST provide a **jobs list** (per tenant) with live status/polling, and
   a **job detail** view showing the manifest, output files, and any errors.
 
-### 14.3 Download — **Live**
+### 14.3 Download
 - `GET /export-file/{job_id}/{part}` returns an NDJSON file (HFS-served output).
 - For `local-fs` output the files are HFS-served; for `s3` output the manifest
   may contain pre-signed URLs. The UI MUST handle both: list each `output[]`
   entry by type and offer download.
 
-### 14.4 Cancel / delete — **Live**
+### 14.4 Cancel / delete
 - `DELETE /export-status/{job_id}` cancels a running job and deletes output.
   Confirm destructive action.
 
 ---
 
-## 15. Subscriptions — **Conditional (feature `subscriptions`)**
+## 15. Subscriptions
 
 When built/enabled, the server exposes:
 - `GET /Subscription/{id}/$status` — status (SubscriptionStatus/Parameters)
@@ -619,21 +606,21 @@ delivers, but may scaffold UI ahead of them (clearly marked).
 
 - **History & vread:** now fully wired end-to-end — instance/type/system history
   and vread return proper Bundles/resources, including on the `-elasticsearch`
-  composite variants. R6 Trial Use delete-history / delete-version also Live.
-  *Live (§8.2).*
-- **Chained / `_has` search:** backend-dependent completeness (§7.6). *Partial.*
-- **No `$validate`, `$everything`, `$graph`, `$document` operations.** *Not present.*
-- **No GraphQL endpoint.** *Not present.*
-- **No user-defined custom `$operations` registration.** *Not present.*
+  composite variants. R6 Trial Use delete-history / delete-version also work
+  (§8.2).
+- **Chained / `_has` search:** backend-dependent completeness (§7.6).
+- **No `$validate`, `$everything`, `$graph`, `$document` operations.**
+- **No GraphQL endpoint.**
+- **No user-defined custom `$operations` registration.**
 - **Subscription delivery to external endpoints** is not implemented in the base
   server (the Subscription resource and `$status`/`$events`/WebSocket exist when
-  the feature is enabled). *Partial/Conditional.*
+  the feature is enabled).
 - **mTLS / OAuth server:** TLS termination and the OAuth/OIDC provider are
   external; the server only validates tokens and points to an external provider
-  via SMART discovery. *External.*
+  via SMART discovery.
 - **SQL-on-FHIR endpoints** are integrated into `hfs` on the
   `feat/sof-integration` branch (§13); availability of each sub-feature is
-  reported by `$sql-on-fhir-capabilities`. *Live (branch) / Conditional.*
+  reported by `$sql-on-fhir-capabilities`.
 - **S3-only backend has no search**; some backends don't support bulk export.
   The UI MUST adapt to advertised capabilities rather than assume all features.
 
@@ -673,5 +660,4 @@ delivers, but may scaffold UI ahead of them (clearly marked).
 ---
 
 *End of requirements. Next step: feed this document into Claude Design to
-produce wireframes for the screens in §5, honoring the capability-status tags so
-the design reflects what `hfs` can do today versus what is planned.*
+produce wireframes for the screens in §5.*
