@@ -8,10 +8,12 @@ use std::sync::Arc;
 
 use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
-use helios_persistence::core::{BulkExportJobStore, ExportOutputStore, ResourceStorage};
+use helios_persistence::core::{
+    BulkExportJobStore, BulkSubmitJobStore, ExportOutputStore, ResourceStorage, SubmitInputFetcher,
+};
 
 use crate::bulk_export_auth::ExportFileAuth;
-use crate::config::{BulkExportConfig, ServerConfig};
+use crate::config::{BulkExportConfig, BulkSubmitConfig, ServerConfig};
 use crate::middleware::auth::AuthMiddlewareState;
 
 /// Shared application state for the REST API.
@@ -68,6 +70,21 @@ pub struct AppState<S> {
 
     /// Bulk export configuration.
     bulk_export_config: Arc<BulkExportConfig>,
+
+    /// Bulk submit job-state store (claim + worker storage + lifecycle).
+    bulk_submit_jobs: Option<Arc<dyn BulkSubmitJobStore>>,
+
+    /// Bulk submit remote input fetcher (manifest + NDJSON retrieval).
+    bulk_submit_fetcher: Option<Arc<dyn SubmitInputFetcher>>,
+
+    /// Bulk submit output store (status-manifest output/error/deleted artifacts).
+    bulk_submit_output: Option<Arc<dyn ExportOutputStore>>,
+
+    /// Bulk submit download authorizer (reuses the export file-auth trait).
+    bulk_submit_file_auth: Option<Arc<dyn ExportFileAuth>>,
+
+    /// Bulk submit configuration.
+    bulk_submit_config: Arc<BulkSubmitConfig>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -86,6 +103,11 @@ impl<S> Clone for AppState<S> {
             bulk_export_output: self.bulk_export_output.clone(),
             bulk_export_file_auth: self.bulk_export_file_auth.clone(),
             bulk_export_config: Arc::clone(&self.bulk_export_config),
+            bulk_submit_jobs: self.bulk_submit_jobs.clone(),
+            bulk_submit_fetcher: self.bulk_submit_fetcher.clone(),
+            bulk_submit_output: self.bulk_submit_output.clone(),
+            bulk_submit_file_auth: self.bulk_submit_file_auth.clone(),
+            bulk_submit_config: Arc::clone(&self.bulk_submit_config),
         }
     }
 }
@@ -99,6 +121,7 @@ impl<S: ResourceStorage> AppState<S> {
     /// * `config` - Server configuration
     pub fn new(storage: Arc<S>, config: ServerConfig) -> Self {
         let bulk_export_config = Arc::new(config.bulk_export.clone());
+        let bulk_submit_config = Arc::new(config.bulk_submit.clone());
         Self {
             storage,
             config: Arc::new(config),
@@ -112,6 +135,11 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_export_output: None,
             bulk_export_file_auth: None,
             bulk_export_config,
+            bulk_submit_jobs: None,
+            bulk_submit_fetcher: None,
+            bulk_submit_output: None,
+            bulk_submit_file_auth: None,
+            bulk_submit_config,
         }
     }
 
@@ -135,6 +163,7 @@ impl<S: ResourceStorage> AppState<S> {
         audit_source_observer: impl Into<String>,
     ) -> Self {
         let bulk_export_config = Arc::new(config.bulk_export.clone());
+        let bulk_submit_config = Arc::new(config.bulk_submit.clone());
         Self {
             storage,
             config: Arc::new(config),
@@ -148,6 +177,11 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_export_output: None,
             bulk_export_file_auth: None,
             bulk_export_config,
+            bulk_submit_jobs: None,
+            bulk_submit_fetcher: None,
+            bulk_submit_output: None,
+            bulk_submit_file_auth: None,
+            bulk_submit_config,
         }
     }
 
@@ -182,6 +216,46 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns the bulk-export configuration.
     pub fn bulk_export_config(&self) -> &BulkExportConfig {
         &self.bulk_export_config
+    }
+
+    /// Wires the bulk-submit job store, input fetcher, output store, and file authorizer.
+    pub fn with_bulk_submit(
+        mut self,
+        jobs: Arc<dyn BulkSubmitJobStore>,
+        fetcher: Arc<dyn SubmitInputFetcher>,
+        output: Arc<dyn ExportOutputStore>,
+        file_auth: Arc<dyn ExportFileAuth>,
+    ) -> Self {
+        self.bulk_submit_jobs = Some(jobs);
+        self.bulk_submit_fetcher = Some(fetcher);
+        self.bulk_submit_output = Some(output);
+        self.bulk_submit_file_auth = Some(file_auth);
+        self
+    }
+
+    /// Returns the bulk-submit job store, if configured.
+    pub fn bulk_submit_jobs(&self) -> Option<&Arc<dyn BulkSubmitJobStore>> {
+        self.bulk_submit_jobs.as_ref()
+    }
+
+    /// Returns the bulk-submit input fetcher, if configured.
+    pub fn bulk_submit_fetcher(&self) -> Option<&Arc<dyn SubmitInputFetcher>> {
+        self.bulk_submit_fetcher.as_ref()
+    }
+
+    /// Returns the bulk-submit output store, if configured.
+    pub fn bulk_submit_output(&self) -> Option<&Arc<dyn ExportOutputStore>> {
+        self.bulk_submit_output.as_ref()
+    }
+
+    /// Returns the bulk-submit download authorizer, if configured.
+    pub fn bulk_submit_file_auth(&self) -> Option<&Arc<dyn ExportFileAuth>> {
+        self.bulk_submit_file_auth.as_ref()
+    }
+
+    /// Returns the bulk-submit configuration.
+    pub fn bulk_submit_config(&self) -> &BulkSubmitConfig {
+        &self.bulk_submit_config
     }
 
     /// Sets the subscription engine on this AppState.
