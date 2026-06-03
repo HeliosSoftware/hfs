@@ -39,6 +39,9 @@ redis = ["helios-rest/redis", "helios-auth/redis"]
 # Subscriptions
 subscriptions = ["helios-rest/subscriptions", "dep:helios-subscriptions"]
 
+# Bulk-submit JWE file decryption (dir + A128/A256GCM)
+bulk-submit-jwe = ["helios-rest/bulk-submit-jwe"]
+
 # Cloud audit backends
 cloudwatch = ["helios-audit/cloudwatch"]
 
