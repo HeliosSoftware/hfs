@@ -94,6 +94,8 @@ pub mod bulk_export;
 pub mod bulk_export_output;
 pub mod bulk_export_worker;
 pub mod bulk_submit;
+pub mod bulk_submit_input;
+pub mod bulk_submit_worker;
 pub mod capabilities;
 pub mod history;
 pub mod search;
@@ -121,6 +123,13 @@ pub use bulk_submit::{
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestStatus, NdjsonEntry,
     StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
     SubmissionManifest, SubmissionStatus, SubmissionSummary,
+};
+pub use bulk_submit_input::{
+    FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
+};
+pub use bulk_submit_worker::{
+    BulkSubmitJobStore, DefaultSubmitWorker, ManifestLease, ManifestWorkerView, PollTokenTarget,
+    SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
 pub use capabilities::{
     CapabilityProvider, GlobalSearchCapabilities, Interaction, ResourceCapabilities,
