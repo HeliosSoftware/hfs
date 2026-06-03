@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Initialize the database schema.
 pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
@@ -270,6 +270,7 @@ async fn migrate_schema(
             5 => migrate_v5_to_v6(client).await?,
             6 => migrate_v6_to_v7(client).await?,
             7 => migrate_v7_to_v8(client).await?,
+            8 => migrate_v8_to_v9(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -626,6 +627,79 @@ async fn migrate_v7_to_v8(client: &deadpool_postgres::Client) -> StorageResult<(
             .execute(*sql, &[])
             .await
             .map_err(|e| pg_error(format!("Migration v7->v8 index failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// Migrate from schema version 8 to version 9.
+///
+/// Adds the async Bulk Data Submit worker layer on top of the existing
+/// synchronous bulk-submit ingestion tables (mirrors the SQLite v8->v9 migration).
+async fn migrate_v8_to_v9(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let migrations = [
+        // bulk_submissions: REST status + auth columns.
+        "ALTER TABLE bulk_submissions ADD COLUMN IF NOT EXISTS owner_subject TEXT",
+        "ALTER TABLE bulk_submissions ADD COLUMN IF NOT EXISTS poll_token TEXT",
+        "ALTER TABLE bulk_submissions ADD COLUMN IF NOT EXISTS transaction_time TIMESTAMPTZ",
+        "ALTER TABLE bulk_submissions ADD COLUMN IF NOT EXISTS requires_access_token BOOLEAN",
+        "ALTER TABLE bulk_submissions ADD COLUMN IF NOT EXISTS request_url TEXT",
+        // bulk_manifests: worker lease/fencing + kickoff parameters + resume cursor.
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS worker_id TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS lease_expiry TIMESTAMPTZ",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS fhir_base_url TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS output_format TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS file_request_headers TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS oauth_metadata_urls TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS file_encryption_key TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS last_processed_line BIGINT NOT NULL DEFAULT 0",
+    ];
+    for sql in &migrations {
+        client
+            .execute(*sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v8->v9 failed: {}", e)))?;
+    }
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS bulk_submit_files (
+                id BIGSERIAL PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                submitter TEXT NOT NULL,
+                submission_id TEXT NOT NULL,
+                manifest_url TEXT,
+                file_type TEXT NOT NULL,
+                resource_type TEXT,
+                part_index INTEGER NOT NULL DEFAULT 0,
+                fencing_token BIGINT NOT NULL DEFAULT 0,
+                file_path TEXT NOT NULL,
+                line_count BIGINT NOT NULL DEFAULT 0,
+                byte_count BIGINT NOT NULL DEFAULT 0,
+                count_severity TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                FOREIGN KEY (tenant_id, submitter, submission_id)
+                    REFERENCES bulk_submissions(tenant_id, submitter, submission_id) ON DELETE CASCADE
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create bulk_submit_files: {}", e)))?;
+
+    let indexes = [
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_submissions_poll_token
+         ON bulk_submissions(poll_token)",
+        "CREATE INDEX IF NOT EXISTS idx_bulk_manifests_claim
+         ON bulk_manifests(tenant_id, status, lease_expiry)",
+        "CREATE INDEX IF NOT EXISTS idx_bulk_submit_files_submission
+         ON bulk_submit_files(tenant_id, submitter, submission_id)",
+    ];
+    for sql in &indexes {
+        client
+            .execute(*sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v8->v9 index failed: {}", e)))?;
     }
 
     Ok(())
