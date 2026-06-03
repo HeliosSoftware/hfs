@@ -1,0 +1,192 @@
+name: HFS Bulk Submit External Smoke
+
+# Manual external smoke coverage for HFS Bulk Data Submit ($bulk-submit).
+# HFS is the Data Consumer: a tiny static HTTP server plays the Data Provider,
+# hosting a Bulk Export Manifest + NDJSON. We POST $bulk-submit pointing at it,
+# poll to completion, and assert the resources were ingested. Intentionally
+# separate from Inferno (there is no upstream submit conformance kit yet).
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+
+jobs:
+  build:
+    name: Build HFS with Bulk Submit support
+    runs-on: [self-hosted, Linux]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Configure LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          {
+            echo '[target.x86_64-unknown-linux-gnu]'
+            echo 'linker = "clang"'
+            echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]'
+          } >> ~/.cargo/config.toml
+      - name: Build HFS
+        run: cargo build -p helios-hfs --no-default-features --features R4,postgres
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hfs-bulk-submit-smoke-binary
+          path: target/debug/hfs
+          retention-days: 1
+
+  smoke:
+    name: Bulk Submit round trip (${{ matrix.backend }})
+    needs: build
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite, postgres]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: hfs-bulk-submit-smoke-binary
+          path: target/debug
+      - run: chmod +x target/debug/hfs
+
+      - name: Resolve runner IP
+        run: echo "RUNNER_IP=$(hostname -I | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Start PostgreSQL (postgres backend only)
+        if: matrix.backend == 'postgres'
+        run: |
+          PG="pg-bulk-submit-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$PG" 2>/dev/null || true
+          docker run -d --name "$PG" -p 0:5432 \
+            -e POSTGRES_USER=helios -e POSTGRES_PASSWORD=helios -e POSTGRES_DB=helios \
+            postgres:16
+          echo "PG_CONTAINER=$PG" >> "$GITHUB_ENV"
+          for i in {1..30}; do
+            if docker exec "$PG" pg_isready -U helios >/dev/null 2>&1; then
+              echo "PG_PORT=$(docker port "$PG" 5432 | head -1 | sed 's/.*://')" >> "$GITHUB_ENV"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Stage Data-Provider manifest + NDJSON
+        run: |
+          mkdir -p provider
+          PROVIDER_PORT=18791
+          echo "PROVIDER_PORT=$PROVIDER_PORT" >> "$GITHUB_ENV"
+          BASE="http://$RUNNER_IP:$PROVIDER_PORT"
+          cat > provider/patients.ndjson <<'EOF'
+          {"resourceType":"Patient","id":"submit-smoke-1","name":[{"family":"Submit","given":["Alpha"]}],"gender":"female"}
+          {"resourceType":"Patient","id":"submit-smoke-2","name":[{"family":"Submit","given":["Beta"]}],"gender":"male"}
+          EOF
+          cat > provider/manifest.json <<EOF
+          {
+            "transactionTime": "2024-01-01T00:00:00Z",
+            "request": "$BASE/manifest.json",
+            "requiresAccessToken": false,
+            "output": [
+              { "type": "Patient", "url": "$BASE/patients.ndjson", "count": 2 }
+            ],
+            "error": [],
+            "deleted": []
+          }
+          EOF
+          ( cd provider && nohup python3 -m http.server "$PROVIDER_PORT" --bind 0.0.0.0 >/tmp/provider.log 2>&1 & echo $! > /tmp/provider.pid )
+          sleep 2
+          curl -sf "$BASE/manifest.json" >/dev/null
+
+      - name: Start HFS
+        run: |
+          PORT=18790
+          echo "HFS_PORT=$PORT" >> "$GITHUB_ENV"
+          COMMON="HFS_BASE_URL=http://$RUNNER_IP:$PORT HFS_BULK_SUBMIT_ENABLED=true HFS_BULK_SUBMIT_BATCH_SIZE=100"
+          if [ "${{ matrix.backend }}" = "postgres" ]; then
+            export HFS_STORAGE_BACKEND=postgres
+            export HFS_DATABASE_URL="postgresql://helios:helios@$RUNNER_IP:$PG_PORT/helios"
+          else
+            export HFS_STORAGE_BACKEND=sqlite
+            export HFS_DATABASE_URL="$RUNNER_IP-ignored"
+            rm -f ./data/hfs.db
+          fi
+          env $COMMON ./target/debug/hfs --port "$PORT" --host 0.0.0.0 >/tmp/hfs.log 2>&1 &
+          echo $! > /tmp/hfs.pid
+          for i in {1..30}; do
+            if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then echo "HFS ready"; break; fi
+            sleep 2
+          done
+
+      - name: Kick off $bulk-submit
+        run: |
+          BASE="http://127.0.0.1:$HFS_PORT"
+          PROVIDER="http://$RUNNER_IP:$PROVIDER_PORT"
+          cat > submit.json <<EOF
+          {
+            "resourceType": "Parameters",
+            "parameter": [
+              { "name": "submitter", "valueIdentifier": { "system": "http://example.org", "value": "smoke" } },
+              { "name": "submissionId", "valueString": "smoke-1" },
+              { "name": "manifestUrl", "valueUrl": "$PROVIDER/manifest.json" },
+              { "name": "fhirBaseUrl", "valueUrl": "$PROVIDER/fhir" },
+              { "name": "submissionStatus", "valueCoding": { "system": "http://hl7.org/fhir/event-status", "code": "completed" } }
+            ]
+          }
+          EOF
+          code=$(curl -sS -o submit-resp.json -w "%{http_code}" -X POST "$BASE/\$bulk-submit" \
+            -H "Content-Type: application/fhir+json" --data-binary @submit.json)
+          echo "kickoff HTTP $code"; cat submit-resp.json
+          [ "$code" = "200" ]
+
+      - name: Poll status to completion
+        run: |
+          BASE="http://127.0.0.1:$HFS_PORT"
+          cat > status.json <<'EOF'
+          { "resourceType": "Parameters", "parameter": [
+            { "name": "submitter", "valueIdentifier": { "system": "http://example.org", "value": "smoke" } },
+            { "name": "submissionId", "valueString": "smoke-1" } ] }
+          EOF
+          LOC=$(curl -sS -D - -o /dev/null -X POST "$BASE/\$bulk-submit-status" \
+            -H "Content-Type: application/fhir+json" --data-binary @status.json \
+            | tr -d '\r' | awk -F': ' 'tolower($1)=="content-location"{print $2}')
+          echo "poll URL: $LOC"
+          [ -n "$LOC" ]
+          # Rewrite host to localhost for in-runner polling.
+          LOC_LOCAL=$(echo "$LOC" | sed "s#http://$RUNNER_IP:$HFS_PORT#http://127.0.0.1:$HFS_PORT#")
+          for i in {1..30}; do
+            code=$(curl -sS -o manifest.json -w "%{http_code}" "$LOC_LOCAL")
+            echo "poll $i: HTTP $code"
+            if [ "$code" = "200" ]; then cat manifest.json; break; fi
+            sleep 2
+          done
+          [ "$code" = "200" ]
+
+      - name: Assert resources were ingested
+        run: |
+          BASE="http://127.0.0.1:$HFS_PORT"
+          for id in submit-smoke-1 submit-smoke-2; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "$BASE/Patient/$id")
+            echo "GET Patient/$id → $code"
+            [ "$code" = "200" ]
+          done
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "=== HFS log ==="; tail -100 /tmp/hfs.log || true
+          echo "=== provider log ==="; tail -50 /tmp/provider.log || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          [ -f /tmp/hfs.pid ] && kill "$(cat /tmp/hfs.pid)" 2>/dev/null || true
+          [ -f /tmp/provider.pid ] && kill "$(cat /tmp/provider.pid)" 2>/dev/null || true
+          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
