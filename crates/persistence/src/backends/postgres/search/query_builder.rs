@@ -198,7 +198,7 @@ impl PostgresQueryBuilder {
             SearchParamType::Quantity => Self::build_quantity_condition(param, param_offset),
             SearchParamType::Reference => Self::build_reference_condition(param, param_offset),
             SearchParamType::Uri => Self::build_uri_condition(param, param_offset),
-            SearchParamType::Composite => None,
+            SearchParamType::Composite => Self::build_composite_condition(param, param_offset),
             SearchParamType::Special => None,
         }
     }
@@ -312,6 +312,12 @@ impl PostgresQueryBuilder {
     }
 
     fn build_token_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
+        // `:of-type` matches an Identifier by its type (system|code) and value,
+        // in the three-part form `type-system|type-code|identifier-value`.
+        if let Some(SearchModifier::OfType) = param.modifier {
+            return Self::build_of_type_condition(param, offset);
+        }
+
         let mut conditions = Vec::new();
 
         for (i, value) in param.values.iter().enumerate() {
@@ -380,6 +386,230 @@ impl PostgresQueryBuilder {
         }
 
         Some(combined)
+    }
+
+    /// Builds an `:of-type` identifier condition (token modifier).
+    ///
+    /// Value form: `type-system|type-code|identifier-value`. Empty parts are
+    /// dropped, so e.g. `||MR12345` matches by identifier value only.
+    fn build_of_type_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
+        let mut value_conditions = Vec::new();
+        let mut all_params: Vec<SqlParam> = Vec::new();
+        let mut current = offset;
+
+        for value in &param.values {
+            let parts: Vec<&str> = value.value.splitn(3, '|').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+            let (type_system, type_code, identifier_value) = (parts[0], parts[1], parts[2]);
+
+            let mut conds = Vec::new();
+            // Identifier value (matched against the token code column).
+            if !identifier_value.is_empty() {
+                current += 1;
+                conds.push(format!("value_token_code = ${}", current));
+                all_params.push(SqlParam::text(identifier_value));
+            }
+            if !type_system.is_empty() {
+                current += 1;
+                conds.push(format!("value_identifier_type_system = ${}", current));
+                all_params.push(SqlParam::text(type_system));
+            }
+            if !type_code.is_empty() {
+                current += 1;
+                conds.push(format!("value_identifier_type_code = ${}", current));
+                all_params.push(SqlParam::text(type_code));
+            }
+            if conds.is_empty() {
+                continue;
+            }
+
+            value_conditions.push(format!(
+                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
+                param.name,
+                conds.join(" AND ")
+            ));
+        }
+
+        if value_conditions.is_empty() {
+            return None;
+        }
+        Some(SqlFragment::with_params(
+            value_conditions.join(" OR "),
+            all_params,
+        ))
+    }
+
+    /// Builds a composite-parameter condition.
+    ///
+    /// Composite values join their components with `$` (e.g.
+    /// `http://loinc.org|8480-6$lt60`). Each component is matched as a bare
+    /// predicate against the columns of a single `search_index` row scoped to
+    /// the composite parameter name — mirroring the SQLite backend. Requires
+    /// `param.components` to be populated (the REST layer does not yet wire
+    /// these from the registry, so this is reachable via the direct backend
+    /// API; see `docs/search-spec-assessment.md`).
+    fn build_composite_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
+        if param.components.is_empty() {
+            return None;
+        }
+
+        let mut value_conditions = Vec::new();
+        let mut all_params: Vec<SqlParam> = Vec::new();
+        let mut current = offset;
+
+        for value in &param.values {
+            let parts: Vec<&str> = value.value.split('$').collect();
+            let inner = if parts.len() != param.components.len() {
+                "1 = 0".to_string()
+            } else {
+                let mut comp_sqls = Vec::new();
+                let mut ok = true;
+                for (part, component) in parts.iter().zip(param.components.iter()) {
+                    let cv = Self::parse_component_value(part);
+                    match Self::build_composite_component(&cv, component.param_type, current) {
+                        Some((sql, params)) => {
+                            current += params.len();
+                            all_params.extend(params);
+                            comp_sqls.push(sql);
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && !comp_sqls.is_empty() {
+                    comp_sqls.join(" AND ")
+                } else {
+                    "1 = 0".to_string()
+                }
+            };
+
+            value_conditions.push(format!(
+                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
+                param.name, inner
+            ));
+        }
+
+        if value_conditions.is_empty() {
+            return None;
+        }
+        Some(SqlFragment::with_params(
+            value_conditions.join(" OR "),
+            all_params,
+        ))
+    }
+
+    /// Parses a composite component value, stripping any comparison prefix.
+    fn parse_component_value(part: &str) -> SearchValue {
+        let prefixes = [
+            ("ne", SearchPrefix::Ne),
+            ("gt", SearchPrefix::Gt),
+            ("lt", SearchPrefix::Lt),
+            ("ge", SearchPrefix::Ge),
+            ("le", SearchPrefix::Le),
+            ("sa", SearchPrefix::Sa),
+            ("eb", SearchPrefix::Eb),
+            ("ap", SearchPrefix::Ap),
+            ("eq", SearchPrefix::Eq),
+        ];
+        for (prefix_str, prefix) in prefixes {
+            if let Some(stripped) = part.strip_prefix(prefix_str) {
+                return SearchValue {
+                    prefix,
+                    value: stripped.to_string(),
+                };
+            }
+        }
+        SearchValue {
+            prefix: SearchPrefix::Eq,
+            value: part.to_string(),
+        }
+    }
+
+    /// Builds a single composite component as a bare column predicate (no
+    /// `id IN (...)` wrapper — the caller scopes it to the composite row).
+    /// Returns `None` if the value cannot be parsed for the component type.
+    fn build_composite_component(
+        value: &SearchValue,
+        param_type: SearchParamType,
+        offset: usize,
+    ) -> Option<(String, Vec<SqlParam>)> {
+        match param_type {
+            SearchParamType::Token => {
+                if let Some((system, code)) = value.value.split_once('|') {
+                    if system.is_empty() {
+                        Some((
+                            format!("value_token_code = ${}", offset + 1),
+                            vec![SqlParam::text(code)],
+                        ))
+                    } else if code.is_empty() {
+                        Some((
+                            format!("value_token_system = ${}", offset + 1),
+                            vec![SqlParam::text(system)],
+                        ))
+                    } else {
+                        Some((
+                            format!(
+                                "value_token_system = ${} AND value_token_code = ${}",
+                                offset + 1,
+                                offset + 2
+                            ),
+                            vec![SqlParam::text(system), SqlParam::text(code)],
+                        ))
+                    }
+                } else {
+                    Some((
+                        format!("value_token_code = ${}", offset + 1),
+                        vec![SqlParam::text(&value.value)],
+                    ))
+                }
+            }
+            SearchParamType::String => Some((
+                format!("value_string ILIKE ${}", offset + 1),
+                vec![SqlParam::text(&format!("{}%", value.value))],
+            )),
+            SearchParamType::Number => {
+                let num = value.value.parse::<f64>().ok()?;
+                let op = Self::prefix_to_operator(&value.prefix);
+                Some((
+                    format!("value_number {} ${}", op, offset + 1),
+                    vec![SqlParam::Float(num)],
+                ))
+            }
+            SearchParamType::Quantity => {
+                let parts: Vec<&str> = value.value.splitn(3, '|').collect();
+                let num = parts.first().and_then(|s| s.parse::<f64>().ok())?;
+                let op = Self::prefix_to_operator(&value.prefix);
+                if parts.len() >= 3 {
+                    Some((
+                        format!(
+                            "value_quantity_value {} ${} AND value_quantity_unit = ${}",
+                            op,
+                            offset + 1,
+                            offset + 2
+                        ),
+                        vec![SqlParam::Float(num), SqlParam::text(parts[2])],
+                    ))
+                } else {
+                    Some((
+                        format!("value_quantity_value {} ${}", op, offset + 1),
+                        vec![SqlParam::Float(num)],
+                    ))
+                }
+            }
+            SearchParamType::Date => {
+                let op = Self::prefix_to_operator(&value.prefix);
+                let ts = Self::parse_date_value(&value.value);
+                Some((
+                    format!("value_date {} ${}", op, offset + 1),
+                    vec![SqlParam::Timestamp(ts)],
+                ))
+            }
+            _ => None,
+        }
     }
 
     fn build_date_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
@@ -581,5 +811,84 @@ impl PostgresQueryBuilder {
             .map(|dt| dt.with_timezone(&Utc))
             .or_else(|_| normalized.parse::<DateTime<Utc>>())
             .unwrap_or_else(|_| Utc::now())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{CompositeSearchComponent, SearchModifier, SearchQuery};
+
+    #[test]
+    fn composite_token_quantity_sql() {
+        let param = SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "http://loinc.org|8480-6$lt60",
+            )],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value".to_string(),
+                },
+            ],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        // Non-cursor search binds $1=tenant, $2=type, so params start at $3.
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("composite should produce a condition");
+
+        assert!(frag.sql.contains("param_name = 'code-value-quantity'"));
+        assert!(frag.sql.contains("value_token_system = $3"));
+        assert!(frag.sql.contains("value_token_code = $4"));
+        assert!(frag.sql.contains("value_quantity_value < $5"));
+        // token (system+code) = 2 params, quantity (no unit) = 1 param.
+        assert_eq!(frag.params.len(), 3);
+    }
+
+    #[test]
+    fn composite_returns_none_without_components() {
+        let param = SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "a$b")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        assert!(PostgresQueryBuilder::build_search_query(&query, 2).is_none());
+    }
+
+    #[test]
+    fn of_type_identifier_sql() {
+        let param = SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::OfType),
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "http://terminology.hl7.org/CodeSystem/v2-0203|MR|12345",
+            )],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Patient").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect(":of-type should produce a condition");
+
+        assert!(frag.sql.contains("param_name = 'identifier'"));
+        assert!(frag.sql.contains("value_token_code = $3"));
+        assert!(frag.sql.contains("value_identifier_type_system = $4"));
+        assert!(frag.sql.contains("value_identifier_type_code = $5"));
+        assert_eq!(frag.params.len(), 3);
     }
 }

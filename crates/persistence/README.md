@@ -347,7 +347,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Number](https://build.fhir.org/search.html#number)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ○   |
 | [Quantity](https://build.fhir.org/search.html#quantity)                     | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ○   |
 | [URI](https://build.fhir.org/search.html#uri)                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
-| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ○          | ○       | ✗         | ○     | ◐             | ✗   |
+| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ✓          | ○       | ✗         | ○     | ◐             | ✗   |
 | **[Search Modifiers](https://build.fhir.org/search.html#modifiers)**        |
 | [:exact](https://build.fhir.org/search.html#modifiers)                      | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
 | [:contains](https://build.fhir.org/search.html#modifiers)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
@@ -356,7 +356,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [:missing](https://build.fhir.org/search.html#modifiers)                    | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ○   |
 | [:above / :below](https://build.fhir.org/search.html#modifiers)             | ◐      | ◐          | †○      | ✗         | ○     | ◐             | ✗   |
 | [:in / :not-in](https://build.fhir.org/search.html#modifiers)               | ✗      | †○         | †○      | ✗         | ○     | †○            | ✗   |
-| [:of-type](https://build.fhir.org/search.html#modifiers)                    | ✓      | ○          | ○       | ✗         | ○     | ✓             | ✗   |
+| [:of-type](https://build.fhir.org/search.html#modifiers)                    | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
 | [:text-advanced](https://build.fhir.org/search.html#modifiertextadvanced)   | ✓      | †○         | †○      | ✗         | ✗     | ✓             | ✗   |
 | **[Special Parameters](https://build.fhir.org/search.html#all)**            |
 | [\_text](https://build.fhir.org/search.html#_text) (narrative search)       | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ✗   |
@@ -390,8 +390,11 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 - **`:in` / `:not-in`** — handled at the REST layer: `:in` is expanded against a terminology
   server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
   backend resolves these natively.
-- **Elasticsearch Composite** — matches on the composite parameter name only; individual
-  component values are not yet evaluated, hence ◐.
+- **Composite** — SQLite and PostgreSQL evaluate composite component values (token, string,
+  number, quantity, date) at the backend level (✓); Elasticsearch matches on the composite
+  parameter name only (◐). Note: the REST layer does not yet populate composite component
+  definitions from the registry, so composite search is currently reachable via the direct
+  backend API rather than over HTTP. See `docs/search-spec-assessment.md`.
 
 The S3 backend is intentionally storage-focused (CRUD/version/history/bulk submit) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but job state belongs to SQLite or PostgreSQL. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
@@ -1127,10 +1130,10 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] History providers (instance, type, system)
 - [x] TransactionProvider with configurable isolation levels
 - [x] Conditional operations (conditional create/update/delete)
-- [x] SearchProvider with all parameter types except composite (string, token, reference, date,
-      number, quantity, URI; supports `:exact`/`:contains`/`:not`/`:missing` and URI
-      `:above`/`:below`; composite and the `:of-type`/`:text-advanced` modifiers are not yet
-      implemented)
+- [x] SearchProvider with all parameter types including composite (string, token, reference, date,
+      number, quantity, URI, composite; supports `:exact`/`:contains`/`:not`/`:missing`/`:of-type`
+      and URI `:above`/`:below`; the `:text-advanced` modifier is not yet implemented). Composite
+      component definitions are not yet wired through the REST layer.
 - [x] ChainedSearchProvider and reverse chaining (\_has)
 - [x] Full-text search (tsvector/tsquery)
 - [x] `_sort` by `_id`/`_lastUpdated` (first-page and offset paths)
