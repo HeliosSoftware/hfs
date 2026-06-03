@@ -1,16 +1,23 @@
-# SQL-on-FHIR `$viewdefinition-run`, `$viewdefinition-export`, and `$sqlquery-run` Spec Inconsistencies
+# SQL-on-FHIR Operation Spec Inconsistencies
 
-Items where the [SQL-on-FHIR v2 `$viewdefinition-run`](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-ViewDefinitionRun.html), [`$viewdefinition-export`](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-ViewDefinitionExport.html), and [`$sqlquery-run`](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/OperationDefinition-SQLQueryRun.html) OperationDefinitions are internally inconsistent, ambiguous, or silent on behavior that implementations must nevertheless decide — including places where the sibling operations drift from each other. Each entry records the spec text, the conflict, our chosen behavior, and the rationale.
+Items where the SQL-on-FHIR v2 operation definitions are internally inconsistent, ambiguous, or silent on behavior that implementations must nevertheless decide — including places where the sibling operations drift from each other. The family now comprises **four** sibling operations in the same IG:
+
+- [`$viewdefinition-run`](https://build.fhir.org/ig/HL7/sql-on-fhir/OperationDefinition-ViewDefinitionRun.html) — synchronous, returns `Binary`.
+- [`$viewdefinition-export`](https://build.fhir.org/ig/HL7/sql-on-fhir/OperationDefinition-ViewDefinitionExport.html) — asynchronous bulk export.
+- [`$sqlquery-run`](https://build.fhir.org/ig/HL7/sql-on-fhir/OperationDefinition-SQLQueryRun.html) — synchronous, returns `Binary` or `Parameters`.
+- [`$sqlquery-export`](https://build.fhir.org/ig/HL7/sql-on-fhir/OperationDefinition-SQLQueryExport.html) — asynchronous bulk export.
+
+Each entry records the relevant spec text, the conflict, and a recommended spec fix. Entries are written to be filed as standalone issues.
 
 ---
 
 ## A — `return Binary 1..1` vs. raw payload in examples
 
-**Spec text (parameter table):**
+**Spec text** — `$viewdefinition-run` return parameter:
 
 > **return** — Binary, 1..1 — "Transformed data encoded in the requested output format."
 
-**Spec examples** (Examples 1–4 on the OperationDefinition page) all return raw bytes with the appropriate `Content-Type`, never a FHIR `Binary` JSON envelope. From Example 1:
+`$sqlquery-run` similarly declares `return` as `Binary` for the flat formats. Yet the worked examples return raw bytes with the appropriate `Content-Type`, never a FHIR `Binary` JSON envelope. From the `$viewdefinition-run` instance example:
 
 ```http
 HTTP/1.1 200 OK
@@ -21,25 +28,24 @@ id,birthDate,family,given
 pt-1,1990-01-15,Smith,John
 ```
 
-**Inconsistency:** The parameter type `Binary` implies a FHIR resource wrapper (`{"resourceType":"Binary","contentType":"...","data":"<base64>"}`), but every worked example returns the unwrapped payload directly.
+**Inconsistency:** The parameter type `Binary` implies a FHIR resource wrapper (`{"resourceType":"Binary","contentType":"...","data":"<base64>"}`), but every worked example returns the unwrapped payload directly. A client coding to the declared type would base64-decode a Binary envelope; a client coding to the examples would read raw CSV/NDJSON. The two cannot both be right.
 
-**Our behavior:** Raw bytes with the matching `Content-Type` (`text/csv`, `application/json`, `application/x-ndjson`, `application/octet-stream`).
-- `crates/sof/src/handlers.rs` (`run_view_definition_handler`) — sof-server
-- `crates/rest/src/handlers/sof/run.rs` (`build_response_with_warnings`) — HFS REST
+**Recommendation:** Resolve the type-vs-example contradiction explicitly, once, in text both run operations reference. Either:
 
-**Rationale:** Matches the spec's own examples and the behavior of reference implementations (Pathling, sof-js). A wrapped `Binary` would require clients to base64-decode before parsing CSV/NDJSON, which no spec example demonstrates.
+1. Keep the `Binary` type but add normative narrative stating that — as with a FHIR `Binary` read under `Accept: application/octet-stream` — the response body is the raw payload in the format's native media type, *not* a serialized `Binary` resource; the `Binary` type denotes the binary stream, not a JSON envelope. Or
+2. Change the declared return so it no longer implies a JSON resource envelope (e.g. describe the output as a binary stream/attachment), and mark the worked examples normative.
 
-**Recommendation:** Treat as a spec documentation gap. No change required.
+Either way, state when (if ever) a serialized `Binary` resource envelope is returned, so the type and the examples stop disagreeing.
 
 ---
 
-## B — `resource 0..* Resource` — Bundle unwrap unspecified
+## B — `resource 0..* Resource`: Bundle unwrap unspecified
 
-**Spec text (parameter table):**
+**Spec text** — `$viewdefinition-run` input parameter:
 
 > **resource** — Resource, 0..* — "FHIR resources to transform instead of using server data."
 
-**Spec Example 3** demonstrates passing discrete resources as separate parameter entries:
+The worked example passes discrete resources as repeated parameter entries:
 
 ```json
 {
@@ -52,134 +58,132 @@ pt-1,1990-01-15,Smith,John
 }
 ```
 
-**Inconsistency:** `Bundle` is a `Resource`, so a Bundle technically satisfies `type=Resource`. The spec is silent on whether the server should:
-1. Treat the Bundle as opaque (no entries iterated, ViewDefinition runs against the Bundle itself), or
-2. Unwrap `Bundle.entry[*].resource` and apply the ViewDefinition to each entry.
+**Inconsistency:** `Bundle` *is* a `Resource`, so a `Bundle` satisfies `type=Resource`. The spec does not say whether the server should:
 
-**Our behavior (asymmetric across binaries):**
-- **sof-server** unwraps `Bundle.entry[*].resource` as a convenience — `crates/sof/src/models.rs:332-353`.
-- **HFS REST** does not unwrap; the Bundle flows through as a single resource — `crates/rest/src/handlers/sof/run.rs`.
+1. Treat the `Bundle` opaquely — run the ViewDefinition against the `Bundle` resource itself, or
+2. Unwrap `Bundle.entry[*].resource` and run the ViewDefinition against each entry.
 
-**Rationale for the asymmetry:** sof-server is the stateless CLI/server path where users commonly pipe FHIR Bundles directly; unwrapping matches their expectation. HFS REST is integrated with persistent storage, where Bundle uploads have explicit batch/transaction semantics elsewhere.
+Because `resource` is already repeatable for passing discrete resources, both readings are plausible and a client cannot predict which it will get. Passing a `Bundle` of Patients is a natural thing to do, and the two interpretations produce completely different result sets.
 
-**Open decision:** Should HFS REST adopt sof-server's unwrap behavior to remove the footgun? Pending direction. If yes, the change point is the `resource` parameter handler in `crates/rest/src/handlers/sof/run.rs`, mirroring `crates/sof/src/models.rs:332-353`.
-
-**Recommendation:** File a clarification with the SOF working group; in the meantime, make HFS REST match sof-server (Bundle entries flattened).
+**Recommendation:** The spec should state one behavior for a `Bundle` supplied as a `resource` value. The least-surprising rule — given that `resource` already accepts repeated discrete resources — is to unwrap `Bundle.entry[*].resource` and run the ViewDefinition against each entry. Add a worked example with a `Bundle` input to make the chosen semantics unambiguous.
 
 ---
 
-## C — Return type shape diverges between `$viewdefinition-run` and `$sqlquery-run`
+## C — Supported `_format` set and return type diverge across the four sibling operations
 
 **Spec text:**
 
-- `$viewdefinition-run` — `return Binary 1..1` for every supported `_format` (`csv`, `json`, `ndjson`, `parquet`).
-- `$sqlquery-run` — `return Binary` for the four flat formats, **but** `return Parameters` (with a repeating `row` parameter, one per result row) when `_format=fhir`.
+| Operation | Delivery | Supported `_format` | Return shape |
+|-----------|----------|---------------------|--------------|
+| `$viewdefinition-run` | synchronous | `csv`, `json`, `ndjson`, `parquet` | `Binary 1..1` |
+| `$sqlquery-run` | synchronous | `csv`, `json`, `ndjson`, `parquet`, **`fhir`** | `Binary` (flat) / **`Parameters`** (`_format=fhir`) |
+| `$viewdefinition-export` | asynchronous | `csv`, `json`, `ndjson`, `parquet` | async manifest → files |
+| `$sqlquery-export` | asynchronous | `csv`, `json`, `ndjson`, `parquet` | async manifest → files |
 
-**Inconsistency:** `$sqlquery-run` introduces a sixth format (`fhir`) that flips the return type to `Parameters`. `$viewdefinition-run` has no equivalent polymorphism — it always returns `Binary` and does not offer a `fhir` format at all. Two sibling operations in the same IG, designed for the same downstream consumers, should not disagree on either the set of supported formats or the return-type contract.
+For `$sqlquery-run`, `_format=fhir` returns a `Parameters` resource with a repeating `row` parameter (one per result row, each row's columns as `part`s, SQL `NULL` represented by omitting the part).
 
-**Our behavior:**
+**Inconsistency:** Across four sibling operations in one IG, designed for the same downstream consumers, the `fhir` format and the `Parameters` return type are a **singleton**: only `$sqlquery-run` offers them. `$viewdefinition-run` has no `fhir` format and always returns `Binary`; both export operations omit `fhir` and deliver files. Most pointedly, `$sqlquery-export` — the asynchronous counterpart of `$sqlquery-run` — drops `fhir`, so a client that adopts FHIR-typed rows synchronously has no async path to the same shape, and no equivalent in any of the other three operations.
 
-- `$viewdefinition-run`: returns raw bytes for `csv`/`json`/`ndjson`/`parquet` (see entry A) — `crates/rest/src/handlers/sof/run.rs`.
-- `$sqlquery-run`: returns raw bytes for flat formats and a `Parameters` resource for `_format=fhir` — `crates/rest/src/handlers/sof/sqlquery.rs`.
+**Recommendation:** Make the supported-format enumeration and the return-type matrix consistent across all four operations, defined once in a shared section the OperationDefinitions reference rather than per-operation. Choose one of:
 
-**Recommendation:** File a clarification with the SOF working group asking for one of:
+1. Promote `fhir` to a first-class format defined in the shared section and supported by all four operations — including deciding its asynchronous semantics for the two export operations (e.g. an NDJSON-of-rows or `Parameters`-per-file manifest). Or
+2. Remove `fhir` from `$sqlquery-run` so all four operations share the flat-format set and a uniform `Binary`/file return contract, and let clients run a follow-up transformation if they need FHIR-typed rows.
 
-1. Add `_format=fhir` to `$viewdefinition-run` with the same `Parameters` + repeating-`row` return shape, or
-2. Drop `_format=fhir` from `$sqlquery-run` and let clients run a follow-up transformation if they need FHIR-typed rows.
-
-Either way, the supported `_format` set and the return type matrix should be identical across the two ops.
+The supported `_format` set and the return type SHALL be identical across operations that share a delivery model, and explicitly reconciled across the sync/async pair for each query type.
 
 ---
 
-## D — Streaming guidance present for `$viewdefinition-run`, absent for `$sqlquery-run` and `$viewdefinition-export`
+## D — Streaming/chunked-encoding guidance present on one operation, absent on the other three; and it conflates two concepts
 
 **Spec text:**
 
-- `$viewdefinition-run` says streaming **MAY use chunked transfer encoding for large result sets**, and every worked example shows `Transfer-Encoding: chunked` in the response headers (see entry A).
-- `$sqlquery-run` says **nothing** about streaming, chunking, async, or polling. No worked example shows `Transfer-Encoding` at all.
-- `$viewdefinition-export` uses a different delivery model entirely — async bulk: `Prefer: respond-async` → `202 Accepted` + `Content-Location` → poll the status URL → a manifest of output-file URLs the client downloads separately. The operation response itself is never a chunked stream; only the individual file downloads could be.
+- `$viewdefinition-run`: "MAY use chunked transfer encoding for large result sets," and the worked example shows `Transfer-Encoding: chunked` on a `text/csv` response.
+- `$sqlquery-run`: says **nothing** about streaming, chunking, or framing.
+- `$viewdefinition-export` and `$sqlquery-export`: use the asynchronous bulk model; neither says anything about the framing of the file downloads.
 
 **Inconsistency:** Two problems — one of wording, one of coverage.
 
-1. **The spec conflates two independent concepts.** `Transfer-Encoding: chunked` is an HTTP/1.1 message-framing mechanism (RFC 9112 §7.1). It is independent of `Content-Type`: *any* payload — CSV, JSON, NDJSON, parquet, `application/octet-stream` — can be sent chunked. The choice between `Content-Length` and chunked framing depends solely on whether the server knows the body size before emitting the first byte, never on the `_format`. A separate, genuinely format-sensitive question is **incremental result production** — whether the server can emit output before the full result set is materialized. NDJSON and CSV are trivially row-incremental; a JSON array needs bracket/comma bookkeeping; parquet must finalize its footer (schema, row-group offsets, column statistics) last but can still flush row groups progressively. Even so, once bytes exist they can always be framed chunked — so chunked encoding is never gated on the format. The spec text reads as if chunked transfer were a property of large or "streamable" formats; it is not.
+1. **The text conflates two independent concepts.** `Transfer-Encoding: chunked` is an HTTP/1.1 message-framing mechanism (RFC 9112 §7.1), independent of `Content-Type`: *any* payload — CSV, JSON, NDJSON, parquet, `application/octet-stream` — can be sent chunked. The choice between `Content-Length` and chunked framing depends solely on whether the server knows the body size before emitting the first byte, never on the `_format`. A separate, genuinely format-sensitive question is **incremental result production** — whether the server can emit output before the full result set is materialized (NDJSON and CSV are trivially row-incremental; a JSON array needs bracket/comma bookkeeping; parquet must finalize its footer last but can still flush row groups progressively). The current text reads as if chunked transfer were a property of large or "streamable" formats; it is not. The IG's own CSV example proves the point — it shows `Transfer-Encoding: chunked` on `text/csv`, contradicting any reading that ties chunking to NDJSON.
 
-2. **The guidance is attached to only one of three sibling ops.** `$sqlquery-run` is the op most likely to produce unbounded result sets — it executes arbitrary SQL, with no `_limit` or `_since` to constrain output (`$viewdefinition-run` has both) — yet it gets no streaming guidance. `$viewdefinition-export` exists precisely for large extracts and has its own async-bulk contract, but the relationship between the three delivery models is never stated.
+2. **The guidance is attached to only one of four sibling operations.** `$sqlquery-run` executes arbitrary SQL — joins and aggregations that can produce large or hard-to-size result sets — yet receives no streaming guidance, while the simpler `$viewdefinition-run` does. The two export operations exist precisely for large extracts but never relate their file-download framing to the run operations' streaming language.
 
-**Our behavior:** Exactly one path uses chunked transfer encoding — HFS REST's NDJSON `$viewdefinition-run`. Every other response, across both binaries and all three operations, is fully buffered and sent with `Content-Length`.
+**Recommendation:** In a shared section all four operations reference, the spec should:
 
-| Op | Binary | Format | Production | Framing |
-|----|--------|--------|-----------|---------|
-| `$viewdefinition-run` | HFS REST | NDJSON | incremental off the row stream | `Transfer-Encoding: chunked` |
-| `$viewdefinition-run` | HFS REST | CSV / JSON / parquet | fully buffered | `Content-Length` |
-| `$viewdefinition-run` | sof-server | all formats (incl. single- & multi-file parquet) | fully buffered | `Content-Length` |
-| `$sqlquery-run` | HFS REST | all formats | fully buffered (SQL engine materializes the result set first) | `Content-Length` |
-| `$viewdefinition-export` | HFS REST | all formats (shard download) | buffered shards | `Content-Length` |
-
-*Legend — **Production**: how the output is built (fully buffered in memory vs. emitted row-incrementally as rows arrive). **Framing**: the resulting HTTP message-framing mechanism that delimits the response body — `Content-Length` (size known upfront) vs. `Transfer-Encoding: chunked` (size unknown, body sent as length-prefixed chunks). Framing is a consequence of Production, not of the `_format`.*
-
-No code sets `Transfer-Encoding: chunked` explicitly — Axum/hyper apply it automatically whenever the response body is a stream (`Body::from_stream`) with no known `Content-Length`.
-
-- HFS REST `$viewdefinition-run`: NDJSON streamed via `streaming_ndjson_response`; other formats drained and buffered via `format_stream` — `crates/rest/src/handlers/sof/run.rs`.
-- HFS REST `$sqlquery-run`: every format buffered — `crates/rest/src/handlers/sof/sqlquery.rs:440-518` (`render_output` / `build_response`).
-- HFS REST `$viewdefinition-export`: async-bulk (`Prefer: respond-async` check at `crates/rest/src/handlers/sof/export.rs:225`); shard downloads served buffered — `export.rs:778` (`download_export_file_handler`).
-- sof-server: every format fully buffered, including single-file parquet and multi-file parquet (the latter bundled into an in-memory ZIP archive) — `crates/sof/src/handlers.rs` (parquet response paths), `crates/sof/src/parquet_zip.rs` (`create_zip_from_buffers`).
-
-This underscores point 1 above: chunked framing is decoupled from the `_format`. The same format proves it — NDJSON is streamed by HFS REST but fully buffered by sof-server — so framing follows the server's production strategy, never the format. Framing is decided only by how the handler hands the body to Axum: a streaming body (`Body::from_stream`) with no `Content-Length` yields `chunked`; a sized buffer yields `Content-Length`. The one chunked path (HFS REST NDJSON) is *forced* onto streaming because incremental production means the size is unknown until the last row. (Compare entry B, which records a similar sof-server vs. HFS REST asymmetry for Bundle unwrap.)
-
-**Rationale:** HFS REST's `$viewdefinition-run` runs against persistent storage via an in-DB runner that pulls rows lazily from a query cursor, so NDJSON — which needs no global state — is produced incrementally; that is the only genuinely streamable path in any SoF operation. sof-server uses the in-process evaluator, which materializes the full result set before formatting, so every format is buffered. `$sqlquery-run` likewise materializes its result set first. Chunked framing therefore appears exactly where — and only where — the server cannot know the response size in advance.
-
-**Recommendation:** File a clarification with the SOF working group asking it to:
-
-1. State, once in a section all three ops reference, that `Transfer-Encoding: chunked` MAY be used for the response of **any** `_format` — it is a transport-framing choice, not a format property — and drop any wording that implies it is reserved for "streamable" formats or singles out NDJSON.
-2. Separate, explicitly, the two concepts the current text conflates: chunked transfer encoding (HTTP transport framing) vs. incremental result production (a server capability that varies by format and query engine).
+1. State that `Transfer-Encoding: chunked` MAY be used for the response of **any** `_format` — it is a transport-framing choice, not a format property — and remove any wording that implies it is reserved for "streamable" formats or singles out NDJSON.
+2. Separate, explicitly, the two concepts the current text conflates: chunked transfer encoding (HTTP transport framing) vs. incremental result production (a server/engine capability that varies by format).
 3. Give `$sqlquery-run` the same streaming language as `$viewdefinition-run`.
-4. Note that `$viewdefinition-export`'s file downloads MAY likewise be chunked, again format-agnostic, while the operation response itself follows the async-bulk model.
-
-Note that entry A of this document already shows `Transfer-Encoding: chunked` on a `text/csv` response — internal evidence that the NDJSON-specific framing was never right.
+4. Note that the two export operations' file downloads MAY likewise be chunked, again format-agnostic, while the operation response itself follows the asynchronous model.
 
 ---
 
-## E — `Accept: application/octet-stream` semantics undefined on both ops
+## E — `Accept` header semantics: raw payload vs. `Binary` envelope undefined on both run operations
 
-**Spec text:** Both operations declare `return Binary` but neither specifies how a client signals "give me the raw payload" vs. "give me a FHIR `Binary` resource envelope with base64-encoded `data`". The OperationDefinition pages do not mention the `Accept` header at all; only the worked examples imply the answer (raw bytes — see entry A).
+**Spec text:** Both `$viewdefinition-run` and `$sqlquery-run` declare a `Binary` return. `$viewdefinition-run` now addresses `Accept` only for *format negotiation*:
 
-**Inconsistency:** The standard FHIR convention for reading a `Binary` resource is:
+> "Servers MAY honour the HTTP `Accept` header to negotiate an alternative format when `_format` is not supplied. When `_format` is supplied, its value SHALL take precedence over `Accept`."
 
-- `Accept: application/octet-stream` → server returns the raw payload with `Content-Type` set to the underlying media type (`text/csv`, `application/x-ndjson`, `application/vnd.apache.parquet`, …).
-- `Accept: application/fhir+json` (or `+xml`) → server returns a `Binary` resource with `contentType` and base64-encoded `data`.
+Neither operation says how a client signals "give me the raw payload" vs. "give me a FHIR `Binary` resource envelope with base64-encoded `data`."
 
-Neither SoF op cites this convention, and the per-format implications matter:
+**Inconsistency:** The base FHIR convention for reading a `Binary` resource is defined in the [Binary resource page, "Serving Binary Resources using the RESTful API"](https://www.hl7.org/fhir/binary.html#rest):
 
-- **Parquet** is the worst case for the envelope form — base64 inflates the payload ~33% and forces clients to decode before they can mmap/scan the file. Anyone asking for parquet wants raw bytes.
-- **NDJSON** only streams meaningfully as raw bytes; wrapping it in a base64 `Binary.data` defeats the format.
-- **CSV / JSON** can go either way, but clients should be able to ask for raw with `Accept: application/octet-stream`.
+> "When a read request is made with a FHIR type in the Accept header (e.g. `application/fhir+xml` or `application/fhir+json`) the Binary resource is returned in the requested FHIR format. When the read request has some other type in the `Accept` header, then the content should be returned with the content type stated in the resource in the `Content-Type` header … the intent is that unless specifically requested, the FHIR XML/JSON representation is not returned."
 
-**Our behavior:** Both ops always return raw bytes with the format's native `Content-Type`, regardless of `Accept`. We do not currently honor `Accept: application/fhir+json` by wrapping the payload in a `Binary` envelope.
+In other words:
 
-- `crates/rest/src/handlers/sof/run.rs`
-- `crates/rest/src/handlers/sof/sqlquery.rs`
+- `Accept: application/octet-stream` (or the native media type) → raw payload, `Content-Type` set to the underlying media type (`text/csv`, `application/x-ndjson`, the parquet media type, …).
+- `Accept: application/fhir+json` (or `+xml`) → a `Binary` resource with `contentType` and base64-encoded `data`.
 
-**Recommendation:** The spec should state, once, in a shared section both ops reference, that:
+The SoF operations cite neither, and the `Accept` text that does exist governs a *different* axis (which `_format`), not the raw-vs-envelope question. The per-format stakes are real:
 
-1. When `Accept: application/octet-stream` is present (or absent — i.e. default), the response body is the raw output in the requested `_format` and `Content-Type` reflects the format's native media type. `Transfer-Encoding: chunked` is allowed for streamable formats.
-2. When a FHIR media type is requested, the server MAY return a `Binary` resource envelope with the payload base64-encoded — and SHOULD document whether large/streaming formats are supported in this mode at all (parquet and NDJSON realistically are not).
+- **Parquet** is the worst case for the envelope form — base64 inflates the payload ~33% and forces clients to decode before they can mmap/scan the file.
+- **NDJSON** only streams meaningfully as raw bytes; a base64 `Binary.data` defeats the format.
+- **CSV / JSON** can go either way, but a client should be able to ask for raw explicitly.
+
+**Recommendation:** In the shared section both run operations reference, state:
+
+1. With `Accept: application/octet-stream` (or no `Accept`, i.e. default), the response body is the raw output in the requested `_format`, with `Content-Type` set to the format's native media type; chunked framing is allowed (see entry D).
+2. With a FHIR media type (`application/fhir+json`/`+xml`), whether the server returns a `Binary` resource envelope with base64-encoded `data` — and explicitly whether the envelope form is supported for large/streaming formats (parquet, NDJSON) at all.
+3. That this raw-vs-envelope axis is distinct from the existing `Accept`-vs-`_format` precedence rule, so the two are not conflated.
 
 ---
 
-## See also
+## F — Export operations specify `303 See Other` on completion but cite a pattern that uses `200 OK`
 
-Other spec ambiguities surfaced during audit but **not** classified as inconsistencies (they are deliberate deployment-policy deviations or out-of-scope conveniences). Tracked separately in the audit log:
+**Spec text** — both `$viewdefinition-export` and `$sqlquery-export`:
 
-- `_limit` upper bound on `$viewdefinition-run` (we cap at 10000; spec is unbounded). `$viewdefinition-export` rejects `_limit` outright — the spec's input parameter table for the export op does not list it, and the bulk-export contract is unbounded by design.
-- `patient` query-string comma-splitting into multiple references (spec cardinality is 0..1 on `$viewdefinition-run`; 0..* on `$viewdefinition-export`).
-- `source` URI scheme enumeration (`file://`, `http(s)://`, `s3://`, `gs://`, `azure://` — spec says only "URI or bucket name").
-- R4-only build exposing type+instance routes (spec's R4 OperationDefinition restricts to system-level).
-- GET requests carrying `viewResource`/`resource` body (spec text reserves these for POST).
-- `$viewdefinition-export` adds `status: in-progress` to its polling Parameters body — the spec's status-polling parameter table lists only `exportId` and `estimatedTimeRemaining`. Additive, no behavioral impact for spec-compliant clients.
-- sof-server and HFS REST both accept a bare `ViewDefinition` body as a shortcut for a `Parameters` body containing a single `viewResource` entry. Spec examples only show the `Parameters` shape; we accept either because the bare form is a common ergonomic convenience for CLI/pipe callers and unambiguous to detect (`resourceType=ViewDefinition`).
+> "This operation follows the FHIR Asynchronous Interaction Request Pattern."
 
-## Resolved spec deviations
+Their status-code flow, however, is:
 
-Items that previously appeared above but have been brought into alignment with the spec:
+- Kick-off → `202 Accepted` with a `Content-Location` polling URL.
+- Polling while processing → `202 Accepted`.
+- **Completion → `303 See Other` redirect**; "Client retrieves results from the redirect location," then downloads files from `output.location`.
 
-- **Absent `patient` / `group` targets now return `400 Bad Request` with an `OperationOutcome` (`code = not-found`).** Earlier the implementation surfaced absence as `200 OK` with one `Warning: 199 - "..."` header per missing reference, citing the spec's "SHOULD return OperationOutcome" language and RFC 7234 §5.5 as motivation. The spec's error table is explicit (`Referenced patient/group not found (400)`), so the warning-header path was retired. Carrier: `SofError::ReferencedResourceNotFound`, mapped to 400 by both binaries.
+The cited [FHIR Asynchronous Bulk Data Request Pattern](https://www.hl7.org/fhir/async-bulk.html) specifies the opposite for completion:
+
+> "HTTP status of `200 OK`" with "A body containing a JSON object providing metadata, and links to the generated Bulk Data files."
+
+That pattern uses `200 OK` with the manifest **in the body** of the status-poll response, and never uses `303 See Other`.
+
+**Inconsistency:** Both export operations claim conformance to the FHIR async pattern but redefine its completion response — from `200 OK` + inline manifest to a `303 See Other` redirect to a separate result resource. This is substantive: it changes the status code clients branch on, and it moves the manifest (the `exportId`/`status`/`output` Parameters) from the poll-response body to behind a redirect. Clients written to the standard pattern — including existing FHIR Bulk Data clients, which the pattern targets — will not follow the redirect or will mis-handle the `303`. (The two SoF export operations are at least consistent with *each other* on `303`; both diverge from the pattern they cite.)
+
+**Recommendation:** Make the export operations and the cited pattern agree. Either:
+
+1. Align with the FHIR Asynchronous Interaction Request Pattern: on completion, return `200 OK` with the manifest (`exportId`/`status`/`output` Parameters) directly in the status-poll response body, and remove the `303` redirect. Or
+2. If a redirect to a distinct result resource is intentional, stop citing the FHIR async pattern as conformant-as-is and instead define the `303`-based flow explicitly as a documented deviation, spelling out how it interoperates with existing async/bulk clients.
+
+Apply the same resolution to both export operations. Relatedly, the "request headers sent during status polling apply only to the status response, not the final operation result" note only makes sense under a redirect model — it should be reconciled with whichever completion model is chosen.
+
+---
+
+## Minor ambiguities and silent points
+
+Lower-severity gaps surfaced during the same review. Each is a place the spec is silent or under-specified rather than self-contradictory; worth a sentence of clarifying text.
+
+- **`_limit` bounds and export applicability.** `$viewdefinition-run` and `$sqlquery-run` accept `_limit` with no defined upper bound or documented server-cap behavior; neither export operation lists `_limit` at all, so there is no documented way to bound an asynchronous extract. The spec should state server-cap semantics for the run operations and whether the omission of `_limit` from the export operations is intentional.
+- **`patient` cardinality split.** `patient` is `0..1` on `$viewdefinition-run` but `0..*` on the export operations and `$sqlquery-export`. The spec does not say whether a single comma-delimited `patient` query parameter may carry multiple references on the `0..1` operations. Clarify.
+- **`source` scheme enumeration.** `source` is a free `string` ("URI or bucket name") with no enumerated scheme set (`file://`, `http(s)://`, `s3://`, `gs://`, `azure://`, …). The spec should enumerate accepted schemes or reference a registry, so implementations agree on what a portable `source` value looks like.
+- **R4 scope vs. type/instance routes.** Where R4 OperationDefinitions restrict an operation to system level, the spec should state the expected behavior of type- and instance-level routes under R4 vs. R5+.
+- **GET requests carrying a body.** Worked examples reserve `viewResource`/`resource`/`queryResource` bodies for POST. The behavior of a GET request that nonetheless carries such a body is unspecified.
+- **Bare resource body shortcut.** Examples only show the `Parameters` envelope. The spec should state whether a bare `ViewDefinition` (for the run/export view operations) or bare `Library` (for the SQL operations) body is an acceptable shorthand for a `Parameters` body containing a single `viewResource`/`queryResource` entry, since it is an unambiguous and common ergonomic convenience.
+- **Status enumeration (now clarified).** The 2.1.0-pre export operations enumerate `status` values (`accepted`, `in-progress`, `completed`, `cancelled`, `failed`) and include `status 1..1` in the polling Parameters — resolving an earlier gap where `status`/`in-progress` were absent from the status-polling parameter table. Noted here as resolved.
