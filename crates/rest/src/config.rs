@@ -426,6 +426,207 @@ impl BulkExportConfig {
     }
 }
 
+/// Bulk Data **Submit** (`$bulk-submit`) configuration, loaded from
+/// `HFS_BULK_SUBMIT_*` environment variables.
+///
+/// HFS acts as the Data Consumer: it accepts submissions, fetches the referenced
+/// manifests/files, ingests them, and serves a status manifest whose
+/// `output`/`error`/`deleted` artifacts are written to the output store below.
+#[derive(Debug, Clone)]
+pub struct BulkSubmitConfig {
+    /// Master switch — when `false`, the `$bulk-submit` endpoints return `501`.
+    pub enabled: bool,
+    /// Output store for status artifacts: `local-fs` or `s3`.
+    pub output_backend: String,
+    /// Local-FS output root directory.
+    pub output_dir: Option<String>,
+    /// S3 bucket for status artifacts (required when `output_backend = s3`).
+    pub s3_bucket: Option<String>,
+    /// Manifest access-token posture: `auto`, `true`, or `false`.
+    pub requires_access_token: String,
+    /// Pre-signed download-URL lifetime, in seconds.
+    pub file_url_ttl_secs: u64,
+    /// How long status artifacts are retained after completion, in seconds.
+    pub output_ttl_secs: u64,
+    /// Maximum manifests this pod ingests concurrently.
+    pub worker_concurrency: u32,
+    /// When `true`, this pod does not run in-process submit workers.
+    pub disable_local_worker: bool,
+    /// Cap on simultaneous in-flight submissions per tenant.
+    pub max_concurrent_per_tenant: u32,
+    /// Resources per ingestion batch.
+    pub batch_size: u32,
+    /// Initial lease length issued at manifest claim, in seconds.
+    pub lease_duration_secs: u64,
+    /// Worker heartbeat cadence, in seconds.
+    pub heartbeat_interval_secs: u64,
+    /// How often the cleanup task scans for expired submissions, in seconds.
+    pub cleanup_interval_secs: u64,
+    /// When `true`, reject a new submission while one is in-progress (`429`).
+    pub block_concurrent_submission: bool,
+    /// OAuth `client_id` HFS presents when fetching protected provider files.
+    pub client_id: Option<String>,
+    /// PEM private key HFS signs its `private_key_jwt` client assertion with.
+    pub private_key: Option<String>,
+    /// Signing algorithm for the client assertion (`ES384` or `RS384`).
+    pub signing_alg: String,
+    /// Read scope requested for the outbound file-retrieval token.
+    pub outbound_scope: String,
+}
+
+impl Default for BulkSubmitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            output_backend: "local-fs".to_string(),
+            output_dir: None,
+            s3_bucket: None,
+            requires_access_token: "auto".to_string(),
+            file_url_ttl_secs: 3600,
+            output_ttl_secs: 86400,
+            worker_concurrency: 2,
+            disable_local_worker: false,
+            max_concurrent_per_tenant: 4,
+            batch_size: 1000,
+            lease_duration_secs: 60,
+            heartbeat_interval_secs: 20,
+            cleanup_interval_secs: 300,
+            block_concurrent_submission: false,
+            client_id: None,
+            private_key: None,
+            signing_alg: "ES384".to_string(),
+            outbound_scope: "system/*.rs".to_string(),
+        }
+    }
+}
+
+impl BulkSubmitConfig {
+    /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars.
+    pub fn from_env() -> Self {
+        fn env_bool(key: &str, default: bool) -> bool {
+            std::env::var(key)
+                .map(|s| {
+                    let s = s.to_lowercase();
+                    s == "true" || s == "1"
+                })
+                .unwrap_or(default)
+        }
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        fn env_u32(key: &str, default: u32) -> u32 {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        let d = Self::default();
+        Self {
+            enabled: env_bool("HFS_BULK_SUBMIT_ENABLED", d.enabled),
+            output_backend: std::env::var("HFS_BULK_SUBMIT_OUTPUT_BACKEND")
+                .unwrap_or(d.output_backend),
+            output_dir: std::env::var("HFS_BULK_SUBMIT_OUTPUT_DIR").ok(),
+            s3_bucket: std::env::var("HFS_BULK_SUBMIT_S3_BUCKET").ok(),
+            requires_access_token: std::env::var("HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN")
+                .unwrap_or(d.requires_access_token),
+            file_url_ttl_secs: env_u64("HFS_BULK_SUBMIT_FILE_URL_TTL", d.file_url_ttl_secs),
+            output_ttl_secs: env_u64("HFS_BULK_SUBMIT_OUTPUT_TTL", d.output_ttl_secs),
+            worker_concurrency: env_u32("HFS_BULK_SUBMIT_WORKER_CONCURRENCY", d.worker_concurrency),
+            disable_local_worker: env_bool(
+                "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",
+                d.disable_local_worker,
+            ),
+            max_concurrent_per_tenant: env_u32(
+                "HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT",
+                d.max_concurrent_per_tenant,
+            ),
+            batch_size: env_u32("HFS_BULK_SUBMIT_BATCH_SIZE", d.batch_size),
+            lease_duration_secs: env_u64("HFS_BULK_SUBMIT_LEASE_DURATION", d.lease_duration_secs),
+            heartbeat_interval_secs: env_u64(
+                "HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL",
+                d.heartbeat_interval_secs,
+            ),
+            cleanup_interval_secs: env_u64(
+                "HFS_BULK_SUBMIT_CLEANUP_INTERVAL",
+                d.cleanup_interval_secs,
+            ),
+            block_concurrent_submission: env_bool(
+                "HFS_BULK_SUBMIT_BLOCK_CONCURRENT_SUBMISSION",
+                d.block_concurrent_submission,
+            ),
+            client_id: std::env::var("HFS_BULK_SUBMIT_CLIENT_ID").ok(),
+            private_key: std::env::var("HFS_BULK_SUBMIT_PRIVATE_KEY").ok(),
+            signing_alg: std::env::var("HFS_BULK_SUBMIT_SIGNING_ALG").unwrap_or(d.signing_alg),
+            outbound_scope: std::env::var("HFS_BULK_SUBMIT_OUTBOUND_SCOPE")
+                .unwrap_or(d.outbound_scope),
+        }
+    }
+
+    /// Validates the bulk-submit configuration.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if !matches!(self.output_backend.as_str(), "local-fs" | "s3") {
+            errors.push(format!(
+                "HFS_BULK_SUBMIT_OUTPUT_BACKEND '{}' invalid (expected local-fs|s3)",
+                self.output_backend
+            ));
+        }
+        if self.output_backend == "s3" && self.s3_bucket.is_none() {
+            errors.push("HFS_BULK_SUBMIT_S3_BUCKET is required when OUTPUT_BACKEND=s3".to_string());
+        }
+        if !matches!(
+            self.requires_access_token.as_str(),
+            "auto" | "true" | "false"
+        ) {
+            errors.push(format!(
+                "HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN '{}' invalid (expected auto|true|false)",
+                self.requires_access_token
+            ));
+        }
+        if self.output_backend == "local-fs" && self.requires_access_token == "false" {
+            errors.push(
+                "HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN=false is invalid with OUTPUT_BACKEND=local-fs"
+                    .to_string(),
+            );
+        }
+        if !matches!(self.signing_alg.as_str(), "ES384" | "RS384") {
+            errors.push(format!(
+                "HFS_BULK_SUBMIT_SIGNING_ALG '{}' invalid (expected ES384|RS384)",
+                self.signing_alg
+            ));
+        }
+        if self.worker_concurrency == 0 {
+            errors.push("HFS_BULK_SUBMIT_WORKER_CONCURRENCY must be >= 1".to_string());
+        }
+        if self.max_concurrent_per_tenant == 0 {
+            errors.push("HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT must be >= 1".to_string());
+        }
+        if self.batch_size == 0 {
+            errors.push("HFS_BULK_SUBMIT_BATCH_SIZE must be >= 1".to_string());
+        }
+        if self.heartbeat_interval_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL must be > 0".to_string());
+        }
+        if self.lease_duration_secs <= self.heartbeat_interval_secs {
+            errors.push(
+                "HFS_BULK_SUBMIT_LEASE_DURATION must be greater than HEARTBEAT_INTERVAL"
+                    .to_string(),
+            );
+        }
+        if self.cleanup_interval_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_CLEANUP_INTERVAL must be > 0".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
 /// Server configuration for the FHIR REST API.
 ///
 /// This struct can be constructed from environment variables using [`ServerConfig::from_env`],
@@ -576,6 +777,10 @@ pub struct ServerConfig {
     /// Bulk data export configuration (loaded from environment variables).
     #[arg(skip)]
     pub bulk_export: BulkExportConfig,
+
+    /// Bulk data submit configuration (loaded from environment variables).
+    #[arg(skip)]
+    pub bulk_submit: BulkSubmitConfig,
 }
 
 impl ServerConfig {
@@ -616,6 +821,7 @@ impl Default for ServerConfig {
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
+            bulk_submit: BulkSubmitConfig::default(),
         }
     }
 }
@@ -632,6 +838,8 @@ impl ServerConfig {
         config.multitenancy = MultitenancyConfig::from_env();
         // Load bulk export config from environment
         config.bulk_export = BulkExportConfig::from_env();
+        // Load bulk submit config from environment
+        config.bulk_submit = BulkSubmitConfig::from_env();
         config
     }
 
@@ -671,6 +879,10 @@ impl ServerConfig {
 
         if let Err(mut bulk_errors) = self.bulk_export.validate() {
             errors.append(&mut bulk_errors);
+        }
+
+        if let Err(mut submit_errors) = self.bulk_submit.validate() {
+            errors.append(&mut submit_errors);
         }
 
         if errors.is_empty() {
@@ -714,6 +926,7 @@ impl ServerConfig {
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
+            bulk_submit: BulkSubmitConfig::default(),
         }
     }
 
