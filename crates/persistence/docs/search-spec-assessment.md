@@ -40,10 +40,18 @@ Neo4j are not implemented.
 | number | ✓ | ✓ | ✓ | ✓ | implicit-precision ranges + all prefixes |
 | quantity | ✓ | ✓ | ✗ | ✓ | MongoDB rejects with `UnsupportedParameterType` |
 | uri | ✓ | ✓ | ✓ | ✓ | exact + `:above`/`:below` prefix matching |
-| composite | ✓ | ✗ | ✗ | ◐ | PG/Mongo return no condition; ES matches name only |
+| composite | ✓ | ✓ | ✗ | ◐ | SQLite/PG evaluate components; ES matches name only; Mongo returns no condition |
 
 The `resource` and `special` parameter types from the spec are modeled in the `SearchParamType`
 enum but have no dedicated execution path beyond the special common parameters below.
+
+**Composite caveat (all backends):** the SQLite and PostgreSQL composite handlers evaluate each
+component (token/string/number/quantity/date) against the columns of a single `search_index` row.
+However, the REST layer builds the outgoing `SearchParameter` with empty `components`
+(`crates/rest/src/extractors/search_query_builder.rs`), so composite search is currently exercised
+through the direct backend API (with components supplied), not over HTTP. Wiring component
+definitions from the registry into the REST query builder is a prerequisite for end-to-end
+composite search on any backend.
 
 ## 2. Search modifiers
 
@@ -54,7 +62,7 @@ enum but have no dedicated execution path beyond the special common parameters b
 | `:contains` | ✓ | ✓ | ✓ | ✓ |
 | `:text` | ✓ | ◐¹ | ✗ | ✓ |
 | `:not` | ✓ | ✓ | ✗ | ✓ |
-| `:of-type` | ✓ | ✗ | ✗ | ✓ |
+| `:of-type` | ✓ | ✓ | ✗ | ✓ |
 | `:text-advanced` | ✓ | ✗ | ✗ | ✓ |
 | `:above` / `:below` (URI) | ✓ | ✓ | ✗ | ✓ |
 | `:above` / `:below` (token hierarchy) | ✗ | ✗ | ✗ | ✗ |
@@ -151,16 +159,19 @@ Ordered roughly by impact:
 2. **Terminology-dependent modifiers** — token `:above`/`:below`, `:in`, `:not-in` need a
    terminology server. `:in` is partially handled via REST-side expansion; the rest are not native.
    URI `:above`/`:below` (hierarchical prefix, no service needed) *is* implemented on SQLite/PG/ES.
-3. **PostgreSQL modifier/param gaps** — composite parameters and the `:of-type` and
-   `:text-advanced` modifiers are not implemented (`:not` and `:missing` are now supported; SQLite
-   implements all of these).
-4. **MongoDB native search gaps** — quantity and composite parameters error out; forward/reverse
+3. **PostgreSQL modifier gaps** — only the `:text-advanced` modifier remains unimplemented relative
+   to SQLite (`:exact`, `:contains`, `:not`, `:missing`, `:of-type`, URI `:above`/`:below`, and
+   composite parameters are all supported at the backend level now).
+4. **Composite REST wiring** — composite search works at the backend level (SQLite, PostgreSQL) but
+   the REST layer does not yet populate composite component definitions, so it is not reachable over
+   HTTP on any backend. See the composite caveat in §1.
+5. **MongoDB native search gaps** — quantity and composite parameters error out; forward/reverse
    chaining, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are unsupported.
-5. **Elasticsearch gaps** — composite matches the parameter name only (components not evaluated);
+6. **Elasticsearch gaps** — composite matches the parameter name only (components not evaluated);
    forward chaining and `_has` silently return nothing rather than erroring; `_filter` unsupported.
-6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
+7. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
    unsupported; Bundles omit `first`/`last` paging links. `:code-text` (newer spec modifier) is
    unsupported everywhere.
 
-SQLite is the most complete backend and serves as the reference for the others; closing the
-PostgreSQL gaps (composite, `:not`/`:missing`) to reach SQLite parity is the most direct next step.
+SQLite is the most complete backend and serves as the reference for the others; PostgreSQL is now
+at near-parity (only `:text-advanced` and REST-side composite wiring remain).
