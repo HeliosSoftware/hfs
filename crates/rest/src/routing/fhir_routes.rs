@@ -248,6 +248,24 @@ where
             "/export-file/{job_id}/{part}",
             get(handlers::export_download_handler::<S>),
         )
+        // Bulk Data Submit ($bulk-submit) — operation routes precede the catch-all.
+        .route(
+            "/$bulk-submit",
+            post(handlers::bulk_submit_kickoff_handler::<S>),
+        )
+        .route(
+            "/$bulk-submit-status",
+            post(handlers::bulk_submit_status_kickoff_handler::<S>),
+        )
+        .route(
+            "/bulk-submit-status/{poll_token}",
+            get(handlers::bulk_submit_poll_handler::<S>)
+                .delete(handlers::bulk_submit_cancel_handler::<S>),
+        )
+        .route(
+            "/bulk-submit-file/{poll_token}/{part}",
+            get(handlers::bulk_submit_file_handler::<S>),
+        )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))
         .route("/{resource_type}", post(handlers::create_handler::<S>))
