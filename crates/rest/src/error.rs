@@ -125,6 +125,18 @@ pub enum RestError {
         resource_type: String,
     },
 
+    /// Conflict — e.g. duplicate submission or invalid state transition (HTTP 409).
+    Conflict {
+        /// Error message.
+        message: String,
+    },
+
+    /// Too many requests — e.g. a concurrent submission is in progress (HTTP 429).
+    TooManyRequests {
+        /// Error message.
+        message: String,
+    },
+
     /// Not implemented (HTTP 501).
     NotImplemented {
         /// Description of what's not implemented.
@@ -205,6 +217,12 @@ impl fmt::Display for RestError {
                 resource_type,
             } => {
                 write!(f, "Method {} not allowed on {}", method, resource_type)
+            }
+            RestError::Conflict { message } => {
+                write!(f, "Conflict: {}", message)
+            }
+            RestError::TooManyRequests { message } => {
+                write!(f, "Too many requests: {}", message)
             }
             RestError::NotImplemented { feature } => {
                 write!(f, "Not implemented: {}", feature)
@@ -299,6 +317,10 @@ impl IntoResponse for RestError {
                 "not-supported",
                 format!("Method {} not allowed on {}", method, resource_type),
             ),
+            RestError::Conflict { message } => (StatusCode::CONFLICT, "conflict", message.clone()),
+            RestError::TooManyRequests { message } => {
+                (StatusCode::TOO_MANY_REQUESTS, "throttled", message.clone())
+            }
             RestError::NotImplemented { feature } => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",
@@ -401,9 +423,31 @@ impl From<StorageError> for RestError {
             StorageError::BulkExport(e) => RestError::InternalError {
                 message: e.to_string(),
             },
-            StorageError::BulkSubmit(e) => RestError::InternalError {
-                message: e.to_string(),
-            },
+            StorageError::BulkSubmit(e) => {
+                use helios_persistence::error::BulkSubmitError as B;
+                let msg = e.to_string();
+                match e {
+                    B::SubmissionNotFound { .. } => RestError::NotFound {
+                        resource_type: "Submission".to_string(),
+                        id: msg,
+                    },
+                    B::ManifestNotFound { .. } => RestError::NotFound {
+                        resource_type: "SubmissionManifest".to_string(),
+                        id: msg,
+                    },
+                    B::DuplicateSubmission { .. }
+                    | B::AlreadyComplete { .. }
+                    | B::InvalidState { .. }
+                    | B::Aborted { .. }
+                    | B::ManifestReplacementError { .. } => RestError::Conflict { message: msg },
+                    B::ParseError { .. }
+                    | B::InvalidResource { .. }
+                    | B::MaxErrorsExceeded { .. } => {
+                        RestError::UnprocessableEntity { message: msg }
+                    }
+                    B::RollbackFailed { .. } => RestError::InternalError { message: msg },
+                }
+            }
         }
     }
 }
