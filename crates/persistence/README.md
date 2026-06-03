@@ -315,6 +315,8 @@ let query_with_include = SearchQuery::new("Observation")
 
 The matrix below shows which FHIR operations each backend supports. This reflects the actual implementation status, not aspirational goals.
 
+For a capability-by-capability narrative of FHIR Search against the [spec](https://build.fhir.org/search.html) — including the REST-layer vs. backend boundary and a roadmap of known gaps — see [`docs/search-spec-assessment.md`](docs/search-spec-assessment.md).
+
 > **Note:** Documentation links reference [build.fhir.org](https://build.fhir.org), which contains the current FHIR development version. Some features marked as planned are new and may be labeled "Trial Use" in the specification.
 
 **Legend:** ✓ Implemented | ◐ Partial | ○ Planned | ✗ Not planned | † Requires external service
@@ -345,24 +347,24 @@ The matrix below shows which FHIR operations each backend supports. This reflect
 | [Number](https://build.fhir.org/search.html#number)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ○   |
 | [Quantity](https://build.fhir.org/search.html#quantity)                     | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ○   |
 | [URI](https://build.fhir.org/search.html#uri)                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
-| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ○          | ○       | ✗         | ○     | ✓             | ✗   |
+| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ○          | ○       | ✗         | ○     | ◐             | ✗   |
 | **[Search Modifiers](https://build.fhir.org/search.html#modifiers)**        |
-| [:exact](https://build.fhir.org/search.html#modifiers)                      | ✓      | ✓          | ○       | ○         | ○     | ✓             | ○   |
-| [:contains](https://build.fhir.org/search.html#modifiers)                   | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
+| [:exact](https://build.fhir.org/search.html#modifiers)                      | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
+| [:contains](https://build.fhir.org/search.html#modifiers)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | [:text](https://build.fhir.org/search.html#modifiers) (full-text)           | ✓      | ◐          | ○       | ✗         | ✗     | ✓             | ✗   |
-| [:not](https://build.fhir.org/search.html#modifiers)                        | ✓      | ○          | ○       | ✗         | ○     | ✓             | ○   |
-| [:missing](https://build.fhir.org/search.html#modifiers)                    | ✓      | ○          | ○       | ✗         | ○     | ✓             | ○   |
-| [:above / :below](https://build.fhir.org/search.html#modifiers)             | ✗      | †○         | †○      | ✗         | ○     | ✓             | ✗   |
+| [:not](https://build.fhir.org/search.html#modifiers)                        | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ○   |
+| [:missing](https://build.fhir.org/search.html#modifiers)                    | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ○   |
+| [:above / :below](https://build.fhir.org/search.html#modifiers)             | ◐      | ◐          | †○      | ✗         | ○     | ◐             | ✗   |
 | [:in / :not-in](https://build.fhir.org/search.html#modifiers)               | ✗      | †○         | †○      | ✗         | ○     | †○            | ✗   |
 | [:of-type](https://build.fhir.org/search.html#modifiers)                    | ✓      | ○          | ○       | ✗         | ○     | ✓             | ✗   |
 | [:text-advanced](https://build.fhir.org/search.html#modifiertextadvanced)   | ✓      | †○         | †○      | ✗         | ✗     | ✓             | ✗   |
 | **[Special Parameters](https://build.fhir.org/search.html#all)**            |
-| [\_text](https://build.fhir.org/search.html#_text) (narrative search)       | ✓      | ◐          | ○       | ✗         | ✗     | ✓             | ✗   |
-| [\_content](https://build.fhir.org/search.html#_content) (full content)     | ✓      | ◐          | ○       | ✗         | ✗     | ✓             | ✗   |
+| [\_text](https://build.fhir.org/search.html#_text) (narrative search)       | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ✗   |
+| [\_content](https://build.fhir.org/search.html#_content) (full content)     | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ✗   |
 | [\_filter](https://build.fhir.org/search.html#_filter) (advanced filtering) | ✓      | ○          | ○       | ✗         | ○     | ○             | ✗   |
 | **Advanced Search**                                                         |
-| [Chained Parameters](https://build.fhir.org/search.html#chaining)           | ✓      | ◐          | ○       | ✗         | ○     | ✗             | ✗   |
-| [Reverse Chaining (\_has)](https://build.fhir.org/search.html#has)          | ✓      | ◐          | ○       | ✗         | ○     | ✗             | ✗   |
+| [Chained Parameters](https://build.fhir.org/search.html#chaining)           | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✗   |
+| [Reverse Chaining (\_has)](https://build.fhir.org/search.html#has)          | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✗   |
 | [\_include](https://build.fhir.org/search.html#include)                     | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | [\_revinclude](https://build.fhir.org/search.html#revinclude)               | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | **[Pagination](https://build.fhir.org/http.html#paging)**                   |
@@ -370,10 +372,26 @@ The matrix below shows which FHIR operations each backend supports. This reflect
 | Cursor (keyset)                                                             | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
 | **[Sorting](https://build.fhir.org/search.html#sort)**                      |
 | Single field                                                                | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
-| Multiple fields                                                             | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
+| Multiple fields                                                             | ✓      | ✓          | ◐       | ✗         | ○     | ✓             | ✗   |
 | **[Bulk Operations](https://hl7.org/fhir/uv/bulkdata/)**                    |
 | [Bulk Export](https://hl7.org/fhir/uv/bulkdata/export.html)                 | ✓      | ✓          | ○       | ○         | ○     | ○             | ◐   |
 | [Bulk Submit](https://hackmd.io/@argonaut/rJoqHZrPle)                       | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
+
+**Notes on partial cells:**
+
+- **Sorting** — "Single/Multiple field" covers `_id` and `_lastUpdated` only on every
+  backend; sorting by an arbitrary search parameter is not yet implemented (it would require a
+  join against the search index). Sort is applied on the first-page and offset paths; cursor
+  (keyset) pages always use the default `_lastUpdated` ordering. MongoDB cannot combine a custom
+  sort with cursor pagination, hence ◐ for multiple fields.
+- **`:above` / `:below`** — SQLite, PostgreSQL, and Elasticsearch implement hierarchical URI
+  prefix matching (no external service needed), shown as ◐. Token/code hierarchy expansion
+  (which needs a terminology server) is not implemented natively.
+- **`:in` / `:not-in`** — handled at the REST layer: `:in` is expanded against a terminology
+  server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
+  backend resolves these natively.
+- **Elasticsearch Composite** — matches on the composite parameter name only; individual
+  component values are not yet evaluated, hence ◐.
 
 The S3 backend is intentionally storage-focused (CRUD/version/history/bulk submit) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but job state belongs to SQLite or PostgreSQL. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
@@ -537,10 +555,12 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 - Full CRUD operations with document-native resource storage
 - Versioning and history providers (`vread`, instance/type/system history)
 - Transaction bundles with urn:uuid reference resolution (requires replica set)
-- Native search (string, token, reference, date, number, URI parameters)
+- Native search (string, token, reference, date, number, URI parameters; quantity and composite
+  parameters, chained/`_has`, `_text`/`_content`, and most modifiers are not yet supported)
 - `_include` and `_revinclude` resolution
 - Conditional create, update, and delete operations
-- Cursor and offset pagination with multi-field sorting
+- Cursor and offset pagination; sorting by `_id`/`_lastUpdated` (a custom sort cannot be combined
+  with cursor pagination)
 - Shared-schema multitenancy with strict tenant filtering
 - Optimistic locking with ETag support
 
@@ -1089,7 +1109,8 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] Index schema and mappings (nested objects for multi-value search params)
 - [x] ResourceStorage implementation for composite sync support
 - [x] Search query translation (FHIR SearchQuery → ES Query DSL)
-- [x] All 8 parameter type handlers (string, token, date, number, quantity, reference, URI, composite)
+- [x] Parameter type handlers (string, token, date, number, quantity, reference, URI; composite
+      matches on the parameter name only — component values are not yet evaluated)
 - [x] Full-text search (`_text`, `_content`, `:text-advanced`)
 - [x] Modifier support (:exact, :contains, :text, :not, :missing, :above, :below, :of-type)
 - [x] `_include` and `_revinclude` resolution
@@ -1106,9 +1127,13 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] History providers (instance, type, system)
 - [x] TransactionProvider with configurable isolation levels
 - [x] Conditional operations (conditional create/update/delete)
-- [x] SearchProvider with all parameter types
+- [x] SearchProvider with all parameter types except composite (string, token, reference, date,
+      number, quantity, URI; supports `:exact`/`:contains`/`:not`/`:missing` and URI
+      `:above`/`:below`; composite and the `:of-type`/`:text-advanced` modifiers are not yet
+      implemented)
 - [x] ChainedSearchProvider and reverse chaining (\_has)
 - [x] Full-text search (tsvector/tsquery)
+- [x] `_sort` by `_id`/`_lastUpdated` (first-page and offset paths)
 - [x] `_include` and `_revinclude` resolution
 - [x] BulkExportStorage and BulkSubmitProvider
 - [x] Search offloading support

@@ -1189,6 +1189,172 @@ mod postgres_integration {
         );
     }
 
+    #[tokio::test]
+    async fn postgres_integration_search_sort_by_id() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchQuery, SortDirective};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Create in non-sorted insertion order to prove ORDER BY is applied.
+        for id in ["p3", "p1", "p2"] {
+            let patient = json!({ "resourceType": "Patient", "id": id });
+            backend
+                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        // Ascending _sort=_id
+        let asc = SearchQuery::new("Patient").with_sort(SortDirective::parse("_id"));
+        let result = backend.search(&tenant, &asc).await.unwrap();
+        let ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["p1", "p2", "p3"],
+            "_sort=_id should return ascending id order"
+        );
+
+        // Descending _sort=-_id
+        let desc = SearchQuery::new("Patient").with_sort(SortDirective::parse("-_id"));
+        let result = backend.search(&tenant, &desc).await.unwrap();
+        let ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["p3", "p2", "p1"],
+            "_sort=-_id should return descending id order"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_search_missing_modifier() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "with-gender", "gender": "male" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "no-gender" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let missing = |present: &str| {
+            SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "gender".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: Some(SearchModifier::Missing),
+                values: vec![SearchValue::eq(present)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        let result = backend.search(&tenant, &missing("true")).await.unwrap();
+        let ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids, vec!["no-gender"], "gender:missing=true → no-gender");
+
+        let result = backend.search(&tenant, &missing("false")).await.unwrap();
+        let ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["with-gender"],
+            "gender:missing=false → with-gender"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_search_not_modifier() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        for (id, gender) in [("male1", Some("male")), ("female1", Some("female"))] {
+            let mut patient = json!({ "resourceType": "Patient", "id": id });
+            if let Some(g) = gender {
+                patient["gender"] = json!(g);
+            }
+            backend
+                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        // A patient with no gender at all should also be returned by :not.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "none1" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("male")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["female1", "none1"],
+            "gender:not=male → non-male incl. resources with no gender"
+        );
+    }
+
     // ========================================================================
     // Backend Health Check Tests
     // ========================================================================
