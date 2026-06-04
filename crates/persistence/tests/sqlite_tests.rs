@@ -1146,7 +1146,114 @@ async fn test_history_system_tenant_isolation() {
 // ============================================================================
 
 use helios_persistence::core::SearchProvider;
-use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+use helios_persistence::types::{
+    CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+};
+
+/// Builds the `code-value-quantity` composite query with the component types
+/// the registry would supply, mirroring what the REST layer now wires up.
+fn code_value_quantity_query(value: &str) -> SearchQuery {
+    SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "code-value-quantity".to_string(),
+        param_type: SearchParamType::Composite,
+        modifier: None,
+        values: vec![SearchValue::eq(value)],
+        chain: vec![],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".to_string(),
+            },
+        ],
+    })
+}
+
+#[tokio::test]
+async fn test_search_value_quantity_choice_type() {
+    // Regression: choice-type elements (`value[x]`) must be indexed. The
+    // `value-quantity` expression is `(Observation.value as Quantity)`.
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    let observation = json!({
+        "resourceType": "Observation",
+        "id": "obs-q",
+        "status": "final",
+        "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+        "valueQuantity": { "value": 72.5, "unit": "kg", "system": "http://unitsofmeasure.org" }
+    });
+    backend
+        .create(&tenant, "Observation", observation, FhirVersion::default())
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "value-quantity".to_string(),
+        param_type: SearchParamType::Quantity,
+        modifier: None,
+        values: vec![SearchValue::new(
+            helios_persistence::types::SearchPrefix::Ge,
+            "70",
+        )],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        "value-quantity ge70 → 1 hit"
+    );
+    assert_eq!(result.resources.items[0].id(), "obs-q");
+}
+
+#[tokio::test]
+async fn test_search_composite_code_value_quantity() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    let observation = json!({
+        "resourceType": "Observation",
+        "id": "obs-bp",
+        "status": "final",
+        "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6" }] },
+        "valueQuantity": { "value": 107, "unit": "mmHg", "system": "http://unitsofmeasure.org" }
+    });
+    backend
+        .create(&tenant, "Observation", observation, FhirVersion::default())
+        .await
+        .unwrap();
+
+    // Matches: correct code AND value satisfies the quantity comparison.
+    let result = backend
+        .search(&tenant, &code_value_quantity_query("8480-6$ge100"))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        "code + value both match → 1 hit"
+    );
+    assert_eq!(result.resources.items[0].id(), "obs-bp");
+
+    // Value component fails (107 is not >= 200).
+    let result = backend
+        .search(&tenant, &code_value_quantity_query("8480-6$ge200"))
+        .await
+        .unwrap();
+    assert!(result.resources.items.is_empty(), "value too low → no hit");
+
+    // Code component fails.
+    let result = backend
+        .search(&tenant, &code_value_quantity_query("9999-9$ge100"))
+        .await
+        .unwrap();
+    assert!(result.resources.items.is_empty(), "code mismatch → no hit");
+}
 
 // Note: These tests verify that search indexing infrastructure is integrated into
 // storage operations. Full end-to-end search filtering requires updating search_impl.rs
@@ -2814,7 +2921,7 @@ async fn test_fts_delete_does_not_fail() {
 // _content Parameter Tests (Full Content Search)
 // ============================================================================
 
-use helios_persistence::types::{CompositeSearchComponent, SearchModifier};
+use helios_persistence::types::SearchModifier;
 
 #[tokio::test]
 async fn test_content_search_basic() {

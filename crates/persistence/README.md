@@ -391,10 +391,10 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
   backend resolves these natively.
 - **Composite** — SQLite and PostgreSQL evaluate composite component values (token, string,
-  number, quantity, date) at the backend level (✓); Elasticsearch matches on the composite
-  parameter name only (◐). Note: the REST layer does not yet populate composite component
-  definitions from the registry, so composite search is currently reachable via the direct
-  backend API rather than over HTTP. See `docs/search-spec-assessment.md`.
+  number, quantity, date) end-to-end (✓): the REST layer resolves component types from the
+  registry, the extractor indexes each composite instance as a `composite_group`, and the backend
+  matches all components within one group. Elasticsearch matches on the composite parameter name
+  only (◐). See `docs/search-spec-assessment.md`.
 
 The S3 backend is intentionally storage-focused (CRUD/version/history/bulk submit) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but job state belongs to SQLite or PostgreSQL. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
@@ -1133,7 +1133,7 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] SearchProvider with all parameter types including composite (string, token, reference, date,
       number, quantity, URI, composite; supports `:exact`/`:contains`/`:not`/`:missing`/`:of-type`
       and URI `:above`/`:below`; the `:text-advanced` modifier is not yet implemented). Composite
-      component definitions are not yet wired through the REST layer.
+      search works end-to-end (REST → registry-resolved components → grouped index → query).
 - [x] ChainedSearchProvider and reverse chaining (\_has)
 - [x] Full-text search (tsvector/tsquery)
 - [x] `_sort` by `_id`/`_lastUpdated` (first-page and offset paths)

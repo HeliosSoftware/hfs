@@ -1355,6 +1355,72 @@ mod postgres_integration {
         );
     }
 
+    #[tokio::test]
+    async fn postgres_integration_search_composite_code_value_quantity() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let observation = json!({
+            "resourceType": "Observation",
+            "id": "obs-bp",
+            "status": "final",
+            "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6" }] },
+            "valueQuantity": { "value": 107, "unit": "mmHg", "system": "http://unitsofmeasure.org" }
+        });
+        backend
+            .create(&tenant, "Observation", observation, FhirVersion::default())
+            .await
+            .unwrap();
+
+        let query = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "code-value-quantity".to_string(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "value-quantity".to_string(),
+                    },
+                ],
+            })
+        };
+
+        let result = backend
+            .search(&tenant, &query("8480-6$ge100"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "code + value match → 1 hit"
+        );
+        assert_eq!(result.resources.items[0].id(), "obs-bp");
+
+        let result = backend
+            .search(&tenant, &query("8480-6$ge200"))
+            .await
+            .unwrap();
+        assert!(result.resources.items.is_empty(), "value too low → no hit");
+
+        let result = backend
+            .search(&tenant, &query("9999-9$ge100"))
+            .await
+            .unwrap();
+        assert!(result.resources.items.is_empty(), "code mismatch → no hit");
+    }
+
     // ========================================================================
     // Backend Health Check Tests
     // ========================================================================

@@ -444,12 +444,11 @@ impl PostgresQueryBuilder {
     /// Builds a composite-parameter condition.
     ///
     /// Composite values join their components with `$` (e.g.
-    /// `http://loinc.org|8480-6$lt60`). Each component is matched as a bare
-    /// predicate against the columns of a single `search_index` row scoped to
-    /// the composite parameter name — mirroring the SQLite backend. Requires
-    /// `param.components` to be populated (the REST layer does not yet wire
-    /// these from the registry, so this is reachable via the direct backend
-    /// API; see `docs/search-spec-assessment.md`).
+    /// `http://loinc.org|8480-6$lt60`). Each component of a composite instance
+    /// is indexed as its own `search_index` row sharing a `composite_group`, so
+    /// a resource matches when there is a group in which every component is
+    /// satisfied by some row. This is expressed with
+    /// `GROUP BY resource_id, composite_group HAVING <every component present>`.
     fn build_composite_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         if param.components.is_empty() {
             return None;
@@ -461,35 +460,37 @@ impl PostgresQueryBuilder {
 
         for value in &param.values {
             let parts: Vec<&str> = value.value.split('$').collect();
-            let inner = if parts.len() != param.components.len() {
-                "1 = 0".to_string()
-            } else {
-                let mut comp_sqls = Vec::new();
-                let mut ok = true;
-                for (part, component) in parts.iter().zip(param.components.iter()) {
-                    let cv = Self::parse_component_value(part);
-                    match Self::build_composite_component(&cv, component.param_type, current) {
-                        Some((sql, params)) => {
-                            current += params.len();
-                            all_params.extend(params);
-                            comp_sqls.push(sql);
-                        }
-                        None => {
-                            ok = false;
-                            break;
-                        }
+            if parts.len() != param.components.len() {
+                value_conditions.push("1 = 0".to_string());
+                continue;
+            }
+
+            let mut havings = Vec::new();
+            let mut ok = true;
+            for (part, component) in parts.iter().zip(param.components.iter()) {
+                let cv = Self::parse_component_value(part);
+                match Self::build_composite_component(&cv, component.param_type, current) {
+                    Some((sql, params)) => {
+                        current += params.len();
+                        all_params.extend(params);
+                        havings.push(format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", sql));
+                    }
+                    None => {
+                        ok = false;
+                        break;
                     }
                 }
-                if ok && !comp_sqls.is_empty() {
-                    comp_sqls.join(" AND ")
-                } else {
-                    "1 = 0".to_string()
-                }
-            };
+            }
+
+            if !ok || havings.is_empty() {
+                value_conditions.push("1 = 0".to_string());
+                continue;
+            }
 
             value_conditions.push(format!(
-                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
-                param.name, inner
+                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' GROUP BY resource_id, composite_group HAVING {})",
+                param.name,
+                havings.join(" AND ")
             ));
         }
 
