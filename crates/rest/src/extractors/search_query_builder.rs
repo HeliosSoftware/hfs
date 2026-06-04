@@ -53,7 +53,17 @@ pub fn build_search_query(
             } else {
                 SortDirective::parse(&format!("-{}", sort.field))
             };
-            query.sort.push(directive);
+            // Resolve the search-parameter type so backends can sort by the
+            // indexed value column. `_id`/`_lastUpdated` are columns on the
+            // resources table and need no type.
+            let param_type = if directive.parameter.starts_with('_') {
+                None
+            } else {
+                registry
+                    .get_param(resource_type, &directive.parameter)
+                    .map(|d| d.param_type)
+            };
+            query.sort.push(directive.with_param_type(param_type));
         }
     }
 

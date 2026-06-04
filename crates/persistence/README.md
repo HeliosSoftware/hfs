@@ -379,11 +379,13 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 
 **Notes on partial cells:**
 
-- **Sorting** — "Single/Multiple field" covers `_id` and `_lastUpdated` only on every
-  backend; sorting by an arbitrary search parameter is not yet implemented (it would require a
-  join against the search index). Sort is applied on the first-page and offset paths; cursor
-  (keyset) pages always use the default `_lastUpdated` ordering. MongoDB cannot combine a custom
-  sort with cursor pagination, hence ◐ for multiple fields.
+- **Sorting** — SQLite and PostgreSQL sort by any indexed search parameter (string, token,
+  date, number, quantity, reference, URI) via a correlated subquery into the search index, taking
+  the min value ascending / max descending for multi-valued params; `_id`/`_lastUpdated` sort on
+  the resources table directly. Sort is applied on the first-page and offset paths; cursor
+  (keyset) pages always use the default `_lastUpdated` ordering. MongoDB sorts by `_id`/
+  `_lastUpdated` only and cannot combine a custom sort with cursor pagination, hence ◐ for
+  multiple fields.
 - **`:above` / `:below`** — SQLite, PostgreSQL, and Elasticsearch implement hierarchical URI
   prefix matching (no external service needed), shown as ◐. Token/code hierarchy expansion
   (which needs a terminology server) is not implemented natively.
@@ -1136,7 +1138,8 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
       search works end-to-end (REST → registry-resolved components → grouped index → query).
 - [x] ChainedSearchProvider and reverse chaining (\_has)
 - [x] Full-text search (tsvector/tsquery)
-- [x] `_sort` by `_id`/`_lastUpdated` (first-page and offset paths)
+- [x] `_sort` by `_id`/`_lastUpdated` and any indexed search parameter via a search_index
+      correlated subquery (first-page and offset paths)
 - [x] `_include` and `_revinclude` resolution
 - [x] BulkExportStorage and BulkSubmitProvider
 - [x] Search offloading support

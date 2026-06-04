@@ -1148,7 +1148,70 @@ async fn test_history_system_tenant_isolation() {
 use helios_persistence::core::SearchProvider;
 use helios_persistence::types::{
     CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    SortDirective,
 };
+
+async fn search_ids(
+    backend: &SqliteBackend,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> Vec<String> {
+    backend
+        .search(tenant, query)
+        .await
+        .unwrap()
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_search_sort_by_indexed_param() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    for (id, family, birth) in [
+        ("p-charlie", "Charlie", "1990-01-01"),
+        ("p-alice", "Alice", "1985-01-01"),
+        ("p-bob", "Bob", "2000-01-01"),
+    ] {
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{ "family": family }],
+            "birthDate": birth,
+        });
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    // Sort by family (string), ascending then descending.
+    let asc = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("family").with_param_type(Some(SearchParamType::String)));
+    assert_eq!(
+        search_ids(&backend, &tenant, &asc).await,
+        vec!["p-alice", "p-bob", "p-charlie"]
+    );
+
+    let desc = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("-family").with_param_type(Some(SearchParamType::String)));
+    assert_eq!(
+        search_ids(&backend, &tenant, &desc).await,
+        vec!["p-charlie", "p-bob", "p-alice"]
+    );
+
+    // Sort by birthdate (date), ascending.
+    let by_birth = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)));
+    assert_eq!(
+        search_ids(&backend, &tenant, &by_birth).await,
+        vec!["p-alice", "p-charlie", "p-bob"]
+    );
+}
 
 /// Builds the `code-value-quantity` composite query with the component types
 /// the registry would supply, mirroring what the REST layer now wires up.

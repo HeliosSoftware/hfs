@@ -12,6 +12,22 @@ use super::parameter_handlers::{
     TokenHandler, UriHandler,
 };
 
+/// Maps a search-parameter type to the `search_index` value column used when
+/// sorting on that parameter. Returns `None` for types that are not sortable via
+/// a single value column (composite, special).
+pub(crate) fn sort_value_column(param_type: SearchParamType) -> Option<&'static str> {
+    match param_type {
+        SearchParamType::String => Some("value_string"),
+        SearchParamType::Token => Some("value_token_code"),
+        SearchParamType::Date => Some("value_date"),
+        SearchParamType::Number => Some("value_number"),
+        SearchParamType::Quantity => Some("value_quantity_value"),
+        SearchParamType::Reference => Some("value_reference"),
+        SearchParamType::Uri => Some("value_uri"),
+        SearchParamType::Composite | SearchParamType::Special => None,
+    }
+}
+
 /// A fragment of SQL with bound parameters.
 #[derive(Debug, Clone)]
 pub struct SqlFragment {
@@ -592,10 +608,7 @@ impl QueryBuilder {
                     crate::types::SortDirection::Ascending => "ASC",
                     crate::types::SortDirection::Descending => "DESC",
                 };
-
-                // Map sort parameters to SQL columns
-                let column = self.sort_column(&s.parameter);
-                format!("{} {}", column, dir)
+                format!("{} {}", self.sort_expression(s), dir)
             })
             .collect();
 
@@ -608,17 +621,32 @@ impl QueryBuilder {
         format!("ORDER BY {}", clauses.join(", "))
     }
 
-    /// Maps a sort parameter name to the corresponding SQL column.
+    /// Builds the ORDER BY expression for a single sort directive.
     ///
-    /// This is used by `build_order_by` to translate FHIR sort parameters
-    /// to SQLite column names.
-    fn sort_column(&self, parameter: &str) -> &'static str {
-        match parameter {
-            "_id" => "id",
-            "_lastUpdated" => "last_updated",
-            // Future: could support arbitrary parameters via search_index join
-            // For now, use id as a stable fallback
-            _ => "id",
+    /// `_id`/`_lastUpdated` map to `resources` columns. Any other indexed search
+    /// parameter sorts on a correlated subquery into `search_index`, taking the
+    /// MIN value for ascending and MAX for descending (FHIR multi-value sort).
+    fn sort_expression(&self, directive: &crate::types::SortDirective) -> String {
+        match directive.parameter.as_str() {
+            "_id" => return "id".to_string(),
+            "_lastUpdated" => return "last_updated".to_string(),
+            _ => {}
+        }
+
+        let column = directive.param_type.and_then(sort_value_column);
+        match column {
+            Some(col) => {
+                let agg = match directive.direction {
+                    crate::types::SortDirection::Ascending => "MIN",
+                    crate::types::SortDirection::Descending => "MAX",
+                };
+                format!(
+                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_id = resources.id AND si.param_name = '{}')",
+                    agg, col, directive.parameter
+                )
+            }
+            // Unsortable (composite/special/unresolved) — stable fallback.
+            None => "id".to_string(),
         }
     }
 
@@ -725,10 +753,12 @@ mod tests {
             SortDirective {
                 parameter: "_lastUpdated".to_string(),
                 direction: SortDirection::Descending,
+                param_type: None,
             },
             SortDirective {
                 parameter: "_id".to_string(),
                 direction: SortDirection::Ascending,
+                param_type: None,
             },
         ];
 
@@ -745,6 +775,7 @@ mod tests {
         query.sort = vec![SortDirective {
             parameter: "_lastUpdated".to_string(),
             direction: SortDirection::Ascending,
+            param_type: None,
         }];
 
         let order_by = builder.build_order_by(&query);
