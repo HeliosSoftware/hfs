@@ -45,13 +45,19 @@ Neo4j are not implemented.
 The `resource` and `special` parameter types from the spec are modeled in the `SearchParamType`
 enum but have no dedicated execution path beyond the special common parameters below.
 
-**Composite caveat (all backends):** the SQLite and PostgreSQL composite handlers evaluate each
-component (token/string/number/quantity/date) against the columns of a single `search_index` row.
-However, the REST layer builds the outgoing `SearchParameter` with empty `components`
-(`crates/rest/src/extractors/search_query_builder.rs`), so composite search is currently exercised
-through the direct backend API (with components supplied), not over HTTP. Wiring component
-definitions from the registry into the REST query builder is a prerequisite for end-to-end
-composite search on any backend.
+**Composite (SQLite, PostgreSQL):** works end-to-end. The REST layer resolves each component's
+type and code from the registry (by the component `definition` URL); the extractor indexes every
+composite instance as a set of `search_index` rows sharing a `composite_group`; and the backend
+matches with `GROUP BY resource_id, composite_group HAVING <every component present>`, so all
+components must be satisfied within the same instance. Elasticsearch still matches the composite
+name only (◐).
+
+**Choice types (`value[x]`):** the extractor evaluates FHIRPath against schema-less JSON, where a
+cast such as `value as Quantity` / `value.ofType(Quantity)` cannot resolve to the stored
+`valueQuantity` field. `rewrite_choice_types` in `search/extractor.rs` rewrites these casts to the
+concrete element name (`valueQuantity`, `medicationCodeableConcept`, `occurrenceDateTime`, …)
+before evaluation. This fixed both composite value components and plain `value[x]` parameters
+(e.g. `value-quantity`), which previously indexed nothing.
 
 ## 2. Search modifiers
 
@@ -161,17 +167,14 @@ Ordered roughly by impact:
    URI `:above`/`:below` (hierarchical prefix, no service needed) *is* implemented on SQLite/PG/ES.
 3. **PostgreSQL modifier gaps** — only the `:text-advanced` modifier remains unimplemented relative
    to SQLite (`:exact`, `:contains`, `:not`, `:missing`, `:of-type`, URI `:above`/`:below`, and
-   composite parameters are all supported at the backend level now).
-4. **Composite REST wiring** — composite search works at the backend level (SQLite, PostgreSQL) but
-   the REST layer does not yet populate composite component definitions, so it is not reachable over
-   HTTP on any backend. See the composite caveat in §1.
-5. **MongoDB native search gaps** — quantity and composite parameters error out; forward/reverse
+   composite parameters are all supported now).
+4. **MongoDB native search gaps** — quantity and composite parameters error out; forward/reverse
    chaining, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are unsupported.
-6. **Elasticsearch gaps** — composite matches the parameter name only (components not evaluated);
+5. **Elasticsearch gaps** — composite matches the parameter name only (components not evaluated);
    forward chaining and `_has` silently return nothing rather than erroring; `_filter` unsupported.
-7. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
+6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
    unsupported; Bundles omit `first`/`last` paging links. `:code-text` (newer spec modifier) is
    unsupported everywhere.
 
 SQLite is the most complete backend and serves as the reference for the others; PostgreSQL is now
-at near-parity (only `:text-advanced` and REST-side composite wiring remain).
+at near-parity (only `:text-advanced` remains).

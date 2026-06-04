@@ -207,6 +207,11 @@ impl QueryBuilder {
             return self.build_special_parameter_condition(param, param_offset);
         }
 
+        // Composite parameters need a group-aware subquery (see below).
+        if matches!(param.param_type, SearchParamType::Composite) {
+            return self.build_composite_parameter_condition(param, param_offset);
+        }
+
         // Multiple values are ORed together
         let mut or_conditions = Vec::new();
         let mut total_params = 0usize;
@@ -237,6 +242,56 @@ impl QueryBuilder {
             ),
             combined.params,
         ))
+    }
+
+    /// Builds a condition for a composite parameter.
+    ///
+    /// Each composite instance is indexed as a set of `search_index` rows that
+    /// share a `composite_group`. A resource matches when there is a group in
+    /// which every component is satisfied by some row, expressed as
+    /// `GROUP BY resource_id, composite_group HAVING <every component present>`.
+    fn build_composite_parameter_condition(
+        &self,
+        param: &SearchParameter,
+        param_offset: usize,
+    ) -> Option<SqlFragment> {
+        if param.components.is_empty() {
+            return None;
+        }
+
+        let mut or_conditions = Vec::new();
+        let mut params = Vec::new();
+        let mut total_params = 0usize;
+
+        for value in &param.values {
+            match CompositeHandler::build_component_fragments(
+                value,
+                &param.components,
+                param_offset + total_params,
+            ) {
+                Some(fragments) if !fragments.is_empty() => {
+                    let havings: Vec<String> = fragments
+                        .iter()
+                        .map(|f| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", f.sql))
+                        .collect();
+                    for f in fragments {
+                        total_params += f.params.len();
+                        params.extend(f.params);
+                    }
+                    or_conditions.push(format!(
+                        "resource_id IN (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' GROUP BY resource_id, composite_group HAVING {})",
+                        param.name,
+                        havings.join(" AND ")
+                    ));
+                }
+                _ => or_conditions.push("0 = 1".to_string()),
+            }
+        }
+
+        if or_conditions.is_empty() {
+            return None;
+        }
+        Some(SqlFragment::with_params(or_conditions.join(" OR "), params))
     }
 
     /// Builds a condition for a special parameter (_id, _lastUpdated, etc.).
