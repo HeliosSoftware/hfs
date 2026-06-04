@@ -137,7 +137,7 @@ These are parsed and largely orchestrated by the REST layer.
 | Parameter | Status | Notes |
 |-----------|--------|-------|
 | `_count` | ✓ | page size; `_offset`/`_cursor` for paging |
-| `_sort` | ◐ | applied for `_id`/`_lastUpdated` only; see below |
+| `_sort` | ✓ | SQLite/PG sort by any indexed param; see below |
 | `_total` | ✓ | `none` / `estimate` / `accurate` parsed and applied |
 | `_summary` | ✓ | `true`/`text`/`data`/`count`/`false`, applied in `subsetting.rs` |
 | `_elements` | ✓ | applied post-search with nested-path support |
@@ -148,20 +148,24 @@ These are parsed and largely orchestrated by the REST layer.
 | `next` / `previous` links | ✓ | cursor-based |
 | `first` / `last` links | ✗ | not generated |
 
-**`_sort` detail.** `_sort` is parsed into `SearchQuery.sort` for every backend. The backends map
-sort fields to columns via a small allow-list — `_id` → `id`, `_lastUpdated` → `last_updated` —
-and fall back to `id` for anything else. So sorting by an arbitrary search parameter (e.g.
-`_sort=birthdate`) currently degrades to a stable-but-not-meaningful `id` ordering on all backends.
-Sort is applied on the first-page and offset query paths; cursor (keyset) pages always use the
-default `_lastUpdated, id` ordering because the keyset `WHERE` comparison depends on it. MongoDB
-additionally cannot combine a custom sort with cursor pagination.
+**`_sort` detail.** `_sort` is parsed into `SearchQuery.sort`; the REST layer resolves each sort
+field's type from the registry (`SortDirective.param_type`). On SQLite and PostgreSQL, `_id` and
+`_lastUpdated` sort on the `resources` table, while any other indexed parameter sorts on a
+correlated subquery into `search_index` — `MIN(value_col)` for ascending, `MAX(value_col)` for
+descending (FHIR multi-value sort), with the value column chosen by the parameter type. Sort is
+applied on the first-page and offset query paths; cursor (keyset) pages always use the default
+`_lastUpdated, id` ordering because the keyset `WHERE` comparison depends on it. MongoDB sorts by
+`_id`/`_lastUpdated` only and cannot combine a custom sort with cursor pagination; Elasticsearch
+sorts on its mapped fields.
 
 ## 7. Known limitations & roadmap
 
 Ordered roughly by impact:
 
-1. **Sort by arbitrary search parameter** — unsupported on all backends (only `_id`/`_lastUpdated`).
-   Would require sorting on `search_index` values via a join. Cursor pages ignore custom sort.
+1. **Cursor pagination + custom sort** — SQLite/PG now sort by any indexed parameter on the
+   first-page and offset paths, but cursor (keyset) pages still use the default `_lastUpdated`
+   ordering. Reconciling keyset pagination with arbitrary sort keys remains open. MongoDB still
+   sorts by `_id`/`_lastUpdated` only.
 2. **Terminology-dependent modifiers** — token `:above`/`:below`, `:in`, `:not-in` need a
    terminology server. `:in` is partially handled via REST-side expansion; the rest are not native.
    URI `:above`/`:below` (hierarchical prefix, no service needed) *is* implemented on SQLite/PG/ES.

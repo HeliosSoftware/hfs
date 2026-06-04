@@ -1238,6 +1238,60 @@ mod postgres_integration {
     }
 
     #[tokio::test]
+    async fn postgres_integration_search_sort_by_indexed_param() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParamType, SearchQuery, SortDirective};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        for (id, family) in [
+            ("p-charlie", "Charlie"),
+            ("p-alice", "Alice"),
+            ("p-bob", "Bob"),
+        ] {
+            let patient = json!({
+                "resourceType": "Patient",
+                "id": id,
+                "name": [{ "family": family }],
+            });
+            backend
+                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let collect_ids = |result: helios_persistence::core::SearchResult| {
+            result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let asc = SearchQuery::new("Patient").with_sort(
+            SortDirective::parse("family").with_param_type(Some(SearchParamType::String)),
+        );
+        let ids = collect_ids(backend.search(&tenant, &asc).await.unwrap());
+        assert_eq!(
+            ids,
+            vec!["p-alice", "p-bob", "p-charlie"],
+            "sort by family asc"
+        );
+
+        let desc = SearchQuery::new("Patient").with_sort(
+            SortDirective::parse("-family").with_param_type(Some(SearchParamType::String)),
+        );
+        let ids = collect_ids(backend.search(&tenant, &desc).await.unwrap());
+        assert_eq!(
+            ids,
+            vec!["p-charlie", "p-bob", "p-alice"],
+            "sort by family desc"
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_integration_search_missing_modifier() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{

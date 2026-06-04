@@ -10,6 +10,22 @@ use crate::types::{
     SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
 };
 
+/// Maps a search-parameter type to the `search_index` value column used when
+/// sorting on that parameter. Returns `None` for types that are not sortable via
+/// a single value column (composite, special).
+pub(crate) fn sort_value_column(param_type: SearchParamType) -> Option<&'static str> {
+    match param_type {
+        SearchParamType::String => Some("value_string"),
+        SearchParamType::Token => Some("value_token_code"),
+        SearchParamType::Date => Some("value_date"),
+        SearchParamType::Number => Some("value_number"),
+        SearchParamType::Quantity => Some("value_quantity_value"),
+        SearchParamType::Reference => Some("value_reference"),
+        SearchParamType::Uri => Some("value_uri"),
+        SearchParamType::Composite | SearchParamType::Special => None,
+    }
+}
+
 /// A SQL fragment with associated parameters.
 #[derive(Debug, Clone)]
 pub struct SqlFragment {
@@ -142,7 +158,7 @@ impl PostgresQueryBuilder {
                     crate::types::SortDirection::Ascending => "ASC",
                     crate::types::SortDirection::Descending => "DESC",
                 };
-                format!("{} {}", Self::sort_column(&s.parameter), dir)
+                format!("{} {}", Self::sort_expression(s), dir)
             })
             .collect();
 
@@ -154,14 +170,31 @@ impl PostgresQueryBuilder {
         format!("ORDER BY {}", clauses.join(", "))
     }
 
-    /// Maps a FHIR sort parameter name to a `resources` table column.
-    fn sort_column(parameter: &str) -> &'static str {
-        match parameter {
-            "_id" => "id",
-            "_lastUpdated" => "last_updated",
-            // Arbitrary search parameters are not yet sortable; fall back to a
-            // stable column.
-            _ => "id",
+    /// Builds the ORDER BY expression for a single sort directive.
+    ///
+    /// `_id`/`_lastUpdated` map to `resources` columns. Any other indexed search
+    /// parameter sorts on a correlated subquery into `search_index`, taking the
+    /// MIN value for ascending and MAX for descending (FHIR multi-value sort).
+    fn sort_expression(directive: &crate::types::SortDirective) -> String {
+        match directive.parameter.as_str() {
+            "_id" => return "id".to_string(),
+            "_lastUpdated" => return "last_updated".to_string(),
+            _ => {}
+        }
+
+        match directive.param_type.and_then(sort_value_column) {
+            Some(col) => {
+                let agg = match directive.direction {
+                    crate::types::SortDirection::Ascending => "MIN",
+                    crate::types::SortDirection::Descending => "MAX",
+                };
+                format!(
+                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = $1 AND si.resource_type = $2 AND si.resource_id = resources.id AND si.param_name = '{}')",
+                    agg, col, directive.parameter
+                )
+            }
+            // Unsortable (composite/special/unresolved) — stable fallback.
+            None => "id".to_string(),
         }
     }
 

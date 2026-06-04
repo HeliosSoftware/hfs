@@ -252,6 +252,7 @@ mod query_builder_tests {
         let query = SearchQuery::new("Patient").with_sort(SortDirective {
             parameter: "_id".to_string(),
             direction: SortDirection::Ascending,
+            param_type: None,
         });
 
         let es_query = builder.build(&query);

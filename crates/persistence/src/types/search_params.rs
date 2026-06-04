@@ -599,6 +599,12 @@ pub struct SortDirective {
     pub parameter: String,
     /// The sort direction.
     pub direction: SortDirection,
+    /// The resolved search-parameter type, when the sort is on an indexed
+    /// search parameter (rather than `_id` / `_lastUpdated`). Lets backends pick
+    /// the correct `search_index` value column. `None` for `_id`/`_lastUpdated`
+    /// or unresolved parameters.
+    #[serde(default)]
+    pub param_type: Option<SearchParamType>,
 }
 
 impl SortDirective {
@@ -608,13 +614,21 @@ impl SortDirective {
             Self {
                 parameter: stripped.to_string(),
                 direction: SortDirection::Descending,
+                param_type: None,
             }
         } else {
             Self {
                 parameter: s.to_string(),
                 direction: SortDirection::Ascending,
+                param_type: None,
             }
         }
+    }
+
+    /// Sets the resolved search-parameter type for this sort directive.
+    pub fn with_param_type(mut self, param_type: Option<SearchParamType>) -> Self {
+        self.param_type = param_type;
+        self
     }
 }
 
