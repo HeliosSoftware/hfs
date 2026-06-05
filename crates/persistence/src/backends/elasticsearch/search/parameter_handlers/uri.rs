@@ -9,6 +9,17 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
     let name = &param.name;
 
     let condition = match param.modifier {
+        Some(SearchModifier::Contains) => {
+            // :contains - case-insensitive substring match on the URI.
+            json!({
+                "wildcard": {
+                    "search_params.uri.value": {
+                        "value": format!("*{}*", value),
+                        "case_insensitive": true
+                    }
+                }
+            })
+        }
         Some(SearchModifier::Below) => {
             // :below - Match URIs that start with the given value
             json!({

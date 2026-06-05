@@ -805,13 +805,20 @@ impl PostgresQueryBuilder {
 
     fn build_reference_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
+        // :contains - case-insensitive substring match on the stored reference.
+        let is_contains = matches!(param.modifier.as_ref(), Some(SearchModifier::Contains));
 
         for (i, value) in param.values.iter().enumerate() {
             let param_num = offset + i + 1;
+            let predicate = if is_contains {
+                format!("value_reference ILIKE '%' || ${} || '%'", param_num)
+            } else {
+                format!("value_reference = ${}", param_num)
+            };
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_reference = ${})",
-                    param.name, param_num
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
+                    param.name, predicate
                 ),
                 vec![SqlParam::text(&value.value)],
             ));
@@ -834,6 +841,13 @@ impl PostgresQueryBuilder {
         for (i, value) in param.values.iter().enumerate() {
             let param_num = offset + i + 1;
             let condition = match modifier {
+                Some(SearchModifier::Contains) => SqlFragment::with_params(
+                    format!(
+                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_uri ILIKE '%' || ${} || '%')",
+                        param.name, param_num
+                    ),
+                    vec![SqlParam::text(&value.value)],
+                ),
                 Some(SearchModifier::Below) => SqlFragment::with_params(
                     format!(
                         "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_uri LIKE ${} || '%')",

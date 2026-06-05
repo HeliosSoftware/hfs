@@ -641,6 +641,16 @@ impl MongoBackend {
             }));
         }
 
+        // :contains - case-insensitive substring match on the stored reference.
+        if matches!(param.modifier.as_ref(), Some(SearchModifier::Contains)) {
+            return Ok(doc! {
+                "value_reference": {
+                    "$regex": regex_escape(&value.value),
+                    "$options": "i"
+                }
+            });
+        }
+
         if let Some(modifier) = &param.modifier {
             return Err(StorageError::Search(SearchError::UnsupportedModifier {
                 modifier: modifier.to_string(),

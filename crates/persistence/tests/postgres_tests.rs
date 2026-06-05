@@ -206,6 +206,44 @@ mod query_builder_tests {
     }
 
     #[test]
+    fn test_uri_parameter_contains() {
+        use helios_persistence::types::SearchModifier;
+
+        let query = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+            name: "url".to_string(),
+            param_type: SearchParamType::Uri,
+            modifier: Some(SearchModifier::Contains),
+            values: vec![SearchValue::eq("example.org")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = PostgresQueryBuilder::build_search_query(&query, 2);
+        assert!(result.is_some());
+        let fragment = result.unwrap();
+        assert!(fragment.sql.contains("value_uri ILIKE"));
+    }
+
+    #[test]
+    fn test_reference_parameter_contains() {
+        use helios_persistence::types::SearchModifier;
+
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: Some(SearchModifier::Contains),
+            values: vec![SearchValue::eq("patient-1")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = PostgresQueryBuilder::build_search_query(&query, 2);
+        assert!(result.is_some());
+        let fragment = result.unwrap();
+        assert!(fragment.sql.contains("value_reference ILIKE"));
+    }
+
+    #[test]
     fn test_token_system_and_code() {
         let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
             name: "code".to_string(),

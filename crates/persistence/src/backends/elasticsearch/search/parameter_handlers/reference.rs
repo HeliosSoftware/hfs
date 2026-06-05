@@ -12,6 +12,30 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
         return build_identifier_clause(name, value);
     }
 
+    // :contains - case-insensitive substring match on the stored reference.
+    if param.modifier == Some(SearchModifier::Contains) {
+        return Some(json!({
+            "nested": {
+                "path": "search_params.reference",
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "term": { "search_params.reference.name": name } },
+                            {
+                                "wildcard": {
+                                    "search_params.reference.reference": {
+                                        "value": format!("*{}*", value),
+                                        "case_insensitive": true
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+    }
+
     let mut must_conditions = vec![json!({ "term": { "search_params.reference.name": name } })];
 
     // Parse reference value

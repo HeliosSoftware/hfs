@@ -180,9 +180,13 @@ impl SearchModifier {
     /// Returns true if this modifier is valid for the given parameter type.
     pub fn is_valid_for(&self, param_type: SearchParamType) -> bool {
         match self {
-            SearchModifier::Exact | SearchModifier::Contains => {
-                param_type == SearchParamType::String
-            }
+            SearchModifier::Exact => param_type == SearchParamType::String,
+            // Per the FHIR spec, `:contains` is defined for string, reference,
+            // and uri parameters (substring/containment match).
+            SearchModifier::Contains => matches!(
+                param_type,
+                SearchParamType::String | SearchParamType::Reference | SearchParamType::Uri
+            ),
             SearchModifier::Text => param_type == SearchParamType::Token,
             // Per the FHIR spec, `:not` is only defined for token parameters
             // (it negates a code match). Our backends only implement it for
@@ -830,6 +834,11 @@ mod tests {
     fn test_search_modifier_validity() {
         assert!(SearchModifier::Exact.is_valid_for(SearchParamType::String));
         assert!(!SearchModifier::Exact.is_valid_for(SearchParamType::Token));
+        // `:contains` is valid for string, reference, and uri (FHIR spec).
+        assert!(SearchModifier::Contains.is_valid_for(SearchParamType::String));
+        assert!(SearchModifier::Contains.is_valid_for(SearchParamType::Reference));
+        assert!(SearchModifier::Contains.is_valid_for(SearchParamType::Uri));
+        assert!(!SearchModifier::Contains.is_valid_for(SearchParamType::Token));
         assert!(SearchModifier::Text.is_valid_for(SearchParamType::Token));
         // `:not` is token-only per the FHIR spec.
         assert!(SearchModifier::Not.is_valid_for(SearchParamType::Token));

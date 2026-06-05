@@ -31,6 +31,15 @@ impl ReferenceHandler {
             return Self::build_identifier_condition(ref_value, param_num);
         }
 
+        // Handle :contains modifier - case-insensitive substring match on the
+        // stored reference string (e.g. "Patient/123" contains "23").
+        if matches!(modifier, Some(SearchModifier::Contains)) {
+            return SqlFragment::with_params(
+                format!("value_reference LIKE '%' || ?{} || '%'", param_num),
+                vec![SqlParam::string(ref_value)],
+            );
+        }
+
         // Handle :Type modifier (restrict to specific resource type)
         if let Some(SearchModifier::Type(type_name)) = modifier {
             // The reference must be to the specified type
@@ -168,6 +177,16 @@ mod tests {
 
         assert!(frag.sql.contains("value_reference = ?1"));
         // The param should be "Patient/123"
+    }
+
+    #[test]
+    fn test_reference_contains_modifier() {
+        let value = SearchValue::new(SearchPrefix::Eq, "123");
+        let frag = ReferenceHandler::build_sql(&value, Some(&SearchModifier::Contains), 0);
+
+        assert!(frag.sql.contains("value_reference LIKE '%' ||"));
+        assert!(frag.sql.contains("|| '%'"));
+        assert_eq!(frag.params.len(), 1);
     }
 
     #[test]

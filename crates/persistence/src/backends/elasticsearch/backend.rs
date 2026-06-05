@@ -558,11 +558,11 @@ impl ElasticsearchBackend {
                 // advertised as supported.
                 vec!["not", "text", "text-advanced", "in", "of-type", "missing"]
             }
-            SearchParamType::Reference => vec!["identifier", "missing"],
+            SearchParamType::Reference => vec!["identifier", "contains", "missing"],
             SearchParamType::Date => vec!["missing"],
             SearchParamType::Number => vec!["missing"],
             SearchParamType::Quantity => vec!["missing"],
-            SearchParamType::Uri => vec!["below", "above", "missing"],
+            SearchParamType::Uri => vec!["contains", "below", "above", "missing"],
             SearchParamType::Composite => vec!["missing"],
             SearchParamType::Special => vec![],
         }

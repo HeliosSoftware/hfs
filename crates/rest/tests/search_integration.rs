@@ -595,6 +595,30 @@ mod reference_search {
         let entries = get_bundle_entries(&body);
         assert_eq!(entries.len(), 2);
     }
+
+    #[tokio::test]
+    async fn test_reference_search_contains_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `:contains` is spec-valid for reference params (substring match on the
+        // stored reference). Previously the validation gate rejected it as
+        // string-only; now it resolves and matches "Patient/patient-1".
+        let response = server
+            .get("/Observation?subject:contains=patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+
+        let entries = get_bundle_entries(&body);
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            let subject = entry["resource"]["subject"]["reference"].as_str().unwrap();
+            assert!(subject.contains("patient-1"));
+        }
+    }
 }
 
 // =============================================================================

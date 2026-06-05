@@ -746,11 +746,11 @@ impl PostgresBackend {
             // value-set filtering is unimplemented), so it must not be
             // advertised as supported.
             SearchParamType::Token => vec!["not", "text", "in", "of-type", "missing"],
-            SearchParamType::Reference => vec!["identifier", "missing"],
+            SearchParamType::Reference => vec!["identifier", "contains", "missing"],
             SearchParamType::Date => vec!["missing"],
             SearchParamType::Number => vec!["missing"],
             SearchParamType::Quantity => vec!["missing"],
-            SearchParamType::Uri => vec!["below", "above", "missing"],
+            SearchParamType::Uri => vec!["contains", "below", "above", "missing"],
             SearchParamType::Composite => vec!["missing"],
             SearchParamType::Special => vec![],
         }
