@@ -152,19 +152,21 @@ These are parsed and largely orchestrated by the REST layer.
 field's type from the registry (`SortDirective.param_type`). On SQLite and PostgreSQL, `_id` and
 `_lastUpdated` sort on the `resources` table, while any other indexed parameter sorts on a
 correlated subquery into `search_index` — `MIN(value_col)` for ascending, `MAX(value_col)` for
-descending (FHIR multi-value sort), with the value column chosen by the parameter type. Sort is
-applied on the first-page and offset query paths; cursor (keyset) pages always use the default
-`_lastUpdated, id` ordering because the keyset `WHERE` comparison depends on it. MongoDB sorts by
+descending (FHIR multi-value sort), with the value column chosen by the parameter type. Cursor
+(keyset) pagination is consistent with the sort: the boundary row's sort value is selected, encoded
+into the opaque `PageCursor` alongside the id, and the next/previous page applies a keyset `WHERE`
+`(sort_expr, id)` comparison on it — so deep paging preserves the order. A multi-field `_sort`
+returns a single page (no cursor) rather than risk an inconsistent keyset. MongoDB sorts by
 `_id`/`_lastUpdated` only and cannot combine a custom sort with cursor pagination; Elasticsearch
-sorts on its mapped fields.
+sorts on its mapped fields via `search_after`.
 
 ## 7. Known limitations & roadmap
 
 Ordered roughly by impact:
 
-1. **Cursor pagination + custom sort** — SQLite/PG now sort by any indexed parameter on the
-   first-page and offset paths, but cursor (keyset) pages still use the default `_lastUpdated`
-   ordering. Reconciling keyset pagination with arbitrary sort keys remains open. MongoDB still
+1. **Multi-field `_sort` + cursor** — single-field sorts (and the default `_lastUpdated`) page
+   correctly via the keyset cursor on SQLite/PG. A multi-field `_sort` currently returns a single
+   page (no cursor); extending the keyset to a multi-key tuple is the remaining work. MongoDB still
    sorts by `_id`/`_lastUpdated` only.
 2. **Terminology-dependent modifiers** — token `:above`/`:below`, `:in`, `:not-in` need a
    terminology server. `:in` is partially handled via REST-side expansion; the rest are not native.

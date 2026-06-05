@@ -26,7 +26,7 @@ use crate::types::{
 
 use super::PostgresBackend;
 use super::search::chain_builder::ChainQueryBuilder;
-use super::search::query_builder::{PostgresQueryBuilder, SqlParam};
+use super::search::query_builder::{PostgresQueryBuilder, SortValueKind, SqlParam};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -50,226 +50,156 @@ impl SearchProvider for PostgresBackend {
         // Get count with default
         let count = query.count.unwrap_or(100) as usize;
 
-        // Check for cursor-based pagination
-        let cursor = query
-            .cursor
-            .as_ref()
-            .and_then(|c| PageCursor::decode(c).ok());
+        // Keyset key for cursor pagination. `None` for multi-field sorts, which
+        // are returned as a single page rather than paged with an inconsistent
+        // keyset.
+        let keyset = PostgresQueryBuilder::primary_keyset_key(query);
 
-        // Determine param offset based on pagination mode
-        // Cursor pagination: $1=tenant, $2=type, $3=timestamp, $4=id -> offset=4
-        // Non-cursor: $1=tenant, $2=type -> offset=2
+        // Only honor an inbound cursor when we can build a keyset comparison.
+        let cursor = if keyset.is_some() {
+            query
+                .cursor
+                .as_ref()
+                .and_then(|c| PageCursor::decode(c).ok())
+        } else {
+            None
+        };
+
+        // Param layout: $1=tenant, $2=type, then (cursor) $3=sort value, $4=id,
+        // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
-        // Build the search filter subquery if there are search parameters
         let search_filter = if !query.parameters.is_empty() {
             PostgresQueryBuilder::build_search_query(query, param_offset)
         } else {
             None
         };
+        let filter_clause = search_filter
+            .as_ref()
+            .map(|f| format!(" AND ({})", f.sql))
+            .unwrap_or_default();
+        let search_params = search_filter.map(|f| f.params).unwrap_or_default();
 
-        // ORDER BY derived from `_sort` (first-page and offset paths only).
-        // When no `_sort` is supplied we keep the original default ordering
-        // (`id DESC` tie-break) so cursor "next" paging stays consistent. The
-        // cursor/keyset paths always keep their `(last_updated, id)` ordering,
-        // which the keyset WHERE comparison depends on.
+        // SELECT the sort key alongside the row so the next cursor can be built.
+        let select_cols = match &keyset {
+            Some(k) => format!(
+                "id, version_id, data, last_updated, fhir_version, {} AS sort_key",
+                k.expr
+            ),
+            None => "id, version_id, data, last_updated, fhir_version".to_string(),
+        };
+
+        // ORDER BY for the first-page / offset paths.
         let order_by = if query.sort.is_empty() {
-            "ORDER BY last_updated DESC, id DESC".to_string()
+            "ORDER BY last_updated DESC, id ASC".to_string()
         } else {
             PostgresQueryBuilder::build_order_by(query)
         };
 
-        // Build query based on pagination mode
-        let (sql, has_previous, search_params) = if let Some(ref cursor) = cursor {
+        // Build query based on pagination mode.
+        let (sql, has_previous) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
+            let e = &k.expr;
+            let asc = k.direction == crate::types::SortDirection::Ascending;
             match cursor.direction() {
                 CursorDirection::Next => {
-                    let sql = if let Some(ref filter) = search_filter {
-                        format!(
-                            "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                             WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                             AND ({})
-                             AND (last_updated < $3 OR (last_updated = $3 AND id < $4))
-                             ORDER BY last_updated DESC, id DESC
-                             LIMIT {}",
-                            filter.sql,
-                            count + 1
-                        )
-                    } else {
-                        format!(
-                            "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                             WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                             AND (last_updated < $3 OR (last_updated = $3 AND id < $4))
-                             ORDER BY last_updated DESC, id DESC
-                             LIMIT {}",
-                            count + 1
-                        )
-                    };
-                    (
-                        sql,
-                        true,
-                        search_filter.map(|f| f.params).unwrap_or_default(),
-                    )
+                    let e_op = if asc { ">" } else { "<" };
+                    let sql = format!(
+                        "SELECT {cols} FROM resources \
+                         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                         AND ({e} {e_op} $3 OR ({e} = $3 AND id > $4)) \
+                         ORDER BY {e} {dir}, id ASC LIMIT {lim}",
+                        cols = select_cols,
+                        filter = filter_clause,
+                        e = e,
+                        e_op = e_op,
+                        dir = if asc { "ASC" } else { "DESC" },
+                        lim = count + 1,
+                    );
+                    (sql, true)
                 }
                 CursorDirection::Previous => {
-                    let sql = if let Some(ref filter) = search_filter {
-                        format!(
-                            "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                             WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                             AND ({})
-                             AND (last_updated > $3 OR (last_updated = $3 AND id > $4))
-                             ORDER BY last_updated ASC, id ASC
-                             LIMIT {}",
-                            filter.sql,
-                            count + 1
-                        )
-                    } else {
-                        format!(
-                            "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                             WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                             AND (last_updated > $3 OR (last_updated = $3 AND id > $4))
-                             ORDER BY last_updated ASC, id ASC
-                             LIMIT {}",
-                            count + 1
-                        )
-                    };
-                    (
-                        sql,
-                        false,
-                        search_filter.map(|f| f.params).unwrap_or_default(),
-                    )
+                    let e_op = if asc { "<" } else { ">" };
+                    let sql = format!(
+                        "SELECT {cols} FROM resources \
+                         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                         AND ({e} {e_op} $3 OR ({e} = $3 AND id < $4)) \
+                         ORDER BY {e} {dir}, id DESC LIMIT {lim}",
+                        cols = select_cols,
+                        filter = filter_clause,
+                        e = e,
+                        e_op = e_op,
+                        dir = if asc { "DESC" } else { "ASC" },
+                        lim = count + 1,
+                    );
+                    (sql, false)
                 }
             }
         } else if let Some(offset) = query.offset {
-            // Offset-based pagination (legacy support)
-            let sql = if let Some(ref filter) = search_filter {
-                format!(
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                     WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                     AND ({})
-                     {}
-                     LIMIT {} OFFSET {}",
-                    filter.sql,
-                    order_by,
-                    count + 1,
-                    offset
-                )
-            } else {
-                format!(
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                     WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                     {}
-                     LIMIT {} OFFSET {}",
-                    order_by,
-                    count + 1,
-                    offset
-                )
-            };
-            (
-                sql,
-                offset > 0,
-                search_filter.map(|f| f.params).unwrap_or_default(),
-            )
+            let sql = format!(
+                "SELECT {cols} FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                 {order} LIMIT {lim} OFFSET {off}",
+                cols = select_cols,
+                filter = filter_clause,
+                order = order_by,
+                lim = count + 1,
+                off = offset,
+            );
+            (sql, offset > 0)
         } else {
-            // First page (no cursor, no offset)
-            let sql = if let Some(ref filter) = search_filter {
-                format!(
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                     WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                     AND ({})
-                     {}
-                     LIMIT {}",
-                    filter.sql,
-                    order_by,
-                    count + 1
-                )
-            } else {
-                format!(
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                     WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                     {}
-                     LIMIT {}",
-                    order_by,
-                    count + 1
-                )
-            };
-            (
-                sql,
-                false,
-                search_filter.map(|f| f.params).unwrap_or_default(),
-            )
+            let sql = format!(
+                "SELECT {cols} FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                 {order} LIMIT {lim}",
+                cols = select_cols,
+                filter = filter_clause,
+                order = order_by,
+                lim = count + 1,
+            );
+            (sql, false)
         };
 
-        // Build parameter list for binding
-        let rows = if let Some(ref cursor) = cursor {
-            let (cursor_timestamp, cursor_id) = Self::extract_cursor_values(cursor)?;
-
-            // Build params: [tenant_id, resource_type, cursor_timestamp, cursor_id, ...search_params]
-            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-                Box::new(cursor_timestamp),
-                Box::new(cursor_id),
-            ];
-
-            for param in &search_params {
-                match param {
-                    SqlParam::Text(s) => params.push(Box::new(s.clone())),
-                    SqlParam::Float(f) => params.push(Box::new(*f)),
-                    SqlParam::Integer(i) => params.push(Box::new(*i)),
-                    SqlParam::Bool(b) => params.push(Box::new(*b)),
-                    SqlParam::Timestamp(dt) => params.push(Box::new(*dt)),
-                    SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-                }
+        // Build parameter list for binding.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
+            Self::bind_cursor_value(&mut params, k.kind, cursor)?;
+            params.push(Box::new(cursor.resource_id().to_string()));
+        }
+        for param in &search_params {
+            match param {
+                SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                SqlParam::Float(f) => params.push(Box::new(*f)),
+                SqlParam::Integer(i) => params.push(Box::new(*i)),
+                SqlParam::Bool(b) => params.push(Box::new(*b)),
+                SqlParam::Timestamp(dt) => params.push(Box::new(*dt)),
+                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
             }
+        }
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = client
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| internal_error(format!("Failed to execute search: {}", e)))?;
 
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-
-            client
-                .query(&sql, &param_refs)
-                .await
-                .map_err(|e| internal_error(format!("Failed to execute search: {}", e)))?
-        } else {
-            // Build params: [tenant_id, resource_type, ...search_params]
-            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-            ];
-
-            for param in &search_params {
-                match param {
-                    SqlParam::Text(s) => params.push(Box::new(s.clone())),
-                    SqlParam::Float(f) => params.push(Box::new(*f)),
-                    SqlParam::Integer(i) => params.push(Box::new(*i)),
-                    SqlParam::Bool(b) => params.push(Box::new(*b)),
-                    SqlParam::Timestamp(dt) => params.push(Box::new(*dt)),
-                    SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-                }
-            }
-
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-
-            client
-                .query(&sql, &param_refs)
-                .await
-                .map_err(|e| internal_error(format!("Failed to execute search: {}", e)))?
-        };
-
-        let mut resources = Vec::new();
+        // Parse rows, capturing the sort key for cursor construction.
+        let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
         for row in &rows {
             let id: String = row.get(0);
             let version_id: String = row.get(1);
             let json_data: serde_json::Value = row.get(2);
             let last_updated: chrono::DateTime<Utc> = row.get(3);
             let fhir_version_str: String = row.get(4);
+            let sort_key = keyset
+                .as_ref()
+                .map(|k| Self::read_cursor_value(row, 5, k.kind));
 
             let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
-
             let resource = StoredResource::from_storage(
                 resource_type.clone(),
                 id,
@@ -281,50 +211,40 @@ impl SearchProvider for PostgresBackend {
                 None,
                 fhir_version,
             );
-
-            resources.push(resource);
+            parsed.push((resource, sort_key));
         }
 
-        // For backward pagination, reverse the results to maintain DESC order
+        // Backward pagination fetched in reverse order — restore sort order.
         if cursor
             .as_ref()
             .map(|c| c.direction() == CursorDirection::Previous)
             .unwrap_or(false)
         {
-            resources.reverse();
+            parsed.reverse();
         }
 
-        // Check if there are more results (we fetched one extra)
-        let has_next = resources.len() > count;
+        // We fetched one extra to detect a further page.
+        let has_next = parsed.len() > count;
         if has_next {
-            resources.pop();
+            parsed.pop();
         }
 
-        // Generate cursors for pagination
         let next_cursor = if has_next {
-            resources.last().map(|r| {
-                let cursor = PageCursor::new(
-                    vec![CursorValue::String(r.last_modified().to_rfc3339())],
-                    r.id(),
-                );
-                cursor.encode()
+            parsed.last().map(|(r, sk)| {
+                PageCursor::new(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
             })
         } else {
             None
         };
-
         let previous_cursor = if has_previous {
-            resources.first().map(|r| {
-                let cursor = PageCursor::previous(
-                    vec![CursorValue::String(r.last_modified().to_rfc3339())],
-                    r.id(),
-                );
-                cursor.encode()
+            parsed.first().map(|(r, sk)| {
+                PageCursor::previous(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
             })
         } else {
             None
         };
 
+        let resources: Vec<StoredResource> = parsed.into_iter().map(|(r, _)| r).collect();
         let page_info = PageInfo {
             next_cursor,
             previous_cursor,
@@ -332,7 +252,6 @@ impl SearchProvider for PostgresBackend {
             has_next,
             has_previous,
         };
-
         let page = Page::new(resources, page_info);
 
         Ok(SearchResult {
@@ -914,18 +833,73 @@ impl TextSearchProvider for PostgresBackend {
 // Helper methods for search implementations
 impl PostgresBackend {
     /// Extract timestamp and ID from a cursor for keyset pagination.
-    fn extract_cursor_values(cursor: &PageCursor) -> StorageResult<(String, String)> {
-        let sort_values = cursor.sort_values();
-        let timestamp = match sort_values.first() {
-            Some(CursorValue::String(s)) => s.clone(),
-            _ => {
-                return Err(internal_error(
-                    "Invalid cursor: missing or invalid timestamp".to_string(),
-                ));
+    /// Binds the cursor's boundary sort value as `$3`, typed per the sort key
+    /// kind so PostgreSQL compares it correctly against the sort expression.
+    fn bind_cursor_value(
+        params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+        kind: SortValueKind,
+        cursor: &PageCursor,
+    ) -> StorageResult<()> {
+        let value = cursor.sort_values().first();
+        match kind {
+            SortValueKind::Timestamp => {
+                let dt = match value {
+                    Some(CursorValue::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
+                        .map(|d| d.with_timezone(&Utc))
+                        .map_err(|_| internal_error("Invalid cursor timestamp".to_string()))?,
+                    _ => {
+                        return Err(internal_error(
+                            "Invalid cursor: expected timestamp".to_string(),
+                        ));
+                    }
+                };
+                params.push(Box::new(dt));
             }
-        };
-        let id = cursor.resource_id().to_string();
-        Ok((timestamp, id))
+            SortValueKind::Number => {
+                let n = match value {
+                    Some(CursorValue::Decimal(f)) => *f,
+                    Some(CursorValue::Number(i)) => *i as f64,
+                    Some(CursorValue::String(s)) => s.parse().unwrap_or(0.0),
+                    _ => {
+                        return Err(internal_error(
+                            "Invalid cursor: expected number".to_string(),
+                        ));
+                    }
+                };
+                params.push(Box::new(n));
+            }
+            SortValueKind::Text => match value {
+                Some(CursorValue::String(s)) => params.push(Box::new(s.clone())),
+                Some(CursorValue::Null) | None => params.push(Box::new(Option::<String>::None)),
+                _ => {
+                    return Err(internal_error("Invalid cursor: expected text".to_string()));
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// Reads the `sort_key` column (index 5) as a `CursorValue` per the key kind.
+    fn read_cursor_value(
+        row: &tokio_postgres::Row,
+        idx: usize,
+        kind: SortValueKind,
+    ) -> CursorValue {
+        match kind {
+            SortValueKind::Timestamp => {
+                let v: Option<chrono::DateTime<Utc>> = row.try_get(idx).ok().flatten();
+                v.map(|d| CursorValue::String(d.to_rfc3339()))
+                    .unwrap_or(CursorValue::Null)
+            }
+            SortValueKind::Number => {
+                let v: Option<f64> = row.try_get(idx).ok().flatten();
+                v.map(CursorValue::Decimal).unwrap_or(CursorValue::Null)
+            }
+            SortValueKind::Text => {
+                let v: Option<String> = row.try_get(idx).ok().flatten();
+                v.map(CursorValue::String).unwrap_or(CursorValue::Null)
+            }
+        }
     }
 
     /// Extract references from a resource for a given search parameter.

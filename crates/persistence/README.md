@@ -382,10 +382,11 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 - **Sorting** — SQLite and PostgreSQL sort by any indexed search parameter (string, token,
   date, number, quantity, reference, URI) via a correlated subquery into the search index, taking
   the min value ascending / max descending for multi-valued params; `_id`/`_lastUpdated` sort on
-  the resources table directly. Sort is applied on the first-page and offset paths; cursor
-  (keyset) pages always use the default `_lastUpdated` ordering. MongoDB sorts by `_id`/
-  `_lastUpdated` only and cannot combine a custom sort with cursor pagination, hence ◐ for
-  multiple fields.
+  the resources table directly. Cursor (keyset) pagination is consistent with the active sort: the
+  sort key value is encoded into the opaque cursor and the keyset comparison runs on it, so deep
+  paging preserves the sort order. A multi-field `_sort` returns a single page (no cursor). MongoDB
+  sorts by `_id`/`_lastUpdated` only and cannot combine a custom sort with cursor pagination, hence
+  ◐ for multiple fields.
 - **`:above` / `:below`** — SQLite, PostgreSQL, and Elasticsearch implement hierarchical URI
   prefix matching (no external service needed), shown as ◐. Token/code hierarchy expansion
   (which needs a terminology server) is not implemented natively.

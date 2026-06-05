@@ -1168,6 +1168,87 @@ async fn search_ids(
 }
 
 #[tokio::test]
+async fn test_search_cursor_with_custom_sort() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    // Insert out of order; page size 1 to force keyset paging across pages.
+    for (id, family) in [
+        ("p-charlie", "Charlie"),
+        ("p-alice", "Alice"),
+        ("p-bob", "Bob"),
+    ] {
+        let patient =
+            json!({ "resourceType": "Patient", "id": id, "name": [{ "family": family }] });
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let mut collected = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..5 {
+        let mut q = SearchQuery::new("Patient")
+            .with_sort(
+                SortDirective::parse("family").with_param_type(Some(SearchParamType::String)),
+            )
+            .with_count(1);
+        q.cursor = cursor.clone();
+        let result = backend.search(&tenant, &q).await.unwrap();
+        for r in &result.resources.items {
+            collected.push(r.id().to_string());
+        }
+        match result.resources.page_info.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        collected,
+        vec!["p-alice", "p-bob", "p-charlie"],
+        "cursor paging with custom sort must preserve global order"
+    );
+}
+
+#[tokio::test]
+async fn test_search_cursor_default_sort_paging() {
+    // The default (no _sort) keyset still pages correctly across pages.
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    for id in ["a", "b", "c", "d"] {
+        let patient = json!({ "resourceType": "Patient", "id": id });
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0;
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let mut q = SearchQuery::new("Patient").with_count(2);
+        q.cursor = cursor.clone();
+        let result = backend.search(&tenant, &q).await.unwrap();
+        for r in &result.resources.items {
+            assert!(
+                seen.insert(r.id().to_string()),
+                "no duplicate ids across pages"
+            );
+            total += 1;
+        }
+        match result.resources.page_info.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(total, 4, "all four resources returned exactly once");
+}
+
+#[tokio::test]
 async fn test_search_sort_by_indexed_param() {
     let backend = create_backend();
     let tenant = create_tenant("test-tenant");

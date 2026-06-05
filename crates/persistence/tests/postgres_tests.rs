@@ -1238,6 +1238,58 @@ mod postgres_integration {
     }
 
     #[tokio::test]
+    async fn postgres_integration_search_cursor_with_custom_sort() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParamType, SearchQuery, SortDirective};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Insert out of order; page size 1 to force keyset paging across pages.
+        for (id, family) in [
+            ("p-charlie", "Charlie"),
+            ("p-alice", "Alice"),
+            ("p-bob", "Bob"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id, "name": [{ "family": family }] }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut collected = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..5 {
+            let mut q = SearchQuery::new("Patient")
+                .with_sort(
+                    SortDirective::parse("family").with_param_type(Some(SearchParamType::String)),
+                )
+                .with_count(1);
+            q.cursor = cursor.clone();
+            let result = backend.search(&tenant, &q).await.unwrap();
+            for r in &result.resources.items {
+                collected.push(r.id().to_string());
+            }
+            match result.resources.page_info.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        // Keyset paging must yield the full set in family order, no dups/gaps.
+        assert_eq!(
+            collected,
+            vec!["p-alice", "p-bob", "p-charlie"],
+            "cursor paging with custom sort must preserve global order"
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_integration_search_sort_by_indexed_param() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{SearchParamType, SearchQuery, SortDirective};
