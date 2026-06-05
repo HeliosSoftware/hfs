@@ -38,7 +38,7 @@ Neo4j are not implemented.
 | reference | ✓ | ✓ | ✓ | ✓ | type modifier + `:identifier` (SQLite/ES) |
 | date | ✓ | ✓ | ✓ | ✓ | precision-aware ranges + all prefixes |
 | number | ✓ | ✓ | ✓ | ✓ | implicit-precision ranges + all prefixes |
-| quantity | ✓ | ✓ | ✗ | ✓ | MongoDB rejects with `UnsupportedParameterType` |
+| quantity | ✓ | ✓ | ✓ | ✓ | value comparison + optional system/unit on all backends |
 | uri | ✓ | ✓ | ✓ | ✓ | exact + `:above`/`:below` prefix matching |
 | composite | ✓ | ✓ | ✗ | ✓ | SQLite/PG group by `composite_group`; ES uses one nested object per instance; Mongo returns no condition |
 
@@ -178,8 +178,9 @@ Ordered roughly by impact:
 3. **PostgreSQL modifier gaps** — only the `:text-advanced` modifier remains unimplemented relative
    to SQLite (`:exact`, `:contains`, `:not`, `:missing`, `:of-type`, URI `:above`/`:below`, and
    composite parameters are all supported now).
-4. **MongoDB native search gaps** — quantity and composite parameters error out; forward/reverse
-   chaining, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are unsupported.
+4. **MongoDB native search gaps** — composite parameters error out; `_text`/`_content` and most
+   modifiers beyond `:exact`/`:contains` are unsupported. (Quantity search is now implemented;
+   chained/`_has` work via the REST-layer resolver.)
 5. **Elasticsearch gaps** — `_filter` unsupported. (Composite now evaluates components via inline
    nested objects; chained/`_has` now work via the REST-layer resolver — see below.)
 6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`

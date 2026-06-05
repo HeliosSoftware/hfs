@@ -345,7 +345,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Reference](https://build.fhir.org/search.html#reference)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | [Date](https://build.fhir.org/search.html#date)                             | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
 | [Number](https://build.fhir.org/search.html#number)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ○   |
-| [Quantity](https://build.fhir.org/search.html#quantity)                     | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ○   |
+| [Quantity](https://build.fhir.org/search.html#quantity)                     | ✓      | ✓          | ✓       | ✗         | ✗     | ✓             | ○   |
 | [URI](https://build.fhir.org/search.html#uri)                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
 | [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
 | **[Search Modifiers](https://build.fhir.org/search.html#modifiers)**        |
@@ -568,8 +568,9 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 - Full CRUD operations with document-native resource storage
 - Versioning and history providers (`vread`, instance/type/system history)
 - Transaction bundles with urn:uuid reference resolution (requires replica set)
-- Native search (string, token, reference, date, number, URI parameters; quantity and composite
-  parameters, chained/`_has`, `_text`/`_content`, and most modifiers are not yet supported)
+- Native search (string, token, reference, date, number, quantity, URI parameters; composite
+  parameters, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are not yet
+  supported; chained/`_has` work via the REST-layer resolver)
 - `_include` and `_revinclude` resolution
 - Conditional create, update, and delete operations
 - Cursor and offset pagination; sorting by `_id`/`_lastUpdated` (a custom sort cannot be combined
