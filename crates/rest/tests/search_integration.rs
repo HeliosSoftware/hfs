@@ -463,6 +463,32 @@ mod string_search {
         let entries = get_bundle_entries(&body);
         assert!(!entries.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_modifier_invalid_for_param_type_returns_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `:above` is only defined for token/uri/reference params; applying it
+        // to the string param `name` must be rejected with a 400 + invalid
+        // OperationOutcome rather than silently ignored.
+        let response = server
+            .get("/Patient?name:above=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["severity"], "error");
+        assert_eq!(body["issue"][0]["code"], "invalid");
+        assert!(
+            body["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("above")
+        );
+    }
 }
 
 // =============================================================================
