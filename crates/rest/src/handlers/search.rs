@@ -192,6 +192,19 @@ where
         build_search_query_from_map(resource_type, &params, &registry)?
     };
 
+    // Resolve chained / reverse-chained (`_has`) parameters into an `_id` filter
+    // via application-side joins, so any backend's `search()` can execute them.
+    let query = if helios_persistence::search::query_has_chains(&query) {
+        helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Chained search resolution failed");
+                RestError::from(e)
+            })?
+    } else {
+        query
+    };
+
     // Execute the search
     // Note: The search provider is responsible for resolving _include/_revinclude
     // directives that are part of the query. The result already contains included resources.

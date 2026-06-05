@@ -120,15 +120,19 @@ effectively a no-op.
 
 | Capability | SQLite | PostgreSQL | MongoDB | Elasticsearch |
 |------------|:------:|:----------:|:-------:|:-------------:|
-| Forward chained params (N-level) | ✓ | ✓ | ✗ | ✗ |
-| Reverse chaining (`_has`, nested) | ✓ | ✓ | ✗ | ✗ |
+| Forward chained params (N-level) | ✓ | ✓ | ◐ | ◐ |
+| Reverse chaining (`_has`) | ✓ | ✓ | ◐ | ◐ |
 | `_include` | ✓ | ✓ | ✓ | ✓ |
 | `_revinclude` | ✓ | ✓ | ✓ | ✓ |
 | `:iterate` on include | parsed | parsed | parsed | parsed |
 
-SQLite and PostgreSQL resolve chains via nested `search_index` subqueries with configurable depth
-limits. MongoDB returns `ChainedSearchNotSupported` / `ReverseChainNotSupported`; Elasticsearch
-silently returns no matches when `param.chain` or `reverse_chains` are present.
+SQLite and PostgreSQL resolve chains natively, via nested `search_index` subqueries with
+configurable depth limits (✓). For all other backends (◐), the REST layer resolves chained and
+reverse-chained parameters before the backend search runs: `search::resolve_chains` issues one
+plain `search()` per chain hop against the same backend and folds the result into an `_id`
+filter — application-side joins. So chained and `_has` queries work end-to-end over HTTP on every
+searchable backend, including Elasticsearch and MongoDB; the per-backend distinction is whether the
+join is pushed into the backend (SQLite/PG) or performed by the REST layer.
 
 ## 6. Result control (paging, sort, total, summary, elements)
 
@@ -176,22 +180,20 @@ Ordered roughly by impact:
    composite parameters are all supported now).
 4. **MongoDB native search gaps** — quantity and composite parameters error out; forward/reverse
    chaining, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are unsupported.
-5. **Elasticsearch gaps** — forward chaining and `_has` silently return nothing rather than
-   erroring; `_filter` unsupported. (Composite now evaluates components via inline nested objects.)
-   See the chaining note below — chained search is a cross-cutting dispatch gap, not ES-specific.
+5. **Elasticsearch gaps** — `_filter` unsupported. (Composite now evaluates components via inline
+   nested objects; chained/`_has` now work via the REST-layer resolver — see below.)
 6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
    unsupported; Bundles omit `first`/`last` paging links. `:code-text` (newer spec modifier) is
    unsupported everywhere.
 
-**Chaining dispatch (cross-cutting).** Chained (`subject.name=Smith`) and reverse-chained
-(`_has:Observation:subject:code=1234`) searches are *parsed* into `SearchQuery` (`param.chain`,
-`reverse_chains`) but the 2-arg `SearchProvider::search` that the REST layer calls does not act on
-them on any backend — the working chain logic lives in the separate `ChainedSearchProvider::
-resolve_chain` API, which `search()` never invokes. `CompositeStorage` already implements
-`resolve_chain` via iterative plain `search()` calls (which work on every backend, including ES).
-So making chained/`_has` search work end-to-end over HTTP is a single dispatch change — detect
-chained params in the `search()` path and route them through `resolve_chain` — not an
-ES-specific fix.
+**Chaining dispatch (resolved).** Chained (`subject.name=Smith`) and reverse-chained
+(`_has:Observation:subject:code=1234`) searches are parsed into `SearchQuery` (`param.chain`,
+`reverse_chains`), but the 2-arg `SearchProvider::search` does not act on them. The REST search
+handler now calls `search::resolve_chains` first: a backend-agnostic resolver that performs the
+chain as application-side joins (one plain `search()` per hop, results folded into an `_id`
+filter), then runs the rewritten query. This works for any `SearchProvider`, so chained and `_has`
+queries are functional end-to-end on SQLite, PostgreSQL, MongoDB, and Elasticsearch. SQLite and PG
+additionally resolve chains natively in-backend.
 
 SQLite is the most complete backend and serves as the reference for the others; PostgreSQL is now
 at near-parity (only `:text-advanced` remains).

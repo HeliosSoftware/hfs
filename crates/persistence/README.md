@@ -363,8 +363,8 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [\_content](https://build.fhir.org/search.html#_content) (full content)     | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ✗   |
 | [\_filter](https://build.fhir.org/search.html#_filter) (advanced filtering) | ✓      | ○          | ○       | ✗         | ○     | ○             | ✗   |
 | **Advanced Search**                                                         |
-| [Chained Parameters](https://build.fhir.org/search.html#chaining)           | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✗   |
-| [Reverse Chaining (\_has)](https://build.fhir.org/search.html#has)          | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✗   |
+| [Chained Parameters](https://build.fhir.org/search.html#chaining)           | ✓      | ✓          | ◐       | ✗         | ○     | ◐             | ✗   |
+| [Reverse Chaining (\_has)](https://build.fhir.org/search.html#has)          | ✓      | ✓          | ◐       | ✗         | ○     | ◐             | ✗   |
 | [\_include](https://build.fhir.org/search.html#include)                     | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | [\_revinclude](https://build.fhir.org/search.html#revinclude)               | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | **[Pagination](https://build.fhir.org/http.html#paging)**                   |
@@ -393,6 +393,12 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 - **`:in` / `:not-in`** — handled at the REST layer: `:in` is expanded against a terminology
   server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
   backend resolves these natively.
+- **Chained / `_has`** — SQLite and PostgreSQL resolve chains natively in-backend (✓). For every
+  other backend (◐), the REST layer resolves chained and reverse-chained parameters via
+  application-side joins (`search::resolve_chains`): each hop is one plain `search()` against the
+  backend, and the result is folded into an `_id` filter. So `GET /Observation?subject.name=Smith`
+  and `?_has:Observation:subject:code=…` work end-to-end on every searchable backend, including
+  Elasticsearch and MongoDB.
 - **Composite** — SQLite, PostgreSQL, and Elasticsearch evaluate composite component values
   (token, string, number, quantity, date) end-to-end (✓): the REST layer resolves component types
   from the registry and the extractor indexes each composite instance as a `composite_group`.
