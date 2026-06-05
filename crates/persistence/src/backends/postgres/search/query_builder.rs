@@ -109,6 +109,62 @@ impl PostgresQueryBuilder {
         Some(combined)
     }
 
+    /// Builds an `ORDER BY` clause from the query's `_sort` directives.
+    ///
+    /// Mirrors the SQLite backend's ordering semantics so the two backends stay
+    /// at parity. Multiple directives (e.g. `_sort=_lastUpdated,-_id`) are
+    /// honored in order, with an `id ASC` tie-breaker appended for stable
+    /// pagination when `_id` is not already part of the sort.
+    ///
+    /// # Supported sort parameters
+    ///
+    /// - `_id` → `id`
+    /// - `_lastUpdated` → `last_updated`
+    ///
+    /// Any other parameter currently falls back to `id`. Sorting by arbitrary
+    /// search parameters would require an additional join against `search_index`
+    /// and is not yet implemented (see the search spec assessment).
+    ///
+    /// Note: this is applied to the first-page and offset paths only. The
+    /// cursor (keyset) paths keep their `(last_updated, id)` ordering, which is
+    /// required by the keyset `WHERE` comparison; cursor pages therefore always
+    /// use the default ordering.
+    pub fn build_order_by(query: &SearchQuery) -> String {
+        if query.sort.is_empty() {
+            return "ORDER BY last_updated DESC, id ASC".to_string();
+        }
+
+        let mut clauses: Vec<String> = query
+            .sort
+            .iter()
+            .map(|s| {
+                let dir = match s.direction {
+                    crate::types::SortDirection::Ascending => "ASC",
+                    crate::types::SortDirection::Descending => "DESC",
+                };
+                format!("{} {}", Self::sort_column(&s.parameter), dir)
+            })
+            .collect();
+
+        let sorts_by_id = query.sort.iter().any(|s| s.parameter == "_id");
+        if !sorts_by_id {
+            clauses.push("id ASC".to_string());
+        }
+
+        format!("ORDER BY {}", clauses.join(", "))
+    }
+
+    /// Maps a FHIR sort parameter name to a `resources` table column.
+    fn sort_column(parameter: &str) -> &'static str {
+        match parameter {
+            "_id" => "id",
+            "_lastUpdated" => "last_updated",
+            // Arbitrary search parameters are not yet sortable; fall back to a
+            // stable column.
+            _ => "id",
+        }
+    }
+
     /// Builds a condition for a single search parameter.
     fn build_parameter_condition(
         param: &SearchParameter,
@@ -116,6 +172,12 @@ impl PostgresQueryBuilder {
     ) -> Option<SqlFragment> {
         if param.values.is_empty() {
             return None;
+        }
+
+        // The `:missing` modifier is type-agnostic and resolved purely from the
+        // presence/absence of a search_index entry for the parameter.
+        if let Some(SearchModifier::Missing) = param.modifier {
+            return Some(Self::build_missing_condition(param));
         }
 
         // Handle special parameters
@@ -178,6 +240,30 @@ impl PostgresQueryBuilder {
             combined = combined.and(cond);
         }
         Some(combined)
+    }
+
+    /// Builds an `id IN/NOT IN` condition for the `:missing` modifier.
+    ///
+    /// `param:missing=true` matches resources with **no** `search_index` entry
+    /// for the parameter; `:missing=false` matches resources that **have** one.
+    /// Uses only the always-present `$1`/`$2` (tenant, resource type) bind
+    /// params, so it adds no parameters to the surrounding query.
+    fn build_missing_condition(param: &SearchParameter) -> SqlFragment {
+        let is_missing = param
+            .values
+            .first()
+            .map(|v| v.value == "true")
+            .unwrap_or(false);
+        let inner = format!(
+            "SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}'",
+            param.name
+        );
+        let sql = if is_missing {
+            format!("id NOT IN ({})", inner)
+        } else {
+            format!("id IN ({})", inner)
+        };
+        SqlFragment::new(sql)
     }
 
     fn build_string_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
@@ -284,6 +370,15 @@ impl PostgresQueryBuilder {
         for cond in conditions {
             combined = combined.or(cond);
         }
+
+        // `:not` reverses the match: include resources that have no matching
+        // value (including those with no value at all). Negating the whole
+        // OR-set gives `NOT (id IN (...) OR id IN (...))`.
+        if let Some(SearchModifier::Not) = param.modifier {
+            let sql = format!("NOT ({})", combined.sql);
+            combined = SqlFragment::with_params(sql, combined.params);
+        }
+
         Some(combined)
     }
 

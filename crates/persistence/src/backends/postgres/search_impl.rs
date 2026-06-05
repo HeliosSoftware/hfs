@@ -68,6 +68,17 @@ impl SearchProvider for PostgresBackend {
             None
         };
 
+        // ORDER BY derived from `_sort` (first-page and offset paths only).
+        // When no `_sort` is supplied we keep the original default ordering
+        // (`id DESC` tie-break) so cursor "next" paging stays consistent. The
+        // cursor/keyset paths always keep their `(last_updated, id)` ordering,
+        // which the keyset WHERE comparison depends on.
+        let order_by = if query.sort.is_empty() {
+            "ORDER BY last_updated DESC, id DESC".to_string()
+        } else {
+            PostgresQueryBuilder::build_order_by(query)
+        };
+
         // Build query based on pagination mode
         let (sql, has_previous, search_params) = if let Some(ref cursor) = cursor {
             match cursor.direction() {
@@ -135,9 +146,10 @@ impl SearchProvider for PostgresBackend {
                     "SELECT id, version_id, data, last_updated, fhir_version FROM resources
                      WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
                      AND ({})
-                     ORDER BY last_updated DESC, id DESC
+                     {}
                      LIMIT {} OFFSET {}",
                     filter.sql,
+                    order_by,
                     count + 1,
                     offset
                 )
@@ -145,8 +157,9 @@ impl SearchProvider for PostgresBackend {
                 format!(
                     "SELECT id, version_id, data, last_updated, fhir_version FROM resources
                      WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                     ORDER BY last_updated DESC, id DESC
+                     {}
                      LIMIT {} OFFSET {}",
+                    order_by,
                     count + 1,
                     offset
                 )
@@ -163,17 +176,19 @@ impl SearchProvider for PostgresBackend {
                     "SELECT id, version_id, data, last_updated, fhir_version FROM resources
                      WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
                      AND ({})
-                     ORDER BY last_updated DESC, id DESC
+                     {}
                      LIMIT {}",
                     filter.sql,
+                    order_by,
                     count + 1
                 )
             } else {
                 format!(
                     "SELECT id, version_id, data, last_updated, fhir_version FROM resources
                      WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                     ORDER BY last_updated DESC, id DESC
+                     {}
                      LIMIT {}",
+                    order_by,
                     count + 1
                 )
             };
