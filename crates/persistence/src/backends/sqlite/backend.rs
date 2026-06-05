@@ -694,7 +694,19 @@ impl SqliteBackend {
     fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "missing"],
-            SearchParamType::Token => vec!["not", "text", "in", "not-in", "of-type", "missing"],
+            // `not-in` is intentionally omitted: the SQLite backend returns 501
+            // for it (negated value-set filtering is unimplemented), so it must
+            // not be advertised. `code`/`text-advanced` are implemented by the
+            // token handler and were previously under-advertised.
+            SearchParamType::Token => vec![
+                "not",
+                "text",
+                "in",
+                "of-type",
+                "code",
+                "text-advanced",
+                "missing",
+            ],
             SearchParamType::Reference => vec!["identifier", "missing"],
             SearchParamType::Date => vec!["missing"],
             SearchParamType::Number => vec!["missing"],
@@ -813,6 +825,11 @@ mod tests {
         let token_mods = SqliteBackend::modifiers_for_type(SearchParamType::Token);
         assert!(token_mods.contains(&"not"));
         assert!(token_mods.contains(&"text"));
+        assert!(token_mods.contains(&"of-type"));
+        assert!(token_mods.contains(&"code"));
+        assert!(token_mods.contains(&"text-advanced"));
+        // `not-in` returns 501, so it must not be advertised as supported.
+        assert!(!token_mods.contains(&"not-in"));
 
         // Reference modifiers
         let ref_mods = SqliteBackend::modifiers_for_type(SearchParamType::Reference);
