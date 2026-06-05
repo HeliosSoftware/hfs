@@ -3,11 +3,12 @@
 //! Uses FHIRPath expressions to extract searchable values from FHIR resources.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use helios_fhirpath::EvaluationContext;
 use helios_fhirpath_support::EvaluationResult;
 use parking_lot::RwLock;
+use regex::Regex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -152,6 +153,12 @@ impl SearchParameterExtractor {
         resource: &Value,
         param: &SearchParameterDefinition,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
+        // Composite parameters are indexed component-by-component, with all the
+        // components of one composite instance sharing a `composite_group`.
+        if matches!(param.param_type, SearchParamType::Composite) {
+            return self.extract_composite(resource, param);
+        }
+
         if param.expression.is_empty() {
             return Ok(Vec::new());
         }
@@ -162,8 +169,10 @@ impl SearchParameterExtractor {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Filter the expression to only include parts relevant to this resource type
-        let filtered_expr = self.filter_expression_for_resource(&param.expression, resource_type);
+        // Rewrite choice-type casts (`value as Quantity` → `valueQuantity`) so they
+        // resolve against schema-less JSON, then filter to this resource type.
+        let rewritten = rewrite_choice_types(&param.expression);
+        let filtered_expr = self.filter_expression_for_resource(&rewritten, resource_type);
 
         if filtered_expr.is_empty() {
             return Ok(Vec::new());
@@ -182,6 +191,75 @@ impl SearchParameterExtractor {
                     param.param_type,
                     idx_value,
                 ));
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Extracts index rows for a composite search parameter.
+    ///
+    /// The composite's `expression` (e.g. `Observation` or
+    /// `Observation.component`) selects the base instances. Each instance gets a
+    /// `composite_group` id, and every component sub-expression is evaluated
+    /// relative to that instance and stored as its own row under the composite
+    /// parameter's code. Component value types are resolved from the registry by
+    /// the component `definition` URL.
+    fn extract_composite(
+        &self,
+        resource: &Value,
+        param: &SearchParameterDefinition,
+    ) -> Result<Vec<ExtractedValue>, ExtractionError> {
+        let components = match &param.component {
+            Some(c) if !c.is_empty() => c,
+            _ => return Ok(Vec::new()),
+        };
+
+        let resource_type = resource
+            .get("resourceType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let rewritten_base = rewrite_choice_types(&param.expression);
+        let base_expr = self.filter_expression_for_resource(&rewritten_base, resource_type);
+        if base_expr.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Resolve each component's value type from the registry (by definition URL).
+        let component_types: Vec<Option<SearchParamType>> = {
+            let registry = self.registry.read();
+            components
+                .iter()
+                .map(|c| registry.get_by_url(&c.definition).map(|d| d.param_type))
+                .collect()
+        };
+
+        // Each base instance becomes a composite group.
+        let base_nodes = self.evaluate_fhirpath(resource, &base_expr)?;
+
+        let mut results = Vec::new();
+        for (group_idx, node) in base_nodes.iter().enumerate() {
+            let group = group_idx as u32;
+            for (component, sub_type) in components.iter().zip(component_types.iter()) {
+                let sub_type = match sub_type {
+                    Some(t) => *t,
+                    None => continue, // unknown component definition — skip
+                };
+                if component.expression.is_empty() {
+                    continue;
+                }
+                let comp_expr = rewrite_choice_types(&component.expression);
+                let values = self.evaluate_fhirpath(node, &comp_expr)?;
+                for value in values {
+                    let converted = ValueConverter::convert(&value, sub_type, &param.code)?;
+                    for idx_value in converted {
+                        results.push(
+                            ExtractedValue::new(&param.code, &param.url, sub_type, idx_value)
+                                .with_composite_group(group),
+                        );
+                    }
+                }
             }
         }
 
@@ -264,6 +342,61 @@ impl SearchParameterExtractor {
         // Convert EvaluationResult back to JSON values
         evaluation_result_to_json_values(&result)
     }
+}
+
+/// Rewrites FHIRPath choice-type casts to concrete element names.
+///
+/// The extractor evaluates expressions against schema-less JSON, where a cast
+/// like `value as Quantity` cannot resolve `value` to the stored `valueQuantity`
+/// field. FHIR choice elements are serialized as `<element><Type>` (e.g.
+/// `valueQuantity`, `medicationCodeableConcept`, `occurrenceDateTime`), so we
+/// rewrite the three cast forms used in SearchParameter expressions to that
+/// concrete name:
+///
+/// - `(Observation.value as Quantity)` → `Observation.valueQuantity`
+/// - `value.as(Quantity)`              → `valueQuantity`
+/// - `Observation.value.ofType(Quantity)` → `Observation.valueQuantity`
+/// - `Observation.value as Quantity`   → `Observation.valueQuantity`
+///
+/// (The loader normalizes the `X as Type` form to `X.ofType(Type)`, so that
+/// form is what usually reaches the extractor.)
+///
+/// Stripping the parentheses in the `(... as Type)` form is intentional: it also
+/// lets `filter_expression_for_resource` recognize the `ResourceType.` prefix,
+/// which it otherwise drops for parenthesized union members.
+fn rewrite_choice_types(expression: &str) -> String {
+    static AS_FN: OnceLock<Regex> = OnceLock::new();
+    static OF_TYPE: OnceLock<Regex> = OnceLock::new();
+    static PAREN_AS: OnceLock<Regex> = OnceLock::new();
+    static BARE_AS: OnceLock<Regex> = OnceLock::new();
+
+    let path = r"[A-Za-z_][A-Za-z0-9_.]*";
+    let ty = r"[A-Za-z][A-Za-z0-9]*";
+    let as_fn =
+        AS_FN.get_or_init(|| Regex::new(&format!(r"({path})\.as\(\s*({ty})\s*\)")).unwrap());
+    let of_type =
+        OF_TYPE.get_or_init(|| Regex::new(&format!(r"({path})\.ofType\(\s*({ty})\s*\)")).unwrap());
+    let paren_as =
+        PAREN_AS.get_or_init(|| Regex::new(&format!(r"\(\s*({path})\s+as\s+({ty})\s*\)")).unwrap());
+    let bare_as = BARE_AS.get_or_init(|| Regex::new(&format!(r"({path})\s+as\s+({ty})")).unwrap());
+
+    let concrete = |caps: &regex::Captures| -> String {
+        let base = &caps[1];
+        let type_name = &caps[2];
+        let mut chars = type_name.chars();
+        let capitalized = match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        };
+        format!("{}{}", base, capitalized)
+    };
+
+    // `.as(Type)` / `.ofType(Type)` and `(path as Type)` first (the latter also
+    // drops parens), then any remaining bare `path as Type`.
+    let step1 = as_fn.replace_all(expression, &concrete);
+    let step2 = of_type.replace_all(&step1, &concrete);
+    let step3 = paren_as.replace_all(&step2, &concrete);
+    bare_as.replace_all(&step3, &concrete).into_owned()
 }
 
 /// Converts a serde_json::Value to an EvaluationResult.
@@ -375,6 +508,33 @@ mod tests {
     use helios_fhir::FhirVersion;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn rewrite_choice_types_handles_all_forms() {
+        // `.as(Type)` form.
+        assert_eq!(rewrite_choice_types("value.as(Quantity)"), "valueQuantity");
+        // `.ofType(Type)` form (what the loader normalizes `as` to).
+        assert_eq!(
+            rewrite_choice_types("(Observation.value.ofType(Quantity))"),
+            "(Observation.valueQuantity)"
+        );
+        // Parenthesized `as` form drops the parens.
+        assert_eq!(
+            rewrite_choice_types("(Observation.value as Quantity)"),
+            "Observation.valueQuantity"
+        );
+        // Lower-case primitive type names are capitalized.
+        assert_eq!(
+            rewrite_choice_types("(RiskAssessment.occurrence as dateTime)"),
+            "RiskAssessment.occurrenceDateTime"
+        );
+        // Unions are rewritten member-by-member; non-cast parts are untouched.
+        assert_eq!(
+            rewrite_choice_types("value.as(Quantity) | value.as(Range)"),
+            "valueQuantity | valueRange"
+        );
+        assert_eq!(rewrite_choice_types("Observation.code"), "Observation.code");
+    }
 
     fn create_test_extractor() -> SearchParameterExtractor {
         let loader = SearchParameterLoader::new(FhirVersion::R4);

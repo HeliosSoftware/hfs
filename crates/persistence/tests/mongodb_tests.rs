@@ -8,6 +8,7 @@
 
 #![cfg(feature = "mongodb")]
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use helios_fhir::FhirVersion;
@@ -25,8 +26,8 @@ use helios_persistence::error::{
 use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    IncludeDirective, IncludeType, SearchParamType, SearchParameter, SearchQuery, SearchValue,
-    SortDirective,
+    IncludeDirective, IncludeType, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
+    SearchValue, SortDirective,
 };
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
@@ -210,6 +211,28 @@ async fn create_backend_with_search_offloaded(
         .await
         .expect("failed to initialize MongoDB schema for integration tests");
 
+    Some(backend)
+}
+
+/// Creates a backend whose registry is loaded from the repo's spec files, so
+/// non-embedded search parameters (e.g. `value-quantity`) are active.
+async fn create_backend_with_full_registry(test_name: &str) -> Option<MongoBackend> {
+    let connection_string = test_mongo_url()?;
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))?;
+    let config = MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        data_dir: Some(data_dir),
+        ..Default::default()
+    };
+    let backend = MongoBackend::new(config).expect("failed to create MongoBackend");
+    backend
+        .initialize()
+        .await
+        .expect("failed to initialize MongoDB schema");
     Some(backend)
 }
 
@@ -1233,6 +1256,82 @@ async fn mongodb_integration_history_delete_trial_use_not_supported() {
             BackendError::UnsupportedCapability { .. }
         ))
     ));
+}
+
+#[tokio::test]
+async fn mongodb_integration_search_quantity() {
+    let Some(backend) = create_backend_with_full_registry("search_quantity").await else {
+        eprintln!("Skipping mongodb_integration_search_quantity (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let tenant = create_tenant("tenant-quantity");
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-weight",
+                "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                "valueQuantity": { "value": 72.5, "unit": "kg", "system": "http://unitsofmeasure.org" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = |prefix: SearchPrefix, value: &str| {
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::new(prefix, value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+
+    // ge70 matches (72.5 >= 70).
+    let result = backend
+        .search(&tenant, &query(SearchPrefix::Ge, "70"))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        "value-quantity ge70 → 1 hit"
+    );
+    assert_eq!(result.resources.items[0].id(), "obs-weight");
+
+    // ge100 does not match.
+    let result = backend
+        .search(&tenant, &query(SearchPrefix::Ge, "100"))
+        .await
+        .unwrap();
+    assert!(result.resources.items.is_empty(), "ge100 → no hit");
+
+    // Quantity with a matching unit code.
+    let result = backend
+        .search(
+            &tenant,
+            &query(SearchPrefix::Ge, "70|http://unitsofmeasure.org|kg"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.resources.items.len(), 1, "ge70 with kg unit → 1 hit");
+
+    // Non-matching unit code excludes.
+    let result = backend
+        .search(
+            &tenant,
+            &query(SearchPrefix::Ge, "70|http://unitsofmeasure.org|lb"),
+        )
+        .await
+        .unwrap();
+    assert!(result.resources.items.is_empty(), "wrong unit → no hit");
 }
 
 #[tokio::test]

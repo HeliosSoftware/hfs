@@ -1238,6 +1238,112 @@ mod postgres_integration {
     }
 
     #[tokio::test]
+    async fn postgres_integration_search_cursor_with_custom_sort() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParamType, SearchQuery, SortDirective};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Insert out of order; page size 1 to force keyset paging across pages.
+        for (id, family) in [
+            ("p-charlie", "Charlie"),
+            ("p-alice", "Alice"),
+            ("p-bob", "Bob"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id, "name": [{ "family": family }] }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut collected = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..5 {
+            let mut q = SearchQuery::new("Patient")
+                .with_sort(
+                    SortDirective::parse("family").with_param_type(Some(SearchParamType::String)),
+                )
+                .with_count(1);
+            q.cursor = cursor.clone();
+            let result = backend.search(&tenant, &q).await.unwrap();
+            for r in &result.resources.items {
+                collected.push(r.id().to_string());
+            }
+            match result.resources.page_info.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        // Keyset paging must yield the full set in family order, no dups/gaps.
+        assert_eq!(
+            collected,
+            vec!["p-alice", "p-bob", "p-charlie"],
+            "cursor paging with custom sort must preserve global order"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_search_sort_by_indexed_param() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParamType, SearchQuery, SortDirective};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        for (id, family) in [
+            ("p-charlie", "Charlie"),
+            ("p-alice", "Alice"),
+            ("p-bob", "Bob"),
+        ] {
+            let patient = json!({
+                "resourceType": "Patient",
+                "id": id,
+                "name": [{ "family": family }],
+            });
+            backend
+                .create(&tenant, "Patient", patient, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let collect_ids = |result: helios_persistence::core::SearchResult| {
+            result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let asc = SearchQuery::new("Patient").with_sort(
+            SortDirective::parse("family").with_param_type(Some(SearchParamType::String)),
+        );
+        let ids = collect_ids(backend.search(&tenant, &asc).await.unwrap());
+        assert_eq!(
+            ids,
+            vec!["p-alice", "p-bob", "p-charlie"],
+            "sort by family asc"
+        );
+
+        let desc = SearchQuery::new("Patient").with_sort(
+            SortDirective::parse("-family").with_param_type(Some(SearchParamType::String)),
+        );
+        let ids = collect_ids(backend.search(&tenant, &desc).await.unwrap());
+        assert_eq!(
+            ids,
+            vec!["p-charlie", "p-bob", "p-alice"],
+            "sort by family desc"
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_integration_search_missing_modifier() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{
@@ -1353,6 +1459,72 @@ mod postgres_integration {
             vec!["female1", "none1"],
             "gender:not=male → non-male incl. resources with no gender"
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_search_composite_code_value_quantity() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let observation = json!({
+            "resourceType": "Observation",
+            "id": "obs-bp",
+            "status": "final",
+            "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6" }] },
+            "valueQuantity": { "value": 107, "unit": "mmHg", "system": "http://unitsofmeasure.org" }
+        });
+        backend
+            .create(&tenant, "Observation", observation, FhirVersion::default())
+            .await
+            .unwrap();
+
+        let query = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "code-value-quantity".to_string(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "value-quantity".to_string(),
+                    },
+                ],
+            })
+        };
+
+        let result = backend
+            .search(&tenant, &query("8480-6$ge100"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "code + value match → 1 hit"
+        );
+        assert_eq!(result.resources.items[0].id(), "obs-bp");
+
+        let result = backend
+            .search(&tenant, &query("8480-6$ge200"))
+            .await
+            .unwrap();
+        assert!(result.resources.items.is_empty(), "value too low → no hit");
+
+        let result = backend
+            .search(&tenant, &query("9999-9$ge100"))
+            .await
+            .unwrap();
+        assert!(result.resources.items.is_empty(), "code mismatch → no hit");
     }
 
     // ========================================================================

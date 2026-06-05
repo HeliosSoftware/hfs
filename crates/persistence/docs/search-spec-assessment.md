@@ -38,12 +38,26 @@ Neo4j are not implemented.
 | reference | ✓ | ✓ | ✓ | ✓ | type modifier + `:identifier` (SQLite/ES) |
 | date | ✓ | ✓ | ✓ | ✓ | precision-aware ranges + all prefixes |
 | number | ✓ | ✓ | ✓ | ✓ | implicit-precision ranges + all prefixes |
-| quantity | ✓ | ✓ | ✗ | ✓ | MongoDB rejects with `UnsupportedParameterType` |
+| quantity | ✓ | ✓ | ✓ | ✓ | value comparison + optional system/unit on all backends |
 | uri | ✓ | ✓ | ✓ | ✓ | exact + `:above`/`:below` prefix matching |
-| composite | ✓ | ✗ | ✗ | ◐ | PG/Mongo return no condition; ES matches name only |
+| composite | ✓ | ✓ | ✗ | ✓ | SQLite/PG group by `composite_group`; ES uses one nested object per instance; Mongo returns no condition |
 
 The `resource` and `special` parameter types from the spec are modeled in the `SearchParamType`
 enum but have no dedicated execution path beyond the special common parameters below.
+
+**Composite (SQLite, PostgreSQL):** works end-to-end. The REST layer resolves each component's
+type and code from the registry (by the component `definition` URL); the extractor indexes every
+composite instance as a set of `search_index` rows sharing a `composite_group`; and the backend
+matches with `GROUP BY resource_id, composite_group HAVING <every component present>`, so all
+components must be satisfied within the same instance. Elasticsearch still matches the composite
+name only (◐).
+
+**Choice types (`value[x]`):** the extractor evaluates FHIRPath against schema-less JSON, where a
+cast such as `value as Quantity` / `value.ofType(Quantity)` cannot resolve to the stored
+`valueQuantity` field. `rewrite_choice_types` in `search/extractor.rs` rewrites these casts to the
+concrete element name (`valueQuantity`, `medicationCodeableConcept`, `occurrenceDateTime`, …)
+before evaluation. This fixed both composite value components and plain `value[x]` parameters
+(e.g. `value-quantity`), which previously indexed nothing.
 
 ## 2. Search modifiers
 
@@ -54,10 +68,10 @@ enum but have no dedicated execution path beyond the special common parameters b
 | `:contains` | ✓ | ✓ | ✓ | ✓ |
 | `:text` | ✓ | ◐¹ | ✗ | ✓ |
 | `:not` | ✓ | ✓ | ✗ | ✓ |
-| `:of-type` | ✓ | ✗ | ✗ | ✓ |
+| `:of-type` | ✓ | ✓ | ✗ | ✓ |
 | `:text-advanced` | ✓ | ✗ | ✗ | ✓ |
 | `:above` / `:below` (URI) | ✓ | ✓ | ✗ | ✓ |
-| `:above` / `:below` (token hierarchy) | ✗ | ✗ | ✗ | ✗ |
+| `:above` / `:below` (token hierarchy) | †³ | †³ | †³ | †³ |
 | `:in` / `:not-in` | †² | †² | †² | †² |
 | `:identifier` (reference) | ✓ | ✗ | ✗ | ✓ |
 | `:[type]` (reference) | ✓ | ✗ | ✓ | ✓ |
@@ -68,6 +82,10 @@ enum but have no dedicated execution path beyond the special common parameters b
 ² `:in` is expanded by the REST layer against a configured terminology server before the query
   reaches the backend (`crates/rest/src/handlers/search.rs`); `:not-in` returns `501 Not
   Implemented`. No backend resolves either modifier natively.
+³ Token `:above`/`:below` (`code:below=system|code`) is resolved at the REST layer: the code and its
+  descendants (`is-a`, for `:below`) or ancestors (`generalizes`, for `:above`) are expanded via the
+  terminology server's `$expand`, then matched as a plain token OR list. Works on every backend when
+  `HFS_TERMINOLOGY_SERVER` is configured; URI `:above`/`:below` is separate and native (above).
 
 The REST layer parses **all** of these modifiers (`crates/rest/src/extractors/search_query_builder.rs`)
 regardless of backend; unsupported ones either no-op, error, or (for some ES/Mongo cases) return no
@@ -106,15 +124,19 @@ effectively a no-op.
 
 | Capability | SQLite | PostgreSQL | MongoDB | Elasticsearch |
 |------------|:------:|:----------:|:-------:|:-------------:|
-| Forward chained params (N-level) | ✓ | ✓ | ✗ | ✗ |
-| Reverse chaining (`_has`, nested) | ✓ | ✓ | ✗ | ✗ |
+| Forward chained params (N-level) | ✓ | ✓ | ◐ | ◐ |
+| Reverse chaining (`_has`) | ✓ | ✓ | ◐ | ◐ |
 | `_include` | ✓ | ✓ | ✓ | ✓ |
 | `_revinclude` | ✓ | ✓ | ✓ | ✓ |
 | `:iterate` on include | parsed | parsed | parsed | parsed |
 
-SQLite and PostgreSQL resolve chains via nested `search_index` subqueries with configurable depth
-limits. MongoDB returns `ChainedSearchNotSupported` / `ReverseChainNotSupported`; Elasticsearch
-silently returns no matches when `param.chain` or `reverse_chains` are present.
+SQLite and PostgreSQL resolve chains natively, via nested `search_index` subqueries with
+configurable depth limits (✓). For all other backends (◐), the REST layer resolves chained and
+reverse-chained parameters before the backend search runs: `search::resolve_chains` issues one
+plain `search()` per chain hop against the same backend and folds the result into an `_id`
+filter — application-side joins. So chained and `_has` queries work end-to-end over HTTP on every
+searchable backend, including Elasticsearch and MongoDB; the per-backend distinction is whether the
+join is pushed into the backend (SQLite/PG) or performed by the REST layer.
 
 ## 6. Result control (paging, sort, total, summary, elements)
 
@@ -123,7 +145,7 @@ These are parsed and largely orchestrated by the REST layer.
 | Parameter | Status | Notes |
 |-----------|--------|-------|
 | `_count` | ✓ | page size; `_offset`/`_cursor` for paging |
-| `_sort` | ◐ | applied for `_id`/`_lastUpdated` only; see below |
+| `_sort` | ✓ | SQLite/PG sort by any indexed param; see below |
 | `_total` | ✓ | `none` / `estimate` / `accurate` parsed and applied |
 | `_summary` | ✓ | `true`/`text`/`data`/`count`/`false`, applied in `subsetting.rs` |
 | `_elements` | ✓ | applied post-search with nested-path support |
@@ -134,33 +156,51 @@ These are parsed and largely orchestrated by the REST layer.
 | `next` / `previous` links | ✓ | cursor-based |
 | `first` / `last` links | ✗ | not generated |
 
-**`_sort` detail.** `_sort` is parsed into `SearchQuery.sort` for every backend. The backends map
-sort fields to columns via a small allow-list — `_id` → `id`, `_lastUpdated` → `last_updated` —
-and fall back to `id` for anything else. So sorting by an arbitrary search parameter (e.g.
-`_sort=birthdate`) currently degrades to a stable-but-not-meaningful `id` ordering on all backends.
-Sort is applied on the first-page and offset query paths; cursor (keyset) pages always use the
-default `_lastUpdated, id` ordering because the keyset `WHERE` comparison depends on it. MongoDB
-additionally cannot combine a custom sort with cursor pagination.
+**`_sort` detail.** `_sort` is parsed into `SearchQuery.sort`; the REST layer resolves each sort
+field's type from the registry (`SortDirective.param_type`). On SQLite and PostgreSQL, `_id` and
+`_lastUpdated` sort on the `resources` table, while any other indexed parameter sorts on a
+correlated subquery into `search_index` — `MIN(value_col)` for ascending, `MAX(value_col)` for
+descending (FHIR multi-value sort), with the value column chosen by the parameter type. Cursor
+(keyset) pagination is consistent with the sort: the boundary row's sort value is selected, encoded
+into the opaque `PageCursor` alongside the id, and the next/previous page applies a keyset `WHERE`
+`(sort_expr, id)` comparison on it — so deep paging preserves the order. A multi-field `_sort`
+returns a single page (no cursor) rather than risk an inconsistent keyset. MongoDB sorts by
+`_id`/`_lastUpdated` only and cannot combine a custom sort with cursor pagination; Elasticsearch
+sorts on its mapped fields via `search_after`.
 
 ## 7. Known limitations & roadmap
 
 Ordered roughly by impact:
 
-1. **Sort by arbitrary search parameter** — unsupported on all backends (only `_id`/`_lastUpdated`).
-   Would require sorting on `search_index` values via a join. Cursor pages ignore custom sort.
-2. **Terminology-dependent modifiers** — token `:above`/`:below`, `:in`, `:not-in` need a
-   terminology server. `:in` is partially handled via REST-side expansion; the rest are not native.
+1. **Multi-field `_sort` + cursor** — single-field sorts (and the default `_lastUpdated`) page
+   correctly via the keyset cursor on SQLite/PG. A multi-field `_sort` currently returns a single
+   page (no cursor); extending the keyset to a multi-key tuple is the remaining work. MongoDB still
+   sorts by `_id`/`_lastUpdated` only.
+2. **Terminology-dependent modifiers** — `:in` and token `:above`/`:below` are resolved at the REST
+   layer via terminology `$expand` (functional when `HFS_TERMINOLOGY_SERVER` is set; no native
+   in-backend resolution). `:not-in` still returns `501` — negated value-set filtering is the
+   remaining gap.
    URI `:above`/`:below` (hierarchical prefix, no service needed) *is* implemented on SQLite/PG/ES.
-3. **PostgreSQL modifier/param gaps** — composite parameters and the `:of-type` and
-   `:text-advanced` modifiers are not implemented (`:not` and `:missing` are now supported; SQLite
-   implements all of these).
-4. **MongoDB native search gaps** — quantity and composite parameters error out; forward/reverse
-   chaining, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are unsupported.
-5. **Elasticsearch gaps** — composite matches the parameter name only (components not evaluated);
-   forward chaining and `_has` silently return nothing rather than erroring; `_filter` unsupported.
+3. **PostgreSQL modifier gaps** — only the `:text-advanced` modifier remains unimplemented relative
+   to SQLite (`:exact`, `:contains`, `:not`, `:missing`, `:of-type`, URI `:above`/`:below`, and
+   composite parameters are all supported now).
+4. **MongoDB native search gaps** — composite parameters error out; `_text`/`_content` and most
+   modifiers beyond `:exact`/`:contains` are unsupported. (Quantity search is now implemented;
+   chained/`_has` work via the REST-layer resolver.)
+5. **Elasticsearch gaps** — `_filter` unsupported. (Composite now evaluates components via inline
+   nested objects; chained/`_has` now work via the REST-layer resolver — see below.)
 6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
    unsupported; Bundles omit `first`/`last` paging links. `:code-text` (newer spec modifier) is
    unsupported everywhere.
 
-SQLite is the most complete backend and serves as the reference for the others; closing the
-PostgreSQL gaps (composite, `:not`/`:missing`) to reach SQLite parity is the most direct next step.
+**Chaining dispatch (resolved).** Chained (`subject.name=Smith`) and reverse-chained
+(`_has:Observation:subject:code=1234`) searches are parsed into `SearchQuery` (`param.chain`,
+`reverse_chains`), but the 2-arg `SearchProvider::search` does not act on them. The REST search
+handler now calls `search::resolve_chains` first: a backend-agnostic resolver that performs the
+chain as application-side joins (one plain `search()` per hop, results folded into an `_id`
+filter), then runs the rewritten query. This works for any `SearchProvider`, so chained and `_has`
+queries are functional end-to-end on SQLite, PostgreSQL, MongoDB, and Elasticsearch. SQLite and PG
+additionally resolve chains natively in-backend.
+
+SQLite is the most complete backend and serves as the reference for the others; PostgreSQL is now
+at near-parity (only `:text-advanced` remains).

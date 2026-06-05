@@ -6,8 +6,9 @@ use std::collections::HashMap;
 
 use helios_persistence::search::{SearchParameterRegistry, resolve_param_type};
 use helios_persistence::types::{
-    IncludeDirective, IncludeType, ReverseChainedParameter, SearchModifier, SearchParamType,
-    SearchParameter, SearchQuery, SearchValue, SortDirective, SummaryMode, TotalMode,
+    CompositeSearchComponent, IncludeDirective, IncludeType, ReverseChainedParameter,
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
+    SummaryMode, TotalMode,
 };
 
 use super::SearchParams;
@@ -52,7 +53,17 @@ pub fn build_search_query(
             } else {
                 SortDirective::parse(&format!("-{}", sort.field))
             };
-            query.sort.push(directive);
+            // Resolve the search-parameter type so backends can sort by the
+            // indexed value column. `_id`/`_lastUpdated` are columns on the
+            // resources table and need no type.
+            let param_type = if directive.parameter.starts_with('_') {
+                None
+            } else {
+                registry
+                    .get_param(resource_type, &directive.parameter)
+                    .map(|d| d.param_type)
+            };
+            query.sort.push(directive.with_param_type(param_type));
         }
     }
 
@@ -165,6 +176,27 @@ fn parse_search_parameter(
         chain,
         components: vec![],
     };
+
+    // For composite parameters, resolve the component sub-parameters from the
+    // registry (type + code), so the backend can match each component within
+    // the same composite instance.
+    if matches!(param_type, SearchParamType::Composite) {
+        if let Some(def) = registry.get_param(resource_type, base_name) {
+            if let Some(comps) = def.component.as_ref() {
+                param.components = comps
+                    .iter()
+                    .filter_map(|c| {
+                        registry
+                            .get_by_url(&c.definition)
+                            .map(|sub| CompositeSearchComponent {
+                                param_type: sub.param_type,
+                                param_name: sub.code.clone(),
+                            })
+                    })
+                    .collect();
+            }
+        }
+    }
 
     // Handle :missing modifier specially
     if param

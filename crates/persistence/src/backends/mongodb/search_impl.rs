@@ -539,11 +539,7 @@ impl MongoBackend {
             SearchParamType::Number => self.build_number_filter(value),
             SearchParamType::Reference => self.build_reference_filter(param, value),
             SearchParamType::Uri => self.build_uri_filter(param, value),
-            SearchParamType::Quantity => Err(StorageError::Search(
-                SearchError::UnsupportedParameterType {
-                    param_type: "quantity".to_string(),
-                },
-            )),
+            SearchParamType::Quantity => self.build_quantity_filter(value),
             SearchParamType::Composite => {
                 Err(StorageError::Search(SearchError::InvalidComposite {
                     message: "Composite search is not supported in MongoDB Phase 4".to_string(),
@@ -725,6 +721,54 @@ impl MongoBackend {
                 })
             }
         }
+    }
+
+    /// Builds a MongoDB filter for a quantity parameter.
+    ///
+    /// Value form: `[prefix]number[|system|code]` (or the `number|code` shorthand).
+    /// The comparison runs on `value_quantity_value`; an optional system/code
+    /// further constrain `value_quantity_system` / `value_quantity_unit` (the
+    /// extractor stores the quantity code under the unit field).
+    fn build_quantity_filter(&self, value: &SearchValue) -> StorageResult<Document> {
+        let parts: Vec<&str> = value.value.splitn(3, '|').collect();
+        let parsed = parts[0].parse::<f64>().map_err(|e| {
+            StorageError::Search(SearchError::QueryParseError {
+                message: format!("Invalid quantity value '{}': {}", value.value, e),
+            })
+        })?;
+
+        let value_condition = match value.prefix {
+            SearchPrefix::Ap => {
+                let delta = (parsed.abs() * 0.1).max(0.1);
+                doc! { "$gte": parsed - delta, "$lte": parsed + delta }
+            }
+            _ => {
+                let op = Self::prefix_to_mongo_operator(value.prefix)?;
+                doc! { op: parsed }
+            }
+        };
+
+        let mut filter = doc! { "value_quantity_value": value_condition };
+        match parts.as_slice() {
+            // number|system|code
+            [_, system, code] => {
+                if !system.is_empty() {
+                    filter.insert("value_quantity_system", *system);
+                }
+                if !code.is_empty() {
+                    filter.insert("value_quantity_unit", *code);
+                }
+            }
+            // number|code shorthand
+            [_, code] => {
+                if !code.is_empty() {
+                    filter.insert("value_quantity_unit", *code);
+                }
+            }
+            _ => {}
+        }
+
+        Ok(filter)
     }
 
     fn build_number_filter(&self, value: &SearchValue) -> StorageResult<Document> {

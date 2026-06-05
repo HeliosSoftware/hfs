@@ -252,6 +252,7 @@ mod query_builder_tests {
         let query = SearchQuery::new("Patient").with_sort(SortDirective {
             parameter: "_id".to_string(),
             direction: SortDirection::Ascending,
+            param_type: None,
         });
 
         let es_query = builder.build(&query);
@@ -1116,6 +1117,77 @@ mod es_integration {
             result_b.resources.items.is_empty(),
             "Tenant B should not see tenant A's patient"
         );
+    }
+
+    #[tokio::test]
+    async fn es_integration_search_composite_code_value_quantity() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-bp",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6" }] },
+                    "valueQuantity": { "value": 107, "unit": "mmHg", "system": "http://unitsofmeasure.org" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let query = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "code-value-quantity".to_string(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "value-quantity".to_string(),
+                    },
+                ],
+            })
+        };
+
+        // Both components match within the same instance.
+        let hit = backend
+            .search(&tenant, &query("8480-6$ge100"))
+            .await
+            .unwrap();
+        assert_eq!(hit.resources.items.len(), 1, "code + value match → 1 hit");
+        assert_eq!(hit.resources.items[0].id(), "obs-bp");
+
+        // Quantity component fails.
+        let miss = backend
+            .search(&tenant, &query("8480-6$ge200"))
+            .await
+            .unwrap();
+        assert!(miss.resources.items.is_empty(), "value too low → no hit");
+
+        // Token component fails.
+        let miss = backend
+            .search(&tenant, &query("9999-9$ge100"))
+            .await
+            .unwrap();
+        assert!(miss.resources.items.is_empty(), "code mismatch → no hit");
     }
 
     #[tokio::test]

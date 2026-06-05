@@ -61,6 +61,7 @@
 //! }
 //! ```
 
+pub mod chain_resolver;
 pub mod converters;
 pub mod errors;
 pub mod extractor;
@@ -70,6 +71,7 @@ pub mod reindex;
 pub mod writer;
 
 // Re-export main types
+pub use chain_resolver::{query_has_chains, resolve_chains};
 pub use converters::{IndexValue, ValueConverter};
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{ExtractedValue, SearchParameterExtractor};
