@@ -40,7 +40,7 @@ Neo4j are not implemented.
 | number | ✓ | ✓ | ✓ | ✓ | implicit-precision ranges + all prefixes |
 | quantity | ✓ | ✓ | ✗ | ✓ | MongoDB rejects with `UnsupportedParameterType` |
 | uri | ✓ | ✓ | ✓ | ✓ | exact + `:above`/`:below` prefix matching |
-| composite | ✓ | ✓ | ✗ | ◐ | SQLite/PG evaluate components; ES matches name only; Mongo returns no condition |
+| composite | ✓ | ✓ | ✗ | ✓ | SQLite/PG group by `composite_group`; ES uses one nested object per instance; Mongo returns no condition |
 
 The `resource` and `special` parameter types from the spec are modeled in the `SearchParamType`
 enum but have no dedicated execution path beyond the special common parameters below.
@@ -176,11 +176,22 @@ Ordered roughly by impact:
    composite parameters are all supported now).
 4. **MongoDB native search gaps** — quantity and composite parameters error out; forward/reverse
    chaining, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are unsupported.
-5. **Elasticsearch gaps** — composite matches the parameter name only (components not evaluated);
-   forward chaining and `_has` silently return nothing rather than erroring; `_filter` unsupported.
+5. **Elasticsearch gaps** — forward chaining and `_has` silently return nothing rather than
+   erroring; `_filter` unsupported. (Composite now evaluates components via inline nested objects.)
+   See the chaining note below — chained search is a cross-cutting dispatch gap, not ES-specific.
 6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
    unsupported; Bundles omit `first`/`last` paging links. `:code-text` (newer spec modifier) is
    unsupported everywhere.
+
+**Chaining dispatch (cross-cutting).** Chained (`subject.name=Smith`) and reverse-chained
+(`_has:Observation:subject:code=1234`) searches are *parsed* into `SearchQuery` (`param.chain`,
+`reverse_chains`) but the 2-arg `SearchProvider::search` that the REST layer calls does not act on
+them on any backend — the working chain logic lives in the separate `ChainedSearchProvider::
+resolve_chain` API, which `search()` never invokes. `CompositeStorage` already implements
+`resolve_chain` via iterative plain `search()` calls (which work on every backend, including ES).
+So making chained/`_has` search work end-to-end over HTTP is a single dispatch change — detect
+chained params in the `search()` path and route them through `resolve_chain` — not an
+ES-specific fix.
 
 SQLite is the most complete backend and serves as the reference for the others; PostgreSQL is now
 at near-parity (only `:text-advanced` remains).

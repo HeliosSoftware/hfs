@@ -347,7 +347,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Number](https://build.fhir.org/search.html#number)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ○   |
 | [Quantity](https://build.fhir.org/search.html#quantity)                     | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ○   |
 | [URI](https://build.fhir.org/search.html#uri)                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
-| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ✓          | ○       | ✗         | ○     | ◐             | ✗   |
+| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
 | **[Search Modifiers](https://build.fhir.org/search.html#modifiers)**        |
 | [:exact](https://build.fhir.org/search.html#modifiers)                      | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
 | [:contains](https://build.fhir.org/search.html#modifiers)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
@@ -393,11 +393,12 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 - **`:in` / `:not-in`** — handled at the REST layer: `:in` is expanded against a terminology
   server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
   backend resolves these natively.
-- **Composite** — SQLite and PostgreSQL evaluate composite component values (token, string,
-  number, quantity, date) end-to-end (✓): the REST layer resolves component types from the
-  registry, the extractor indexes each composite instance as a `composite_group`, and the backend
-  matches all components within one group. Elasticsearch matches on the composite parameter name
-  only (◐). See `docs/search-spec-assessment.md`.
+- **Composite** — SQLite, PostgreSQL, and Elasticsearch evaluate composite component values
+  (token, string, number, quantity, date) end-to-end (✓): the REST layer resolves component types
+  from the registry and the extractor indexes each composite instance as a `composite_group`.
+  SQLite/PG match all components within one group via `GROUP BY … HAVING`; Elasticsearch indexes
+  each instance as one nested object with inline component values and matches with a single nested
+  query. See `docs/search-spec-assessment.md`.
 
 The S3 backend is intentionally storage-focused (CRUD/version/history/bulk submit) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but job state belongs to SQLite or PostgreSQL. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
@@ -1115,8 +1116,9 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] Index schema and mappings (nested objects for multi-value search params)
 - [x] ResourceStorage implementation for composite sync support
 - [x] Search query translation (FHIR SearchQuery → ES Query DSL)
-- [x] Parameter type handlers (string, token, date, number, quantity, reference, URI; composite
-      matches on the parameter name only — component values are not yet evaluated)
+- [x] Parameter type handlers (string, token, date, number, quantity, reference, URI, composite —
+      each composite instance is one nested object with inline component values, matched by a
+      single nested query)
 - [x] Full-text search (`_text`, `_content`, `:text-advanced`)
 - [x] Modifier support (:exact, :contains, :text, :not, :missing, :above, :below, :of-type)
 - [x] `_include` and `_revinclude` resolution
