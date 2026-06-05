@@ -158,7 +158,10 @@ impl SearchModifier {
             "in" => Some(SearchModifier::In),
             "not-in" => Some(SearchModifier::NotIn),
             "identifier" => Some(SearchModifier::Identifier),
-            "oftype" => Some(SearchModifier::OfType),
+            // The FHIR spec (build.fhir.org) spells this `of-type`, and that is
+            // the form advertised in our CapabilityStatement; accept the legacy
+            // camelCase `ofType` too so older clients keep working.
+            "of-type" | "oftype" => Some(SearchModifier::OfType),
             "code" => Some(SearchModifier::CodeOnly),
             "iterate" => Some(SearchModifier::Iterate),
             "text-advanced" => Some(SearchModifier::TextAdvanced),
@@ -806,6 +809,16 @@ mod tests {
         assert_eq!(
             SearchModifier::parse("Patient"),
             Some(SearchModifier::Type("Patient".to_string()))
+        );
+        // Both the spec/CapabilityStatement spelling (`of-type`) and the legacy
+        // camelCase (`ofType`) must parse to the same modifier.
+        assert_eq!(
+            SearchModifier::parse("of-type"),
+            Some(SearchModifier::OfType)
+        );
+        assert_eq!(
+            SearchModifier::parse("ofType"),
+            Some(SearchModifier::OfType)
         );
         assert_eq!(SearchModifier::parse("unknown"), None);
     }
