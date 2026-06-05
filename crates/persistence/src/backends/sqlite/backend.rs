@@ -693,7 +693,7 @@ impl SqliteBackend {
     /// Returns supported modifiers for a parameter type.
     fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
-            SearchParamType::String => vec!["exact", "contains", "missing"],
+            SearchParamType::String => vec!["exact", "contains", "text", "missing"],
             // `not-in` is intentionally omitted: the SQLite backend returns 501
             // for it (negated value-set filtering is unimplemented), so it must
             // not be advertised. `code`/`text-advanced` are implemented by the
@@ -819,6 +819,7 @@ mod tests {
         let string_mods = SqliteBackend::modifiers_for_type(SearchParamType::String);
         assert!(string_mods.contains(&"exact"));
         assert!(string_mods.contains(&"contains"));
+        assert!(string_mods.contains(&"text"));
         assert!(string_mods.contains(&"missing"));
 
         // Token modifiers

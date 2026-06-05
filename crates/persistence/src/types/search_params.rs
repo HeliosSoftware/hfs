@@ -187,7 +187,12 @@ impl SearchModifier {
                 param_type,
                 SearchParamType::String | SearchParamType::Reference | SearchParamType::Uri
             ),
-            SearchModifier::Text => param_type == SearchParamType::Token,
+            // Per the FHIR spec, `:text` is defined for string, token, and
+            // reference params. Reference `:text` (matching `Reference.display`)
+            // is not yet implemented; string and token are.
+            SearchModifier::Text => {
+                matches!(param_type, SearchParamType::String | SearchParamType::Token)
+            }
             // Per the FHIR spec, `:not` is only defined for token parameters
             // (it negates a code match). Our backends only implement it for
             // token; advertising it for other types was incorrect.
@@ -840,6 +845,9 @@ mod tests {
         assert!(SearchModifier::Contains.is_valid_for(SearchParamType::Uri));
         assert!(!SearchModifier::Contains.is_valid_for(SearchParamType::Token));
         assert!(SearchModifier::Text.is_valid_for(SearchParamType::Token));
+        // `:text` is valid for string and token (FHIR spec).
+        assert!(SearchModifier::Text.is_valid_for(SearchParamType::String));
+        assert!(!SearchModifier::Text.is_valid_for(SearchParamType::Uri));
         // `:not` is token-only per the FHIR spec.
         assert!(SearchModifier::Not.is_valid_for(SearchParamType::Token));
         assert!(!SearchModifier::Not.is_valid_for(SearchParamType::String));

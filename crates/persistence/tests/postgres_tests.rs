@@ -206,6 +206,33 @@ mod query_builder_tests {
     }
 
     #[test]
+    fn test_string_parameter_text() {
+        use helios_persistence::types::SearchModifier;
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: Some(SearchModifier::Text),
+            values: vec![SearchValue::eq("mit")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = PostgresQueryBuilder::build_search_query(&query, 2);
+        assert!(result.is_some());
+        let fragment = result.unwrap();
+        assert!(fragment.sql.contains("value_string ILIKE"));
+        // Substring match: param wrapped as %mit%
+        match &fragment.params[0] {
+            SqlParam::Text(s) => {
+                assert!(s.starts_with('%'));
+                assert!(s.ends_with('%'));
+            }
+            _ => panic!("Expected Text param"),
+        }
+    }
+
+    #[test]
     fn test_uri_parameter_contains() {
         use helios_persistence::types::SearchModifier;
 

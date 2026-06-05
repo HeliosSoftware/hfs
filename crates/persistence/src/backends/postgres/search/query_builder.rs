@@ -376,7 +376,9 @@ impl PostgresQueryBuilder {
                     ),
                     vec![SqlParam::text(&value.value)],
                 ),
-                Some(SearchModifier::Contains) => SqlFragment::with_params(
+                // `:text` on a string is a case-insensitive partial match,
+                // implemented here as a substring match (same as `:contains`).
+                Some(SearchModifier::Contains | SearchModifier::Text) => SqlFragment::with_params(
                     format!(
                         "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string ILIKE ${})",
                         param.name, param_num

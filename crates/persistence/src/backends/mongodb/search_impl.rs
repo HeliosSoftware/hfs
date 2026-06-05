@@ -575,7 +575,9 @@ impl MongoBackend {
                 }
             }),
             Some(SearchModifier::Exact) => Ok(doc! { "value_string": lowered }),
-            Some(SearchModifier::Contains) => Ok(doc! {
+            // `:text` on a string is a case-insensitive partial match,
+            // implemented here as a substring match (same as `:contains`).
+            Some(SearchModifier::Contains | SearchModifier::Text) => Ok(doc! {
                 "value_string": {
                     "$regex": regex_escape(&lowered)
                 }

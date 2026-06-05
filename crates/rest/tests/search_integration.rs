@@ -465,6 +465,25 @@ mod string_search {
     }
 
     #[tokio::test]
+    async fn test_string_search_text_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `:text` on a string is a case-insensitive partial match (FHIR spec
+        // allows :text on string). Previously the gate rejected it as
+        // token-only; now it matches "Smith" via the substring "mit".
+        let response = server
+            .get("/Patient?name:text=mit")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert!(!entries.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_modifier_invalid_for_param_type_returns_400() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
