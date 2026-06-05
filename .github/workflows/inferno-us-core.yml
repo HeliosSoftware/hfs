@@ -202,6 +202,10 @@ jobs:
           # Note: Inferno uses "us_core_311" naming for this group across all US Core versions
           OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-us_core_311_data_absent_reason-us_core_311_data_absent_reason_extension\""
           OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-us_core_311_data_absent_reason-us_core_311_data_absent_reason_code_system\""
+          # smokingstatus/simple-observation: shared test data references SNOMED CT US-edition version (731000124108) not in International Edition; Inferno validator can't resolve it.
+          # The offending bundle (uscore_bundle_patient_client_test.json) is loaded for every suite, so omit across all versions.
+          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_smokingstatus-${SUITE}_smokingstatus_validation_test\""
+          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_simple_observation-${SUITE}_simple_observation_validation_test\""
 
           case "$SUITE" in
             us_core_v501|us_core_v610|us_core_v700|us_core_v800)
@@ -221,9 +225,6 @@ jobs:
             us_core_v700|us_core_v800)
               # Inferno fhir_client gem bug with UUID-based Location references
               OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_location-${SUITE}_location_address_search_test\""
-              # smokingstatus/simple-observation: shared test data references SNOMED CT US-edition version (731000124108) not in International Edition; Inferno validator can't resolve it
-              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_smokingstatus-${SUITE}_smokingstatus_validation_test\""
-              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_simple_observation-${SUITE}_simple_observation_validation_test\""
               ;;
           esac
 
