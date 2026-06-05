@@ -206,6 +206,60 @@ mod query_builder_tests {
     }
 
     #[test]
+    fn test_token_parameter_code_text() {
+        use helios_persistence::types::SearchModifier;
+
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::CodeText),
+            values: vec![SearchValue::eq("Heart")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = PostgresQueryBuilder::build_search_query(&query, 2);
+        assert!(result.is_some());
+        let fragment = result.unwrap();
+        assert!(fragment.sql.contains("value_token_display ILIKE"));
+        // starts-with: param is "Heart%"
+        match &fragment.params[0] {
+            SqlParam::Text(s) => {
+                assert!(!s.starts_with('%'));
+                assert!(s.ends_with('%'));
+            }
+            _ => panic!("Expected Text param"),
+        }
+    }
+
+    #[test]
+    fn test_token_parameter_text_contains() {
+        use helios_persistence::types::SearchModifier;
+
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Text),
+            values: vec![SearchValue::eq("Heart")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = PostgresQueryBuilder::build_search_query(&query, 2);
+        assert!(result.is_some());
+        let fragment = result.unwrap();
+        assert!(fragment.sql.contains("value_token_display ILIKE"));
+        // contains: param is "%Heart%"
+        match &fragment.params[0] {
+            SqlParam::Text(s) => {
+                assert!(s.starts_with('%'));
+                assert!(s.ends_with('%'));
+            }
+            _ => panic!("Expected Text param"),
+        }
+    }
+
+    #[test]
     fn test_string_parameter_text() {
         use helios_persistence::types::SearchModifier;
 

@@ -556,7 +556,15 @@ impl ElasticsearchBackend {
                 // `not-in` is intentionally omitted: it returns 501 (negated
                 // value-set filtering is unimplemented), so it must not be
                 // advertised as supported.
-                vec!["not", "text", "text-advanced", "in", "of-type", "missing"]
+                vec![
+                    "not",
+                    "text",
+                    "text-advanced",
+                    "code-text",
+                    "in",
+                    "of-type",
+                    "missing",
+                ]
             }
             SearchParamType::Reference => vec!["identifier", "contains", "missing"],
             SearchParamType::Date => vec!["missing"],

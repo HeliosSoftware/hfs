@@ -704,6 +704,7 @@ impl SqliteBackend {
                 "in",
                 "of-type",
                 "code",
+                "code-text",
                 "text-advanced",
                 "missing",
             ],

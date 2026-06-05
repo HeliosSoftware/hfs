@@ -416,6 +416,39 @@ impl PostgresQueryBuilder {
             return Self::build_of_type_condition(param, offset);
         }
 
+        // `:text` (contains) and `:code-text` (starts-with) match the token's
+        // display text (Coding.display / CodeableConcept.text).
+        if matches!(
+            param.modifier,
+            Some(SearchModifier::Text | SearchModifier::CodeText)
+        ) {
+            let starts_with = matches!(param.modifier, Some(SearchModifier::CodeText));
+            let mut conditions = Vec::new();
+            for (i, value) in param.values.iter().enumerate() {
+                let param_num = offset + i + 1;
+                let pattern = if starts_with {
+                    format!("{}%", value.value)
+                } else {
+                    format!("%{}%", value.value)
+                };
+                conditions.push(SqlFragment::with_params(
+                    format!(
+                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_display ILIKE ${})",
+                        param.name, param_num
+                    ),
+                    vec![SqlParam::text(&pattern)],
+                ));
+            }
+            if conditions.is_empty() {
+                return None;
+            }
+            let mut combined = conditions.remove(0);
+            for cond in conditions {
+                combined = combined.or(cond);
+            }
+            return Some(combined);
+        }
+
         let mut conditions = Vec::new();
 
         for (i, value) in param.values.iter().enumerate() {

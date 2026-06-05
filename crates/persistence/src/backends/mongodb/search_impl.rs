@@ -605,6 +605,19 @@ impl MongoBackend {
 
         match param.modifier.as_ref() {
             None | Some(SearchModifier::CodeOnly) => {}
+            // `:text` (contains) and `:code-text` (starts-with) match the
+            // token's display text (Coding.display / CodeableConcept.text).
+            Some(m @ (SearchModifier::Text | SearchModifier::CodeText)) => {
+                let escaped = regex_escape(&value.value);
+                let regex = if *m == SearchModifier::CodeText {
+                    format!("^{}", escaped)
+                } else {
+                    escaped
+                };
+                return Ok(doc! {
+                    "value_token_display": { "$regex": regex, "$options": "i" }
+                });
+            }
             Some(other) => {
                 return Err(StorageError::Search(SearchError::UnsupportedModifier {
                     modifier: other.to_string(),

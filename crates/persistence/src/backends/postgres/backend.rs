@@ -745,7 +745,9 @@ impl PostgresBackend {
             // `not-in` is intentionally omitted: it returns 501 (negated
             // value-set filtering is unimplemented), so it must not be
             // advertised as supported.
-            SearchParamType::Token => vec!["not", "text", "in", "of-type", "missing"],
+            SearchParamType::Token => {
+                vec!["not", "text", "code-text", "in", "of-type", "missing"]
+            }
             SearchParamType::Reference => vec!["identifier", "contains", "missing"],
             SearchParamType::Date => vec!["missing"],
             SearchParamType::Number => vec!["missing"],

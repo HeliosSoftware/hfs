@@ -25,6 +25,9 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
         Some(SearchModifier::TextAdvanced) => {
             return build_text_advanced_clause(name, value);
         }
+        Some(SearchModifier::CodeText) => {
+            return build_code_text_clause(name, value);
+        }
         Some(SearchModifier::OfType) => {
             return build_of_type_clause(name, value);
         }
@@ -117,6 +120,23 @@ fn build_text_advanced_clause(name: &str, value: &str) -> Option<Value> {
                                 "query": value
                             }
                         }
+                    ]
+                }
+            }
+        }
+    }))
+}
+
+/// Builds a :code-text modifier clause (case-insensitive starts-with on display).
+fn build_code_text_clause(name: &str, value: &str) -> Option<Value> {
+    Some(json!({
+        "nested": {
+            "path": "search_params.token",
+            "query": {
+                "bool": {
+                    "must": [
+                        { "term": { "search_params.token.name": name } },
+                        { "match_phrase_prefix": { "search_params.token.display": value } }
                     ]
                 }
             }
