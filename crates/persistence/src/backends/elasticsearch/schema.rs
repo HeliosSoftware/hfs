@@ -150,7 +150,31 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                             "type": "nested",
                             "properties": {
                                 "name": { "type": "keyword" },
-                                "group_id": { "type": "integer" }
+                                "group_id": { "type": "integer" },
+                                // Component values stored inline (as arrays) so a
+                                // single nested query matches all components of the
+                                // same composite instance.
+                                "token_system": { "type": "keyword" },
+                                "token_code": { "type": "keyword" },
+                                "string": {
+                                    "type": "keyword",
+                                    "fields": {
+                                        "lowercase": {
+                                            "type": "keyword",
+                                            "normalizer": "lowercase_normalizer"
+                                        }
+                                    }
+                                },
+                                "number": { "type": "double" },
+                                "quantity_value": { "type": "double" },
+                                "quantity_unit": { "type": "keyword" },
+                                "quantity_system": { "type": "keyword" },
+                                "date": {
+                                    "type": "date",
+                                    "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd"
+                                },
+                                "reference": { "type": "keyword" },
+                                "uri": { "type": "keyword" }
                             }
                         }
                     }
