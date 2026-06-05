@@ -75,6 +75,41 @@ impl CompositeHandler {
         SqlFragment::with_params(format!("({})", conditions_sql), all_params)
     }
 
+    /// Builds one bare predicate fragment per component.
+    ///
+    /// Returns `None` if the value's part count does not match the component
+    /// count, or if any component value cannot be built. The caller wraps each
+    /// fragment in a `MAX(CASE WHEN ... THEN 1 ELSE 0 END) = 1` aggregate and
+    /// groups by `(resource_id, composite_group)` so that all components are
+    /// matched within the same composite instance.
+    pub fn build_component_fragments(
+        value: &SearchValue,
+        components: &[CompositeSearchComponent],
+        param_offset: usize,
+    ) -> Option<Vec<SqlFragment>> {
+        let parts: Vec<&str> = value.value.split('$').collect();
+        if parts.len() != components.len() || components.is_empty() {
+            return None;
+        }
+
+        let mut fragments = Vec::new();
+        let mut current_offset = param_offset;
+        for (part, component) in parts.iter().zip(components.iter()) {
+            let component_value = Self::parse_component_value(part);
+            let fragment = Self::build_component_sql_from_type(
+                &component_value,
+                component.param_type,
+                current_offset,
+            );
+            if fragment.sql == "1 = 0" {
+                return None;
+            }
+            current_offset += fragment.params.len();
+            fragments.push(fragment);
+        }
+        Some(fragments)
+    }
+
     /// Builds SQL for a composite parameter value.
     ///
     /// The value should be in the format "value1$value2$..." where each value

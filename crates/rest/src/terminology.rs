@@ -165,6 +165,70 @@ impl TerminologyServiceClient {
 
         extract_expansion_codes(&value)
     }
+
+    /// Expands the concepts subsumed by (or subsuming) a code, via an inline
+    /// ValueSet `$expand` with a filter.
+    ///
+    /// - `op = "is-a"` returns the code and all its descendants (for `:below`).
+    /// - `op = "generalizes"` returns the code and all its ancestors (for `:above`).
+    ///
+    /// Both include the code itself, per FHIR subsumption-testing semantics.
+    pub async fn expand_subsumption(
+        &self,
+        system: &str,
+        code: &str,
+        op: &str,
+    ) -> Result<Vec<ExpandedCode>, TerminologyError> {
+        let endpoint = format!("{}/ValueSet/$expand", self.base_url);
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "valueSet",
+                "resource": {
+                    "resourceType": "ValueSet",
+                    "compose": {
+                        "include": [{
+                            "system": system,
+                            "filter": [{ "property": "concept", "op": op, "value": code }]
+                        }]
+                    }
+                }
+            }]
+        });
+
+        let response = self
+            .client
+            .post(&endpoint)
+            .json(&body)
+            .header("Content-Type", "application/fhir+json")
+            .header("Accept", "application/fhir+json")
+            .send()
+            .await
+            .map_err(|e| TerminologyError::Network(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(512)
+                .collect::<String>();
+            return Err(TerminologyError::ServerError {
+                status,
+                body: body_text,
+            });
+        }
+
+        let value: Value = response
+            .json()
+            .await
+            .map_err(|e| TerminologyError::Parse(e.to_string()))?;
+
+        extract_expansion_codes(&value)
+    }
 }
 
 /// Extracts `ExpandedCode` entries from a FHIR ValueSet resource with expansion.

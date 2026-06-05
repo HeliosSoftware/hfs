@@ -559,7 +559,7 @@ impl SyncManager {
         let _max_lag = self.config.max_read_lag_ms;
         let status = self.status.read();
 
-        for (_, backend_status) in status.iter() {
+        for backend_status in status.values() {
             // Consider unhealthy if pending events exceed threshold
             // (rough approximation of lag)
             if backend_status.pending_events > self.config.batch_size * 10 {

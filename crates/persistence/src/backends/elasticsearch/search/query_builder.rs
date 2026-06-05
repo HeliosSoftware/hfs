@@ -336,6 +336,7 @@ mod tests {
         let query = SearchQuery::new("Patient").with_sort(SortDirective {
             parameter: "_id".to_string(),
             direction: SortDirection::Ascending,
+            param_type: None,
         });
 
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());

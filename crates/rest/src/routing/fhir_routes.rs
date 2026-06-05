@@ -12,6 +12,7 @@ use axum::{
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
+    SystemHistoryProvider, TypeHistoryProvider,
 };
 use tower::ServiceExt;
 
@@ -58,6 +59,8 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
         + helios_persistence::core::ExportDataProvider
         + helios_persistence::core::PatientExportProvider
@@ -80,6 +83,8 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
         + helios_persistence::core::ExportDataProvider
         + helios_persistence::core::PatientExportProvider
@@ -101,6 +106,8 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
         + helios_persistence::core::ExportDataProvider
         + helios_persistence::core::PatientExportProvider
@@ -127,6 +134,8 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
         + helios_persistence::core::ExportDataProvider
         + helios_persistence::core::PatientExportProvider
@@ -192,6 +201,8 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
         + helios_persistence::core::ExportDataProvider
         + helios_persistence::core::PatientExportProvider

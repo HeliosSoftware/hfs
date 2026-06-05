@@ -9,21 +9,30 @@
 //! - Delete instance history: `DELETE [base]/[type]/[id]/_history`
 //! - Delete specific version: `DELETE [base]/[type]/[id]/_history/[vid]`
 //!
-//! Note: Full history functionality requires a backend that implements
-//! the InstanceHistoryProvider, TypeHistoryProvider, and SystemHistoryProvider traits.
+//! History reads are backed by the `InstanceHistoryProvider`,
+//! `TypeHistoryProvider`, and `SystemHistoryProvider` traits, which every
+//! first-class storage backend (SQLite, PostgreSQL, MongoDB, S3) implements
+//! and which `CompositeStorage` delegates to its primary.
 
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{InstanceHistoryProvider, ResourceStorage};
+use chrono::{DateTime, Utc};
+use helios_persistence::core::{
+    HistoryEntry, HistoryMethod, HistoryParams, InstanceHistoryProvider, ResourceStorage,
+    SystemHistoryProvider, TypeHistoryProvider,
+};
 use serde::Deserialize;
+use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::TenantExtractor;
+use crate::middleware::content_type::negotiate_format;
+use crate::responses::format_resource_response;
 use crate::state::AppState;
 
 /// Query parameters for history requests.
@@ -41,6 +50,98 @@ pub struct HistoryQuery {
     #[serde(rename = "_at")]
     #[allow(dead_code)]
     pub at: Option<String>,
+
+    /// Response format override (`json` / `xml` / full media types).
+    #[serde(rename = "_format")]
+    pub format: Option<String>,
+}
+
+/// Builds [`HistoryParams`] from the request query, applying the configured
+/// page-size limits and parsing the optional `_since` instant.
+fn build_history_params<S>(params: &HistoryQuery, state: &AppState<S>) -> RestResult<HistoryParams>
+where
+    S: ResourceStorage + Send + Sync,
+{
+    let count = params
+        .count
+        .unwrap_or(state.default_page_size())
+        .min(state.max_page_size()) as u32;
+
+    let mut history_params = HistoryParams::new().count(count).include_deleted(true);
+
+    if let Some(since_str) = params.since.as_deref() {
+        let since = DateTime::parse_from_rfc3339(since_str)
+            .map_err(|_| RestError::BadRequest {
+                message: format!("Invalid _since value (expected an RFC3339 instant): {since_str}"),
+            })?
+            .with_timezone(&Utc);
+        history_params = history_params.since(since);
+    }
+
+    Ok(history_params)
+}
+
+/// Converts a single [`HistoryEntry`] into a FHIR history Bundle entry.
+fn history_entry_to_json(entry: &HistoryEntry, base_url: &str) -> Value {
+    let resource = &entry.resource;
+    let resource_type = resource.resource_type();
+    let id = resource.id();
+    let version_id = resource.version_id();
+
+    let (method, request_url, status) = match entry.method {
+        HistoryMethod::Post => ("POST", resource_type.to_string(), "201"),
+        HistoryMethod::Put => ("PUT", format!("{resource_type}/{id}"), "200"),
+        HistoryMethod::Patch => ("PATCH", format!("{resource_type}/{id}"), "200"),
+        HistoryMethod::Delete => ("DELETE", format!("{resource_type}/{id}"), "204"),
+    };
+
+    let mut bundle_entry = json!({
+        "fullUrl": format!("{base_url}/{resource_type}/{id}"),
+        "request": {
+            "method": method,
+            "url": request_url,
+        },
+        "response": {
+            "status": status,
+            "etag": format!("W/\"{version_id}\""),
+            "lastModified": entry.timestamp.to_rfc3339(),
+        },
+    });
+
+    // Deleted versions carry no resource body.
+    if entry.method != HistoryMethod::Delete {
+        bundle_entry["resource"] = resource.content().clone();
+    }
+
+    bundle_entry
+}
+
+/// Builds a FHIR `history` Bundle from a page of history entries.
+fn build_history_bundle(entries: &[HistoryEntry], base_url: &str, total: u64) -> Value {
+    let bundle_entries: Vec<Value> = entries
+        .iter()
+        .map(|entry| history_entry_to_json(entry, base_url))
+        .collect();
+
+    json!({
+        "resourceType": "Bundle",
+        "type": "history",
+        "total": total,
+        "entry": bundle_entries,
+    })
+}
+
+/// Serializes a history Bundle in the negotiated response format.
+fn respond_with_bundle(
+    bundle: &Value,
+    req_headers: &HeaderMap,
+    format_param: Option<&str>,
+) -> Response {
+    let negotiated = negotiate_format(req_headers, format_param);
+    match format_resource_response(StatusCode::OK, HeaderMap::new(), bundle, negotiated.format) {
+        Ok(response) => response,
+        Err(response) => response,
+    }
 }
 
 /// Handler for instance history.
@@ -58,15 +159,17 @@ pub struct HistoryQuery {
 ///
 /// # Response
 ///
-/// Returns a Bundle of type "history".
+/// - `200 OK` - Returns a Bundle of type "history"
+/// - `404 Not Found` - The resource has no history (never existed)
 pub async fn history_instance_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
+    req_headers: HeaderMap,
     Query(params): Query<HistoryQuery>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + InstanceHistoryProvider + Send + Sync,
 {
     debug!(
         resource_type = %resource_type,
@@ -75,14 +178,33 @@ where
         "Processing instance history request"
     );
 
-    let _count = params.count.unwrap_or(state.default_page_size());
-    let _since = params.since.as_deref();
+    let history_params = build_history_params(&params, &state)?;
 
-    // For now, return a not implemented error
-    // Full implementation requires InstanceHistoryProvider
-    Err(RestError::NotImplemented {
-        feature: format!("Instance history for {}/{}", resource_type, id),
-    })
+    let page = state
+        .storage()
+        .history_instance(tenant.context(), &resource_type, &id, &history_params)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Instance history failed");
+            RestError::from(e)
+        })?;
+
+    // An existing resource always has at least its current version in history,
+    // so an empty *unfiltered* page means the resource never existed. When a
+    // `_since` filter is in play, an empty page just means nothing matched, so
+    // we return an empty history Bundle rather than a 404.
+    if page.items.is_empty() && params.since.is_none() {
+        return Err(RestError::NotFound { resource_type, id });
+    }
+
+    let total = page.page_info.total.unwrap_or(page.items.len() as u64);
+    let bundle = build_history_bundle(&page.items, state.base_url(), total);
+
+    Ok(respond_with_bundle(
+        &bundle,
+        &req_headers,
+        params.format.as_deref(),
+    ))
 }
 
 /// Handler for type history.
@@ -96,10 +218,11 @@ pub async fn history_type_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
+    req_headers: HeaderMap,
     Query(params): Query<HistoryQuery>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + TypeHistoryProvider + Send + Sync,
 {
     debug!(
         resource_type = %resource_type,
@@ -107,14 +230,25 @@ where
         "Processing type history request"
     );
 
-    let _count = params.count.unwrap_or(state.default_page_size());
-    let _since = params.since.as_deref();
+    let history_params = build_history_params(&params, &state)?;
 
-    // For now, return a not implemented error
-    // Full implementation requires TypeHistoryProvider
-    Err(RestError::NotImplemented {
-        feature: format!("Type history for {}", resource_type),
-    })
+    let page = state
+        .storage()
+        .history_type(tenant.context(), &resource_type, &history_params)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Type history failed");
+            RestError::from(e)
+        })?;
+
+    let total = page.page_info.total.unwrap_or(page.items.len() as u64);
+    let bundle = build_history_bundle(&page.items, state.base_url(), total);
+
+    Ok(respond_with_bundle(
+        &bundle,
+        &req_headers,
+        params.format.as_deref(),
+    ))
 }
 
 /// Handler for system history.
@@ -127,24 +261,36 @@ where
 pub async fn history_system_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
+    req_headers: HeaderMap,
     Query(params): Query<HistoryQuery>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SystemHistoryProvider + Send + Sync,
 {
     debug!(
         tenant = %tenant.tenant_id(),
         "Processing system history request"
     );
 
-    let _count = params.count.unwrap_or(state.default_page_size());
-    let _since = params.since.as_deref();
+    let history_params = build_history_params(&params, &state)?;
 
-    // For now, return a not implemented error
-    // Full implementation requires SystemHistoryProvider
-    Err(RestError::NotImplemented {
-        feature: "System history".to_string(),
-    })
+    let page = state
+        .storage()
+        .history_system(tenant.context(), &history_params)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "System history failed");
+            RestError::from(e)
+        })?;
+
+    let total = page.page_info.total.unwrap_or(page.items.len() as u64);
+    let bundle = build_history_bundle(&page.items, state.base_url(), total);
+
+    Ok(respond_with_bundle(
+        &bundle,
+        &req_headers,
+        params.format.as_deref(),
+    ))
 }
 
 /// Handler for deleting instance history.
@@ -256,77 +402,4 @@ where
     );
 
     Ok(StatusCode::NO_CONTENT.into_response())
-}
-
-/// Builds a history Bundle from history entries.
-#[allow(dead_code)]
-fn build_history_bundle(entries: &[HistoryBundleEntry], base_url: &str) -> serde_json::Value {
-    let bundle_entries: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|e| {
-            let mut entry = serde_json::json!({
-                "fullUrl": format!(
-                    "{}/{}/{}/_history/{}",
-                    base_url, e.resource_type, e.id, e.version_id
-                ),
-            });
-
-            // Add request info based on method
-            let request = match e.method.as_str() {
-                "POST" => serde_json::json!({
-                    "method": "POST",
-                    "url": e.resource_type
-                }),
-                "PUT" => serde_json::json!({
-                    "method": "PUT",
-                    "url": format!("{}/{}", e.resource_type, e.id)
-                }),
-                "DELETE" => serde_json::json!({
-                    "method": "DELETE",
-                    "url": format!("{}/{}", e.resource_type, e.id)
-                }),
-                _ => serde_json::json!({
-                    "method": e.method,
-                    "url": format!("{}/{}", e.resource_type, e.id)
-                }),
-            };
-            entry["request"] = request;
-
-            // Add response info
-            let response = serde_json::json!({
-                "status": if e.method == "DELETE" { "204" } else { "200" },
-                "etag": format!("W/\"{}\"", e.version_id),
-                "lastModified": e.timestamp
-            });
-            entry["response"] = response;
-
-            // Add resource if not deleted
-            if e.method != "DELETE" {
-                if let Some(content) = &e.content {
-                    entry["resource"] = content.clone();
-                }
-            }
-
-            entry
-        })
-        .collect();
-
-    serde_json::json!({
-        "resourceType": "Bundle",
-        "type": "history",
-        "total": bundle_entries.len(),
-        "entry": bundle_entries
-    })
-}
-
-/// A history bundle entry for internal use.
-#[derive(Debug)]
-#[allow(dead_code)]
-struct HistoryBundleEntry {
-    resource_type: String,
-    id: String,
-    version_id: String,
-    method: String,
-    timestamp: String,
-    content: Option<serde_json::Value>,
 }

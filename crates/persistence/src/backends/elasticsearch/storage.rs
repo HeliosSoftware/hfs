@@ -106,6 +106,50 @@ fn collect_strings(value: &Value, parts: &mut Vec<String>) {
 }
 
 /// Builds an ES document from a FHIR resource and its extracted search values.
+/// Appends a value to a JSON array field on `obj`, creating the array if needed.
+fn push_array_field(obj: &mut Value, key: &str, val: Value) {
+    match obj.get_mut(key) {
+        Some(Value::Array(arr)) => arr.push(val),
+        _ => obj[key] = json!([val]),
+    }
+}
+
+/// Merges one composite component's value into the composite instance object,
+/// placing it in the array field matching the component's value type. All
+/// components of one instance share a nested object, so a single nested query
+/// can require every component to match within the same instance.
+fn merge_composite_component(entry: &mut Value, value: &IndexValue) {
+    match value {
+        IndexValue::String(s) => push_array_field(entry, "string", json!(s)),
+        IndexValue::Token { system, code, .. } => {
+            push_array_field(entry, "token_code", json!(code));
+            if let Some(sys) = system {
+                push_array_field(entry, "token_system", json!(sys));
+            }
+        }
+        IndexValue::Number(n) => push_array_field(entry, "number", json!(n)),
+        IndexValue::Quantity {
+            value,
+            unit,
+            system,
+            ..
+        } => {
+            push_array_field(entry, "quantity_value", json!(value));
+            if let Some(u) = unit {
+                push_array_field(entry, "quantity_unit", json!(u));
+            }
+            if let Some(s) = system {
+                push_array_field(entry, "quantity_system", json!(s));
+            }
+        }
+        IndexValue::Date { value, .. } => push_array_field(entry, "date", json!(value)),
+        IndexValue::Reference { reference, .. } => {
+            push_array_field(entry, "reference", json!(reference))
+        }
+        IndexValue::Uri(u) => push_array_field(entry, "uri", json!(u)),
+    }
+}
+
 pub(crate) fn build_es_document(
     tenant_id: &str,
     resource_type: &str,
@@ -124,9 +168,22 @@ pub(crate) fn build_es_document(
     let mut quantity_params: Vec<Value> = Vec::new();
     let mut reference_params: Vec<Value> = Vec::new();
     let mut uri_params: Vec<Value> = Vec::new();
-    let mut composite_params: Vec<Value> = Vec::new();
+    // Composite instances, keyed by (param name, group) so all components of one
+    // instance land in a single nested object with inline (array) component values.
+    let mut composite_groups: std::collections::BTreeMap<(String, u32), Value> =
+        std::collections::BTreeMap::new();
 
     for ev in extracted_values {
+        // Composite component values are accumulated into their instance object
+        // rather than the per-type arrays.
+        if let Some(group) = ev.composite_group {
+            let entry = composite_groups
+                .entry((ev.param_name.clone(), group))
+                .or_insert_with(|| json!({ "name": ev.param_name, "group_id": group }));
+            merge_composite_component(entry, &ev.value);
+            continue;
+        }
+
         match &ev.value {
             IndexValue::String(s) => {
                 string_params.push(json!({
@@ -217,14 +274,9 @@ pub(crate) fn build_es_document(
                 }));
             }
         }
-
-        if let Some(group) = ev.composite_group {
-            composite_params.push(json!({
-                "name": ev.param_name,
-                "group_id": group,
-            }));
-        }
     }
+
+    let composite_params: Vec<Value> = composite_groups.into_values().collect();
 
     json!({
         "resource_type": resource_type,

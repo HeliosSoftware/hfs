@@ -49,7 +49,8 @@ use crate::core::{
     ConditionalUpdateResult, ExportDataProvider, ExportRequest, GroupExportProvider,
     IncludeProvider, InstanceHistoryProvider, NdjsonBatch, PatchFormat, PatientExportProvider,
     ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, StorageCapabilities,
-    TerminologySearchProvider, TextSearchProvider, VersionedStorage,
+    SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider, TypeHistoryProvider,
+    VersionedStorage,
 };
 use crate::error::{BackendError, StorageError, StorageResult, TransactionError};
 use crate::tenant::TenantContext;
@@ -77,6 +78,9 @@ pub type DynVersionedStorage = Arc<dyn VersionedStorage + Send + Sync>;
 
 /// A dynamically typed instance history provider.
 pub type DynInstanceHistoryProvider = Arc<dyn InstanceHistoryProvider + Send + Sync>;
+
+/// A dynamically typed system history provider (also covers Type + Instance).
+pub type DynSystemHistoryProvider = Arc<dyn SystemHistoryProvider + Send + Sync>;
 
 /// A dynamically typed bundle provider.
 pub type DynBundleProvider = Arc<dyn BundleProvider + Send + Sync>;
@@ -129,6 +133,9 @@ pub struct CompositeStorage {
 
     /// Primary as InstanceHistoryProvider (if supported).
     history_provider: Option<DynInstanceHistoryProvider>,
+
+    /// Primary as SystemHistoryProvider (if supported) — covers Type + System history.
+    system_history_provider: Option<DynSystemHistoryProvider>,
 
     /// Primary as BundleProvider (if supported).
     bundle_provider: Option<DynBundleProvider>,
@@ -291,6 +298,7 @@ impl CompositeStorage {
             conditional_storage: None,
             versioned_storage: None,
             history_provider: None,
+            system_history_provider: None,
             bundle_provider: None,
             export_provider: None,
         })
@@ -343,6 +351,8 @@ impl CompositeStorage {
             + ConditionalStorage
             + VersionedStorage
             + InstanceHistoryProvider
+            + TypeHistoryProvider
+            + SystemHistoryProvider
             + BundleProvider
             + GroupExportProvider
             + Send
@@ -352,6 +362,7 @@ impl CompositeStorage {
         self.conditional_storage = Some(primary.clone() as DynConditionalStorage);
         self.versioned_storage = Some(primary.clone() as DynVersionedStorage);
         self.history_provider = Some(primary.clone() as DynInstanceHistoryProvider);
+        self.system_history_provider = Some(primary.clone() as DynSystemHistoryProvider);
         self.bundle_provider = Some(primary.clone() as DynBundleProvider);
         self.export_provider = Some(primary as DynGroupExportProvider);
         self
@@ -1401,6 +1412,69 @@ impl InstanceHistoryProvider for CompositeStorage {
         provider
             .history_instance_count(tenant, resource_type, id)
             .await
+    }
+}
+
+#[async_trait]
+impl TypeHistoryProvider for CompositeStorage {
+    async fn history_type(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        params: &HistoryParams,
+    ) -> StorageResult<crate::core::HistoryPage> {
+        let provider = self.system_history_provider.as_ref().ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "TypeHistoryProvider".to_string(),
+            })
+        })?;
+
+        provider.history_type(tenant, resource_type, params).await
+    }
+
+    async fn history_type_count(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        let provider = self.system_history_provider.as_ref().ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "TypeHistoryProvider".to_string(),
+            })
+        })?;
+
+        provider.history_type_count(tenant, resource_type).await
+    }
+}
+
+#[async_trait]
+impl SystemHistoryProvider for CompositeStorage {
+    async fn history_system(
+        &self,
+        tenant: &TenantContext,
+        params: &HistoryParams,
+    ) -> StorageResult<crate::core::HistoryPage> {
+        let provider = self.system_history_provider.as_ref().ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "SystemHistoryProvider".to_string(),
+            })
+        })?;
+
+        provider.history_system(tenant, params).await
+    }
+
+    async fn history_system_count(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        let provider = self.system_history_provider.as_ref().ok_or_else(|| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "SystemHistoryProvider".to_string(),
+            })
+        })?;
+
+        provider.history_system_count(tenant).await
     }
 }
 

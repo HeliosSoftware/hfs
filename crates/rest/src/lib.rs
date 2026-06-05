@@ -163,6 +163,7 @@ use std::sync::Arc;
 use axum::{Router, extract::DefaultBodyLimit};
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
+    SystemHistoryProvider, TypeHistoryProvider,
 };
 use tower::ServiceBuilder;
 use tower_http::{
@@ -196,6 +197,8 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
         + helios_persistence::core::ExportDataProvider
         + helios_persistence::core::PatientExportProvider
@@ -237,6 +240,8 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
         + helios_persistence::core::ExportDataProvider
         + helios_persistence::core::PatientExportProvider
@@ -284,6 +289,8 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
         + helios_persistence::core::ExportDataProvider
         + helios_persistence::core::PatientExportProvider
@@ -317,6 +324,8 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
         + helios_persistence::core::ExportDataProvider
         + helios_persistence::core::PatientExportProvider
@@ -350,6 +359,8 @@ where
         + ConditionalStorage
         + SearchProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
         + helios_persistence::core::ExportDataProvider
         + helios_persistence::core::PatientExportProvider
