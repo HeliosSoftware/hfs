@@ -12,6 +12,47 @@ use super::parameter_handlers::{
     TokenHandler, UriHandler,
 };
 
+/// How a sort key's value is typed for cursor (keyset) binding and comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortValueKind {
+    /// Text column (string/token/uri/reference/`_id`).
+    Text,
+    /// Floating-point column (number/quantity).
+    Number,
+    /// Timestamp column, stored as RFC3339 text (`_lastUpdated`, date).
+    Timestamp,
+}
+
+/// A single keyset sort key: the SQL value expression, its direction, and the
+/// value kind used to bind/read the cursor boundary value.
+#[derive(Debug, Clone)]
+pub struct KeysetKey {
+    /// SQL expression yielding the sort value (column or correlated subquery).
+    pub expr: String,
+    /// Sort direction.
+    pub direction: crate::types::SortDirection,
+    /// How the value is typed for binding/reading.
+    pub kind: SortValueKind,
+}
+
+/// Determines the value kind for a sort parameter.
+pub(crate) fn sort_value_kind(
+    parameter: &str,
+    param_type: Option<SearchParamType>,
+) -> SortValueKind {
+    match parameter {
+        "_id" => SortValueKind::Text,
+        "_lastUpdated" => SortValueKind::Timestamp,
+        _ => match param_type {
+            Some(SearchParamType::Number) | Some(SearchParamType::Quantity) => {
+                SortValueKind::Number
+            }
+            Some(SearchParamType::Date) => SortValueKind::Timestamp,
+            _ => SortValueKind::Text,
+        },
+    }
+}
+
 /// Maps a search-parameter type to the `search_index` value column used when
 /// sorting on that parameter. Returns `None` for types that are not sortable via
 /// a single value column (composite, special).
@@ -619,6 +660,28 @@ impl QueryBuilder {
         }
 
         format!("ORDER BY {}", clauses.join(", "))
+    }
+
+    /// Returns the keyset sort key for cursor pagination, or `None` when the
+    /// query has multiple sort fields (those are returned as a single page
+    /// rather than paged with a possibly-inconsistent keyset).
+    pub fn primary_keyset_key(&self, query: &SearchQuery) -> Option<KeysetKey> {
+        match query.sort.len() {
+            0 => Some(KeysetKey {
+                expr: "last_updated".to_string(),
+                direction: crate::types::SortDirection::Descending,
+                kind: SortValueKind::Timestamp,
+            }),
+            1 => {
+                let directive = &query.sort[0];
+                Some(KeysetKey {
+                    expr: self.sort_expression(directive),
+                    direction: directive.direction,
+                    kind: sort_value_kind(&directive.parameter, directive.param_type),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Builds the ORDER BY expression for a single sort directive.
