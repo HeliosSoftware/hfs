@@ -742,7 +742,10 @@ impl PostgresBackend {
     fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "missing"],
-            SearchParamType::Token => vec!["not", "text", "in", "not-in", "of-type", "missing"],
+            // `not-in` is intentionally omitted: it returns 501 (negated
+            // value-set filtering is unimplemented), so it must not be
+            // advertised as supported.
+            SearchParamType::Token => vec!["not", "text", "in", "of-type", "missing"],
             SearchParamType::Reference => vec!["identifier", "missing"],
             SearchParamType::Date => vec!["missing"],
             SearchParamType::Number => vec!["missing"],

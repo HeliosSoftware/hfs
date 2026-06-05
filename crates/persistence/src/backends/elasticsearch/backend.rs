@@ -553,15 +553,10 @@ impl ElasticsearchBackend {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
             SearchParamType::Token => {
-                vec![
-                    "not",
-                    "text",
-                    "text-advanced",
-                    "in",
-                    "not-in",
-                    "of-type",
-                    "missing",
-                ]
+                // `not-in` is intentionally omitted: it returns 501 (negated
+                // value-set filtering is unimplemented), so it must not be
+                // advertised as supported.
+                vec!["not", "text", "text-advanced", "in", "of-type", "missing"]
             }
             SearchParamType::Reference => vec!["identifier", "missing"],
             SearchParamType::Date => vec!["missing"],
