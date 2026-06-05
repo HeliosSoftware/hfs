@@ -354,7 +354,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [:text](https://build.fhir.org/search.html#modifiers) (full-text)           | ✓      | ◐          | ○       | ✗         | ✗     | ✓             | ✗   |
 | [:not](https://build.fhir.org/search.html#modifiers)                        | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ○   |
 | [:missing](https://build.fhir.org/search.html#modifiers)                    | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ○   |
-| [:above / :below](https://build.fhir.org/search.html#modifiers)             | ◐      | ◐          | †○      | ✗         | ○     | ◐             | ✗   |
+| [:above / :below](https://build.fhir.org/search.html#modifiers)             | ◐      | ◐          | ◐       | ✗         | ○     | ◐             | ✗   |
 | [:in / :not-in](https://build.fhir.org/search.html#modifiers)               | ✗      | †○         | †○      | ✗         | ○     | †○            | ✗   |
 | [:of-type](https://build.fhir.org/search.html#modifiers)                    | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
 | [:text-advanced](https://build.fhir.org/search.html#modifiertextadvanced)   | ✓      | †○         | †○      | ✗         | ✗     | ✓             | ✗   |
@@ -387,9 +387,12 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   paging preserves the sort order. A multi-field `_sort` returns a single page (no cursor). MongoDB
   sorts by `_id`/`_lastUpdated` only and cannot combine a custom sort with cursor pagination, hence
   ◐ for multiple fields.
-- **`:above` / `:below`** — SQLite, PostgreSQL, and Elasticsearch implement hierarchical URI
-  prefix matching (no external service needed), shown as ◐. Token/code hierarchy expansion
-  (which needs a terminology server) is not implemented natively.
+- **`:above` / `:below`** — two mechanisms (◐ = both, conditional on context): (1) hierarchical
+  **URI** prefix matching is native to SQLite, PostgreSQL, and Elasticsearch (no external service);
+  (2) **token/code** hierarchy (e.g. `code:below=http://snomed.info/sct|73211009`) is resolved at
+  the REST layer — the code and its descendants (`:below`, `is-a`) or ancestors (`:above`,
+  `generalizes`) are expanded via the terminology server's `$expand`, then matched as a plain token
+  OR list on any backend. Token hierarchy therefore requires `HFS_TERMINOLOGY_SERVER`.
 - **`:in` / `:not-in`** — handled at the REST layer: `:in` is expanded against a terminology
   server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
   backend resolves these natively.

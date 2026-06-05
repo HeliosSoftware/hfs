@@ -71,7 +71,7 @@ before evaluation. This fixed both composite value components and plain `value[x
 | `:of-type` | ✓ | ✓ | ✗ | ✓ |
 | `:text-advanced` | ✓ | ✗ | ✗ | ✓ |
 | `:above` / `:below` (URI) | ✓ | ✓ | ✗ | ✓ |
-| `:above` / `:below` (token hierarchy) | ✗ | ✗ | ✗ | ✗ |
+| `:above` / `:below` (token hierarchy) | †³ | †³ | †³ | †³ |
 | `:in` / `:not-in` | †² | †² | †² | †² |
 | `:identifier` (reference) | ✓ | ✗ | ✗ | ✓ |
 | `:[type]` (reference) | ✓ | ✗ | ✓ | ✓ |
@@ -82,6 +82,10 @@ before evaluation. This fixed both composite value components and plain `value[x
 ² `:in` is expanded by the REST layer against a configured terminology server before the query
   reaches the backend (`crates/rest/src/handlers/search.rs`); `:not-in` returns `501 Not
   Implemented`. No backend resolves either modifier natively.
+³ Token `:above`/`:below` (`code:below=system|code`) is resolved at the REST layer: the code and its
+  descendants (`is-a`, for `:below`) or ancestors (`generalizes`, for `:above`) are expanded via the
+  terminology server's `$expand`, then matched as a plain token OR list. Works on every backend when
+  `HFS_TERMINOLOGY_SERVER` is configured; URI `:above`/`:below` is separate and native (above).
 
 The REST layer parses **all** of these modifiers (`crates/rest/src/extractors/search_query_builder.rs`)
 regardless of backend; unsupported ones either no-op, error, or (for some ES/Mongo cases) return no
@@ -172,8 +176,10 @@ Ordered roughly by impact:
    correctly via the keyset cursor on SQLite/PG. A multi-field `_sort` currently returns a single
    page (no cursor); extending the keyset to a multi-key tuple is the remaining work. MongoDB still
    sorts by `_id`/`_lastUpdated` only.
-2. **Terminology-dependent modifiers** — token `:above`/`:below`, `:in`, `:not-in` need a
-   terminology server. `:in` is partially handled via REST-side expansion; the rest are not native.
+2. **Terminology-dependent modifiers** — `:in` and token `:above`/`:below` are resolved at the REST
+   layer via terminology `$expand` (functional when `HFS_TERMINOLOGY_SERVER` is set; no native
+   in-backend resolution). `:not-in` still returns `501` — negated value-set filtering is the
+   remaining gap.
    URI `:above`/`:below` (hierarchical prefix, no service needed) *is* implemented on SQLite/PG/ES.
 3. **PostgreSQL modifier gaps** — only the `:text-advanced` modifier remains unimplemented relative
    to SQLite (`:exact`, `:contains`, `:not`, `:missing`, `:of-type`, URI `:above`/`:below`, and
