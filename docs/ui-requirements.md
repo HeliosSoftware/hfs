@@ -263,20 +263,54 @@ Search is central for P1, P3, and P4. Two entry points: the **Search Builder**
 ### 7.1 Parameter types
 Support building and editing all FHIR search parameter types the server
 advertises per type: **token, string, reference, date, quantity, number, uri,
-composite, special** (`_id`, `_lastUpdated`, `_tag`, `_profile`, `_security`,
-`_text`, `_content`).
+composite, special**. The common cross-resource parameters `hfs` indexes are
+`_id` (token), `_lastUpdated` (date), `_tag` (token), `_security` (token), and
+`_profile` (uri). The type-`special` full-text parameters `_text` and `_content`
+are advertised in the CapabilityStatement but require a text-search backend
+(e.g. Elasticsearch) and otherwise return `501`. Note that `hfs` does **not**
+implement `_filter`, `_query`, `_list`, `_source`, `_contained` /
+`_containedType`, or `_score`; the builder MUST NOT offer these.
 
 ### 7.2 Modifiers
-Expose type-appropriate modifiers in the builder:
-- String: `:exact`, `:contains`
-- Token/uri: `:text`, `:above`, `:below`, `:in`, `:not-in`, `:ofType`,
-  `:code`/`:code-only`, and (R6) `:code-text`, `:text-advanced`
-- Reference: `:identifier`, `:[Type]` (target type)
-- All: `:missing`, `:not`
-- `_include` modifier: `:iterate`
-- Note: `:in`/`:not-in`/`:above`/`:below` may **delegate to a terminology
-  server** — see §11. The UI SHOULD indicate when a terminology server is
-  required and whether one is configured.
+Expose type-appropriate modifiers in the builder. The list below reflects what
+`hfs` actually parses and validates (`SearchModifier` in
+`crates/persistence/src/types/search_params.rs`):
+- **All types:** `:missing`, `:not`
+- **String:** `:exact`, `:contains`
+- **Token:** `:text`, `:ofType`, `:code`, `:code-text`, `:text-advanced`
+  (`:text-advanced` also applies to string)
+- **Token or uri:** `:above`, `:below`, `:in`
+- **Reference:** `:identifier`, `:[Type]` (target type)
+- `_include` / `_revinclude` modifier: `:iterate`
+- **Not supported — do not offer (or clearly mark unavailable):** `:not-in` is
+  parsed but **rejected at runtime with `501 Not Implemented`** (negated
+  value-set filtering is unimplemented on the SQLite backend). There is **no**
+  `:code-only` modifier — only `:code`.
+- Note: the text/terminology modifiers depend on a backend that can satisfy
+  them. `:text`, `:text-advanced`, and `:code-text` require a text-search backend
+  (e.g. Elasticsearch); `:in`, `:above`, and `:below` **delegate to a terminology
+  server** (see §11). Without the required backend the server returns `501`. The
+  UI SHOULD indicate when such a backend/terminology server is required and
+  whether one is configured.
+- **Deviations from the FHIR spec** (the groupings above reflect `hfs`, not the
+  published spec — the UI should follow `hfs`, but designers should be aware):
+  - `:not` — `hfs` accepts it on **all** parameter types; the spec restricts it
+    to **token**.
+  - `:contains` — `hfs` accepts it on **string** only; the spec also allows it
+    on **reference** and **uri**.
+  - `:text` — `hfs` accepts it on **token** only; the spec also allows it on
+    **string** and **reference**.
+  - `:text-advanced` — `hfs` accepts it on **string** or **token**; the spec
+    defines it for **reference** and **token**.
+  - `:code-text` — `hfs` accepts it on **token** only; the spec defines it for
+    **reference** and **token**.
+  - `:above` / `:below` — `hfs` accepts them on **token** or **uri**; the spec
+    also allows **reference**.
+  - `:in` / `:not-in` — the spec restricts these to **token**; `hfs` parses them
+    on **token** or **uri** (and `:not-in` returns `501` regardless).
+  - `:ofType` — `hfs` spells the modifier `:ofType` (the R4 spelling); current
+    build.fhir.org spells it `:of-type`. The UI MUST emit `:ofType` against
+    `hfs`.
 
 ### 7.3 Prefixes
 For number/date/quantity values, expose prefixes: `eq, ne, gt, lt, ge, le, sa,
@@ -297,10 +331,12 @@ eb, ap`.
   MUST visually distinguish match vs include entries.
 
 ### 7.6 Chained & reverse-chained search
-- Forward chaining (`subject.name=...`) and `_has` reverse chaining are
-  supported with backend-dependent completeness. The builder SHOULD allow
-  composing chains and `_has`, while signaling these may not be fully supported
-  on the active backend.
+- Forward chaining (`subject.name=...`) and `_has` reverse chaining (including
+  nested `_has`) are supported. `hfs` resolves them application-side via
+  iterative searches (rewritten as an `_id` filter), so they work uniformly
+  across all backends rather than being backend-dependent. Chain depth is capped
+  (default 4 forward / 4 reverse, configurable). The builder SHOULD allow
+  composing chains and `_has`, and MAY surface the depth limit.
 
 ### 7.7 Results presentation
 - **P1:** raw Bundle (JSON/XML), with each entry's `fullUrl`, `search.mode`,
@@ -608,7 +644,9 @@ delivers, but may scaffold UI ahead of them (clearly marked).
   and vread return proper Bundles/resources, including on the `-elasticsearch`
   composite variants. R6 Trial Use delete-history / delete-version also work
   (§8.2).
-- **Chained / `_has` search:** backend-dependent completeness (§7.6).
+- **Chained / `_has` search:** resolved application-side (uniform across
+  backends) with a configurable depth cap (default 4); nested `_has` supported
+  (§7.6).
 - **No `$validate`, `$everything`, `$graph`, `$document` operations.**
 - **No GraphQL endpoint.**
 - **No user-defined custom `$operations` registration.**
