@@ -96,11 +96,12 @@ pub fn build_search_query(
         }
     }
 
-    // Store raw parameters for debugging
-    query.raw_params = params
-        .iter()
-        .map(|(k, v)| (k.clone(), vec![v.clone()]))
-        .collect();
+    // Store raw parameters for debugging, grouping repeated keys.
+    let mut raw_params: HashMap<String, Vec<String>> = HashMap::new();
+    for (k, v) in params.iter() {
+        raw_params.entry(k.clone()).or_default().push(v.clone());
+    }
+    query.raw_params = raw_params;
 
     // Process search parameters (non-system params)
     for (name, value) in params.search_params() {
@@ -129,6 +130,19 @@ pub fn build_search_query_from_map(
     registry: &SearchParameterRegistry,
 ) -> Result<SearchQuery, RestError> {
     let search_params = SearchParams::from_map(params.clone());
+    build_search_query(resource_type, &search_params, registry)
+}
+
+/// Builds a SearchQuery from ordered key/value pairs.
+///
+/// Unlike [`build_search_query_from_map`], this preserves repeated parameters
+/// (FHIR AND semantics) and multiple `_include`/`_revinclude`/`_has` directives.
+pub fn build_search_query_from_pairs(
+    resource_type: &str,
+    pairs: &[(String, String)],
+    registry: &SearchParameterRegistry,
+) -> Result<SearchQuery, RestError> {
+    let search_params = SearchParams::from_pairs(pairs.to_vec());
     build_search_query(resource_type, &search_params, registry)
 }
 
@@ -746,6 +760,81 @@ mod tests {
         assert_eq!(query.includes.len(), 1);
         assert_eq!(query.includes[0].source_type, "Observation");
         assert_eq!(query.includes[0].search_param, "patient");
+    }
+
+    #[test]
+    fn test_repeated_search_params_are_anded() {
+        // `?name=Smith&name=Jones` -> two ANDed parameters, both preserved.
+        let pairs = vec![
+            ("name".to_string(), "Smith".to_string()),
+            ("name".to_string(), "Jones".to_string()),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Patient", &sp, &test_registry()).unwrap();
+
+        let name_values: Vec<&str> = query
+            .parameters
+            .iter()
+            .filter(|p| p.name == "name")
+            .flat_map(|p| p.values.iter().map(|v| v.value.as_str()))
+            .collect();
+        assert_eq!(query.parameters.len(), 2, "both name params preserved");
+        assert!(name_values.contains(&"Smith"));
+        assert!(name_values.contains(&"Jones"));
+    }
+
+    #[test]
+    fn test_repeated_include_directives_preserved() {
+        // `?_include=A&_include=B` -> two include directives (was last-wins before).
+        let pairs = vec![
+            ("_include".to_string(), "Observation:subject".to_string()),
+            ("_include".to_string(), "Observation:encounter".to_string()),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Observation", &sp, &test_registry()).unwrap();
+
+        assert_eq!(query.includes.len(), 2);
+        let params: Vec<&str> = query
+            .includes
+            .iter()
+            .map(|d| d.search_param.as_str())
+            .collect();
+        assert!(params.contains(&"subject"));
+        assert!(params.contains(&"encounter"));
+    }
+
+    #[test]
+    fn test_repeated_has_chains_preserved() {
+        // Repeated `_has` -> multiple reverse chains, all preserved.
+        let pairs = vec![
+            (
+                "_has:Observation:patient:code".to_string(),
+                "1234-5".to_string(),
+            ),
+            (
+                "_has:Observation:patient:status".to_string(),
+                "final".to_string(),
+            ),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Patient", &sp, &test_registry()).unwrap();
+
+        assert_eq!(query.reverse_chains.len(), 2);
+    }
+
+    #[test]
+    fn test_mixed_comma_and_repeat_include() {
+        // Comma and repeat combine: `?_include=A,B&_include=C` -> three directives.
+        let pairs = vec![
+            (
+                "_include".to_string(),
+                "Observation:subject,Observation:encounter".to_string(),
+            ),
+            ("_include".to_string(), "Observation:patient".to_string()),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Observation", &sp, &test_registry()).unwrap();
+        assert_eq!(query.includes.len(), 3);
     }
 
     #[test]
