@@ -255,14 +255,8 @@ impl SearchProvider for PostgresBackend {
 
         let resources: Vec<StoredResource> = parsed.into_iter().map(|(r, _)| r).collect();
 
-        // Populate Bundle.total only when the client asked for it
-        // (`_total=accurate|estimate`); otherwise skip the extra COUNT query.
-        let total = if query.wants_total() {
-            Some(self.search_count(tenant, query).await?)
-        } else {
-            None
-        };
-
+        // `total` was computed up-front (before acquiring `client`) to avoid
+        // holding a non-Send guard across the count query's await.
         let page_info = PageInfo {
             next_cursor,
             previous_cursor,
