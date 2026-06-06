@@ -21,8 +21,9 @@ use helios_fhir::FhirVersion;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::query_pairs::{last_value, parse_query_pairs};
-use crate::extractors::{SearchParams, TenantExtractor, build_search_query};
+use crate::extractors::{SearchParams, TenantExtractor, build_search_query, unknown_search_params};
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
+use crate::middleware::prefer::PreferHeader;
 use crate::responses::format_resource_response;
 use crate::responses::subsetting::{SummaryMode, apply_elements, apply_summary};
 use crate::state::AppState;
@@ -59,8 +60,17 @@ where
 
     let format_param = last_value(&pairs, "_format");
     let negotiated = negotiate_format(&req_headers, format_param.as_deref());
+    let strict = PreferHeader::from_headers(&req_headers).is_strict();
 
-    execute_search(&state, tenant, &resource_type, pairs, negotiated.format).await
+    execute_search(
+        &state,
+        tenant,
+        &resource_type,
+        pairs,
+        negotiated.format,
+        strict,
+    )
+    .await
 }
 
 /// Handler for POST search.
@@ -92,8 +102,17 @@ where
     );
 
     let negotiated = negotiate_format(&req_headers, None);
+    let strict = PreferHeader::from_headers(&req_headers).is_strict();
 
-    execute_search(&state, tenant, &resource_type, pairs, negotiated.format).await
+    execute_search(
+        &state,
+        tenant,
+        &resource_type,
+        pairs,
+        negotiated.format,
+        strict,
+    )
+    .await
 }
 
 /// Handler for system-level search.
@@ -132,6 +151,7 @@ async fn execute_search<S>(
     resource_type: &str,
     pairs: Vec<(String, String)>,
     format: FhirFormat,
+    strict: bool,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
@@ -163,6 +183,20 @@ where
     // Send by default, which would make this async fn !Send.
     let mut query = {
         let registry = state.storage().search_param_registry().read();
+        // Under `Prefer: handling=strict`, reject unknown search parameters
+        // (the lenient default ignores them).
+        if strict {
+            let unknown = unknown_search_params(resource_type, &search_params, &registry);
+            if !unknown.is_empty() {
+                return Err(RestError::InvalidParameter {
+                    param: unknown.join(", "),
+                    message: format!(
+                        "unknown search parameter(s) rejected under Prefer: handling=strict: {}",
+                        unknown.join(", ")
+                    ),
+                });
+            }
+        }
         build_search_query(resource_type, &search_params, &registry)?
     };
 
@@ -257,6 +291,9 @@ where
 
     // Build a search query (resource type doesn't matter much for system search).
     // Scope the registry read guard tightly so it doesn't span any await.
+    // Note: strict unknown-parameter validation is intentionally skipped for
+    // system search — parameters there are interpreted across many resource
+    // types, so a per-"Resource" registry check would false-positive.
     let mut query = {
         let registry = state.storage().search_param_registry().read();
         build_search_query("Resource", &search_params, &registry)?

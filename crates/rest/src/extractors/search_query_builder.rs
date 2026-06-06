@@ -133,6 +133,46 @@ pub fn build_search_query_from_map(
     build_search_query(resource_type, &search_params, registry)
 }
 
+/// Returns the names of search parameters that are not recognized for the given
+/// resource type (used to enforce `Prefer: handling=strict`).
+///
+/// A parameter is "unknown" when its base name (after stripping any modifier and
+/// chain) is not registered for `resource_type` or for `Resource`, and is not a
+/// global parameter (those start with `_`, e.g. `_id`, `_text`, `_has`). Under
+/// lenient handling the server ignores such parameters; under strict handling
+/// the caller turns this list into a `400`.
+pub fn unknown_search_params(
+    resource_type: &str,
+    params: &SearchParams,
+    registry: &SearchParameterRegistry,
+) -> Vec<String> {
+    let mut unknown = Vec::new();
+    for (name, _) in params.search_params() {
+        // Reverse chaining is validated when parsed; skip here.
+        if name == "_has" || name.starts_with("_has:") {
+            continue;
+        }
+        // Strip modifier (`name:exact`, `subject:Patient`) then chain (`a.b`).
+        let base = name
+            .split(':')
+            .next()
+            .unwrap_or(name)
+            .split('.')
+            .next()
+            .unwrap_or(name);
+        // Global/result parameters (`_id`, `_text`, `_type`, …) are always allowed.
+        if base.starts_with('_') {
+            continue;
+        }
+        let known = registry.get_param(resource_type, base).is_some()
+            || registry.get_param("Resource", base).is_some();
+        if !known {
+            unknown.push(name.clone());
+        }
+    }
+    unknown
+}
+
 /// Builds a SearchQuery from ordered key/value pairs.
 ///
 /// Unlike [`build_search_query_from_map`], this preserves repeated parameters

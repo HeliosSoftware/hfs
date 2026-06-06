@@ -372,6 +372,41 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_unknown_param_lenient_ignored_strict_rejected() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Lenient (default): unknown parameter is ignored, search succeeds.
+        let lenient = server
+            .get("/Patient?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+
+        // Strict: unknown parameter is rejected with 400.
+        let strict = server
+            .get("/Patient?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(strict.status_code(), StatusCode::BAD_REQUEST);
+
+        // A known parameter is accepted even under strict handling.
+        let ok = server
+            .get("/Patient?name=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        ok.assert_status_ok();
+    }
+
+    #[tokio::test]
     async fn test_search_by_id() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
