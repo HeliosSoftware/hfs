@@ -15,13 +15,93 @@ use crate::types::{
 /// Returns the implicit precision of a decimal search value from its string form
 /// (e.g. `"100"` → 1.0, `"100.0"` → 0.1), used to build `eq` ranges.
 fn quantity_implicit_precision(num_str: &str) -> f64 {
-    match num_str.find('.') {
-        Some(dot) => {
-            let decimals = num_str.len() - dot - 1;
-            10f64.powi(-(decimals as i32))
+    crate::search::implicit_precision(num_str)
+}
+
+/// Builds the numeric comparison SQL for `col` against the implicit-precision
+/// range `[lo, hi)` per the FHIR prefix semantics, advancing `next` and
+/// returning the SQL plus its bound params. `num` is used only for the `ap`
+/// margin.
+fn numeric_predicate(
+    col: &str,
+    prefix: SearchPrefix,
+    num: f64,
+    lo: f64,
+    hi: f64,
+    next: &mut usize,
+) -> (String, Vec<SqlParam>) {
+    match prefix {
+        SearchPrefix::Eq => {
+            *next += 1;
+            let a = *next;
+            *next += 1;
+            (
+                format!("{col} >= ${a} AND {col} < ${next}"),
+                vec![SqlParam::Float(lo), SqlParam::Float(hi)],
+            )
         }
-        None => 1.0,
+        SearchPrefix::Ne => {
+            *next += 1;
+            let a = *next;
+            *next += 1;
+            (
+                format!("({col} < ${a} OR {col} >= ${next})"),
+                vec![SqlParam::Float(lo), SqlParam::Float(hi)],
+            )
+        }
+        SearchPrefix::Gt | SearchPrefix::Sa => {
+            *next += 1;
+            (format!("{col} >= ${next}"), vec![SqlParam::Float(hi)])
+        }
+        SearchPrefix::Lt | SearchPrefix::Eb => {
+            *next += 1;
+            (format!("{col} < ${next}"), vec![SqlParam::Float(lo)])
+        }
+        SearchPrefix::Ge => {
+            *next += 1;
+            (format!("{col} >= ${next}"), vec![SqlParam::Float(lo)])
+        }
+        SearchPrefix::Le => {
+            *next += 1;
+            (format!("{col} < ${next}"), vec![SqlParam::Float(hi)])
+        }
+        SearchPrefix::Ap => {
+            let margin = (num.abs() * 0.1).max(0.0001);
+            *next += 1;
+            let a = *next;
+            *next += 1;
+            (
+                format!("{col} BETWEEN ${a} AND ${next}"),
+                vec![SqlParam::Float(num - margin), SqlParam::Float(num + margin)],
+            )
+        }
     }
+}
+
+/// Returns the `[start, end)` timestamp range for a date search value at its
+/// inherent precision (year/month/day). Full-precision instants return a
+/// degenerate range (`start == end`).
+fn date_precision_range(value: &str) -> (DateTime<Utc>, DateTime<Utc>) {
+    use chrono::Datelike;
+    let start = PostgresQueryBuilder::parse_date_value(value);
+    let end = if value.contains('T') {
+        start
+    } else if value.len() == 4 {
+        start.with_year(start.year() + 1).unwrap_or(start)
+    } else if value.len() == 7 {
+        let (y, m) = (start.year(), start.month());
+        let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        start
+            .with_month(1)
+            .and_then(|d| d.with_year(ny))
+            .and_then(|d| d.with_month(nm))
+            .unwrap_or(start)
+    } else if value.len() == 10 {
+        start + chrono::Duration::days(1)
+    } else {
+        start
+    };
+    (start, end)
 }
 
 /// How a sort key's value is typed for cursor (keyset) binding and comparison.
@@ -762,17 +842,76 @@ impl PostgresQueryBuilder {
 
     fn build_date_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
+        let mut next = offset;
 
-        for (i, value) in param.values.iter().enumerate() {
-            let param_num = offset + i + 1;
-            let op = Self::prefix_to_operator(&value.prefix);
-            let timestamp = Self::parse_date_value(&value.value);
+        for value in &param.values {
+            let (start, end) = date_precision_range(&value.value);
+            // Comparators match against the precision-range boundaries; a
+            // full-precision instant (degenerate range) falls back to scalar.
+            let degenerate = start == end;
+            let (sql, params): (String, Vec<SqlParam>) = match value.prefix {
+                SearchPrefix::Eq if !degenerate => {
+                    next += 1;
+                    let a = next;
+                    next += 1;
+                    (
+                        format!("value_date >= ${a} AND value_date < ${next}"),
+                        vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
+                    )
+                }
+                SearchPrefix::Ne if !degenerate => {
+                    next += 1;
+                    let a = next;
+                    next += 1;
+                    (
+                        format!("(value_date < ${a} OR value_date >= ${next})"),
+                        vec![SqlParam::Timestamp(start), SqlParam::Timestamp(end)],
+                    )
+                }
+                SearchPrefix::Gt | SearchPrefix::Sa if !degenerate => {
+                    next += 1;
+                    (
+                        format!("value_date >= ${next}"),
+                        vec![SqlParam::Timestamp(end)],
+                    )
+                }
+                SearchPrefix::Lt | SearchPrefix::Eb if !degenerate => {
+                    next += 1;
+                    (
+                        format!("value_date < ${next}"),
+                        vec![SqlParam::Timestamp(start)],
+                    )
+                }
+                SearchPrefix::Ge if !degenerate => {
+                    next += 1;
+                    (
+                        format!("value_date >= ${next}"),
+                        vec![SqlParam::Timestamp(start)],
+                    )
+                }
+                SearchPrefix::Le if !degenerate => {
+                    next += 1;
+                    (
+                        format!("value_date < ${next}"),
+                        vec![SqlParam::Timestamp(end)],
+                    )
+                }
+                // Degenerate (full-precision) or unhandled: scalar comparison.
+                other => {
+                    let op = Self::prefix_to_operator(&other);
+                    next += 1;
+                    (
+                        format!("value_date {op} ${next}"),
+                        vec![SqlParam::Timestamp(start)],
+                    )
+                }
+            };
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_date {} ${})",
-                    param.name, op, param_num
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
+                    param.name, sql
                 ),
-                vec![SqlParam::Timestamp(timestamp)],
+                params,
             ));
         }
 
@@ -788,19 +927,23 @@ impl PostgresQueryBuilder {
 
     fn build_number_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
+        let mut next = offset;
 
-        for (i, value) in param.values.iter().enumerate() {
-            let param_num = offset + i + 1;
-            let op = Self::prefix_to_operator(&value.prefix);
-            if let Ok(num) = value.value.parse::<f64>() {
-                conditions.push(SqlFragment::with_params(
-                    format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_number {} ${})",
-                        param.name, op, param_num
-                    ),
-                    vec![SqlParam::Float(num)],
-                ));
-            }
+        for value in &param.values {
+            let num: f64 = match value.value.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let (lo, hi) = crate::search::implicit_range(num, &value.value);
+            let (sql, params) =
+                numeric_predicate("value_number", value.prefix, num, lo, hi, &mut next);
+            conditions.push(SqlFragment::with_params(
+                format!(
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
+                    param.name, sql
+                ),
+                params,
+            ));
         }
 
         if conditions.is_empty() {
@@ -827,7 +970,6 @@ impl PostgresQueryBuilder {
                 None => continue,
             };
             let num_str = parts[0];
-            let op = Self::prefix_to_operator(&value.prefix);
             let (system, code) = match parts.len() {
                 3 => (
                     (!parts[1].is_empty()).then_some(parts[1]),
@@ -837,12 +979,11 @@ impl PostgresQueryBuilder {
                 _ => (None, None),
             };
 
-            let mut params: Vec<SqlParam> = Vec::new();
-
-            // Raw branch: exact value comparison + the stored unit/system.
-            next += 1;
-            params.push(SqlParam::Float(num));
-            let mut raw = format!("value_quantity_value {op} ${next}");
+            // Raw branch: range-boundary value comparison + the stored unit/system.
+            let (lo, hi) = crate::search::implicit_range(num, num_str);
+            let (raw_num, mut params) =
+                numeric_predicate("value_quantity_value", value.prefix, num, lo, hi, &mut next);
+            let mut raw = raw_num;
             if let Some(c) = code {
                 next += 1;
                 params.push(SqlParam::text(c));
@@ -866,26 +1007,30 @@ impl PostgresQueryBuilder {
                             helios_fhirpath::ucum::canonicalize_quantity(x, c).map(|(v, _)| v)
                         };
                         let col = "value_quantity_canonical_value";
+                        // Comparators match canonicalized range boundaries:
+                        // gt/sa → ≥ canon(hi), lt/eb → < canon(lo),
+                        // ge → ≥ canon(lo), le → < canon(hi).
+                        let half = quantity_implicit_precision(num_str) / 2.0;
                         let range: Option<String> = match value.prefix {
-                            SearchPrefix::Gt | SearchPrefix::Sa => canon(num).map(|b| {
-                                next += 1;
-                                params.push(SqlParam::Float(b));
-                                format!("{col} > ${next}")
-                            }),
-                            SearchPrefix::Lt | SearchPrefix::Eb => canon(num).map(|b| {
-                                next += 1;
-                                params.push(SqlParam::Float(b));
-                                format!("{col} < ${next}")
-                            }),
-                            SearchPrefix::Ge => canon(num).map(|b| {
+                            SearchPrefix::Gt | SearchPrefix::Sa => canon(num + half).map(|b| {
                                 next += 1;
                                 params.push(SqlParam::Float(b));
                                 format!("{col} >= ${next}")
                             }),
-                            SearchPrefix::Le => canon(num).map(|b| {
+                            SearchPrefix::Lt | SearchPrefix::Eb => canon(num - half).map(|b| {
                                 next += 1;
                                 params.push(SqlParam::Float(b));
-                                format!("{col} <= ${next}")
+                                format!("{col} < ${next}")
+                            }),
+                            SearchPrefix::Ge => canon(num - half).map(|b| {
+                                next += 1;
+                                params.push(SqlParam::Float(b));
+                                format!("{col} >= ${next}")
+                            }),
+                            SearchPrefix::Le => canon(num + half).map(|b| {
+                                next += 1;
+                                params.push(SqlParam::Float(b));
+                                format!("{col} < ${next}")
                             }),
                             SearchPrefix::Ap => {
                                 let margin = (num.abs() * 0.1).max(0.0001);

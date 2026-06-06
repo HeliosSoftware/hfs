@@ -77,11 +77,15 @@ fn range_condition(
     num_str: &str,
     map: impl Fn(f64) -> Option<f64>,
 ) -> Option<Value> {
+    // Half-precision of the search value (e.g. "100" → 0.5); comparators match
+    // the implicit range boundaries: gt/sa → ≥ hi, lt/eb → < lo, ge → ≥ lo,
+    // le → < hi (per the FHIR spec).
+    let p = super::number::implicit_range(num_str);
     let range = match prefix {
-        SearchPrefix::Gt | SearchPrefix::Sa => json!({ "gt": map(num)? }),
-        SearchPrefix::Lt | SearchPrefix::Eb => json!({ "lt": map(num)? }),
-        SearchPrefix::Ge => json!({ "gte": map(num)? }),
-        SearchPrefix::Le => json!({ "lte": map(num)? }),
+        SearchPrefix::Gt | SearchPrefix::Sa => json!({ "gte": map(num + p)? }),
+        SearchPrefix::Lt | SearchPrefix::Eb => json!({ "lt": map(num - p)? }),
+        SearchPrefix::Ge => json!({ "gte": map(num - p)? }),
+        SearchPrefix::Le => json!({ "lt": map(num + p)? }),
         SearchPrefix::Ap => {
             let margin = (num * 0.1).abs().max(0.5);
             let (lo, hi) = ordered(map(num - margin)?, map(num + margin)?);
@@ -89,8 +93,7 @@ fn range_condition(
         }
         // Eq, Ne (treated as Eq range here), and any default
         _ => {
-            let precision = super::number::implicit_range(num_str);
-            let (lo, hi) = ordered(map(num - precision)?, map(num + precision)?);
+            let (lo, hi) = ordered(map(num - p)?, map(num + p)?);
             json!({ "gte": lo, "lt": hi })
         }
     };

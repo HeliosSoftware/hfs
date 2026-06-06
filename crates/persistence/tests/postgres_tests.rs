@@ -463,7 +463,8 @@ mod query_builder_tests {
         assert!(result.is_some());
         let fragment = result.unwrap();
         assert!(fragment.sql.contains("value_date"));
-        assert!(fragment.sql.contains("> $"));
+        // gt now matches strictly after the day → value_date >= (next day).
+        assert!(fragment.sql.contains(">= $"));
     }
 
     #[test]
@@ -482,8 +483,10 @@ mod query_builder_tests {
         let fragment = result.unwrap();
         assert!(fragment.sql.contains("value_number"));
         assert!(fragment.sql.contains(">= $"));
+        // ge matches from the low boundary of the implicit range: "0.5" has
+        // precision 0.1, so the bound is 0.5 - 0.05 = 0.45.
         match &fragment.params[0] {
-            SqlParam::Float(f) => assert!((f - 0.5).abs() < f64::EPSILON),
+            SqlParam::Float(f) => assert!((f - 0.45).abs() < 1e-9),
             _ => panic!("Expected Float param"),
         }
     }

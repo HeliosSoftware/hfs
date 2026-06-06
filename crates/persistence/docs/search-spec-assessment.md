@@ -238,9 +238,11 @@ Ordered roughly by impact:
    (`Patient/1/_history/2` ⇄ `Patient/1`, via `strip_reference_version`, on SQLite/PG/ES). The
    remaining gap is canonical `url|version` hierarchy for reference `:above`/`:below`; `:identifier`
    also assumes a `Type/id` reference shape.
-10. **Ordered-value boundary semantics** — `gt`/`lt` (and SQLite `sa`/`eb`) compare against the
-    scalar value rather than the precision-range boundary the spec defines; `eq`/`ne`/`ap` already
-    use implicit-precision ranges. Edge-case-only.
+10. **Ordered-value boundary semantics** — **done** (SQLite, Postgres, Elasticsearch). Comparator
+    prefixes now match against the search value's implicit-precision range boundaries per spec:
+    `ge → x≥lo`, `le → x<hi`, `gt`/`sa → x≥hi`, `lt`/`eb → x<lo` (range `[lo, hi)`), for number,
+    quantity, and date (date falls back to scalar for full-precision instants). Postgres also gained
+    implicit-precision `eq`/`ne` ranges for number/date (was exact). Shared `search::range` helper.
 
 **Recently landed (REST layer).** Repeated query parameters are now preserved as FHIR AND semantics
 (previously collapsed to last-wins by `HashMap` extraction); `Prefer: handling=strict` rejects
