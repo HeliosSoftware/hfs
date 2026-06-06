@@ -131,16 +131,21 @@ impl QuantityHandler {
                 };
                 (sql, vec![SqlParam::float(lo), SqlParam::float(hi)], unit)
             }
+            // Comparators match against the canonicalized range boundaries:
+            // gt/sa → ≥ canon(hi), lt/eb → < canon(lo), ge → ≥ canon(lo),
+            // le → < canon(hi).
             SearchPrefix::Gt | SearchPrefix::Sa => {
-                let (b, unit) = canon(value, code)?;
+                let hi = value + Self::get_implicit_precision(value) / 2.0;
+                let (b, unit) = canon(hi, code)?;
                 (
-                    format!("{col} > ?{}", param_num),
+                    format!("{col} >= ?{}", param_num),
                     vec![SqlParam::float(b)],
                     unit,
                 )
             }
             SearchPrefix::Lt | SearchPrefix::Eb => {
-                let (b, unit) = canon(value, code)?;
+                let lo = value - Self::get_implicit_precision(value) / 2.0;
+                let (b, unit) = canon(lo, code)?;
                 (
                     format!("{col} < ?{}", param_num),
                     vec![SqlParam::float(b)],
@@ -148,7 +153,8 @@ impl QuantityHandler {
                 )
             }
             SearchPrefix::Ge => {
-                let (b, unit) = canon(value, code)?;
+                let lo = value - Self::get_implicit_precision(value) / 2.0;
+                let (b, unit) = canon(lo, code)?;
                 (
                     format!("{col} >= ?{}", param_num),
                     vec![SqlParam::float(b)],
@@ -156,9 +162,10 @@ impl QuantityHandler {
                 )
             }
             SearchPrefix::Le => {
-                let (b, unit) = canon(value, code)?;
+                let hi = value + Self::get_implicit_precision(value) / 2.0;
+                let (b, unit) = canon(hi, code)?;
                 (
-                    format!("{col} <= ?{}", param_num),
+                    format!("{col} < ?{}", param_num),
                     vec![SqlParam::float(b)],
                     unit,
                 )
@@ -217,22 +224,36 @@ impl QuantityHandler {
                     vec![SqlParam::float(value - half), SqlParam::float(value + half)],
                 )
             }
-            SearchPrefix::Gt | SearchPrefix::Sa => SqlFragment::with_params(
-                format!("{column} > ?{}", param_num),
-                vec![SqlParam::float(value)],
-            ),
-            SearchPrefix::Lt | SearchPrefix::Eb => SqlFragment::with_params(
-                format!("{column} < ?{}", param_num),
-                vec![SqlParam::float(value)],
-            ),
-            SearchPrefix::Ge => SqlFragment::with_params(
-                format!("{column} >= ?{}", param_num),
-                vec![SqlParam::float(value)],
-            ),
-            SearchPrefix::Le => SqlFragment::with_params(
-                format!("{column} <= ?{}", param_num),
-                vec![SqlParam::float(value)],
-            ),
+            // Comparators match against the implicit-precision range boundaries
+            // (FHIR spec): gt/sa → ≥ hi, lt/eb → < lo, ge → ≥ lo, le → < hi.
+            SearchPrefix::Gt | SearchPrefix::Sa => {
+                let hi = value + Self::get_implicit_precision(value) / 2.0;
+                SqlFragment::with_params(
+                    format!("{column} >= ?{}", param_num),
+                    vec![SqlParam::float(hi)],
+                )
+            }
+            SearchPrefix::Lt | SearchPrefix::Eb => {
+                let lo = value - Self::get_implicit_precision(value) / 2.0;
+                SqlFragment::with_params(
+                    format!("{column} < ?{}", param_num),
+                    vec![SqlParam::float(lo)],
+                )
+            }
+            SearchPrefix::Ge => {
+                let lo = value - Self::get_implicit_precision(value) / 2.0;
+                SqlFragment::with_params(
+                    format!("{column} >= ?{}", param_num),
+                    vec![SqlParam::float(lo)],
+                )
+            }
+            SearchPrefix::Le => {
+                let hi = value + Self::get_implicit_precision(value) / 2.0;
+                SqlFragment::with_params(
+                    format!("{column} < ?{}", param_num),
+                    vec![SqlParam::float(hi)],
+                )
+            }
             SearchPrefix::Ap => {
                 // +/- 10%
                 let margin = (value.abs() * 0.1).max(0.0001);
@@ -293,10 +314,11 @@ mod tests {
 
     #[test]
     fn test_quantity_gt() {
+        // gt matches strictly above the search range → `value_quantity_value >= hi`.
         let value = SearchValue::new(SearchPrefix::Gt, "5.4|mg");
         let frag = QuantityHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains("> ?1"));
+        assert!(frag.sql.contains(">= ?1"));
     }
 
     #[test]

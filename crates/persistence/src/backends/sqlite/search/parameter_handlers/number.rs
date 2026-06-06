@@ -23,17 +23,29 @@ impl NumberHandler {
             }
         };
 
+        // Implicit-precision range [lo, hi) of the search value; comparators
+        // match against its boundaries per the FHIR spec.
+        let (lo, hi) = crate::search::implicit_range(num_value, &value.value);
+
         match value.prefix {
             SearchPrefix::Eq => Self::build_equals(num_value, param_num),
             SearchPrefix::Ne => Self::build_not_equals(num_value, param_num),
-            SearchPrefix::Gt => Self::build_greater_than(num_value, param_num),
-            SearchPrefix::Lt => Self::build_less_than(num_value, param_num),
-            SearchPrefix::Ge => Self::build_greater_equal(num_value, param_num),
-            SearchPrefix::Le => Self::build_less_equal(num_value, param_num),
-            SearchPrefix::Sa => Self::build_greater_than(num_value, param_num), // Same as gt for numbers
-            SearchPrefix::Eb => Self::build_less_than(num_value, param_num), // Same as lt for numbers
+            // gt / sa: strictly above the whole search range.
+            SearchPrefix::Gt | SearchPrefix::Sa => Self::cmp(">=", hi, param_num),
+            // lt / eb: strictly below the whole search range.
+            SearchPrefix::Lt | SearchPrefix::Eb => Self::cmp("<", lo, param_num),
+            SearchPrefix::Ge => Self::cmp(">=", lo, param_num),
+            SearchPrefix::Le => Self::cmp("<", hi, param_num),
             SearchPrefix::Ap => Self::build_approximately(num_value, param_num),
         }
+    }
+
+    /// Builds a single-boundary numeric comparison `value_number {op} ?`.
+    fn cmp(op: &str, bound: f64, param_num: usize) -> SqlFragment {
+        SqlFragment::with_params(
+            format!("value_number {} ?{}", op, param_num),
+            vec![SqlParam::float(bound)],
+        )
     }
 
     /// Equality - exact match with implicit precision.
@@ -72,38 +84,6 @@ impl NumberHandler {
                 SqlParam::float(value - half_precision),
                 SqlParam::float(value + half_precision),
             ],
-        )
-    }
-
-    /// Greater than.
-    fn build_greater_than(value: f64, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_number > ?{}", param_num),
-            vec![SqlParam::float(value)],
-        )
-    }
-
-    /// Less than.
-    fn build_less_than(value: f64, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_number < ?{}", param_num),
-            vec![SqlParam::float(value)],
-        )
-    }
-
-    /// Greater than or equal.
-    fn build_greater_equal(value: f64, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_number >= ?{}", param_num),
-            vec![SqlParam::float(value)],
-        )
-    }
-
-    /// Less than or equal.
-    fn build_less_equal(value: f64, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_number <= ?{}", param_num),
-            vec![SqlParam::float(value)],
         )
     }
 
@@ -151,19 +131,29 @@ mod tests {
 
     #[test]
     fn test_number_gt() {
+        // gt matches strictly above the search range; for "100" that is >= 100.5.
         let value = SearchValue::new(SearchPrefix::Gt, "100");
         let frag = NumberHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains("> ?1"));
+        assert!(frag.sql.contains(">= ?1"));
         assert_eq!(frag.params.len(), 1);
+        match &frag.params[0] {
+            SqlParam::Float(f) => assert!((*f - 100.5).abs() < 1e-9),
+            _ => panic!("expected float bound"),
+        }
     }
 
     #[test]
     fn test_number_le() {
+        // le matches up to the top of the search range; for "100" that is < 100.5.
         let value = SearchValue::new(SearchPrefix::Le, "100");
         let frag = NumberHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains("<= ?1"));
+        assert!(frag.sql.contains("< ?1"));
+        match &frag.params[0] {
+            SqlParam::Float(f) => assert!((*f - 100.5).abs() < 1e-9),
+            _ => panic!("expected float bound"),
+        }
     }
 
     #[test]

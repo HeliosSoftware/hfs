@@ -407,6 +407,52 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_date_prefix_uses_precision_boundaries() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "born-2020", "birthDate": "2020-06-15" }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        let ids = |body: &Value| -> Vec<String> {
+            get_bundle_entries(body)
+                .iter()
+                .filter_map(|e| e["resource"]["id"].as_str().map(String::from))
+                .collect()
+        };
+        let search = |q: &'static str| {
+            let server = &server;
+            async move {
+                server
+                    .get(&format!("/Patient?birthdate={}", q))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .await
+                    .json::<Value>()
+            }
+        };
+
+        // gt2020 means "after all of 2020" → 2020-06-15 must NOT match.
+        assert!(
+            !ids(&search("gt2020").await).contains(&"born-2020".to_string()),
+            "gt2020 should not match a date within 2020"
+        );
+        // gt2019 → after 2019 → matches.
+        assert!(
+            ids(&search("gt2019").await).contains(&"born-2020".to_string()),
+            "gt2019 should match 2020-06-15"
+        );
+        // lt2021 → before 2021 → matches; lt2020 → before 2020 → no match.
+        assert!(ids(&search("lt2021").await).contains(&"born-2020".to_string()));
+        assert!(!ids(&search("lt2020").await).contains(&"born-2020".to_string()));
+    }
+
+    #[tokio::test]
     async fn test_string_search_is_accent_insensitive() {
         let (server, backend) = create_test_server().await;
         let tenant = test_tenant();
