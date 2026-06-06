@@ -158,7 +158,10 @@ impl SearchModifier {
             "in" => Some(SearchModifier::In),
             "not-in" => Some(SearchModifier::NotIn),
             "identifier" => Some(SearchModifier::Identifier),
-            "oftype" => Some(SearchModifier::OfType),
+            // The FHIR spec (build.fhir.org) spells this `of-type`, and that is
+            // the form advertised in our CapabilityStatement; accept the legacy
+            // camelCase `ofType` too so older clients keep working.
+            "of-type" | "oftype" => Some(SearchModifier::OfType),
             "code" => Some(SearchModifier::CodeOnly),
             "iterate" => Some(SearchModifier::Iterate),
             "text-advanced" => Some(SearchModifier::TextAdvanced),
@@ -177,18 +180,35 @@ impl SearchModifier {
     /// Returns true if this modifier is valid for the given parameter type.
     pub fn is_valid_for(&self, param_type: SearchParamType) -> bool {
         match self {
-            SearchModifier::Exact | SearchModifier::Contains => {
-                param_type == SearchParamType::String
-            }
-            SearchModifier::Text => param_type == SearchParamType::Token,
-            SearchModifier::Not => true,     // Valid for all types
+            SearchModifier::Exact => param_type == SearchParamType::String,
+            // Per the FHIR spec, `:contains` is defined for string, reference,
+            // and uri parameters (substring/containment match).
+            SearchModifier::Contains => matches!(
+                param_type,
+                SearchParamType::String | SearchParamType::Reference | SearchParamType::Uri
+            ),
+            // Per the FHIR spec, `:text` is defined for string, token, and
+            // reference params (reference matches the indexed `Reference.display`).
+            SearchModifier::Text => matches!(
+                param_type,
+                SearchParamType::String | SearchParamType::Token | SearchParamType::Reference
+            ),
+            // Per the FHIR spec, `:not` is only defined for token parameters
+            // (it negates a code match). Our backends only implement it for
+            // token; advertising it for other types was incorrect.
+            SearchModifier::Not => param_type == SearchParamType::Token,
             SearchModifier::Missing => true, // Valid for all types
-            SearchModifier::Above
-            | SearchModifier::Below
-            | SearchModifier::In
-            | SearchModifier::NotIn => {
-                param_type == SearchParamType::Token || param_type == SearchParamType::Uri
-            }
+            // `:above`/`:below` are defined for token, uri, and reference.
+            // Reference uses URL/path-prefix hierarchy (canonical `|version`
+            // comparison is not implemented).
+            SearchModifier::Above | SearchModifier::Below => matches!(
+                param_type,
+                SearchParamType::Token | SearchParamType::Uri | SearchParamType::Reference
+            ),
+            // `:in`/`:not-in` are token-only per the FHIR spec. (`:not-in`
+            // itself returns 501 at the REST layer — negated value-set
+            // filtering is unimplemented.)
+            SearchModifier::In | SearchModifier::NotIn => param_type == SearchParamType::Token,
             SearchModifier::Identifier | SearchModifier::Type(_) => {
                 param_type == SearchParamType::Reference
             }
@@ -198,7 +218,12 @@ impl SearchModifier {
             SearchModifier::TextAdvanced => {
                 param_type == SearchParamType::String || param_type == SearchParamType::Token
             }
-            SearchModifier::CodeText => param_type == SearchParamType::Token,
+            // `:code-text` is defined for token and reference params (matches a
+            // code's display, or the indexed `Reference.display`).
+            SearchModifier::CodeText => matches!(
+                param_type,
+                SearchParamType::Token | SearchParamType::Reference
+            ),
         }
     }
 }
@@ -807,6 +832,16 @@ mod tests {
             SearchModifier::parse("Patient"),
             Some(SearchModifier::Type("Patient".to_string()))
         );
+        // Both the spec/CapabilityStatement spelling (`of-type`) and the legacy
+        // camelCase (`ofType`) must parse to the same modifier.
+        assert_eq!(
+            SearchModifier::parse("of-type"),
+            Some(SearchModifier::OfType)
+        );
+        assert_eq!(
+            SearchModifier::parse("ofType"),
+            Some(SearchModifier::OfType)
+        );
         assert_eq!(SearchModifier::parse("unknown"), None);
     }
 
@@ -814,9 +849,32 @@ mod tests {
     fn test_search_modifier_validity() {
         assert!(SearchModifier::Exact.is_valid_for(SearchParamType::String));
         assert!(!SearchModifier::Exact.is_valid_for(SearchParamType::Token));
+        // `:contains` is valid for string, reference, and uri (FHIR spec).
+        assert!(SearchModifier::Contains.is_valid_for(SearchParamType::String));
+        assert!(SearchModifier::Contains.is_valid_for(SearchParamType::Reference));
+        assert!(SearchModifier::Contains.is_valid_for(SearchParamType::Uri));
+        assert!(!SearchModifier::Contains.is_valid_for(SearchParamType::Token));
         assert!(SearchModifier::Text.is_valid_for(SearchParamType::Token));
-        assert!(SearchModifier::Not.is_valid_for(SearchParamType::String));
+        // `:text` is valid for string and token (FHIR spec).
+        assert!(SearchModifier::Text.is_valid_for(SearchParamType::String));
+        assert!(!SearchModifier::Text.is_valid_for(SearchParamType::Uri));
+        // `:not` is token-only per the FHIR spec.
         assert!(SearchModifier::Not.is_valid_for(SearchParamType::Token));
+        assert!(!SearchModifier::Not.is_valid_for(SearchParamType::String));
+        // `:missing` is valid for every parameter type.
+        assert!(SearchModifier::Missing.is_valid_for(SearchParamType::String));
+        assert!(SearchModifier::Missing.is_valid_for(SearchParamType::Reference));
+        // `:in`/`:not-in` are token-only per the FHIR spec (not uri).
+        assert!(SearchModifier::In.is_valid_for(SearchParamType::Token));
+        assert!(!SearchModifier::In.is_valid_for(SearchParamType::Uri));
+        assert!(SearchModifier::NotIn.is_valid_for(SearchParamType::Token));
+        assert!(!SearchModifier::NotIn.is_valid_for(SearchParamType::Uri));
+        // `:above`/`:below` are valid for token, uri, and reference.
+        assert!(SearchModifier::Above.is_valid_for(SearchParamType::Uri));
+        assert!(SearchModifier::Below.is_valid_for(SearchParamType::Token));
+        assert!(SearchModifier::Above.is_valid_for(SearchParamType::Reference));
+        assert!(SearchModifier::Below.is_valid_for(SearchParamType::Reference));
+        assert!(!SearchModifier::Above.is_valid_for(SearchParamType::String));
     }
 
     #[test]

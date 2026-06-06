@@ -159,6 +159,29 @@ fn parse_search_parameter(
     // custom params. See `helios_persistence::search::resolve_param_type`.
     let param_type = resolve_param_type(registry, resource_type, base_name, &tentative_values);
 
+    // FHIR-spec modifier validation: reject a modifier that is not defined for
+    // this parameter's type (e.g. `:exact` on a token, `:contains` on a date)
+    // with a 400, rather than silently ignoring it. Scoped to registry-known,
+    // non-special params:
+    //   * unregistered custom params get a value-shape heuristic type, so
+    //     gating them could falsely reject a legitimate custom modifier;
+    //   * the `special` full-text params (`_text`, `_content`, …) carry
+    //     server-specific modifier semantics outside the typed modifier table.
+    // `is_valid_for` reflects what this server honors; combinations that are
+    // spec-valid but not yet implemented are enabled as their phase lands.
+    if let Some(m) = &modifier {
+        let registered = registry.get_param(resource_type, base_name).is_some()
+            || registry.get_param("Resource", base_name).is_some();
+        if registered && param_type != SearchParamType::Special && !m.is_valid_for(param_type) {
+            return Err(RestError::InvalidParameter {
+                param: name.to_string(),
+                message: format!(
+                    "search modifier ':{m}' is not supported for {param_type} parameter '{base_name}'"
+                ),
+            });
+        }
+    }
+
     let values: Vec<SearchValue> = if matches!(
         param_type,
         SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity

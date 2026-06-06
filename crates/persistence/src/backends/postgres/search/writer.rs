@@ -171,13 +171,14 @@ impl PostgresSearchIndexWriter {
                 reference,
                 resource_type: _,
                 resource_id: _,
+                display,
             } => {
                 client
                     .execute(
                         "INSERT INTO search_index (
                             tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_reference, composite_group
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            value_reference, composite_group, value_reference_display
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                         &[
                             &tenant_id,
                             &resource_type,
@@ -186,6 +187,7 @@ impl PostgresSearchIndexWriter {
                             &extracted.param_url.as_str(),
                             &reference.as_str(),
                             &extracted.composite_group.map(|g| g as i32),
+                            &display.as_deref(),
                         ],
                     )
                     .await

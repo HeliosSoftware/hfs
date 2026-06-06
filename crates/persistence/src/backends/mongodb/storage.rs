@@ -1325,8 +1325,13 @@ impl MongoBackend {
                     doc.insert("value_quantity_system", system.clone());
                 }
             }
-            IndexValue::Reference { reference, .. } => {
+            IndexValue::Reference {
+                reference, display, ..
+            } => {
                 doc.insert("value_reference", reference.clone());
+                if let Some(d) = display {
+                    doc.insert("value_reference_display", d.clone());
+                }
             }
             IndexValue::Uri(uri) => {
                 doc.insert("value_uri", uri.clone());
