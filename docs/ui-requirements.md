@@ -272,49 +272,59 @@ implement `_filter`, `_query`, `_list`, `_source`, `_contained` /
 `_containedType`, or `_score`; the builder MUST NOT offer these.
 
 ### 7.2 Modifiers
-Expose type-appropriate modifiers in the builder. The list below reflects what
-`hfs` actually parses and validates (`SearchModifier` in
-`crates/persistence/src/types/search_params.rs`):
-- **All types:** `:missing`, `:not`
-- **String:** `:exact`, `:contains`
-- **Token:** `:text`, `:ofType`, `:code`, `:code-text`, `:text-advanced`
-  (`:text-advanced` also applies to string)
-- **Token or uri:** `:above`, `:below`, `:in`
-- **Reference:** `:identifier`, `:[Type]` (target type)
+Expose type-appropriate modifiers in the builder. The groupings below reflect
+what `hfs` actually parses and validates (`SearchModifier::is_valid_for` in
+`crates/persistence/src/types/search_params.rs`). As of the search-modifier
+spec-compliance work, these now align with the published FHIR spec except for the
+few items called out under "Deviations" below.
+- **All types:** `:missing`
+- **String:** `:exact`, `:contains`, `:text`, `:text-advanced`
+- **Token:** `:not`, `:text`, `:in`, `:above`, `:below`, `:of-type`, `:code`,
+  `:code-text`, `:text-advanced`
+- **Reference:** `:identifier`, `:[Type]` (target type), `:contains`, `:text`,
+  `:above`, `:below`, `:code-text`
+- **Uri:** `:contains`, `:above`, `:below`
 - `_include` / `_revinclude` modifier: `:iterate`
 - **Not supported — do not offer (or clearly mark unavailable):** `:not-in` is
-  parsed but **rejected at runtime with `501 Not Implemented`** (negated
-  value-set filtering is unimplemented on the SQLite backend). There is **no**
-  `:code-only` modifier — only `:code`.
+  parsed (token only) but **rejected at runtime with `501 Not Implemented`**
+  (negated value-set filtering is unimplemented). There is **no** `:code-only`
+  modifier — only `:code`.
 - Note: the text/terminology modifiers depend on a backend that can satisfy
   them. `:text`, `:text-advanced`, and `:code-text` require a text-search backend
-  (e.g. Elasticsearch); `:in`, `:above`, and `:below` **delegate to a terminology
-  server** (see §11). Without the required backend the server returns `501`. The
-  UI SHOULD indicate when such a backend/terminology server is required and
+  (e.g. Elasticsearch); `:in`, and `:above`/`:below` **against code hierarchies**
+  (token), **delegate to a terminology server** (see §11). (Reference and uri
+  `:above`/`:below` are resolved locally via URL/path-prefix hierarchy and need
+  no terminology server.) Without the required backend the server returns `501`.
+  The UI SHOULD indicate when such a backend/terminology server is required and
   whether one is configured.
-- **Deviations from the FHIR spec** (the groupings above reflect `hfs`, not the
-  published spec — the UI should follow `hfs`, but designers should be aware):
-  - `:not` — `hfs` accepts it on **all** parameter types; the spec restricts it
-    to **token**.
-  - `:contains` — `hfs` accepts it on **string** only; the spec also allows it
-    on **reference** and **uri**.
-  - `:text` — `hfs` accepts it on **token** only; the spec also allows it on
-    **string** and **reference**.
+- **Advertised vs. validated:** the CapabilityStatement (`modifiers_for_type` in
+  the SQLite backend) advertises a slightly narrower set than the parser accepts:
+  token `:above`/`:below` and string `:text-advanced` are validated by the parser
+  but **not advertised** by the bare SQLite backend (they need a terminology /
+  text-search backend). The UI discovers the advertised set via §4.1 and SHOULD
+  prefer it; treat the parser groupings above as the upper bound.
+- **`:of-type` spelling:** the parser accepts **both** `:of-type` (the spec /
+  build.fhir.org spelling) and the legacy R4 `:ofType`, and the
+  CapabilityStatement advertises `:of-type`. The UI SHOULD emit `:of-type`.
+- **Deviations from the FHIR spec** (the UI should follow `hfs`, but designers
+  should be aware — every other grouping above now matches the spec):
+  - `:code` — `hfs` exposes a `:code` token modifier; the published spec defines
+    no `:code` modifier (its token modifiers are `:text`, `:not`, `:above`,
+    `:below`, `:in`, `:not-in`, `:of-type`, `:identifier`, `:code-text`,
+    `:text-advanced`). Treat `:code` as an `hfs` extension.
   - `:text-advanced` — `hfs` accepts it on **string** or **token**; the spec
     defines it for **reference** and **token**.
-  - `:code-text` — `hfs` accepts it on **token** only; the spec defines it for
-    **reference** and **token**.
-  - `:above` / `:below` — `hfs` accepts them on **token** or **uri**; the spec
-    also allows **reference**.
-  - `:in` / `:not-in` — the spec restricts these to **token**; `hfs` parses them
-    on **token** or **uri** (and `:not-in` returns `501` regardless).
-  - `:ofType` — `hfs` spells the modifier `:ofType` (the R4 spelling); current
-    build.fhir.org spells it `:of-type`. The UI MUST emit `:ofType` against
-    `hfs`.
+  - `:not-in` — the spec restricts it to **token** (as `hfs` does), but `hfs`
+    returns `501` for it regardless (see above).
 
 ### 7.3 Prefixes
 For number/date/quantity values, expose prefixes: `eq, ne, gt, lt, ge, le, sa,
-eb, ap`.
+eb, ap`. The builder SHOULD scope which prefixes it offers by parameter type, per
+`hfs` (`SearchPrefix::is_valid_for`):
+- `eq`, `ne` — all ordered types (number, date, quantity).
+- `gt`, `lt`, `ge`, `le`, `ap` — number, date, quantity.
+- `sa`, `eb` (starts-after / ends-before) — **date only**; do not offer them for
+  number or quantity.
 
 ### 7.4 Result controls
 - `_count` (default 20, server max 1000), pagination via `_offset`
