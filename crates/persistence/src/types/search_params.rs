@@ -734,6 +734,15 @@ impl SearchQuery {
         }
     }
 
+    /// Returns true if the client requested a total count via
+    /// `_total=accurate` or `_total=estimate`.
+    ///
+    /// `_total=none` or an unspecified `_total` returns `false`, so backends
+    /// skip the extra count query (FHIR allows omitting `Bundle.total`).
+    pub fn wants_total(&self) -> bool {
+        matches!(self.total, Some(TotalMode::Estimate | TotalMode::Accurate))
+    }
+
     /// Adds a search parameter.
     pub fn with_parameter(mut self, param: SearchParameter) -> Self {
         self.parameters.push(param);

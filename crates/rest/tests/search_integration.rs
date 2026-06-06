@@ -340,6 +340,38 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_total_accurate_populates_bundle_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Baseline count of all patients (no _total -> total omitted).
+        let baseline: Value = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let patient_count = get_bundle_entries(&baseline).len() as i64;
+        assert!(patient_count > 0, "fixture should seed patients");
+        assert!(
+            baseline["total"].is_null(),
+            "Bundle.total should be absent without _total"
+        );
+
+        // _total=accurate -> Bundle.total present and equal to the match count.
+        let response = server
+            .get("/Patient?_total=accurate")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert_eq!(
+            body["total"].as_i64(),
+            Some(patient_count),
+            "Bundle.total must equal the number of matches"
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_by_id() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
