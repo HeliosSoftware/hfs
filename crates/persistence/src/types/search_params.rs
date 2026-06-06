@@ -188,11 +188,11 @@ impl SearchModifier {
                 SearchParamType::String | SearchParamType::Reference | SearchParamType::Uri
             ),
             // Per the FHIR spec, `:text` is defined for string, token, and
-            // reference params. Reference `:text` (matching `Reference.display`)
-            // is not yet implemented; string and token are.
-            SearchModifier::Text => {
-                matches!(param_type, SearchParamType::String | SearchParamType::Token)
-            }
+            // reference params (reference matches the indexed `Reference.display`).
+            SearchModifier::Text => matches!(
+                param_type,
+                SearchParamType::String | SearchParamType::Token | SearchParamType::Reference
+            ),
             // Per the FHIR spec, `:not` is only defined for token parameters
             // (it negates a code match). Our backends only implement it for
             // token; advertising it for other types was incorrect.
@@ -213,7 +213,12 @@ impl SearchModifier {
             SearchModifier::TextAdvanced => {
                 param_type == SearchParamType::String || param_type == SearchParamType::Token
             }
-            SearchModifier::CodeText => param_type == SearchParamType::Token,
+            // `:code-text` is defined for token and reference params (matches a
+            // code's display, or the indexed `Reference.display`).
+            SearchModifier::CodeText => matches!(
+                param_type,
+                SearchParamType::Token | SearchParamType::Reference
+            ),
         }
     }
 }

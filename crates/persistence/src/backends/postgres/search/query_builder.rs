@@ -840,12 +840,21 @@ impl PostgresQueryBuilder {
 
     fn build_reference_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
-        // :contains - case-insensitive substring match on the stored reference.
-        let is_contains = matches!(param.modifier.as_ref(), Some(SearchModifier::Contains));
+        // :contains - case-insensitive substring on the stored reference.
+        // :text (contains) / :code-text (starts-with) match the indexed
+        // Reference.display text.
+        let modifier = param.modifier.as_ref();
+        let is_contains = matches!(modifier, Some(SearchModifier::Contains));
+        let is_text = matches!(modifier, Some(SearchModifier::Text));
+        let is_code_text = matches!(modifier, Some(SearchModifier::CodeText));
 
         for (i, value) in param.values.iter().enumerate() {
             let param_num = offset + i + 1;
-            let predicate = if is_contains {
+            let predicate = if is_text {
+                format!("value_reference_display ILIKE '%' || ${} || '%'", param_num)
+            } else if is_code_text {
+                format!("value_reference_display ILIKE ${} || '%'", param_num)
+            } else if is_contains {
                 format!("value_reference ILIKE '%' || ${} || '%'", param_num)
             } else {
                 format!("value_reference = ${}", param_num)

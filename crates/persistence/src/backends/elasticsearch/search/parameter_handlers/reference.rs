@@ -12,6 +12,31 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
         return build_identifier_clause(name, value);
     }
 
+    // :text (full-text) and :code-text (starts-with) match Reference.display.
+    if matches!(
+        param.modifier,
+        Some(SearchModifier::Text | SearchModifier::CodeText)
+    ) {
+        let display_query = if param.modifier == Some(SearchModifier::CodeText) {
+            json!({ "match_phrase_prefix": { "search_params.reference.display": value } })
+        } else {
+            json!({ "match": { "search_params.reference.display": { "query": value } } })
+        };
+        return Some(json!({
+            "nested": {
+                "path": "search_params.reference",
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "term": { "search_params.reference.name": name } },
+                            display_query
+                        ]
+                    }
+                }
+            }
+        }));
+    }
+
     // :contains - case-insensitive substring match on the stored reference.
     if param.modifier == Some(SearchModifier::Contains) {
         return Some(json!({

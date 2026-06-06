@@ -40,6 +40,27 @@ impl ReferenceHandler {
             );
         }
 
+        // Handle :text (contains) and :code-text (starts-with) on the indexed
+        // Reference.display text.
+        if matches!(modifier, Some(SearchModifier::Text)) {
+            return SqlFragment::with_params(
+                format!(
+                    "value_reference_display COLLATE NOCASE LIKE '%' || ?{} || '%'",
+                    param_num
+                ),
+                vec![SqlParam::string(value.value.to_lowercase())],
+            );
+        }
+        if matches!(modifier, Some(SearchModifier::CodeText)) {
+            return SqlFragment::with_params(
+                format!(
+                    "value_reference_display COLLATE NOCASE LIKE ?{} || '%'",
+                    param_num
+                ),
+                vec![SqlParam::string(value.value.to_lowercase())],
+            );
+        }
+
         // Handle :Type modifier (restrict to specific resource type)
         if let Some(SearchModifier::Type(type_name)) = modifier {
             // The reference must be to the specified type
@@ -187,6 +208,23 @@ mod tests {
         assert!(frag.sql.contains("value_reference LIKE '%' ||"));
         assert!(frag.sql.contains("|| '%'"));
         assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn test_reference_text_modifier() {
+        let value = SearchValue::new(SearchPrefix::Eq, "John");
+        let frag = ReferenceHandler::build_sql(&value, Some(&SearchModifier::Text), 0);
+        assert!(frag.sql.contains("value_reference_display"));
+        assert!(frag.sql.contains("'%' || ?1 || '%'"));
+    }
+
+    #[test]
+    fn test_reference_code_text_modifier() {
+        let value = SearchValue::new(SearchPrefix::Eq, "John");
+        let frag = ReferenceHandler::build_sql(&value, Some(&SearchModifier::CodeText), 0);
+        assert!(frag.sql.contains("value_reference_display"));
+        // starts-with: no leading '%'
+        assert!(frag.sql.contains("LIKE ?1 || '%'"));
     }
 
     #[test]

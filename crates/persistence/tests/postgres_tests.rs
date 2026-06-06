@@ -306,6 +306,33 @@ mod query_builder_tests {
     }
 
     #[test]
+    fn test_reference_parameter_text_and_code_text() {
+        use helios_persistence::types::SearchModifier;
+
+        for (modifier, expect_leading_pct) in [
+            (SearchModifier::Text, true),
+            (SearchModifier::CodeText, false),
+        ] {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: Some(modifier),
+                values: vec![SearchValue::eq("John")],
+                chain: vec![],
+                components: vec![],
+            });
+
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            assert!(fragment.sql.contains("value_reference_display ILIKE"));
+            // :text wraps as %John%; :code-text is starts-with John%
+            assert_eq!(
+                fragment.sql.contains("'%' || $3 || '%'"),
+                expect_leading_pct
+            );
+        }
+    }
+
+    #[test]
     fn test_reference_parameter_contains() {
         use helios_persistence::types::SearchModifier;
 

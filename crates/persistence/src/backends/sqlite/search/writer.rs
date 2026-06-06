@@ -20,14 +20,16 @@ impl SqliteSearchIndexWriter {
             value_date, value_date_precision,
             value_number, value_quantity_value, value_quantity_unit, value_quantity_system,
             value_reference, value_uri, composite_group,
-            value_identifier_type_system, value_identifier_type_code
+            value_identifier_type_system, value_identifier_type_code,
+            value_reference_display
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8, ?9,
             ?10, ?11,
             ?12, ?13, ?14, ?15,
             ?16, ?17, ?18,
-            ?19, ?20
+            ?19, ?20,
+            ?21
         )
         "#
     }
@@ -58,6 +60,10 @@ impl SqliteSearchIndexWriter {
             SqlValue::String(extracted.param_name.clone()),
             SqlValue::String(extracted.param_url.clone()),
         ];
+
+        // `value_reference_display` is appended as the final column; capture it
+        // here so the common tail (and the Token early-return) can emit it.
+        let mut reference_display: Option<String> = None;
 
         // Add value columns based on the IndexValue type
         match &extracted.value {
@@ -99,6 +105,7 @@ impl SqliteSearchIndexWriter {
                 )); // composite_group
                 params.push(SqlValue::OptString(identifier_type_system.clone())); // value_identifier_type_system
                 params.push(SqlValue::OptString(identifier_type_code.clone())); // value_identifier_type_code
+                params.push(SqlValue::Null); // value_reference_display
                 return params;
             }
             IndexValue::Date { value, precision } => {
@@ -152,7 +159,9 @@ impl SqliteSearchIndexWriter {
                 reference,
                 resource_type: _,
                 resource_id: _,
+                display,
             } => {
+                reference_display = display.clone();
                 params.push(SqlValue::Null); // value_string
                 params.push(SqlValue::Null); // value_token_system
                 params.push(SqlValue::Null); // value_token_code
@@ -188,6 +197,7 @@ impl SqliteSearchIndexWriter {
         )); // composite_group
         params.push(SqlValue::Null); // value_identifier_type_system
         params.push(SqlValue::Null); // value_identifier_type_code
+        params.push(SqlValue::OptString(reference_display)); // value_reference_display
 
         params
     }

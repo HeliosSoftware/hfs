@@ -638,6 +638,59 @@ mod reference_search {
             assert!(subject.contains("patient-1"));
         }
     }
+
+    #[tokio::test]
+    async fn test_reference_search_text_modifier_on_display() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+
+        // An Observation whose subject reference carries a display string. The
+        // extractor indexes Reference.display so :text (contains) and :code-text
+        // (starts-with) can match it.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-display-1",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+                    "subject": {"reference": "Patient/p-xyz", "display": "Johnny Appleseed"}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        // :text matches a substring of the display.
+        let response = server
+            .get("/Observation?subject:text=Appleseed")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resource"]["id"], "obs-display-1");
+
+        // :code-text matches a prefix of the display, but not a mid-string token.
+        let prefix = server
+            .get("/Observation?subject:code-text=Johnny")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        prefix.assert_status_ok();
+        let prefix_body: Value = prefix.json();
+        assert_eq!(get_bundle_entries(&prefix_body).len(), 1);
+
+        let mid = server
+            .get("/Observation?subject:code-text=Appleseed")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        mid.assert_status_ok();
+        let mid_body: Value = mid.json();
+        assert_eq!(get_bundle_entries(&mid_body).len(), 0);
+    }
 }
 
 // =============================================================================

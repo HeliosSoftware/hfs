@@ -666,6 +666,22 @@ impl MongoBackend {
             });
         }
 
+        // :text (contains) / :code-text (starts-with) match Reference.display.
+        if matches!(
+            param.modifier.as_ref(),
+            Some(SearchModifier::Text | SearchModifier::CodeText)
+        ) {
+            let escaped = regex_escape(&value.value);
+            let regex = if matches!(param.modifier.as_ref(), Some(SearchModifier::CodeText)) {
+                format!("^{}", escaped)
+            } else {
+                escaped
+            };
+            return Ok(doc! {
+                "value_reference_display": { "$regex": regex, "$options": "i" }
+            });
+        }
+
         if let Some(modifier) = &param.modifier {
             return Err(StorageError::Search(SearchError::UnsupportedModifier {
                 modifier: modifier.to_string(),

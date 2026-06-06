@@ -566,7 +566,9 @@ impl ElasticsearchBackend {
                     "missing",
                 ]
             }
-            SearchParamType::Reference => vec!["identifier", "contains", "missing"],
+            SearchParamType::Reference => {
+                vec!["identifier", "contains", "text", "code-text", "missing"]
+            }
             SearchParamType::Date => vec!["missing"],
             SearchParamType::Number => vec!["missing"],
             SearchParamType::Quantity => vec!["missing"],
