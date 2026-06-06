@@ -410,14 +410,13 @@ fn parse_has_parameter(
         SearchValue::eq(value)
     };
 
-    // Check for nested _has
-    if search_param == "_has" || search_param.starts_with("_has:") {
-        // Nested reverse chain - this is complex and requires recursion
-        // For now, return a basic structure; the backend can handle it
-        let nested = parse_has_parameter(
-            &format!("_has:{}", &chain_str[parts[0].len() + parts[1].len() + 2..]),
-            value,
-        )?;
+    // Check for nested _has, e.g.
+    // `_has:Observation:subject:_has:Provenance:target:agent`.
+    // Everything after `source_type:reference_param:` is itself a `_has:...`
+    // expression, which we parse recursively.
+    if search_param == "_has" {
+        let inner = &chain_str[parts[0].len() + parts[1].len() + 2..];
+        let nested = parse_has_parameter(inner, value)?;
         if let Some(nested_chain) = nested {
             return Ok(Some(ReverseChainedParameter::nested(
                 source_type,
@@ -646,6 +645,34 @@ mod tests {
         assert_eq!(chain.source_type, "Observation");
         assert_eq!(chain.reference_param, "patient");
         assert_eq!(chain.search_param, "code");
+    }
+
+    #[test]
+    fn test_parse_nested_has_parameter() {
+        // _has:Observation:subject:_has:Provenance:target:agent=prac-1
+        let result = parse_has_parameter(
+            "_has:Observation:subject:_has:Provenance:target:agent",
+            "prac-1",
+        )
+        .unwrap()
+        .expect("nested chain parsed");
+
+        // Outer level.
+        assert_eq!(result.source_type, "Observation");
+        assert_eq!(result.reference_param, "subject");
+        assert!(result.value.is_none(), "outer level carries no value");
+        assert_eq!(result.depth(), 2);
+
+        // Inner (terminal) level.
+        let inner = result.nested.expect("inner chain present");
+        assert_eq!(inner.source_type, "Provenance");
+        assert_eq!(inner.reference_param, "target");
+        assert_eq!(inner.search_param, "agent");
+        assert_eq!(
+            inner.value.as_ref().map(|v| v.value.as_str()),
+            Some("prac-1")
+        );
+        assert!(inner.is_terminal());
     }
 
     #[test]
