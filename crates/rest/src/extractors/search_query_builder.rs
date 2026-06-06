@@ -96,6 +96,10 @@ pub fn build_search_query(
         }
     }
 
+    // Expand wildcard includes (_include=Type:*) into one directive per
+    // reference search parameter of the source type.
+    expand_wildcard_includes(&mut query.includes, registry);
+
     // Store raw parameters for debugging, grouping repeated keys.
     let mut raw_params: HashMap<String, Vec<String>> = HashMap::new();
     for (k, v) in params.iter() {
@@ -513,6 +517,35 @@ fn parse_include_directive(directive: &str, include_type: IncludeType) -> Option
         target_type,
         iterate,
     })
+}
+
+/// Expands wildcard include directives (`_include=Type:*`) into a concrete
+/// directive for each reference-typed search parameter of the source type,
+/// preserving the original `iterate` / `target_type` flags. Non-wildcard
+/// directives pass through unchanged.
+fn expand_wildcard_includes(
+    includes: &mut Vec<IncludeDirective>,
+    registry: &SearchParameterRegistry,
+) {
+    if !includes.iter().any(|d| d.search_param == "*") {
+        return;
+    }
+    let mut expanded = Vec::with_capacity(includes.len());
+    for directive in includes.drain(..) {
+        if directive.search_param == "*" {
+            for def in registry.get_active_params(&directive.source_type) {
+                if def.param_type == SearchParamType::Reference {
+                    expanded.push(IncludeDirective {
+                        search_param: def.code.clone(),
+                        ..directive.clone()
+                    });
+                }
+            }
+        } else {
+            expanded.push(directive);
+        }
+    }
+    *includes = expanded;
 }
 
 /// Parses _total parameter value.

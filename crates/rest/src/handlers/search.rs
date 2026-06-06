@@ -13,7 +13,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Response,
 };
-use helios_persistence::core::{MultiTypeSearchProvider, ResourceStorage, SearchProvider};
+use helios_persistence::core::{
+    IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
+    resolve_includes_iterative,
+};
 use helios_persistence::types::SearchBundle;
 use tracing::{debug, warn};
 
@@ -48,7 +51,7 @@ pub async fn search_get_handler<S>(
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
     let pairs = parse_query_pairs(raw_query.as_deref());
     debug!(
@@ -90,7 +93,7 @@ pub async fn search_post_handler<S>(
     RawForm(form): RawForm,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
     let body = String::from_utf8_lossy(form.as_ref());
     let pairs = parse_query_pairs(Some(&body));
@@ -154,7 +157,7 @@ async fn execute_search<S>(
     strict: bool,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
     // `:not-in` requires negated value-set filtering, which no backend
     // implements. Reject it explicitly (501) regardless of whether a terminology
@@ -222,9 +225,7 @@ where
     };
 
     // Execute the search
-    // Note: The search provider is responsible for resolving _include/_revinclude
-    // directives that are part of the query. The result already contains included resources.
-    let result = state
+    let mut result = state
         .storage()
         .search(tenant.context(), &query)
         .await
@@ -232,6 +233,25 @@ where
             warn!(error = %e, "Search failed");
             RestError::from(e)
         })?;
+
+    // Resolve _include/_revinclude (with :iterate) for backends whose search()
+    // does not populate includes inline (SQLite, Postgres). Backends that
+    // resolve inline (Elasticsearch, MongoDB) return a non-empty `included` and
+    // are left as-is.
+    if !query.includes.is_empty() && result.included.is_empty() {
+        let included = resolve_includes_iterative(
+            state.storage(),
+            tenant.context(),
+            &result.resources.items,
+            &query.includes,
+        )
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Include resolution failed");
+            RestError::from(e)
+        })?;
+        result.included = included;
+    }
 
     // Build the self link URL
     let self_link = build_search_url(state.base_url(), resource_type, &search_params);

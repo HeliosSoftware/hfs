@@ -9,16 +9,18 @@
 //! - [`TerminologySearchProvider`] - :above, :below, :in, :not-in
 //! - [`TextSearchProvider`] - Full-text search (_text, _content, :text)
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use crate::error::StorageResult;
-use crate::search::SearchParameterRegistry;
+use crate::search::{IndexValue, SearchParameterExtractor, SearchParameterRegistry};
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, Page, ReverseChainedParameter, SearchBundle, SearchQuery, StoredResource,
+    IncludeDirective, IncludeType, Page, ReverseChainedParameter, SearchBundle, SearchParamType,
+    SearchParameter, SearchQuery, SearchValue, StoredResource,
 };
 
 use super::storage::ResourceStorage;
@@ -312,6 +314,152 @@ pub trait RevincludeProvider: SearchProvider {
         resources: &[StoredResource],
         revincludes: &[IncludeDirective],
     ) -> StorageResult<Vec<StoredResource>>;
+}
+
+/// Maximum number of `:iterate` hops when transitively following includes,
+/// guarding against reference cycles.
+const MAX_INCLUDE_ITERATE_DEPTH: usize = 5;
+
+/// Upper bound on resources fetched per internal include/revinclude query, to
+/// avoid the default page size silently truncating included resources.
+const INCLUDE_FETCH_LIMIT: u32 = 10_000;
+
+/// Resolves `_include`/`_revinclude` directives for a set of primary matches,
+/// following `:iterate` directives transitively until no new resources are
+/// found (bounded by [`MAX_INCLUDE_ITERATE_DEPTH`]). Included resources are
+/// deduplicated by `type/id` and never include a primary match.
+///
+/// This is the single, backend-agnostic include-resolution path used by the
+/// REST layer for backends whose `search()` does not resolve includes inline
+/// (SQLite, Postgres). References are extracted via the search-parameter
+/// registry's FHIRPath expression — so parameters whose name differs from the
+/// JSON field (e.g. Patient `organization` → `managingOrganization`) resolve
+/// correctly — and the referenced resources are fetched with `search()`.
+pub async fn resolve_includes_iterative<S>(
+    provider: &S,
+    tenant: &TenantContext,
+    matches: &[StoredResource],
+    includes: &[IncludeDirective],
+) -> StorageResult<Vec<StoredResource>>
+where
+    S: SearchProvider + ?Sized,
+{
+    if matches.is_empty() || includes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let extractor = SearchParameterExtractor::new(provider.search_param_registry().clone());
+    let key = |r: &StoredResource| format!("{}/{}", r.resource_type(), r.id());
+
+    // Don't re-include primary matches.
+    let mut seen: HashSet<String> = matches.iter().map(&key).collect();
+    let mut included: Vec<StoredResource> = Vec::new();
+
+    let mut frontier: Vec<StoredResource> = matches.to_vec();
+    let mut first_hop = true;
+    let mut depth = 0;
+
+    loop {
+        // First hop applies all directives; later hops only `:iterate` ones.
+        let active: Vec<&IncludeDirective> =
+            includes.iter().filter(|d| first_hop || d.iterate).collect();
+        if active.is_empty() {
+            break;
+        }
+
+        let mut fetched: Vec<StoredResource> = Vec::new();
+        for directive in active {
+            match directive.include_type {
+                IncludeType::Include => {
+                    // Forward: collect references from the frontier resources,
+                    // then fetch the referenced resources by id.
+                    let mut wanted: Vec<(String, String)> = Vec::new();
+                    for res in &frontier {
+                        if res.resource_type() != directive.source_type {
+                            continue;
+                        }
+                        let def = provider
+                            .search_param_registry()
+                            .read()
+                            .get_param(res.resource_type(), &directive.search_param);
+                        let Some(def) = def else { continue };
+                        if let Ok(values) = extractor.extract_for_param(res.content(), &def) {
+                            for v in values {
+                                if let IndexValue::Reference { reference, .. } = v.value {
+                                    if let Some((t, i)) = reference.split_once('/') {
+                                        if let Some(target) = &directive.target_type {
+                                            if t != target {
+                                                continue;
+                                            }
+                                        }
+                                        wanted.push((t.to_string(), i.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Group ids by type and fetch each group.
+                    let mut by_type: std::collections::HashMap<String, Vec<String>> =
+                        std::collections::HashMap::new();
+                    for (t, i) in wanted {
+                        by_type.entry(t).or_default().push(i);
+                    }
+                    for (rtype, ids) in by_type {
+                        let mut q = SearchQuery::new(&rtype).with_parameter(SearchParameter {
+                            name: "_id".to_string(),
+                            param_type: SearchParamType::Token,
+                            modifier: None,
+                            values: ids.iter().map(SearchValue::eq).collect(),
+                            chain: vec![],
+                            components: vec![],
+                        });
+                        q.count = Some(INCLUDE_FETCH_LIMIT);
+                        let result = provider.search(tenant, &q).await?;
+                        fetched.extend(result.resources.items);
+                    }
+                }
+                IncludeType::Revinclude => {
+                    // Reverse: find source resources that reference any frontier
+                    // resource via the directive's reference parameter.
+                    let refs: Vec<SearchValue> =
+                        frontier.iter().map(|r| SearchValue::eq(key(r))).collect();
+                    if refs.is_empty() {
+                        continue;
+                    }
+                    let mut q =
+                        SearchQuery::new(&directive.source_type).with_parameter(SearchParameter {
+                            name: directive.search_param.clone(),
+                            param_type: SearchParamType::Reference,
+                            modifier: None,
+                            values: refs,
+                            chain: vec![],
+                            components: vec![],
+                        });
+                    q.count = Some(INCLUDE_FETCH_LIMIT);
+                    let result = provider.search(tenant, &q).await?;
+                    fetched.extend(result.resources.items);
+                }
+            }
+        }
+
+        // Dedup against everything seen so far; newly-added become next frontier.
+        let mut next = Vec::new();
+        for r in fetched {
+            if seen.insert(key(&r)) {
+                next.push(r.clone());
+                included.push(r);
+            }
+        }
+
+        first_hop = false;
+        depth += 1;
+        frontier = next;
+        if frontier.is_empty() || depth >= MAX_INCLUDE_ITERATE_DEPTH {
+            break;
+        }
+    }
+
+    Ok(included)
 }
 
 /// Search provider that supports chained parameters and _has.

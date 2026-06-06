@@ -104,8 +104,8 @@ impl SearchParams {
         if !sort_specs.is_empty() {
             result.sort = Some(sort_specs.iter().map(|s| parse_one_sort(s)).collect());
         }
-        result.include = collect_multi(&pairs, "_include");
-        result.revinclude = collect_multi(&pairs, "_revinclude");
+        result.include = collect_includes(&pairs, "_include");
+        result.revinclude = collect_includes(&pairs, "_revinclude");
         let elements = collect_multi(&pairs, "_elements");
         if !elements.is_empty() {
             result.elements = Some(elements);
@@ -137,7 +137,9 @@ impl SearchParams {
             "_summary",
             "_elements",
             "_include",
+            "_include:iterate",
             "_revinclude",
+            "_revinclude:iterate",
             "_contained",
             "_containedType",
             "_format",
@@ -202,6 +204,23 @@ impl SearchParams {
     pub fn contains(&self, name: &str) -> bool {
         self.pairs.iter().any(|(k, _)| k == name)
     }
+}
+
+/// Collects `_include`/`_revinclude` directives, supporting both the value-suffix
+/// iterate form (`_include=Obs:subject:iterate`) and the spec's key-modifier form
+/// (`_include:iterate=Obs:subject`). For the key-modifier form an `:iterate`
+/// suffix is appended so directive parsing flags it consistently.
+fn collect_includes(pairs: &[(String, String)], base: &str) -> Vec<String> {
+    let mut out = collect_multi(pairs, base);
+    let iterate_key = format!("{base}:iterate");
+    for v in collect_multi(pairs, &iterate_key) {
+        if v.ends_with(":iterate") {
+            out.push(v);
+        } else {
+            out.push(format!("{v}:iterate"));
+        }
+    }
+    out
 }
 
 /// Parses a single sort token into a structured param (`-field` = descending).
