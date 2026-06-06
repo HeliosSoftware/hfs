@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::search::fold_text;
 use crate::types::{
     SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
     strip_reference_version,
@@ -379,21 +380,23 @@ impl PostgresQueryBuilder {
                 ),
                 // `:text` on a string is a case-insensitive partial match,
                 // implemented here as a substring match (same as `:contains`).
+                // Match the accent-folded column (falling back to the raw column
+                // for not-yet-reindexed rows) against a folded pattern.
                 Some(SearchModifier::Contains | SearchModifier::Text) => SqlFragment::with_params(
                     format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string ILIKE ${})",
+                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND COALESCE(value_string_folded, value_string) ILIKE ${})",
                         param.name, param_num
                     ),
-                    vec![SqlParam::text(&format!("%{}%", value.value))],
+                    vec![SqlParam::text(&format!("%{}%", fold_text(&value.value)))],
                 ),
                 _ => {
-                    // Default: starts-with (case-insensitive)
+                    // Default: starts-with (case- and accent-insensitive).
                     SqlFragment::with_params(
                         format!(
-                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string ILIKE ${})",
+                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND COALESCE(value_string_folded, value_string) ILIKE ${})",
                             param.name, param_num
                         ),
-                        vec![SqlParam::text(&format!("{}%", value.value))],
+                        vec![SqlParam::text(&format!("{}%", fold_text(&value.value)))],
                     )
                 }
             };

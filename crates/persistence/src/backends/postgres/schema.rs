@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// Initialize the database schema.
 pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
@@ -272,6 +272,7 @@ async fn migrate_schema(
             6 => migrate_v6_to_v7(client).await?,
             7 => migrate_v7_to_v8(client).await?,
             8 => migrate_v8_to_v9(client).await?,
+            9 => migrate_v9_to_v10(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -652,6 +653,26 @@ async fn migrate_v8_to_v9(client: &deadpool_postgres::Client) -> StorageResult<(
         )
         .await
         .map_err(|e| pg_error(format!("Migration v8->v9 index failed: {}", e)))?;
+    Ok(())
+}
+
+/// v9 -> v10: UCUM-canonical quantity columns + case/accent-folded string column.
+async fn migrate_v9_to_v10(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_quantity_canonical_value DOUBLE PRECISION",
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_quantity_canonical_unit TEXT",
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_string_folded TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical
+         ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value)",
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded
+         ON search_index(tenant_id, resource_type, param_name, value_string_folded)",
+    ];
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v9->v10 failed: {}", e)))?;
+    }
     Ok(())
 }
 

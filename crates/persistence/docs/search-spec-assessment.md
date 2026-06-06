@@ -208,19 +208,26 @@ Ordered roughly by impact:
    nested objects; chained/`_has` now work via the REST-layer resolver — see below.)
 6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
    unsupported; Bundles omit `first`/`last` paging links.
-7. **Quantity UCUM canonicalization** — **done on SQLite** (schema v10): the index stores a
-   dimension-canonical value/unit (`value_quantity_canonical_value`/`_unit`) computed via
-   `helios_fhirpath::ucum::canonicalize_quantity`, and quantity search matches the canonical columns
-   (bounds canonicalized to preserve implicit precision) OR the raw unit, so `1|g` matches
-   `1000|mg`. **Remaining:** Postgres/Elasticsearch (their schema/mapping + writer + handler), and a
-   **reindex backfill** (`ReindexRequest`) to populate canonical columns for resources written
-   before the upgrade — un-reindexed rows fall back to raw unit matching.
-8. **Accent-insensitive string search** — string search is case-insensitive and prefix-based, but
-   not accent/diacritic-insensitive for ordinary string parameters (only the FTS `_text`/`_content`
-   path folds diacritics). This is **migration-class**, not a handler tweak: SQLite has no native
-   `unaccent` (needs a folded index column + reindex, or a custom connection-registered function),
-   Postgres needs the `unaccent` extension, and Elasticsearch needs an `asciifolding` analyzer +
-   reindex. Best done alongside the UCUM index migration (item 7).
+7. **Quantity UCUM canonicalization** (schema v10) — the index stores a dimension-canonical
+   value/unit (`value_quantity_canonical_value`/`_unit`) computed via
+   `helios_fhirpath::ucum::canonicalize_quantity`, so `1|g` matches `1000|mg`.
+   - **SQLite: complete** — writer populates canonical columns; the quantity handler matches the
+     canonical columns (search bounds canonicalized to preserve implicit precision) OR the raw unit.
+   - **Postgres: write-side done** (canonical columns populated by the writer); the **query-side OR**
+     into the canonical columns is not yet wired (raw unit matching only) — pending param-stride and
+     float-tolerance handling.
+   - **Elasticsearch: remaining.**
+   - A **reindex backfill** (`ReindexRequest`) is required to populate canonical columns for
+     resources written before the upgrade; un-reindexed rows fall back to raw unit matching.
+8. **Accent-insensitive string search** (schema v10) — string search folds case **and** accents via
+   NFD + combining-mark stripping (`unicode-normalization`, shared `search::fold_text`), stored in
+   `value_string_folded`.
+   - **SQLite: complete** — default/`:contains`/`:text` match the folded column ORed with the raw
+     (case-insensitive) column; `:exact` stays case/accent-sensitive.
+   - **Postgres: complete** — `COALESCE(value_string_folded, value_string) ILIKE` against a folded
+     pattern (raw fallback keeps non-accented pre-reindex rows matching case-insensitively).
+   - **Elasticsearch: remaining** (needs an `asciifolding` analyzer + reindex).
+   - Pre-reindex rows need the **reindex backfill** for accent-insensitivity.
 9. **Canonical `url|version` references** — versioned reference matching is now version-agnostic
    (`Patient/1/_history/2` ⇄ `Patient/1`, via `strip_reference_version`, on SQLite/PG/ES). The
    remaining gap is canonical `url|version` hierarchy for reference `:above`/`:below`; `:identifier`
