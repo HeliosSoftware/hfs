@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 
 use crate::types::{
     SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+    strip_reference_version,
 };
 
 /// How a sort key's value is typed for cursor (keyset) binding and comparison.
@@ -945,14 +946,27 @@ impl PostgresQueryBuilder {
                     param_num
                 )
             } else {
-                format!("value_reference = ${}", param_num)
+                // Plain reference match, version-agnostic: the bound value is
+                // the version-stripped base; match it exactly or carrying any
+                // `_history` version.
+                format!(
+                    "(value_reference = ${0} OR value_reference LIKE ${0} || '/_history/%')",
+                    param_num
+                )
+            };
+            // For the plain match the bound value is version-stripped; modifiers
+            // keep the literal value.
+            let bound = if is_text || is_code_text || is_contains || is_below || is_above {
+                value.value.clone()
+            } else {
+                strip_reference_version(&value.value).to_string()
             };
             conditions.push(SqlFragment::with_params(
                 format!(
                     "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
                     param.name, predicate
                 ),
-                vec![SqlParam::text(&value.value)],
+                vec![SqlParam::text(&bound)],
             ));
         }
 

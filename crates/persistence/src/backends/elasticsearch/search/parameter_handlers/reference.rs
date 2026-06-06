@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::types::{SearchModifier, SearchParameter};
+use crate::types::{SearchModifier, SearchParameter, strip_reference_version};
 
 /// Builds an ES query clause for a reference search parameter.
 pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
@@ -105,17 +105,27 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
 
     let mut must_conditions = vec![json!({ "term": { "search_params.reference.name": name } })];
 
-    // Parse reference value
-    if value.contains('/') {
+    // Reference matching is version-agnostic: strip any `/_history/<vid>` and
+    // match the base reference or the same reference carrying a version.
+    let base = strip_reference_version(value);
+    if base.contains('/') {
         // Type/id format (e.g., "Patient/123") or full URL
-        must_conditions.push(json!({ "term": { "search_params.reference.reference": value } }));
+        must_conditions.push(json!({
+            "bool": {
+                "should": [
+                    { "term": { "search_params.reference.reference": base } },
+                    { "prefix": { "search_params.reference.reference": format!("{}/_history/", base) } }
+                ],
+                "minimum_should_match": 1
+            }
+        }));
     } else {
         // Just an ID - match either resource_id or reference ending with /id
         must_conditions.push(json!({
             "bool": {
                 "should": [
-                    { "term": { "search_params.reference.resource_id": value } },
-                    { "term": { "search_params.reference.reference": value } }
+                    { "term": { "search_params.reference.resource_id": base } },
+                    { "term": { "search_params.reference.reference": base } }
                 ],
                 "minimum_should_match": 1
             }
