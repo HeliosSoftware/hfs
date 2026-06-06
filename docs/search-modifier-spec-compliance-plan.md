@@ -77,15 +77,20 @@ handler, MongoDB handler, the backend `capabilities()` modifier lists, the
   unconditionally.
 - [x] **Postgres `:identifier`** — implemented (was advertised but broken).
 
-### Remaining (tracked as tasks, not blocking)
+- [x] **MongoDB `SearchCapabilityProvider`** — Mongo now advertises exactly the
+  modifiers it honors.
+- [x] **Reference `:above`/`:below`** — URL/path-prefix hierarchy (SQLite/PG/ES;
+  Mongo honestly 400s).
 
-- [ ] Reference `:text-advanced` (FTS over display) and `:above`/`:below`
-  (canonical version hierarchy). `is_valid_for` keeps them strict (gate 400s
-  them) until implemented.
-- [ ] MongoDB has no `SearchCapabilityProvider`, so it advertises no modifiers
-  while honoring several (string exact/contains/text, token code/text/code-text,
-  reference contains/text/code-text, uri exact/contains). Advertising-only gap;
-  no correctness impact.
+### Remaining (deferred by design decision)
+
+- [ ] Reference `:text-advanced` — needs FTS over `Reference.display` across
+  backends; disproportionate for a doubly-niche modifier. `is_valid_for` keeps
+  it strict, so the gate returns an honest 400 rather than a degraded result.
+- [ ] Canonical `|version` comparison for reference `:above`/`:below` — current
+  implementation is URL/path-prefix only.
+- [ ] `:text-advanced` is implemented for token on SQLite (FTS5) and ES only;
+  PG/Mongo don't advertise it.
 
 Validation: SQLite (full REST + unit) and Postgres (Docker integration) suites
 green on every commit; Elasticsearch and MongoDB compile-checked with logic
