@@ -922,6 +922,8 @@ impl PostgresQueryBuilder {
         let is_contains = matches!(modifier, Some(SearchModifier::Contains));
         let is_text = matches!(modifier, Some(SearchModifier::Text));
         let is_code_text = matches!(modifier, Some(SearchModifier::CodeText));
+        let is_below = matches!(modifier, Some(SearchModifier::Below));
+        let is_above = matches!(modifier, Some(SearchModifier::Above));
 
         for (i, value) in param.values.iter().enumerate() {
             let param_num = offset + i + 1;
@@ -931,6 +933,17 @@ impl PostgresQueryBuilder {
                 format!("value_reference_display ILIKE ${} || '%'", param_num)
             } else if is_contains {
                 format!("value_reference ILIKE '%' || ${} || '%'", param_num)
+            } else if is_below {
+                // URL/path-prefix hierarchy (canonical |version not handled).
+                format!(
+                    "(value_reference = ${0} OR value_reference LIKE ${0} || '/%')",
+                    param_num
+                )
+            } else if is_above {
+                format!(
+                    "(${0} = value_reference OR ${0} LIKE value_reference || '/%')",
+                    param_num
+                )
             } else {
                 format!("value_reference = ${}", param_num)
             };

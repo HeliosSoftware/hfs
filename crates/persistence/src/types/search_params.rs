@@ -198,12 +198,13 @@ impl SearchModifier {
             // token; advertising it for other types was incorrect.
             SearchModifier::Not => param_type == SearchParamType::Token,
             SearchModifier::Missing => true, // Valid for all types
-            // `:above`/`:below` are defined for token and uri (the spec also
-            // lists reference, a niche canonical-hierarchy case not yet
-            // implemented).
-            SearchModifier::Above | SearchModifier::Below => {
-                matches!(param_type, SearchParamType::Token | SearchParamType::Uri)
-            }
+            // `:above`/`:below` are defined for token, uri, and reference.
+            // Reference uses URL/path-prefix hierarchy (canonical `|version`
+            // comparison is not implemented).
+            SearchModifier::Above | SearchModifier::Below => matches!(
+                param_type,
+                SearchParamType::Token | SearchParamType::Uri | SearchParamType::Reference
+            ),
             // `:in`/`:not-in` are token-only per the FHIR spec. (`:not-in`
             // itself returns 501 at the REST layer — negated value-set
             // filtering is unimplemented.)
@@ -868,9 +869,12 @@ mod tests {
         assert!(!SearchModifier::In.is_valid_for(SearchParamType::Uri));
         assert!(SearchModifier::NotIn.is_valid_for(SearchParamType::Token));
         assert!(!SearchModifier::NotIn.is_valid_for(SearchParamType::Uri));
-        // `:above`/`:below` remain valid for token and uri.
+        // `:above`/`:below` are valid for token, uri, and reference.
         assert!(SearchModifier::Above.is_valid_for(SearchParamType::Uri));
         assert!(SearchModifier::Below.is_valid_for(SearchParamType::Token));
+        assert!(SearchModifier::Above.is_valid_for(SearchParamType::Reference));
+        assert!(SearchModifier::Below.is_valid_for(SearchParamType::Reference));
+        assert!(!SearchModifier::Above.is_valid_for(SearchParamType::String));
     }
 
     #[test]

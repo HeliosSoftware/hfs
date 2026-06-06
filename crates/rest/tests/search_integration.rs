@@ -656,6 +656,28 @@ mod reference_search {
     }
 
     #[tokio::test]
+    async fn test_reference_search_below_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // :below does URL/path-prefix hierarchy on the reference. "Patient"
+        // matches "Patient/patient-1" etc. (the seeded observation subjects).
+        let response = server
+            .get("/Observation?subject:below=Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            let subject = entry["resource"]["subject"]["reference"].as_str().unwrap();
+            assert!(subject.starts_with("Patient/"));
+        }
+    }
+
+    #[tokio::test]
     async fn test_reference_search_text_modifier_on_display() {
         let (server, backend) = create_test_server().await;
         let tenant = test_tenant();

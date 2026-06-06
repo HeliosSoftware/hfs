@@ -287,6 +287,25 @@ mod query_builder_tests {
     }
 
     #[test]
+    fn test_reference_parameter_below_above() {
+        use helios_persistence::types::SearchModifier;
+
+        for modifier in [SearchModifier::Below, SearchModifier::Above] {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: Some(modifier),
+                values: vec![SearchValue::eq("http://x.org/Questionnaire/q")],
+                chain: vec![],
+                components: vec![],
+            });
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            assert!(fragment.sql.contains("value_reference"));
+            assert!(fragment.sql.contains("|| '/%'"));
+        }
+    }
+
+    #[test]
     fn test_reference_parameter_identifier() {
         use helios_persistence::types::SearchModifier;
 

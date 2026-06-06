@@ -64,14 +64,15 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
     }))
 }
 
-/// Computes all parent URIs for :above matching.
+/// Computes all parent URIs for :above matching (shared with the reference
+/// handler's URL/path-prefix `:above`).
 ///
 /// For "http://example.org/fhir/ValueSet/123", returns:
 /// - "http://example.org/fhir/ValueSet/123"
 /// - "http://example.org/fhir/ValueSet"
 /// - "http://example.org/fhir"
 /// - "http://example.org"
-fn compute_parent_uris(uri: &str) -> Vec<String> {
+pub(crate) fn compute_parent_uris(uri: &str) -> Vec<String> {
     let mut result = vec![uri.to_string()];
 
     // Strip query and fragment

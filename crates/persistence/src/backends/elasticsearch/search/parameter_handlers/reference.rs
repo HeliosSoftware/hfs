@@ -37,6 +37,48 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
         }));
     }
 
+    // :below / :above - URL/path-prefix hierarchy on the reference value
+    // (canonical |version comparison is not handled).
+    if param.modifier == Some(SearchModifier::Below) {
+        return Some(json!({
+            "nested": {
+                "path": "search_params.reference",
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "term": { "search_params.reference.name": name } },
+                            {
+                                "bool": {
+                                    "should": [
+                                        { "term": { "search_params.reference.reference": value } },
+                                        { "prefix": { "search_params.reference.reference": format!("{}/", value.trim_end_matches('/')) } }
+                                    ],
+                                    "minimum_should_match": 1
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+    }
+    if param.modifier == Some(SearchModifier::Above) {
+        let parents = super::uri::compute_parent_uris(value);
+        return Some(json!({
+            "nested": {
+                "path": "search_params.reference",
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "term": { "search_params.reference.name": name } },
+                            { "terms": { "search_params.reference.reference": parents } }
+                        ]
+                    }
+                }
+            }
+        }));
+    }
+
     // :contains - case-insensitive substring match on the stored reference.
     if param.modifier == Some(SearchModifier::Contains) {
         return Some(json!({

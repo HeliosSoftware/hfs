@@ -748,9 +748,15 @@ impl PostgresBackend {
             SearchParamType::Token => {
                 vec!["not", "text", "code-text", "in", "of-type", "missing"]
             }
-            SearchParamType::Reference => {
-                vec!["identifier", "contains", "text", "code-text", "missing"]
-            }
+            SearchParamType::Reference => vec![
+                "identifier",
+                "contains",
+                "text",
+                "code-text",
+                "below",
+                "above",
+                "missing",
+            ],
             SearchParamType::Date => vec!["missing"],
             SearchParamType::Number => vec!["missing"],
             SearchParamType::Quantity => vec!["missing"],
