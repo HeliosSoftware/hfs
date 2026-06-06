@@ -12,6 +12,18 @@ use crate::types::{
     strip_reference_version,
 };
 
+/// Returns the implicit precision of a decimal search value from its string form
+/// (e.g. `"100"` → 1.0, `"100.0"` → 0.1), used to build `eq` ranges.
+fn quantity_implicit_precision(num_str: &str) -> f64 {
+    match num_str.find('.') {
+        Some(dot) => {
+            let decimals = num_str.len() - dot - 1;
+            10f64.powi(-(decimals as i32))
+        }
+        None => 1.0,
+    }
+}
+
 /// How a sort key's value is typed for cursor (keyset) binding and comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortValueKind {
@@ -803,33 +815,128 @@ impl PostgresQueryBuilder {
 
     fn build_quantity_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
+        // Running placeholder counter: the outer builder advances by the
+        // fragment's params.len(), so numbering must be sequential and gap-free.
+        let mut next = offset;
 
-        for (i, value) in param.values.iter().enumerate() {
-            let base_offset = offset + i * 2;
-            // Parse quantity: [prefix]number|system|code
+        for value in &param.values {
+            // Parse quantity: [prefix]number|system|code (or number|code, or number).
             let parts: Vec<&str> = value.value.splitn(3, '|').collect();
-            if let Some(num_str) = parts.first() {
-                if let Ok(num) = num_str.parse::<f64>() {
-                    let op = Self::prefix_to_operator(&value.prefix);
-                    if parts.len() >= 3 {
-                        conditions.push(SqlFragment::with_params(
-                            format!(
-                                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_quantity_value {} ${} AND value_quantity_unit = ${})",
-                                param.name, op, base_offset + 1, base_offset + 2
-                            ),
-                            vec![SqlParam::Float(num), SqlParam::text(parts[2])],
-                        ));
-                    } else {
-                        conditions.push(SqlFragment::with_params(
-                            format!(
-                                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_quantity_value {} ${})",
-                                param.name, op, base_offset + 1
-                            ),
-                            vec![SqlParam::Float(num)],
-                        ));
+            let num: f64 = match parts.first().and_then(|s| s.parse::<f64>().ok()) {
+                Some(n) => n,
+                None => continue,
+            };
+            let num_str = parts[0];
+            let op = Self::prefix_to_operator(&value.prefix);
+            let (system, code) = match parts.len() {
+                3 => (
+                    (!parts[1].is_empty()).then_some(parts[1]),
+                    (!parts[2].is_empty()).then_some(parts[2]),
+                ),
+                2 => (None, (!parts[1].is_empty()).then_some(parts[1])),
+                _ => (None, None),
+            };
+
+            let mut params: Vec<SqlParam> = Vec::new();
+
+            // Raw branch: exact value comparison + the stored unit/system.
+            next += 1;
+            params.push(SqlParam::Float(num));
+            let mut raw = format!("value_quantity_value {op} ${next}");
+            if let Some(c) = code {
+                next += 1;
+                params.push(SqlParam::text(c));
+                raw.push_str(&format!(" AND value_quantity_unit = ${next}"));
+            }
+            if let Some(s) = system {
+                next += 1;
+                params.push(SqlParam::text(s));
+                raw.push_str(&format!(" AND value_quantity_system = ${next}"));
+            }
+
+            // Canonical branch (range-based on the canonical columns) so unit
+            // equivalents match (g ⇄ mg). Bounds are canonicalized to preserve
+            // range/precision and absorb float-conversion noise. Skipped for
+            // `ne` and non-convertible units.
+            let mut predicate = format!("({raw})");
+            if let Some(c) = code {
+                if !matches!(value.prefix, SearchPrefix::Ne) {
+                    if let Some((_, cunit)) = helios_fhirpath::ucum::canonicalize_quantity(num, c) {
+                        let canon = |x: f64| {
+                            helios_fhirpath::ucum::canonicalize_quantity(x, c).map(|(v, _)| v)
+                        };
+                        let col = "value_quantity_canonical_value";
+                        let range: Option<String> = match value.prefix {
+                            SearchPrefix::Gt | SearchPrefix::Sa => canon(num).map(|b| {
+                                next += 1;
+                                params.push(SqlParam::Float(b));
+                                format!("{col} > ${next}")
+                            }),
+                            SearchPrefix::Lt | SearchPrefix::Eb => canon(num).map(|b| {
+                                next += 1;
+                                params.push(SqlParam::Float(b));
+                                format!("{col} < ${next}")
+                            }),
+                            SearchPrefix::Ge => canon(num).map(|b| {
+                                next += 1;
+                                params.push(SqlParam::Float(b));
+                                format!("{col} >= ${next}")
+                            }),
+                            SearchPrefix::Le => canon(num).map(|b| {
+                                next += 1;
+                                params.push(SqlParam::Float(b));
+                                format!("{col} <= ${next}")
+                            }),
+                            SearchPrefix::Ap => {
+                                let margin = (num.abs() * 0.1).max(0.0001);
+                                match (canon(num - margin), canon(num + margin)) {
+                                    (Some(a), Some(b)) => {
+                                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                                        next += 1;
+                                        params.push(SqlParam::Float(lo));
+                                        let lo_p = next;
+                                        next += 1;
+                                        params.push(SqlParam::Float(hi));
+                                        Some(format!("{col} BETWEEN ${lo_p} AND ${next}"))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            // Eq + default: implicit-precision range.
+                            _ => {
+                                let half = quantity_implicit_precision(num_str) / 2.0;
+                                match (canon(num - half), canon(num + half)) {
+                                    (Some(a), Some(b)) => {
+                                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                                        next += 1;
+                                        params.push(SqlParam::Float(lo));
+                                        let lo_p = next;
+                                        next += 1;
+                                        params.push(SqlParam::Float(hi));
+                                        Some(format!("{col} >= ${lo_p} AND {col} < ${next}"))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                        };
+                        if let Some(range) = range {
+                            next += 1;
+                            params.push(SqlParam::text(&cunit));
+                            predicate = format!(
+                                "(({raw}) OR ({range} AND value_quantity_canonical_unit = ${next}))"
+                            );
+                        }
                     }
                 }
             }
+
+            conditions.push(SqlFragment::with_params(
+                format!(
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
+                    param.name, predicate
+                ),
+                params,
+            ));
         }
 
         if conditions.is_empty() {

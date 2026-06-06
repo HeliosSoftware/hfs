@@ -216,11 +216,14 @@ Ordered roughly by impact:
    - **Elasticsearch: complete** — canonical `value`/`unit` stored in the `quantity` nested object;
      the handler ORs a canonical range (bounds canonicalized) with the raw match (integration-tested
      against a live ES container).
-   - **Postgres: write-side done** (canonical columns populated by the writer); the **query-side OR**
-     into the canonical columns is not yet wired (raw unit matching only) — pending param-stride and
-     float-tolerance handling.
+   - **Postgres: complete** — writer populates canonical columns; the quantity handler ORs a
+     range-based canonical predicate (bounds canonicalized; eq uses an implicit-precision range that
+     also absorbs float-conversion noise) with the raw match. Integration-tested against a live PG
+     container.
    - A **reindex backfill** (`ReindexRequest`) is required to populate canonical columns for
      resources written before the upgrade; un-reindexed rows fall back to raw unit matching.
+
+   All three searchable backends (SQLite, Postgres, Elasticsearch) now match UCUM-equivalent units.
 8. **Accent-insensitive string search** (schema v10) — string search folds case **and** accents via
    NFD + combining-mark stripping (`unicode-normalization`, shared `search::fold_text`), stored in
    `value_string_folded`.
