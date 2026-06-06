@@ -287,6 +287,26 @@ mod query_builder_tests {
     }
 
     #[test]
+    fn test_reference_parameter_identifier() {
+        use helios_persistence::types::SearchModifier;
+
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: Some(SearchModifier::Identifier),
+            values: vec![SearchValue::eq("http://hospital.org|12345")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+        // Correlated subquery against the target's 'identifier' index rows.
+        assert!(fragment.sql.contains("param_name = 'identifier'"));
+        assert!(fragment.sql.contains("idx.value_token_system"));
+        assert!(fragment.sql.contains("idx.value_token_code"));
+    }
+
+    #[test]
     fn test_uri_parameter_contains() {
         use helios_persistence::types::SearchModifier;
 
@@ -2601,6 +2621,77 @@ mod postgres_integration {
         let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
         assert!(ids.contains(&"obs-1"));
         assert!(ids.contains(&"obs-2"));
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_search_reference_identifier() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Patient with a known identifier, plus a decoy patient.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p-ident-1",
+                    "identifier": [{"system": "http://hospital.org", "value": "MRN-42"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p-ident-2",
+                    "identifier": [{"system": "http://hospital.org", "value": "MRN-99"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        for (oid, pid) in [("obs-i1", "p-ident-1"), ("obs-i2", "p-ident-2")] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": oid,
+                        "subject": {"reference": format!("Patient/{pid}")},
+                        "status": "final"
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // subject:identifier matches the observation whose subject patient has
+        // the given identifier.
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: Some(SearchModifier::Identifier),
+            values: vec![SearchValue::eq("http://hospital.org|MRN-42")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+        assert_eq!(ids, vec!["obs-i1"]);
     }
 
     #[tokio::test]
