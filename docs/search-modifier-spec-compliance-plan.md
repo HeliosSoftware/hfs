@@ -65,5 +65,28 @@ handler, MongoDB handler, the backend `capabilities()` modifier lists, the
 
 ## Status
 
-- [x] `:of-type` spelling alias (`of-type` + `ofType`) — committed.
-- [ ] Phase 0 … Phase 5 (see task list).
+- [x] `:of-type` spelling alias (`of-type` + `ofType`).
+- [x] **Phase 0** — `:not` token-only; central 400 validation gate; capability
+  audit (drop `:not-in` 501-advertisement) across all 4 backends.
+- [x] **Phase 1** — `:contains` on uri + reference (all backends).
+- [x] **Phase 2** — `:text` on string (all backends).
+- [x] **Phase 3** — `:code-text` on token (all backends); also filled PG token `:text`.
+- [x] **Phase 4** — `Reference.display` indexed (SQLite/PG v8→v9 migrations, ES
+  mapping, Mongo); reference `:text`/`:code-text` (all backends).
+- [x] **Phase 5** — `:in`/`:not-in` token-only; `:not-in` returns 501
+  unconditionally.
+- [x] **Postgres `:identifier`** — implemented (was advertised but broken).
+
+### Remaining (tracked as tasks, not blocking)
+
+- [ ] Reference `:text-advanced` (FTS over display) and `:above`/`:below`
+  (canonical version hierarchy). `is_valid_for` keeps them strict (gate 400s
+  them) until implemented.
+- [ ] MongoDB has no `SearchCapabilityProvider`, so it advertises no modifiers
+  while honoring several (string exact/contains/text, token code/text/code-text,
+  reference contains/text/code-text, uri exact/contains). Advertising-only gap;
+  no correctness impact.
+
+Validation: SQLite (full REST + unit) and Postgres (Docker integration) suites
+green on every commit; Elasticsearch and MongoDB compile-checked with logic
+mirroring the validated backends (CI runs their Docker matrix).

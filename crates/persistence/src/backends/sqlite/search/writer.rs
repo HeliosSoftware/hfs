@@ -266,7 +266,7 @@ mod tests {
         let params =
             SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", &extracted);
 
-        assert_eq!(params.len(), 20); // Updated for new columns
+        assert_eq!(params.len(), 21); // Updated for new columns
         assert!(matches!(&params[0], SqlValue::String(s) if s == "tenant1"));
         assert!(matches!(&params[5], SqlValue::OptString(Some(s)) if s == "Smith"));
     }
@@ -290,7 +290,7 @@ mod tests {
         let params =
             SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", &extracted);
 
-        assert_eq!(params.len(), 20); // Updated for new columns
+        assert_eq!(params.len(), 21); // Updated for new columns
         assert!(matches!(&params[6], SqlValue::OptString(Some(s)) if s == "http://example.org"));
         assert!(matches!(&params[7], SqlValue::String(s) if s == "12345"));
     }
@@ -314,7 +314,7 @@ mod tests {
         let params =
             SqliteSearchIndexWriter::to_sql_params("tenant1", "Observation", "123", &extracted);
 
-        assert_eq!(params.len(), 20);
+        assert_eq!(params.len(), 21);
         assert!(matches!(&params[8], SqlValue::OptString(Some(s)) if s == "Test Display")); // value_token_display
     }
 
@@ -339,7 +339,7 @@ mod tests {
         let params =
             SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", &extracted);
 
-        assert_eq!(params.len(), 20);
+        assert_eq!(params.len(), 21);
         // value_identifier_type_system is at index 18
         assert!(
             matches!(&params[18], SqlValue::OptString(Some(s)) if s == "http://terminology.hl7.org/CodeSystem/v2-0203")
