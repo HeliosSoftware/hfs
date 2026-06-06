@@ -340,6 +340,73 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_total_accurate_populates_bundle_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Baseline count of all patients (no _total -> total omitted).
+        let baseline: Value = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let patient_count = get_bundle_entries(&baseline).len() as i64;
+        assert!(patient_count > 0, "fixture should seed patients");
+        assert!(
+            baseline["total"].is_null(),
+            "Bundle.total should be absent without _total"
+        );
+
+        // _total=accurate -> Bundle.total present and equal to the match count.
+        let response = server
+            .get("/Patient?_total=accurate")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert_eq!(
+            body["total"].as_i64(),
+            Some(patient_count),
+            "Bundle.total must equal the number of matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_param_lenient_ignored_strict_rejected() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Lenient (default): unknown parameter is ignored, search succeeds.
+        let lenient = server
+            .get("/Patient?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+
+        // Strict: unknown parameter is rejected with 400.
+        let strict = server
+            .get("/Patient?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(strict.status_code(), StatusCode::BAD_REQUEST);
+
+        // A known parameter is accepted even under strict handling.
+        let ok = server
+            .get("/Patient?name=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        ok.assert_status_ok();
+    }
+
+    #[tokio::test]
     async fn test_search_by_id() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
@@ -973,6 +1040,39 @@ mod subsetting {
             // Should not include unrequested elements
             assert!(resource["gender"].is_null());
             assert!(resource["birthDate"].is_null());
+            // Subset responses must carry the SUBSETTED meta.tag (FHIR spec).
+            let tags = resource["meta"]["tag"]
+                .as_array()
+                .expect("meta.tag present");
+            assert!(
+                tags.iter().any(|t| t["code"] == "SUBSETTED"
+                    && t["system"] == "http://terminology.hl7.org/CodeSystem/v3-ObservationValue"),
+                "subsetted entry should be tagged SUBSETTED"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_subsetted_tag_without_subsetting() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_count=1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        if let Some(entry) = entries.first() {
+            let tags = entry["resource"]["meta"]["tag"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !tags.iter().any(|t| t["code"] == "SUBSETTED"),
+                "full representation must not be tagged SUBSETTED"
+            );
         }
     }
 }
@@ -1438,12 +1538,20 @@ mod includes {
 
         assert!(obs_count >= 1, "Should have at least 1 observation");
 
-        // If includes are working, we should have a patient too
-        // Check if any entry has search.mode = "include"
-        let has_include = entries.iter().any(|e| e["search"]["mode"] == "include");
-        if has_include {
-            assert!(patient_count >= 1, "Should include the patient");
-        }
+        // The referenced Patient must be included, tagged search.mode=include.
+        assert!(patient_count >= 1, "Should include the referenced patient");
+        let included_patient = entries.iter().find(|e| {
+            e["resource"]["resourceType"] == "Patient" && e["search"]["mode"] == "include"
+        });
+        assert!(
+            included_patient.is_some(),
+            "Patient should be present as an include entry"
+        );
+        assert_eq!(
+            included_patient.unwrap()["resource"]["id"],
+            "patient-1",
+            "the subject of obs-1 is patient-1"
+        );
     }
 
     #[tokio::test]
@@ -1490,7 +1598,13 @@ mod includes {
             resource_types.contains(&"Observation"),
             "Should have observation"
         );
-        // Included resources depend on implementation
+        // Repeated _include keys are both honored (AND). obs-1's subject is
+        // Patient/patient-1; it has no encounter, so only the Patient is added —
+        // but crucially the subject include is NOT lost to the encounter one.
+        assert!(
+            resource_types.contains(&"Patient"),
+            "subject include must survive alongside the encounter include"
+        );
     }
 
     #[tokio::test]
@@ -1522,11 +1636,15 @@ mod includes {
             .filter(|e| e["resource"]["resourceType"] == "Observation")
             .count();
 
-        // If revinclude is working, we should have observations
-        let has_include = entries.iter().any(|e| e["search"]["mode"] == "include");
-        if has_include {
-            assert!(obs_count >= 1, "Should revinclude observations");
-        }
+        // Observations referencing patient-1 must be reverse-included.
+        assert!(obs_count >= 1, "Should revinclude observations");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["resource"]["resourceType"] == "Observation"
+                    && e["search"]["mode"] == "include"),
+            "revincluded observations must be tagged search.mode=include"
+        );
     }
 
     #[tokio::test]
@@ -1552,17 +1670,26 @@ mod includes {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        // Use _include:iterate to follow references from included resources
+        // _include:iterate follows references from included resources:
+        // obs-1 -> subject Patient/patient-1 -> organization Organization/org-1.
         let response = server
             .get("/Observation?_id=obs-1&_include=Observation:subject&_include:iterate=Patient:organization")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        // May or may not be supported
-        let status = response.status_code();
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        let types: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e["resource"]["resourceType"].as_str())
+            .collect();
+
+        // First-hop include (Patient) and the transitively-included Organization.
+        assert!(types.contains(&"Patient"), "subject Patient included");
         assert!(
-            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
-            "Should return OK or indicate unsupported"
+            types.contains(&"Organization"),
+            ":iterate should transitively include the Patient's managingOrganization"
         );
     }
 
@@ -1571,17 +1698,28 @@ mod includes {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        // Use * to include all references
+        // _include=Observation:* expands to every reference search param of
+        // Observation; obs-1 references subject (Patient) and performer
+        // (Practitioner), both of which should be included.
         let response = server
             .get("/Observation?_id=obs-1&_include=Observation:*")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        // May or may not be supported
-        let status = response.status_code();
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        let types: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e["resource"]["resourceType"].as_str())
+            .collect();
         assert!(
-            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
-            "Should return OK or indicate unsupported"
+            types.contains(&"Patient"),
+            "wildcard include resolves subject"
+        );
+        assert!(
+            types.contains(&"Practitioner"),
+            "wildcard include resolves performer"
         );
     }
 

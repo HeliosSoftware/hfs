@@ -51,30 +51,7 @@ fn bad_request(msg: impl Into<String>) -> RestError {
     }
 }
 
-/// Parses a raw query string into ordered key/value pairs (repeated keys kept).
-fn parse_query_pairs(raw: Option<&str>) -> Vec<(String, String)> {
-    match raw {
-        None => Vec::new(),
-        Some(q) => url::form_urlencoded::parse(q.as_bytes())
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect(),
-    }
-}
-
-/// Collects all values for `key`, splitting each on `,`.
-fn collect_multi(pairs: &[(String, String)], key: &str) -> Vec<String> {
-    pairs
-        .iter()
-        .filter(|(k, _)| k == key)
-        .flat_map(|(_, v)| v.split(',').map(|s| s.trim().to_string()))
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-/// Returns the first value for `key`, if any.
-fn first_value(pairs: &[(String, String)], key: &str) -> Option<String> {
-    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-}
+use crate::extractors::query_pairs::{collect_multi, first_value, parse_query_pairs};
 
 /// Parses a FHIR `instant` into a UTC datetime.
 fn parse_instant(s: &str) -> Result<chrono::DateTime<Utc>, RestError> {

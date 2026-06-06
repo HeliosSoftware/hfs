@@ -76,6 +76,15 @@ impl SearchProvider for SqliteBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        // Populate Bundle.total only when the client asked for it
+        // (`_total=accurate|estimate`). Computed up-front, before acquiring the
+        // (non-Send) connection, so it is not held across this await.
+        let total = if query.wants_total() {
+            Some(self.search_count(tenant, query).await?)
+        } else {
+            None
+        };
+
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
@@ -306,7 +315,7 @@ impl SearchProvider for SqliteBackend {
         let page_info = PageInfo {
             next_cursor,
             previous_cursor,
-            total: None,
+            total,
             has_next,
             has_previous,
         };
@@ -316,7 +325,7 @@ impl SearchProvider for SqliteBackend {
         Ok(SearchResult {
             resources: page,
             included: Vec::new(),
-            total: None,
+            total,
         })
     }
 
