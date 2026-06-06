@@ -407,6 +407,29 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_reference_search_is_version_agnostic() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // obs-1 stores an unversioned subject (Patient/patient-1). A versioned
+        // reference search must still match it (version is not considered).
+        let response = server
+            .get("/Observation?subject=Patient/patient-1/_history/5")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let ids: Vec<&str> = get_bundle_entries(&body)
+            .iter()
+            .filter_map(|e| e["resource"]["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"obs-1"),
+            "versioned reference search should match the unversioned stored reference"
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_by_id() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;

@@ -875,12 +875,14 @@ mod tests {
 
         let fragment = builder.build(&query);
 
-        // Should use ?3 and ?4 for the two params in ID-only reference search
-        // (after ?1 tenant and ?2 resource_type)
+        // ID-only reference search is version-agnostic: exact, `%/id`, and
+        // `%/id/_history/%`, so three params (?3, ?4, ?5) after ?1 tenant / ?2
+        // resource_type.
         assert!(fragment.sql.contains("?3"));
         assert!(fragment.sql.contains("?4"));
-        // Should have 4 total params: tenant, resource_type, ref_value, ref_value
-        assert_eq!(fragment.params.len(), 4);
+        assert!(fragment.sql.contains("?5"));
+        // tenant, resource_type, + 3 ref_value bindings
+        assert_eq!(fragment.params.len(), 5);
     }
 
     #[test]
@@ -900,13 +902,12 @@ mod tests {
 
         let fragment = builder.build(&query);
 
-        // First value uses ?3 and ?4 (2 params for ID-only)
-        // Second value uses ?5 and ?6 (2 more params for ID-only)
-        assert!(fragment.sql.contains("?3"));
-        assert!(fragment.sql.contains("?4"));
-        assert!(fragment.sql.contains("?5"));
-        assert!(fragment.sql.contains("?6"));
-        // Should have 6 total params: tenant, resource_type, + 4 for 2 ID-only refs
-        assert_eq!(fragment.params.len(), 6);
+        // Each ID-only value now binds 3 params (exact, `%/id`, `%/id/_history/%`):
+        // first value ?3..?5, second value ?6..?8.
+        for p in ["?3", "?4", "?5", "?6", "?7", "?8"] {
+            assert!(fragment.sql.contains(p), "missing placeholder {p}");
+        }
+        // tenant, resource_type, + 3 per ID-only ref × 2 values
+        assert_eq!(fragment.params.len(), 8);
     }
 }

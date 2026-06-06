@@ -725,6 +725,17 @@ pub enum SummaryMode {
     Count,
 }
 
+/// Strips a `/_history/<vid>` version suffix from a FHIR reference, returning
+/// the version-agnostic base. References without a version are returned
+/// unchanged. Used so reference search matches regardless of version, per the
+/// FHIR spec.
+pub fn strip_reference_version(reference: &str) -> &str {
+    match reference.find("/_history/") {
+        Some(i) => &reference[..i],
+        None => reference,
+    }
+}
+
 impl SearchQuery {
     /// Creates a new search query for the given resource type.
     pub fn new(resource_type: impl Into<String>) -> Self {
