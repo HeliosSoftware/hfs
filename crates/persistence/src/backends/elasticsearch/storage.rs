@@ -254,6 +254,7 @@ pub(crate) fn build_es_document(
                 reference,
                 resource_type: ref_type,
                 resource_id: ref_id,
+                display,
             } => {
                 let mut ref_doc = json!({
                     "name": ev.param_name,
@@ -264,6 +265,9 @@ pub(crate) fn build_es_document(
                 }
                 if let Some(ri) = ref_id {
                     ref_doc["resource_id"] = json!(ri);
+                }
+                if let Some(d) = display {
+                    ref_doc["display"] = json!(d);
                 }
                 reference_params.push(ref_doc);
             }

@@ -61,6 +61,9 @@ pub enum IndexValue {
         resource_type: Option<String>,
         /// Resource ID if extractable.
         resource_id: Option<String>,
+        /// Display text (`Reference.display`), for the `:text`/`:code-text`/
+        /// `:text-advanced` modifiers on reference parameters.
+        display: Option<String>,
     },
 
     /// URI value.
@@ -160,8 +163,13 @@ impl IndexValue {
         }
     }
 
-    /// Creates a reference index value.
+    /// Creates a reference index value (no display text).
     pub fn reference(reference: impl Into<String>) -> Self {
+        Self::reference_with_display(reference, None)
+    }
+
+    /// Creates a reference index value with optional `Reference.display` text.
+    pub fn reference_with_display(reference: impl Into<String>, display: Option<String>) -> Self {
         let reference = reference.into();
         let (resource_type, resource_id) = parse_reference(&reference);
 
@@ -169,6 +177,7 @@ impl IndexValue {
             reference,
             resource_type,
             resource_id,
+            display,
         }
     }
 
@@ -534,7 +543,11 @@ impl ValueConverter {
             }
             Value::Object(obj) => {
                 if let Some(reference) = obj.get("reference").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::reference(reference));
+                    let display = obj
+                        .get("display")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    results.push(IndexValue::reference_with_display(reference, display));
                 }
             }
             _ => {}
@@ -732,7 +745,8 @@ mod tests {
     #[test]
     fn test_convert_reference_object() {
         let value = json!({
-            "reference": "Patient/123"
+            "reference": "Patient/123",
+            "display": "John Smith"
         });
         let results =
             ValueConverter::convert(&value, SearchParamType::Reference, "subject").unwrap();
@@ -742,11 +756,13 @@ mod tests {
             reference,
             resource_type,
             resource_id,
+            display,
         } = &results[0]
         {
             assert_eq!(reference, "Patient/123");
             assert_eq!(resource_type.as_ref().unwrap(), "Patient");
             assert_eq!(resource_id.as_ref().unwrap(), "123");
+            assert_eq!(display.as_ref().unwrap(), "John Smith");
         }
     }
 

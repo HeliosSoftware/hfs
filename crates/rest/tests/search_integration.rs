@@ -463,6 +463,67 @@ mod string_search {
         let entries = get_bundle_entries(&body);
         assert!(!entries.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_string_search_text_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `:text` on a string is a case-insensitive partial match (FHIR spec
+        // allows :text on string). Previously the gate rejected it as
+        // token-only; now it matches "Smith" via the substring "mit".
+        let response = server
+            .get("/Patient?name:text=mit")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert!(!entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_not_in_modifier_returns_501_without_terminology_server() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // :not-in needs negated value-set filtering, which is unimplemented; it
+        // must return 501 rather than silently returning a superset, even when
+        // no terminology server is configured.
+        let response = server
+            .get("/Observation?code:not-in=http://example.org/vs")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn test_modifier_invalid_for_param_type_returns_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `:above` is only defined for token/uri/reference params; applying it
+        // to the string param `name` must be rejected with a 400 + invalid
+        // OperationOutcome rather than silently ignored.
+        let response = server
+            .get("/Patient?name:above=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["severity"], "error");
+        assert_eq!(body["issue"][0]["code"], "invalid");
+        assert!(
+            body["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("above")
+        );
+    }
 }
 
 // =============================================================================
@@ -568,6 +629,105 @@ mod reference_search {
 
         let entries = get_bundle_entries(&body);
         assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reference_search_contains_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `:contains` is spec-valid for reference params (substring match on the
+        // stored reference). Previously the validation gate rejected it as
+        // string-only; now it resolves and matches "Patient/patient-1".
+        let response = server
+            .get("/Observation?subject:contains=patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+
+        let entries = get_bundle_entries(&body);
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            let subject = entry["resource"]["subject"]["reference"].as_str().unwrap();
+            assert!(subject.contains("patient-1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reference_search_below_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // :below does URL/path-prefix hierarchy on the reference. "Patient"
+        // matches "Patient/patient-1" etc. (the seeded observation subjects).
+        let response = server
+            .get("/Observation?subject:below=Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            let subject = entry["resource"]["subject"]["reference"].as_str().unwrap();
+            assert!(subject.starts_with("Patient/"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reference_search_text_modifier_on_display() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+
+        // An Observation whose subject reference carries a display string. The
+        // extractor indexes Reference.display so :text (contains) and :code-text
+        // (starts-with) can match it.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-display-1",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+                    "subject": {"reference": "Patient/p-xyz", "display": "Johnny Appleseed"}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        // :text matches a substring of the display.
+        let response = server
+            .get("/Observation?subject:text=Appleseed")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resource"]["id"], "obs-display-1");
+
+        // :code-text matches a prefix of the display, but not a mid-string token.
+        let prefix = server
+            .get("/Observation?subject:code-text=Johnny")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        prefix.assert_status_ok();
+        let prefix_body: Value = prefix.json();
+        assert_eq!(get_bundle_entries(&prefix_body).len(), 1);
+
+        let mid = server
+            .get("/Observation?subject:code-text=Appleseed")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        mid.assert_status_ok();
+        let mid_body: Value = mid.json();
+        assert_eq!(get_bundle_entries(&mid_body).len(), 0);
     }
 }
 

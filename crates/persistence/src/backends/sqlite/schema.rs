@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -148,6 +148,7 @@ fn create_schema_v1(conn: &Connection) -> StorageResult<()> {
             composite_group INTEGER,
             value_identifier_type_system TEXT,
             value_identifier_type_code TEXT,
+            value_reference_display TEXT,
             FOREIGN KEY (tenant_id, resource_type, resource_id)
                 REFERENCES resources(tenant_id, resource_type, id) ON DELETE CASCADE
         )",
@@ -264,6 +265,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             5 => migrate_v5_to_v6(conn)?,
             6 => migrate_v6_to_v7(conn)?,
             7 => migrate_v7_to_v8(conn)?,
+            8 => migrate_v8_to_v9(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -941,6 +943,25 @@ fn migrate_v7_to_v8(conn: &Connection) -> StorageResult<()> {
             .map_err(|e| migration_err(format!("create index: {e}")))?;
     }
 
+    Ok(())
+}
+
+/// v8 → v9: add `value_reference_display` for reference text modifiers
+/// (`:text`/`:code-text`/`:text-advanced` on reference params). Additive and
+/// nullable; existing rows stay NULL until the resource is reindexed.
+fn migrate_v8_to_v9(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`; the column may already exist if
+    // the table was created fresh at v9, so ignore a duplicate-column error.
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN value_reference_display TEXT",
+        [],
+    );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_reference_display
+         ON search_index(tenant_id, resource_type, param_name, value_reference_display)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create reference_display index: {e}")))?;
     Ok(())
 }
 

@@ -519,3 +519,129 @@ impl Backend for MongoBackend {
             })
     }
 }
+
+// ============================================================================
+// SearchCapabilityProvider Implementation
+// ============================================================================
+
+use crate::core::capabilities::{
+    GlobalSearchCapabilities, ResourceSearchCapabilities, SearchCapabilityProvider,
+};
+use crate::types::{
+    IncludeCapability, PaginationCapability, ResultModeCapability, SearchParamFullCapability,
+    SearchParamType, SpecialSearchParam,
+};
+
+impl MongoBackend {
+    /// Returns the search modifiers the MongoDB backend actually honors for a
+    /// parameter type. Unlike the SQL backends, the Mongo search implementation
+    /// does not implement `:missing`, token `:not`/`:of-type`, reference
+    /// `:identifier`, or uri `:above`/`:below`; advertising only what
+    /// `search_impl` accepts keeps the CapabilityStatement honest.
+    fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
+        match param_type {
+            SearchParamType::String => vec!["exact", "contains", "text"],
+            SearchParamType::Token => vec!["code", "text", "code-text"],
+            SearchParamType::Reference => vec!["contains", "text", "code-text"],
+            SearchParamType::Uri => vec!["exact", "contains"],
+            SearchParamType::Date
+            | SearchParamType::Number
+            | SearchParamType::Quantity
+            | SearchParamType::Composite
+            | SearchParamType::Special => vec![],
+        }
+    }
+}
+
+impl SearchCapabilityProvider for MongoBackend {
+    fn resource_search_capabilities(
+        &self,
+        resource_type: &str,
+    ) -> Option<ResourceSearchCapabilities> {
+        let params = {
+            let registry = self.search_registry.read();
+            registry.get_active_params(resource_type)
+        };
+        let common_params = {
+            let registry = self.search_registry.read();
+            registry.get_active_params("Resource")
+        };
+        if params.is_empty() && common_params.is_empty() {
+            return None;
+        }
+
+        let mut search_params = Vec::new();
+        for param in &params {
+            let mut cap = SearchParamFullCapability::new(&param.code, param.param_type)
+                .with_definition(&param.url)
+                .with_modifiers(Self::modifiers_for_type(param.param_type));
+            if let Some(ref targets) = param.target {
+                cap = cap.with_targets(targets.iter().map(|s| s.as_str()));
+            }
+            search_params.push(cap);
+        }
+        for param in &common_params {
+            if !search_params.iter().any(|p| p.name == param.code) {
+                search_params.push(
+                    SearchParamFullCapability::new(&param.code, param.param_type)
+                        .with_definition(&param.url)
+                        .with_modifiers(Self::modifiers_for_type(param.param_type)),
+                );
+            }
+        }
+
+        Some(
+            ResourceSearchCapabilities::new(resource_type)
+                .with_special_params(vec![SpecialSearchParam::Id])
+                .with_include_capabilities(vec![
+                    IncludeCapability::Include,
+                    IncludeCapability::Revinclude,
+                ])
+                .with_pagination_capabilities(vec![
+                    PaginationCapability::Count,
+                    PaginationCapability::Offset,
+                    PaginationCapability::MaxPageSize(1000),
+                    PaginationCapability::DefaultPageSize(20),
+                ])
+                .with_result_mode_capabilities(vec![ResultModeCapability::Total])
+                .with_param_list(search_params),
+        )
+    }
+
+    fn global_search_capabilities(&self) -> GlobalSearchCapabilities {
+        GlobalSearchCapabilities::new().with_special_params(vec![SpecialSearchParam::Id])
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn test_modifiers_for_type_reflects_mongo_support() {
+        // String honors exact/contains/text but not :missing.
+        let s = MongoBackend::modifiers_for_type(SearchParamType::String);
+        assert!(s.contains(&"exact"));
+        assert!(s.contains(&"text"));
+        assert!(!s.contains(&"missing"));
+
+        // Token honors code/text/code-text but not :not or :of-type.
+        let t = MongoBackend::modifiers_for_type(SearchParamType::Token);
+        assert!(t.contains(&"code"));
+        assert!(t.contains(&"code-text"));
+        assert!(!t.contains(&"not"));
+        assert!(!t.contains(&"of-type"));
+
+        // Reference honors contains/text/code-text but not :identifier.
+        let r = MongoBackend::modifiers_for_type(SearchParamType::Reference);
+        assert!(r.contains(&"contains"));
+        assert!(r.contains(&"text"));
+        assert!(!r.contains(&"identifier"));
+
+        // Uri honors exact/contains but not :above/:below.
+        let u = MongoBackend::modifiers_for_type(SearchParamType::Uri);
+        assert!(u.contains(&"contains"));
+        assert!(!u.contains(&"above"));
+        assert!(!u.contains(&"below"));
+    }
+}

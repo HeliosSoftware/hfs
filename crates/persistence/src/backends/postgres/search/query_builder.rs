@@ -376,7 +376,9 @@ impl PostgresQueryBuilder {
                     ),
                     vec![SqlParam::text(&value.value)],
                 ),
-                Some(SearchModifier::Contains) => SqlFragment::with_params(
+                // `:text` on a string is a case-insensitive partial match,
+                // implemented here as a substring match (same as `:contains`).
+                Some(SearchModifier::Contains | SearchModifier::Text) => SqlFragment::with_params(
                     format!(
                         "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_string ILIKE ${})",
                         param.name, param_num
@@ -412,6 +414,39 @@ impl PostgresQueryBuilder {
         // in the three-part form `type-system|type-code|identifier-value`.
         if let Some(SearchModifier::OfType) = param.modifier {
             return Self::build_of_type_condition(param, offset);
+        }
+
+        // `:text` (contains) and `:code-text` (starts-with) match the token's
+        // display text (Coding.display / CodeableConcept.text).
+        if matches!(
+            param.modifier,
+            Some(SearchModifier::Text | SearchModifier::CodeText)
+        ) {
+            let starts_with = matches!(param.modifier, Some(SearchModifier::CodeText));
+            let mut conditions = Vec::new();
+            for (i, value) in param.values.iter().enumerate() {
+                let param_num = offset + i + 1;
+                let pattern = if starts_with {
+                    format!("{}%", value.value)
+                } else {
+                    format!("%{}%", value.value)
+                };
+                conditions.push(SqlFragment::with_params(
+                    format!(
+                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_display ILIKE ${})",
+                        param.name, param_num
+                    ),
+                    vec![SqlParam::text(&pattern)],
+                ));
+            }
+            if conditions.is_empty() {
+                return None;
+            }
+            let mut combined = conditions.remove(0);
+            for cond in conditions {
+                combined = combined.or(cond);
+            }
+            return Some(combined);
         }
 
         let mut conditions = Vec::new();
@@ -803,15 +838,119 @@ impl PostgresQueryBuilder {
         Some(combined)
     }
 
-    fn build_reference_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
+    /// Builds the `:identifier` condition: match references whose target
+    /// resource has an identifier equal to the supplied `system|value`. Mirrors
+    /// the SQLite implementation using PG's `SUBSTRING`/`POSITION`.
+    fn build_reference_identifier_condition(
+        param: &SearchParameter,
+        offset: usize,
+    ) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
+        let mut next = offset; // running 0-based param offset
+
+        for value in &param.values {
+            // Correlate the target resource id (the part after '/') with an
+            // 'identifier' index row for that resource.
+            let target = "idx.resource_id = SUBSTRING(ref.value_reference FROM POSITION('/' IN ref.value_reference) + 1)";
+            let (filter, params): (String, Vec<SqlParam>) = match value.value.split_once('|') {
+                Some((system, code)) if system.is_empty() => {
+                    next += 1;
+                    (
+                        format!(
+                            "(idx.value_token_system IS NULL OR idx.value_token_system = '') AND idx.value_token_code = ${next}"
+                        ),
+                        vec![SqlParam::text(code)],
+                    )
+                }
+                Some((system, code)) if code.is_empty() => {
+                    next += 1;
+                    (
+                        format!("idx.value_token_system = ${next}"),
+                        vec![SqlParam::text(system)],
+                    )
+                }
+                Some((system, code)) => {
+                    let s = next + 1;
+                    let c = next + 2;
+                    next += 2;
+                    (
+                        format!("idx.value_token_system = ${s} AND idx.value_token_code = ${c}"),
+                        vec![SqlParam::text(system), SqlParam::text(code)],
+                    )
+                }
+                None => {
+                    next += 1;
+                    (
+                        format!("idx.value_token_code = ${next}"),
+                        vec![SqlParam::text(&value.value)],
+                    )
+                }
+            };
+            conditions.push(SqlFragment::with_params(
+                format!(
+                    "id IN (SELECT ref.resource_id FROM search_index ref \
+                     WHERE ref.tenant_id = $1 AND ref.resource_type = $2 AND ref.param_name = '{}' \
+                     AND EXISTS (SELECT 1 FROM search_index idx \
+                       WHERE idx.tenant_id = $1 AND idx.param_name = 'identifier' \
+                       AND {target} AND {filter}))",
+                    param.name
+                ),
+                params,
+            ));
+        }
+
+        if conditions.is_empty() {
+            return None;
+        }
+        let mut combined = conditions.remove(0);
+        for cond in conditions {
+            combined = combined.or(cond);
+        }
+        Some(combined)
+    }
+
+    fn build_reference_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
+        if matches!(param.modifier.as_ref(), Some(SearchModifier::Identifier)) {
+            return Self::build_reference_identifier_condition(param, offset);
+        }
+
+        let mut conditions = Vec::new();
+        // :contains - case-insensitive substring on the stored reference.
+        // :text (contains) / :code-text (starts-with) match the indexed
+        // Reference.display text.
+        let modifier = param.modifier.as_ref();
+        let is_contains = matches!(modifier, Some(SearchModifier::Contains));
+        let is_text = matches!(modifier, Some(SearchModifier::Text));
+        let is_code_text = matches!(modifier, Some(SearchModifier::CodeText));
+        let is_below = matches!(modifier, Some(SearchModifier::Below));
+        let is_above = matches!(modifier, Some(SearchModifier::Above));
 
         for (i, value) in param.values.iter().enumerate() {
             let param_num = offset + i + 1;
+            let predicate = if is_text {
+                format!("value_reference_display ILIKE '%' || ${} || '%'", param_num)
+            } else if is_code_text {
+                format!("value_reference_display ILIKE ${} || '%'", param_num)
+            } else if is_contains {
+                format!("value_reference ILIKE '%' || ${} || '%'", param_num)
+            } else if is_below {
+                // URL/path-prefix hierarchy (canonical |version not handled).
+                format!(
+                    "(value_reference = ${0} OR value_reference LIKE ${0} || '/%')",
+                    param_num
+                )
+            } else if is_above {
+                format!(
+                    "(${0} = value_reference OR ${0} LIKE value_reference || '/%')",
+                    param_num
+                )
+            } else {
+                format!("value_reference = ${}", param_num)
+            };
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_reference = ${})",
-                    param.name, param_num
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
+                    param.name, predicate
                 ),
                 vec![SqlParam::text(&value.value)],
             ));
@@ -834,6 +973,13 @@ impl PostgresQueryBuilder {
         for (i, value) in param.values.iter().enumerate() {
             let param_num = offset + i + 1;
             let condition = match modifier {
+                Some(SearchModifier::Contains) => SqlFragment::with_params(
+                    format!(
+                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_uri ILIKE '%' || ${} || '%')",
+                        param.name, param_num
+                    ),
+                    vec![SqlParam::text(&value.value)],
+                ),
                 Some(SearchModifier::Below) => SqlFragment::with_params(
                     format!(
                         "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_uri LIKE ${} || '%')",

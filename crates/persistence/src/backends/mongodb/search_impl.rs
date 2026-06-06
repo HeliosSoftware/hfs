@@ -575,7 +575,9 @@ impl MongoBackend {
                 }
             }),
             Some(SearchModifier::Exact) => Ok(doc! { "value_string": lowered }),
-            Some(SearchModifier::Contains) => Ok(doc! {
+            // `:text` on a string is a case-insensitive partial match,
+            // implemented here as a substring match (same as `:contains`).
+            Some(SearchModifier::Contains | SearchModifier::Text) => Ok(doc! {
                 "value_string": {
                     "$regex": regex_escape(&lowered)
                 }
@@ -603,6 +605,19 @@ impl MongoBackend {
 
         match param.modifier.as_ref() {
             None | Some(SearchModifier::CodeOnly) => {}
+            // `:text` (contains) and `:code-text` (starts-with) match the
+            // token's display text (Coding.display / CodeableConcept.text).
+            Some(m @ (SearchModifier::Text | SearchModifier::CodeText)) => {
+                let escaped = regex_escape(&value.value);
+                let regex = if *m == SearchModifier::CodeText {
+                    format!("^{}", escaped)
+                } else {
+                    escaped
+                };
+                return Ok(doc! {
+                    "value_token_display": { "$regex": regex, "$options": "i" }
+                });
+            }
             Some(other) => {
                 return Err(StorageError::Search(SearchError::UnsupportedModifier {
                     modifier: other.to_string(),
@@ -639,6 +654,32 @@ impl MongoBackend {
                     value.prefix, param.name
                 ),
             }));
+        }
+
+        // :contains - case-insensitive substring match on the stored reference.
+        if matches!(param.modifier.as_ref(), Some(SearchModifier::Contains)) {
+            return Ok(doc! {
+                "value_reference": {
+                    "$regex": regex_escape(&value.value),
+                    "$options": "i"
+                }
+            });
+        }
+
+        // :text (contains) / :code-text (starts-with) match Reference.display.
+        if matches!(
+            param.modifier.as_ref(),
+            Some(SearchModifier::Text | SearchModifier::CodeText)
+        ) {
+            let escaped = regex_escape(&value.value);
+            let regex = if matches!(param.modifier.as_ref(), Some(SearchModifier::CodeText)) {
+                format!("^{}", escaped)
+            } else {
+                escaped
+            };
+            return Ok(doc! {
+                "value_reference_display": { "$regex": regex, "$options": "i" }
+            });
         }
 
         if let Some(modifier) = &param.modifier {

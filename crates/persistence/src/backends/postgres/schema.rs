@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Initialize the database schema.
 pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
@@ -122,6 +122,7 @@ async fn create_schema_v1(client: &deadpool_postgres::Client) -> StorageResult<(
                 composite_group INTEGER,
                 value_identifier_type_system TEXT,
                 value_identifier_type_code TEXT,
+                value_reference_display TEXT,
                 CONSTRAINT fk_search_resource FOREIGN KEY (tenant_id, resource_type, resource_id)
                     REFERENCES resources(tenant_id, resource_type, id) ON DELETE CASCADE
             )",
@@ -270,6 +271,7 @@ async fn migrate_schema(
             5 => migrate_v5_to_v6(client).await?,
             6 => migrate_v6_to_v7(client).await?,
             7 => migrate_v7_to_v8(client).await?,
+            8 => migrate_v8_to_v9(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -628,6 +630,28 @@ async fn migrate_v7_to_v8(client: &deadpool_postgres::Client) -> StorageResult<(
             .map_err(|e| pg_error(format!("Migration v7->v8 index failed: {}", e)))?;
     }
 
+    Ok(())
+}
+
+/// v8 -> v9: add `value_reference_display` for reference text modifiers
+/// (`:text`/`:code-text` on reference params). Additive and nullable; existing
+/// rows stay NULL until the resource is reindexed.
+async fn migrate_v8_to_v9(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_reference_display TEXT",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v8->v9 failed: {}", e)))?;
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_search_reference_display
+             ON search_index(tenant_id, resource_type, param_name, value_reference_display)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v8->v9 index failed: {}", e)))?;
     Ok(())
 }
 

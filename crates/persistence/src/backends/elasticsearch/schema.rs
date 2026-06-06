@@ -131,7 +131,8 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 "name": { "type": "keyword" },
                                 "reference": { "type": "keyword" },
                                 "resource_type": { "type": "keyword" },
-                                "resource_id": { "type": "keyword" }
+                                "resource_id": { "type": "keyword" },
+                                "display": { "type": "text" }
                             }
                         },
                         "uri": {
