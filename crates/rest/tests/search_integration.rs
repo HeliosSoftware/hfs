@@ -407,6 +407,43 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_string_search_is_accent_insensitive() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "accent-pt",
+                    "name": [{ "family": "Müller" }]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        // An unaccented, lowercase query must match the accented stored name.
+        for query in ["muller", "Müller", "MULLER"] {
+            let response = server
+                .get(&format!("/Patient?family={}", query))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+            let ids: Vec<&str> = get_bundle_entries(&body)
+                .iter()
+                .filter_map(|e| e["resource"]["id"].as_str())
+                .collect();
+            assert!(
+                ids.contains(&"accent-pt"),
+                "accent-insensitive family search '{query}' should match 'Müller'"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_quantity_search_ucum_unit_equivalence() {
         let (server, backend) = create_test_server().await;
         let tenant = test_tenant();

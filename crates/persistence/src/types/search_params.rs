@@ -295,8 +295,10 @@ impl SearchPrefix {
     ///
     /// Returns the prefix and the remaining value.
     pub fn extract(value: &str) -> (Self, &str) {
-        if value.len() >= 2 {
-            let prefix = &value[..2];
+        // `get(..2)` is char-boundary safe: it returns None when the first two
+        // bytes don't form a valid prefix (e.g. a multibyte first character like
+        // "Müller"), avoiding a panic from slicing mid-codepoint.
+        if let Some(prefix) = value.get(..2) {
             if let Ok(p) = prefix.parse() {
                 return (p, &value[2..]);
             }

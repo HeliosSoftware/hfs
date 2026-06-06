@@ -968,10 +968,13 @@ fn migrate_v8_to_v9(conn: &Connection) -> StorageResult<()> {
 
 /// Migrate from schema version 9 to version 10.
 ///
-/// Adds UCUM-canonicalized quantity columns so quantity search can match across
-/// equivalent units (e.g. `1 g` ⇄ `1000 mg`). Existing rows have NULL canonical
-/// columns until a reindex backfills them; the quantity handler falls back to
-/// raw unit matching for those rows.
+/// Adds:
+/// - UCUM-canonicalized quantity columns so quantity search matches across
+///   equivalent units (e.g. `1 g` ⇄ `1000 mg`); and
+/// - a case/accent-folded string column so string search is accent-insensitive.
+///
+/// Existing rows have NULL values in the new columns until a reindex backfills
+/// them; the handlers fall back to raw matching for those rows.
 fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
     // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore duplicate-column errors
     // (the columns may already exist if the table was created fresh at v10).
@@ -983,12 +986,22 @@ fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
         "ALTER TABLE search_index ADD COLUMN value_quantity_canonical_unit TEXT",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN value_string_folded TEXT",
+        [],
+    );
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical
          ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value)",
         [],
     )
     .map_err(|e| migration_err(format!("create canonical quantity index: {e}")))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded
+         ON search_index(tenant_id, resource_type, param_name, value_string_folded)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create folded string index: {e}")))?;
     Ok(())
 }
 

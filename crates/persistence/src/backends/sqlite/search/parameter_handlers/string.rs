@@ -1,5 +1,6 @@
 //! String parameter SQL handler.
 
+use crate::search::fold_text;
 use crate::types::{SearchModifier, SearchValue};
 
 use super::super::query_builder::{SqlFragment, SqlParam};
@@ -26,31 +27,37 @@ impl StringHandler {
                     vec![SqlParam::string(&value.value)],
                 )
             }
-            Some(SearchModifier::Contains) => {
-                // Contains (case-insensitive)
+            Some(SearchModifier::Contains) | Some(SearchModifier::Text) => {
+                // Contains (case- and accent-insensitive). Match the folded
+                // column; OR the raw column (case-insensitive) so rows not yet
+                // reindexed — whose folded column is NULL — still match.
                 SqlFragment::with_params(
                     format!(
-                        "value_string COLLATE NOCASE LIKE '%' || ?{} || '%'",
-                        param_num
+                        "(value_string_folded LIKE '%' || ?{} || '%' \
+                          OR value_string COLLATE NOCASE LIKE '%' || ?{} || '%')",
+                        param_num,
+                        param_num + 1
                     ),
-                    vec![SqlParam::string(value.value.to_lowercase())],
-                )
-            }
-            Some(SearchModifier::Text) => {
-                // Full-text search - use FTS5 if available, otherwise contains
-                SqlFragment::with_params(
-                    format!(
-                        "value_string COLLATE NOCASE LIKE '%' || ?{} || '%'",
-                        param_num
-                    ),
-                    vec![SqlParam::string(value.value.to_lowercase())],
+                    vec![
+                        SqlParam::string(fold_text(&value.value)),
+                        SqlParam::string(value.value.to_lowercase()),
+                    ],
                 )
             }
             _ => {
-                // Default: case-insensitive prefix match
+                // Default: case- and accent-insensitive prefix match, with a raw
+                // fallback for not-yet-reindexed rows (folded column NULL).
                 SqlFragment::with_params(
-                    format!("value_string COLLATE NOCASE LIKE ?{} || '%'", param_num),
-                    vec![SqlParam::string(value.value.to_lowercase())],
+                    format!(
+                        "(value_string_folded LIKE ?{} || '%' \
+                          OR value_string COLLATE NOCASE LIKE ?{} || '%')",
+                        param_num,
+                        param_num + 1
+                    ),
+                    vec![
+                        SqlParam::string(fold_text(&value.value)),
+                        SqlParam::string(value.value.to_lowercase()),
+                    ],
                 )
             }
         }
@@ -67,9 +74,10 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Eq, "Smith");
         let frag = StringHandler::build_sql(&value, None, 0);
 
+        assert!(frag.sql.contains("value_string_folded LIKE"));
         assert!(frag.sql.contains("COLLATE NOCASE LIKE"));
         assert!(frag.sql.contains("|| '%'"));
-        assert_eq!(frag.params.len(), 1);
+        assert_eq!(frag.params.len(), 2);
     }
 
     #[test]

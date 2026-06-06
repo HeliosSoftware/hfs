@@ -68,6 +68,7 @@ pub mod extractor;
 pub mod loader;
 pub mod registry;
 pub mod reindex;
+pub mod text_fold;
 pub mod writer;
 
 // Re-export main types
@@ -84,4 +85,5 @@ pub use reindex::{
     ReindexOperation, ReindexProgress, ReindexRequest, ReindexStatus, ReindexableStorage,
     ResourcePage,
 };
+pub use text_fold::fold_text;
 pub use writer::SearchIndexWriter;
