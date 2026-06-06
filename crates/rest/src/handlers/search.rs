@@ -179,6 +179,19 @@ where
         state.max_page_size(),
     );
 
+    // `:not-in` requires negated value-set filtering, which no backend
+    // implements. Reject it explicitly (501) regardless of whether a terminology
+    // server is configured, rather than silently ignoring it (which would return
+    // a superset of the intended results).
+    if let Some(key) = params.keys().find(|k| k.ends_with(":not-in")) {
+        return Err(RestError::NotImplemented {
+            feature: format!(
+                "search modifier ':not-in' is not supported ({key}); \
+                 use ':in' or remove this modifier"
+            ),
+        });
+    }
+
     // Pre-process :in / :not-in modifiers via the terminology server (if configured).
     if let Some(ts_url) = state.terminology_server_url() {
         params = expand_terminology_params(params, ts_url).await?;

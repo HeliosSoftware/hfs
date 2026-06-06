@@ -484,6 +484,22 @@ mod string_search {
     }
 
     #[tokio::test]
+    async fn test_not_in_modifier_returns_501_without_terminology_server() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // :not-in needs negated value-set filtering, which is unimplemented; it
+        // must return 501 rather than silently returning a superset, even when
+        // no terminology server is configured.
+        let response = server
+            .get("/Observation?code:not-in=http://example.org/vs")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
     async fn test_modifier_invalid_for_param_type_returns_400() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
