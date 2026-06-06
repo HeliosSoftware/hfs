@@ -208,22 +208,41 @@ Ordered roughly by impact:
    nested objects; chained/`_has` now work via the REST-layer resolver — see below.)
 6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
    unsupported; Bundles omit `first`/`last` paging links.
-7. **Quantity UCUM canonicalization** — quantity `system|code` is matched by literal string equality;
-   there is no unit conversion, so `120|mm[Hg]` does not match `120|mmHg` and `1|g` does not match
-   `1000|mg`. (UCUM logic exists in `helios-fhirpath` but is not wired into the search index.)
-8. **Accent-insensitive string search** — string search is case-insensitive and prefix-based, but
-   not accent/diacritic-insensitive for ordinary string parameters (only the FTS `_text`/`_content`
-   path folds diacritics). This is **migration-class**, not a handler tweak: SQLite has no native
-   `unaccent` (needs a folded index column + reindex, or a custom connection-registered function),
-   Postgres needs the `unaccent` extension, and Elasticsearch needs an `asciifolding` analyzer +
-   reindex. Best done alongside the UCUM index migration (item 7).
+7. **Quantity UCUM canonicalization** (schema v10) — the index stores a dimension-canonical
+   value/unit (`value_quantity_canonical_value`/`_unit`) computed via
+   `helios_fhirpath::ucum::canonicalize_quantity`, so `1|g` matches `1000|mg`.
+   - **SQLite: complete** — writer populates canonical columns; the quantity handler matches the
+     canonical columns (search bounds canonicalized to preserve implicit precision) OR the raw unit.
+   - **Elasticsearch: complete** — canonical `value`/`unit` stored in the `quantity` nested object;
+     the handler ORs a canonical range (bounds canonicalized) with the raw match (integration-tested
+     against a live ES container).
+   - **Postgres: complete** — writer populates canonical columns; the quantity handler ORs a
+     range-based canonical predicate (bounds canonicalized; eq uses an implicit-precision range that
+     also absorbs float-conversion noise) with the raw match. Integration-tested against a live PG
+     container.
+   - A **reindex backfill** (`ReindexRequest`) is required to populate canonical columns for
+     resources written before the upgrade; un-reindexed rows fall back to raw unit matching.
+
+   All three searchable backends (SQLite, Postgres, Elasticsearch) now match UCUM-equivalent units.
+8. **Accent-insensitive string search** (schema v10) — string search folds case **and** accents via
+   NFD + combining-mark stripping (`unicode-normalization`, shared `search::fold_text`), stored in
+   `value_string_folded`.
+   - **SQLite: complete** — default/`:contains`/`:text` match the folded column ORed with the raw
+     (case-insensitive) column; `:exact` stays case/accent-sensitive.
+   - **Postgres: complete** — `COALESCE(value_string_folded, value_string) ILIKE` against a folded
+     pattern (raw fallback keeps non-accented pre-reindex rows matching case-insensitively).
+   - **Elasticsearch: complete** — a `folded` keyword field (written via `fold_text`) is matched
+     (wildcard) ORed with the raw field; integration-tested against a live ES container.
+   - Pre-reindex rows need the **reindex backfill** for accent-insensitivity.
 9. **Canonical `url|version` references** — versioned reference matching is now version-agnostic
    (`Patient/1/_history/2` ⇄ `Patient/1`, via `strip_reference_version`, on SQLite/PG/ES). The
    remaining gap is canonical `url|version` hierarchy for reference `:above`/`:below`; `:identifier`
    also assumes a `Type/id` reference shape.
-10. **Ordered-value boundary semantics** — `gt`/`lt` (and SQLite `sa`/`eb`) compare against the
-    scalar value rather than the precision-range boundary the spec defines; `eq`/`ne`/`ap` already
-    use implicit-precision ranges. Edge-case-only.
+10. **Ordered-value boundary semantics** — **done** (SQLite, Postgres, Elasticsearch). Comparator
+    prefixes now match against the search value's implicit-precision range boundaries per spec:
+    `ge → x≥lo`, `le → x<hi`, `gt`/`sa → x≥hi`, `lt`/`eb → x<lo` (range `[lo, hi)`), for number,
+    quantity, and date (date falls back to scalar for full-precision instants). Postgres also gained
+    implicit-precision `eq`/`ne` ranges for number/date (was exact). Shared `search::range` helper.
 
 **Recently landed (REST layer).** Repeated query parameters are now preserved as FHIR AND semantics
 (previously collapsed to last-wins by `HashMap` extraction); `Prefer: handling=strict` rejects

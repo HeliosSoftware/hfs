@@ -407,6 +407,132 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_date_prefix_uses_precision_boundaries() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "born-2020", "birthDate": "2020-06-15" }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        let ids = |body: &Value| -> Vec<String> {
+            get_bundle_entries(body)
+                .iter()
+                .filter_map(|e| e["resource"]["id"].as_str().map(String::from))
+                .collect()
+        };
+        let search = |q: &'static str| {
+            let server = &server;
+            async move {
+                server
+                    .get(&format!("/Patient?birthdate={}", q))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .await
+                    .json::<Value>()
+            }
+        };
+
+        // gt2020 means "after all of 2020" → 2020-06-15 must NOT match.
+        assert!(
+            !ids(&search("gt2020").await).contains(&"born-2020".to_string()),
+            "gt2020 should not match a date within 2020"
+        );
+        // gt2019 → after 2019 → matches.
+        assert!(
+            ids(&search("gt2019").await).contains(&"born-2020".to_string()),
+            "gt2019 should match 2020-06-15"
+        );
+        // lt2021 → before 2021 → matches; lt2020 → before 2020 → no match.
+        assert!(ids(&search("lt2021").await).contains(&"born-2020".to_string()));
+        assert!(!ids(&search("lt2020").await).contains(&"born-2020".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_string_search_is_accent_insensitive() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "accent-pt",
+                    "name": [{ "family": "Müller" }]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        // An unaccented, lowercase query must match the accented stored name.
+        for query in ["muller", "Müller", "MULLER"] {
+            let response = server
+                .get(&format!("/Patient?family={}", query))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+            let ids: Vec<&str> = get_bundle_entries(&body)
+                .iter()
+                .filter_map(|e| e["resource"]["id"].as_str())
+                .collect();
+            assert!(
+                ids.contains(&"accent-pt"),
+                "accent-insensitive family search '{query}' should match 'Müller'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quantity_search_ucum_unit_equivalence() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+        // Observation with a mass quantity expressed in grams.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-mass",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "x" }] },
+                    "valueQuantity": {
+                        "value": 1,
+                        "unit": "g",
+                        "system": "http://unitsofmeasure.org",
+                        "code": "g"
+                    }
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        // Searching the equivalent quantity in milligrams must match (g ⇄ mg).
+        let response = server
+            .get("/Observation?value-quantity=1000|http://unitsofmeasure.org|mg")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let ids: Vec<&str> = get_bundle_entries(&body)
+            .iter()
+            .filter_map(|e| e["resource"]["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"obs-mass"),
+            "UCUM-equivalent quantity (1000 mg) should match the stored 1 g"
+        );
+    }
+
+    #[tokio::test]
     async fn test_reference_search_is_version_agnostic() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;

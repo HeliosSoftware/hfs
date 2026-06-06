@@ -11,76 +11,99 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
     let (num_str, system, code) = parse_quantity_value(value);
     let num: f64 = num_str.parse().ok()?;
 
-    let mut must_conditions = vec![json!({ "term": { "search_params.quantity.name": name } })];
-
-    // Add numeric condition based on prefix
-    let num_condition = match prefix {
-        SearchPrefix::Eq => {
-            let precision = super::number::implicit_range(num_str);
-            json!({
-                "range": {
-                    "search_params.quantity.value": {
-                        "gte": num - precision,
-                        "lt": num + precision
-                    }
-                }
-            })
-        }
-        SearchPrefix::Gt => {
-            json!({ "range": { "search_params.quantity.value": { "gt": num } } })
-        }
-        SearchPrefix::Lt => {
-            json!({ "range": { "search_params.quantity.value": { "lt": num } } })
-        }
-        SearchPrefix::Ge => {
-            json!({ "range": { "search_params.quantity.value": { "gte": num } } })
-        }
-        SearchPrefix::Le => {
-            json!({ "range": { "search_params.quantity.value": { "lte": num } } })
-        }
-        SearchPrefix::Ap => {
-            let margin = (num * 0.1).abs().max(0.5);
-            json!({
-                "range": {
-                    "search_params.quantity.value": {
-                        "gte": num - margin,
-                        "lte": num + margin
-                    }
-                }
-            })
-        }
-        _ => {
-            let precision = super::number::implicit_range(num_str);
-            json!({
-                "range": {
-                    "search_params.quantity.value": {
-                        "gte": num - precision,
-                        "lt": num + precision
-                    }
-                }
-            })
-        }
-    };
-    must_conditions.push(num_condition);
-
-    // Add system/code conditions if specified
+    // Raw match against the stored value/unit/system.
+    let mut raw_must = vec![
+        json!({ "term": { "search_params.quantity.name": name } }),
+        range_condition("search_params.quantity.value", prefix, num, num_str, |x| {
+            Some(x)
+        })?,
+    ];
     if let Some(sys) = system {
-        must_conditions.push(json!({ "term": { "search_params.quantity.system": sys } }));
+        raw_must.push(json!({ "term": { "search_params.quantity.system": sys } }));
     }
     if let Some(c) = code {
-        must_conditions.push(json!({ "term": { "search_params.quantity.code": c } }));
+        raw_must.push(json!({ "term": { "search_params.quantity.code": c } }));
     }
+
+    // Canonical match: when a UCUM code is supplied and convertible, also match
+    // rows whose canonical unit/value are equivalent (e.g. g ⇄ mg). Bounds are
+    // canonicalized so range/precision semantics survive unit conversion.
+    let canonical = code.and_then(|c| {
+        let (_, canon_unit) = helios_fhirpath::ucum::canonicalize_quantity(num, c)?;
+        let canon = |x: f64| helios_fhirpath::ucum::canonicalize_quantity(x, c).map(|(v, _)| v);
+        let range = range_condition(
+            "search_params.quantity.canonical_value",
+            prefix,
+            num,
+            num_str,
+            canon,
+        )?;
+        Some(json!({
+            "bool": {
+                "must": [
+                    { "term": { "search_params.quantity.name": name } },
+                    range,
+                    { "term": { "search_params.quantity.canonical_unit": canon_unit } }
+                ]
+            }
+        }))
+    });
+
+    let query = match canonical {
+        Some(canon_clause) => json!({
+            "bool": {
+                "should": [ { "bool": { "must": raw_must } }, canon_clause ],
+                "minimum_should_match": 1
+            }
+        }),
+        None => json!({ "bool": { "must": raw_must } }),
+    };
 
     Some(json!({
         "nested": {
             "path": "search_params.quantity",
-            "query": {
-                "bool": {
-                    "must": must_conditions
-                }
-            }
+            "query": query
         }
     }))
+}
+
+/// Builds an ES `range` condition for `field`, transforming the numeric bounds
+/// through `map` (identity for the raw value, UCUM-canonicalization for the
+/// canonical column). Returns `None` if a transformed bound is unavailable.
+fn range_condition(
+    field: &str,
+    prefix: SearchPrefix,
+    num: f64,
+    num_str: &str,
+    map: impl Fn(f64) -> Option<f64>,
+) -> Option<Value> {
+    // Half-precision of the search value (e.g. "100" → 0.5); comparators match
+    // the implicit range boundaries: gt/sa → ≥ hi, lt/eb → < lo, ge → ≥ lo,
+    // le → < hi (per the FHIR spec).
+    let p = super::number::implicit_range(num_str);
+    let range = match prefix {
+        SearchPrefix::Gt | SearchPrefix::Sa => json!({ "gte": map(num + p)? }),
+        SearchPrefix::Lt | SearchPrefix::Eb => json!({ "lt": map(num - p)? }),
+        SearchPrefix::Ge => json!({ "gte": map(num - p)? }),
+        SearchPrefix::Le => json!({ "lt": map(num + p)? }),
+        SearchPrefix::Ap => {
+            let margin = (num * 0.1).abs().max(0.5);
+            let (lo, hi) = ordered(map(num - margin)?, map(num + margin)?);
+            json!({ "gte": lo, "lte": hi })
+        }
+        // Eq, Ne (treated as Eq range here), and any default
+        _ => {
+            let (lo, hi) = ordered(map(num - p)?, map(num + p)?);
+            json!({ "gte": lo, "lt": hi })
+        }
+    };
+    Some(json!({ "range": { field: range } }))
+}
+
+/// Returns the two values in ascending order (canonicalization factor is
+/// positive, but guard against any inversion).
+fn ordered(a: f64, b: f64) -> (f64, f64) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 /// Parses a quantity value string into (number, system, code).
