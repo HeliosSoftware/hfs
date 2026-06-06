@@ -208,9 +208,13 @@ Ordered roughly by impact:
    nested objects; chained/`_has` now work via the REST-layer resolver — see below.)
 6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
    unsupported; Bundles omit `first`/`last` paging links.
-7. **Quantity UCUM canonicalization** — quantity `system|code` is matched by literal string equality;
-   there is no unit conversion, so `120|mm[Hg]` does not match `120|mmHg` and `1|g` does not match
-   `1000|mg`. (UCUM logic exists in `helios-fhirpath` but is not wired into the search index.)
+7. **Quantity UCUM canonicalization** — **done on SQLite** (schema v10): the index stores a
+   dimension-canonical value/unit (`value_quantity_canonical_value`/`_unit`) computed via
+   `helios_fhirpath::ucum::canonicalize_quantity`, and quantity search matches the canonical columns
+   (bounds canonicalized to preserve implicit precision) OR the raw unit, so `1|g` matches
+   `1000|mg`. **Remaining:** Postgres/Elasticsearch (their schema/mapping + writer + handler), and a
+   **reindex backfill** (`ReindexRequest`) to populate canonical columns for resources written
+   before the upgrade — un-reindexed rows fall back to raw unit matching.
 8. **Accent-insensitive string search** — string search is case-insensitive and prefix-based, but
    not accent/diacritic-insensitive for ordinary string parameters (only the FTS `_text`/`_content`
    path folds diacritics). This is **migration-class**, not a handler tweak: SQLite has no native

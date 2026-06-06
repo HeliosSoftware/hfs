@@ -407,6 +407,49 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_quantity_search_ucum_unit_equivalence() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+        // Observation with a mass quantity expressed in grams.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-mass",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "x" }] },
+                    "valueQuantity": {
+                        "value": 1,
+                        "unit": "g",
+                        "system": "http://unitsofmeasure.org",
+                        "code": "g"
+                    }
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        // Searching the equivalent quantity in milligrams must match (g ⇄ mg).
+        let response = server
+            .get("/Observation?value-quantity=1000|http://unitsofmeasure.org|mg")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let ids: Vec<&str> = get_bundle_entries(&body)
+            .iter()
+            .filter_map(|e| e["resource"]["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"obs-mass"),
+            "UCUM-equivalent quantity (1000 mg) should match the stored 1 g"
+        );
+    }
+
+    #[tokio::test]
     async fn test_reference_search_is_version_agnostic() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;

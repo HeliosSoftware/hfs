@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -266,6 +266,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             6 => migrate_v6_to_v7(conn)?,
             7 => migrate_v7_to_v8(conn)?,
             8 => migrate_v8_to_v9(conn)?,
+            9 => migrate_v9_to_v10(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -962,6 +963,32 @@ fn migrate_v8_to_v9(conn: &Connection) -> StorageResult<()> {
         [],
     )
     .map_err(|e| migration_err(format!("create reference_display index: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 9 to version 10.
+///
+/// Adds UCUM-canonicalized quantity columns so quantity search can match across
+/// equivalent units (e.g. `1 g` ⇄ `1000 mg`). Existing rows have NULL canonical
+/// columns until a reindex backfills them; the quantity handler falls back to
+/// raw unit matching for those rows.
+fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore duplicate-column errors
+    // (the columns may already exist if the table was created fresh at v10).
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN value_quantity_canonical_value REAL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN value_quantity_canonical_unit TEXT",
+        [],
+    );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical
+         ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create canonical quantity index: {e}")))?;
     Ok(())
 }
 
