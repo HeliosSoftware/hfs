@@ -1082,7 +1082,7 @@ async fn start_sqlite_elasticsearch(
     use helios_persistence::backends::elasticsearch::{
         ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig,
     };
-    use helios_persistence::composite::{CompositeConfig, CompositeStorage};
+    use helios_persistence::composite::{CompositeConfig, CompositeStorage, SyncMode};
     use helios_persistence::core::BackendKind;
 
     // Create SQLite backend with search offloaded to Elasticsearch
@@ -1140,6 +1140,10 @@ async fn start_sqlite_elasticsearch(
     let composite_config = CompositeConfig::builder()
         .primary("sqlite", BackendKind::Sqlite)
         .search_backend("es", BackendKind::Elasticsearch)
+        // Read-your-write consistency: a POST /Resource must be indexed in ES
+        // before the response returns. Default Asynchronous mode acks before
+        // the search backend has indexed, racing follow-up searches.
+        .sync_mode(SyncMode::Synchronous)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -1293,7 +1297,7 @@ async fn start_postgres_elasticsearch(
         ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig,
     };
     use helios_persistence::backends::postgres::PostgresBackend;
-    use helios_persistence::composite::{CompositeConfig, CompositeStorage};
+    use helios_persistence::composite::{CompositeConfig, CompositeStorage, SyncMode};
     use helios_persistence::core::BackendKind;
 
     // Create PostgreSQL backend
@@ -1367,6 +1371,7 @@ async fn start_postgres_elasticsearch(
     let composite_config = CompositeConfig::builder()
         .primary("postgres", BackendKind::Postgres)
         .search_backend("es", BackendKind::Elasticsearch)
+        .sync_mode(SyncMode::Synchronous)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -1454,7 +1459,7 @@ async fn start_mongodb_elasticsearch(
     use helios_persistence::backends::elasticsearch::{
         ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig,
     };
-    use helios_persistence::composite::{CompositeConfig, CompositeStorage};
+    use helios_persistence::composite::{CompositeConfig, CompositeStorage, SyncMode};
     use helios_persistence::core::BackendKind;
 
     // Create MongoDB backend
@@ -1521,6 +1526,7 @@ async fn start_mongodb_elasticsearch(
     let composite_config = CompositeConfig::builder()
         .primary("mongodb", BackendKind::MongoDB)
         .search_backend("es", BackendKind::Elasticsearch)
+        .sync_mode(SyncMode::Synchronous)
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -1719,7 +1725,7 @@ async fn start_s3_elasticsearch(
         ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig,
     };
     use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
-    use helios_persistence::composite::{CompositeConfig, CompositeStorage};
+    use helios_persistence::composite::{CompositeConfig, CompositeStorage, SyncMode};
     use helios_persistence::core::BackendKind;
 
     // --- S3 backend (primary) ---
@@ -1811,6 +1817,7 @@ async fn start_s3_elasticsearch(
     let composite_config = CompositeConfig::builder()
         .primary("s3", BackendKind::S3)
         .search_backend("es", BackendKind::Elasticsearch)
+        .sync_mode(SyncMode::Synchronous)
         .build()?;
 
     let mut backends = HashMap::new();
