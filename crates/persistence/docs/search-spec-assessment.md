@@ -213,10 +213,12 @@ Ordered roughly by impact:
    `helios_fhirpath::ucum::canonicalize_quantity`, so `1|g` matches `1000|mg`.
    - **SQLite: complete** — writer populates canonical columns; the quantity handler matches the
      canonical columns (search bounds canonicalized to preserve implicit precision) OR the raw unit.
+   - **Elasticsearch: complete** — canonical `value`/`unit` stored in the `quantity` nested object;
+     the handler ORs a canonical range (bounds canonicalized) with the raw match (integration-tested
+     against a live ES container).
    - **Postgres: write-side done** (canonical columns populated by the writer); the **query-side OR**
      into the canonical columns is not yet wired (raw unit matching only) — pending param-stride and
      float-tolerance handling.
-   - **Elasticsearch: remaining.**
    - A **reindex backfill** (`ReindexRequest`) is required to populate canonical columns for
      resources written before the upgrade; un-reindexed rows fall back to raw unit matching.
 8. **Accent-insensitive string search** (schema v10) — string search folds case **and** accents via
@@ -226,7 +228,8 @@ Ordered roughly by impact:
      (case-insensitive) column; `:exact` stays case/accent-sensitive.
    - **Postgres: complete** — `COALESCE(value_string_folded, value_string) ILIKE` against a folded
      pattern (raw fallback keeps non-accented pre-reindex rows matching case-insensitively).
-   - **Elasticsearch: remaining** (needs an `asciifolding` analyzer + reindex).
+   - **Elasticsearch: complete** — a `folded` keyword field (written via `fold_text`) is matched
+     (wildcard) ORed with the raw field; integration-tested against a live ES container.
    - Pre-reindex rows need the **reindex backfill** for accent-insensitivity.
 9. **Canonical `url|version` references** — versioned reference matching is now version-agnostic
    (`Patient/1/_history/2` ⇄ `Patient/1`, via `strip_reference_version`, on SQLite/PG/ES). The
