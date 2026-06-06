@@ -213,10 +213,14 @@ Ordered roughly by impact:
    `1000|mg`. (UCUM logic exists in `helios-fhirpath` but is not wired into the search index.)
 8. **Accent-insensitive string search** — string search is case-insensitive and prefix-based, but
    not accent/diacritic-insensitive for ordinary string parameters (only the FTS `_text`/`_content`
-   path folds diacritics). The spec calls for accent-insensitive string matching.
-9. **Versioned / canonical references** — a versioned reference (`Patient/1/_history/2`) is matched
-   as a literal string, and canonical `url|version` hierarchy for reference `:above`/`:below` is not
-   implemented; `:identifier` assumes a `Type/id` reference shape.
+   path folds diacritics). This is **migration-class**, not a handler tweak: SQLite has no native
+   `unaccent` (needs a folded index column + reindex, or a custom connection-registered function),
+   Postgres needs the `unaccent` extension, and Elasticsearch needs an `asciifolding` analyzer +
+   reindex. Best done alongside the UCUM index migration (item 7).
+9. **Canonical `url|version` references** — versioned reference matching is now version-agnostic
+   (`Patient/1/_history/2` ⇄ `Patient/1`, via `strip_reference_version`, on SQLite/PG/ES). The
+   remaining gap is canonical `url|version` hierarchy for reference `:above`/`:below`; `:identifier`
+   also assumes a `Type/id` reference shape.
 10. **Ordered-value boundary semantics** — `gt`/`lt` (and SQLite `sa`/`eb`) compare against the
     scalar value rather than the precision-range boundary the spec defines; `eq`/`ne`/`ap` already
     use implicit-precision ranges. Edge-case-only.
