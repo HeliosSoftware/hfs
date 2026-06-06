@@ -1005,6 +1005,39 @@ mod subsetting {
             // Should not include unrequested elements
             assert!(resource["gender"].is_null());
             assert!(resource["birthDate"].is_null());
+            // Subset responses must carry the SUBSETTED meta.tag (FHIR spec).
+            let tags = resource["meta"]["tag"]
+                .as_array()
+                .expect("meta.tag present");
+            assert!(
+                tags.iter().any(|t| t["code"] == "SUBSETTED"
+                    && t["system"] == "http://terminology.hl7.org/CodeSystem/v3-ObservationValue"),
+                "subsetted entry should be tagged SUBSETTED"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_subsetted_tag_without_subsetting() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_count=1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        if let Some(entry) = entries.first() {
+            let tags = entry["resource"]["meta"]["tag"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !tags.iter().any(|t| t["code"] == "SUBSETTED"),
+                "full representation must not be tagged SUBSETTED"
+            );
         }
     }
 }

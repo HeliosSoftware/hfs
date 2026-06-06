@@ -401,15 +401,27 @@ fn apply_subsetting(
     fhir_version: FhirVersion,
 ) -> serde_json::Value {
     let mut result = resource.clone();
+    let mut subsetted = false;
 
     // Apply _summary if specified
     if let Some(mode) = summary_mode {
         result = apply_summary(&result, mode, fhir_version);
+        if mode != SummaryMode::False {
+            subsetted = true;
+        }
     }
 
     // Apply _elements if specified (takes precedence over _summary for element selection)
     if let Some(elem_list) = elements {
-        result = apply_elements(&result, elem_list);
+        if !elem_list.is_empty() {
+            result = apply_elements(&result, elem_list);
+            subsetted = true;
+        }
+    }
+
+    // Flag incomplete representations with the SUBSETTED tag (FHIR spec).
+    if subsetted {
+        crate::responses::subsetting::add_subsetted_tag(&mut result);
     }
 
     result
