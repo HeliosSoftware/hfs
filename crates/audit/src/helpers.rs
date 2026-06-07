@@ -4,11 +4,11 @@
 //! programmatic construction verbose.  This module provides terse helpers that
 //! produce valid FHIR types with minimal ceremony.
 
-use chrono::Utc;
-use helios_fhir::r4::{
+use crate::fhir_model::{
     AuditEventEntityDetail, AuditEventEntityDetailValue, Boolean, Canonical, Code, CodeableConcept,
     Coding, Instant, Reference, String as FhirString, Uri,
 };
+use chrono::Utc;
 use helios_fhir::{Element, PrecisionInstant};
 
 // ── Primitive helpers ────────────────────────────────────────────────────────

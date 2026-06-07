@@ -116,7 +116,7 @@ pub async fn strip_tenant_prefix_middleware(mut request: Request, next: Next) ->
     let path = original_uri.path();
 
     // Use the default FHIR version for resource type checking
-    let fhir_version = FhirVersion::default();
+    let fhir_version = FhirVersion::default_enabled();
 
     // Try to extract tenant from path
     if let Some((tenant, remaining_path)) = extract_tenant_from_path(path, &fhir_version) {

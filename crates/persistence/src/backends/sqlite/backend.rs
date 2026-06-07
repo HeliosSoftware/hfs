@@ -72,7 +72,7 @@ pub struct SqliteBackendConfig {
 
     /// FHIR version for this backend instance.
     /// Used to load the appropriate SearchParameter definitions.
-    #[serde(default)]
+    #[serde(default = "crate::default_fhir_version")]
     pub fhir_version: FhirVersion,
 
     /// Directory containing FHIR SearchParameter spec files.
@@ -115,7 +115,7 @@ impl Default for SqliteBackendConfig {
             busy_timeout_ms: default_busy_timeout_ms(),
             enable_wal: true,
             enable_foreign_keys: true,
-            fhir_version: FhirVersion::default(),
+            fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
         }

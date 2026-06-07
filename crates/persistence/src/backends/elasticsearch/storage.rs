@@ -727,7 +727,8 @@ fn parse_stored_resource(
         .and_then(|v| v.as_str())
         .unwrap_or("4.0");
 
-    let fhir_version = FhirVersion::from_mime_param(fhir_version_str).unwrap_or_default();
+    let fhir_version = FhirVersion::from_mime_param(fhir_version_str)
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
     let last_updated = source
         .get("last_updated")

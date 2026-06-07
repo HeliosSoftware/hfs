@@ -853,7 +853,7 @@ impl PostgresQueryBuilder {
             // 'identifier' index row for that resource.
             let target = "idx.resource_id = SUBSTRING(ref.value_reference FROM POSITION('/' IN ref.value_reference) + 1)";
             let (filter, params): (String, Vec<SqlParam>) = match value.value.split_once('|') {
-                Some((system, code)) if system.is_empty() => {
+                Some(("", code)) => {
                     next += 1;
                     (
                         format!(
@@ -862,7 +862,7 @@ impl PostgresQueryBuilder {
                         vec![SqlParam::text(code)],
                     )
                 }
-                Some((system, code)) if code.is_empty() => {
+                Some((system, "")) => {
                     next += 1;
                     (
                         format!("idx.value_token_system = ${next}"),

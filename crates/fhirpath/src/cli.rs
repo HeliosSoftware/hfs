@@ -126,7 +126,7 @@ pub struct Args {
     pub trace: bool,
 
     /// FHIR version to use for parsing resources
-    #[arg(long, value_enum, default_value_t = FhirVersion::R4)]
+    #[arg(long, value_enum, default_value_t = FhirVersion::default_enabled())]
     pub fhir_version: FhirVersion,
 
     /// Validate expression before execution

@@ -64,7 +64,8 @@ impl FhirVersionExtractor {
     /// Uses the Content-Type version if specified, otherwise falls back
     /// to the default FHIR version.
     pub fn storage_version(&self) -> FhirVersion {
-        self.content_version.unwrap_or_default()
+        self.content_version
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled)
     }
 }
 

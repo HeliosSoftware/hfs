@@ -12,8 +12,13 @@ description = "Audit event logging for HFS — FHIR AuditEvent with IHE BALP pro
 default = ["R4"]
 R4 = ["helios-fhir/R4"]
 R4B = ["helios-fhir/R4B"]
-R5 = ["helios-fhir/R5"]
-R6 = ["helios-fhir/R6"]
+# IHE BALP AuditEvents use the R4 AuditEvent model (R4/R4B share an identical
+# API; R5/R6 restructured it). The crate aliases to the lowest enabled R4-family
+# version, so R5/R6 builds pull in R4B as the BALP baseline rather than forcing
+# the heavier R4 feature. R4-only and R4B-only builds stay free of cross-version
+# drag.
+R5 = ["helios-fhir/R5", "R4B"]
+R6 = ["helios-fhir/R6", "R4B"]
 
 # Cloud audit backends
 cloudwatch = ["dep:aws-sdk-cloudwatchlogs", "dep:aws-config"]

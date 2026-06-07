@@ -782,8 +782,8 @@ impl ExportWorkerStorage for SqliteBackend {
                 ))));
             }
         };
-        let fhir_version =
-            helios_fhir::FhirVersion::from_mime_param(&fhir_version).unwrap_or_default();
+        let fhir_version = helios_fhir::FhirVersion::from_mime_param(&fhir_version)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
         let transaction_time = parse_dt(&transaction_time).map_err(LeaseError::Storage)?;
 
         // Load persisted per-type progress for resume.

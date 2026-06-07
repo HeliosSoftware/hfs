@@ -157,7 +157,7 @@ fn strip_tenant_prefix(mut request: Request<Body>) -> Request<Body> {
     let path = request.uri().path().to_string();
 
     // Use the default FHIR version for resource type checking
-    let fhir_version = FhirVersion::default();
+    let fhir_version = FhirVersion::default_enabled();
 
     if let Some((tenant, remaining_path)) = extract_tenant_from_path(&path, &fhir_version) {
         // Store original path and extracted tenant in extensions

@@ -1467,40 +1467,50 @@ fn clean_identifier(ident: &str) -> String {
     }
 }
 
-/// Determines if a FHIR resource type is a DomainResource
+/// Determines if a FHIR resource type is a DomainResource for the given FHIR version
 ///
-/// In FHIR, many resource types inherit from DomainResource.
-/// This function checks if a given resource type is a DomainResource.
-pub fn is_fhir_domain_resource(resource_type: &str) -> bool {
-    // In a real implementation, this should ideally use the FHIR type system
-    // or a proper knowledge base of FHIR resource type hierarchy.
-    // Instead of a static list, we should query the actual type system.
-
-    // These are *some* of the resources that inherit from DomainResource
-    // This is not a comprehensive list - in a production implementation,
-    // this should be derived from the FHIR specification metadata
-    match resource_type {
-        // Clinical Resources
-        "Patient" | "Practitioner" | "PractitionerRole" | "RelatedPerson" |
-        "Person" | "Group" | "Organization" | "CareTeam" | "EpisodeOfCare" |
-        // Clinical Summary
-        "Condition" | "Procedure" | "Observation" | "DiagnosticReport" |
-        "CarePlan" | "ClinicalImpression" | "FamilyMemberHistory" |
-        // Medications
-        "Medication" | "MedicationRequest" | "MedicationAdministration" |
-        "MedicationDispense" | "MedicationStatement" | "Immunization" |
-        // Workflow
-        "Encounter" | "Appointment" | "Schedule" | "ServiceRequest" | "Task" |
-        // Financial
-        "Coverage" | "Claim" | "ClaimResponse" | "Invoice" |
-        // Administrative
-        "Location" | "Device" | "Questionnaire" | "QuestionnaireResponse" |
-        // Foundation Resources
-        "ValueSet" | "CodeSystem" | "StructureDefinition" | "CapabilityStatement" |
-        "ImplementationGuide" | "OperationDefinition" | "SearchParameter" => true,
-        // Not a DomainResource (or not recognized)
-        _ => false,
+/// This delegates to the macro-generated `type_hierarchy` module emitted into each
+/// version's model file, which records every type's `baseDefinition` parent. A type
+/// is a `DomainResource` if walking its parent chain reaches `DomainResource`
+/// (true for almost all resources; `Binary`, `Bundle`, and `Parameters` derive
+/// directly from `Resource` and are therefore not DomainResources).
+pub fn is_fhir_domain_resource_for_version(
+    resource_type: &str,
+    fhir_version: &FhirVersion,
+) -> bool {
+    match fhir_version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => {
+            helios_fhir::r4::type_hierarchy::is_subtype_of(resource_type, "DomainResource")
+        }
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => {
+            helios_fhir::r4b::type_hierarchy::is_subtype_of(resource_type, "DomainResource")
+        }
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => {
+            helios_fhir::r5::type_hierarchy::is_subtype_of(resource_type, "DomainResource")
+        }
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => {
+            helios_fhir::r6::type_hierarchy::is_subtype_of(resource_type, "DomainResource")
+        }
+        #[allow(unreachable_patterns)]
+        _ => false, // For versions not enabled by feature flags
     }
+}
+
+/// Determines if a FHIR resource type is a DomainResource.
+///
+/// Version-agnostic convenience wrapper around [`is_fhir_domain_resource_for_version`].
+/// Returns `true` if the type is a DomainResource in any enabled FHIR version.
+/// DomainResource membership is consistent across versions, so checking the enabled
+/// versions in turn is sufficient and avoids requiring callers to thread a version
+/// through type-checking code paths that don't have one.
+pub fn is_fhir_domain_resource(resource_type: &str) -> bool {
+    FhirVersion::enabled_versions()
+        .iter()
+        .any(|version| is_fhir_domain_resource_for_version(resource_type, version))
 }
 
 // is_fhir_type and is_system_type were removed as they were never used and

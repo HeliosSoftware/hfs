@@ -4,8 +4,8 @@
 //! infallible — failures are logged via `tracing` and never propagated to
 //! callers, preserving the fire-and-forget contract.
 
+use crate::fhir_model::AuditEvent;
 use async_trait::async_trait;
-use helios_fhir::r4::AuditEvent;
 
 /// Pluggable backend for recording FHIR `AuditEvent` resources.
 ///

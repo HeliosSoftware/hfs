@@ -1,7 +1,7 @@
 //! No-op audit sink for development and testing.
 
+use crate::fhir_model::AuditEvent;
 use async_trait::async_trait;
-use helios_fhir::r4::AuditEvent;
 
 use crate::sink::AuditSink;
 
