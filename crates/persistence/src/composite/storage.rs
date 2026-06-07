@@ -662,8 +662,8 @@ impl CompositeStorage {
                 let fhir_version = resource_json
                     .get("meta")
                     .and_then(|m| m.get("profile"))
-                    .map(|_| FhirVersion::default())
-                    .unwrap_or_default();
+                    .map(|_| FhirVersion::default_enabled())
+                    .unwrap_or_else(FhirVersion::default_enabled);
 
                 if let Err(e) = self
                     .sync_to_secondaries(SyncEvent::Create {
@@ -1817,7 +1817,7 @@ impl CompositeStorage {
                             }
                         })
                     })
-                    .unwrap_or_else(|| infer_chain_target_type(ref_param));
+                    .unwrap_or_else(|| crate::search::chain_resolver::infer_target_type(ref_param));
                 types.push(next.clone());
                 current = next;
             }
@@ -1899,31 +1899,6 @@ impl CompositeStorage {
         }
 
         Ok(current_refs)
-    }
-}
-
-/// Hardcoded fallback for ambiguous reference targets. Matches
-/// `sqlite/search/chain_builder::infer_target_type` so composite agrees with
-/// the underlying backends. See the open-question note in the plan about
-/// migrating to a registry-driven first-target pick.
-fn infer_chain_target_type(ref_param: &str) -> String {
-    match ref_param {
-        "patient" | "subject" => "Patient".to_string(),
-        "practitioner" | "performer" | "requester" | "author" => "Practitioner".to_string(),
-        "organization" | "managingOrganization" | "custodian" => "Organization".to_string(),
-        "encounter" | "context" => "Encounter".to_string(),
-        "location" => "Location".to_string(),
-        "device" => "Device".to_string(),
-        "specimen" => "Specimen".to_string(),
-        "medication" => "Medication".to_string(),
-        "condition" => "Condition".to_string(),
-        _ => {
-            let mut chars = ref_param.chars();
-            match chars.next() {
-                Some(c) => c.to_uppercase().chain(chars).collect(),
-                None => ref_param.to_string(),
-            }
-        }
     }
 }
 

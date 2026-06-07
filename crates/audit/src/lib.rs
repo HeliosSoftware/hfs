@@ -30,6 +30,25 @@
 //! | `HFS_AUDIT_SOURCE_OBSERVER` | `Device/hfs` | AuditEvent.source.observer |
 //! | `HFS_AUDIT_EXCLUDE_PATHS` | — | Comma-separated paths to skip |
 
+/// Version-agnostic alias for the FHIR model module backing `AuditEvent`.
+///
+/// `helios-audit` emits IHE BALP `AuditEvent` resources, whose structure is
+/// defined on the **R4** `AuditEvent` model (R4 and R4B share an identical
+/// `AuditEvent` API; R5/R6 restructured it incompatibly). Rather than hard-pin
+/// `helios_fhir::r4`, this aliases to the lowest enabled R4-family version so the
+/// crate builds in single-version-minimal configurations (e.g. R4B-only) without
+/// dragging in the R4 feature.
+#[cfg(feature = "R4")]
+pub(crate) use helios_fhir::r4 as fhir_model;
+#[cfg(all(feature = "R4B", not(feature = "R4")))]
+pub(crate) use helios_fhir::r4b as fhir_model;
+
+#[cfg(all(not(feature = "R4"), not(feature = "R4B")))]
+compile_error!(
+    "helios-audit emits IHE BALP (R4-structured) AuditEvents and requires the \
+     `R4` or `R4B` feature. For an R5/R6-only build, additionally enable `R4B`."
+);
+
 pub mod balp;
 pub mod builder;
 pub mod config;

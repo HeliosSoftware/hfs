@@ -697,8 +697,8 @@ impl ExportWorkerStorage for PostgresBackend {
                 ))));
             }
         };
-        let fhir_version =
-            helios_fhir::FhirVersion::from_mime_param(&fhir_version_str).unwrap_or_default();
+        let fhir_version = helios_fhir::FhirVersion::from_mime_param(&fhir_version_str)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
         let progress_rows = client
             .query(

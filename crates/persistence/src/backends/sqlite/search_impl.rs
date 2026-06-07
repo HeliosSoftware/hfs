@@ -264,7 +264,8 @@ impl SearchProvider for SqliteBackend {
                 .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                 .with_timezone(&Utc);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 resource_type.clone(),
@@ -465,7 +466,8 @@ impl MultiTypeSearchProvider for SqliteBackend {
                 .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                 .with_timezone(&Utc);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 resource_type,
@@ -669,7 +671,8 @@ impl RevincludeProvider for SqliteBackend {
                     .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                     .with_timezone(&Utc);
 
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 let resource = StoredResource::from_storage(
                     &revinclude.source_type,
@@ -932,7 +935,8 @@ impl SqliteBackend {
                     .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                     .with_timezone(&Utc);
 
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 Ok(Some(StoredResource::from_storage(
                     resource_type,
@@ -1085,7 +1089,8 @@ impl SqliteBackend {
                 .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                 .with_timezone(&Utc);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             resources.push(StoredResource::from_storage(
                 resource_type,

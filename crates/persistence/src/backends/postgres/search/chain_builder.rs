@@ -213,7 +213,7 @@ impl ChainQueryBuilder {
             }
         }
 
-        Ok(infer_target_type(ref_param))
+        Ok(crate::search::chain_resolver::infer_target_type(ref_param))
     }
 
     fn resolve_terminal_type(
@@ -625,31 +625,6 @@ fn parse_chain_part(part: &str) -> (String, Option<String>) {
         (param.to_string(), Some(type_mod.to_string()))
     } else {
         (part.to_string(), None)
-    }
-}
-
-/// Hardcoded fallback for ambiguous reference targets, matching SQLite's
-/// `chain_builder::infer_target_type` so chained queries pick the same
-/// default on both backends. See the open-question note in the plan about
-/// migrating this to a registry-driven first-target pick later.
-fn infer_target_type(ref_param: &str) -> String {
-    match ref_param {
-        "patient" | "subject" => "Patient".to_string(),
-        "practitioner" | "performer" | "requester" | "author" => "Practitioner".to_string(),
-        "organization" | "managingOrganization" | "custodian" => "Organization".to_string(),
-        "encounter" | "context" => "Encounter".to_string(),
-        "location" => "Location".to_string(),
-        "device" => "Device".to_string(),
-        "specimen" => "Specimen".to_string(),
-        "medication" => "Medication".to_string(),
-        "condition" => "Condition".to_string(),
-        _ => {
-            let mut chars = ref_param.chars();
-            match chars.next() {
-                Some(c) => c.to_uppercase().chain(chars).collect(),
-                None => ref_param.to_string(),
-            }
-        }
     }
 }
 

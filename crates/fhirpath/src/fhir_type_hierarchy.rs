@@ -2,42 +2,41 @@
 //!
 //! Implements FHIR type system navigation and inheritance checking for FHIRPath type operations.
 
-use once_cell::sync::Lazy;
-use std::collections::HashSet;
+use helios_fhir::{FhirPrimitiveTypeProvider, FhirVersion};
 
 /// FHIR Type Hierarchy module
 ///
 /// This module provides utility functions for FHIR type checking and string manipulation.
 /// It includes primitive type checking and string capitalization utilities.
 ///
-/// Set of FHIR primitive types
-static FHIR_PRIMITIVE_TYPES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    let mut s = HashSet::new();
-    s.insert("boolean");
-    s.insert("string");
-    s.insert("integer");
-    s.insert("decimal");
-    s.insert("date");
-    s.insert("dateTime");
-    s.insert("time");
-    s.insert("code");
-    s.insert("id");
-    s.insert("uri");
-    s.insert("url");
-    s.insert("canonical");
-    s.insert("markdown");
-    s.insert("base64Binary");
-    s.insert("instant");
-    s.insert("oid");
-    s.insert("positiveInt");
-    s.insert("unsignedInt");
-    s.insert("uuid");
-    s
-});
+/// Checks if a type is a FHIR primitive type in the given FHIR version.
+///
+/// Delegates to the macro-generated [`FhirPrimitiveTypeProvider`] implementation,
+/// which is derived from the FHIR specification (StructureDefinitions of kind
+/// `primitive-type`), rather than a hand-maintained list.
+pub fn is_fhir_primitive_type_for_version(type_name: &str, fhir_version: &FhirVersion) -> bool {
+    match fhir_version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => helios_fhir::r4::PrimitiveTypes::is_primitive_type(type_name),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => helios_fhir::r4b::PrimitiveTypes::is_primitive_type(type_name),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => helios_fhir::r5::PrimitiveTypes::is_primitive_type(type_name),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => helios_fhir::r6::PrimitiveTypes::is_primitive_type(type_name),
+        #[allow(unreachable_patterns)]
+        _ => false, // For versions not enabled by feature flags
+    }
+}
 
-/// Checks if a type is a FHIR primitive type
+/// Checks if a type is a FHIR primitive type.
+///
+/// Version-agnostic convenience wrapper around [`is_fhir_primitive_type_for_version`]:
+/// returns `true` if the type is a primitive in any enabled FHIR version.
 pub fn is_fhir_primitive_type(type_name: &str) -> bool {
-    FHIR_PRIMITIVE_TYPES.contains(type_name.to_lowercase().as_str())
+    FhirVersion::enabled_versions()
+        .iter()
+        .any(|version| is_fhir_primitive_type_for_version(type_name, version))
 }
 
 /// Utility function to capitalize the first letter of a string

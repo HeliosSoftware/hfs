@@ -555,9 +555,19 @@ mod tests {
     }
 }
 
-/// Heuristic fallback for ambiguous reference targets, matching the SQLite /
-/// PostgreSQL chain builders so all backends agree.
-fn infer_target_type(ref_param: &str) -> String {
+/// Heuristic fallback for inferring the target resource type of a reference
+/// search parameter when the registry has no (or an ambiguous) target list.
+///
+/// This is the single source of truth shared by every backend's chain builder
+/// (SQLite, PostgreSQL) and the composite storage layer, so all of them agree on
+/// which type an untyped chain link resolves to. Callers reach it via
+/// `crate::search::chain_resolver::infer_target_type`.
+///
+/// Note: this remains a hand-maintained heuristic rather than spec-derived data;
+/// the longer-term fix is to pick the first declared target from the
+/// SearchParameter registry. Keeping it in one place is the prerequisite for that
+/// migration.
+pub(crate) fn infer_target_type(ref_param: &str) -> String {
     match ref_param {
         "patient" | "subject" => "Patient".to_string(),
         "practitioner" | "performer" | "requester" | "author" => "Practitioner".to_string(),

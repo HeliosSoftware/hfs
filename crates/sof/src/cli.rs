@@ -194,7 +194,7 @@ struct Args {
     threads: Option<usize>,
 
     /// FHIR version to use for parsing resources
-    #[arg(long, value_enum, default_value_t = FhirVersion::R4)]
+    #[arg(long, value_enum, default_value_t = FhirVersion::default_enabled())]
     fhir_version: FhirVersion,
 
     /// Parquet row group size in MB (default: 256MB, range: 64-1024MB)
