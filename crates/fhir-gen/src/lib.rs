@@ -2204,8 +2204,8 @@ fn generate_element_documentation(element: &ElementDefinition) -> String {
                 line.to_string()
             } else {
                 // This should never happen, but if it does, add the prefix
-                eprintln!("ERROR in generate_element_documentation for {}: Line {} missing /// prefix: {}", 
-                    &element.path, i, line);
+                eprintln!("ERROR in generate_element_documentation for {}: Line {} missing /// prefix: {}",
+                    element.path, i, line);
                 format!("/// {}", line)
             }
         })
