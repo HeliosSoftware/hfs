@@ -275,7 +275,9 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        assert!(fragment.sql.contains("value_string ILIKE"));
+        // Accent-folded substring match: COALESCE(folded, raw) ILIKE %mit%
+        assert!(fragment.sql.contains("value_string_folded"));
+        assert!(fragment.sql.contains("ILIKE"));
         // Substring match: param wrapped as %mit%
         match &fragment.params[0] {
             SqlParam::Text(s) => {
@@ -461,7 +463,8 @@ mod query_builder_tests {
         assert!(result.is_some());
         let fragment = result.unwrap();
         assert!(fragment.sql.contains("value_date"));
-        assert!(fragment.sql.contains("> $"));
+        // gt now matches strictly after the day → value_date >= (next day).
+        assert!(fragment.sql.contains(">= $"));
     }
 
     #[test]
@@ -480,8 +483,10 @@ mod query_builder_tests {
         let fragment = result.unwrap();
         assert!(fragment.sql.contains("value_number"));
         assert!(fragment.sql.contains(">= $"));
+        // ge matches from the low boundary of the implicit range: "0.5" has
+        // precision 0.1, so the bound is 0.5 - 0.05 = 0.45.
         match &fragment.params[0] {
-            SqlParam::Float(f) => assert!((f - 0.5).abs() < f64::EPSILON),
+            SqlParam::Float(f) => assert!((f - 0.45).abs() < 1e-9),
             _ => panic!("Expected Float param"),
         }
     }
@@ -1335,6 +1340,91 @@ mod postgres_integration {
             "Search by name should find the patient"
         );
         assert_eq!(result.resources.items[0].id(), "p1");
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_string_search_is_accent_insensitive() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "accent-pg",
+                    "name": [{ "family": "Müller" }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        for q in ["muller", "Müller", "MULLER"] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "family".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq(q)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(
+                result.resources.items.len(),
+                1,
+                "accent-insensitive family search '{q}' should match 'Müller'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_quantity_search_ucum_equivalence() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-mass-pg",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "x" }] },
+                    "valueQuantity": { "value": 1, "unit": "g", "system": "http://unitsofmeasure.org", "code": "g" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::eq("1000|http://unitsofmeasure.org|mg")],
+            chain: vec![],
+            components: vec![],
+        });
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "UCUM-equivalent quantity (1000 mg) should match stored 1 g"
+        );
+        assert_eq!(result.resources.items[0].id(), "obs-mass-pg");
     }
 
     #[tokio::test]

@@ -96,11 +96,16 @@ pub fn build_search_query(
         }
     }
 
-    // Store raw parameters for debugging
-    query.raw_params = params
-        .iter()
-        .map(|(k, v)| (k.clone(), vec![v.clone()]))
-        .collect();
+    // Expand wildcard includes (_include=Type:*) into one directive per
+    // reference search parameter of the source type.
+    expand_wildcard_includes(&mut query.includes, registry);
+
+    // Store raw parameters for debugging, grouping repeated keys.
+    let mut raw_params: HashMap<String, Vec<String>> = HashMap::new();
+    for (k, v) in params.iter() {
+        raw_params.entry(k.clone()).or_default().push(v.clone());
+    }
+    query.raw_params = raw_params;
 
     // Process search parameters (non-system params)
     for (name, value) in params.search_params() {
@@ -129,6 +134,59 @@ pub fn build_search_query_from_map(
     registry: &SearchParameterRegistry,
 ) -> Result<SearchQuery, RestError> {
     let search_params = SearchParams::from_map(params.clone());
+    build_search_query(resource_type, &search_params, registry)
+}
+
+/// Returns the names of search parameters that are not recognized for the given
+/// resource type (used to enforce `Prefer: handling=strict`).
+///
+/// A parameter is "unknown" when its base name (after stripping any modifier and
+/// chain) is not registered for `resource_type` or for `Resource`, and is not a
+/// global parameter (those start with `_`, e.g. `_id`, `_text`, `_has`). Under
+/// lenient handling the server ignores such parameters; under strict handling
+/// the caller turns this list into a `400`.
+pub fn unknown_search_params(
+    resource_type: &str,
+    params: &SearchParams,
+    registry: &SearchParameterRegistry,
+) -> Vec<String> {
+    let mut unknown = Vec::new();
+    for (name, _) in params.search_params() {
+        // Reverse chaining is validated when parsed; skip here.
+        if name == "_has" || name.starts_with("_has:") {
+            continue;
+        }
+        // Strip modifier (`name:exact`, `subject:Patient`) then chain (`a.b`).
+        let base = name
+            .split(':')
+            .next()
+            .unwrap_or(name)
+            .split('.')
+            .next()
+            .unwrap_or(name);
+        // Global/result parameters (`_id`, `_text`, `_type`, …) are always allowed.
+        if base.starts_with('_') {
+            continue;
+        }
+        let known = registry.get_param(resource_type, base).is_some()
+            || registry.get_param("Resource", base).is_some();
+        if !known {
+            unknown.push(name.clone());
+        }
+    }
+    unknown
+}
+
+/// Builds a SearchQuery from ordered key/value pairs.
+///
+/// Unlike [`build_search_query_from_map`], this preserves repeated parameters
+/// (FHIR AND semantics) and multiple `_include`/`_revinclude`/`_has` directives.
+pub fn build_search_query_from_pairs(
+    resource_type: &str,
+    pairs: &[(String, String)],
+    registry: &SearchParameterRegistry,
+) -> Result<SearchQuery, RestError> {
+    let search_params = SearchParams::from_pairs(pairs.to_vec());
     build_search_query(resource_type, &search_params, registry)
 }
 
@@ -396,14 +454,13 @@ fn parse_has_parameter(
         SearchValue::eq(value)
     };
 
-    // Check for nested _has
-    if search_param == "_has" || search_param.starts_with("_has:") {
-        // Nested reverse chain - this is complex and requires recursion
-        // For now, return a basic structure; the backend can handle it
-        let nested = parse_has_parameter(
-            &format!("_has:{}", &chain_str[parts[0].len() + parts[1].len() + 2..]),
-            value,
-        )?;
+    // Check for nested _has, e.g.
+    // `_has:Observation:subject:_has:Provenance:target:agent`.
+    // Everything after `source_type:reference_param:` is itself a `_has:...`
+    // expression, which we parse recursively.
+    if search_param == "_has" {
+        let inner = &chain_str[parts[0].len() + parts[1].len() + 2..];
+        let nested = parse_has_parameter(inner, value)?;
         if let Some(nested_chain) = nested {
             return Ok(Some(ReverseChainedParameter::nested(
                 source_type,
@@ -460,6 +517,35 @@ fn parse_include_directive(directive: &str, include_type: IncludeType) -> Option
         target_type,
         iterate,
     })
+}
+
+/// Expands wildcard include directives (`_include=Type:*`) into a concrete
+/// directive for each reference-typed search parameter of the source type,
+/// preserving the original `iterate` / `target_type` flags. Non-wildcard
+/// directives pass through unchanged.
+fn expand_wildcard_includes(
+    includes: &mut Vec<IncludeDirective>,
+    registry: &SearchParameterRegistry,
+) {
+    if !includes.iter().any(|d| d.search_param == "*") {
+        return;
+    }
+    let mut expanded = Vec::with_capacity(includes.len());
+    for directive in includes.drain(..) {
+        if directive.search_param == "*" {
+            for def in registry.get_active_params(&directive.source_type) {
+                if def.param_type == SearchParamType::Reference {
+                    expanded.push(IncludeDirective {
+                        search_param: def.code.clone(),
+                        ..directive.clone()
+                    });
+                }
+            }
+        } else {
+            expanded.push(directive);
+        }
+    }
+    *includes = expanded;
 }
 
 /// Parses _total parameter value.
@@ -635,6 +721,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_nested_has_parameter() {
+        // _has:Observation:subject:_has:Provenance:target:agent=prac-1
+        let result = parse_has_parameter(
+            "_has:Observation:subject:_has:Provenance:target:agent",
+            "prac-1",
+        )
+        .unwrap()
+        .expect("nested chain parsed");
+
+        // Outer level.
+        assert_eq!(result.source_type, "Observation");
+        assert_eq!(result.reference_param, "subject");
+        assert!(result.value.is_none(), "outer level carries no value");
+        assert_eq!(result.depth(), 2);
+
+        // Inner (terminal) level.
+        let inner = result.nested.expect("inner chain present");
+        assert_eq!(inner.source_type, "Provenance");
+        assert_eq!(inner.reference_param, "target");
+        assert_eq!(inner.search_param, "agent");
+        assert_eq!(
+            inner.value.as_ref().map(|v| v.value.as_str()),
+            Some("prac-1")
+        );
+        assert!(inner.is_terminal());
+    }
+
+    #[test]
     fn test_build_search_query_basic() {
         let mut params = HashMap::new();
         params.insert("name".to_string(), "Smith".to_string());
@@ -746,6 +860,81 @@ mod tests {
         assert_eq!(query.includes.len(), 1);
         assert_eq!(query.includes[0].source_type, "Observation");
         assert_eq!(query.includes[0].search_param, "patient");
+    }
+
+    #[test]
+    fn test_repeated_search_params_are_anded() {
+        // `?name=Smith&name=Jones` -> two ANDed parameters, both preserved.
+        let pairs = vec![
+            ("name".to_string(), "Smith".to_string()),
+            ("name".to_string(), "Jones".to_string()),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Patient", &sp, &test_registry()).unwrap();
+
+        let name_values: Vec<&str> = query
+            .parameters
+            .iter()
+            .filter(|p| p.name == "name")
+            .flat_map(|p| p.values.iter().map(|v| v.value.as_str()))
+            .collect();
+        assert_eq!(query.parameters.len(), 2, "both name params preserved");
+        assert!(name_values.contains(&"Smith"));
+        assert!(name_values.contains(&"Jones"));
+    }
+
+    #[test]
+    fn test_repeated_include_directives_preserved() {
+        // `?_include=A&_include=B` -> two include directives (was last-wins before).
+        let pairs = vec![
+            ("_include".to_string(), "Observation:subject".to_string()),
+            ("_include".to_string(), "Observation:encounter".to_string()),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Observation", &sp, &test_registry()).unwrap();
+
+        assert_eq!(query.includes.len(), 2);
+        let params: Vec<&str> = query
+            .includes
+            .iter()
+            .map(|d| d.search_param.as_str())
+            .collect();
+        assert!(params.contains(&"subject"));
+        assert!(params.contains(&"encounter"));
+    }
+
+    #[test]
+    fn test_repeated_has_chains_preserved() {
+        // Repeated `_has` -> multiple reverse chains, all preserved.
+        let pairs = vec![
+            (
+                "_has:Observation:patient:code".to_string(),
+                "1234-5".to_string(),
+            ),
+            (
+                "_has:Observation:patient:status".to_string(),
+                "final".to_string(),
+            ),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Patient", &sp, &test_registry()).unwrap();
+
+        assert_eq!(query.reverse_chains.len(), 2);
+    }
+
+    #[test]
+    fn test_mixed_comma_and_repeat_include() {
+        // Comma and repeat combine: `?_include=A,B&_include=C` -> three directives.
+        let pairs = vec![
+            (
+                "_include".to_string(),
+                "Observation:subject,Observation:encounter".to_string(),
+            ),
+            ("_include".to_string(), "Observation:patient".to_string()),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Observation", &sp, &test_registry()).unwrap();
+        assert_eq!(query.includes.len(), 3);
     }
 
     #[test]

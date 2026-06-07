@@ -189,6 +189,7 @@ pub(crate) fn build_es_document(
                 string_params.push(json!({
                     "name": ev.param_name,
                     "value": s,
+                    "folded": crate::search::fold_text(s),
                 }));
             }
             IndexValue::Token {
@@ -247,6 +248,16 @@ pub(crate) fn build_es_document(
                 }
                 if let Some(c) = code {
                     qty["code"] = json!(c);
+                }
+                // UCUM-canonical value/unit so quantity search matches equivalent
+                // units (g ⇄ mg). Uses the code if present, else the unit display.
+                if let Some((cv, cu)) = code
+                    .as_deref()
+                    .or(unit.as_deref())
+                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
+                {
+                    qty["canonical_value"] = json!(cv);
+                    qty["canonical_unit"] = json!(cu);
                 }
                 quantity_params.push(qty);
             }

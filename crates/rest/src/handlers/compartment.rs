@@ -6,11 +6,9 @@
 //! Compartment search allows finding all resources related to a specific resource,
 //! such as all Observations for a specific Patient.
 
-use std::collections::HashMap;
-
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, RawQuery, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -18,7 +16,8 @@ use helios_persistence::core::{ResourceStorage, SearchProvider};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::{FhirVersionExtractor, TenantExtractor, build_search_query_from_map};
+use crate::extractors::query_pairs::parse_query_pairs;
+use crate::extractors::{FhirVersionExtractor, SearchParams, TenantExtractor, build_search_query};
 use crate::state::AppState;
 
 /// Handler for compartment search.
@@ -43,17 +42,18 @@ pub async fn compartment_search_handler<S>(
     Path((compartment_type, compartment_id, target_type)): Path<(String, String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
-    Query(mut params): Query<HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
+    let mut pairs = parse_query_pairs(raw_query.as_deref());
     debug!(
         compartment_type = %compartment_type,
         compartment_id = %compartment_id,
         target_type = %target_type,
         tenant = %tenant.tenant_id(),
-        params = ?params,
+        params = ?pairs,
         "Processing compartment search request"
     );
 
@@ -77,21 +77,24 @@ where
 
     // Add the first compartment reference parameter to the search parameters
     // (the first parameter is typically the most specific one)
-    params.insert(ref_params[0].to_string(), compartment_ref);
+    pairs.push((ref_params[0].to_string(), compartment_ref));
 
-    // Apply pagination limits
-    apply_pagination_limits(
-        &mut params,
-        state.default_page_size(),
-        state.max_page_size(),
-    );
+    let search_params = SearchParams::from_pairs(pairs);
 
     // Convert REST params to persistence SearchQuery. Scope the registry read
     // guard tightly so it doesn't span any await.
-    let query = {
+    let mut query = {
         let registry = state.storage().search_param_registry().read();
-        build_search_query_from_map(&target_type, &params, &registry)?
+        build_search_query(&target_type, &search_params, &registry)?
     };
+
+    // Clamp page size to the configured default/maximum.
+    let count = query
+        .count
+        .map(|c| c as usize)
+        .unwrap_or(state.default_page_size())
+        .min(state.max_page_size());
+    query.count = Some(count as u32);
 
     // Execute the search
     let result = state
@@ -109,7 +112,7 @@ where
         &compartment_type,
         &compartment_id,
         &target_type,
-        &params,
+        &search_params,
     );
 
     // Convert result to FHIR Bundle
@@ -140,7 +143,7 @@ pub async fn compartment_search_all_handler<S>(
     State(_state): State<AppState<S>>,
     Path((compartment_type, compartment_id)): Path<(String, String)>,
     _tenant: TenantExtractor,
-    Query(_params): Query<HashMap<String, String>>,
+    RawQuery(_raw_query): RawQuery,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
@@ -162,42 +165,27 @@ where
     })
 }
 
-/// Applies pagination limits from configuration to the params.
-fn apply_pagination_limits(
-    params: &mut HashMap<String, String>,
-    default_page_size: usize,
-    max_page_size: usize,
-) {
-    let count = params
-        .get("_count")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default_page_size)
-        .min(max_page_size);
-
-    params.insert("_count".to_string(), count.to_string());
-}
-
 /// Builds a compartment search URL.
 fn build_compartment_search_url(
     base_url: &str,
     compartment_type: &str,
     compartment_id: &str,
     target_type: &str,
-    params: &HashMap<String, String>,
+    params: &SearchParams,
 ) -> String {
     let path = format!(
         "{}/{}/{}/{}",
         base_url, compartment_type, compartment_id, target_type
     );
 
-    if params.is_empty() {
+    let query: String = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
         path
     } else {
-        let query: String = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
         format!("{}?{}", path, query)
     }
 }
@@ -306,15 +294,14 @@ mod tests {
             "Patient",
             "123",
             "Observation",
-            &HashMap::new(),
+            &SearchParams::from_pairs(vec![]),
         );
         assert_eq!(url, "http://example.com/fhir/Patient/123/Observation");
     }
 
     #[test]
     fn test_build_compartment_search_url_with_params() {
-        let mut params = HashMap::new();
-        params.insert("code".to_string(), "8867-4".to_string());
+        let params = SearchParams::from_pairs(vec![("code".to_string(), "8867-4".to_string())]);
 
         let url = build_compartment_search_url(
             "http://example.com/fhir",

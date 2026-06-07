@@ -77,7 +77,11 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                             "normalizer": "lowercase_normalizer"
                                         }
                                     }
-                                }
+                                },
+                                // Case- and accent-folded value (NFD + combining-mark
+                                // stripping, computed by the writer) for accent-
+                                // insensitive string search.
+                                "folded": { "type": "keyword" }
                             }
                         },
                         "token": {
@@ -122,7 +126,11 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 "value": { "type": "double" },
                                 "unit": { "type": "keyword" },
                                 "system": { "type": "keyword" },
-                                "code": { "type": "keyword" }
+                                "code": { "type": "keyword" },
+                                // UCUM-canonical value/unit (computed by the writer)
+                                // for unit-equivalent quantity search (g ⇄ mg).
+                                "canonical_value": { "type": "double" },
+                                "canonical_unit": { "type": "keyword" }
                             }
                         },
                         "reference": {

@@ -9,63 +9,28 @@
 //! to execute searches against the storage backend.
 
 use axum::{
-    Form,
-    extract::{Path, Query, State},
+    extract::{Path, RawForm, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::Response,
 };
-use helios_persistence::core::{MultiTypeSearchProvider, ResourceStorage, SearchProvider};
+use helios_persistence::core::{
+    IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
+    resolve_includes_iterative,
+};
 use helios_persistence::types::SearchBundle;
-use serde::Deserialize;
-use std::collections::HashMap;
 use tracing::{debug, warn};
 
 use helios_fhir::FhirVersion;
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::{TenantExtractor, build_search_query_from_map};
+use crate::extractors::query_pairs::{last_value, parse_query_pairs};
+use crate::extractors::{SearchParams, TenantExtractor, build_search_query, unknown_search_params};
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
+use crate::middleware::prefer::PreferHeader;
 use crate::responses::format_resource_response;
 use crate::responses::subsetting::{SummaryMode, apply_elements, apply_summary};
 use crate::state::AppState;
 use crate::terminology::TerminologyServiceClient;
-
-/// Query parameters for search (used in the SearchQuery struct in handlers).
-#[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
-pub struct SearchQueryParams {
-    /// The page size (_count parameter).
-    #[serde(rename = "_count")]
-    pub count: Option<usize>,
-
-    /// The page offset for pagination.
-    #[serde(rename = "_offset")]
-    pub offset: Option<usize>,
-
-    /// Include total count in response.
-    #[serde(rename = "_total")]
-    pub total: Option<String>,
-
-    /// Sort order.
-    #[serde(rename = "_sort")]
-    pub sort: Option<String>,
-
-    /// Summary mode (_summary parameter).
-    #[serde(rename = "_summary")]
-    pub summary: Option<String>,
-
-    /// Elements to include (_elements parameter).
-    #[serde(rename = "_elements")]
-    pub elements: Option<String>,
-
-    /// Resources to include (_include parameter).
-    #[serde(rename = "_include")]
-    pub include: Option<Vec<String>>,
-
-    /// Resources to reverse include (_revinclude parameter).
-    #[serde(rename = "_revinclude")]
-    pub revinclude: Option<Vec<String>>,
-}
 
 /// Handler for GET search.
 ///
@@ -83,22 +48,32 @@ pub async fn search_get_handler<S>(
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     req_headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    let pairs = parse_query_pairs(raw_query.as_deref());
     debug!(
         resource_type = %resource_type,
         tenant = %tenant.tenant_id(),
-        params = ?params,
+        params = ?pairs,
         "Processing search GET request"
     );
 
-    let format_param = params.get("_format").map(|s| s.as_str());
-    let negotiated = negotiate_format(&req_headers, format_param);
+    let format_param = last_value(&pairs, "_format");
+    let negotiated = negotiate_format(&req_headers, format_param.as_deref());
+    let strict = PreferHeader::from_headers(&req_headers).is_strict();
 
-    execute_search(&state, tenant, &resource_type, params, negotiated.format).await
+    execute_search(
+        &state,
+        tenant,
+        &resource_type,
+        pairs,
+        negotiated.format,
+        strict,
+    )
+    .await
 }
 
 /// Handler for POST search.
@@ -115,21 +90,32 @@ pub async fn search_post_handler<S>(
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     req_headers: HeaderMap,
-    Form(params): Form<HashMap<String, String>>,
+    RawForm(form): RawForm,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    let body = String::from_utf8_lossy(form.as_ref());
+    let pairs = parse_query_pairs(Some(&body));
     debug!(
         resource_type = %resource_type,
         tenant = %tenant.tenant_id(),
-        params = ?params,
+        params = ?pairs,
         "Processing search POST request"
     );
 
     let negotiated = negotiate_format(&req_headers, None);
+    let strict = PreferHeader::from_headers(&req_headers).is_strict();
 
-    execute_search(&state, tenant, &resource_type, params, negotiated.format).await
+    execute_search(
+        &state,
+        tenant,
+        &resource_type,
+        pairs,
+        negotiated.format,
+        strict,
+    )
+    .await
 }
 
 /// Handler for system-level search.
@@ -143,21 +129,22 @@ pub async fn search_system_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     req_headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + MultiTypeSearchProvider + Send + Sync,
 {
+    let pairs = parse_query_pairs(raw_query.as_deref());
     debug!(
         tenant = %tenant.tenant_id(),
-        params = ?params,
+        params = ?pairs,
         "Processing system-level search request"
     );
 
-    let format_param = params.get("_format").map(|s| s.as_str());
-    let negotiated = negotiate_format(&req_headers, format_param);
+    let format_param = last_value(&pairs, "_format");
+    let negotiated = negotiate_format(&req_headers, format_param.as_deref());
 
-    execute_system_search(&state, tenant, params, negotiated.format).await
+    execute_system_search(&state, tenant, pairs, negotiated.format).await
 }
 
 /// Executes a type-level search and returns a Bundle response.
@@ -165,25 +152,18 @@ async fn execute_search<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
     resource_type: &str,
-    params: HashMap<String, String>,
+    pairs: Vec<(String, String)>,
     format: FhirFormat,
+    strict: bool,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
-    // Apply pagination limits from config
-    let mut params = params;
-    apply_pagination_limits(
-        &mut params,
-        state.default_page_size(),
-        state.max_page_size(),
-    );
-
     // `:not-in` requires negated value-set filtering, which no backend
     // implements. Reject it explicitly (501) regardless of whether a terminology
     // server is configured, rather than silently ignoring it (which would return
     // a superset of the intended results).
-    if let Some(key) = params.keys().find(|k| k.ends_with(":not-in")) {
+    if let Some((key, _)) = pairs.iter().find(|(k, _)| k.ends_with(":not-in")) {
         return Err(RestError::NotImplemented {
             feature: format!(
                 "search modifier ':not-in' is not supported ({key}); \
@@ -192,18 +172,44 @@ where
         });
     }
 
-    // Pre-process :in / :not-in modifiers via the terminology server (if configured).
-    if let Some(ts_url) = state.terminology_server_url() {
-        params = expand_terminology_params(params, ts_url).await?;
-    }
+    // Pre-process :in / :above / :below modifiers via the terminology server.
+    let pairs = if let Some(ts_url) = state.terminology_server_url() {
+        expand_terminology_params(pairs, ts_url).await?
+    } else {
+        pairs
+    };
+
+    let search_params = SearchParams::from_pairs(pairs);
 
     // Convert REST params to persistence SearchQuery. Scope the registry read
     // guard tightly so it doesn't span any await — parking_lot guards aren't
     // Send by default, which would make this async fn !Send.
-    let query = {
+    let mut query = {
         let registry = state.storage().search_param_registry().read();
-        build_search_query_from_map(resource_type, &params, &registry)?
+        // Under `Prefer: handling=strict`, reject unknown search parameters
+        // (the lenient default ignores them).
+        if strict {
+            let unknown = unknown_search_params(resource_type, &search_params, &registry);
+            if !unknown.is_empty() {
+                return Err(RestError::InvalidParameter {
+                    param: unknown.join(", "),
+                    message: format!(
+                        "unknown search parameter(s) rejected under Prefer: handling=strict: {}",
+                        unknown.join(", ")
+                    ),
+                });
+            }
+        }
+        build_search_query(resource_type, &search_params, &registry)?
     };
+
+    // Clamp page size to the configured default/maximum.
+    let count = query
+        .count
+        .map(|c| c as usize)
+        .unwrap_or(state.default_page_size())
+        .min(state.max_page_size());
+    query.count = Some(count as u32);
 
     // Resolve chained / reverse-chained (`_has`) parameters into an `_id` filter
     // via application-side joins, so any backend's `search()` can execute them.
@@ -219,9 +225,7 @@ where
     };
 
     // Execute the search
-    // Note: The search provider is responsible for resolving _include/_revinclude
-    // directives that are part of the query. The result already contains included resources.
-    let result = state
+    let mut result = state
         .storage()
         .search(tenant.context(), &query)
         .await
@@ -230,17 +234,38 @@ where
             RestError::from(e)
         })?;
 
+    // Resolve _include/_revinclude (with :iterate) for backends whose search()
+    // does not populate includes inline (SQLite, Postgres). Backends that
+    // resolve inline (Elasticsearch, MongoDB) return a non-empty `included` and
+    // are left as-is.
+    if !query.includes.is_empty() && result.included.is_empty() {
+        let included = resolve_includes_iterative(
+            state.storage(),
+            tenant.context(),
+            &result.resources.items,
+            &query.includes,
+        )
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Include resolution failed");
+            RestError::from(e)
+        })?;
+        result.included = included;
+    }
+
     // Build the self link URL
-    let self_link = build_search_url(state.base_url(), resource_type, &params);
+    let self_link = build_search_url(state.base_url(), resource_type, &search_params);
 
     // Convert result to FHIR Bundle
     let bundle = result.to_bundle(state.base_url(), &self_link);
 
     // Parse subsetting parameters
-    let summary_mode = params.get("_summary").and_then(|v| SummaryMode::parse(v));
-    let elements: Option<Vec<&str>> = params
-        .get("_elements")
-        .map(|v| v.split(',').map(|s| s.trim()).collect());
+    let summary_mode = search_params
+        .get("_summary")
+        .and_then(|v| SummaryMode::parse(v));
+    let elements: Option<Vec<&str>> = search_params
+        .elements()
+        .map(|e| e.iter().map(|s| s.as_str()).collect());
 
     debug!(
         resource_type = %resource_type,
@@ -269,32 +294,38 @@ where
 async fn execute_system_search<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
-    params: HashMap<String, String>,
+    pairs: Vec<(String, String)>,
     format: FhirFormat,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + MultiTypeSearchProvider + Send + Sync,
 {
-    // Apply pagination limits from config
-    let mut params = params;
-    apply_pagination_limits(
-        &mut params,
-        state.default_page_size(),
-        state.max_page_size(),
-    );
+    let search_params = SearchParams::from_pairs(pairs);
 
     // Get resource types from _type parameter (if specified)
-    let resource_types: Vec<&str> = params
-        .get("_type")
-        .map(|t| t.split(',').collect())
+    let type_param = search_params.get("_type").cloned();
+    let resource_types: Vec<&str> = type_param
+        .as_deref()
+        .map(|t| t.split(',').map(|s| s.trim()).collect())
         .unwrap_or_default();
 
     // Build a search query (resource type doesn't matter much for system search).
     // Scope the registry read guard tightly so it doesn't span any await.
-    let query = {
+    // Note: strict unknown-parameter validation is intentionally skipped for
+    // system search — parameters there are interpreted across many resource
+    // types, so a per-"Resource" registry check would false-positive.
+    let mut query = {
         let registry = state.storage().search_param_registry().read();
-        build_search_query_from_map("Resource", &params, &registry)?
+        build_search_query("Resource", &search_params, &registry)?
     };
+
+    // Clamp page size to the configured default/maximum.
+    let count = query
+        .count
+        .map(|c| c as usize)
+        .unwrap_or(state.default_page_size())
+        .min(state.max_page_size());
+    query.count = Some(count as u32);
 
     // Execute the multi-type search
     let result = state
@@ -307,16 +338,18 @@ where
         })?;
 
     // Build the self link URL
-    let self_link = build_system_search_url(state.base_url(), &params);
+    let self_link = build_system_search_url(state.base_url(), &search_params);
 
     // Convert result to FHIR Bundle
     let bundle = result.to_bundle(state.base_url(), &self_link);
 
     // Parse subsetting parameters
-    let summary_mode = params.get("_summary").and_then(|v| SummaryMode::parse(v));
-    let elements: Option<Vec<&str>> = params
-        .get("_elements")
-        .map(|v| v.split(',').map(|s| s.trim()).collect());
+    let summary_mode = search_params
+        .get("_summary")
+        .and_then(|v| SummaryMode::parse(v));
+    let elements: Option<Vec<&str>> = search_params
+        .elements()
+        .map(|e| e.iter().map(|s| s.as_str()).collect());
 
     debug!(
         results = result.resources.len(),
@@ -338,52 +371,33 @@ where
     })
 }
 
-/// Applies pagination limits from configuration to the params.
-fn apply_pagination_limits(
-    params: &mut HashMap<String, String>,
-    default_page_size: usize,
-    max_page_size: usize,
-) {
-    // Parse and limit _count
-    let count = params
-        .get("_count")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default_page_size)
-        .min(max_page_size);
-
-    params.insert("_count".to_string(), count.to_string());
-}
-
 /// Builds a type-level search URL from base URL and parameters.
-fn build_search_url(
-    base_url: &str,
-    resource_type: &str,
-    params: &HashMap<String, String>,
-) -> String {
-    if params.is_empty() {
+fn build_search_url(base_url: &str, resource_type: &str, params: &SearchParams) -> String {
+    let query = encode_query(params);
+    if query.is_empty() {
         format!("{}/{}", base_url, resource_type)
     } else {
-        let query: String = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
         format!("{}/{}?{}", base_url, resource_type, query)
     }
 }
 
 /// Builds a system-level search URL from base URL and parameters.
-fn build_system_search_url(base_url: &str, params: &HashMap<String, String>) -> String {
-    if params.is_empty() {
+fn build_system_search_url(base_url: &str, params: &SearchParams) -> String {
+    let query = encode_query(params);
+    if query.is_empty() {
         base_url.to_string()
     } else {
-        let query: String = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
         format!("{}?{}", base_url, query)
     }
+}
+
+/// Encodes search params back into a query string, preserving repeated keys.
+fn encode_query(params: &SearchParams) -> String {
+    params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Converts a SearchBundle to a serde_json::Value for response with optional subsetting.
@@ -444,15 +458,27 @@ fn apply_subsetting(
     fhir_version: FhirVersion,
 ) -> serde_json::Value {
     let mut result = resource.clone();
+    let mut subsetted = false;
 
     // Apply _summary if specified
     if let Some(mode) = summary_mode {
         result = apply_summary(&result, mode, fhir_version);
+        if mode != SummaryMode::False {
+            subsetted = true;
+        }
     }
 
     // Apply _elements if specified (takes precedence over _summary for element selection)
     if let Some(elem_list) = elements {
-        result = apply_elements(&result, elem_list);
+        if !elem_list.is_empty() {
+            result = apply_elements(&result, elem_list);
+            subsetted = true;
+        }
+    }
+
+    // Flag incomplete representations with the SUBSETTED tag (FHIR spec).
+    if subsetted {
+        crate::responses::subsetting::add_subsetted_tag(&mut result);
     }
 
     result
@@ -482,13 +508,13 @@ mod urlencoding {
 /// failures the problematic parameter is skipped with a warning so a single
 /// bad ValueSet URL does not abort the entire search.
 async fn expand_terminology_params(
-    params: HashMap<String, String>,
+    pairs: Vec<(String, String)>,
     ts_url: &str,
-) -> Result<HashMap<String, String>, RestError> {
+) -> Result<Vec<(String, String)>, RestError> {
     let client = TerminologyServiceClient::new(ts_url.to_string());
-    let mut result: HashMap<String, String> = HashMap::with_capacity(params.len());
+    let mut result: Vec<(String, String)> = Vec::with_capacity(pairs.len());
 
-    for (key, value) in params {
+    for (key, value) in pairs {
         if let Some(param_name) = key.strip_suffix(":in") {
             // Expand the ValueSet and join codes with commas for OR token search.
             match client.expand_value_set(&value).await {
@@ -504,7 +530,7 @@ async fn expand_terminology_params(
                         codes = %codes.len(),
                         "Expanded ValueSet for :in modifier"
                     );
-                    result.insert(param_name.to_string(), token_list);
+                    result.push((param_name.to_string(), token_list));
                 }
                 Ok(_) => {
                     // Empty expansion — no code can match; use a sentinel value
@@ -515,10 +541,7 @@ async fn expand_terminology_params(
                         "ValueSet $expand returned empty expansion for :in modifier; \
                          injecting sentinel value so no resources match"
                     );
-                    result.insert(
-                        param_name.to_string(),
-                        "__hts_empty_expansion__".to_string(),
-                    );
+                    result.push((param_name.to_string(), HTS_EMPTY_EXPANSION.to_string()));
                 }
                 Err(e) => {
                     warn!(
@@ -564,10 +587,10 @@ async fn expand_terminology_params(
                 )
                 .await;
             } else {
-                result.insert(key, value);
+                result.push((key, value));
             }
         } else {
-            result.insert(key, value);
+            result.push((key, value));
         }
     }
 
@@ -584,7 +607,7 @@ const HTS_EMPTY_EXPANSION: &str = "__hts_empty_expansion__";
 /// fail-open (drop the filter).
 #[allow(clippy::too_many_arguments)]
 async fn expand_subsumption_into(
-    result: &mut HashMap<String, String>,
+    result: &mut Vec<(String, String)>,
     client: &TerminologyServiceClient,
     param_name: &str,
     key: &str,
@@ -608,7 +631,7 @@ async fn expand_subsumption_into(
                 codes = codes.len(),
                 "Expanded token hierarchy modifier"
             );
-            result.insert(param_name.to_string(), token_list);
+            result.push((param_name.to_string(), token_list));
         }
         Ok(_) => {
             warn!(
@@ -616,7 +639,7 @@ async fn expand_subsumption_into(
                 modifier = %modifier,
                 "Token hierarchy expansion returned no codes; injecting sentinel so no resources match"
             );
-            result.insert(param_name.to_string(), HTS_EMPTY_EXPANSION.to_string());
+            result.push((param_name.to_string(), HTS_EMPTY_EXPANSION.to_string()));
         }
         Err(e) => {
             warn!(
@@ -632,70 +655,89 @@ async fn expand_subsumption_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    /// Collapses result pairs into a last-wins map for assertions.
+    fn as_map(pairs: &[(String, String)]) -> HashMap<String, String> {
+        pairs.iter().cloned().collect()
+    }
+
+    fn sp(pairs: &[(&str, &str)]) -> SearchParams {
+        SearchParams::from_pairs(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
 
     #[test]
     fn test_build_search_url_no_params() {
-        let url = build_search_url("http://example.com/fhir", "Patient", &HashMap::new());
+        let url = build_search_url("http://example.com/fhir", "Patient", &sp(&[]));
         assert_eq!(url, "http://example.com/fhir/Patient");
     }
 
     #[test]
     fn test_build_search_url_with_params() {
-        let mut params = HashMap::new();
-        params.insert("name".to_string(), "Smith".to_string());
-        params.insert("_count".to_string(), "10".to_string());
-
-        let url = build_search_url("http://example.com/fhir", "Patient", &params);
+        let url = build_search_url(
+            "http://example.com/fhir",
+            "Patient",
+            &sp(&[("name", "Smith"), ("_count", "10")]),
+        );
         assert!(url.starts_with("http://example.com/fhir/Patient?"));
         assert!(url.contains("name=Smith"));
         assert!(url.contains("_count=10"));
     }
 
     #[test]
-    fn test_build_system_search_url() {
-        let mut params = HashMap::new();
-        params.insert("_type".to_string(), "Patient,Observation".to_string());
+    fn test_build_search_url_preserves_repeated_keys() {
+        let url = build_search_url(
+            "http://example.com/fhir",
+            "Observation",
+            &sp(&[
+                ("_include", "Observation:subject"),
+                ("_include", "Observation:encounter"),
+            ]),
+        );
+        assert!(url.contains("_include=Observation%3Asubject"));
+        assert!(url.contains("_include=Observation%3Aencounter"));
+    }
 
-        let url = build_system_search_url("http://example.com/fhir", &params);
+    #[test]
+    fn test_build_system_search_url() {
+        let url = build_system_search_url(
+            "http://example.com/fhir",
+            &sp(&[("_type", "Patient,Observation")]),
+        );
         assert!(url.starts_with("http://example.com/fhir?"));
         assert!(url.contains("_type="));
     }
 
-    #[test]
-    fn test_apply_pagination_limits() {
-        let mut params = HashMap::new();
-        params.insert("_count".to_string(), "1000".to_string());
-
-        apply_pagination_limits(&mut params, 20, 100);
-
-        assert_eq!(params.get("_count"), Some(&"100".to_string()));
-    }
-
-    #[test]
-    fn test_apply_pagination_limits_default() {
-        let mut params = HashMap::new();
-
-        apply_pagination_limits(&mut params, 20, 100);
-
-        assert_eq!(params.get("_count"), Some(&"20".to_string()));
-    }
-
     // ─── expand_terminology_params ───────────────────────────────────────────
 
-    /// Verifies that non-terminology params pass through unchanged.
+    /// Verifies that non-terminology params pass through unchanged, including
+    /// repeated keys.
     #[tokio::test]
     async fn test_expand_terminology_params_passthrough() {
-        let mut params = HashMap::new();
-        params.insert("name".to_string(), "Smith".to_string());
-        params.insert("_count".to_string(), "10".to_string());
+        let params = vec![
+            ("name".to_string(), "Smith".to_string()),
+            ("name".to_string(), "Jones".to_string()),
+            ("_count".to_string(), "10".to_string()),
+        ];
 
-        // Use a URL that won't be reachable — but only :in/:not-in keys trigger calls.
-        let result = expand_terminology_params(params.clone(), "http://localhost:9999")
+        // Use a URL that won't be reachable — but only :in/:above/:below keys trigger calls.
+        let result = expand_terminology_params(params, "http://localhost:9999")
             .await
             .unwrap();
 
-        assert_eq!(result.get("name"), Some(&"Smith".to_string()));
-        assert_eq!(result.get("_count"), Some(&"10".to_string()));
+        // Both repeated `name` values survive (FHIR AND semantics).
+        let names: Vec<&str> = result
+            .iter()
+            .filter(|(k, _)| k == "name")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(names, vec!["Smith", "Jones"]);
+        assert_eq!(as_map(&result).get("_count"), Some(&"10".to_string()));
     }
 
     /// Verifies that a `:not-in` parameter returns `NotImplemented` rather than
@@ -703,12 +745,13 @@ mod tests {
     #[tokio::test]
     async fn test_expand_terminology_params_not_in_returns_not_implemented() {
         use crate::error::RestError;
-        let mut params = HashMap::new();
-        params.insert(
-            "code:not-in".to_string(),
-            "http://example.org/vs".to_string(),
-        );
-        params.insert("name".to_string(), "Smith".to_string());
+        let params = vec![
+            (
+                "code:not-in".to_string(),
+                "http://example.org/vs".to_string(),
+            ),
+            ("name".to_string(), "Smith".to_string()),
+        ];
 
         let result = expand_terminology_params(params, "http://127.0.0.1:19999").await;
 
@@ -719,33 +762,33 @@ mod tests {
     /// Verifies that a :in param is dropped on network error (fail-open).
     #[tokio::test]
     async fn test_expand_terminology_params_in_dropped_on_network_error() {
-        let mut params = HashMap::new();
-        params.insert("code:in".to_string(), "http://example.org/vs".to_string());
+        let params = vec![("code:in".to_string(), "http://example.org/vs".to_string())];
 
         let result = expand_terminology_params(params, "http://127.0.0.1:19999")
             .await
             .unwrap();
 
         // The :in key is gone; no code key was injected either (fail-open)
-        assert!(!result.contains_key("code:in"));
-        assert!(!result.contains_key("code"));
+        let map = as_map(&result);
+        assert!(!map.contains_key("code:in"));
+        assert!(!map.contains_key("code"));
     }
 
     /// A token `:below` (`system|code`) is fail-open dropped on network error.
     #[tokio::test]
     async fn test_expand_terminology_params_below_token_dropped_on_network_error() {
-        let mut params = HashMap::new();
-        params.insert(
+        let params = vec![(
             "code:below".to_string(),
             "http://snomed.info/sct|73211009".to_string(),
-        );
+        )];
 
         let result = expand_terminology_params(params, "http://127.0.0.1:19999")
             .await
             .unwrap();
 
-        assert!(!result.contains_key("code:below"));
-        assert!(!result.contains_key("code"));
+        let map = as_map(&result);
+        assert!(!map.contains_key("code:below"));
+        assert!(!map.contains_key("code"));
     }
 
     /// Happy path: a token `:below` expands to the code and its descendants via
@@ -772,18 +815,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let mut params = HashMap::new();
-        params.insert(
+        let params = vec![(
             "code:below".to_string(),
             "http://snomed.info/sct|73211009".to_string(),
-        );
+        )];
         let result = expand_terminology_params(params, &format!("http://{addr}"))
             .await
             .unwrap();
 
         // Modifier consumed; rewritten to a plain token OR list of descendants.
-        assert!(!result.contains_key("code:below"));
-        let codes = result.get("code").expect("code param injected");
+        let map = as_map(&result);
+        assert!(!map.contains_key("code:below"));
+        let codes = map.get("code").expect("code param injected");
         assert!(codes.contains("http://snomed.info/sct|73211009"));
         assert!(codes.contains("http://snomed.info/sct|44054006"));
         assert!(codes.contains("http://snomed.info/sct|46635009"));
@@ -793,11 +836,10 @@ mod tests {
     /// so the backend can resolve URI hierarchy natively — no terminology call.
     #[tokio::test]
     async fn test_expand_terminology_params_below_uri_passthrough() {
-        let mut params = HashMap::new();
-        params.insert(
+        let params = vec![(
             "url:below".to_string(),
             "http://example.org/fhir/ValueSet/x".to_string(),
-        );
+        )];
 
         let result = expand_terminology_params(params, "http://127.0.0.1:19999")
             .await
@@ -805,7 +847,7 @@ mod tests {
 
         // Unchanged — no `|`, so not treated as a token subsumption.
         assert_eq!(
-            result.get("url:below"),
+            as_map(&result).get("url:below"),
             Some(&"http://example.org/fhir/ValueSet/x".to_string())
         );
     }
