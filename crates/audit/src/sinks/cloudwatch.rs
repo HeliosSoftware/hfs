@@ -6,10 +6,10 @@
 //!
 //! Requires the `cloudwatch` feature flag.
 
+use crate::fhir_model::AuditEvent;
 use async_trait::async_trait;
 use aws_sdk_cloudwatchlogs::Client;
 use aws_sdk_cloudwatchlogs::types::InputLogEvent;
-use helios_fhir::r4::AuditEvent;
 
 use crate::sink::AuditSink;
 

@@ -86,6 +86,7 @@ pub use search_params::{
     ChainConfig, ChainedParameter, CompositeSearchComponent, IncludeDirective, IncludeType,
     ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
     SearchQuery, SearchValue, SortDirection, SortDirective, SummaryMode, TotalMode,
+    strip_reference_version,
 };
 
 pub use stored_resource::{ResourceMeta, ResourceMethod, StoredResource, StoredResourceBuilder};

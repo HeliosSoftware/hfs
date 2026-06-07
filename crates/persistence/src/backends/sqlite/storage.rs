@@ -224,7 +224,8 @@ impl ResourceStorage for SqliteBackend {
                     .with_timezone(&Utc);
 
                 // Parse the FHIR version from storage
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 Ok(Some(StoredResource::from_storage(
                     resource_type,
@@ -795,7 +796,7 @@ impl SqliteBackend {
     /// search parameter registry, making it available for searches on new resources.
     /// Existing resources will NOT be indexed for this parameter until $reindex is run.
     fn handle_search_parameter_create(&self, resource: &Value) -> StorageResult<()> {
-        let loader = SearchParameterLoader::new(FhirVersion::R4);
+        let loader = SearchParameterLoader::new(FhirVersion::default_enabled());
 
         match loader.parse_resource(resource) {
             Ok(def) => {
@@ -828,7 +829,7 @@ impl SqliteBackend {
         old_resource: &Value,
         new_resource: &Value,
     ) -> StorageResult<()> {
-        let loader = SearchParameterLoader::new(FhirVersion::R4);
+        let loader = SearchParameterLoader::new(FhirVersion::default_enabled());
 
         let old_def = loader.parse_resource(old_resource).ok();
         let new_def = loader.parse_resource(new_resource).ok();
@@ -935,7 +936,8 @@ impl VersionedStorage for SqliteBackend {
                     None
                 };
 
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 Ok(Some(StoredResource::from_storage(
                     resource_type,
@@ -1153,7 +1155,8 @@ impl InstanceHistoryProvider for SqliteBackend {
                 None
             };
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 resource_type,
@@ -1462,7 +1465,8 @@ impl TypeHistoryProvider for SqliteBackend {
                 None
             };
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 resource_type,
@@ -1662,7 +1666,8 @@ impl SystemHistoryProvider for SqliteBackend {
                 None
             };
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 &resource_type,
@@ -1932,7 +1937,8 @@ impl DifferentialHistoryProvider for SqliteBackend {
                 .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                 .with_timezone(&Utc);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 &resource_type,
@@ -2733,7 +2739,12 @@ impl SqliteBackend {
 
                 // Use default FHIR version for bundle operations
                 let created = self
-                    .create(tenant, &resource_type, resource, FhirVersion::default())
+                    .create(
+                        tenant,
+                        &resource_type,
+                        resource,
+                        FhirVersion::default_enabled(),
+                    )
                     .await?;
                 Ok(BundleEntryResult::created(created))
             }
@@ -2752,7 +2763,7 @@ impl SqliteBackend {
                         &resource_type,
                         &id,
                         resource,
-                        FhirVersion::default(),
+                        FhirVersion::default_enabled(),
                     )
                     .await?;
                 Ok(BundleEntryResult::ok(stored))
@@ -2950,7 +2961,8 @@ impl ReindexableStorage for SqliteBackend {
                 let last_modified = chrono::DateTime::parse_from_rfc3339(&last_updated)
                     .ok()?
                     .with_timezone(&Utc);
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
                 Some(StoredResource::from_storage(
                     resource_type.to_string(),
                     id,

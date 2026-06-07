@@ -189,6 +189,7 @@ pub(crate) fn build_es_document(
                 string_params.push(json!({
                     "name": ev.param_name,
                     "value": s,
+                    "folded": crate::search::fold_text(s),
                 }));
             }
             IndexValue::Token {
@@ -247,6 +248,16 @@ pub(crate) fn build_es_document(
                 }
                 if let Some(c) = code {
                     qty["code"] = json!(c);
+                }
+                // UCUM-canonical value/unit so quantity search matches equivalent
+                // units (g ⇄ mg). Uses the code if present, else the unit display.
+                if let Some((cv, cu)) = code
+                    .as_deref()
+                    .or(unit.as_deref())
+                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
+                {
+                    qty["canonical_value"] = json!(cv);
+                    qty["canonical_unit"] = json!(cu);
                 }
                 quantity_params.push(qty);
             }
@@ -727,7 +738,8 @@ fn parse_stored_resource(
         .and_then(|v| v.as_str())
         .unwrap_or("4.0");
 
-    let fhir_version = FhirVersion::from_mime_param(fhir_version_str).unwrap_or_default();
+    let fhir_version = FhirVersion::from_mime_param(fhir_version_str)
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
     let last_updated = source
         .get("last_updated")

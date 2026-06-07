@@ -215983,6 +215983,38 @@ impl crate::FhirComplexTypeProvider for ComplexTypes {
     }
 }
 
+// --- Primitive Types Provider ---
+/// Marker struct for primitive type information
+pub struct PrimitiveTypes;
+
+impl crate::FhirPrimitiveTypeProvider for PrimitiveTypes {
+    fn get_primitive_type_names() -> Vec<&'static str> {
+        vec![
+            "base64Binary",
+            "boolean",
+            "canonical",
+            "code",
+            "date",
+            "dateTime",
+            "decimal",
+            "id",
+            "instant",
+            "integer",
+            "integer64",
+            "markdown",
+            "oid",
+            "positiveInt",
+            "string",
+            "time",
+            "unsignedInt",
+            "uri",
+            "url",
+            "uuid",
+            "xhtml",
+        ]
+    }
+}
+
 // --- Summary Fields Lookup ---
 /// Returns the summary fields for a given resource type.
 ///

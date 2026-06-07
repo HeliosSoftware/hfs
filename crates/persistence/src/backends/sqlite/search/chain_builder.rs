@@ -270,41 +270,18 @@ impl ChainQueryBuilder {
                     return Ok(targets[0].clone());
                 } else if targets.is_empty() {
                     // Fallback to inference
-                    return Ok(self.infer_target_type(ref_param));
+                    return Ok(crate::search::chain_resolver::infer_target_type(ref_param));
                 } else {
                     // Multiple targets - use inference for common patterns
                     // This allows queries like `Observation?subject.name=Smith` to work
                     // by defaulting `subject` to `Patient`
-                    return Ok(self.infer_target_type(ref_param));
+                    return Ok(crate::search::chain_resolver::infer_target_type(ref_param));
                 }
             }
         }
 
         // Fall back to inference based on common parameter names
-        Ok(self.infer_target_type(ref_param))
-    }
-
-    /// Infers target type based on common parameter naming conventions.
-    fn infer_target_type(&self, ref_param: &str) -> String {
-        match ref_param {
-            "patient" | "subject" => "Patient".to_string(),
-            "practitioner" | "performer" | "requester" | "author" => "Practitioner".to_string(),
-            "organization" | "managingOrganization" | "custodian" => "Organization".to_string(),
-            "encounter" | "context" => "Encounter".to_string(),
-            "location" => "Location".to_string(),
-            "device" => "Device".to_string(),
-            "specimen" => "Specimen".to_string(),
-            "medication" => "Medication".to_string(),
-            "condition" => "Condition".to_string(),
-            _ => {
-                // Default: capitalize first letter
-                let mut chars = ref_param.chars();
-                match chars.next() {
-                    Some(c) => c.to_uppercase().chain(chars).collect(),
-                    None => ref_param.to_string(),
-                }
-            }
-        }
+        Ok(crate::search::chain_resolver::infer_target_type(ref_param))
     }
 
     /// Resolves the type of the terminal parameter.

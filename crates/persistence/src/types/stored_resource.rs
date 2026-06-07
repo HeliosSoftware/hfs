@@ -422,7 +422,9 @@ impl StoredResourceBuilder {
             id: self.id.expect("id is required"),
             version_id,
             tenant_id: self.tenant_id.expect("tenant_id is required"),
-            fhir_version: self.fhir_version.unwrap_or_default(),
+            fhir_version: self
+                .fhir_version
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled),
             content: self.content.expect("content is required"),
             created_at: self.created_at.unwrap_or(now),
             last_modified: self.last_modified.unwrap_or(now),

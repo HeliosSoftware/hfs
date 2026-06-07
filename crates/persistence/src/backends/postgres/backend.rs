@@ -75,7 +75,7 @@ pub struct PostgresConfig {
     pub statement_timeout_ms: u64,
 
     /// FHIR version for this backend instance.
-    #[serde(default)]
+    #[serde(default = "crate::default_fhir_version")]
     pub fhir_version: FhirVersion,
 
     /// Directory containing FHIR SearchParameter spec files.
@@ -144,7 +144,7 @@ impl Default for PostgresConfig {
             max_connections: default_max_connections(),
             connect_timeout_secs: default_connect_timeout_secs(),
             statement_timeout_ms: default_statement_timeout_ms(),
-            fhir_version: FhirVersion::default(),
+            fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
             schema_name: None,

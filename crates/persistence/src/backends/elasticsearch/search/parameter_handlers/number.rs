@@ -45,24 +45,26 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
                 }
             }));
         }
-        SearchPrefix::Gt => {
+        // Comparators match the implicit-precision range boundaries (FHIR spec):
+        // gt/sa → ≥ hi, lt/eb → < lo, ge → ≥ lo, le → < hi.
+        SearchPrefix::Gt | SearchPrefix::Sa => {
             json!({
-                "range": { "search_params.number.value": { "gt": num } }
+                "range": { "search_params.number.value": { "gte": num + implicit_precision } }
             })
         }
-        SearchPrefix::Lt => {
+        SearchPrefix::Lt | SearchPrefix::Eb => {
             json!({
-                "range": { "search_params.number.value": { "lt": num } }
+                "range": { "search_params.number.value": { "lt": num - implicit_precision } }
             })
         }
         SearchPrefix::Ge => {
             json!({
-                "range": { "search_params.number.value": { "gte": num } }
+                "range": { "search_params.number.value": { "gte": num - implicit_precision } }
             })
         }
         SearchPrefix::Le => {
             json!({
-                "range": { "search_params.number.value": { "lte": num } }
+                "range": { "search_params.number.value": { "lt": num + implicit_precision } }
             })
         }
         SearchPrefix::Ap => {
@@ -73,16 +75,6 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
                     "search_params.number.value": {
                         "gte": num - margin,
                         "lte": num + margin
-                    }
-                }
-            })
-        }
-        _ => {
-            json!({
-                "range": {
-                    "search_params.number.value": {
-                        "gte": num - implicit_precision,
-                        "lt": num + implicit_precision
                     }
                 }
             })
@@ -139,8 +131,9 @@ mod tests {
 
     #[test]
     fn test_gt() {
+        // gt matches strictly above the search range; for "100" that is >= 100.5.
         let clause = build_clause("length", "100", SearchPrefix::Gt).unwrap();
         let s = serde_json::to_string(&clause).unwrap();
-        assert!(s.contains("\"gt\":100"));
+        assert!(s.contains("\"gte\":100.5"));
     }
 }

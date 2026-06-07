@@ -148,6 +148,17 @@ pub mod strategy;
 pub mod tenant;
 pub mod types;
 
+/// Default FHIR version for backend configuration fields.
+///
+/// Used as the `#[serde(default = "...")]` source for `fhir_version` fields on the
+/// backend `Config` structs. Unlike `#[serde(default)]` — which would require the
+/// `Default` impl for `FhirVersion` that is gated on `feature = "R4"` — this
+/// resolves to [`helios_fhir::FhirVersion::default_enabled`], which is available in
+/// any single-version-minimal build (e.g. R4B-only).
+pub(crate) fn default_fhir_version() -> helios_fhir::FhirVersion {
+    helios_fhir::FhirVersion::default_enabled()
+}
+
 // Re-export commonly used types at crate root
 pub use error::{StorageError, StorageResult};
 pub use tenant::{TenantContext, TenantId, TenantPermissions};

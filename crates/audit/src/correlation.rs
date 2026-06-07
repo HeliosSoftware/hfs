@@ -5,7 +5,7 @@
 //! audit events that share a correlation ID, so the full set of operations within
 //! the bundle can be traced as a group.
 
-use helios_fhir::r4::AuditEvent;
+use crate::fhir_model::AuditEvent;
 
 use crate::balp::AuditAction;
 use crate::builder::AuditEventBuilder;
@@ -171,7 +171,7 @@ mod tests {
         let get_bundle_id = |event: &AuditEvent| -> String {
             let details = event.entity.as_ref().unwrap()[0].detail.as_ref().unwrap();
             match &details[0].value {
-                Some(helios_fhir::r4::AuditEventEntityDetailValue::String(s)) => {
+                Some(crate::fhir_model::AuditEventEntityDetailValue::String(s)) => {
                     s.value.clone().unwrap()
                 }
                 _ => panic!("Expected string value"),

@@ -875,7 +875,7 @@ impl PostgresBackend {
                             tenant,
                             &entry.resource_type,
                             entry.resource.clone(),
-                            FhirVersion::default(),
+                            FhirVersion::default_enabled(),
                         )
                         .await?;
 
@@ -902,7 +902,7 @@ impl PostgresBackend {
                     tenant,
                     &entry.resource_type,
                     entry.resource.clone(),
-                    FhirVersion::default(),
+                    FhirVersion::default_enabled(),
                 )
                 .await?;
 

@@ -1064,7 +1064,7 @@ impl MongoBackend {
             .get_str("fhir_version")
             .ok()
             .and_then(FhirVersion::from_storage)
-            .unwrap_or_default();
+            .unwrap_or_else(FhirVersion::default_enabled);
 
         Ok(StoredResource::from_storage(
             resource_type,

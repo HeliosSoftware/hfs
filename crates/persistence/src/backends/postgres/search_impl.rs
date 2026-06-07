@@ -43,6 +43,15 @@ impl SearchProvider for PostgresBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        // Populate Bundle.total only when the client asked for it
+        // (`_total=accurate|estimate`). Computed up-front so the count query's
+        // client is not held across the main query's await points.
+        let total = if query.wants_total() {
+            Some(self.search_count(tenant, query).await?)
+        } else {
+            None
+        };
+
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
@@ -199,7 +208,8 @@ impl SearchProvider for PostgresBackend {
                 .as_ref()
                 .map(|k| Self::read_cursor_value(row, 5, k.kind));
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
             let resource = StoredResource::from_storage(
                 resource_type.clone(),
                 id,
@@ -245,10 +255,13 @@ impl SearchProvider for PostgresBackend {
         };
 
         let resources: Vec<StoredResource> = parsed.into_iter().map(|(r, _)| r).collect();
+
+        // `total` was computed up-front (before acquiring `client`) to avoid
+        // holding a non-Send guard across the count query's await.
         let page_info = PageInfo {
             next_cursor,
             previous_cursor,
-            total: None,
+            total,
             has_next,
             has_previous,
         };
@@ -257,7 +270,7 @@ impl SearchProvider for PostgresBackend {
         Ok(SearchResult {
             resources: page,
             included: Vec::new(),
-            total: None,
+            total,
         })
     }
 
@@ -381,7 +394,8 @@ impl MultiTypeSearchProvider for PostgresBackend {
             let last_updated: chrono::DateTime<Utc> = row.get(4);
             let fhir_version_str: String = row.get(5);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 res_type,
@@ -550,7 +564,8 @@ impl RevincludeProvider for PostgresBackend {
                 }
                 seen_ids.insert(resource_key);
 
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 let resource = StoredResource::from_storage(
                     &revinclude.source_type,
@@ -721,7 +736,8 @@ impl TextSearchProvider for PostgresBackend {
             let last_updated: chrono::DateTime<Utc> = row.get(3);
             let fhir_version_str: String = row.get(4);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             resources.push(StoredResource::from_storage(
                 resource_type,
@@ -794,7 +810,8 @@ impl TextSearchProvider for PostgresBackend {
             let last_updated: chrono::DateTime<Utc> = row.get(3);
             let fhir_version_str: String = row.get(4);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             resources.push(StoredResource::from_storage(
                 resource_type,
@@ -975,7 +992,8 @@ impl PostgresBackend {
         let json_data: serde_json::Value = row.get(1);
         let last_updated: chrono::DateTime<Utc> = row.get(2);
         let fhir_version_str: String = row.get(3);
-        let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
         Ok(Some(StoredResource::from_storage(
             resource_type,

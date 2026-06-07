@@ -342,7 +342,7 @@ fn parse_history_row(
     let last_updated = extract_last_updated(doc, now);
     let is_deleted = doc.get_bool("is_deleted").unwrap_or(false);
     let deleted_at = extract_deleted_at(doc).or(if is_deleted { Some(last_updated) } else { None });
-    let fhir_version = extract_fhir_version(doc, FhirVersion::default());
+    let fhir_version = extract_fhir_version(doc, FhirVersion::default_enabled());
 
     Ok(ParsedHistoryRow {
         resource_type,
@@ -406,7 +406,7 @@ fn document_to_stored_resource(
     let created_at = extract_created_at(doc, now);
     let last_updated = extract_last_updated(doc, now);
     let deleted_at = extract_deleted_at(doc);
-    let fhir_version = extract_fhir_version(doc, FhirVersion::default());
+    let fhir_version = extract_fhir_version(doc, FhirVersion::default_enabled());
 
     Ok(StoredResource::from_storage(
         resource_type,
@@ -740,7 +740,7 @@ impl ResourceStorage for MongoBackend {
         let now = Utc::now();
         let created_at = extract_created_at(&doc, now);
         let last_updated = extract_last_updated(&doc, now);
-        let fhir_version = extract_fhir_version(&doc, FhirVersion::default());
+        let fhir_version = extract_fhir_version(&doc, FhirVersion::default_enabled());
 
         Ok(Some(StoredResource::from_storage(
             resource_type,
@@ -2270,7 +2270,7 @@ impl MongoBackend {
         let now = Utc::now();
         let now_bson = chrono_to_bson(now);
         let version_id = "1".to_string();
-        let fhir_version = FhirVersion::default();
+        let fhir_version = FhirVersion::default_enabled();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
         resources
