@@ -406,6 +406,7 @@ jobs:
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
             HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
+            HFS_COMPOSITE_SYNC_MODE=synchronous \
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres" ]; then
             HFS_STORAGE_BACKEND=postgres \
@@ -427,6 +428,7 @@ jobs:
             HFS_S3_PREFIX=ci/${{ matrix.suite_id }}/ \
             HFS_S3_VALIDATE_BUCKETS=false \
             HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
+            HFS_COMPOSITE_SYNC_MODE=synchronous \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &

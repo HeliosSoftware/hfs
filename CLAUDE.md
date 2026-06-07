@@ -238,6 +238,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | hfs | Elasticsearch index name prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | (none) | Elasticsearch basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | (none) | Elasticsearch basic auth password |
+| `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | Composite-store write sync mode for ES-backed backends. One of `asynchronous`, `synchronous`, `hybrid`. With `asynchronous` (default) the write returns as soon as the primary commits and the search backend is updated on a background worker — lowest latency, but a follow-up search can race the indexing. Use `synchronous` when callers need read-your-write semantics (e.g. integration tests, bulk loads that immediately search). Ignored when the storage backend has no search secondary. |
 
 #### Multi-tenancy
 | Variable | Default | Description |
