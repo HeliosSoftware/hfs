@@ -21,7 +21,9 @@ impl SqliteSearchIndexWriter {
             value_number, value_quantity_value, value_quantity_unit, value_quantity_system,
             value_reference, value_uri, composite_group,
             value_identifier_type_system, value_identifier_type_code,
-            value_reference_display
+            value_reference_display,
+            value_quantity_canonical_value, value_quantity_canonical_unit,
+            value_string_folded
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8, ?9,
@@ -29,7 +31,9 @@ impl SqliteSearchIndexWriter {
             ?12, ?13, ?14, ?15,
             ?16, ?17, ?18,
             ?19, ?20,
-            ?21
+            ?21,
+            ?22, ?23,
+            ?24
         )
         "#
     }
@@ -61,13 +65,18 @@ impl SqliteSearchIndexWriter {
             SqlValue::String(extracted.param_url.clone()),
         ];
 
-        // `value_reference_display` is appended as the final column; capture it
-        // here so the common tail (and the Token early-return) can emit it.
+        // `value_reference_display` and the UCUM-canonical quantity columns are
+        // appended as trailing columns; capture them here so the common tail
+        // (and the Token early-return) can emit them.
         let mut reference_display: Option<String> = None;
+        let mut canonical_value: Option<f64> = None;
+        let mut canonical_unit: Option<String> = None;
+        let mut string_folded: Option<String> = None;
 
         // Add value columns based on the IndexValue type
         match &extracted.value {
             IndexValue::String(s) => {
+                string_folded = Some(crate::search::fold_text(s));
                 params.push(SqlValue::OptString(Some(s.clone()))); // value_string
                 params.push(SqlValue::Null); // value_token_system
                 params.push(SqlValue::Null); // value_token_code
@@ -106,6 +115,9 @@ impl SqliteSearchIndexWriter {
                 params.push(SqlValue::OptString(identifier_type_system.clone())); // value_identifier_type_system
                 params.push(SqlValue::OptString(identifier_type_code.clone())); // value_identifier_type_code
                 params.push(SqlValue::Null); // value_reference_display
+                params.push(SqlValue::Null); // value_quantity_canonical_value
+                params.push(SqlValue::Null); // value_quantity_canonical_unit
+                params.push(SqlValue::Null); // value_string_folded
                 return params;
             }
             IndexValue::Date { value, precision } => {
@@ -140,8 +152,19 @@ impl SqliteSearchIndexWriter {
                 value,
                 unit,
                 system,
-                code: _,
+                code,
             } => {
+                // Canonicalize using the UCUM code when present, else the unit
+                // display string. Stored alongside the raw value so quantity
+                // search can match equivalent units (e.g. g ⇄ mg).
+                let ucum = code.as_deref().or(unit.as_deref());
+                if let Some(u) = ucum {
+                    if let Some((cv, cu)) = helios_fhirpath::ucum::canonicalize_quantity(*value, u)
+                    {
+                        canonical_value = Some(cv);
+                        canonical_unit = Some(cu);
+                    }
+                }
                 params.push(SqlValue::Null); // value_string
                 params.push(SqlValue::Null); // value_token_system
                 params.push(SqlValue::Null); // value_token_code
@@ -198,6 +221,12 @@ impl SqliteSearchIndexWriter {
         params.push(SqlValue::Null); // value_identifier_type_system
         params.push(SqlValue::Null); // value_identifier_type_code
         params.push(SqlValue::OptString(reference_display)); // value_reference_display
+        params.push(match canonical_value {
+            Some(v) => SqlValue::Float(v),
+            None => SqlValue::Null,
+        }); // value_quantity_canonical_value
+        params.push(SqlValue::OptString(canonical_unit)); // value_quantity_canonical_unit
+        params.push(SqlValue::OptString(string_folded)); // value_string_folded
 
         params
     }
@@ -266,7 +295,7 @@ mod tests {
         let params =
             SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", &extracted);
 
-        assert_eq!(params.len(), 21); // Updated for new columns
+        assert_eq!(params.len(), 24); // Updated for new columns
         assert!(matches!(&params[0], SqlValue::String(s) if s == "tenant1"));
         assert!(matches!(&params[5], SqlValue::OptString(Some(s)) if s == "Smith"));
     }
@@ -290,7 +319,7 @@ mod tests {
         let params =
             SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", &extracted);
 
-        assert_eq!(params.len(), 21); // Updated for new columns
+        assert_eq!(params.len(), 24); // Updated for new columns
         assert!(matches!(&params[6], SqlValue::OptString(Some(s)) if s == "http://example.org"));
         assert!(matches!(&params[7], SqlValue::String(s) if s == "12345"));
     }
@@ -314,7 +343,7 @@ mod tests {
         let params =
             SqliteSearchIndexWriter::to_sql_params("tenant1", "Observation", "123", &extracted);
 
-        assert_eq!(params.len(), 21);
+        assert_eq!(params.len(), 24);
         assert!(matches!(&params[8], SqlValue::OptString(Some(s)) if s == "Test Display")); // value_token_display
     }
 
@@ -339,7 +368,7 @@ mod tests {
         let params =
             SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", &extracted);
 
-        assert_eq!(params.len(), 21);
+        assert_eq!(params.len(), 24);
         // value_identifier_type_system is at index 18
         assert!(
             matches!(&params[18], SqlValue::OptString(Some(s)) if s == "http://terminology.hl7.org/CodeSystem/v2-0203")

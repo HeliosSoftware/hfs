@@ -96,7 +96,7 @@ impl TenantSourceExtractor for UrlPathTenantExtractor {
 
         // Skip reserved paths that are not tenant identifiers
         // Use the default FHIR version for resource type checking
-        let fhir_version = FhirVersion::default();
+        let fhir_version = FhirVersion::default_enabled();
         if is_reserved_path(tenant, &fhir_version) {
             return None;
         }

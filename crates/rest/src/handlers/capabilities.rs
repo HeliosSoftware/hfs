@@ -68,7 +68,9 @@ where
     S: ResourceStorage + Send + Sync,
 {
     // Determine which version to describe (from Accept header or default)
-    let fhir_version = version.accept_version().unwrap_or_default();
+    let fhir_version = version
+        .accept_version()
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
     debug!(
         fhir_version = %fhir_version,

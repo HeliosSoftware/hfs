@@ -204,7 +204,8 @@ impl ResourceStorage for PostgresBackend {
                     }));
                 }
 
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 Ok(Some(StoredResource::from_storage(
                     resource_type,
@@ -806,7 +807,8 @@ impl VersionedStorage for PostgresBackend {
                 // For deleted versions, use last_updated as deleted_at
                 let deleted_at = if is_deleted { Some(last_updated) } else { None };
 
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 Ok(Some(StoredResource::from_storage(
                     resource_type,
@@ -1023,7 +1025,8 @@ impl InstanceHistoryProvider for PostgresBackend {
 
             let deleted_at = if is_deleted { Some(last_updated) } else { None };
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 resource_type,
@@ -1317,7 +1320,8 @@ impl TypeHistoryProvider for PostgresBackend {
 
             let deleted_at = if is_deleted { Some(last_updated) } else { None };
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 resource_type,
@@ -1488,7 +1492,8 @@ impl SystemHistoryProvider for PostgresBackend {
 
             let deleted_at = if is_deleted { Some(last_updated) } else { None };
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 &row_resource_type,
@@ -1640,7 +1645,8 @@ impl DifferentialHistoryProvider for PostgresBackend {
             let last_updated: DateTime<Utc> = row.get(4);
             let fhir_version_str: String = row.get(5);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 &row_resource_type,
@@ -2500,7 +2506,12 @@ impl PostgresBackend {
                     })?;
 
                 let created = self
-                    .create(tenant, &resource_type, resource, FhirVersion::default())
+                    .create(
+                        tenant,
+                        &resource_type,
+                        resource,
+                        FhirVersion::default_enabled(),
+                    )
                     .await?;
                 Ok(BundleEntryResult::created(created))
             }
@@ -2518,7 +2529,7 @@ impl PostgresBackend {
                         &resource_type,
                         &id,
                         resource,
-                        FhirVersion::default(),
+                        FhirVersion::default_enabled(),
                     )
                     .await?;
                 Ok(BundleEntryResult::ok(stored))
@@ -2688,7 +2699,8 @@ impl ReindexableStorage for PostgresBackend {
                 let data: Value = row.get(2);
                 let last_updated: DateTime<Utc> = row.get(3);
                 let fhir_version_str: String = row.get(4);
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 StoredResource::from_storage(
                     resource_type,

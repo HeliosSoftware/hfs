@@ -191,7 +191,7 @@ impl Transaction for PostgresTransaction {
 
         let now = Utc::now();
         let version_id = "1";
-        let fhir_version = FhirVersion::default();
+        let fhir_version = FhirVersion::default_enabled();
         let fhir_version_str = fhir_version.as_mime_param();
         let is_deleted = false;
 
@@ -268,7 +268,8 @@ impl Transaction for PostgresTransaction {
                     return Ok(None);
                 }
 
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 Ok(Some(StoredResource::from_storage(
                     resource_type,

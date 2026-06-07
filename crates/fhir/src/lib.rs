@@ -1848,6 +1848,22 @@ impl FhirVersion {
             FhirVersion::R6,
         ]
     }
+
+    /// Returns the default FHIR version for the current build.
+    ///
+    /// This is `R4` when the `R4` feature is enabled (the canonical default),
+    /// otherwise the first enabled version (`R4B`, then `R5`, then `R6`). Unlike
+    /// [`Default::default`] — which is gated on `feature = "R4"` and therefore
+    /// unavailable in single-version-minimal builds — this helper is available
+    /// whenever at least one FHIR version feature is enabled, which the crate
+    /// requires at compile time. Use it instead of `unwrap_or_default()` /
+    /// `FhirVersion::default()` on code paths that must compile in any
+    /// single-version build (e.g. R4B-only).
+    pub fn default_enabled() -> FhirVersion {
+        // `enabled_versions()` always has at least one entry: at least one FHIR
+        // version feature must be enabled at compile time.
+        FhirVersion::enabled_versions()[0]
+    }
 }
 
 /// Returns the compartment search parameters for a given FHIR version.
@@ -2008,6 +2024,25 @@ pub trait FhirComplexTypeProvider {
         Self::get_complex_type_names()
             .iter()
             .any(|&complex_type| complex_type.eq_ignore_ascii_case(type_name))
+    }
+}
+
+/// Trait for providing FHIR primitive type information
+///
+/// This trait allows querying which primitive data types are available in a specific
+/// FHIR version without hardcoding primitive type lists in multiple places. The
+/// implementation is generated from the FHIR specification (StructureDefinitions
+/// whose `kind` is `primitive-type`).
+pub trait FhirPrimitiveTypeProvider {
+    /// Returns a vector of all primitive type names supported in this FHIR version
+    /// (e.g. `boolean`, `string`, `dateTime`, `positiveInt`).
+    fn get_primitive_type_names() -> Vec<&'static str>;
+
+    /// Checks if a given type name is a primitive type in this FHIR version
+    fn is_primitive_type(type_name: &str) -> bool {
+        Self::get_primitive_type_names()
+            .iter()
+            .any(|&primitive_type| primitive_type.eq_ignore_ascii_case(type_name))
     }
 }
 

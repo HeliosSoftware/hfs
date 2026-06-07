@@ -30,12 +30,13 @@ impl PostgresSearchIndexWriter {
     ) -> StorageResult<()> {
         match &extracted.value {
             IndexValue::String(s) => {
+                let folded = crate::search::fold_text(s);
                 client
                     .execute(
                         "INSERT INTO search_index (
                             tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_string, composite_group
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            value_string, composite_group, value_string_folded
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                         &[
                             &tenant_id,
                             &resource_type,
@@ -44,6 +45,7 @@ impl PostgresSearchIndexWriter {
                             &extracted.param_url.as_str(),
                             &Some(s.as_str()),
                             &extracted.composite_group.map(|g| g as i32),
+                            &folded.as_str(),
                         ],
                     )
                     .await
@@ -139,14 +141,23 @@ impl PostgresSearchIndexWriter {
                 value,
                 unit,
                 system,
-                code: _,
+                code,
             } => {
+                // Canonicalize using the UCUM code (else the unit display) so
+                // quantity search can match equivalent units (g ⇄ mg).
+                let (canonical_value, canonical_unit) = code
+                    .as_deref()
+                    .or(unit.as_deref())
+                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
+                    .map(|(v, u)| (Some(v), Some(u)))
+                    .unwrap_or((None, None));
                 client
                     .execute(
                         "INSERT INTO search_index (
                             tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_quantity_value, value_quantity_unit, value_quantity_system, composite_group
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                            value_quantity_value, value_quantity_unit, value_quantity_system, composite_group,
+                            value_quantity_canonical_value, value_quantity_canonical_unit
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                         &[
                             &tenant_id,
                             &resource_type,
@@ -157,6 +168,8 @@ impl PostgresSearchIndexWriter {
                             &unit.as_deref(),
                             &system.as_deref(),
                             &extracted.composite_group.map(|g| g as i32),
+                            &canonical_value,
+                            &canonical_unit.as_deref(),
                         ],
                     )
                     .await

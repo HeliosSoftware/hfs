@@ -66,8 +66,10 @@ pub mod converters;
 pub mod errors;
 pub mod extractor;
 pub mod loader;
+pub mod range;
 pub mod registry;
 pub mod reindex;
+pub mod text_fold;
 pub mod writer;
 
 // Re-export main types
@@ -76,6 +78,7 @@ pub use converters::{IndexValue, ValueConverter};
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{ExtractedValue, SearchParameterExtractor};
 pub use loader::SearchParameterLoader;
+pub use range::{implicit_precision, implicit_range};
 pub use registry::{
     RegistryUpdate, SearchParameterDefinition, SearchParameterRegistry, SearchParameterSource,
     SearchParameterStatus, resolve_param_targets, resolve_param_type,
@@ -84,4 +87,5 @@ pub use reindex::{
     ReindexOperation, ReindexProgress, ReindexRequest, ReindexStatus, ReindexableStorage,
     ResourcePage,
 };
+pub use text_fold::fold_text;
 pub use writer::SearchIndexWriter;

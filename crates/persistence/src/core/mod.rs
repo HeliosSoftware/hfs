@@ -134,7 +134,7 @@ pub use history::{
 pub use search::{
     ChainedSearchProvider, FullSearchProvider, IncludeProvider, MultiTypeSearchProvider,
     RevincludeProvider, SearchProvider, SearchResult, TerminologySearchProvider,
-    TextSearchProvider,
+    TextSearchProvider, resolve_includes_iterative,
 };
 pub use storage::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,

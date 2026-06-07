@@ -295,8 +295,10 @@ impl SearchPrefix {
     ///
     /// Returns the prefix and the remaining value.
     pub fn extract(value: &str) -> (Self, &str) {
-        if value.len() >= 2 {
-            let prefix = &value[..2];
+        // `get(..2)` is char-boundary safe: it returns None when the first two
+        // bytes don't form a valid prefix (e.g. a multibyte first character like
+        // "Müller"), avoiding a panic from slicing mid-codepoint.
+        if let Some(prefix) = value.get(..2) {
             if let Ok(p) = prefix.parse() {
                 return (p, &value[2..]);
             }
@@ -725,6 +727,17 @@ pub enum SummaryMode {
     Count,
 }
 
+/// Strips a `/_history/<vid>` version suffix from a FHIR reference, returning
+/// the version-agnostic base. References without a version are returned
+/// unchanged. Used so reference search matches regardless of version, per the
+/// FHIR spec.
+pub fn strip_reference_version(reference: &str) -> &str {
+    match reference.find("/_history/") {
+        Some(i) => &reference[..i],
+        None => reference,
+    }
+}
+
 impl SearchQuery {
     /// Creates a new search query for the given resource type.
     pub fn new(resource_type: impl Into<String>) -> Self {
@@ -732,6 +745,15 @@ impl SearchQuery {
             resource_type: resource_type.into(),
             ..Default::default()
         }
+    }
+
+    /// Returns true if the client requested a total count via
+    /// `_total=accurate` or `_total=estimate`.
+    ///
+    /// `_total=none` or an unspecified `_total` returns `false`, so backends
+    /// skip the extra count query (FHIR allows omitting `Bundle.total`).
+    pub fn wants_total(&self) -> bool {
+        matches!(self.total, Some(TotalMode::Estimate | TotalMode::Accurate))
     }
 
     /// Adds a search parameter.

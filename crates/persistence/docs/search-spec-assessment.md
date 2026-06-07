@@ -125,10 +125,10 @@ effectively a no-op.
 | Capability | SQLite | PostgreSQL | MongoDB | Elasticsearch |
 |------------|:------:|:----------:|:-------:|:-------------:|
 | Forward chained params (N-level) | ✓ | ✓ | ◐ | ◐ |
-| Reverse chaining (`_has`) | ✓ | ✓ | ◐ | ◐ |
-| `_include` | ✓ | ✓ | ✓ | ✓ |
-| `_revinclude` | ✓ | ✓ | ✓ | ✓ |
-| `:iterate` on include | parsed | parsed | parsed | parsed |
+| Reverse chaining (`_has`), incl. **nested** | ✓ | ✓ | ◐ | ◐ |
+| `_include` / `_revinclude` | ✓ | ✓ | ✓ | ✓ |
+| `:iterate` on include | ✓¹ | ✓¹ | parsed | ✓ (inline) |
+| `_include=Type:*` wildcard | ✓ | ✓ | ✓ | ✓ |
 
 SQLite and PostgreSQL resolve chains natively, via nested `search_index` subqueries with
 configurable depth limits (✓). For all other backends (◐), the REST layer resolves chained and
@@ -138,6 +138,23 @@ filter — application-side joins. So chained and `_has` queries work end-to-end
 searchable backend, including Elasticsearch and MongoDB; the per-backend distinction is whether the
 join is pushed into the backend (SQLite/PG) or performed by the REST layer.
 
+**Nested `_has`** (`_has:Observation:subject:_has:Provenance:target:agent=X`) is resolved
+recursively by `resolve_reverse_chain`: the inner chain selects the qualifying source resources by
+id, then the outer level collects their references to the base type. A reverse-depth cap
+(`ChainConfig::max_reverse_depth`, default 4) is enforced.
+
+**Include resolution (`_include`/`_revinclude`).** Elasticsearch and MongoDB populate `included`
+inside their own `search()`. SQLite and Postgres do not — so the REST handler resolves includes via
+the backend-agnostic `core::resolve_includes_iterative` whenever the backend left `included` empty.
+References are extracted through the search-parameter registry's FHIRPath expression (so a parameter
+whose name differs from its JSON field — e.g. Patient `organization` → `managingOrganization` —
+resolves correctly), and the referenced/referencing resources are fetched with `search()`.
+
+¹ `:iterate` transitively follows includes of already-included resources (depth-capped, deduped) via
+  `resolve_includes_iterative`. Both spellings are accepted: `_include=Obs:subject:iterate` and the
+  spec's `_include:iterate=Obs:subject`. `_include=Type:*` expands at query-build time to one
+  directive per reference search parameter of `Type`.
+
 ## 6. Result control (paging, sort, total, summary, elements)
 
 These are parsed and largely orchestrated by the REST layer.
@@ -146,9 +163,9 @@ These are parsed and largely orchestrated by the REST layer.
 |-----------|--------|-------|
 | `_count` | ✓ | page size; `_offset`/`_cursor` for paging |
 | `_sort` | ✓ | SQLite/PG sort by any indexed param; see below |
-| `_total` | ✓ | `none` / `estimate` / `accurate` parsed and applied |
-| `_summary` | ✓ | `true`/`text`/`data`/`count`/`false`, applied in `subsetting.rs` |
-| `_elements` | ✓ | applied post-search with nested-path support |
+| `_total` | ✓ | `accurate`/`estimate` populate `Bundle.total` (incl. SQLite/PG via `search_count`); `none`/absent omit it |
+| `_summary` | ✓ | `true`/`text`/`data`/`count`/`false`, applied in `subsetting.rs`; adds `SUBSETTED` `meta.tag` |
+| `_elements` | ✓ | applied post-search with nested-path support; adds `SUBSETTED` `meta.tag` |
 | `_include` / `_revinclude` | ✓ | see §5 |
 | `_maxresults` | ✗ | not handled |
 | `_score` | ✗ | bundle field exists but is never populated |
@@ -190,8 +207,49 @@ Ordered roughly by impact:
 5. **Elasticsearch gaps** — `_filter` unsupported. (Composite now evaluates components via inline
    nested objects; chained/`_has` now work via the REST-layer resolver — see below.)
 6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
-   unsupported; Bundles omit `first`/`last` paging links. `:code-text` (newer spec modifier) is
-   unsupported everywhere.
+   unsupported; Bundles omit `first`/`last` paging links.
+7. **Quantity UCUM canonicalization** (schema v10) — the index stores a dimension-canonical
+   value/unit (`value_quantity_canonical_value`/`_unit`) computed via
+   `helios_fhirpath::ucum::canonicalize_quantity`, so `1|g` matches `1000|mg`.
+   - **SQLite: complete** — writer populates canonical columns; the quantity handler matches the
+     canonical columns (search bounds canonicalized to preserve implicit precision) OR the raw unit.
+   - **Elasticsearch: complete** — canonical `value`/`unit` stored in the `quantity` nested object;
+     the handler ORs a canonical range (bounds canonicalized) with the raw match (integration-tested
+     against a live ES container).
+   - **Postgres: complete** — writer populates canonical columns; the quantity handler ORs a
+     range-based canonical predicate (bounds canonicalized; eq uses an implicit-precision range that
+     also absorbs float-conversion noise) with the raw match. Integration-tested against a live PG
+     container.
+   - A **reindex backfill** (`ReindexRequest`) is required to populate canonical columns for
+     resources written before the upgrade; un-reindexed rows fall back to raw unit matching.
+
+   All three searchable backends (SQLite, Postgres, Elasticsearch) now match UCUM-equivalent units.
+8. **Accent-insensitive string search** (schema v10) — string search folds case **and** accents via
+   NFD + combining-mark stripping (`unicode-normalization`, shared `search::fold_text`), stored in
+   `value_string_folded`.
+   - **SQLite: complete** — default/`:contains`/`:text` match the folded column ORed with the raw
+     (case-insensitive) column; `:exact` stays case/accent-sensitive.
+   - **Postgres: complete** — `COALESCE(value_string_folded, value_string) ILIKE` against a folded
+     pattern (raw fallback keeps non-accented pre-reindex rows matching case-insensitively).
+   - **Elasticsearch: complete** — a `folded` keyword field (written via `fold_text`) is matched
+     (wildcard) ORed with the raw field; integration-tested against a live ES container.
+   - Pre-reindex rows need the **reindex backfill** for accent-insensitivity.
+9. **Canonical `url|version` references** — versioned reference matching is now version-agnostic
+   (`Patient/1/_history/2` ⇄ `Patient/1`, via `strip_reference_version`, on SQLite/PG/ES). The
+   remaining gap is canonical `url|version` hierarchy for reference `:above`/`:below`; `:identifier`
+   also assumes a `Type/id` reference shape.
+10. **Ordered-value boundary semantics** — **done** (SQLite, Postgres, Elasticsearch). Comparator
+    prefixes now match against the search value's implicit-precision range boundaries per spec:
+    `ge → x≥lo`, `le → x<hi`, `gt`/`sa → x≥hi`, `lt`/`eb → x<lo` (range `[lo, hi)`), for number,
+    quantity, and date (date falls back to scalar for full-precision instants). Postgres also gained
+    implicit-precision `eq`/`ne` ranges for number/date (was exact). Shared `search::range` helper.
+
+**Recently landed (REST layer).** Repeated query parameters are now preserved as FHIR AND semantics
+(previously collapsed to last-wins by `HashMap` extraction); `Prefer: handling=strict` rejects
+unknown search parameters with `400` on type-level search (lenient default still ignores them);
+`_include`/`_revinclude` (with `:iterate` and `Type:*` wildcard) resolve on SQLite/Postgres;
+nested `_has` resolves; `Bundle.total` populates on SQLite/Postgres; and `_summary`/`_elements`
+responses carry the `SUBSETTED` tag.
 
 **Chaining dispatch (resolved).** Chained (`subject.name=Smith`) and reverse-chained
 (`_has:Observation:subject:code=1234`) searches are parsed into `SearchQuery` (`param.chain`,

@@ -5,8 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::fhir_model::AuditEvent;
 use async_trait::async_trait;
-use helios_fhir::r4::AuditEvent;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 

@@ -60,7 +60,19 @@ where
         id_sets.push(ids.into_iter().collect());
     }
 
+    let max_reverse_depth = crate::types::ChainConfig::default().max_reverse_depth;
     for reverse_chain in &query.reverse_chains {
+        if reverse_chain.depth() > max_reverse_depth {
+            return Err(crate::error::StorageError::Search(
+                crate::error::SearchError::QueryParseError {
+                    message: format!(
+                        "_has nesting depth {} exceeds the maximum of {}",
+                        reverse_chain.depth(),
+                        max_reverse_depth
+                    ),
+                },
+            ));
+        }
         let ids = resolve_reverse_chain(storage, tenant, &base_type, reverse_chain).await?;
         id_sets.push(ids.into_iter().collect());
     }
@@ -229,6 +241,10 @@ where
 /// Resolves a reverse chain (`_has:Source:refParam:searchParam=value`) to a set
 /// of `base_type` ids by finding matching source resources and collecting the
 /// references they make to `base_type`.
+///
+/// Nested `_has` (`_has:Source:refParam:_has:...`) is resolved recursively: the
+/// inner chain selects the qualifying `Source` resources by id, then this level
+/// collects the references those resources make to `base_type`.
 async fn resolve_reverse_chain<S>(
     storage: &S,
     tenant: &TenantContext,
@@ -238,29 +254,54 @@ async fn resolve_reverse_chain<S>(
 where
     S: SearchProvider + ?Sized,
 {
-    let values = match &reverse_chain.value {
-        Some(v) => vec![v.clone()],
-        None => vec![],
-    };
-    let search_param_type = {
-        let registry = storage.search_param_registry().read();
-        resolve_param_type(
-            &registry,
+    // Build a query selecting the matching `source_type` resources.
+    let source_query = if let Some(inner) = &reverse_chain.nested {
+        // Nested: the inner chain decides which source resources qualify. Its
+        // base type is *this* level's source type.
+        let inner_ids = Box::pin(resolve_reverse_chain(
+            storage,
+            tenant,
             &reverse_chain.source_type,
-            &reverse_chain.search_param,
-            &values,
-        )
+            inner,
+        ))
+        .await?;
+        if inner_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: inner_ids.iter().map(SearchValue::eq).collect(),
+            chain: vec![],
+            components: vec![],
+        })
+    } else {
+        // Terminal: match source resources by `search_param=value`.
+        let values = match &reverse_chain.value {
+            Some(v) => vec![v.clone()],
+            None => vec![],
+        };
+        let search_param_type = {
+            let registry = storage.search_param_registry().read();
+            resolve_param_type(
+                &registry,
+                &reverse_chain.source_type,
+                &reverse_chain.search_param,
+                &values,
+            )
+        };
+        SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
+            name: reverse_chain.search_param.clone(),
+            param_type: search_param_type,
+            modifier: None,
+            values,
+            chain: vec![],
+            components: vec![],
+        })
     };
-    let query = SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
-        name: reverse_chain.search_param.clone(),
-        param_type: search_param_type,
-        modifier: None,
-        values,
-        chain: vec![],
-        components: vec![],
-    });
 
-    let result = storage.search(tenant, &query).await?;
+    let result = storage.search(tenant, &source_query).await?;
 
     let extractor = SearchParameterExtractor::new(storage.search_param_registry().clone());
     let mut ids = Vec::new();
@@ -442,6 +483,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_reverse_chain_has() {
+        let b = backend();
+        let t = tenant();
+        seed(&b, &t).await;
+
+        // A Provenance targets Smith's observation (o1) with a known agent.
+        b.create(
+            &t,
+            "Provenance",
+            json!({ "resourceType": "Provenance", "id": "prov1",
+                    "target": [{ "reference": "Observation/o1" }],
+                    "recorded": "2020-01-01T00:00:00Z",
+                    "agent": [{ "who": { "reference": "Practitioner/prac-1" } }] }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        // Patient?_has:Observation:subject:_has:Provenance:target:agent=Practitioner/prac-1
+        // -> patients whose observation is the target of a provenance with that agent.
+        let inner = ReverseChainedParameter::terminal(
+            "Provenance",
+            "target",
+            "agent",
+            SearchValue::eq("Practitioner/prac-1"),
+        );
+        let mut query = SearchQuery::new("Patient");
+        query.reverse_chains.push(ReverseChainedParameter::nested(
+            "Observation",
+            "subject",
+            inner,
+        ));
+
+        let rewritten = resolve_chains(&b, &t, &query).await.unwrap();
+        let result = b.search(&t, &rewritten).await.unwrap();
+        let ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["smith"],
+            "only Smith's observation is targeted by the matching provenance"
+        );
+    }
+
+    #[tokio::test]
     async fn no_match_chain_yields_empty() {
         let b = backend();
         let t = tenant();
@@ -465,9 +555,19 @@ mod tests {
     }
 }
 
-/// Heuristic fallback for ambiguous reference targets, matching the SQLite /
-/// PostgreSQL chain builders so all backends agree.
-fn infer_target_type(ref_param: &str) -> String {
+/// Heuristic fallback for inferring the target resource type of a reference
+/// search parameter when the registry has no (or an ambiguous) target list.
+///
+/// This is the single source of truth shared by every backend's chain builder
+/// (SQLite, PostgreSQL) and the composite storage layer, so all of them agree on
+/// which type an untyped chain link resolves to. Callers reach it via
+/// `crate::search::chain_resolver::infer_target_type`.
+///
+/// Note: this remains a hand-maintained heuristic rather than spec-derived data;
+/// the longer-term fix is to pick the first declared target from the
+/// SearchParameter registry. Keeping it in one place is the prerequisite for that
+/// migration.
+pub(crate) fn infer_target_type(ref_param: &str) -> String {
     match ref_param {
         "patient" | "subject" => "Patient".to_string(),
         "practitioner" | "performer" | "requester" | "author" => "Practitioner".to_string(),

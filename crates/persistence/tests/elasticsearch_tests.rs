@@ -1191,6 +1191,94 @@ mod es_integration {
     }
 
     #[tokio::test]
+    async fn es_integration_string_search_is_accent_insensitive() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "accent-es",
+                    "name": [{ "family": "Müller" }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        for q in ["muller", "Müller", "MULLER"] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "family".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq(q)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(
+                result.resources.items.len(),
+                1,
+                "accent-insensitive family search '{q}' should match 'Müller'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn es_integration_quantity_search_ucum_equivalence() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-mass-es",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "x" }] },
+                    "valueQuantity": { "value": 1, "unit": "g", "system": "http://unitsofmeasure.org", "code": "g" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // 1 g stored; search the equivalent 1000 mg.
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::eq("1000|http://unitsofmeasure.org|mg")],
+            chain: vec![],
+            components: vec![],
+        });
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "UCUM-equivalent quantity (1000 mg) should match stored 1 g"
+        );
+        assert_eq!(result.resources.items[0].id(), "obs-mass-es");
+    }
+
+    #[tokio::test]
     async fn es_integration_tenant_isolation_delete() {
         let backend = create_backend().await;
         let tenant_a = create_tenant("tenant-a");
