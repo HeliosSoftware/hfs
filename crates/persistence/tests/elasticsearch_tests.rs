@@ -1475,6 +1475,100 @@ mod es_integration {
     }
 
     #[tokio::test]
+    async fn es_integration_compartment_search() {
+        // Compartment membership: a resource joins the Patient compartment if it
+        // references the patient via ANY of the membership params (here `subject`
+        // OR `performer`). Resources for another patient must be excluded.
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{CompartmentMembership, SearchQuery};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // In the compartment via `subject`.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-subject",
+                    "status": "final",
+                    "code": {"text": "hr"},
+                    "subject": {"reference": "Patient/p1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // In the compartment via the NON-first param `performer` only (subject
+        // points elsewhere). This verifies the OR across membership params.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-performer",
+                    "status": "final",
+                    "code": {"text": "hr"},
+                    "subject": {"reference": "Patient/p2"},
+                    "performer": [{"reference": "Patient/p1"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Not in the compartment (references another patient).
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-other",
+                    "status": "final",
+                    "code": {"text": "hr"},
+                    "subject": {"reference": "Patient/p2"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let mut query = SearchQuery::new("Observation");
+        query.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+
+        assert!(
+            ids.contains(&"obs-subject".to_string()),
+            "compartment must include the resource linked via `subject`"
+        );
+        assert!(
+            ids.contains(&"obs-performer".to_string()),
+            "compartment must include the resource linked via `performer`"
+        );
+        assert!(
+            !ids.contains(&"obs-other".to_string()),
+            "compartment must exclude resources of another patient"
+        );
+    }
+
+    #[tokio::test]
     async fn es_integration_search_by_name_multiple() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{

@@ -20,9 +20,9 @@ use crate::core::{
 use crate::error::{BackendError, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
-    CursorDirection, CursorValue, IncludeDirective, IncludeType, Page, PageCursor, PageInfo,
-    SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
-    StoredResource,
+    CompartmentMembership, CursorDirection, CursorValue, IncludeDirective, IncludeType, Page,
+    PageCursor, PageInfo, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, SearchValue, StoredResource, strip_reference_version,
 };
 
 use super::MongoBackend;
@@ -387,17 +387,6 @@ impl ConditionalStorage for MongoBackend {
 
 impl MongoBackend {
     fn validate_query_support(&self, query: &SearchQuery) -> StorageResult<()> {
-        // Compartment membership (OR across reference params) is not yet wired
-        // into the Mongo filter builder. Fail loud rather than ignoring it.
-        if query.compartment.is_some() {
-            return Err(StorageError::Backend(
-                crate::error::BackendError::UnsupportedCapability {
-                    backend_name: "mongodb".to_string(),
-                    capability: "compartment search".to_string(),
-                },
-            ));
-        }
-
         if query.parameters.iter().any(|param| !param.chain.is_empty()) {
             return Err(StorageError::Search(
                 SearchError::ChainedSearchNotSupported {
@@ -474,7 +463,72 @@ impl MongoBackend {
             }
         }
 
+        // Compartment membership: a resource joins the compartment if it
+        // references the compartment via ANY of the membership params (OR),
+        // per the FHIR CompartmentDefinition. Computed as a single OR query
+        // over the search_index and intersected with the parameter matches.
+        if let Some(comp) = &query.compartment {
+            if let Some(ids) = self
+                .compartment_resource_ids(&search_index, tenant_id, resource_type, comp)
+                .await?
+            {
+                if ids.is_empty() {
+                    return Ok(Some(HashSet::new()));
+                }
+                matched = Some(match matched {
+                    Some(current) => current
+                        .intersection(&ids)
+                        .cloned()
+                        .collect::<HashSet<String>>(),
+                    None => ids,
+                });
+            }
+        }
+
         Ok(matched)
+    }
+
+    /// Returns the resource IDs that are members of the compartment described by
+    /// `comp`: resources that reference `comp.reference` through ANY of the
+    /// membership params (logical OR). Reference matching is version-agnostic
+    /// (mirrors the reference handler): the stored reference must equal the base
+    /// reference or carry a `/_history/<vid>` suffix.
+    ///
+    /// Returns `Ok(None)` when `comp` carries no params or no reference (no
+    /// restriction to apply), otherwise `Ok(Some(ids))` (possibly empty).
+    async fn compartment_resource_ids(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        comp: &CompartmentMembership,
+    ) -> StorageResult<Option<HashSet<String>>> {
+        if comp.params.is_empty() || comp.reference.is_empty() {
+            return Ok(None);
+        }
+
+        let base = strip_reference_version(&comp.reference);
+        let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
+
+        let filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "param_name": { "$in": Bson::Array(params) },
+            "$or": [
+                { "value_reference": &base },
+                { "value_reference": { "$regex": format!("^{}/_history/", regex_escape(base)) } },
+            ],
+        };
+
+        let ids = search_index
+            .distinct("resource_id", filter)
+            .await
+            .map_err(|e| internal_error(format!("Failed to query search_index: {}", e)))?
+            .into_iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect::<HashSet<_>>();
+
+        Ok(Some(ids))
     }
 
     fn build_search_index_filter(
