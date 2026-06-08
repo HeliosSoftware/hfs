@@ -349,8 +349,10 @@ few items called out under "Deviations" below.
     no `:code` modifier (its token modifiers are `:text`, `:not`, `:above`,
     `:below`, `:in`, `:not-in`, `:of-type`, `:identifier`, `:code-text`,
     `:text-advanced`). Treat `:code` as an `hfs` extension.
-  - `:contains` — `hfs` accepts and executes it on **reference** and **uri** as
-    well as string; the spec defines `:contains` for **string** only.
+  - *(Not a deviation)* `:contains` — `hfs` accepts it on **string**,
+    **reference**, and **uri**, which matches build.fhir.org (the spec defines
+    `:contains` for reference, string, and uri). Listed here only to correct an
+    earlier note that wrongly called this string-only.
   - `:text-advanced` — `hfs` accepts it on **string** or **token**; the spec
     defines it for **reference** and **token**. `hfs` thus deviates in *both*
     directions (wrongly accepts it on string, wrongly rejects it on reference), so
@@ -361,18 +363,19 @@ few items called out under "Deviations" below.
 
 ### 7.3 Prefixes
 For number/date/quantity values, expose prefixes: `eq, ne, gt, lt, ge, le, sa,
-eb, ap`. Per the FHIR spec these apply to any ordered type (number, date,
-quantity), and `sa`/`eb` (starts-after / ends-before) are likewise spec-valid on
-all three. The builder SHOULD therefore scope prefixes by parameter type
-client-side (e.g. no prefixes on string/token/uri params).
+eb, ap`. Per the FHIR spec, `eq, ne, gt, lt, ge, le, ap` apply to any ordered
+type (number, date, quantity), while `sa`/`eb` (starts-after / ends-before) are
+defined for **date and quantity only — not number**. The builder SHOULD scope
+prefixes by parameter type client-side (e.g. no prefixes on string/token/uri
+params, and no `sa`/`eb` on number).
 - **Caution — `hfs` does NO prefix validation.** `SearchPrefix::is_valid_for`
   exists but is **never invoked on the request path** (only in unit tests). The
   server therefore neither rejects a nonsensical prefix (e.g. `name=gt2020` on a
   string param is *not* a `400`) nor enforces any type-scoping. In particular
   `sa`/`eb` on number/quantity are **not** rejected and actually **execute** — the
   number/quantity handlers implement them. (The internal `is_valid_for` table
-  still restricts `sa`/`eb` to date, but that table is dead code today, so it has
-  no runtime effect.)
+  restricts `sa`/`eb` to date, which is itself wrong — the spec allows quantity
+  too — but the table is dead code today, so it has no runtime effect.)
 - **Implication for the UI:** do your own prefix/type scoping client-side and do
   **not** rely on the server to reject malformed prefix usage; a raw query that
   misuses a prefix will generally return `200` (with the prefix either applied or
@@ -777,8 +780,8 @@ delivers, but may scaffold UI ahead of them (clearly marked).
   the filter/sort was applied.
 - **No prefix/parameter-type validation:** `hfs` never validates search prefixes
   against parameter type, so misuse (e.g. `gt` on a string param, or `sa`/`eb` on
-  number/quantity) is neither rejected nor reliably honored — the UI must scope
-  prefixes client-side (§7.3).
+  number — which the spec allows only for date/quantity) is neither rejected nor
+  reliably honored — the UI must scope prefixes client-side (§7.3).
 - **No search-value escaping:** the server does not unescape `\,` `\|` `\$` `\\`
   in search values, so literal commas/pipes in user input are mis-split into
   OR-values / token `system|code`. The UI must escape on its own (§7.1).
