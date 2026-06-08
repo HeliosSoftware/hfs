@@ -312,6 +312,7 @@ where
         auth_state,
         audit_state,
         None,
+        None,
     )
 }
 
@@ -349,11 +350,56 @@ where
         auth_state,
         audit_state,
         Some(bulk_export),
+        None,
     )
 }
 
-/// Internal app builder shared by [`create_app_with_auth`] and
-/// [`create_app_with_auth_and_bulk_export`].
+/// Like [`create_app_with_auth_and_bulk_export`], but also wires the per-user
+/// settings store (used by the `/_user/settings` endpoints). `bulk_export` is
+/// optional so this single entry point covers both bulk-enabled and bulk-less
+/// deployments of a settings-capable backend (SQLite, PostgreSQL).
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_auth_bulk_export_and_settings<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        bulk_export,
+        settings_store,
+    )
+}
+
+/// Internal app builder shared by [`create_app_with_auth`],
+/// [`create_app_with_auth_and_bulk_export`], and
+/// [`create_app_with_auth_bulk_export_and_settings`].
+#[allow(clippy::too_many_arguments)]
 fn build_app<S>(
     storage: Arc<S>,
     config: ServerConfig,
@@ -361,6 +407,7 @@ fn build_app<S>(
     auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
     audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
     bulk_export: Option<BulkExportBundle>,
+    settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
 ) -> Router
 where
     S: ResourceStorage
@@ -415,6 +462,12 @@ where
     // Wire the bulk-export subsystem if provided.
     let state = match bulk_export {
         Some(b) => state.with_bulk_export(b.jobs, b.output, b.file_auth),
+        None => state,
+    };
+
+    // Wire the per-user settings store if provided.
+    let state = match settings_store {
+        Some(store) => state.with_settings_store(store),
         None => state,
     };
 

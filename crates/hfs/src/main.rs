@@ -25,18 +25,25 @@ use helios_audit::{
 };
 use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
 use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
-use helios_rest::{
-    AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth, init_logging,
-};
+use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode, init_logging};
 use tracing::info;
 
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+use helios_persistence::core::SettingsStore;
 use helios_persistence::core::{
     BulkExportJobStore, DefaultExportWorker, ExportOutputStore, WorkerId,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_rest::bulk_export_auth::BearerScopeAuth;
+// Settings-capable standalone backends (SQLite, PostgreSQL).
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
+use helios_rest::create_app_with_auth_bulk_export_and_settings;
+// Composite/secondary backends (MongoDB, Elasticsearch, S3) that do not host a
+// settings store and so use the plain app builders.
+#[cfg(any(feature = "mongodb", feature = "elasticsearch", feature = "s3"))]
+use helios_rest::create_app_with_auth;
+#[cfg(any(feature = "mongodb", feature = "elasticsearch"))]
 use helios_rest::create_app_with_auth_and_bulk_export;
 
 #[cfg(feature = "sqlite")]
@@ -841,26 +848,17 @@ async fn start_sqlite(
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
 
-    if let Some(bundle) = build_bulk_export(&config, backend.clone(), backend.clone()).await? {
-        let app = create_app_with_auth_and_bulk_export(
-            backend,
-            config.clone(),
-            auth_config,
-            auth_state,
-            audit_state,
-            bundle,
-        );
-        return serve(app, &config, serve_audit_state).await;
-    }
-
-    let app = create_app_with_auth(
-        Arc::try_unwrap(backend).unwrap_or_else(|_| {
-            unreachable!("backend Arc is uniquely owned when bulk export is disabled")
-        }),
+    // The SQLite backend also hosts the per-user settings store.
+    let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
+    let bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
+    let app = create_app_with_auth_bulk_export_and_settings(
+        backend,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        bundle,
+        settings_store,
     );
     serve(app, &config, serve_audit_state).await
 }
@@ -1272,26 +1270,17 @@ async fn start_postgres(
     let backend = Arc::new(backend);
 
     let serve_audit_state = audit_state.clone();
-    if let Some(bundle) = build_bulk_export(&config, backend.clone(), backend.clone()).await? {
-        let app = create_app_with_auth_and_bulk_export(
-            backend,
-            config.clone(),
-            auth_config,
-            auth_state,
-            audit_state,
-            bundle,
-        );
-        return serve(app, &config, serve_audit_state).await;
-    }
-
-    let app = create_app_with_auth(
-        Arc::try_unwrap(backend).unwrap_or_else(|_| {
-            unreachable!("backend Arc is uniquely owned when bulk export is disabled")
-        }),
+    // The PostgreSQL backend also hosts the per-user settings store.
+    let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
+    let bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
+    let app = create_app_with_auth_bulk_export_and_settings(
+        backend,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        bundle,
+        settings_store,
     );
     serve(app, &config, serve_audit_state).await
 }
