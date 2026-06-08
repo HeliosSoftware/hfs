@@ -78,7 +78,7 @@ impl SearchProvider for PostgresBackend {
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
-        let search_filter = if !query.parameters.is_empty() {
+        let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
             PostgresQueryBuilder::build_search_query(query, param_offset)
         } else {
             None
@@ -286,7 +286,7 @@ impl SearchProvider for PostgresBackend {
         let (sql, params): (
             String,
             Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
-        ) = if !query.parameters.is_empty() {
+        ) = if !query.parameters.is_empty() || query.compartment.is_some() {
             let filter = PostgresQueryBuilder::build_search_query(query, 2);
 
             let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![

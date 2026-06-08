@@ -112,6 +112,16 @@ impl SearchResult {
             bundle = bundle.with_previous_link(replace_cursor_param(self_link, cursor));
         }
 
+        // First-page link: the self URL with paging params (`_cursor` / `_offset`)
+        // stripped. Emitted only for multi-page results (when a next/previous page
+        // exists). A `last` link is intentionally not emitted: under keyset
+        // (cursor) paging the final page is not cheaply computable.
+        if self.resources.page_info.next_cursor.is_some()
+            || self.resources.page_info.previous_cursor.is_some()
+        {
+            bundle = bundle.with_link("first", strip_paging_params(self_link));
+        }
+
         // Add matching resources
         for resource in &self.resources.items {
             let full_url = format!("{}/{}", base_url, resource.url());
@@ -152,6 +162,27 @@ impl SearchResult {
 /// ```text
 /// .../Patient?_count=3&_elements=id&_cursor=…
 /// ```
+/// Returns `url` with any `_cursor=…` and `_offset=…` query parameters removed,
+/// yielding the first-page URL for a paginated search.
+fn strip_paging_params(url: &str) -> String {
+    let (base, query) = match url.find('?') {
+        Some(pos) => (&url[..pos], &url[pos + 1..]),
+        None => return url.to_string(),
+    };
+
+    let parts: Vec<String> = query
+        .split('&')
+        .filter(|p| !p.is_empty() && !p.starts_with("_cursor=") && !p.starts_with("_offset="))
+        .map(str::to_string)
+        .collect();
+
+    if parts.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}?{}", base, parts.join("&"))
+    }
+}
+
 fn replace_cursor_param(url: &str, cursor: &str) -> String {
     let (base, query) = match url.find('?') {
         Some(pos) => (&url[..pos], &url[pos + 1..]),

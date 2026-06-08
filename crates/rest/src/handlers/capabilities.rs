@@ -20,7 +20,9 @@ use axum::{
     response::Response,
 };
 use helios_fhir::FhirVersion;
-use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::{ResourceStorage, SearchProvider};
+use helios_persistence::search::SearchParameterRegistry;
+use helios_persistence::types::SearchParamType;
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
@@ -65,7 +67,7 @@ pub async fn capabilities_handler<S>(
     req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync,
 {
     // Determine which version to describe (from Accept header or default)
     let fhir_version = version
@@ -121,16 +123,20 @@ fn build_capability_statement<S>(
     base_url: &str,
 ) -> serde_json::Value
 where
-    S: ResourceStorage,
+    S: ResourceStorage + SearchProvider,
 {
     let backend_name = state.storage().backend_name();
 
     // Get resource types for the requested FHIR version
     let resource_types = get_resource_type_names_for_version(version);
 
+    // Advertise each resource type's real search parameters from the loaded
+    // SearchParameter registry (not just the seven common params). The read
+    // guard is held only across this synchronous build (no await).
+    let registry = state.storage().search_param_registry().read();
     let resources: Vec<serde_json::Value> = resource_types
         .iter()
-        .map(|rt| build_resource_capability(rt))
+        .map(|rt| build_resource_capability(rt, &registry))
         .collect();
 
     #[allow(unused_mut)]
@@ -197,7 +203,10 @@ where
 }
 
 /// Builds the capability entry for a resource type.
-fn build_resource_capability(resource_type: &str) -> serde_json::Value {
+fn build_resource_capability(
+    resource_type: &str,
+    registry: &SearchParameterRegistry,
+) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "type": resource_type,
         "profile": format!("http://hl7.org/fhir/StructureDefinition/{}", resource_type),
@@ -221,7 +230,7 @@ fn build_resource_capability(resource_type: &str) -> serde_json::Value {
         "conditionalDelete": "single",
         "searchInclude": ["*"],
         "searchRevInclude": ["*"],
-        "searchParam": build_common_search_params()
+        "searchParam": build_search_params(resource_type, registry)
     });
     // Bulk Data Access IG: per-resource `$export` operation entries on Patient
     // and Group, in addition to the system-level `$export` advertised at
@@ -242,6 +251,53 @@ fn build_resource_capability(resource_type: &str) -> serde_json::Value {
         _ => {}
     }
     entry
+}
+
+/// Builds the full `searchParam` list for a resource type: the seven common
+/// params plus the resource-specific params from the loaded SearchParameter
+/// registry. Control/common params (those starting with `_`) and duplicates are
+/// skipped.
+fn build_search_params(
+    resource_type: &str,
+    registry: &SearchParameterRegistry,
+) -> Vec<serde_json::Value> {
+    let mut params = build_common_search_params();
+    let mut seen: std::collections::HashSet<String> = params
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect();
+
+    for def in registry.get_active_params(resource_type) {
+        if def.code.starts_with('_') || !seen.insert(def.code.clone()) {
+            continue;
+        }
+        let mut param = serde_json::json!({
+            "name": def.code,
+            "type": fhir_search_param_type(def.param_type),
+            "definition": def.url,
+        });
+        if let Some(doc) = &def.description {
+            param["documentation"] = serde_json::Value::String(doc.clone());
+        }
+        params.push(param);
+    }
+    params
+}
+
+/// Maps an internal search-parameter type to its FHIR CapabilityStatement
+/// `searchParam.type` code.
+fn fhir_search_param_type(t: SearchParamType) -> &'static str {
+    match t {
+        SearchParamType::Number => "number",
+        SearchParamType::Date => "date",
+        SearchParamType::String => "string",
+        SearchParamType::Token => "token",
+        SearchParamType::Reference => "reference",
+        SearchParamType::Composite => "composite",
+        SearchParamType::Quantity => "quantity",
+        SearchParamType::Uri => "uri",
+        SearchParamType::Special => "special",
+    }
 }
 
 /// Builds common search parameters supported by all resources.
@@ -274,12 +330,12 @@ fn build_common_search_params() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "_text",
-            "type": "string",
+            "type": "special",
             "documentation": "Search on the narrative of the resource"
         }),
         serde_json::json!({
             "name": "_content",
-            "type": "string",
+            "type": "special",
             "documentation": "Search on the entire content of the resource"
         }),
     ]

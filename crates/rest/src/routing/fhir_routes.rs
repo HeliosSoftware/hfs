@@ -344,7 +344,7 @@ where
 /// of functionality.
 pub fn create_minimal_routes<S>(state: AppState<S>) -> Router
 where
-    S: ResourceStorage + Send + Sync + 'static,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     Router::new()
         .route("/health", get(handlers::health_handler::<S>))

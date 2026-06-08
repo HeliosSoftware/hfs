@@ -215,9 +215,12 @@ impl SearchModifier {
             SearchModifier::OfType => param_type == SearchParamType::Token,
             SearchModifier::CodeOnly => param_type == SearchParamType::Token,
             SearchModifier::Iterate => false, // Only for _include/_revinclude
-            SearchModifier::TextAdvanced => {
-                param_type == SearchParamType::String || param_type == SearchParamType::Token
-            }
+            // Per the FHIR spec (build.fhir.org), `:text-advanced` is defined for
+            // reference and token parameters (NOT string).
+            SearchModifier::TextAdvanced => matches!(
+                param_type,
+                SearchParamType::Token | SearchParamType::Reference
+            ),
             // `:code-text` is defined for token and reference params (matches a
             // code's display, or the indexed `Reference.display`).
             SearchModifier::CodeText => matches!(
@@ -316,7 +319,12 @@ impl SearchPrefix {
                     SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
                 )
             }
-            SearchPrefix::Sa | SearchPrefix::Eb => param_type == SearchParamType::Date,
+            // Per the FHIR spec, `sa`/`eb` (starts-after / ends-before) apply to
+            // date and quantity ordered types (not number).
+            SearchPrefix::Sa | SearchPrefix::Eb => matches!(
+                param_type,
+                SearchParamType::Date | SearchParamType::Quantity
+            ),
             SearchPrefix::Ap => {
                 matches!(
                     param_type,
@@ -695,8 +703,28 @@ pub struct SearchQuery {
     /// Elements to include (_elements).
     pub elements: Vec<String>,
 
+    /// Compartment membership filter, when this is a compartment search
+    /// (`GET /{compartmentType}/{id}/{targetType}`). Restricts results to
+    /// resources that reference the compartment via *any* of the membership
+    /// params (OR), per the FHIR CompartmentDefinition.
+    pub compartment: Option<CompartmentMembership>,
+
     /// Raw query parameters for debugging.
     pub raw_params: HashMap<String, Vec<String>>,
+}
+
+/// Compartment membership constraint for a compartment search.
+///
+/// A resource is in the compartment if it references `reference` through *any*
+/// of the `params` reference search parameters (logical OR). See
+/// https://hl7.org/fhir/compartmentdefinition.html.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CompartmentMembership {
+    /// The membership reference search parameters (e.g. `patient`, `recorder`,
+    /// `asserter`). Matching ANY of these satisfies membership.
+    pub params: Vec<String>,
+    /// The compartment reference value, e.g. `Patient/123`.
+    pub reference: String,
 }
 
 /// Mode for _total parameter.
@@ -918,6 +946,9 @@ mod tests {
         assert!(SearchPrefix::Gt.is_valid_for(SearchParamType::Date));
         assert!(!SearchPrefix::Gt.is_valid_for(SearchParamType::String));
         assert!(SearchPrefix::Sa.is_valid_for(SearchParamType::Date));
+        // `sa`/`eb` apply to date and quantity, but not number, per the spec.
+        assert!(SearchPrefix::Sa.is_valid_for(SearchParamType::Quantity));
+        assert!(SearchPrefix::Eb.is_valid_for(SearchParamType::Quantity));
         assert!(!SearchPrefix::Sa.is_valid_for(SearchParamType::Number));
     }
 

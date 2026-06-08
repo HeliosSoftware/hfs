@@ -111,7 +111,7 @@ impl SearchProvider for SqliteBackend {
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
-        let search_filter = if !query.parameters.is_empty() {
+        let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
             let builder =
                 QueryBuilder::new(tenant_id, resource_type).with_param_offset(param_offset);
             let fragment = builder.build(query);
@@ -339,10 +339,11 @@ impl SearchProvider for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
 
-        // Build the search filter if there are search parameters
+        // Build the search filter if there are search parameters or a compartment.
         let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query
             .parameters
             .is_empty()
+            || query.compartment.is_some()
         {
             let builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
             let fragment = builder.build(query);
