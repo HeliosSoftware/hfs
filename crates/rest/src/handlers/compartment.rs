@@ -47,7 +47,7 @@ pub async fn compartment_search_handler<S>(
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
-    let mut pairs = parse_query_pairs(raw_query.as_deref());
+    let pairs = parse_query_pairs(raw_query.as_deref());
     debug!(
         compartment_type = %compartment_type,
         compartment_id = %compartment_id,
@@ -75,10 +75,6 @@ where
     // Build the compartment reference
     let compartment_ref = format!("{}/{}", compartment_type, compartment_id);
 
-    // Add the first compartment reference parameter to the search parameters
-    // (the first parameter is typically the most specific one)
-    pairs.push((ref_params[0].to_string(), compartment_ref));
-
     let search_params = SearchParams::from_pairs(pairs);
 
     // Convert REST params to persistence SearchQuery. Scope the registry read
@@ -87,6 +83,16 @@ where
         let registry = state.storage().search_param_registry().read();
         build_search_query(&target_type, &search_params, &registry)?
     };
+
+    // Restrict to compartment members. A resource joins a compartment if it
+    // references the compartment through ANY of the membership reference params
+    // (e.g. AllergyIntolerance via `patient`, `recorder`, OR `asserter`), so we
+    // pass all of them — not just the first — and the backend ORs them. This
+    // avoids the under-inclusive "first param only" behaviour.
+    query.compartment = Some(helios_persistence::types::CompartmentMembership {
+        params: ref_params.iter().map(|s| s.to_string()).collect(),
+        reference: compartment_ref,
+    });
 
     // Clamp page size to the configured default/maximum.
     let count = query

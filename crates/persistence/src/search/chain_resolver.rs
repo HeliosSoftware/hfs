@@ -46,9 +46,23 @@ where
     let base_type = query.resource_type.clone();
     let mut id_sets: Vec<HashSet<String>> = Vec::new();
 
+    let max_forward_depth = crate::types::ChainConfig::default().max_forward_depth;
     for param in &query.parameters {
         if param.chain.is_empty() {
             continue;
+        }
+        // Forward-chain depth = number of reference hops. Cap it (mirroring the
+        // reverse `_has` cap) so a pathological chain can't fan out unboundedly.
+        let depth = param.chain.len();
+        if depth > max_forward_depth {
+            return Err(crate::error::StorageError::Search(
+                crate::error::SearchError::QueryParseError {
+                    message: format!(
+                        "forward chain depth {} exceeds the maximum of {}",
+                        depth, max_forward_depth
+                    ),
+                },
+            ));
         }
         let chain = reconstruct_chain_string(param);
         let value = param

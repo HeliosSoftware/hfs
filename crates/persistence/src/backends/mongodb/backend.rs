@@ -541,7 +541,7 @@ impl MongoBackend {
     fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text"],
-            SearchParamType::Token => vec!["code", "text", "code-text"],
+            SearchParamType::Token => vec!["text", "code-text"],
             SearchParamType::Reference => vec!["contains", "text", "code-text"],
             SearchParamType::Uri => vec!["exact", "contains"],
             SearchParamType::Date
@@ -625,9 +625,9 @@ mod capability_tests {
         assert!(s.contains(&"text"));
         assert!(!s.contains(&"missing"));
 
-        // Token honors code/text/code-text but not :not or :of-type.
+        // Token honors text/code-text but not the non-spec :code, nor :not / :of-type.
         let t = MongoBackend::modifiers_for_type(SearchParamType::Token);
-        assert!(t.contains(&"code"));
+        assert!(!t.contains(&"code"));
         assert!(t.contains(&"code-text"));
         assert!(!t.contains(&"not"));
         assert!(!t.contains(&"of-type"));

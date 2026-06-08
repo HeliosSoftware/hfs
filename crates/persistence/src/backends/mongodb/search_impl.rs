@@ -387,6 +387,17 @@ impl ConditionalStorage for MongoBackend {
 
 impl MongoBackend {
     fn validate_query_support(&self, query: &SearchQuery) -> StorageResult<()> {
+        // Compartment membership (OR across reference params) is not yet wired
+        // into the Mongo filter builder. Fail loud rather than ignoring it.
+        if query.compartment.is_some() {
+            return Err(StorageError::Backend(
+                crate::error::BackendError::UnsupportedCapability {
+                    backend_name: "mongodb".to_string(),
+                    capability: "compartment search".to_string(),
+                },
+            ));
+        }
+
         if query.parameters.iter().any(|param| !param.chain.is_empty()) {
             return Err(StorageError::Search(
                 SearchError::ChainedSearchNotSupported {
@@ -604,7 +615,7 @@ impl MongoBackend {
         }
 
         match param.modifier.as_ref() {
-            None | Some(SearchModifier::CodeOnly) => {}
+            None => {}
             // `:text` (contains) and `:code-text` (starts-with) match the
             // token's display text (Coding.display / CodeableConcept.text).
             Some(m @ (SearchModifier::Text | SearchModifier::CodeText)) => {

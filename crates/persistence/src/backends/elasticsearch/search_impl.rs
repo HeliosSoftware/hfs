@@ -163,6 +163,18 @@ impl SearchProvider for ElasticsearchBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        // Compartment membership (OR across reference params) is not yet wired
+        // into the ES query DSL. Fail loud rather than silently ignoring the
+        // membership filter and returning every resource of the target type.
+        if query.compartment.is_some() {
+            return Err(crate::error::StorageError::Backend(
+                crate::error::BackendError::UnsupportedCapability {
+                    backend_name: "elasticsearch".to_string(),
+                    capability: "compartment search".to_string(),
+                },
+            ));
+        }
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);

@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 
 use crate::search::fold_text;
 use crate::types::{
-    SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
-    strip_reference_version,
+    CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, SearchValue, strip_reference_version,
 };
 
 /// Returns the implicit precision of a decimal search value from its string form
@@ -247,6 +247,15 @@ impl PostgresQueryBuilder {
             }
         }
 
+        // Compartment membership: match resources that reference the compartment
+        // through ANY of the membership params (OR), per the CompartmentDefinition.
+        if let Some(comp) = &query.compartment {
+            // Last condition appended, so no need to advance `current_offset`.
+            if let Some(condition) = Self::build_compartment_condition(comp, current_offset) {
+                conditions.push(condition);
+            }
+        }
+
         if conditions.is_empty() {
             return None;
         }
@@ -258,6 +267,40 @@ impl PostgresQueryBuilder {
         }
 
         Some(combined)
+    }
+
+    /// Builds the compartment-membership subquery: matches resources that
+    /// reference `comp.reference` via ANY of `comp.params` (logical OR), mirroring
+    /// the SQLite backend. Returns `None` when there are no params or reference.
+    fn build_compartment_condition(
+        comp: &CompartmentMembership,
+        param_offset: usize,
+    ) -> Option<SqlFragment> {
+        if comp.params.is_empty() || comp.reference.is_empty() {
+            return None;
+        }
+
+        // Membership params come from the bundled FHIR CompartmentDefinitions
+        // (trusted); escape single quotes defensively before inlining.
+        let in_list = comp
+            .params
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let base = strip_reference_version(&comp.reference).to_string();
+        let p1 = param_offset + 1;
+        let p2 = param_offset + 2;
+
+        Some(SqlFragment::with_params(
+            format!(
+                "id IN (SELECT resource_id FROM search_index \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name IN ({in_list}) \
+                 AND (value_reference = ${p1} OR value_reference LIKE ${p2} || '/_history/%'))"
+            ),
+            vec![SqlParam::text(&base), SqlParam::text(&base)],
+        ))
     }
 
     /// Builds an `ORDER BY` clause from the query's `_sort` directives.

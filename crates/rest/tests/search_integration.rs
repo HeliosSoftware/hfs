@@ -1230,6 +1230,31 @@ mod subsetting {
 // Compartment Search Tests
 // =============================================================================
 
+mod unsupported_params {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_unsupported_control_param_rejected() {
+        // `_query`/`_list`/`_contained`/`_score` are not implemented; the server
+        // must reject them (400) rather than silently ignoring them and returning
+        // an unfiltered result.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for param in ["_query", "_list", "_contained", "_score"] {
+            let response = server
+                .get(&format!("/Patient?{param}=anything"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for unsupported param {param}"
+            );
+        }
+    }
+}
+
 mod compartment_search {
     use super::*;
 
@@ -1302,6 +1327,57 @@ mod compartment_search {
                 assert!(subject.contains("patient-1"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_compartment_membership_via_non_first_param() {
+        // A resource that belongs to the compartment via a NON-first membership
+        // param must still be found. AllergyIntolerance joins the Patient
+        // compartment via patient/recorder/asserter; here the resource is linked
+        // ONLY through `recorder` (its `patient` points elsewhere). The previous
+        // first-param-only behaviour would have missed it.
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "patient-1", "active": true}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("create patient-1");
+
+        backend
+            .create(
+                &tenant,
+                "AllergyIntolerance",
+                json!({
+                    "resourceType": "AllergyIntolerance",
+                    "id": "ai-1",
+                    "patient": {"reference": "Patient/patient-2"},
+                    "recorder": {"reference": "Patient/patient-1"}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("create allergy");
+
+        let response = server
+            .get("/Patient/patient-1/AllergyIntolerance")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(
+            entries.len(),
+            1,
+            "AllergyIntolerance linked via `recorder` should be in the compartment"
+        );
+        assert_eq!(entries[0]["resource"]["id"], "ai-1");
     }
 
     #[tokio::test]

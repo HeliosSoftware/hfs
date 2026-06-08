@@ -17,7 +17,7 @@ use helios_persistence::core::{
     IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
     resolve_includes_iterative,
 };
-use helios_persistence::types::SearchBundle;
+use helios_persistence::types::{SearchBundle, SearchParamType};
 use tracing::{debug, warn};
 
 use helios_fhir::FhirVersion;
@@ -159,6 +159,22 @@ async fn execute_search<S>(
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    // Reject known-but-unimplemented control parameters instead of silently
+    // ignoring them (which returns an unfiltered, misleading `200`). These FHIR
+    // search controls are not implemented by any backend. See search spec
+    // assessment item A1a.
+    const UNSUPPORTED_PARAMS: [&str; 5] =
+        ["_query", "_list", "_contained", "_containedType", "_score"];
+    if let Some((key, _)) = pairs
+        .iter()
+        .find(|(k, _)| UNSUPPORTED_PARAMS.contains(&k.as_str()))
+    {
+        return Err(RestError::InvalidParameter {
+            param: key.clone(),
+            message: format!("search parameter '{key}' is not supported by this server"),
+        });
+    }
+
     // `:not-in` requires negated value-set filtering, which no backend
     // implements. Reject it explicitly (501) regardless of whether a terminology
     // server is configured, rather than silently ignoring it (which would return
@@ -176,6 +192,37 @@ where
     let pairs = if let Some(ts_url) = state.terminology_server_url() {
         expand_terminology_params(pairs, ts_url).await?
     } else {
+        // No terminology server configured: token `:in` / `:above` / `:below`
+        // cannot be satisfied. Reject them with `501` rather than silently
+        // falling through to literal matching (which returns misleading results).
+        // `:in` is token-only, so it always needs terminology; `:above`/`:below`
+        // also apply to reference/uri, which resolve locally — only reject those
+        // when the parameter is a token. See assessment item A2c.
+        {
+            let registry = state.storage().search_param_registry().read();
+            for (key, _) in &pairs {
+                let Some((base, modifier)) = key.split_once(':') else {
+                    continue;
+                };
+                let needs_terminology = match modifier {
+                    "in" => true,
+                    "above" | "below" => registry
+                        .get_param(resource_type, base)
+                        .or_else(|| registry.get_param("Resource", base))
+                        .map(|p| p.param_type == SearchParamType::Token)
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if needs_terminology {
+                    return Err(RestError::NotImplemented {
+                        feature: format!(
+                            "search modifier ':{modifier}' on token parameter '{base}' requires a \
+                             configured terminology server (set HFS_TERMINOLOGY_SERVER)"
+                        ),
+                    });
+                }
+            }
+        }
         pairs
     };
 
@@ -200,7 +247,31 @@ where
                 });
             }
         }
-        build_search_query(resource_type, &search_params, &registry)?
+        let built = build_search_query(resource_type, &search_params, &registry)?;
+        // Under strict handling, reject a `_sort` on a field the server cannot
+        // actually sort by (it would otherwise silently fall back to `id`). Only
+        // `_id`, `_lastUpdated`, and registered indexed typed params sort
+        // reliably; composite/special/unknown fields do not. See item A4a.
+        if strict {
+            for s in &built.sort {
+                let sortable = s.parameter == "_id"
+                    || s.parameter == "_lastUpdated"
+                    || matches!(
+                        s.param_type,
+                        Some(t) if t != SearchParamType::Composite && t != SearchParamType::Special
+                    );
+                if !sortable {
+                    return Err(RestError::InvalidParameter {
+                        param: format!("_sort={}", s.parameter),
+                        message: format!(
+                            "cannot sort by '{}' (unsupported sort field) under Prefer: handling=strict",
+                            s.parameter
+                        ),
+                    });
+                }
+            }
+        }
+        built
     };
 
     // Clamp page size to the configured default/maximum.

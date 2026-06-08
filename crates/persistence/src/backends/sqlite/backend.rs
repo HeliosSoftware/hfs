@@ -696,14 +696,13 @@ impl SqliteBackend {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
             // `not-in` is intentionally omitted: the SQLite backend returns 501
             // for it (negated value-set filtering is unimplemented), so it must
-            // not be advertised. `code`/`text-advanced` are implemented by the
-            // token handler and were previously under-advertised.
+            // not be advertised. `text-advanced` is implemented by the token
+            // handler and was previously under-advertised.
             SearchParamType::Token => vec![
                 "not",
                 "text",
                 "in",
                 "of-type",
-                "code",
                 "code-text",
                 "text-advanced",
                 "missing",
@@ -836,7 +835,8 @@ mod tests {
         assert!(token_mods.contains(&"not"));
         assert!(token_mods.contains(&"text"));
         assert!(token_mods.contains(&"of-type"));
-        assert!(token_mods.contains(&"code"));
+        // `:code` is a non-spec modifier and must not be advertised.
+        assert!(!token_mods.contains(&"code"));
         assert!(token_mods.contains(&"text-advanced"));
         // `not-in` returns 501, so it must not be advertised as supported.
         assert!(!token_mods.contains(&"not-in"));
