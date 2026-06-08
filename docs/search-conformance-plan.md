@@ -38,12 +38,18 @@ Each item notes the spec basis, the fix, the files touched, and backend coverage
   results. Fix: when no `HFS_TERMINOLOGY_SERVER` is configured, reject these token
   modifiers with `501` (fail loud), mirroring the existing `:not-in` handling.
   Files: `crates/rest/src/handlers/search.rs`.
-- **A2d — `:code` cross-backend consistency.** *No change made.* `:code` is an
-  `hfs` extension; the Postgres token handler does **not** implement it, so
-  Postgres correctly does **not** advertise it. Advertising an unimplemented
-  modifier would be the real bug — so PG's behaviour is left as-is. Implementing
-  `:code` in PG (to match SQLite/ES) is an optional follow-up, not a conformance
-  fix.
+- **A2d — `:code` token modifier removed entirely.** `:code` was a non-spec
+  `hfs` invention with no FHIR basis. Its SQL (`value_token_code = ?`) is
+  byte-for-byte identical to a plain code match (`code=X`), and it actively
+  *breaks* `system|code` values (it matches the literal `"system|code"` as a
+  code). Redundant at best, harmful at worst. Removed from the `SearchModifier`
+  enum, parser, validity table, the SQLite token handler, the Mongo no-op arm,
+  and the SQLite/Mongo `modifiers_for_type` advertisements (with regression-guard
+  tests asserting it stays gone). Files:
+  `crates/persistence/src/types/search_params.rs`,
+  `crates/persistence/src/backends/sqlite/search/parameter_handlers/token.rs`,
+  `crates/persistence/src/backends/{sqlite,mongodb}/backend.rs`,
+  `crates/persistence/src/backends/mongodb/search_impl.rs`.
 - *No change (verified conformant):* `:contains` (reference/string/uri) and
   `:above`/`:below` (reference/token/uri) match build.fhir.org — the earlier
   "deviation" reading was incorrect.

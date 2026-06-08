@@ -615,7 +615,7 @@ impl MongoBackend {
         }
 
         match param.modifier.as_ref() {
-            None | Some(SearchModifier::CodeOnly) => {}
+            None => {}
             // `:text` (contains) and `:code-text` (starts-with) match the
             // token's display text (Coding.display / CodeableConcept.text).
             Some(m @ (SearchModifier::Text | SearchModifier::CodeText)) => {

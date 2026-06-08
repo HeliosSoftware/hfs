@@ -101,8 +101,6 @@ pub enum SearchModifier {
     Type(String),
     /// Match on type (token parameters for polymorphic elements).
     OfType,
-    /// Match on code only (token parameters).
-    CodeOnly,
     /// Iterate through results (_include modifier).
     Iterate,
     /// Advanced text search with synonyms and linguistic matching (FHIR v6.0.0).
@@ -136,7 +134,6 @@ impl fmt::Display for SearchModifier {
             SearchModifier::Identifier => write!(f, "identifier"),
             SearchModifier::Type(t) => write!(f, "{}", t),
             SearchModifier::OfType => write!(f, "ofType"),
-            SearchModifier::CodeOnly => write!(f, "code"),
             SearchModifier::Iterate => write!(f, "iterate"),
             SearchModifier::TextAdvanced => write!(f, "text-advanced"),
             SearchModifier::CodeText => write!(f, "code-text"),
@@ -162,7 +159,6 @@ impl SearchModifier {
             // the form advertised in our CapabilityStatement; accept the legacy
             // camelCase `ofType` too so older clients keep working.
             "of-type" | "oftype" => Some(SearchModifier::OfType),
-            "code" => Some(SearchModifier::CodeOnly),
             "iterate" => Some(SearchModifier::Iterate),
             "text-advanced" => Some(SearchModifier::TextAdvanced),
             "code-text" => Some(SearchModifier::CodeText),
@@ -213,7 +209,6 @@ impl SearchModifier {
                 param_type == SearchParamType::Reference
             }
             SearchModifier::OfType => param_type == SearchParamType::Token,
-            SearchModifier::CodeOnly => param_type == SearchParamType::Token,
             SearchModifier::Iterate => false, // Only for _include/_revinclude
             // Per the FHIR spec (build.fhir.org), `:text-advanced` is defined for
             // reference and token parameters (NOT string).
