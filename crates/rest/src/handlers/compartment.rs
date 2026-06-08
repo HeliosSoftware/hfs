@@ -57,6 +57,20 @@ where
         "Processing compartment search request"
     );
 
+    // `GET [base]/[compartment]/[id]/*` searches every resource type that is a
+    // member of the compartment, rather than a single target type.
+    if target_type == "*" {
+        return compartment_search_all(
+            state,
+            compartment_type,
+            compartment_id,
+            tenant,
+            version,
+            pairs,
+        )
+        .await;
+    }
+
     // Get the reference parameters for this compartment/target combination
     let fhir_version = version.storage_version();
     let ref_params =
@@ -135,40 +149,133 @@ where
     Ok((StatusCode::OK, Json(bundle_to_json(bundle))).into_response())
 }
 
-/// Handler for compartment search across all types.
+/// Searches across all resource types in a compartment.
 ///
-/// Returns all resources in a compartment.
+/// Implements `GET [base]/[compartment-type]/[id]/*`: returns every resource
+/// that is a member of the compartment, regardless of type. Membership is
+/// resolved per type from the bundled FHIR `CompartmentDefinition`s (via
+/// [`helios_fhir::get_compartment_params`]) — the same source the single-type
+/// compartment search uses.
 ///
-/// # HTTP Request
+/// Each member type is searched independently and the matches are merged into a
+/// single `searchset` Bundle. Query parameters are applied per type on a
+/// best-effort basis: a type for which a parameter is not a valid search
+/// parameter is skipped (it cannot match that constraint anyway).
 ///
-/// `GET [base]/[compartment-type]/[id]/*`
+/// # Pagination
 ///
-/// Note: This is a less common operation and returns resources of various types.
-#[allow(dead_code)]
-pub async fn compartment_search_all_handler<S>(
-    State(_state): State<AppState<S>>,
-    Path((compartment_type, compartment_id)): Path<(String, String)>,
-    _tenant: TenantExtractor,
-    RawQuery(_raw_query): RawQuery,
+/// Cross-type keyset pagination is not supported. Results are capped at the
+/// effective page size (`_count`, clamped to the server maximum) and no
+/// `next`/`previous` links are emitted. `_count` therefore acts as an overall
+/// ceiling across all member types.
+async fn compartment_search_all<S>(
+    state: AppState<S>,
+    compartment_type: String,
+    compartment_id: String,
+    tenant: TenantExtractor,
+    version: FhirVersionExtractor,
+    pairs: Vec<(String, String)>,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
+    let fhir_version = version.storage_version();
+    let compartment_ref = format!("{}/{}", compartment_type, compartment_id);
+    let search_params = SearchParams::from_pairs(pairs.clone());
+
+    // Effective overall page size, clamped to the server maximum.
+    let count = search_params
+        .count()
+        .unwrap_or(state.default_page_size())
+        .min(state.max_page_size());
+
+    // Enumerate compartment member types and pre-build a SearchQuery for each,
+    // restricted to the compartment. Building happens under the registry read
+    // lock (no await); the lock is released before any search executes.
+    let queries: Vec<helios_persistence::types::SearchQuery> = {
+        let registry = state.storage().search_param_registry().read();
+        crate::fhir_types::get_resource_type_names_for_version(fhir_version)
+            .iter()
+            .filter_map(|target_type| {
+                let ref_params = helios_fhir::get_compartment_params(
+                    fhir_version,
+                    &compartment_type,
+                    target_type,
+                );
+                if ref_params.is_empty() {
+                    return None; // not a member of this compartment
+                }
+
+                // A parameter that is invalid for this member type means the type
+                // cannot satisfy it — skip the type rather than failing the request.
+                let mut query = match build_search_query(target_type, &search_params, &registry) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        debug!(
+                            target_type = %target_type,
+                            error = %e,
+                            "Skipping compartment member type: query not applicable"
+                        );
+                        return None;
+                    }
+                };
+
+                query.compartment = Some(helios_persistence::types::CompartmentMembership {
+                    params: ref_params.iter().map(|s| s.to_string()).collect(),
+                    reference: compartment_ref.clone(),
+                });
+                // Cross-type paging is unsupported; cap each type at the overall
+                // ceiling and drop any client cursor/offset.
+                query.count = Some(count as u32);
+                query.cursor = None;
+                query.offset = None;
+                Some(query)
+            })
+            .collect()
+    };
+
+    // Run each member-type search, accumulating matches up to the page-size cap.
+    let mut collected: Vec<helios_persistence::types::StoredResource> = Vec::new();
+    for query in &queries {
+        if collected.len() >= count {
+            break;
+        }
+        match state.storage().search(tenant.context(), query).await {
+            Ok(result) => collected.extend(result.resources.items),
+            Err(e) => {
+                tracing::warn!(
+                    resource_type = %query.resource_type,
+                    error = %e,
+                    "Compartment all-types search failed for member type"
+                );
+                return Err(RestError::from(e));
+            }
+        }
+    }
+    collected.truncate(count);
+
+    // Merge into a single searchset Bundle (no cross-type paging links).
+    let page =
+        helios_persistence::types::Page::new(collected, helios_persistence::types::PageInfo::end());
+    let result = helios_persistence::core::SearchResult::new(page);
+
+    let self_link = build_compartment_search_url(
+        state.base_url(),
+        &compartment_type,
+        &compartment_id,
+        "*",
+        &search_params,
+    );
+    let bundle = result.to_bundle(state.base_url(), &self_link);
+
     debug!(
         compartment_type = %compartment_type,
         compartment_id = %compartment_id,
-        "Processing compartment search all request"
+        results = result.resources.len(),
+        "Compartment all-types search completed"
     );
 
-    // For now, return an error - full implementation would search multiple types
-    // and combine results
-    Err(RestError::BadRequest {
-        message: format!(
-            "Searching all types in compartment '{}' is not yet implemented. \
-             Please specify a resource type: GET /{}/{}/[type]",
-            compartment_type, compartment_type, compartment_id
-        ),
-    })
+    Ok((StatusCode::OK, Json(bundle_to_json(bundle))).into_response())
 }
 
 /// Builds a compartment search URL.
