@@ -171,6 +171,30 @@ jobs:
     name: IG conformance — ${{ matrix.backend }} / FHIR ${{ matrix.label }}
     needs: [setup, build]
     runs-on: [self-hosted, Linux]
+    env:
+      # ── Known-unsupportable upstream tests ──────────────────────────────
+      # The IG is checked out at its default-branch HEAD, so a nightly run can
+      # pick up brand-new test cases the moment they land upstream. A handful
+      # of those bake in terminology content that only tx.fhir.org has loaded
+      # server-side — content the IG itself does not ship as a fixture and the
+      # request body does not carry. No server lacking that private content
+      # can reproduce the expected response, so we exclude them from the gate
+      # (same spirit as the ConceptMap-novs.json fixture skip). The validator
+      # still runs them; we just don't count them as failures here.
+      #
+      # Format: one `suite/test` name per line (matches report.json .test[].name).
+      # Blank lines and `#` comments are ignored. Keep each entry's rationale
+      # next to it so this list stays auditable and shrinks when upstream or
+      # HTS changes make a test passable.
+      IGNORED_TESTS: |
+        # version/vs-expand-versionless — expands the whole NCI Thesaurus
+        # (http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl) versionless,
+        # supplying only a 2-concept fragment tx-resource. tx.fhir.org returns
+        # its own server-loaded 2384-code NCIt fragment (with a valueset-unclosed
+        # extension); those 2382 extra codes exist in neither the IG fixtures
+        # nor the request, so HTS cannot reproduce total=2384. Added upstream
+        # 2026-06-08 (HL7/fhir-tx-ecosystem-ig@e187e74).
+        version/vs-expand-versionless
     strategy:
       fail-fast: false
       matrix:
@@ -529,6 +553,13 @@ jobs:
           OUTPUT_DIR="tx-test-output"
           REPORT_JSON="${OUTPUT_DIR}/report.json"
 
+          # Build a JSON array of known-unsupportable test names from the
+          # IGNORED_TESTS env (drop blank lines and `#` comments).
+          IGNORED_JSON=$(printf '%s\n' "${IGNORED_TESTS:-}" \
+            | sed 's/#.*//' | tr -d '[:blank:]' | grep -v '^$' \
+            | jq -R . | jq -cs . 2>/dev/null)
+          [ -z "$IGNORED_JSON" ] && IGNORED_JSON='[]'
+
           # The validator writes per-failing-test JSON diffs to OUTPUT_DIR/actual/.
           # `$versions.json` is metadata (always written) — exclude it from the
           # failure count.
@@ -544,6 +575,7 @@ jobs:
           TOTAL="unknown"
           PASSED="unknown"
           SKIPPED=0
+          IGNORED=0
           PASS_RATE="unknown"
           SERVER_VERSION="unknown"
           if [ -s "$REPORT_JSON" ] && command -v jq >/dev/null 2>&1; then
@@ -556,13 +588,18 @@ jobs:
               # `skip` is the validator's own decision to not run a test
               # (e.g. tests with `mode: tx.fhir.org` are gated to that server only)
               # — it is NOT a server failure and must not be counted as one.
-              JFAIL=$(jq -r '[.test[]? | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip")))] | length' "$REPORT_JSON" 2>/dev/null)
+              # Tests in IGNORED_TESTS depend on server-private terminology the
+              # IG does not ship; they are excluded from the failure count and
+              # surfaced separately as "Ignored".
+              JFAIL=$(jq -r --argjson ignore "$IGNORED_JSON" '[.test[]? | select((.name as $n | $ignore | index($n)) | not) | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip")))] | length' "$REPORT_JSON" 2>/dev/null)
               JSKIP=$(jq -r '[.test[]? | select(all(.action[]?; .operation.result == "skip" or .operation.result == "pass")) | select(any(.action[]?; .operation.result == "skip"))] | length' "$REPORT_JSON" 2>/dev/null)
+              JIGNORED=$(jq -r --argjson ignore "$IGNORED_JSON" '[.test[]? | select((.name as $n | $ignore | index($n)) != null) | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip")))] | length' "$REPORT_JSON" 2>/dev/null)
               # Prefer the report's own pass/fail count; fall back to the file count.
               if [ -n "$JFAIL" ] && [ "$JFAIL" -ge "$FAILED" ] 2>/dev/null; then
                 FAILED="$JFAIL"
               fi
               [ -n "$JSKIP" ] && SKIPPED="$JSKIP"
+              [ -n "$JIGNORED" ] && IGNORED="$JIGNORED"
             fi
           fi
           if [ "$TOTAL" = "unknown" ]; then
@@ -571,10 +608,10 @@ jobs:
             [ -n "$TOTAL_GUESS" ] && TOTAL="$TOTAL_GUESS"
           fi
           if [ "$TOTAL" != "unknown" ] && [ "$TOTAL" -gt 0 ] 2>/dev/null; then
-            PASSED=$((TOTAL - FAILED - SKIPPED))
-            # Pass rate is computed against the applicable population
-            # (excludes skipped tests that the validator gated to other servers).
-            APPLICABLE=$((TOTAL - SKIPPED))
+            PASSED=$((TOTAL - FAILED - SKIPPED - IGNORED))
+            # Pass rate is computed against the applicable population — excludes
+            # both validator-gated skips and ignored server-private-content tests.
+            APPLICABLE=$((TOTAL - SKIPPED - IGNORED))
             if [ "$APPLICABLE" -gt 0 ] 2>/dev/null; then
               PASS_RATE=$(awk -v p="$PASSED" -v t="$APPLICABLE" 'BEGIN{ printf "%.1f%%", (p*100)/t }')
             fi
@@ -599,11 +636,13 @@ jobs:
             fi
           fi
 
-          # Status badge
-          if [ "${TXTESTS_EXIT:-1}" = "0" ] && [ "$FAILED" = "0" ]; then
-            STATUS=":white_check_mark: passed"
-          elif [ "$TOTAL" = "unknown" ] || [ "$TOTAL" = "0" ]; then
+          # Status badge. A non-zero validator exit caused solely by ignored
+          # server-private-content tests is not a failure — the gate keys off
+          # FAILED (which already excludes ignored + skipped tests).
+          if [ "$TOTAL" = "unknown" ] || [ "$TOTAL" = "0" ]; then
             STATUS=":x: validator did not run"
+          elif [ "$FAILED" = "0" ]; then
+            STATUS=":white_check_mark: passed"
           else
             STATUS=":x: ${FAILED} failing"
           fi
@@ -623,12 +662,16 @@ jobs:
             echo ""
             echo "### Results"
             echo ""
-            echo "| Total | Passed | Failed | Skipped | Pass rate | Validator exit |"
-            echo "|------:|-------:|-------:|--------:|----------:|---------------:|"
-            echo "| ${TOTAL} | ${PASSED} | ${FAILED} | ${SKIPPED} | ${PASS_RATE} | ${TXTESTS_EXIT:-?} |"
+            echo "| Total | Passed | Failed | Skipped | Ignored | Pass rate | Validator exit |"
+            echo "|------:|-------:|-------:|--------:|--------:|----------:|---------------:|"
+            echo "| ${TOTAL} | ${PASSED} | ${FAILED} | ${SKIPPED} | ${IGNORED} | ${PASS_RATE} | ${TXTESTS_EXIT:-?} |"
             if [ "${SKIPPED:-0}" -gt 0 ] 2>/dev/null; then
               echo ""
               echo "_Skipped tests are gated by the validator (e.g. \`mode: tx.fhir.org\` tests are run only against tx.fhir.org). Pass rate is computed against the applicable population._"
+            fi
+            if [ "${IGNORED:-0}" -gt 0 ] 2>/dev/null; then
+              echo ""
+              echo "_Ignored tests depend on terminology content only tx.fhir.org has loaded server-side (not shipped by the IG); they cannot pass on any other server and are excluded from the gate. See \`IGNORED_TESTS\` in the workflow for the audited list and rationale._"
             fi
             echo ""
 
@@ -716,20 +759,39 @@ jobs:
           # Count true failures (actions with result != "pass" AND result != "skip")
           # from the validator's TestReport. Skips are tx.fhir.org-only fixtures
           # that the validator correctly declines to run against any other server
-          # — they are not failures.
+          # — they are not failures. Tests listed in IGNORED_TESTS depend on
+          # terminology content only tx.fhir.org has loaded server-side (not
+          # shipped by the IG), so no other server can reproduce them — they are
+          # excluded from the gate too. Keep that list audited and minimal.
           REPORT="tx-test-output/report.json"
           if [ ! -s "$REPORT" ]; then
             echo "tx-test-output/report.json missing or empty — failing job"
             exit 1
           fi
-          FAILED=$(jq -r '[.test[]? | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip")))] | length' "$REPORT")
+          IGNORED_JSON=$(printf '%s\n' "${IGNORED_TESTS:-}" \
+            | sed 's/#.*//' | tr -d '[:blank:]' | grep -v '^$' \
+            | jq -R . | jq -cs . 2>/dev/null)
+          [ -z "$IGNORED_JSON" ] && IGNORED_JSON='[]'
+
+          FAILED=$(jq -r --argjson ignore "$IGNORED_JSON" '[.test[]? | select((.name as $n | $ignore | index($n)) | not) | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip")))] | length' "$REPORT")
           if [ "$FAILED" -gt 0 ]; then
             echo "$FAILED tx-ecosystem tests failed — failing job"
+            echo "Failing tests:"
+            jq -r --argjson ignore "$IGNORED_JSON" '.test[]? | select((.name as $n | $ignore | index($n)) | not) | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip"))) | "  - " + .name' "$REPORT" || true
             exit 1
           fi
+          # Report any ignored tests that the validator did flag, so a stale
+          # allowlist entry (one that has started passing) is visible and can be
+          # pruned, and an entry masking a real failure stays auditable.
+          IGNORED_HIT=$(jq -r --argjson ignore "$IGNORED_JSON" '[.test[]? | select((.name as $n | $ignore | index($n)) != null) | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip")))] | length' "$REPORT")
+          if [ "${IGNORED_HIT:-0}" -gt 0 ]; then
+            echo "Note: ${IGNORED_HIT} ignored server-private-content test(s) failed as expected and were excluded from the gate:"
+            jq -r --argjson ignore "$IGNORED_JSON" '.test[]? | select((.name as $n | $ignore | index($n)) != null) | select(any(.action[]?; (.operation.result != "pass") and (.operation.result != "skip"))) | "  - " + .name' "$REPORT" || true
+          fi
           # Validator exit codes: 0 = all pass; non-zero = something didn't pass.
-          # We tolerate non-zero IFF the only non-passes are skips (handled above).
-          echo "All applicable tx-ecosystem tests passed (validator exit ${TXTESTS_EXIT:-?}; skips ignored)"
+          # We tolerate non-zero IFF the only non-passes are skips or ignored
+          # server-private-content tests (both handled above).
+          echo "All applicable tx-ecosystem tests passed (validator exit ${TXTESTS_EXIT:-?}; skips and ignored tests excluded)"
 
       - name: Dump server log on failure
         if: failure()
