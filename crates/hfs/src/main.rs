@@ -25,9 +25,7 @@ use helios_audit::{
 };
 use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
 use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
-use helios_rest::{
-    AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth, init_logging,
-};
+use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth};
 use tracing::info;
 
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
@@ -559,6 +557,15 @@ async fn serve(
 
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
+
+    // Observability: expose `/metrics` (outside the auth layer, so scrapers
+    // need no token) and instrument every request with metrics + a trace span.
+    let app = app
+        .merge(helios_observability::metrics::router())
+        .layer(axum::middleware::from_fn(
+            helios_observability::middleware::track,
+        ));
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     axum::serve(listener, app)
@@ -569,6 +576,8 @@ async fn serve(
                 lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
                 state.sink.flush().await;
             }
+            // Flush any buffered OTLP spans (no-op without the `otel` feature).
+            helios_observability::telemetry::shutdown();
         })
         .await?;
     Ok(())
@@ -743,7 +752,9 @@ async fn main() -> anyhow::Result<()> {
     // sub-structs — both `#[arg(skip)]` for clap — are populated from
     // their `HFS_*` environment variables.
     let config = ServerConfig::from_env();
-    init_logging(&config.log_level);
+    helios_observability::uptime::init();
+    helios_observability::telemetry::init("hfs", &config.log_level);
+    helios_observability::metrics::init("hfs");
 
     if let Err(errors) = config.validate() {
         for error in &errors {

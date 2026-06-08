@@ -24,6 +24,7 @@ default-members = [
 	"crates/auth",
 	"crates/audit",
 	"crates/subscriptions",
+	"crates/observability",
 ]
 resolver = "2"
 
