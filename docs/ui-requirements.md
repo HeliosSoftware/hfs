@@ -301,7 +301,7 @@ spec-compliance work, these now align with the published FHIR spec except for th
 few items called out under "Deviations" below.
 - **All types:** `:missing`
 - **String:** `:exact`, `:contains`, `:text`, `:text-advanced`
-- **Token:** `:not`, `:text`, `:in`, `:above`, `:below`, `:of-type`, `:code`,
+- **Token:** `:not`, `:text`, `:in`, `:above`, `:below`, `:of-type`,
   `:code-text`, `:text-advanced`
 - **Reference:** `:identifier`, `:[Type]` (target type), `:contains`, `:text`,
   `:above`, `:below`, `:code-text`
@@ -309,8 +309,7 @@ few items called out under "Deviations" below.
 - `_include` / `_revinclude` modifier: `:iterate`
 - **Not supported — do not offer (or clearly mark unavailable):** `:not-in` is
   parsed (token only) but **rejected at runtime with `501 Not Implemented`**
-  (negated value-set filtering is unimplemented). There is **no** `:code-only`
-  modifier — only `:code`.
+  (negated value-set filtering is unimplemented).
 - Note: the text/terminology modifiers depend on a backend that can satisfy
   them. `:text-advanced` (token) uses the SQLite FTS5 full-text index; `:text`
   and `:code-text` match against indexed display text and also run on the default
@@ -345,10 +344,6 @@ few items called out under "Deviations" below.
   CapabilityStatement advertises `:of-type`. The UI SHOULD emit `:of-type`.
 - **Deviations from the FHIR spec** (the UI should follow `hfs`, but designers
   should be aware — every other grouping above now matches the spec):
-  - `:code` — `hfs` exposes a `:code` token modifier; the published spec defines
-    no `:code` modifier (its token modifiers are `:text`, `:not`, `:above`,
-    `:below`, `:in`, `:not-in`, `:of-type`, `:identifier`, `:code-text`,
-    `:text-advanced`). Treat `:code` as an `hfs` extension.
   - *(Not a deviation)* `:contains` — `hfs` accepts it on **string**,
     **reference**, and **uri**, which matches build.fhir.org (the spec defines
     `:contains` for reference, string, and uri). Listed here only to correct an
