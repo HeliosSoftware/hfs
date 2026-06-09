@@ -72,7 +72,7 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
     let backend = SqliteTerminologyBackend::new(&config.database_url)?;
     let hts_pool = backend.pool().clone();
 
-    bootstrap_if_empty_sqlite(&backend, &config.bootstrap_dir).await?;
+    bootstrap_sync_sqlite(&backend, &config.bootstrap_dir).await?;
 
     let resource_store = SqliteBackend::open(&config.database_url)
         .map_err(|e| anyhow::anyhow!("Failed to open resource store: {e}"))?;
@@ -121,7 +121,7 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
 
-    bootstrap_if_empty_postgres(&backend, &config.bootstrap_dir).await?;
+    bootstrap_sync_postgres(&backend, &config.bootstrap_dir).await?;
 
     let resource_store = PostgresBackend::from_connection_string(&config.database_url)
         .await
@@ -149,85 +149,58 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
-/// If `bootstrap_dir` is non-empty and points at an existing directory, and
-/// the connected database has no CodeSystems yet, import every recognized
-/// file in the directory before returning. Otherwise log and no-op.
+/// If `bootstrap_dir` is non-empty and points at an existing directory,
+/// synchronize its contents into the connected database: every recognized file
+/// is hashed (SHA-256) and imported only when its hash is absent from, or
+/// differs from, the `bootstrap_imports` ledger. Unchanged files are skipped
+/// without re-parsing. Otherwise log and no-op.
+///
+/// Unlike the previous first-run-only behavior, this runs on every startup, so
+/// files added to the directory after the first boot — and updated terminology
+/// releases that replace an existing file — are picked up automatically. The
+/// underlying import is idempotent (upsert keyed on canonical `(url, version)`),
+/// so re-importing a changed file refreshes it in place.
 ///
 /// Triggered by `HTS_BOOTSTRAP_DIR`; the Docker image sets this to
 /// `/app/terminology-data` so first `docker run` yields a populated server.
 #[cfg(feature = "sqlite")]
-async fn bootstrap_if_empty_sqlite(
+async fn bootstrap_sync_sqlite(
     backend: &SqliteTerminologyBackend,
     bootstrap_dir: &str,
 ) -> anyhow::Result<()> {
     let Some(dir) = resolve_bootstrap_dir(bootstrap_dir) else {
         return Ok(());
     };
-
-    let pool = backend.pool().clone();
-    let count = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
-        let conn = pool.get()?;
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM code_systems", [], |r| r.get(0))?;
-        Ok(n)
-    })
-    .await??;
-
-    if count > 0 {
-        info!(
-            bootstrap_dir = %dir.display(),
-            code_systems = count,
-            "bootstrap skipped: database already populated"
-        );
-        return Ok(());
-    }
-
-    info!(bootstrap_dir = %dir.display(), "bootstrap: database empty, importing");
-    let ctx = TenantContext::system();
-    let (stats, imported, skipped) = import_directory_files(backend, &ctx, &dir, 500, false)
-        .await
-        .map_err(|e| anyhow::anyhow!("bootstrap import failed: {e}"))?;
-    info!(
-        imported_files = imported,
-        skipped_files = skipped,
-        code_systems = stats.code_systems,
-        value_sets = stats.value_sets,
-        concept_maps = stats.concept_maps,
-        concepts = stats.concepts,
-        "bootstrap complete"
-    );
-    Ok(())
+    let tracker = BootstrapTracker::Sqlite(backend);
+    bootstrap_sync(&tracker, backend, &dir).await
 }
 
 #[cfg(feature = "postgres")]
-async fn bootstrap_if_empty_postgres(
+async fn bootstrap_sync_postgres(
     backend: &PostgresTerminologyBackend,
     bootstrap_dir: &str,
 ) -> anyhow::Result<()> {
     let Some(dir) = resolve_bootstrap_dir(bootstrap_dir) else {
         return Ok(());
     };
+    let tracker = BootstrapTracker::Postgres(backend);
+    bootstrap_sync(&tracker, backend, &dir).await
+}
 
-    let client = backend.pool().get().await?;
-    let row = client
-        .query_one("SELECT COUNT(*)::bigint FROM code_systems", &[])
-        .await?;
-    let count: i64 = row.get(0);
-    drop(client);
-
-    if count > 0 {
-        info!(
-            bootstrap_dir = %dir.display(),
-            code_systems = count,
-            "bootstrap skipped: database already populated"
-        );
-        return Ok(());
-    }
-
-    info!(bootstrap_dir = %dir.display(), "bootstrap: database empty, importing");
+/// Backend-agnostic bootstrap sync: import the directory, gating each file on
+/// its content hash via `tracker`.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn bootstrap_sync(
+    tracker: &BootstrapTracker<'_>,
+    backend: &dyn BundleImportBackend,
+    dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    info!(bootstrap_dir = %dir.display(), "bootstrap: syncing terminology directory");
     let ctx = TenantContext::system();
-    let (stats, imported, skipped) = import_directory_files(backend, &ctx, &dir, 500, false)
-        .await
-        .map_err(|e| anyhow::anyhow!("bootstrap import failed: {e}"))?;
+    let (stats, imported, skipped) =
+        import_directory_files(backend, &ctx, dir, 500, false, Some(tracker))
+            .await
+            .map_err(|e| anyhow::anyhow!("bootstrap import failed: {e}"))?;
     info!(
         imported_files = imported,
         skipped_files = skipped,
@@ -235,7 +208,7 @@ async fn bootstrap_if_empty_postgres(
         value_sets = stats.value_sets,
         concept_maps = stats.concept_maps,
         concepts = stats.concepts,
-        "bootstrap complete"
+        "bootstrap sync complete"
     );
     Ok(())
 }
@@ -255,6 +228,146 @@ fn resolve_bootstrap_dir(bootstrap_dir: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     Some(dir)
+}
+
+/// Ledger over the `bootstrap_imports` table, used by [`import_directory_files`]
+/// to skip files that have already been imported with identical content.
+///
+/// Backend-specific because the SQLite pool is blocking (run on a
+/// `spawn_blocking` worker) while the PostgreSQL pool is async.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+enum BootstrapTracker<'a> {
+    #[cfg(feature = "sqlite")]
+    Sqlite(&'a SqliteTerminologyBackend),
+    #[cfg(feature = "postgres")]
+    Postgres(&'a PostgresTerminologyBackend),
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+impl BootstrapTracker<'_> {
+    /// The content hash previously recorded for `path` (file name), if any.
+    async fn imported_hash(&self, path: &str) -> anyhow::Result<Option<String>> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(backend) => {
+                use rusqlite::OptionalExtension;
+                let pool = backend.pool().clone();
+                let key = path.to_string();
+                let hash =
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+                        let conn = pool.get()?;
+                        let h = conn
+                            .query_row(
+                                "SELECT content_hash FROM bootstrap_imports WHERE path = ?1",
+                                [&key],
+                                |r| r.get::<_, String>(0),
+                            )
+                            .optional()?;
+                        Ok(h)
+                    })
+                    .await??;
+                Ok(hash)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(backend) => {
+                let client = backend.pool().get().await?;
+                let row = client
+                    .query_opt(
+                        "SELECT content_hash FROM bootstrap_imports WHERE path = $1",
+                        &[&path],
+                    )
+                    .await?;
+                Ok(row.map(|r| r.get::<_, String>(0)))
+            }
+        }
+    }
+
+    /// Record (insert or update) the content hash and size for `path`.
+    async fn record(&self, path: &str, hash: &str, size: i64) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(backend) => {
+                let pool = backend.pool().clone();
+                let (key, hash) = (path.to_string(), hash.to_string());
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let conn = pool.get()?;
+                    conn.execute(
+                        "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) \
+                         VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(path) DO UPDATE SET \
+                             content_hash = excluded.content_hash, \
+                             size_bytes   = excluded.size_bytes, \
+                             imported_at  = datetime('now')",
+                        rusqlite::params![key, hash, size],
+                    )?;
+                    Ok(())
+                })
+                .await??;
+                Ok(())
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(backend) => {
+                let client = backend.pool().get().await?;
+                client
+                    .execute(
+                        "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) \
+                         VALUES ($1, $2, $3) \
+                         ON CONFLICT (path) DO UPDATE SET \
+                             content_hash = EXCLUDED.content_hash, \
+                             size_bytes   = EXCLUDED.size_bytes, \
+                             imported_at  = now()",
+                        &[&path, &hash, &size],
+                    )
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Compute a `(SHA-256 hex, size in bytes)` signature for a bootstrap entry.
+///
+/// For a regular file, this is the SHA-256 of its contents. For a directory
+/// (e.g. an RxNorm RRF folder), hashing every byte on every startup would
+/// dominate boot time, so the signature is derived from the sorted
+/// `(name, size)` of its immediate children instead — a new release dropped in
+/// (which changes file sizes) still re-triggers import, while an unchanged
+/// folder is cheaply recognized.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn compute_signature(path: &std::path::Path) -> std::io::Result<(String, i64)> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let size: u64 = if path.is_dir() {
+        let mut entries: Vec<(String, u64)> = std::fs::read_dir(path)?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let len = e.metadata().ok()?.len();
+                Some((name, len))
+            })
+            .collect();
+        entries.sort();
+        let mut total: u64 = 0;
+        for (name, len) in &entries {
+            hasher.update(name.as_bytes());
+            hasher.update(b":");
+            hasher.update(len.to_le_bytes());
+            hasher.update(b"\n");
+            total += len;
+        }
+        total
+    } else {
+        let mut file = std::fs::File::open(path)?;
+        std::io::copy(&mut file, &mut hasher)?
+    };
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok((hex, size as i64))
 }
 
 // ── Import ────────────────────────────────────────────────────────────────────
@@ -455,15 +568,28 @@ async fn import_directory(
     ctx: &TenantContext,
     args: &ImportArgs,
 ) -> Result<(ImportStats, String), helios_hts::error::HtsError> {
-    let (stats, imported_count, skipped_count) =
-        import_directory_files(backend, ctx, &args.path, args.batch_size, args.dry_run).await?;
+    let (stats, imported_count, skipped_count) = import_directory_files(
+        backend,
+        ctx,
+        &args.path,
+        args.batch_size,
+        args.dry_run,
+        None,
+    )
+    .await?;
     let label = format!("directory ({imported_count} imported, {skipped_count} skipped)");
     Ok((stats, label))
 }
 
 /// Shared directory-iteration loop used by both `hts import <dir>` and the
-/// `HTS_BOOTSTRAP_DIR` first-run path. Returns (aggregated stats, imported
-/// file count, skipped file count).
+/// `HTS_BOOTSTRAP_DIR` sync path. Returns (aggregated stats, imported file
+/// count, skipped file count).
+///
+/// When `tracker` is `Some`, each file's SHA-256 content signature is compared
+/// against the `bootstrap_imports` ledger: files whose signature is unchanged
+/// are skipped (counted as skipped), and successfully imported files have their
+/// signature recorded. When `tracker` is `None` (CLI `hts import <dir>`), every
+/// recognized file is imported unconditionally.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 async fn import_directory_files(
     backend: &dyn BundleImportBackend,
@@ -471,6 +597,7 @@ async fn import_directory_files(
     dir: &std::path::Path,
     batch_size: usize,
     dry_run: bool,
+    tracker: Option<&BootstrapTracker<'_>>,
 ) -> Result<(ImportStats, usize, usize), helios_hts::error::HtsError> {
     use helios_hts::error::HtsError;
 
@@ -499,59 +626,92 @@ async fn import_directory_files(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("<non-utf8>");
-        if entry.is_dir() {
+        let is_dir = entry.is_dir();
+        let suffix = if is_dir { "/" } else { "" };
+
+        // Resolve the import format for this entry, skipping entries we don't
+        // recognize (non-rxnorm directories, undetectable file formats).
+        let format = if is_dir {
             if contains_rxnorm_rrf(entry) {
-                eprintln!("[import] file {}/{total} (rxnorm): {fname}/", idx + 1);
-                match dispatch_import(
-                    ImportFormat::Rxnorm,
-                    backend,
-                    ctx,
-                    entry,
-                    batch_size,
-                    dry_run,
-                )
-                .await
-                {
-                    Ok(file_stats) => {
-                        stats.merge(file_stats);
-                        imported_count += 1;
-                    }
-                    Err(e) => {
-                        let msg = format!("[rxnorm] '{fname}/' failed: {e}");
-                        eprintln!("[error] {msg}");
-                        stats.errors.push(msg);
-                        skipped_count += 1;
-                    }
-                }
+                ImportFormat::Rxnorm
             } else {
                 eprintln!(
                     "[skip] {}/{total} {fname}/: nested directory ignored",
                     idx + 1
                 );
                 skipped_count += 1;
+                continue;
             }
-            continue;
-        }
-        let Some(format) = detect_format(entry) else {
-            eprintln!(
-                "[skip] {}/{total} {fname}: format not auto-detected",
-                idx + 1
-            );
-            skipped_count += 1;
-            continue;
+        } else {
+            match detect_format(entry) {
+                Some(f) => f,
+                None => {
+                    eprintln!(
+                        "[skip] {}/{total} {fname}: format not auto-detected",
+                        idx + 1
+                    );
+                    skipped_count += 1;
+                    continue;
+                }
+            }
         };
-        eprintln!("[import] file {}/{total} ({format}): {fname}", idx + 1);
+
+        // Bootstrap-sync gating: skip files already imported with identical
+        // content; otherwise remember the signature to record after a
+        // successful import. A hashing or ledger-lookup error is non-fatal —
+        // we log it and fall through to import the file unconditionally.
+        let mut pending_signature: Option<(String, i64)> = None;
+        if let Some(tracker) = tracker {
+            match compute_signature(entry) {
+                Ok((hash, size)) => match tracker.imported_hash(fname).await {
+                    Ok(Some(prev)) if prev == hash => {
+                        eprintln!(
+                            "[skip] {}/{total} {fname}{suffix}: unchanged since last bootstrap",
+                            idx + 1
+                        );
+                        skipped_count += 1;
+                        continue;
+                    }
+                    Ok(_) => pending_signature = Some((hash, size)),
+                    Err(e) => tracing::warn!(
+                        file = fname,
+                        error = %e,
+                        "bootstrap ledger lookup failed; importing unconditionally"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    file = fname,
+                    error = %e,
+                    "could not hash bootstrap file; importing unconditionally"
+                ),
+            }
+        }
+
+        eprintln!(
+            "[import] file {}/{total} ({format}): {fname}{suffix}",
+            idx + 1
+        );
         match dispatch_import(format, backend, ctx, entry, batch_size, dry_run).await {
             Ok(file_stats) => {
                 stats.merge(file_stats);
                 imported_count += 1;
+                if let (Some(tracker), Some((hash, size))) = (tracker, pending_signature.as_ref())
+                    && !dry_run
+                    && let Err(e) = tracker.record(fname, hash, *size).await
+                {
+                    tracing::warn!(
+                        file = fname,
+                        error = %e,
+                        "failed to record bootstrap import; file will be re-imported next startup"
+                    );
+                }
             }
             Err(e) => {
                 // In directory-iteration mode we deliberately keep going so
                 // one broken file doesn't prevent the rest of the bundle
                 // from loading. The failure is still reported via
                 // ImportStats.errors, which drives exit code 2.
-                let msg = format!("[{format}] '{fname}' failed: {e}");
+                let msg = format!("[{format}] '{fname}{suffix}' failed: {e}");
                 eprintln!("[error] {msg}");
                 stats.errors.push(msg);
                 skipped_count += 1;
@@ -659,6 +819,112 @@ fn print_import_summary(result: &helios_hts::import::ImportResult, dry_run: bool
         );
         for e in result.stats.errors.iter().take(10) {
             eprintln!("  - {e}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+
+    /// Write a minimal FHIR Bundle wrapping a single CodeSystem to `dir/name`.
+    fn write_bundle(dir: &std::path::Path, name: &str, cs_url: &str, version: &str) {
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [{
+                "resource": {
+                    "resourceType": "CodeSystem",
+                    "url": cs_url,
+                    "version": version,
+                    "status": "active",
+                    "content": "complete",
+                    "concept": [{ "code": "A", "display": "Alpha" }]
+                }
+            }]
+        });
+        std::fs::write(dir.join(name), serde_json::to_vec(&bundle).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn compute_signature_is_deterministic_and_content_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.json");
+
+        std::fs::write(&file, b"hello").unwrap();
+        let (h1, s1) = compute_signature(&file).unwrap();
+        let (h2, s2) = compute_signature(&file).unwrap();
+        assert_eq!(h1, h2, "same content hashes identically");
+        assert_eq!(s1, 5);
+        assert_eq!(s2, 5);
+
+        std::fs::write(&file, b"hello world").unwrap();
+        let (h3, s3) = compute_signature(&file).unwrap();
+        assert_ne!(h1, h3, "changed content yields a different hash");
+        assert_eq!(s3, 11);
+    }
+
+    /// The bootstrap sync must import a file the first time, skip it while
+    /// unchanged, re-import it when its content changes (e.g. a version bump),
+    /// and pick up newly added files — without re-importing the unchanged ones.
+    #[tokio::test]
+    async fn bootstrap_sync_imports_new_and_changed_files_only() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let backend = SqliteTerminologyBackend::new(db.path().to_str().unwrap()).unwrap();
+        let ctx = TenantContext::system();
+        let tracker = BootstrapTracker::Sqlite(&backend);
+        let boot = tempfile::tempdir().unwrap();
+        write_bundle(boot.path(), "cs.json", "http://example.org/cs", "1.0.0");
+
+        // First run: imports the file.
+        let (stats, imported, skipped) =
+            import_directory_files(&backend, &ctx, boot.path(), 500, false, Some(&tracker))
+                .await
+                .unwrap();
+        assert_eq!((imported, skipped), (1, 0));
+        assert_eq!(stats.code_systems, 1);
+
+        // Second run, file unchanged: skipped, nothing imported.
+        let (stats, imported, skipped) =
+            import_directory_files(&backend, &ctx, boot.path(), 500, false, Some(&tracker))
+                .await
+                .unwrap();
+        assert_eq!((imported, skipped), (0, 1));
+        assert_eq!(stats.code_systems, 0);
+
+        // Bump the version: content changes, so the file is re-imported.
+        write_bundle(boot.path(), "cs.json", "http://example.org/cs", "2.0.0");
+        let (_stats, imported, skipped) =
+            import_directory_files(&backend, &ctx, boot.path(), 500, false, Some(&tracker))
+                .await
+                .unwrap();
+        assert_eq!((imported, skipped), (1, 0));
+
+        // Add a brand-new file: only it is imported; cs.json stays skipped.
+        write_bundle(boot.path(), "cs2.json", "http://example.org/cs2", "1.0.0");
+        let (_stats, imported, skipped) =
+            import_directory_files(&backend, &ctx, boot.path(), 500, false, Some(&tracker))
+                .await
+                .unwrap();
+        assert_eq!((imported, skipped), (1, 1));
+    }
+
+    /// Without a tracker (the `hts import <dir>` CLI path) every recognized file
+    /// is imported unconditionally on each invocation.
+    #[tokio::test]
+    async fn import_without_tracker_always_imports() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let backend = SqliteTerminologyBackend::new(db.path().to_str().unwrap()).unwrap();
+        let ctx = TenantContext::system();
+        let boot = tempfile::tempdir().unwrap();
+        write_bundle(boot.path(), "cs.json", "http://example.org/cs", "1.0.0");
+
+        for _ in 0..2 {
+            let (_stats, imported, skipped) =
+                import_directory_files(&backend, &ctx, boot.path(), 500, false, None)
+                    .await
+                    .unwrap();
+            assert_eq!((imported, skipped), (1, 0));
         }
     }
 }
