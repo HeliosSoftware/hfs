@@ -562,7 +562,7 @@ Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
 # License
 
-The Helios FHIR Server is licensed under the [MIT License](LICENSE).
+The Helios FHIR Server is licensed under the [MIT License](LICENSE.md).
 
 # Community
 
