@@ -2265,6 +2265,131 @@ mod es_integration {
             !result.resources.items.is_empty(),
             "_content search should find resources containing the term"
         );
+
+        // Full-text search ranks by relevance, so the backend must populate
+        // `SearchResult.scores` (-> Bundle.entry.search.score) for the matches.
+        assert!(
+            !result.scores.is_empty(),
+            "full-text search should populate relevance scores"
+        );
+        for resource in &result.resources.items {
+            let score = result.scores.get(&resource.url());
+            assert!(
+                matches!(score, Some(s) if *s > 0.0),
+                "matched resource {} should have a positive relevance score, got {score:?}",
+                resource.url()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn es_integration_contained_search() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            ContainedMode, ContainedReturn, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("contained-test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs1",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
+                    "subject": { "reference": "#p1" },
+                    "contained": [{
+                        "resourceType": "Patient",
+                        "id": "p1",
+                        "name": [{ "family": "Smith", "given": ["Contained"] }],
+                        "gender": "male"
+                    }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "top1", "name": [{ "family": "Smith" }] }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
+
+        let name_query = |mode: ContainedMode, ret: ContainedReturn| {
+            let mut q = SearchQuery::new("Patient");
+            q.contained = mode;
+            q.contained_return = ret;
+            q.parameters.push(SearchParameter {
+                name: "name".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq("Smith")],
+                chain: vec![],
+                components: vec![],
+            });
+            q
+        };
+
+        // Default (_contained=off): only the top-level Patient.
+        let off = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::Off, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let off_urls: Vec<String> = off.resources.items.iter().map(|r| r.url()).collect();
+        assert_eq!(
+            off_urls,
+            vec!["Patient/top1"],
+            "off excludes contained docs"
+        );
+
+        // _contained=true: the container is returned.
+        let on = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::On, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let on_urls: Vec<String> = on.resources.items.iter().map(|r| r.url()).collect();
+        assert_eq!(on_urls, vec!["Observation/obs1"], "container returned");
+
+        // _containedType=contained: the contained Patient itself.
+        let contained = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::On, ContainedReturn::Contained),
+            )
+            .await
+            .unwrap();
+        assert_eq!(contained.resources.items.len(), 1);
+        assert_eq!(contained.resources.items[0].resource_type(), "Patient");
+        assert_eq!(contained.resources.items[0].id(), "p1");
+
+        // _contained=both: top-level + container.
+        let both = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::Both, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let mut both_urls: Vec<String> = both.resources.items.iter().map(|r| r.url()).collect();
+        both_urls.sort();
+        assert_eq!(both_urls, vec!["Observation/obs1", "Patient/top1"]);
     }
 
     #[tokio::test]

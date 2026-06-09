@@ -29,7 +29,7 @@ use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
 use super::SqliteBackend;
-use super::search::writer::SqliteSearchIndexWriter;
+use super::search::writer::{SqlValue, SqliteSearchIndexWriter};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -580,6 +580,10 @@ impl SqliteBackend {
             count += 1;
         }
 
+        // Also index any contained resources for `_contained` search.
+        count +=
+            self.index_contained_resources(conn, tenant_id, resource_type, resource_id, resource)?;
+
         Ok(count)
     }
 
@@ -627,6 +631,99 @@ impl SqliteBackend {
 
         conn.execute(SqliteSearchIndexWriter::insert_sql(), param_refs.as_slice())
             .map_err(|e| internal_error(format!("Failed to insert search index entry: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Extracts and indexes a container's `contained[]` resources for
+    /// `_contained` search. Each contained resource's search values are written
+    /// as `is_contained = 1` rows whose `resource_type` / `resource_id` identify
+    /// the container. Returns the number of entries written.
+    fn index_contained_resources(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+        resource: &Value,
+    ) -> StorageResult<usize> {
+        let mut count = 0;
+        let container = (container_type, container_id);
+        for contained in self.search_extractor().extract_contained(resource) {
+            for value in &contained.values {
+                self.write_contained_index_entry(
+                    conn,
+                    tenant_id,
+                    container,
+                    (&contained.contained_type, &contained.local_id),
+                    value,
+                )?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Writes a single contained `ExtractedValue` to the search_index table,
+    /// flagged `is_contained = 1` and carrying the contained resource's type and
+    /// local id (mirrors [`Self::write_index_entry`]). `container` is the
+    /// `(type, id)` of the holding resource; `contained` is the
+    /// `(type, local id)` of the nested resource.
+    fn write_contained_index_entry(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant_id: &str,
+        container: (&str, &str),
+        contained: (&str, &str),
+        value: &ExtractedValue,
+    ) -> StorageResult<()> {
+        use crate::search::converters::IndexValue;
+
+        let (container_type, container_id) = container;
+        let (contained_type, contained_local_id) = contained;
+
+        let normalized_value = match &value.value {
+            IndexValue::Date {
+                value: date_str,
+                precision,
+            } => {
+                let mut normalized = value.clone();
+                normalized.value = IndexValue::Date {
+                    value: Self::normalize_date_for_sqlite(date_str),
+                    precision: *precision,
+                };
+                Some(normalized)
+            }
+            _ => None,
+        };
+        let value_to_use = normalized_value.as_ref().unwrap_or(value);
+
+        let mut sql_params = SqliteSearchIndexWriter::to_sql_params(
+            tenant_id,
+            container_type,
+            container_id,
+            value_to_use,
+        );
+        // Trailing contained columns (?25..?27).
+        sql_params.push(SqlValue::Int(1));
+        sql_params.push(SqlValue::String(contained_type.to_string()));
+        sql_params.push(SqlValue::String(contained_local_id.to_string()));
+
+        let param_refs: Vec<&dyn ToSql> = sql_params
+            .iter()
+            .map(|p| self.sql_value_to_ref(p))
+            .collect();
+
+        conn.execute(
+            SqliteSearchIndexWriter::insert_contained_sql(),
+            param_refs.as_slice(),
+        )
+        .map_err(|e| {
+            internal_error(format!(
+                "Failed to insert contained search index entry: {}",
+                e
+            ))
+        })?;
 
         Ok(())
     }
@@ -3033,6 +3130,16 @@ impl ReindexableStorage for SqliteBackend {
             )?;
             count += 1;
         }
+
+        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
+        // search entries.
+        count += self.index_contained_resources(
+            &conn,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            resource_id,
+            resource,
+        )?;
 
         Ok(count)
     }

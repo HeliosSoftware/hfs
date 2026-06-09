@@ -65,6 +65,7 @@ pub mod chain_resolver;
 pub mod converters;
 pub mod errors;
 pub mod extractor;
+pub mod list_resolver;
 pub mod loader;
 pub mod range;
 pub mod registry;
@@ -76,7 +77,8 @@ pub mod writer;
 pub use chain_resolver::{query_has_chains, resolve_chains};
 pub use converters::{IndexValue, ValueConverter};
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
-pub use extractor::{ExtractedValue, SearchParameterExtractor};
+pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};
+pub use list_resolver::{query_has_list, resolve_list};
 pub use loader::SearchParameterLoader;
 pub use range::{implicit_precision, implicit_range};
 pub use registry::{

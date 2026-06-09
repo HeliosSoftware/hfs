@@ -6,9 +6,9 @@ use std::collections::HashMap;
 
 use helios_persistence::search::{SearchParameterRegistry, resolve_param_type};
 use helios_persistence::types::{
-    CompositeSearchComponent, IncludeDirective, IncludeType, ReverseChainedParameter,
-    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
-    SummaryMode, TotalMode,
+    CompositeSearchComponent, ContainedMode, ContainedReturn, IncludeDirective, IncludeType,
+    ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+    SearchValue, SortDirective, SummaryMode, TotalMode,
 };
 
 use super::SearchParams;
@@ -119,6 +119,37 @@ pub fn build_search_query(
         query.elements = elements.to_vec();
     }
 
+    // Process _contained / _containedType
+    if let Some(v) = params.get("_contained") {
+        query.contained = match v.as_str() {
+            "false" | "" => ContainedMode::Off,
+            "true" => ContainedMode::On,
+            "both" => ContainedMode::Both,
+            other => {
+                return Err(RestError::InvalidParameter {
+                    param: "_contained".to_string(),
+                    message: format!(
+                        "invalid _contained value '{other}' (expected 'true', 'false', or 'both')"
+                    ),
+                });
+            }
+        };
+    }
+    if let Some(v) = params.get("_containedType") {
+        query.contained_return = match v.as_str() {
+            "container" | "" => ContainedReturn::Container,
+            "contained" => ContainedReturn::Contained,
+            other => {
+                return Err(RestError::InvalidParameter {
+                    param: "_containedType".to_string(),
+                    message: format!(
+                        "invalid _containedType value '{other}' (expected 'container' or 'contained')"
+                    ),
+                });
+            }
+        };
+    }
+
     // Process _include directives
     for include in params.include() {
         if let Some(directive) = parse_include_directive(include, IncludeType::Include) {
@@ -150,6 +181,17 @@ pub fn build_search_query(
         if name == "_has" || name.starts_with("_has:") {
             if let Some(reverse_chain) = parse_has_parameter(name, value)? {
                 query.reverse_chains.push(reverse_chain);
+            }
+            continue;
+        }
+
+        // Handle _list: restrict results to members of the referenced List
+        // resource(s). Resolved application-side into an `_id` filter. A value
+        // may be a bare logical id (`42`) or a `List/42` reference; both are
+        // accepted and normalized to the logical id by the resolver.
+        if name == "_list" {
+            if !value.is_empty() {
+                query.list.push(value.to_string());
             }
             continue;
         }

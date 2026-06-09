@@ -674,6 +674,21 @@ pub struct SearchQuery {
     /// Reverse chain parameters (_has).
     pub reverse_chains: Vec<ReverseChainedParameter>,
 
+    /// `_list` filters: logical ids of `List` resources whose `entry.item`
+    /// references restrict the result set. Multiple values are AND-ed (a result
+    /// must be a member of every listed `List`). Resolved application-side into
+    /// an `_id` filter by [`crate::search::list_resolver`], so any backend can
+    /// execute the rewritten query.
+    pub list: Vec<String>,
+
+    /// `_contained` mode: whether the search matches against resources nested in
+    /// other resources' `contained[]` arrays.
+    pub contained: ContainedMode,
+
+    /// `_containedType`: when a contained resource matches, whether to return the
+    /// container resource (default) or the contained resource itself.
+    pub contained_return: ContainedReturn,
+
     /// Include directives.
     pub includes: Vec<IncludeDirective>,
 
@@ -720,6 +735,32 @@ pub struct CompartmentMembership {
     pub params: Vec<String>,
     /// The compartment reference value, e.g. `Patient/123`.
     pub reference: String,
+}
+
+/// Mode for the `_contained` parameter — whether contained resources (nested in
+/// another resource's `contained[]`) participate in matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainedMode {
+    /// `_contained=false` (default): match only top-level resources.
+    #[default]
+    Off,
+    /// `_contained=true`: match contained resources only.
+    On,
+    /// `_contained=both`: match both top-level and contained resources.
+    Both,
+}
+
+/// Mode for the `_containedType` parameter — what to return when a contained
+/// resource matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainedReturn {
+    /// `_containedType=container` (default): return the container resource.
+    #[default]
+    Container,
+    /// `_containedType=contained`: return the contained resource itself.
+    Contained,
 }
 
 /// Mode for _total parameter.

@@ -160,11 +160,11 @@ where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
     // Reject known-but-unimplemented control parameters instead of silently
-    // ignoring them (which returns an unfiltered, misleading `200`). These FHIR
-    // search controls are not implemented by any backend. See search spec
-    // assessment item A1a.
-    const UNSUPPORTED_PARAMS: [&str; 5] =
-        ["_query", "_list", "_contained", "_containedType", "_score"];
+    // ignoring them (which returns an unfiltered, misleading `200`). `_query`
+    // (named queries) is not implemented by any backend. (`_list` is implemented
+    // via list resolution; `_score` as an output/`_sort` concept; `_contained` /
+    // `_containedType` are parsed below and gated per backend capability.)
+    const UNSUPPORTED_PARAMS: [&str; 1] = ["_query"];
     if let Some((key, _)) = pairs
         .iter()
         .find(|(k, _)| UNSUPPORTED_PARAMS.contains(&k.as_str()))
@@ -256,6 +256,9 @@ where
             for s in &built.sort {
                 let sortable = s.parameter == "_id"
                     || s.parameter == "_lastUpdated"
+                    // `_score` ranks by relevance on full-text backends
+                    // (Elasticsearch); other backends fall back to default order.
+                    || s.parameter == "_score"
                     || matches!(
                         s.param_type,
                         Some(t) if t != SearchParamType::Composite && t != SearchParamType::Special
@@ -274,6 +277,17 @@ where
         built
     };
 
+    // `_contained=true|both` requires contained-resource indexing. Gate it on the
+    // backend's capability so unsupported backends return a clear 501 rather than
+    // silently ignoring the parameter and returning an unfiltered result.
+    if query.contained != helios_persistence::types::ContainedMode::Off
+        && !state.storage().supports_contained_search()
+    {
+        return Err(RestError::NotImplemented {
+            feature: "'_contained' search is not supported by this storage backend".to_string(),
+        });
+    }
+
     // Clamp page size to the configured default/maximum.
     let count = query
         .count
@@ -281,6 +295,30 @@ where
         .unwrap_or(state.default_page_size())
         .min(state.max_page_size());
     query.count = Some(count as u32);
+
+    // Resolve `_list` into an `_id` filter via application-side List lookup, so
+    // any backend's `search()` can execute it. Functional list values (the
+    // `$current-*` pseudo-lists) require patient-compartment clinical logic that
+    // no backend implements; reject them explicitly rather than silently
+    // returning an unfiltered result.
+    if let Some(functional) = query.list.iter().find(|v| v.starts_with('$')) {
+        return Err(RestError::NotImplemented {
+            feature: format!(
+                "functional list '{functional}' is not supported; \
+                 use '_list=[List id]' with a stored List resource"
+            ),
+        });
+    }
+    let query = if helios_persistence::search::query_has_list(&query) {
+        helios_persistence::search::resolve_list(state.storage(), tenant.context(), &query)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "List (_list) resolution failed");
+                RestError::from(e)
+            })?
+    } else {
+        query
+    };
 
     // Resolve chained / reverse-chained (`_has`) parameters into an `_id` filter
     // via application-side joins, so any backend's `search()` can execute them.
@@ -508,13 +546,19 @@ fn bundle_to_json_with_subsetting(
                 entry["resource"] = subsetted;
             }
             if let Some(ref search) = e.search {
-                entry["search"] = serde_json::json!({
+                let mut search_json = serde_json::json!({
                     "mode": match search.mode {
                         helios_persistence::types::SearchEntryMode::Match => "match",
                         helios_persistence::types::SearchEntryMode::Include => "include",
                         helios_persistence::types::SearchEntryMode::Outcome => "outcome",
                     }
                 });
+                // Relevance score (Bundle.entry.search.score), when the backend
+                // computed one.
+                if let Some(score) = search.score {
+                    search_json["score"] = serde_json::json!(score);
+                }
+                entry["search"] = search_json;
             }
             entry
         }).collect::<Vec<_>>()
@@ -921,5 +965,36 @@ mod tests {
             as_map(&result).get("url:below"),
             Some(&"http://example.org/fhir/ValueSet/x".to_string())
         );
+    }
+
+    #[test]
+    fn test_bundle_json_emits_search_score() {
+        use helios_persistence::types::{BundleEntry, SearchBundle};
+
+        let bundle = SearchBundle::new().with_entry(
+            BundleEntry::match_entry(
+                "http://example.com/fhir/Patient/1",
+                serde_json::json!({"resourceType": "Patient", "id": "1"}),
+            )
+            .with_score(Some(0.42)),
+        );
+
+        let json = bundle_to_json_with_subsetting(bundle, None, None, FhirVersion::R4);
+        let search = &json["entry"][0]["search"];
+        assert_eq!(search["mode"], "match");
+        assert_eq!(search["score"], serde_json::json!(0.42));
+    }
+
+    #[test]
+    fn test_bundle_json_omits_absent_search_score() {
+        use helios_persistence::types::{BundleEntry, SearchBundle};
+
+        let bundle = SearchBundle::new().with_entry(BundleEntry::match_entry(
+            "http://example.com/fhir/Patient/1",
+            serde_json::json!({"resourceType": "Patient", "id": "1"}),
+        ));
+
+        let json = bundle_to_json_with_subsetting(bundle, None, None, FhirVersion::R4);
+        assert!(json["entry"][0]["search"].get("score").is_none());
     }
 }

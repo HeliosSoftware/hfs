@@ -303,6 +303,88 @@ impl PostgresQueryBuilder {
         ))
     }
 
+    /// Builds the `_contained` match subquery (mirrors the SQLite backend's
+    /// `build_contained`).
+    ///
+    /// Returns SQL selecting `(resource_type, resource_id, contained_local_id)`
+    /// from `search_index` for contained resources (`is_contained = TRUE`) of the
+    /// searched type (`contained_type = $2`) matching every standard parameter,
+    /// keyed on the contained entity `(resource_id, contained_local_id)` via
+    /// `GROUP BY ... HAVING COUNT(DISTINCT param_name) >= n`. Value predicates are
+    /// the bare column conditions shared with composite-component matching.
+    ///
+    /// Param layout: `$1` = tenant, `$2` = contained type, then value params.
+    /// Returns `None` when no standard parameter contributes a condition
+    /// (special `_`-params and composites are not applied to contained matching).
+    pub fn build_contained(query: &SearchQuery) -> Option<SqlFragment> {
+        let mut branches: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParam> = Vec::new();
+        let mut distinct_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // $1 = tenant, $2 = contained_type are bound by the caller.
+        let mut offset = 2;
+
+        for param in &query.parameters {
+            if param.name.starts_with('_')
+                || matches!(
+                    param.param_type,
+                    SearchParamType::Composite | SearchParamType::Special
+                )
+            {
+                continue;
+            }
+
+            let mut or_parts: Vec<String> = Vec::new();
+            for value in &param.values {
+                let predicate = match param.param_type {
+                    SearchParamType::Token
+                    | SearchParamType::String
+                    | SearchParamType::Number
+                    | SearchParamType::Quantity
+                    | SearchParamType::Date => {
+                        Self::build_composite_component(value, param.param_type, offset)
+                    }
+                    SearchParamType::Reference => Some((
+                        format!("value_reference = ${}", offset + 1),
+                        vec![SqlParam::text(strip_reference_version(&value.value))],
+                    )),
+                    SearchParamType::Uri => Some((
+                        format!("value_uri = ${}", offset + 1),
+                        vec![SqlParam::text(&value.value)],
+                    )),
+                    SearchParamType::Composite | SearchParamType::Special => None,
+                };
+                if let Some((sql, ps)) = predicate {
+                    offset += ps.len();
+                    or_parts.push(sql);
+                    params.extend(ps);
+                }
+            }
+            if or_parts.is_empty() {
+                continue;
+            }
+            branches.push(format!(
+                "(param_name = '{}' AND ({}))",
+                param.name,
+                or_parts.join(" OR ")
+            ));
+            distinct_names.insert(param.name.clone());
+        }
+
+        if branches.is_empty() {
+            return None;
+        }
+        let sql = format!(
+            "SELECT resource_type, resource_id, contained_local_id FROM search_index \
+             WHERE tenant_id = $1 AND is_contained = TRUE AND contained_type = $2 AND ({}) \
+             GROUP BY resource_type, resource_id, contained_local_id \
+             HAVING COUNT(DISTINCT param_name) >= {}",
+            branches.join(" OR "),
+            distinct_names.len()
+        );
+        Some(SqlFragment::with_params(sql, params))
+    }
+
     /// Builds an `ORDER BY` clause from the query's `_sort` directives.
     ///
     /// Mirrors the SQLite backend's ordering semantics so the two backends stay

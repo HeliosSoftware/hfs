@@ -266,6 +266,78 @@ impl QueryBuilder {
         base
     }
 
+    /// Builds the `_contained` match subquery.
+    ///
+    /// Returns SQL selecting `(resource_type, resource_id, contained_local_id)`
+    /// from `search_index` for contained resources (`is_contained = 1`) of the
+    /// searched type (`contained_type = ?2`) that match every standard search
+    /// parameter. Matching is keyed on the contained entity
+    /// `(resource_id, contained_local_id)` via `GROUP BY ... HAVING
+    /// COUNT(DISTINCT param_name) >= <n>`, so a container only matches when a
+    /// single contained resource satisfies all parameters.
+    ///
+    /// Param layout: `?1` = tenant, `?2` = contained type, then value params.
+    /// Returns `None` when no standard parameter contributes a condition
+    /// (special `_`-params and composites are not applied to contained matching).
+    ///
+    /// Limitation: repeated occurrences of the same parameter name are treated
+    /// as OR rather than AND for the distinct-name count.
+    pub fn build_contained(&self, query: &SearchQuery) -> Option<SqlFragment> {
+        let mut branches: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParam> = Vec::new();
+        let mut distinct_names: HashSet<String> = HashSet::new();
+        // ?1 = tenant, ?2 = contained_type already consumed by the caller.
+        let mut offset = 2;
+
+        for param in &query.parameters {
+            if param.name.starts_with('_')
+                || matches!(
+                    param.param_type,
+                    SearchParamType::Composite | SearchParamType::Special
+                )
+            {
+                continue;
+            }
+
+            let mut or_conditions = Vec::new();
+            let mut local_offset = offset;
+            for value in &param.values {
+                if let Some(cond) = self.build_value_condition(param, value, local_offset) {
+                    local_offset += cond.params.len();
+                    or_conditions.push(cond);
+                }
+            }
+            if or_conditions.is_empty() {
+                continue;
+            }
+            let mut combined = or_conditions.remove(0);
+            for cond in or_conditions {
+                combined = combined.or(cond);
+            }
+            offset += combined.params.len();
+            branches.push(format!(
+                "(param_name = '{}' AND ({}))",
+                param.name, combined.sql
+            ));
+            params.extend(combined.params);
+            distinct_names.insert(param.name.clone());
+        }
+
+        if branches.is_empty() {
+            return None;
+        }
+
+        let sql = format!(
+            "SELECT resource_type, resource_id, contained_local_id FROM search_index \
+             WHERE tenant_id = ?1 AND is_contained = 1 AND contained_type = ?2 AND ({}) \
+             GROUP BY resource_type, resource_id, contained_local_id \
+             HAVING COUNT(DISTINCT param_name) >= {}",
+            branches.join(" OR "),
+            distinct_names.len()
+        );
+        Some(SqlFragment::with_params(sql, params))
+    }
+
     /// Builds the compartment-membership subquery: matches resources that
     /// reference `comp.reference` via ANY of `comp.params` (logical OR), which
     /// is how a resource joins a FHIR compartment. Reference matching mirrors the

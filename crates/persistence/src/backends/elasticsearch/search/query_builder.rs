@@ -22,6 +22,19 @@ pub struct EsQuery {
     pub index: String,
 }
 
+/// Returns true if the query contains a relevance-scoring (full-text) clause:
+/// the `_text` / `_content` special params, or a `:text` / `:text-advanced`
+/// modifier. Such clauses make Elasticsearch's `_score` meaningful.
+fn query_has_relevance(query: &SearchQuery) -> bool {
+    query.parameters.iter().any(|p| {
+        matches!(p.name.as_str(), "_text" | "_content")
+            || matches!(
+                p.modifier,
+                Some(SearchModifier::Text) | Some(SearchModifier::TextAdvanced)
+            )
+    })
+}
+
 /// Builds Elasticsearch queries from FHIR search queries.
 pub struct EsQueryBuilder<'a> {
     tenant_id: &'a str,
@@ -43,10 +56,25 @@ impl<'a> EsQueryBuilder<'a> {
     /// Builds a complete ES query from a FHIR SearchQuery.
     pub fn build(&self, query: &SearchQuery) -> EsQuery {
         let mut must_clauses: Vec<Value> = Vec::new();
-        let filter_clauses: Vec<Value> = vec![
+        let mut filter_clauses: Vec<Value> = vec![
             json!({ "term": { "tenant_id": self.tenant_id } }),
             json!({ "term": { "is_deleted": false } }),
         ];
+
+        // `_contained` mode selects between top-level and contained docs. Contained
+        // docs carry `is_contained=true`; top-level docs omit the field, so
+        // `must_not term is_contained=true` excludes contained docs without
+        // requiring a value on every existing document.
+        let mut must_not_clauses: Vec<Value> = Vec::new();
+        match query.contained {
+            crate::types::ContainedMode::Off => {
+                must_not_clauses.push(json!({ "term": { "is_contained": true } }));
+            }
+            crate::types::ContainedMode::On => {
+                filter_clauses.push(json!({ "term": { "is_contained": true } }));
+            }
+            crate::types::ContainedMode::Both => {}
+        }
 
         // Process each search parameter
         for param in &query.parameters {
@@ -62,6 +90,10 @@ impl<'a> EsQueryBuilder<'a> {
 
         if !must_clauses.is_empty() {
             bool_query["must"] = json!(must_clauses);
+        }
+
+        if !must_not_clauses.is_empty() {
+            bool_query["must_not"] = json!(must_not_clauses);
         }
 
         let mut body = json!({
@@ -87,6 +119,14 @@ impl<'a> EsQueryBuilder<'a> {
 
         // Track total hits
         body["track_total_hits"] = json!(true);
+
+        // When the query contributes relevance (full-text), ask ES to compute
+        // `_score` even though we sort by a field — otherwise `_score` is null
+        // and we can't populate `Bundle.entry.search.score`. A `_sort=_score`
+        // already scores natively, so this only matters for the field-sort case.
+        if query_has_relevance(query) {
+            body["track_scores"] = json!(true);
+        }
 
         EsQuery {
             body,
@@ -222,6 +262,10 @@ impl<'a> EsQueryBuilder<'a> {
                 }
                 "_lastUpdated" => {
                     sort_clauses.push(json!({ "last_updated": { "order": order } }));
+                }
+                // `_sort=_score` ranks by Elasticsearch relevance.
+                "_score" => {
+                    sort_clauses.push(json!({ "_score": { "order": order } }));
                 }
                 // For other parameters, sort on the nested search_params field
                 name => {
