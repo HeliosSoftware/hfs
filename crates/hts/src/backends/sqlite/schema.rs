@@ -238,6 +238,19 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 -- Reverse lookup: all ancestors of a given descendant code.
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
+
+-- ── Bootstrap import ledger ───────────────────────────────────────────────────
+-- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
+-- file name with the SHA-256 of the file's contents. On every startup the
+-- bootstrap sync hashes each file in the directory and imports only those whose
+-- hash is absent or differs from the stored value — so newly added files and
+-- updated terminology releases are picked up without re-parsing unchanged files.
+CREATE TABLE IF NOT EXISTS bootstrap_imports (
+    path          TEXT PRIMARY KEY,
+    content_hash  TEXT NOT NULL,
+    size_bytes    INTEGER NOT NULL,
+    imported_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
 ";
 
 /// Apply the HTS schema to the given database connection.

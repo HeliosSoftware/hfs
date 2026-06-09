@@ -523,8 +523,27 @@ HTS_DATABASE_URL=./my-terminology.db HTS_SERVER_PORT=9090 cargo run --bin hts
 | `HTS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
 | `HTS_DATABASE_URL` | ./data/hts.db | Database location — SQLite file path, or `postgresql://user:pass@host/db` for Postgres |
 | `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite` default; `postgres` when built with `--features postgres`) |
+| `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files imported on startup. The Docker image sets this to `/app/terminology-data`. See bootstrap sync below. |
 | `HTS_ENABLE_CORS` | true | Enable CORS |
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
+
+### Bootstrap directory sync
+
+When `HTS_BOOTSTRAP_DIR` points at a directory, HTS synchronizes its contents
+into the database **on every startup** (not just the first run). Each recognized
+file is hashed (SHA-256) and recorded in a `bootstrap_imports` ledger keyed on
+file name; a file is imported only when its hash is absent or differs from the
+recorded value. So:
+
+- **Adding a new file** to the directory imports it on the next restart.
+- **Replacing a file with a newer terminology release** re-imports it (the
+  underlying import upserts on canonical `(url, version)`, so a new version
+  coexists with the old and a same-version re-import refreshes in place).
+- **Unchanged files** are skipped without re-parsing, keeping startup fast.
+
+For RxNorm RRF *directories* the signature is derived from the immediate
+children's `(name, size)` rather than full content hashing, to avoid re-reading
+multi-gigabyte folders on every boot.
 
 ### API Endpoints
 
