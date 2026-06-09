@@ -519,11 +519,45 @@ impl PostgresBackend {
             }
         }
 
+        // Index any contained resources for `_contained` search.
+        self.index_contained_resources(client, tenant_id, resource_type, resource_id, resource)
+            .await?;
+
         // Index FTS content for _text and _content searches
         self.index_fts_content(client, tenant_id, resource_type, resource_id, resource)
             .await?;
 
         Ok(())
+    }
+
+    /// Extracts and indexes a container's `contained[]` resources for
+    /// `_contained` search. Each contained resource's search values are written
+    /// as `is_contained = TRUE` rows whose `resource_type` / `resource_id`
+    /// identify the container. Returns the number of entries written.
+    async fn index_contained_resources(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+        resource: &Value,
+    ) -> StorageResult<usize> {
+        let mut count = 0;
+        let container = (container_type, container_id);
+        for contained in self.search_extractor().extract_contained(resource) {
+            for value in &contained.values {
+                PostgresSearchIndexWriter::write_contained_entry(
+                    client,
+                    tenant_id,
+                    container,
+                    (&contained.contained_type, &contained.local_id),
+                    value,
+                )
+                .await?;
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Index full-text search content for _text and _content searches.
@@ -2775,6 +2809,12 @@ impl ReindexableStorage for PostgresBackend {
             .await?;
             count += 1;
         }
+
+        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
+        // search entries.
+        count += self
+            .index_contained_resources(&client, tenant_id, resource_type, resource_id, resource)
+            .await?;
 
         Ok(count)
     }

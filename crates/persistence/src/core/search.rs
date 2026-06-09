@@ -9,7 +9,7 @@
 //! - [`TerminologySearchProvider`] - :above, :below, :in, :not-in
 //! - [`TextSearchProvider`] - Full-text search (_text, _content, :text)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -36,6 +36,11 @@ pub struct SearchResult {
 
     /// Total count of matches (if requested via _total).
     pub total: Option<u64>,
+
+    /// Relevance scores (`Bundle.entry.search.score`) for matched resources,
+    /// keyed by resource URL (`Type/id`). Populated by backends that compute
+    /// relevance (e.g. Elasticsearch full-text search); empty otherwise.
+    pub scores: HashMap<String, f64>,
 }
 
 impl SearchResult {
@@ -45,6 +50,7 @@ impl SearchResult {
             resources,
             included: Vec::new(),
             total: None,
+            scores: HashMap::new(),
         }
     }
 
@@ -57,6 +63,12 @@ impl SearchResult {
     /// Sets the total count.
     pub fn with_total(mut self, total: u64) -> Self {
         self.total = Some(total);
+        self
+    }
+
+    /// Sets the relevance scores, keyed by resource URL (`Type/id`).
+    pub fn with_scores(mut self, scores: HashMap<String, f64>) -> Self {
+        self.scores = scores;
         self
     }
 
@@ -122,13 +134,13 @@ impl SearchResult {
             bundle = bundle.with_link("first", strip_paging_params(self_link));
         }
 
-        // Add matching resources
+        // Add matching resources, attaching a relevance score when the backend
+        // computed one for this resource (`Bundle.entry.search.score`).
         for resource in &self.resources.items {
             let full_url = format!("{}/{}", base_url, resource.url());
-            bundle = bundle.with_entry(BundleEntry::match_entry(
-                full_url,
-                resource.content().clone(),
-            ));
+            let entry = BundleEntry::match_entry(full_url, resource.content().clone())
+                .with_score(self.scores.get(&resource.url()).copied());
+            bundle = bundle.with_entry(entry);
         }
 
         // Add included resources
@@ -272,6 +284,15 @@ pub trait SearchProvider: ResourceStorage {
     /// and chained-search builders both consult it so they cannot disagree on
     /// whether a given param is a Date vs. Token vs. Reference, etc.
     fn search_param_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>>;
+
+    /// Whether this backend can evaluate `_contained=true|both` searches (which
+    /// require contained-resource indexing). Defaults to `false`; backends that
+    /// index `contained[]` entries override this. The REST layer uses it to
+    /// reject `_contained` with `501` on backends that don't support it rather
+    /// than silently returning an unfiltered result.
+    fn supports_contained_search(&self) -> bool {
+        false
+    }
 }
 
 /// Search provider that supports searching across multiple resource types.
@@ -707,6 +728,32 @@ mod tests {
 
         assert_eq!(bundle.total, Some(1));
         assert_eq!(bundle.entry.len(), 1);
+        // No score recorded -> entry.search.score stays absent.
+        assert!(bundle.entry[0].search.as_ref().unwrap().score.is_none());
+    }
+
+    #[test]
+    fn test_search_result_to_bundle_attaches_score() {
+        let resource = StoredResource::new(
+            "Patient",
+            "123",
+            crate::tenant::TenantId::new("t1"),
+            serde_json::json!({"resourceType": "Patient", "id": "123"}),
+            FhirVersion::default(),
+        );
+        let page = Page::new(vec![resource], PageInfo::end());
+        let mut scores = HashMap::new();
+        scores.insert("Patient/123".to_string(), 0.875);
+        let result = SearchResult::new(page).with_scores(scores);
+
+        let bundle = result.to_bundle("http://example.com/fhir", "http://example.com/fhir/Patient");
+
+        assert_eq!(bundle.entry.len(), 1);
+        assert_eq!(
+            bundle.entry[0].search.as_ref().unwrap().score,
+            Some(0.875),
+            "the matched entry carries Bundle.entry.search.score"
+        );
     }
 
     /// Self-link has no query: cursor is appended with `?` (issue #69 bug 1).

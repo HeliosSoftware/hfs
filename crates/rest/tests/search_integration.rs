@@ -1235,13 +1235,14 @@ mod unsupported_params {
 
     #[tokio::test]
     async fn test_unsupported_control_param_rejected() {
-        // `_query`/`_list`/`_contained`/`_score` are not implemented; the server
+        // `_query`/`_contained`/`_containedType` are not implemented; the server
         // must reject them (400) rather than silently ignoring them and returning
-        // an unfiltered result.
+        // an unfiltered result. (`_list` and `_score` are implemented — see the
+        // `list_search` and `score_param` modules below.)
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        for param in ["_query", "_list", "_contained", "_score"] {
+        for param in ["_query", "_contained", "_containedType"] {
             let response = server
                 .get(&format!("/Patient?{param}=anything"))
                 .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
@@ -2187,6 +2188,283 @@ mod fulltext_search {
         assert!(
             status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
             "Should return OK or 400"
+        );
+    }
+}
+
+mod list_search {
+    use super::*;
+
+    /// Creates a `List` resource whose entries reference the given patient ids.
+    async fn create_patient_list(backend: &SqliteBackend, id: &str, patient_ids: &[&str]) {
+        let entries: Vec<Value> = patient_ids
+            .iter()
+            .map(|pid| json!({ "item": { "reference": format!("Patient/{pid}") } }))
+            .collect();
+        backend
+            .create(
+                &test_tenant(),
+                "List",
+                json!({
+                    "resourceType": "List",
+                    "id": id,
+                    "status": "current",
+                    "mode": "working",
+                    "entry": entries,
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create List {id}: {e}"));
+    }
+
+    #[tokio::test]
+    async fn test_list_filters_to_members() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        create_patient_list(&backend, "list-1", &["patient-1", "patient-3"]).await;
+
+        let response = server
+            .get("/Patient?_list=list-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let mut ids: Vec<String> = get_bundle_entries(&body)
+            .iter()
+            .map(|e| e["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["patient-1", "patient-3"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_combined_with_other_criteria() {
+        // `_list` membership AND-s with ordinary search criteria.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        create_patient_list(&backend, "list-1", &["patient-1", "patient-2", "patient-3"]).await;
+
+        let response = server
+            .get("/Patient?_list=list-1&gender=male")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        // Only list members that are also male.
+        for entry in get_bundle_entries(&body) {
+            assert_eq!(entry["resource"]["gender"], "male");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_missing_yields_empty() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_list=does-not-exist")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(get_bundle_entries(&body).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_functional_list_rejected() {
+        // The `$current-*` functional lists are not implemented; reject (501)
+        // rather than silently returning an unfiltered result.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_list=$current-problems")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
+    }
+}
+
+mod score_param {
+    use super::*;
+
+    const PREFER: HeaderName = HeaderName::from_static("prefer");
+
+    #[tokio::test]
+    async fn test_score_input_accepted_and_ignored() {
+        // `_score` is an output concept, not a filter. It must not be rejected
+        // (it used to 400) and must not filter results — it is simply ignored
+        // as an input.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_score=5")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(
+            !get_bundle_entries(&body).is_empty(),
+            "`_score` input is ignored, so all patients are returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sort_by_score_accepted() {
+        // `_sort=_score` is accepted under both lenient and strict handling. On a
+        // non-full-text backend (SQLite) it falls back to default ordering.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let lenient = server
+            .get("/Patient?_sort=_score")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+
+        let strict = server
+            .get("/Patient?_sort=_score")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(PREFER, HeaderValue::from_static("handling=strict"))
+            .await;
+        strict.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn test_no_score_without_relevance_backend() {
+        // SQLite does not compute relevance, so match entries carry no
+        // `search.score` field.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_id=patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["search"]["mode"], "match");
+        assert!(entries[0]["search"].get("score").is_none());
+    }
+}
+
+mod contained_search {
+    use super::*;
+
+    /// Seeds an Observation containing a Patient named "Smith".
+    async fn seed_contained(backend: &SqliteBackend) {
+        backend
+            .create(
+                &test_tenant(),
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-c",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
+                    "subject": { "reference": "#pc" },
+                    "contained": [{
+                        "resourceType": "Patient",
+                        "id": "pc",
+                        "name": [{ "family": "Smith" }]
+                    }]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_contained_true_returns_container() {
+        let (server, backend) = create_test_server().await;
+        seed_contained(&backend).await;
+
+        let response = server
+            .get("/Patient?_contained=true&name=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resource"]["resourceType"], "Observation");
+        assert_eq!(entries[0]["resource"]["id"], "obs-c");
+    }
+
+    #[tokio::test]
+    async fn test_contained_type_contained_returns_contained_resource() {
+        let (server, backend) = create_test_server().await;
+        seed_contained(&backend).await;
+
+        let response = server
+            .get("/Patient?_contained=true&_containedType=contained&name=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resource"]["resourceType"], "Patient");
+        assert_eq!(entries[0]["resource"]["id"], "pc");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_contained_value_rejected() {
+        let (server, backend) = create_test_server().await;
+        seed_contained(&backend).await;
+
+        let response = server
+            .get("/Patient?_contained=maybe")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_advertises_new_search_controls() {
+        // SQLite supports contained search, so `_contained`/`_containedType` are
+        // advertised alongside the always-supported `_list`.
+        let (server, _backend) = create_test_server().await;
+
+        let response = server
+            .get("/metadata")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+
+        let patient = body["rest"][0]["resource"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["type"] == "Patient")
+            .expect("Patient resource in CapabilityStatement");
+        let names: Vec<&str> = patient["searchParam"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+
+        assert!(names.contains(&"_list"), "advertises _list");
+        assert!(names.contains(&"_contained"), "advertises _contained");
+        assert!(
+            names.contains(&"_containedType"),
+            "advertises _containedType"
         );
     }
 }

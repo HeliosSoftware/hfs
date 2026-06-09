@@ -45,6 +45,16 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                 "fhir_version": { "type": "keyword" },
                 "is_deleted": { "type": "boolean" },
 
+                // `_contained` search: a doc extracted from a container's
+                // `contained[]` entry is flagged `is_contained` and carries the
+                // container's identity plus the contained resource's local id.
+                // Its `resource_type`/`search_params` describe the contained
+                // resource (so it lands in that type's index and matches normally).
+                "is_contained": { "type": "boolean" },
+                "container_type": { "type": "keyword" },
+                "container_id": { "type": "keyword" },
+                "contained_local_id": { "type": "keyword" },
+
                 // Raw FHIR JSON - stored but not indexed
                 "content": { "type": "object", "enabled": false },
 

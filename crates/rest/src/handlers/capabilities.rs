@@ -133,10 +133,14 @@ where
     // Advertise each resource type's real search parameters from the loaded
     // SearchParameter registry (not just the seven common params). The read
     // guard is held only across this synchronous build (no await).
+    // `_contained` / `_containedType` are only advertised when the backend can
+    // evaluate contained search (others reject them with 501).
+    let supports_contained = state.storage().supports_contained_search();
+
     let registry = state.storage().search_param_registry().read();
     let resources: Vec<serde_json::Value> = resource_types
         .iter()
-        .map(|rt| build_resource_capability(rt, &registry))
+        .map(|rt| build_resource_capability(rt, &registry, supports_contained))
         .collect();
 
     #[allow(unused_mut)]
@@ -206,6 +210,7 @@ where
 fn build_resource_capability(
     resource_type: &str,
     registry: &SearchParameterRegistry,
+    supports_contained: bool,
 ) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "type": resource_type,
@@ -230,7 +235,7 @@ fn build_resource_capability(
         "conditionalDelete": "single",
         "searchInclude": ["*"],
         "searchRevInclude": ["*"],
-        "searchParam": build_search_params(resource_type, registry)
+        "searchParam": build_search_params(resource_type, registry, supports_contained)
     });
     // Bulk Data Access IG: per-resource `$export` operation entries on Patient
     // and Group, in addition to the system-level `$export` advertised at
@@ -260,8 +265,9 @@ fn build_resource_capability(
 fn build_search_params(
     resource_type: &str,
     registry: &SearchParameterRegistry,
+    supports_contained: bool,
 ) -> Vec<serde_json::Value> {
-    let mut params = build_common_search_params();
+    let mut params = build_common_search_params(supports_contained);
     let mut seen: std::collections::HashSet<String> = params
         .iter()
         .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
@@ -301,8 +307,12 @@ fn fhir_search_param_type(t: SearchParamType) -> &'static str {
 }
 
 /// Builds common search parameters supported by all resources.
-fn build_common_search_params() -> Vec<serde_json::Value> {
-    vec![
+///
+/// `_contained` / `_containedType` are only included when `supports_contained`
+/// is set (the backend can evaluate contained search). `_list` is always
+/// advertised (resolved application-side on every backend).
+fn build_common_search_params(supports_contained: bool) -> Vec<serde_json::Value> {
+    let mut params = vec![
         serde_json::json!({
             "name": "_id",
             "type": "token",
@@ -338,5 +348,55 @@ fn build_common_search_params() -> Vec<serde_json::Value> {
             "type": "special",
             "documentation": "Search on the entire content of the resource"
         }),
-    ]
+        serde_json::json!({
+            "name": "_list",
+            "type": "special",
+            "documentation": "Resources referenced by the given List resource"
+        }),
+    ];
+
+    if supports_contained {
+        params.push(serde_json::json!({
+            "name": "_contained",
+            "type": "token",
+            "documentation": "Whether to search contained resources (false|true|both)"
+        }));
+        params.push(serde_json::json!({
+            "name": "_containedType",
+            "type": "token",
+            "documentation": "Return the container or the contained resource (container|contained)"
+        }));
+    }
+
+    params
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn param_names(params: &[serde_json::Value]) -> Vec<String> {
+        params
+            .iter()
+            .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn common_params_always_advertise_list() {
+        let names = param_names(&build_common_search_params(false));
+        assert!(names.contains(&"_list".to_string()));
+        assert!(names.contains(&"_text".to_string()));
+    }
+
+    #[test]
+    fn contained_params_gated_on_capability() {
+        let without = param_names(&build_common_search_params(false));
+        assert!(!without.contains(&"_contained".to_string()));
+        assert!(!without.contains(&"_containedType".to_string()));
+
+        let with = param_names(&build_common_search_params(true));
+        assert!(with.contains(&"_contained".to_string()));
+        assert!(with.contains(&"_containedType".to_string()));
+    }
 }

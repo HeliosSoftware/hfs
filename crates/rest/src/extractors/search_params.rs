@@ -142,6 +142,9 @@ impl SearchParams {
             "_revinclude:iterate",
             "_contained",
             "_containedType",
+            // `_score` is an output/sort concept (Bundle.entry.search.score,
+            // `_sort=_score`), never a result filter — ignore it as an input.
+            "_score",
             "_format",
             "_pretty",
         ];

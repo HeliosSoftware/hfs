@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use elasticsearch::{DeleteParts, GetParts, IndexParts};
+use elasticsearch::{DeleteByQueryParts, DeleteParts, GetParts, IndexParts};
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
@@ -317,6 +317,141 @@ pub(crate) fn build_es_document(
     })
 }
 
+/// Synthetic ES `resource_id` for a contained-resource document: the
+/// container's id plus the contained local id, so it is unique within the
+/// contained type's index and stable across re-indexing.
+pub(crate) fn contained_resource_id(container_id: &str, local_id: &str) -> String {
+    format!("{}#{}", container_id, local_id)
+}
+
+/// Builds an ES document for a contained resource (`_contained` search). The
+/// doc describes the contained resource (its `resource_type`, `content`, and
+/// `search_params`) so it matches normally within that type's index, and is
+/// tagged with the container's identity for result resolution.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_es_contained_document(
+    tenant_id: &str,
+    container_type: &str,
+    container_id: &str,
+    contained_type: &str,
+    local_id: &str,
+    contained_content: &Value,
+    version_id: &str,
+    fhir_version: FhirVersion,
+    extracted_values: &[ExtractedValue],
+) -> Value {
+    let synthetic_id = contained_resource_id(container_id, local_id);
+    let mut doc = build_es_document(
+        tenant_id,
+        contained_type,
+        &synthetic_id,
+        version_id,
+        contained_content,
+        fhir_version,
+        extracted_values,
+    );
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert("is_contained".to_string(), json!(true));
+        obj.insert("container_type".to_string(), json!(container_type));
+        obj.insert("container_id".to_string(), json!(container_id));
+        obj.insert("contained_local_id".to_string(), json!(local_id));
+    }
+    doc
+}
+
+impl ElasticsearchBackend {
+    /// Deletes all contained-resource docs derived from the given container
+    /// (across the tenant's indices), used before re-indexing or on container
+    /// delete so removed contained resources don't linger.
+    pub(crate) async fn delete_contained_docs(
+        &self,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+    ) -> StorageResult<()> {
+        let pattern = format!(
+            "{}_{}_*",
+            self.config().index_prefix,
+            tenant_id.to_lowercase()
+        );
+        let body = json!({
+            "query": { "bool": { "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "term": { "is_contained": true } },
+                { "term": { "container_type": container_type } },
+                { "term": { "container_id": container_id } }
+            ]}}
+        });
+        // Missing indices are fine (nothing to delete).
+        let _ = self
+            .client()
+            .delete_by_query(DeleteByQueryParts::Index(&[&pattern]))
+            .ignore_unavailable(true)
+            .refresh(true)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| internal_error(format!("Failed to delete contained docs: {}", e)))?;
+        Ok(())
+    }
+
+    /// Extracts and indexes a container's `contained[]` resources as separate
+    /// `is_contained` docs in their respective type indices. When `delete_first`
+    /// is set, stale contained docs for this container are removed first
+    /// (needed on update, where contained resources may have changed/been removed).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn index_contained_docs(
+        &self,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+        resource: &Value,
+        fhir_version: FhirVersion,
+        version_id: &str,
+        delete_first: bool,
+    ) -> StorageResult<()> {
+        if delete_first {
+            self.delete_contained_docs(tenant_id, container_type, container_id)
+                .await?;
+        }
+
+        for contained in self.search_extractor().extract_contained(resource) {
+            let doc = build_es_contained_document(
+                tenant_id,
+                container_type,
+                container_id,
+                &contained.contained_type,
+                &contained.local_id,
+                &contained.content,
+                version_id,
+                fhir_version,
+                &contained.values,
+            );
+            schema::ensure_index(self, tenant_id, &contained.contained_type).await?;
+            let index = self.index_name(tenant_id, &contained.contained_type);
+            let doc_id = Self::document_id(
+                &contained.contained_type,
+                &contained_resource_id(container_id, &contained.local_id),
+            );
+            let response = self
+                .client()
+                .index(IndexParts::IndexId(&index, &doc_id))
+                .body(doc)
+                .send()
+                .await
+                .map_err(|e| internal_error(format!("Failed to index contained doc: {}", e)))?;
+            if !response.status_code().is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(internal_error(format!(
+                    "Failed to index contained doc: {}",
+                    body
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl ResourceStorage for ElasticsearchBackend {
     fn backend_name(&self) -> &'static str {
@@ -389,6 +524,25 @@ impl ResourceStorage for ElasticsearchBackend {
                 "Failed to index document (status {}): {}",
                 status, body
             )));
+        }
+
+        // Index any contained resources for `_contained` search. New resource,
+        // so no stale docs to delete first.
+        if resource
+            .get("contained")
+            .and_then(|c| c.as_array())
+            .is_some_and(|a| !a.is_empty())
+        {
+            self.index_contained_docs(
+                tenant_id,
+                resource_type,
+                &id,
+                &resource,
+                fhir_version,
+                version_id,
+                false,
+            )
+            .await?;
         }
 
         let now = Utc::now();
@@ -484,6 +638,19 @@ impl ResourceStorage for ElasticsearchBackend {
                 status, body
             )));
         }
+
+        // Re-sync contained docs (delete stale, then re-index) so updates that
+        // add/remove/change `contained[]` entries are reflected.
+        self.index_contained_docs(
+            tenant_id,
+            resource_type,
+            id,
+            &resource,
+            fhir_version,
+            &version_id,
+            true,
+        )
+        .await?;
 
         let now = Utc::now();
         Ok((
@@ -662,6 +829,10 @@ impl ResourceStorage for ElasticsearchBackend {
                 status, body
             )));
         }
+
+        // Remove any contained-resource docs derived from this container.
+        self.delete_contained_docs(tenant_id, resource_type, id)
+            .await?;
 
         Ok(())
     }

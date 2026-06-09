@@ -84,6 +84,38 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
     Ok(docs)
 }
 
+/// Finds the `contained[]` entry with the given local `id` in a container's
+/// content.
+fn extract_contained_resource(content: &Value, local_id: &str) -> Option<Value> {
+    content
+        .get("contained")?
+        .as_array()?
+        .iter()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(local_id))
+        .cloned()
+}
+
+/// Builds a `StoredResource` for a contained resource, inheriting the
+/// container's version/tenant/timestamps. Used for `_containedType=contained`.
+fn build_contained_stored(
+    container: &StoredResource,
+    contained_type: &str,
+    local_id: &str,
+    content: Value,
+) -> StoredResource {
+    StoredResource::from_storage(
+        contained_type.to_string(),
+        local_id.to_string(),
+        container.version_id().to_string(),
+        container.tenant_id().clone(),
+        content,
+        container.created_at(),
+        container.last_modified(),
+        None,
+        container.fhir_version(),
+    )
+}
+
 fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
     params
         .split('&')
@@ -101,6 +133,14 @@ impl SearchProvider for MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        // `_contained` search uses a dedicated path (separate index rows and
+        // heterogeneous result types); standard search handles `_contained=false`
+        // (contained rows carry the container's resource_type, so the standard
+        // type-scoped filter naturally excludes them).
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+
         self.validate_query_support(query)?;
 
         let db = self.get_database().await?;
@@ -249,6 +289,7 @@ impl SearchProvider for MongoBackend {
             resources: page,
             included,
             total,
+            scores: Default::default(),
         })
     }
 
@@ -285,6 +326,10 @@ impl SearchProvider for MongoBackend {
         &self,
     ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
         self.search_registry()
+    }
+
+    fn supports_contained_search(&self) -> bool {
+        true
     }
 }
 
@@ -386,6 +431,168 @@ impl ConditionalStorage for MongoBackend {
 }
 
 impl MongoBackend {
+    /// Executes a `_contained=true|both` search (see the SQLite backend's
+    /// `search_contained` for shared semantics). Returns containers (default) or
+    /// contained resources (`_containedType=contained`); `both` merges top-level
+    /// matches first. Single window (no keyset cursor).
+    async fn search_contained(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        use crate::types::{ContainedMode, ContainedReturn};
+
+        let db = self.get_database().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let contained_type = query.resource_type.as_str();
+
+        let matches = self
+            .matching_contained(&db, tenant_id, contained_type, query)
+            .await?;
+
+        let mut items: Vec<StoredResource> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        match query.contained_return {
+            ContainedReturn::Container => {
+                for (ctype, cid, _) in &matches {
+                    if !seen.insert(format!("{ctype}/{cid}")) {
+                        continue;
+                    }
+                    if let Some(container) = self.read(tenant, ctype, cid).await? {
+                        items.push(container);
+                    }
+                }
+            }
+            ContainedReturn::Contained => {
+                for (ctype, cid, local) in &matches {
+                    let Some(local_id) = local else { continue };
+                    if !seen.insert(format!("{ctype}/{cid}#{local_id}")) {
+                        continue;
+                    }
+                    if let Some(container) = self.read(tenant, ctype, cid).await? {
+                        if let Some(c) = extract_contained_resource(container.content(), local_id) {
+                            items.push(build_contained_stored(
+                                &container,
+                                contained_type,
+                                local_id,
+                                c,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if query.contained == ContainedMode::Both {
+            let mut top_query = query.clone();
+            top_query.contained = ContainedMode::Off;
+            top_query.contained_return = ContainedReturn::Container;
+            let top = self.search(tenant, &top_query).await?;
+            let mut merged = top.resources.items;
+            let top_urls: HashSet<String> = merged.iter().map(|r| r.url()).collect();
+            for item in items {
+                if !top_urls.contains(&item.url()) {
+                    merged.push(item);
+                }
+            }
+            items = merged;
+        }
+
+        let count = query.count.unwrap_or(100) as usize;
+        let offset = query.offset.unwrap_or(0) as usize;
+        let total = if query.total.is_some() {
+            Some(items.len() as u64)
+        } else {
+            None
+        };
+        let windowed: Vec<StoredResource> = items.into_iter().skip(offset).take(count).collect();
+        let page = Page::new(windowed, PageInfo::end());
+        let mut result = SearchResult::new(page);
+        if let Some(t) = total {
+            result = result.with_total(t);
+        }
+        Ok(result)
+    }
+
+    /// Resolves `_contained` matches via an aggregation over `search_index`,
+    /// grouping contained rows by the contained entity
+    /// `(resource_type, resource_id, contained_local_id)` and requiring every
+    /// searched parameter to be present on that entity. Returns
+    /// `(container_type, container_id, contained_local_id)` tuples.
+    async fn matching_contained(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        contained_type: &str,
+        query: &SearchQuery,
+    ) -> StorageResult<Vec<(String, String, Option<String>)>> {
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
+        let mut branches: Vec<Bson> = Vec::new();
+        let mut distinct_names: Vec<String> = Vec::new();
+        for param in &query.parameters {
+            if param.name.starts_with('_')
+                || matches!(
+                    param.param_type,
+                    SearchParamType::Composite | SearchParamType::Special
+                )
+            {
+                continue;
+            }
+            // Reuse the standard per-param value filter, dropping the tenant /
+            // resource_type scoping (handled by the pipeline's top `$match`).
+            let mut branch = self.build_search_index_filter("", "", param)?;
+            branch.remove("tenant_id");
+            branch.remove("resource_type");
+            branches.push(Bson::Document(branch));
+            if !distinct_names.contains(&param.name) {
+                distinct_names.push(param.name.clone());
+            }
+        }
+        if branches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "is_contained": true,
+                "contained_type": contained_type,
+                "$or": branches,
+            }},
+            doc! { "$group": {
+                "_id": {
+                    "rtype": "$resource_type",
+                    "rid": "$resource_id",
+                    "lid": "$contained_local_id",
+                },
+                "names": { "$addToSet": "$param_name" },
+            }},
+        ];
+        if distinct_names.len() > 1 {
+            pipeline.push(doc! { "$match": { "names": { "$all": distinct_names } } });
+        }
+
+        let cursor = search_index
+            .aggregate(pipeline)
+            .await
+            .map_err(|e| internal_error(format!("Failed to aggregate contained search: {}", e)))?;
+        let docs = collect_documents(cursor).await?;
+
+        let mut out = Vec::new();
+        for doc in docs {
+            if let Ok(id) = doc.get_document("_id") {
+                let rtype = id.get_str("rtype").unwrap_or_default().to_string();
+                let rid = id.get_str("rid").unwrap_or_default().to_string();
+                let lid = id.get_str("lid").ok().map(ToString::to_string);
+                if !rtype.is_empty() && !rid.is_empty() {
+                    out.push((rtype, rid, lid));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn validate_query_support(&self, query: &SearchQuery) -> StorageResult<()> {
         if query.parameters.iter().any(|param| !param.chain.is_empty()) {
             return Err(StorageError::Search(

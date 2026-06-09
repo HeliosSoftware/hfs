@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 10;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -267,6 +267,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             7 => migrate_v7_to_v8(conn)?,
             8 => migrate_v8_to_v9(conn)?,
             9 => migrate_v9_to_v10(conn)?,
+            10 => migrate_v10_to_v11(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1002,6 +1003,36 @@ fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
         [],
     )
     .map_err(|e| migration_err(format!("create folded string index: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 10 to version 11.
+///
+/// Adds columns supporting `_contained` search: index rows extracted from a
+/// container's `contained[]` entries are flagged `is_contained = 1` and carry
+/// the contained resource's type and local id. The row's `resource_type` /
+/// `resource_id` continue to identify the *container* (preserving the FK to
+/// `resources`), while `contained_type` records the nested resource's type.
+fn migrate_v10_to_v11(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore duplicate-column errors.
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN is_contained INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN contained_type TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN contained_local_id TEXT",
+        [],
+    );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_contained
+         ON search_index(tenant_id, contained_type, is_contained, param_name)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create contained index: {e}")))?;
     Ok(())
 }
 

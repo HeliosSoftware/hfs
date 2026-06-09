@@ -979,6 +979,24 @@ impl SearchProvider for CompositeStorage {
             ))
         })
     }
+
+    fn supports_contained_search(&self) -> bool {
+        // Same routing as `search`: defer to the dedicated Search backend when
+        // configured, otherwise the primary provider.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.supports_contained_search();
+            }
+        }
+        self.search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+            .map(|p| p.supports_contained_search())
+            .unwrap_or(false)
+    }
 }
 
 #[async_trait]

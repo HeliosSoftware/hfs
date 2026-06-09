@@ -14,8 +14,8 @@ use chrono::Utc;
 use helios_fhir::FhirVersion;
 
 use crate::core::{
-    ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, RevincludeProvider,
-    SearchProvider, SearchResult, TextSearchProvider,
+    ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
+    RevincludeProvider, SearchProvider, SearchResult, TextSearchProvider,
 };
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -43,6 +43,12 @@ impl SearchProvider for PostgresBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        // `_contained` search uses a dedicated path (different index columns and
+        // heterogeneous result types); standard search handles `_contained=false`.
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+
         // Populate Bundle.total only when the client asked for it
         // (`_total=accurate|estimate`). Computed up-front so the count query's
         // client is not held across the main query's await points.
@@ -271,6 +277,7 @@ impl SearchProvider for PostgresBackend {
             resources: page,
             included: Vec::new(),
             total,
+            scores: Default::default(),
         })
     }
 
@@ -342,6 +349,10 @@ impl SearchProvider for PostgresBackend {
         &self,
     ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
         self.search_registry()
+    }
+
+    fn supports_contained_search(&self) -> bool {
+        true
     }
 }
 
@@ -429,6 +440,7 @@ impl MultiTypeSearchProvider for PostgresBackend {
             resources: Page::new(resources, page_info),
             included: Vec::new(),
             total: None,
+            scores: Default::default(),
         })
     }
 }
@@ -769,6 +781,7 @@ impl TextSearchProvider for PostgresBackend {
             resources: Page::new(resources, page_info),
             included: Vec::new(),
             total: None,
+            scores: Default::default(),
         })
     }
 
@@ -843,7 +856,173 @@ impl TextSearchProvider for PostgresBackend {
             resources: Page::new(resources, page_info),
             included: Vec::new(),
             total: None,
+            scores: Default::default(),
         })
+    }
+}
+
+/// Finds the `contained[]` entry with the given local `id` in a container's
+/// content.
+fn extract_contained_resource(
+    content: &serde_json::Value,
+    local_id: &str,
+) -> Option<serde_json::Value> {
+    content
+        .get("contained")?
+        .as_array()?
+        .iter()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(local_id))
+        .cloned()
+}
+
+/// Builds a `StoredResource` for a contained resource, inheriting the
+/// container's version/tenant/timestamps. Used for `_containedType=contained`.
+fn build_contained_stored(
+    container: &StoredResource,
+    contained_type: &str,
+    local_id: &str,
+    content: serde_json::Value,
+) -> StoredResource {
+    StoredResource::from_storage(
+        contained_type.to_string(),
+        local_id.to_string(),
+        container.version_id().to_string(),
+        container.tenant_id().clone(),
+        content,
+        container.created_at(),
+        container.last_modified(),
+        None,
+        container.fhir_version(),
+    )
+}
+
+// Contained (`_contained`) search.
+impl PostgresBackend {
+    /// Executes a `_contained=true|both` search. See the SQLite backend's
+    /// `search_contained` for the shared semantics: matches contained resources
+    /// of `query.resource_type` via the `is_contained` index rows, returns the
+    /// containers (default) or the contained resources (`_containedType=contained`),
+    /// and for `both` merges top-level matches first. Paginated by
+    /// `_offset`/`_count` as a single window (no keyset cursor).
+    async fn search_contained(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        use crate::types::{ContainedMode, ContainedReturn};
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let contained_type = query.resource_type.as_str();
+
+        // 1. Resolve contained matches → (container_type, container_id, local_id).
+        let matches: Vec<(String, String, Option<String>)> =
+            match PostgresQueryBuilder::build_contained(query) {
+                Some(fragment) => {
+                    let client = self.get_client().await?;
+                    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+                        Box::new(tenant_id.to_string()),
+                        Box::new(contained_type.to_string()),
+                    ];
+                    for param in &fragment.params {
+                        match param {
+                            SqlParam::Text(s) => params.push(Box::new(s.clone())),
+                            SqlParam::Float(f) => params.push(Box::new(*f)),
+                            SqlParam::Integer(i) => params.push(Box::new(*i)),
+                            SqlParam::Bool(b) => params.push(Box::new(*b)),
+                            SqlParam::Timestamp(dt) => params.push(Box::new(*dt)),
+                            SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+                        }
+                    }
+                    let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                        .iter()
+                        .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                        .collect();
+                    let rows = client
+                        .query(&fragment.sql, &param_refs)
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed to execute contained query: {e}"))
+                        })?;
+                    rows.iter()
+                        .map(|row| {
+                            (
+                                row.get::<_, String>(0),
+                                row.get::<_, String>(1),
+                                row.get::<_, Option<String>>(2),
+                            )
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+
+        // 2. Materialize result items (container or contained), de-duplicated.
+        let mut items: Vec<StoredResource> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        match query.contained_return {
+            ContainedReturn::Container => {
+                for (ctype, cid, _) in &matches {
+                    if !seen.insert(format!("{ctype}/{cid}")) {
+                        continue;
+                    }
+                    if let Some(container) = self.read(tenant, ctype, cid).await? {
+                        items.push(container);
+                    }
+                }
+            }
+            ContainedReturn::Contained => {
+                for (ctype, cid, local) in &matches {
+                    let Some(local_id) = local else { continue };
+                    if !seen.insert(format!("{ctype}/{cid}#{local_id}")) {
+                        continue;
+                    }
+                    if let Some(container) = self.read(tenant, ctype, cid).await? {
+                        if let Some(c) = extract_contained_resource(container.content(), local_id) {
+                            items.push(build_contained_stored(
+                                &container,
+                                contained_type,
+                                local_id,
+                                c,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. For `both`, merge top-level matches ahead of contained ones.
+        if query.contained == ContainedMode::Both {
+            let mut top_query = query.clone();
+            top_query.contained = ContainedMode::Off;
+            top_query.contained_return = ContainedReturn::Container;
+            let top = self.search(tenant, &top_query).await?;
+            let mut merged = top.resources.items;
+            let top_urls: HashSet<String> = merged.iter().map(|r| r.url()).collect();
+            for item in items {
+                if !top_urls.contains(&item.url()) {
+                    merged.push(item);
+                }
+            }
+            items = merged;
+        }
+
+        // 4. Apply the offset/count window.
+        let count = query.count.unwrap_or(100) as usize;
+        let offset = query.offset.unwrap_or(0) as usize;
+        let total_matches = items.len() as u64;
+        let windowed: Vec<StoredResource> = items.into_iter().skip(offset).take(count).collect();
+
+        let total = if query.wants_total() {
+            Some(total_matches)
+        } else {
+            None
+        };
+        let page = Page::new(windowed, PageInfo::end());
+        let mut result = SearchResult::new(page);
+        if let Some(t) = total {
+            result = result.with_total(t);
+        }
+        Ok(result)
     }
 }
 
