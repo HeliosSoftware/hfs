@@ -164,18 +164,6 @@ impl SearchProvider for ElasticsearchBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
-        // Compartment membership (OR across reference params) is not yet wired
-        // into the ES query DSL. Fail loud rather than silently ignoring the
-        // membership filter and returning every resource of the target type.
-        if query.compartment.is_some() {
-            return Err(crate::error::StorageError::Backend(
-                crate::error::BackendError::UnsupportedCapability {
-                    backend_name: "elasticsearch".to_string(),
-                    capability: "compartment search".to_string(),
-                },
-            ));
-        }
-
         // `_contained` search post-processes contained-doc hits into containers or
         // contained resources; standard search excludes contained docs via the
         // query builder's `must_not is_contained`.

@@ -5,8 +5,8 @@
 use serde_json::{Value, json};
 
 use crate::types::{
-    PageCursor, SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
-    SortDirection, SortDirective,
+    CompartmentMembership, PageCursor, SearchModifier, SearchParamType, SearchParameter,
+    SearchPrefix, SearchQuery, SortDirection, SortDirective, strip_reference_version,
 };
 
 use super::fts;
@@ -83,6 +83,16 @@ impl<'a> EsQueryBuilder<'a> {
             }
         }
 
+        // Compartment membership: a resource joins the compartment if it
+        // references `comp.reference` via ANY of the membership params (OR),
+        // per the FHIR CompartmentDefinition. Modeled as a single nested query
+        // over the stored reference search params.
+        if let Some(comp) = &query.compartment {
+            if let Some(clause) = Self::build_compartment_clause(comp) {
+                must_clauses.push(clause);
+            }
+        }
+
         // Build the bool query
         let mut bool_query = json!({
             "filter": filter_clauses,
@@ -132,6 +142,45 @@ impl<'a> EsQueryBuilder<'a> {
             body,
             index: self.index.clone(),
         }
+    }
+
+    /// Builds a nested clause matching resources that reference
+    /// `comp.reference` through ANY of the compartment membership params
+    /// (logical OR), which is how a resource joins a FHIR compartment.
+    ///
+    /// Reference matching is version-agnostic and mirrors the reference
+    /// parameter handler: the stored reference must equal the base reference or
+    /// carry a `/_history/<vid>` suffix. The membership params come from the
+    /// bundled FHIR `CompartmentDefinition`s. Returns `None` if there are no
+    /// membership params or no reference.
+    fn build_compartment_clause(comp: &CompartmentMembership) -> Option<Value> {
+        if comp.params.is_empty() || comp.reference.is_empty() {
+            return None;
+        }
+
+        let base = strip_reference_version(&comp.reference);
+
+        Some(json!({
+            "nested": {
+                "path": "search_params.reference",
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "terms": { "search_params.reference.name": comp.params } },
+                            {
+                                "bool": {
+                                    "should": [
+                                        { "term": { "search_params.reference.reference": base } },
+                                        { "prefix": { "search_params.reference.reference": format!("{base}/_history/") } }
+                                    ],
+                                    "minimum_should_match": 1
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }))
     }
 
     /// Builds a clause for a single search parameter.

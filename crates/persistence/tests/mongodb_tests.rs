@@ -1438,6 +1438,100 @@ async fn mongodb_integration_search_quantity() {
 }
 
 #[tokio::test]
+async fn mongodb_integration_compartment_search() {
+    // Compartment membership: a resource joins the Patient compartment if it
+    // references the patient via ANY of the membership params (`subject` OR
+    // `performer`). Resources for another patient must be excluded.
+    use helios_persistence::types::CompartmentMembership;
+
+    let Some(backend) = create_backend_with_full_registry("compartment_search").await else {
+        eprintln!("Skipping mongodb_integration_compartment_search (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let tenant = create_tenant("tenant-compartment");
+
+    // In the compartment via `subject`.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-subject",
+                "status": "final",
+                "code": {"text": "hr"},
+                "subject": {"reference": "Patient/p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // In the compartment via the NON-first param `performer` only.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-performer",
+                "status": "final",
+                "code": {"text": "hr"},
+                "subject": {"reference": "Patient/p2"},
+                "performer": [{"reference": "Patient/p1"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // Not in the compartment (references another patient).
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-other",
+                "status": "final",
+                "code": {"text": "hr"},
+                "subject": {"reference": "Patient/p2"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut query = SearchQuery::new("Observation");
+    query.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string(), "performer".to_string()],
+        reference: "Patient/p1".to_string(),
+    });
+
+    let result = backend.search(&tenant, &query).await.unwrap();
+    let ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+
+    assert!(
+        ids.contains(&"obs-subject".to_string()),
+        "compartment must include the resource linked via `subject`"
+    );
+    assert!(
+        ids.contains(&"obs-performer".to_string()),
+        "compartment must include the resource linked via `performer`"
+    );
+    assert!(
+        !ids.contains(&"obs-other".to_string()),
+        "compartment must exclude resources of another patient"
+    );
+}
+
+#[tokio::test]
 async fn mongodb_integration_search_token_string_and_offset_pagination() {
     let Some(backend) = create_backend("search_token_string").await else {
         eprintln!(

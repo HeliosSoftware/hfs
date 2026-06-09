@@ -577,6 +577,10 @@ cargo run --bin hts -- import ./hl7.terminology.r4-6.0.0.tgz
 cargo run --bin hts -- import ./SnomedCT_InternationalRF2_*.zip --format snomed-rf2
 
 # LOINC CSV ZIP  ⚠️  requires free Regenstrief registration at loinc.org
+# Language translations under AccessoryFiles/LinguisticVariants/ (e.g.
+# frFR28LinguisticVariant.csv) are imported automatically as FHIR
+# concept.designation entries tagged with the BCP-47 language (fr-FR, de-DE, …).
+# No extra flag needed — works for both `hts import` and server bootstrap.
 cargo run --bin hts -- import ./Loinc_*.zip --format loinc
 
 # ICD-10-CM tabular XML (free, no license needed — from cms.gov)

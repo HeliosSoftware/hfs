@@ -1395,6 +1395,44 @@ mod compartment_search {
         // Should return 400 Bad Request
         response.assert_status(StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn test_patient_compartment_all_types() {
+        // `GET /Patient/{id}/*` returns every resource in the compartment,
+        // regardless of type. patient-1 has 2 Observations in the seed data,
+        // all of which must appear; nothing referencing another patient should.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient/patient-1/*")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "Bundle");
+        assert_eq!(body["type"], "searchset");
+
+        let entries = get_bundle_entries(&body);
+        // At least the 2 Observations for patient-1 should be present.
+        let observations = entries
+            .iter()
+            .filter(|e| e["resource"]["resourceType"] == "Observation")
+            .count();
+        assert_eq!(observations, 2, "expected both patient-1 observations");
+
+        // Every returned resource must actually belong to patient-1 (never
+        // patient-2). We can't assert a single reference field across types, so
+        // confirm patient-2 is not referenced anywhere in the matched set.
+        for entry in &entries {
+            let serialized = entry["resource"].to_string();
+            assert!(
+                !serialized.contains("patient-2"),
+                "compartment all-types must not include resources of another patient"
+            );
+        }
+    }
 }
 
 // =============================================================================
