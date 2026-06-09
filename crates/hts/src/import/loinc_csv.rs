@@ -437,9 +437,10 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
 
 /// Parse `LinguisticVariants.csv` into `variant_id → (iso_language, iso_country)`.
 ///
-/// Columns: `LinguisticVariantId, IsoLanguage, IsoCountry, LanguageName`. A
-/// missing or malformed index is non-fatal — callers fall back to deriving the
-/// language tag from the per-variant filename.
+/// Columns: `ID, ISO_LANGUAGE, ISO_COUNTRY, LANGUAGE_NAME` (the documented
+/// `LinguisticVariantId`/`IsoLanguage`/`IsoCountry` spellings are also
+/// accepted). A missing or malformed index is non-fatal — callers fall back to
+/// deriving the language tag from the per-variant filename.
 fn parse_linguistic_index(
     reader: impl std::io::Read,
     errors: &mut Vec<String>,
@@ -454,13 +455,17 @@ fn parse_linguistic_index(
         }
     };
 
-    let id_idx = find_col(&headers, "LinguisticVariantId").ok();
-    let lang_idx = find_col(&headers, "IsoLanguage").ok();
-    let country_idx = find_col(&headers, "IsoCountry").ok();
+    // Real LOINC releases name these columns `ID`, `ISO_LANGUAGE`,
+    // `ISO_COUNTRY`; accept the documented `LinguisticVariantId`/`IsoLanguage`/
+    // `IsoCountry` spellings too so either form parses.
+    let find_any = |names: &[&str]| names.iter().find_map(|n| find_col(&headers, n).ok());
+    let id_idx = find_any(&["ID", "LinguisticVariantId"]);
+    let lang_idx = find_any(&["ISO_LANGUAGE", "IsoLanguage"]);
+    let country_idx = find_any(&["ISO_COUNTRY", "IsoCountry"]);
 
     let (Some(id_idx), Some(lang_idx)) = (id_idx, lang_idx) else {
         errors.push(
-            "LinguisticVariants.csv missing LinguisticVariantId/IsoLanguage columns — \
+            "LinguisticVariants.csv missing ID/ISO_LANGUAGE columns — \
              language tags will be derived from filenames"
                 .into(),
         );
@@ -534,9 +539,26 @@ fn format_lang_tag(lang: &str, country: &str) -> String {
     }
 }
 
+/// LOINC axis columns, in fully-specified-name order. Used to synthesize a
+/// translated display when a linguistic-variant file leaves the combined-name
+/// columns empty (e.g. the es-ES and it-IT translations only populate the
+/// individual axes).
+const LOINC_AXIS_COLUMNS: [&str; 6] = [
+    "COMPONENT",
+    "PROPERTY",
+    "TIME_ASPCT",
+    "SYSTEM",
+    "SCALE_TYP",
+    "METHOD_TYP",
+];
+
 /// Parse one `*LinguisticVariant.csv` into `(loinc_code, translated_display)`
-/// rows. The translated display prefers `LONG_COMMON_NAME`, falling back to
-/// `SHORTNAME`. Rows without a code or any translated text are skipped.
+/// rows. The translated display prefers `LONG_COMMON_NAME`, then `SHORTNAME`,
+/// then `LinguisticVariantDisplayName`. When none of those combined-name
+/// columns carry text (as in the es-ES and it-IT variants, which translate only
+/// the individual axes), the display is synthesized as a LOINC fully-specified
+/// name — the populated `COMPONENT:PROPERTY:TIME_ASPCT:SYSTEM:SCALE_TYP:METHOD_TYP`
+/// axes joined with `:`. Rows without a code or any translated text are skipped.
 fn parse_linguistic_variant(
     reader: impl std::io::Read,
     filename: &str,
@@ -552,10 +574,16 @@ fn parse_linguistic_variant(
     let code_idx = find_col(&headers, "LOINC_NUM")?;
     let long_idx = find_col(&headers, "LONG_COMMON_NAME").ok();
     let short_idx = find_col(&headers, "SHORTNAME").ok();
+    let display_idx = find_col(&headers, "LinguisticVariantDisplayName").ok();
+    let axis_idxs: Vec<usize> = LOINC_AXIS_COLUMNS
+        .iter()
+        .filter_map(|c| find_col(&headers, c).ok())
+        .collect();
 
-    if long_idx.is_none() && short_idx.is_none() {
+    if long_idx.is_none() && short_idx.is_none() && display_idx.is_none() && axis_idxs.is_empty() {
         errors.push(format!(
-            "{filename}: no LONG_COMMON_NAME/SHORTNAME column — no translations imported"
+            "{filename}: no LONG_COMMON_NAME/SHORTNAME/LinguisticVariantDisplayName or axis \
+             columns — no translations imported"
         ));
         return Ok(Vec::new());
     }
@@ -569,21 +597,37 @@ fn parse_linguistic_variant(
         if code.is_empty() {
             continue;
         }
-        let value = long_idx
-            .and_then(|i| record.get(i))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                short_idx
-                    .and_then(|i| record.get(i))
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-            })
-            .unwrap_or("");
-        if value.is_empty() {
+        let pick = |idx: Option<usize>| {
+            idx.and_then(|i| record.get(i))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        let value: String = match pick(long_idx)
+            .or_else(|| pick(short_idx))
+            .or_else(|| pick(display_idx))
+        {
+            Some(v) => v.to_string(),
+            // No combined name — synthesize the LOINC fully-specified name from
+            // the translated axis columns (e.g. es-ES, it-IT). Trailing empty
+            // axes are dropped so a partly-populated row doesn't render dangling
+            // `:` separators; interior gaps are kept to preserve axis position.
+            None => {
+                let mut axes: Vec<&str> = axis_idxs
+                    .iter()
+                    .map(|&i| record.get(i).unwrap_or("").trim())
+                    .collect();
+                while axes.last().is_some_and(|s| s.is_empty()) {
+                    axes.pop();
+                }
+                axes.join(":")
+            }
+        };
+        // A synthesized FSN of only empty axes collapses to ":::::" — treat
+        // anything without an alphanumeric character as no translation.
+        if !value.chars().any(|c| c.is_alphanumeric()) {
             continue;
         }
-        rows.push((code, value.to_string()));
+        rows.push((code, value));
     }
     Ok(rows)
 }
@@ -767,10 +811,20 @@ LP7786-3.LP10156-0.718-7,3,LP10156-0,718-7,Hemoglobin\r\n";
 
     // Linguistic-variant fixtures. The index maps numeric ids → language/country;
     // the per-variant files carry translated LONG_COMMON_NAME values.
+    // Uses the real LOINC release column names (`ID`, `ISO_LANGUAGE`, …); the
+    // documented `LinguisticVariantId`/`IsoLanguage` spellings are accepted too.
     const LV_INDEX_CSV: &str = "\
-LinguisticVariantId,IsoLanguage,IsoCountry,LanguageName\r\n\
-28,fr,FR,French (France)\r\n\
-8,de,DE,German (Germany)\r\n";
+ID,ISO_LANGUAGE,ISO_COUNTRY,LANGUAGE_NAME,PRODUCER\r\n\
+28,fr,FR,French (France),Some Producer\r\n\
+8,de,DE,German (Germany),Some Producer\r\n";
+
+    // es-ES / it-IT style: only the individual axes are translated; the
+    // combined-name columns (LONG_COMMON_NAME/SHORTNAME/LinguisticVariantDisplayName)
+    // are empty. The display must be synthesized from the axes.
+    const LV_ES_AXES_CSV: &str = "\
+LOINC_NUM,COMPONENT,PROPERTY,TIME_ASPCT,SYSTEM,SCALE_TYP,METHOD_TYP,CLASS,SHORTNAME,LONG_COMMON_NAME,RELATEDNAMES2,LinguisticVariantDisplayName\r\n\
+2160-0,Creatinina,MCnc,Punto temporal,Suero o Plasma,Cuant,,,,,,\r\n\
+718-7,Hemoglobina,MCnc,Punto temporal,Sangre,Cuant,,,,,,\r\n";
 
     const LV_FR_CSV: &str = "\
 LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
@@ -1077,6 +1131,38 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             rows[0].1,
             "Créatinine [Masse/volume] dans le sérum ou le plasma"
         );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_linguistic_variant_synthesizes_display_from_axes() {
+        // es-ES / it-IT only populate the axis columns; the display must be the
+        // fully-specified name built from the populated axes (regression: these
+        // variants used to import zero designations).
+        let mut errors = Vec::new();
+        let rows = parse_linguistic_variant(
+            LV_ES_AXES_CSV.as_bytes(),
+            "esES12LinguisticVariant.csv",
+            &mut errors,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "2160-0");
+        // Trailing empty axis (METHOD_TYP) is dropped — no dangling separator.
+        assert_eq!(
+            rows[0].1,
+            "Creatinina:MCnc:Punto temporal:Suero o Plasma:Cuant"
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_linguistic_index_accepts_real_loinc_columns() {
+        // Real LOINC releases use ID/ISO_LANGUAGE/ISO_COUNTRY rather than the
+        // documented camelCase spellings — both must parse without error.
+        let mut errors = Vec::new();
+        let index = parse_linguistic_index(LV_INDEX_CSV.as_bytes(), &mut errors);
+        assert_eq!(index["28"], ("fr".to_string(), "FR".to_string()));
         assert!(errors.is_empty());
     }
 
