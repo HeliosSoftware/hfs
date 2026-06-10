@@ -389,7 +389,7 @@ where
                     tenant.context(),
                     &resource_type,
                     resource,
-                    FhirVersion::default(),
+                    FhirVersion::default_enabled(),
                 )
                 .await
             {
@@ -414,7 +414,7 @@ where
                     &resource_type,
                     &id,
                     resource,
-                    FhirVersion::default(),
+                    FhirVersion::default_enabled(),
                 )
                 .await
             {

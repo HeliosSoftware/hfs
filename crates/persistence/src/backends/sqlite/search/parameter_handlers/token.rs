@@ -43,18 +43,23 @@ impl TokenHandler {
             );
         }
 
+        // Handle :code-text modifier - case-insensitive starts-with match on the
+        // display text (Coding.display, CodeableConcept.text). Distinct from
+        // :text, which is a substring/contains match.
+        if matches!(modifier, Some(SearchModifier::CodeText)) {
+            return SqlFragment::with_params(
+                format!(
+                    "value_token_display COLLATE NOCASE LIKE ?{} || '%'",
+                    param_num
+                ),
+                vec![SqlParam::string(value.value.to_lowercase())],
+            );
+        }
+
         // Handle :text-advanced modifier - FTS5-based advanced text search
         // Supports boolean operators (AND, OR, NOT), phrase matching, prefix search, and NEAR
         if matches!(modifier, Some(SearchModifier::TextAdvanced)) {
             return Self::build_text_advanced_sql(&value.value, param_offset);
-        }
-
-        // Handle :code-only modifier
-        if matches!(modifier, Some(SearchModifier::CodeOnly)) {
-            return SqlFragment::with_params(
-                format!("value_token_code = ?{}", param_num),
-                vec![SqlParam::string(&value.value)],
-            );
         }
 
         // Handle :of-type modifier (for identifier searches)
@@ -266,6 +271,21 @@ mod tests {
         let frag = TokenHandler::build_sql(&value, Some(&SearchModifier::Not), 0);
 
         assert!(frag.sql.starts_with("NOT ("));
+    }
+
+    #[test]
+    fn test_code_text_starts_with_display() {
+        // :code-text is a case-insensitive starts-with match on the display.
+        let value = SearchValue::new(SearchPrefix::Eq, "Heart");
+        let frag = TokenHandler::build_sql(&value, Some(&SearchModifier::CodeText), 0);
+
+        assert!(
+            frag.sql
+                .contains("value_token_display COLLATE NOCASE LIKE ?1 || '%'")
+        );
+        // No leading '%': starts-with, not contains.
+        assert!(!frag.sql.contains("'%' || ?1"));
+        assert_eq!(frag.params.len(), 1);
     }
 
     #[test]

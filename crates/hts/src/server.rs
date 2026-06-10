@@ -6,9 +6,15 @@
 //!
 //! ## Middleware stack (outermost → innermost)
 //!
-//! 1. **CORS** — configurable allowed origins; enabled by default with `*`.
-//! 2. **Tracing** — emits `tracing` spans for every request/response pair.
-//! 3. **Timeout** — hard 30-second request deadline (non-configurable).
+//! 1. **Tracing** — emits `tracing` spans for every request/response pair.
+//! 2. **Timeout** — hard 30-second request deadline (non-configurable).
+//! 3. **CORS** — configurable allowed origins; enabled by default with `*`.
+//! 4. **Response compression** — gzip/deflate/br/zstd when the client sends
+//!    `Accept-Encoding` (adds `Content-Encoding` + `Vary: Accept-Encoding`).
+//! 5. **Request decompression** — bodies sent with `Content-Encoding` are
+//!    decompressed before parsing; unsupported encodings get `415`.
+//! 6. **Body-size limit** — `HTS_MAX_BODY_SIZE` (default 10 MiB), measured on
+//!    the decompressed body.
 //!
 //! ## Route registration order
 //!
@@ -19,12 +25,16 @@
 
 use crate::operations::batch::batch_handler;
 use crate::operations::batch_validate::vs_batch_validate_handler;
+use axum::extract::DefaultBodyLimit;
 use axum::{
     Router,
     routing::{get, post},
 };
 use std::time::Duration;
-use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{
+    compression::CompressionLayer, cors::CorsLayer, decompression::RequestDecompressionLayer,
+    timeout::TimeoutLayer, trace::TraceLayer,
+};
 
 use crate::config::HtsConfig;
 use crate::import::BundleImportBackend;
@@ -167,6 +177,17 @@ where
                 .delete(delete_concept_map::<B>),
         )
         .with_state(state)
+        // Raise the body-size limit from axum's 2 MiB default to the
+        // configured ceiling. The decompression layer below replaces the
+        // request body before extractors read it, so this limit applies to
+        // the *decompressed* bytes — a small highly-compressed payload
+        // cannot bypass `HTS_MAX_BODY_SIZE`.
+        .layer(DefaultBodyLimit::max(config.max_body_size))
+        // Decompress request bodies sent with `Content-Encoding` (gzip,
+        // deflate, br, zstd); unsupported encodings get 415. Compress
+        // responses when the client sends `Accept-Encoding`.
+        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new())
         .layer(cors)
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
@@ -183,12 +204,30 @@ fn build_cors(config: &HtsConfig) -> CorsLayer {
     if config.cors_origins.trim() == "*" {
         CorsLayer::permissive()
     } else {
+        use axum::http::{Method, header};
+
         let origins: Vec<axum::http::HeaderValue> = config
             .cors_origins
             .split(',')
             .filter_map(|s| s.trim().parse().ok())
             .collect();
 
-        CorsLayer::new().allow_origin(origins)
+        // With explicit origins the browser enforces the allow-lists below;
+        // include `Content-Encoding` so clients can send compressed bodies.
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::ACCEPT,
+                header::AUTHORIZATION,
+                header::CONTENT_ENCODING,
+            ])
     }
 }

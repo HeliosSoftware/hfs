@@ -6,12 +6,50 @@ use std::collections::HashMap;
 
 use helios_persistence::search::{SearchParameterRegistry, resolve_param_type};
 use helios_persistence::types::{
-    IncludeDirective, IncludeType, ReverseChainedParameter, SearchModifier, SearchParamType,
-    SearchParameter, SearchQuery, SearchValue, SortDirective, SummaryMode, TotalMode,
+    CompositeSearchComponent, ContainedMode, ContainedReturn, IncludeDirective, IncludeType,
+    ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+    SearchValue, SortDirective, SummaryMode, TotalMode,
 };
 
 use super::SearchParams;
 use crate::error::RestError;
+
+/// Splits a FHIR search value into its comma-separated OR-alternatives,
+/// respecting backslash escaping.
+///
+/// Per the FHIR spec, the characters `, | $ \` are escaped with a leading
+/// backslash inside a value. Only the comma is the OR-list separator at this
+/// layer, so we split on *unescaped* commas and unescape `\,` and `\\` here.
+/// Other escapes (`\|`, `\$`) are left intact for the backend's token/composite
+/// parsing to interpret.
+fn split_unescaped_commas(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.peek() {
+                Some(',') => {
+                    cur.push(',');
+                    chars.next();
+                }
+                Some('\\') => {
+                    cur.push('\\');
+                    chars.next();
+                }
+                // Preserve other escapes (e.g. `\|`, `\$`) for downstream parsing.
+                _ => cur.push('\\'),
+            },
+            ',' => {
+                out.push(cur.trim().to_string());
+                cur = String::new();
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur.trim().to_string());
+    out
+}
 
 /// Builds a SearchQuery from REST parameters.
 ///
@@ -52,7 +90,17 @@ pub fn build_search_query(
             } else {
                 SortDirective::parse(&format!("-{}", sort.field))
             };
-            query.sort.push(directive);
+            // Resolve the search-parameter type so backends can sort by the
+            // indexed value column. `_id`/`_lastUpdated` are columns on the
+            // resources table and need no type.
+            let param_type = if directive.parameter.starts_with('_') {
+                None
+            } else {
+                registry
+                    .get_param(resource_type, &directive.parameter)
+                    .map(|d| d.param_type)
+            };
+            query.sort.push(directive.with_param_type(param_type));
         }
     }
 
@@ -71,6 +119,37 @@ pub fn build_search_query(
         query.elements = elements.to_vec();
     }
 
+    // Process _contained / _containedType
+    if let Some(v) = params.get("_contained") {
+        query.contained = match v.as_str() {
+            "false" | "" => ContainedMode::Off,
+            "true" => ContainedMode::On,
+            "both" => ContainedMode::Both,
+            other => {
+                return Err(RestError::InvalidParameter {
+                    param: "_contained".to_string(),
+                    message: format!(
+                        "invalid _contained value '{other}' (expected 'true', 'false', or 'both')"
+                    ),
+                });
+            }
+        };
+    }
+    if let Some(v) = params.get("_containedType") {
+        query.contained_return = match v.as_str() {
+            "container" | "" => ContainedReturn::Container,
+            "contained" => ContainedReturn::Contained,
+            other => {
+                return Err(RestError::InvalidParameter {
+                    param: "_containedType".to_string(),
+                    message: format!(
+                        "invalid _containedType value '{other}' (expected 'container' or 'contained')"
+                    ),
+                });
+            }
+        };
+    }
+
     // Process _include directives
     for include in params.include() {
         if let Some(directive) = parse_include_directive(include, IncludeType::Include) {
@@ -85,11 +164,16 @@ pub fn build_search_query(
         }
     }
 
-    // Store raw parameters for debugging
-    query.raw_params = params
-        .iter()
-        .map(|(k, v)| (k.clone(), vec![v.clone()]))
-        .collect();
+    // Expand wildcard includes (_include=Type:*) into one directive per
+    // reference search parameter of the source type.
+    expand_wildcard_includes(&mut query.includes, registry);
+
+    // Store raw parameters for debugging, grouping repeated keys.
+    let mut raw_params: HashMap<String, Vec<String>> = HashMap::new();
+    for (k, v) in params.iter() {
+        raw_params.entry(k.clone()).or_default().push(v.clone());
+    }
+    query.raw_params = raw_params;
 
     // Process search parameters (non-system params)
     for (name, value) in params.search_params() {
@@ -97,6 +181,17 @@ pub fn build_search_query(
         if name == "_has" || name.starts_with("_has:") {
             if let Some(reverse_chain) = parse_has_parameter(name, value)? {
                 query.reverse_chains.push(reverse_chain);
+            }
+            continue;
+        }
+
+        // Handle _list: restrict results to members of the referenced List
+        // resource(s). Resolved application-side into an `_id` filter. A value
+        // may be a bare logical id (`42`) or a `List/42` reference; both are
+        // accepted and normalized to the logical id by the resolver.
+        if name == "_list" {
+            if !value.is_empty() {
+                query.list.push(value.to_string());
             }
             continue;
         }
@@ -121,6 +216,59 @@ pub fn build_search_query_from_map(
     build_search_query(resource_type, &search_params, registry)
 }
 
+/// Returns the names of search parameters that are not recognized for the given
+/// resource type (used to enforce `Prefer: handling=strict`).
+///
+/// A parameter is "unknown" when its base name (after stripping any modifier and
+/// chain) is not registered for `resource_type` or for `Resource`, and is not a
+/// global parameter (those start with `_`, e.g. `_id`, `_text`, `_has`). Under
+/// lenient handling the server ignores such parameters; under strict handling
+/// the caller turns this list into a `400`.
+pub fn unknown_search_params(
+    resource_type: &str,
+    params: &SearchParams,
+    registry: &SearchParameterRegistry,
+) -> Vec<String> {
+    let mut unknown = Vec::new();
+    for (name, _) in params.search_params() {
+        // Reverse chaining is validated when parsed; skip here.
+        if name == "_has" || name.starts_with("_has:") {
+            continue;
+        }
+        // Strip modifier (`name:exact`, `subject:Patient`) then chain (`a.b`).
+        let base = name
+            .split(':')
+            .next()
+            .unwrap_or(name)
+            .split('.')
+            .next()
+            .unwrap_or(name);
+        // Global/result parameters (`_id`, `_text`, `_type`, …) are always allowed.
+        if base.starts_with('_') {
+            continue;
+        }
+        let known = registry.get_param(resource_type, base).is_some()
+            || registry.get_param("Resource", base).is_some();
+        if !known {
+            unknown.push(name.clone());
+        }
+    }
+    unknown
+}
+
+/// Builds a SearchQuery from ordered key/value pairs.
+///
+/// Unlike [`build_search_query_from_map`], this preserves repeated parameters
+/// (FHIR AND semantics) and multiple `_include`/`_revinclude`/`_has` directives.
+pub fn build_search_query_from_pairs(
+    resource_type: &str,
+    pairs: &[(String, String)],
+    registry: &SearchParameterRegistry,
+) -> Result<SearchQuery, RestError> {
+    let search_params = SearchParams::from_pairs(pairs.to_vec());
+    build_search_query(resource_type, &search_params, registry)
+}
+
 /// Parses a single search parameter with potential modifiers.
 fn parse_search_parameter(
     resource_type: &str,
@@ -138,7 +286,10 @@ fn parse_search_parameter(
     // date/number/quantity types per FHIR. For tokens/strings/references/uris,
     // the raw value is the value — e.g. status code "appended" must not be
     // misread as Ap-prefix + "pended".
-    let raw_values: Vec<&str> = value.split(',').map(str::trim).collect();
+    // Split the OR-list on UNescaped commas and unescape `\,` / `\\`, per FHIR
+    // value escaping. A literal comma in a value is written `\,` and must not
+    // start a new OR-alternative.
+    let raw_values: Vec<String> = split_unescaped_commas(value);
     let tentative_values: Vec<SearchValue> =
         raw_values.iter().map(|v| SearchValue::parse(v)).collect();
 
@@ -148,13 +299,39 @@ fn parse_search_parameter(
     // custom params. See `helios_persistence::search::resolve_param_type`.
     let param_type = resolve_param_type(registry, resource_type, base_name, &tentative_values);
 
+    // FHIR-spec modifier validation: reject a modifier that is not defined for
+    // this parameter's type (e.g. `:exact` on a token, `:contains` on a date)
+    // with a 400, rather than silently ignoring it. Scoped to registry-known,
+    // non-special params:
+    //   * unregistered custom params get a value-shape heuristic type, so
+    //     gating them could falsely reject a legitimate custom modifier;
+    //   * the `special` full-text params (`_text`, `_content`, …) carry
+    //     server-specific modifier semantics outside the typed modifier table.
+    // `is_valid_for` reflects what this server honors; combinations that are
+    // spec-valid but not yet implemented are enabled as their phase lands.
+    if let Some(m) = &modifier {
+        let registered = registry.get_param(resource_type, base_name).is_some()
+            || registry.get_param("Resource", base_name).is_some();
+        if registered && param_type != SearchParamType::Special && !m.is_valid_for(param_type) {
+            return Err(RestError::InvalidParameter {
+                param: name.to_string(),
+                message: format!(
+                    "search modifier ':{m}' is not supported for {param_type} parameter '{base_name}'"
+                ),
+            });
+        }
+    }
+
     let values: Vec<SearchValue> = if matches!(
         param_type,
         SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity
     ) {
         tentative_values
     } else {
-        raw_values.iter().map(|v| SearchValue::eq(*v)).collect()
+        raw_values
+            .iter()
+            .map(|v| SearchValue::eq(v.clone()))
+            .collect()
     };
 
     let mut param = SearchParameter {
@@ -165,6 +342,27 @@ fn parse_search_parameter(
         chain,
         components: vec![],
     };
+
+    // For composite parameters, resolve the component sub-parameters from the
+    // registry (type + code), so the backend can match each component within
+    // the same composite instance.
+    if matches!(param_type, SearchParamType::Composite) {
+        if let Some(def) = registry.get_param(resource_type, base_name) {
+            if let Some(comps) = def.component.as_ref() {
+                param.components = comps
+                    .iter()
+                    .filter_map(|c| {
+                        registry
+                            .get_by_url(&c.definition)
+                            .map(|sub| CompositeSearchComponent {
+                                param_type: sub.param_type,
+                                param_name: sub.code.clone(),
+                            })
+                    })
+                    .collect();
+            }
+        }
+    }
 
     // Handle :missing modifier specially
     if param
@@ -341,14 +539,13 @@ fn parse_has_parameter(
         SearchValue::eq(value)
     };
 
-    // Check for nested _has
-    if search_param == "_has" || search_param.starts_with("_has:") {
-        // Nested reverse chain - this is complex and requires recursion
-        // For now, return a basic structure; the backend can handle it
-        let nested = parse_has_parameter(
-            &format!("_has:{}", &chain_str[parts[0].len() + parts[1].len() + 2..]),
-            value,
-        )?;
+    // Check for nested _has, e.g.
+    // `_has:Observation:subject:_has:Provenance:target:agent`.
+    // Everything after `source_type:reference_param:` is itself a `_has:...`
+    // expression, which we parse recursively.
+    if search_param == "_has" {
+        let inner = &chain_str[parts[0].len() + parts[1].len() + 2..];
+        let nested = parse_has_parameter(inner, value)?;
         if let Some(nested_chain) = nested {
             return Ok(Some(ReverseChainedParameter::nested(
                 source_type,
@@ -405,6 +602,35 @@ fn parse_include_directive(directive: &str, include_type: IncludeType) -> Option
         target_type,
         iterate,
     })
+}
+
+/// Expands wildcard include directives (`_include=Type:*`) into a concrete
+/// directive for each reference-typed search parameter of the source type,
+/// preserving the original `iterate` / `target_type` flags. Non-wildcard
+/// directives pass through unchanged.
+fn expand_wildcard_includes(
+    includes: &mut Vec<IncludeDirective>,
+    registry: &SearchParameterRegistry,
+) {
+    if !includes.iter().any(|d| d.search_param == "*") {
+        return;
+    }
+    let mut expanded = Vec::with_capacity(includes.len());
+    for directive in includes.drain(..) {
+        if directive.search_param == "*" {
+            for def in registry.get_active_params(&directive.source_type) {
+                if def.param_type == SearchParamType::Reference {
+                    expanded.push(IncludeDirective {
+                        search_param: def.code.clone(),
+                        ..directive.clone()
+                    });
+                }
+            }
+        } else {
+            expanded.push(directive);
+        }
+    }
+    *includes = expanded;
 }
 
 /// Parses _total parameter value.
@@ -495,6 +721,22 @@ mod tests {
     }
 
     #[test]
+    fn test_split_unescaped_commas() {
+        // Plain OR-list splits on commas.
+        assert_eq!(split_unescaped_commas("a,b,c"), vec!["a", "b", "c"]);
+        // An escaped comma stays part of one value and is unescaped.
+        assert_eq!(
+            split_unescaped_commas("Smith\\, John,Doe"),
+            vec!["Smith, John", "Doe"]
+        );
+        // Escaped backslash is unescaped; other escapes (\|) are preserved.
+        assert_eq!(split_unescaped_commas("a\\\\b"), vec!["a\\b"]);
+        assert_eq!(split_unescaped_commas("sys\\|code"), vec!["sys\\|code"]);
+        // Surrounding whitespace is trimmed.
+        assert_eq!(split_unescaped_commas(" a , b "), vec!["a", "b"]);
+    }
+
+    #[test]
     fn test_parse_parameter_name_with_modifier() {
         let (name, modifier) = parse_parameter_name("name:exact");
         assert_eq!(name, "name");
@@ -577,6 +819,34 @@ mod tests {
         assert_eq!(chain.source_type, "Observation");
         assert_eq!(chain.reference_param, "patient");
         assert_eq!(chain.search_param, "code");
+    }
+
+    #[test]
+    fn test_parse_nested_has_parameter() {
+        // _has:Observation:subject:_has:Provenance:target:agent=prac-1
+        let result = parse_has_parameter(
+            "_has:Observation:subject:_has:Provenance:target:agent",
+            "prac-1",
+        )
+        .unwrap()
+        .expect("nested chain parsed");
+
+        // Outer level.
+        assert_eq!(result.source_type, "Observation");
+        assert_eq!(result.reference_param, "subject");
+        assert!(result.value.is_none(), "outer level carries no value");
+        assert_eq!(result.depth(), 2);
+
+        // Inner (terminal) level.
+        let inner = result.nested.expect("inner chain present");
+        assert_eq!(inner.source_type, "Provenance");
+        assert_eq!(inner.reference_param, "target");
+        assert_eq!(inner.search_param, "agent");
+        assert_eq!(
+            inner.value.as_ref().map(|v| v.value.as_str()),
+            Some("prac-1")
+        );
+        assert!(inner.is_terminal());
     }
 
     #[test]
@@ -691,6 +961,81 @@ mod tests {
         assert_eq!(query.includes.len(), 1);
         assert_eq!(query.includes[0].source_type, "Observation");
         assert_eq!(query.includes[0].search_param, "patient");
+    }
+
+    #[test]
+    fn test_repeated_search_params_are_anded() {
+        // `?name=Smith&name=Jones` -> two ANDed parameters, both preserved.
+        let pairs = vec![
+            ("name".to_string(), "Smith".to_string()),
+            ("name".to_string(), "Jones".to_string()),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Patient", &sp, &test_registry()).unwrap();
+
+        let name_values: Vec<&str> = query
+            .parameters
+            .iter()
+            .filter(|p| p.name == "name")
+            .flat_map(|p| p.values.iter().map(|v| v.value.as_str()))
+            .collect();
+        assert_eq!(query.parameters.len(), 2, "both name params preserved");
+        assert!(name_values.contains(&"Smith"));
+        assert!(name_values.contains(&"Jones"));
+    }
+
+    #[test]
+    fn test_repeated_include_directives_preserved() {
+        // `?_include=A&_include=B` -> two include directives (was last-wins before).
+        let pairs = vec![
+            ("_include".to_string(), "Observation:subject".to_string()),
+            ("_include".to_string(), "Observation:encounter".to_string()),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Observation", &sp, &test_registry()).unwrap();
+
+        assert_eq!(query.includes.len(), 2);
+        let params: Vec<&str> = query
+            .includes
+            .iter()
+            .map(|d| d.search_param.as_str())
+            .collect();
+        assert!(params.contains(&"subject"));
+        assert!(params.contains(&"encounter"));
+    }
+
+    #[test]
+    fn test_repeated_has_chains_preserved() {
+        // Repeated `_has` -> multiple reverse chains, all preserved.
+        let pairs = vec![
+            (
+                "_has:Observation:patient:code".to_string(),
+                "1234-5".to_string(),
+            ),
+            (
+                "_has:Observation:patient:status".to_string(),
+                "final".to_string(),
+            ),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Patient", &sp, &test_registry()).unwrap();
+
+        assert_eq!(query.reverse_chains.len(), 2);
+    }
+
+    #[test]
+    fn test_mixed_comma_and_repeat_include() {
+        // Comma and repeat combine: `?_include=A,B&_include=C` -> three directives.
+        let pairs = vec![
+            (
+                "_include".to_string(),
+                "Observation:subject,Observation:encounter".to_string(),
+            ),
+            ("_include".to_string(), "Observation:patient".to_string()),
+        ];
+        let sp = SearchParams::from_pairs(pairs);
+        let query = build_search_query("Observation", &sp, &test_registry()).unwrap();
+        assert_eq!(query.includes.len(), 3);
     }
 
     #[test]

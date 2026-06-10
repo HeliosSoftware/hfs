@@ -18,6 +18,26 @@ pub fn validate_unit(unit: &str) -> bool {
     validate(unit).is_ok()
 }
 
+/// Canonicalizes a quantity to its UCUM canonical unit.
+///
+/// Returns `(canonical_value, canonical_unit)`, or `None` if the unit is
+/// unknown or cannot be converted. Used by the search index to store a
+/// unit-normalized quantity so that, e.g., `1 g` and `1000 mg` compare equal.
+pub fn canonicalize_quantity(value: f64, unit: &str) -> Option<(f64, String)> {
+    if unit.is_empty() {
+        return None;
+    }
+    // `get_canonical_units` reduces the unit to its dimension-based base form and
+    // gives the conversion factor/offset, so commensurable units (g, mg, kg)
+    // share the same canonical `unit` string and comparable canonical values.
+    let canonical = octofhir_ucum::get_canonical_units(unit).ok()?;
+    if canonical.unit.is_empty() {
+        return None;
+    }
+    let canonical_value = value * canonical.factor + canonical.offset;
+    Some((canonical_value, canonical.unit))
+}
+
 /// Converts a value from one UCUM unit to another
 pub fn convert_units(value: Decimal, from_unit: &str, to_unit: &str) -> Result<Decimal, String> {
     // Normalize calendar units to UCUM format

@@ -233,7 +233,12 @@ impl S3Backend {
                     .to_string();
 
                 let created = self
-                    .create(tenant, &resource_type, resource, FhirVersion::default())
+                    .create(
+                        tenant,
+                        &resource_type,
+                        resource,
+                        FhirVersion::default_enabled(),
+                    )
                     .await?;
 
                 Ok((
@@ -278,7 +283,7 @@ impl S3Backend {
                             &resource_type,
                             &id,
                             resource,
-                            FhirVersion::default(),
+                            FhirVersion::default_enabled(),
                         )
                         .await?;
 

@@ -64,13 +64,23 @@
 //! - `SOF_SERVER_PORT` / `--port`: Server port (default: 8080)
 //! - `SOF_SERVER_HOST` / `--host`: Server host (default: 127.0.0.1)
 //! - `SOF_LOG_LEVEL` / `--log-level`: Log level (default: info)
-//! - `SOF_MAX_BODY_SIZE` / `--max-body-size`: Max request size in bytes (default: 10MB)
+//! - `SOF_MAX_BODY_SIZE` / `--max-body-size`: Max request size in bytes (default: 10MB).
+//!   Applies to the decompressed body for compressed requests.
 //! - `SOF_REQUEST_TIMEOUT` / `--request-timeout`: Request timeout in seconds (default: 30)
 //! - `SOF_ENABLE_CORS` / `--enable-cors`: Enable CORS (default: true)
 //! - `SOF_CORS_ORIGINS` / `--cors-origins`: Allowed origins, comma-separated (default: *)
 //! - `SOF_CORS_METHODS` / `--cors-methods`: Allowed methods, comma-separated (default: *)
 //! - `SOF_CORS_HEADERS` / `--cors-headers`: Allowed headers, comma-separated (default: *)
 //! - `SOF_TERMINOLOGY_SERVER` / `--terminology-server`: Terminology server URL for FHIRPath functions
+//!
+//! ## HTTP Compression
+//!
+//! Request bodies sent with `Content-Encoding: gzip` (or `deflate`, `br`,
+//! `zstd`) are decompressed transparently before parsing; unsupported
+//! encodings are rejected with `415 Unsupported Media Type`. Responses are
+//! compressed when the client advertises support via `Accept-Encoding` —
+//! except `application/parquet` and `application/zip` outputs, which are
+//! already compressed and are returned as-is.
 //!
 //! ## CORS Configuration Examples
 //!
@@ -146,7 +156,7 @@ impl Default for ServerConfig {
             enable_cors: true,
             cors_origins: "*".to_string(),
             cors_methods: "GET,POST,PUT,DELETE,OPTIONS".to_string(),
-            cors_headers: "Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With".to_string(),
+            cors_headers: "Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With,Content-Encoding".to_string(),
             terminology_server: None,
         }
     }
@@ -269,7 +279,7 @@ fn parse_args() -> ServerConfig {
         #[arg(
             long,
             env = "SOF_CORS_HEADERS",
-            default_value = "Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With"
+            default_value = "Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With,Content-Encoding"
         )]
         cors_headers: String,
 
@@ -306,7 +316,17 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
     use axum::extract::DefaultBodyLimit;
     use std::time::Duration;
     use tower::ServiceBuilder;
+    use tower_http::compression::CompressionLayer;
+    use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
+    use tower_http::decompression::RequestDecompressionLayer;
     use tower_http::timeout::TimeoutLayer;
+
+    // Compress responses on `Accept-Encoding`, but never re-compress Parquet
+    // or ZIP output — both are already compressed, so HTTP-level compression
+    // would only burn CPU for no size win.
+    let compress_predicate = SizeAbove::new(32)
+        .and(NotForContentType::const_new("application/parquet"))
+        .and(NotForContentType::const_new("application/zip"));
 
     let mut app = Router::new()
         // FHIR endpoints
@@ -317,8 +337,15 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
         )
         // Health check endpoint
         .route("/health", get(handlers::health_check))
-        // Add body size limit
+        // Add body size limit. The decompression layer below replaces the
+        // request body before extractors read it, so this limit applies to
+        // the *decompressed* bytes — a small highly-compressed payload
+        // cannot bypass SOF_MAX_BODY_SIZE.
         .layer(DefaultBodyLimit::max(config.max_body_size))
+        // Decompress request bodies sent with `Content-Encoding` (gzip,
+        // deflate, br, zstd); unsupported encodings get 415.
+        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new().compress_when(compress_predicate))
         // Add request timeout
         .layer(
             ServiceBuilder::new()
@@ -453,5 +480,235 @@ mod tests {
         let json: serde_json::Value = response.json();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["service"], "sof-server");
+    }
+
+    // ── HTTP compression ──────────────────────────────────────────────────
+
+    /// A minimal valid `$viewdefinition-run` Parameters body.
+    fn run_request_body() -> serde_json::Value {
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {
+                    "name": "viewResource",
+                    "resource": {
+                        "resourceType": "ViewDefinition",
+                        "status": "active",
+                        "resource": "Patient",
+                        "select": [{
+                            "column": [
+                                {"name": "id", "path": "id"},
+                                {"name": "gender", "path": "gender"}
+                            ]
+                        }]
+                    }
+                },
+                {
+                    "name": "resource",
+                    "resource": {
+                        "resourceType": "Patient",
+                        "id": "example",
+                        "gender": "male"
+                    }
+                }
+            ]
+        })
+    }
+
+    fn gzip_bytes(input: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(input).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn gunzip_bytes(input: &[u8]) -> Vec<u8> {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let mut decoder = GzDecoder::new(input);
+        let mut output = Vec::new();
+        decoder.read_to_end(&mut output).unwrap();
+        output
+    }
+
+    #[tokio::test]
+    async fn test_gzip_request_body_is_decompressed() {
+        let server = TestServer::new(create_app()).unwrap();
+        let body = serde_json::to_vec(&run_request_body()).unwrap();
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("content-encoding", "gzip")
+            .add_header("accept", "application/json")
+            .content_type("application/json")
+            .bytes(gzip_bytes(&body).into())
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let json: serde_json::Value = response.json();
+        assert_eq!(json[0]["id"], "example");
+    }
+
+    #[tokio::test]
+    async fn test_deflate_request_body_is_decompressed() {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+
+        let server = TestServer::new(create_app()).unwrap();
+        let body = serde_json::to_vec(&run_request_body()).unwrap();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&body).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("content-encoding", "deflate")
+            .add_header("accept", "application/json")
+            .content_type("application/json")
+            .bytes(compressed.into())
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_uncompressed_request_still_works() {
+        let server = TestServer::new(create_app()).unwrap();
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("accept", "application/json")
+            .json(&run_request_body())
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_gzip_request_body_is_client_error() {
+        let server = TestServer::new(create_app()).unwrap();
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("content-encoding", "gzip")
+            .content_type("application/json")
+            .bytes(b"this is not gzip".to_vec().into())
+            .await;
+
+        assert!(
+            response.status_code().is_client_error(),
+            "invalid gzip body must produce a 4xx, got {}",
+            response.status_code()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_content_encoding_is_rejected() {
+        let server = TestServer::new(create_app()).unwrap();
+        let body = serde_json::to_vec(&run_request_body()).unwrap();
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("content-encoding", "compress")
+            .content_type("application/json")
+            .bytes(body.into())
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_response_is_gzip_compressed_on_accept_encoding() {
+        let server = TestServer::new(create_app()).unwrap();
+
+        let response = server
+            .get("/metadata")
+            .add_header("accept-encoding", "gzip")
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+        let vary = response
+            .headers()
+            .get_all("vary")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(vary.contains("accept-encoding"), "Vary was: {vary}");
+
+        let decompressed = gunzip_bytes(response.as_bytes());
+        let json: serde_json::Value = serde_json::from_slice(&decompressed).unwrap();
+        assert_eq!(json["resourceType"], "CapabilityStatement");
+    }
+
+    #[tokio::test]
+    async fn test_response_is_not_compressed_without_accept_encoding() {
+        let server = TestServer::new(create_app()).unwrap();
+
+        let response = server.get("/metadata").await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert!(response.headers().get("content-encoding").is_none());
+        let json: serde_json::Value = response.json();
+        assert_eq!(json["resourceType"], "CapabilityStatement");
+    }
+
+    #[tokio::test]
+    async fn test_parquet_response_is_not_http_compressed() {
+        let server = TestServer::new(create_app()).unwrap();
+        let mut body = run_request_body();
+        body["parameter"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"name": "_format", "valueCode": "application/parquet"}),
+        );
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("accept-encoding", "gzip")
+            .json(&body)
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/parquet"
+        );
+        // Parquet is already compressed — the gzip layer must skip it.
+        assert!(response.headers().get("content-encoding").is_none());
+        assert!(response.as_bytes().starts_with(b"PAR1"));
+    }
+
+    #[tokio::test]
+    async fn test_body_limit_applies_to_decompressed_size() {
+        let config = ServerConfig {
+            max_body_size: 1024,
+            ..Default::default()
+        };
+        let server = TestServer::new(create_app_with_config(&config)).unwrap();
+
+        // ~64 KiB of repeated text compresses to well under the 1 KiB limit,
+        // but the decompressed body must still be rejected with 413.
+        let mut body = run_request_body();
+        body["parameter"][1]["resource"]["name"] =
+            serde_json::json!([{"family": "a".repeat(64 * 1024)}]);
+        let raw = serde_json::to_vec(&body).unwrap();
+        let compressed = gzip_bytes(&raw);
+        assert!(
+            compressed.len() < 1024,
+            "test payload must compress below the limit"
+        );
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("content-encoding", "gzip")
+            .content_type("application/json")
+            .bytes(compressed.into())
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

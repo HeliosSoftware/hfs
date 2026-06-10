@@ -75,7 +75,7 @@ pub struct PostgresConfig {
     pub statement_timeout_ms: u64,
 
     /// FHIR version for this backend instance.
-    #[serde(default)]
+    #[serde(default = "crate::default_fhir_version")]
     pub fhir_version: FhirVersion,
 
     /// Directory containing FHIR SearchParameter spec files.
@@ -144,7 +144,7 @@ impl Default for PostgresConfig {
             max_connections: default_max_connections(),
             connect_timeout_secs: default_connect_timeout_secs(),
             statement_timeout_ms: default_statement_timeout_ms(),
-            fhir_version: FhirVersion::default(),
+            fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
             schema_name: None,
@@ -741,13 +741,26 @@ impl PostgresBackend {
     /// Returns supported modifiers for a parameter type.
     fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
-            SearchParamType::String => vec!["exact", "contains", "missing"],
-            SearchParamType::Token => vec!["not", "text", "in", "not-in", "of-type", "missing"],
-            SearchParamType::Reference => vec!["identifier", "missing"],
+            SearchParamType::String => vec!["exact", "contains", "text", "missing"],
+            // `not-in` is intentionally omitted: it returns 501 (negated
+            // value-set filtering is unimplemented), so it must not be
+            // advertised as supported.
+            SearchParamType::Token => {
+                vec!["not", "text", "code-text", "in", "of-type", "missing"]
+            }
+            SearchParamType::Reference => vec![
+                "identifier",
+                "contains",
+                "text",
+                "code-text",
+                "below",
+                "above",
+                "missing",
+            ],
             SearchParamType::Date => vec!["missing"],
             SearchParamType::Number => vec!["missing"],
             SearchParamType::Quantity => vec!["missing"],
-            SearchParamType::Uri => vec!["below", "above", "missing"],
+            SearchParamType::Uri => vec!["contains", "below", "above", "missing"],
             SearchParamType::Composite => vec!["missing"],
             SearchParamType::Special => vec![],
         }

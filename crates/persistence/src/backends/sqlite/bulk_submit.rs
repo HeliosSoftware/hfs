@@ -880,7 +880,7 @@ impl SqliteBackend {
                             tenant,
                             &entry.resource_type,
                             entry.resource.clone(),
-                            FhirVersion::default(),
+                            FhirVersion::default_enabled(),
                         )
                         .await?;
 
@@ -910,7 +910,7 @@ impl SqliteBackend {
                     tenant,
                     &entry.resource_type,
                     entry.resource.clone(),
-                    FhirVersion::default(),
+                    FhirVersion::default_enabled(),
                 )
                 .await?;
 

@@ -79,6 +79,37 @@ fn is_mongodb_url(url: &str) -> bool {
     url.starts_with("mongodb://") || url.starts_with("mongodb+srv://")
 }
 
+/// Resolves the composite sync mode from `HFS_COMPOSITE_SYNC_MODE`.
+///
+/// Composite stores route writes to a primary backend (e.g. SQLite, Postgres,
+/// MongoDB, S3) and a search backend (Elasticsearch). `Asynchronous` (the
+/// default) acks the write as soon as the primary commits and forwards the
+/// search-index write on a background worker — lowest latency, but a
+/// follow-up search can race the indexing. `Synchronous` blocks the write
+/// until the search backend has indexed it, giving read-your-write
+/// semantics at the cost of extra latency on each write.
+#[cfg(feature = "elasticsearch")]
+fn composite_sync_mode_from_env() -> helios_persistence::composite::SyncMode {
+    use helios_persistence::composite::SyncMode;
+    match std::env::var("HFS_COMPOSITE_SYNC_MODE") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "synchronous" | "sync" => SyncMode::Synchronous,
+            "asynchronous" | "async" => SyncMode::Asynchronous,
+            "hybrid" => SyncMode::Hybrid {
+                sync_for_search: true,
+            },
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "Unknown HFS_COMPOSITE_SYNC_MODE; defaulting to asynchronous"
+                );
+                SyncMode::Asynchronous
+            }
+        },
+        Err(_) => SyncMode::Asynchronous,
+    }
+}
+
 #[cfg(feature = "mongodb")]
 fn build_mongodb_config(config: &ServerConfig, search_offloaded: bool) -> MongoBackendConfig {
     build_mongodb_config_with_env(config, search_offloaded, |name| std::env::var(name).ok())
@@ -1329,6 +1360,7 @@ async fn start_sqlite_elasticsearch(
     let composite_config = CompositeConfig::builder()
         .primary("sqlite", BackendKind::Sqlite)
         .search_backend("es", BackendKind::Elasticsearch)
+        .sync_mode(composite_sync_mode_from_env())
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -1562,6 +1594,7 @@ async fn start_postgres_elasticsearch(
     let composite_config = CompositeConfig::builder()
         .primary("postgres", BackendKind::Postgres)
         .search_backend("es", BackendKind::Elasticsearch)
+        .sync_mode(composite_sync_mode_from_env())
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -1719,6 +1752,7 @@ async fn start_mongodb_elasticsearch(
     let composite_config = CompositeConfig::builder()
         .primary("mongodb", BackendKind::MongoDB)
         .search_backend("es", BackendKind::Elasticsearch)
+        .sync_mode(composite_sync_mode_from_env())
         .build()?;
 
     // Build backends map for CompositeStorage
@@ -2010,6 +2044,7 @@ async fn start_s3_elasticsearch(
     let composite_config = CompositeConfig::builder()
         .primary("s3", BackendKind::S3)
         .search_backend("es", BackendKind::Elasticsearch)
+        .sync_mode(composite_sync_mode_from_env())
         .build()?;
 
     let mut backends = HashMap::new();

@@ -52,7 +52,7 @@ where
 
     // Get all enabled versions
     let enabled_versions = FhirVersion::enabled_versions();
-    let default_version = FhirVersion::default();
+    let default_version = FhirVersion::default_enabled();
 
     // Build version parameters
     let mut parameters: Vec<serde_json::Value> = enabled_versions

@@ -72,7 +72,7 @@ pub struct SqliteBackendConfig {
 
     /// FHIR version for this backend instance.
     /// Used to load the appropriate SearchParameter definitions.
-    #[serde(default)]
+    #[serde(default = "crate::default_fhir_version")]
     pub fhir_version: FhirVersion,
 
     /// Directory containing FHIR SearchParameter spec files.
@@ -115,7 +115,7 @@ impl Default for SqliteBackendConfig {
             busy_timeout_ms: default_busy_timeout_ms(),
             enable_wal: true,
             enable_foreign_keys: true,
-            fhir_version: FhirVersion::default(),
+            fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
         }
@@ -693,13 +693,33 @@ impl SqliteBackend {
     /// Returns supported modifiers for a parameter type.
     fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
-            SearchParamType::String => vec!["exact", "contains", "missing"],
-            SearchParamType::Token => vec!["not", "text", "in", "not-in", "of-type", "missing"],
-            SearchParamType::Reference => vec!["identifier", "missing"],
+            SearchParamType::String => vec!["exact", "contains", "text", "missing"],
+            // `not-in` is intentionally omitted: the SQLite backend returns 501
+            // for it (negated value-set filtering is unimplemented), so it must
+            // not be advertised. `text-advanced` is implemented by the token
+            // handler and was previously under-advertised.
+            SearchParamType::Token => vec![
+                "not",
+                "text",
+                "in",
+                "of-type",
+                "code-text",
+                "text-advanced",
+                "missing",
+            ],
+            SearchParamType::Reference => vec![
+                "identifier",
+                "contains",
+                "text",
+                "code-text",
+                "below",
+                "above",
+                "missing",
+            ],
             SearchParamType::Date => vec!["missing"],
             SearchParamType::Number => vec!["missing"],
             SearchParamType::Quantity => vec!["missing"],
-            SearchParamType::Uri => vec!["below", "above", "missing"],
+            SearchParamType::Uri => vec!["contains", "below", "above", "missing"],
             SearchParamType::Composite => vec!["missing"],
             SearchParamType::Special => vec![],
         }
@@ -807,12 +827,19 @@ mod tests {
         let string_mods = SqliteBackend::modifiers_for_type(SearchParamType::String);
         assert!(string_mods.contains(&"exact"));
         assert!(string_mods.contains(&"contains"));
+        assert!(string_mods.contains(&"text"));
         assert!(string_mods.contains(&"missing"));
 
         // Token modifiers
         let token_mods = SqliteBackend::modifiers_for_type(SearchParamType::Token);
         assert!(token_mods.contains(&"not"));
         assert!(token_mods.contains(&"text"));
+        assert!(token_mods.contains(&"of-type"));
+        // `:code` is a non-spec modifier and must not be advertised.
+        assert!(!token_mods.contains(&"code"));
+        assert!(token_mods.contains(&"text-advanced"));
+        // `not-in` returns 501, so it must not be advertised as supported.
+        assert!(!token_mods.contains(&"not-in"));
 
         // Reference modifiers
         let ref_mods = SqliteBackend::modifiers_for_type(SearchParamType::Reference);

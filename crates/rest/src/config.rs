@@ -10,12 +10,12 @@
 //! | `HFS_SERVER_PORT` | 8080 | Server port |
 //! | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 //! | `HFS_LOG_LEVEL` | info | Log level |
-//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes) |
+//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
 //! | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 //! | `HFS_ENABLE_CORS` | true | Enable CORS |
 //! | `HFS_CORS_ORIGINS` | * | Allowed origins |
 //! | `HFS_CORS_METHODS` | GET,POST,PUT,PATCH,DELETE,OPTIONS | Allowed methods |
-//! | `HFS_CORS_HEADERS` | Content-Type,Authorization,Accept,If-Match,If-None-Match,Prefer | Allowed headers |
+//! | `HFS_CORS_HEADERS` | Content-Type,Authorization,Accept,If-Match,If-None-Match,Prefer,Content-Encoding | Allowed headers |
 //! | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
 //! | `HFS_BASE_URL` | http://localhost:8080 | Server base URL |
 //! | `HFS_DEFAULT_FHIR_VERSION` | R4 | Default FHIR version (R4, R4B, R5, R6) |
@@ -648,6 +648,10 @@ pub struct ServerConfig {
     pub log_level: String,
 
     /// Maximum request body size in bytes.
+    ///
+    /// For requests sent with `Content-Encoding`, the limit applies to the
+    /// *decompressed* body, so a small highly-compressed payload cannot
+    /// bypass it.
     #[arg(long, env = "HFS_MAX_BODY_SIZE", default_value = "10485760")]
     pub max_body_size: usize,
 
@@ -675,7 +679,7 @@ pub struct ServerConfig {
     #[arg(
         long,
         env = "HFS_CORS_HEADERS",
-        default_value = "Content-Type,Authorization,Accept,If-Match,If-None-Match,If-None-Exist,If-Modified-Since,Prefer,X-Tenant-ID"
+        default_value = "Content-Type,Authorization,Accept,If-Match,If-None-Match,If-None-Exist,If-Modified-Since,Prefer,X-Tenant-ID,Content-Encoding"
     )]
     pub cors_headers: String,
 
@@ -801,7 +805,7 @@ impl Default for ServerConfig {
             enable_cors: true,
             cors_origins: "*".to_string(),
             cors_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS".to_string(),
-            cors_headers: "Content-Type,Authorization,Accept,If-Match,If-None-Match,If-None-Exist,If-Modified-Since,Prefer,X-Tenant-ID".to_string(),
+            cors_headers: "Content-Type,Authorization,Accept,If-Match,If-None-Match,If-None-Exist,If-Modified-Since,Prefer,X-Tenant-ID,Content-Encoding".to_string(),
             default_tenant: "default".to_string(),
             base_url: "http://localhost:8080".to_string(),
             database_url: None,
@@ -809,7 +813,7 @@ impl Default for ServerConfig {
             return_gone: true,
             enable_versioning: true,
             require_if_match: false,
-            default_fhir_version: FhirVersion::default(),
+            default_fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             default_page_size: 20,
             max_page_size: 1000,
@@ -914,7 +918,7 @@ impl ServerConfig {
             return_gone: true,
             enable_versioning: true,
             require_if_match: false,
-            default_fhir_version: FhirVersion::default(),
+            default_fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             default_page_size: 10,
             max_page_size: 100,

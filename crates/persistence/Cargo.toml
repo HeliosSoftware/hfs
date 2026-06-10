@@ -11,8 +11,13 @@ description = "Polyglot persistence layer for Helios FHIR Server"
 keywords = ["helios-software", "hl7", "fhir", "helios-fhir-server", "persistence"]
 categories = ["database", "web-programming"]
 
+# `R4` is included in the default set so a bare `cargo build -p helios-persistence`
+# compiles: the crate depends on helios-fhir/helios-fhirpath with
+# `default-features = false`, so without a FHIR version feature the FhirVersion
+# enum has no variants and version-dispatch matches fail to compile. This mirrors
+# the `rest` and `hfs` crates, which also default to `["R4", "sqlite"]`.
 [features]
-default = ["sqlite"]
+default = ["R4", "sqlite"]
 
 # Database backends
 sqlite = ["dep:rusqlite", "dep:r2d2", "dep:r2d2_sqlite"]
@@ -30,10 +35,10 @@ advisor = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber"]
 audit = ["dep:helios-audit"]
 
 # FHIR version features (pass through to helios-fhir and helios-fhirpath)
-R4 = ["helios-fhir/R4", "helios-fhirpath/R4"]
-R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B"]
-R5 = ["helios-fhir/R5", "helios-fhirpath/R5"]
-R6 = ["helios-fhir/R6", "helios-fhirpath/R6"]
+R4 = ["helios-fhir/R4", "helios-fhirpath/R4", "helios-audit?/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B", "helios-audit?/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhirpath/R5", "helios-audit?/R5"]
+R6 = ["helios-fhir/R6", "helios-fhirpath/R6", "helios-audit?/R6"]
 
 [dependencies]
 # Core dependencies (always included)
@@ -55,6 +60,7 @@ parking_lot = "0.12"
 json-patch = "3"
 humantime = "2"
 futures = "0.3"
+unicode-normalization = "0.1"
 
 # SQLite backend
 rusqlite = { version = "0.33", features = ["bundled", "serde_json"], optional = true }
@@ -88,7 +94,7 @@ aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
 
 # Audit event integration
-helios-audit = { path = "../audit", version = "0.1.47", optional = true }
+helios-audit = { path = "../audit", version = "0.1.47", optional = true, default-features = false }
 
 # Configuration advisor HTTP server
 axum = { version = "0.8", optional = true }

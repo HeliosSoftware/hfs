@@ -82,7 +82,7 @@ Options:
 | `HFS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
 | `DATABASE_URL` | fhir.db | Database connection string |
 | `HFS_DATA_DIR` | ./data | Path to FHIR data directory (search parameters) |
-| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes) |
+| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `HFS_ENABLE_CORS` | true | Enable CORS |
 | `HFS_CORS_ORIGINS` | * | Allowed CORS origins |
@@ -90,6 +90,7 @@ Options:
 | `HFS_CORS_HEADERS` | Content-Type,Authorization,X-Requested-With | Allowed headers |
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
 | `HFS_TERMINOLOGY_SERVER` | (none) | Terminology server URL for `:in`/`:not-in` modifiers and FHIRPath `memberOf()`/`subsumes()` |
+| `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | Composite-store write sync mode for ES-backed backends (`sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb-elasticsearch`, `s3-elasticsearch`). One of `asynchronous`, `synchronous`, `hybrid`. With `asynchronous` (default) the write returns as soon as the primary commits and the search backend is updated on a background worker — lowest latency, but a follow-up search can race the indexing. Use `synchronous` when callers need read-your-write semantics (e.g. integration tests, bulk-load flows that immediately search). Ignored when the storage backend has no search secondary. |
 
 ## FHIR Version Support
 

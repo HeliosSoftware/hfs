@@ -71,6 +71,14 @@ pub struct HtsConfig {
     #[arg(long, env = "HTS_CORS_ORIGINS", default_value = "*")]
     pub cors_origins: String,
 
+    /// Maximum request body size in bytes.
+    ///
+    /// For requests sent with `Content-Encoding`, the limit applies to the
+    /// *decompressed* body, so a small highly-compressed payload cannot
+    /// bypass it. Mirrors `HFS_MAX_BODY_SIZE` / `SOF_MAX_BODY_SIZE`.
+    #[arg(long, env = "HTS_MAX_BODY_SIZE", default_value = "10485760")]
+    pub max_body_size: usize,
+
     /// Maximum number of codes allowed in a single ValueSet expansion.
     /// Requests that would exceed this limit receive HTTP 422 with issue
     /// code `too-costly`.
@@ -105,6 +113,7 @@ impl Default for HtsConfig {
             storage_backend: "sqlite".into(),
             enable_cors: true,
             cors_origins: "*".into(),
+            max_body_size: 10 * 1024 * 1024, // 10MB
             max_expansion_size: 10_000,
             bootstrap_dir: String::new(),
         }

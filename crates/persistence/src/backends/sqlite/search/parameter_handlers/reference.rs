@@ -1,6 +1,6 @@
 //! Reference parameter SQL handler.
 
-use crate::types::{SearchModifier, SearchValue};
+use crate::types::{SearchModifier, SearchValue, strip_reference_version};
 
 use super::super::query_builder::{SqlFragment, SqlParam};
 
@@ -31,27 +31,70 @@ impl ReferenceHandler {
             return Self::build_identifier_condition(ref_value, param_num);
         }
 
+        // Handle :contains modifier - case-insensitive substring match on the
+        // stored reference string (e.g. "Patient/123" contains "23").
+        if matches!(modifier, Some(SearchModifier::Contains)) {
+            return SqlFragment::with_params(
+                format!("value_reference LIKE '%' || ?{} || '%'", param_num),
+                vec![SqlParam::string(ref_value)],
+            );
+        }
+
+        // Handle :text (contains) and :code-text (starts-with) on the indexed
+        // Reference.display text.
+        if matches!(modifier, Some(SearchModifier::Text)) {
+            return SqlFragment::with_params(
+                format!(
+                    "value_reference_display COLLATE NOCASE LIKE '%' || ?{} || '%'",
+                    param_num
+                ),
+                vec![SqlParam::string(value.value.to_lowercase())],
+            );
+        }
+        if matches!(modifier, Some(SearchModifier::CodeText)) {
+            return SqlFragment::with_params(
+                format!(
+                    "value_reference_display COLLATE NOCASE LIKE ?{} || '%'",
+                    param_num
+                ),
+                vec![SqlParam::string(value.value.to_lowercase())],
+            );
+        }
+
+        // :below / :above - URL/path-prefix hierarchy on the reference value
+        // (e.g. an absolute/canonical reference URL). Mirrors uri :below/:above
+        // (two placeholders, two bound params). Note: canonical `|version`
+        // comparison is not implemented.
+        if matches!(modifier, Some(SearchModifier::Below)) {
+            return SqlFragment::with_params(
+                format!(
+                    "(value_reference = ?{} OR value_reference LIKE ?{} || '/%')",
+                    param_num,
+                    param_num + 1
+                ),
+                vec![SqlParam::string(ref_value), SqlParam::string(ref_value)],
+            );
+        }
+        if matches!(modifier, Some(SearchModifier::Above)) {
+            return SqlFragment::with_params(
+                format!(
+                    "(?{} = value_reference OR ?{} LIKE value_reference || '/%')",
+                    param_num,
+                    param_num + 1
+                ),
+                vec![SqlParam::string(ref_value), SqlParam::string(ref_value)],
+            );
+        }
+
         // Handle :Type modifier (restrict to specific resource type)
         if let Some(SearchModifier::Type(type_name)) = modifier {
-            // The reference must be to the specified type
-            let expected_prefix = format!("{}/", type_name);
-
-            if ref_value.contains('/') {
-                // Value already has type - just match it
-                SqlFragment::with_params(
-                    format!("value_reference = ?{}", param_num),
-                    vec![SqlParam::string(ref_value)],
-                )
+            // Normalize to a `Type/id` reference, then match version-agnostically.
+            let full = if ref_value.contains('/') {
+                ref_value.to_string()
             } else {
-                // Value is just an ID - prepend the type
-                SqlFragment::with_params(
-                    format!("value_reference = ?{}", param_num),
-                    vec![SqlParam::string(format!(
-                        "{}{}",
-                        expected_prefix, ref_value
-                    ))],
-                )
-            }
+                format!("{}/{}", type_name, ref_value)
+            };
+            Self::build_reference_condition(&full, param_num)
         } else {
             // No modifier - match the reference as given
             Self::build_reference_condition(ref_value, param_num)
@@ -59,24 +102,42 @@ impl ReferenceHandler {
     }
 
     /// Builds a condition for a standard reference value.
+    ///
+    /// Reference matching is **version-agnostic** per the FHIR spec: a versioned
+    /// reference (`Patient/123/_history/2`) is normalized by stripping the
+    /// version, and a stored versioned reference still matches an unversioned
+    /// search (and vice versa).
     fn build_reference_condition(ref_value: &str, param_num: usize) -> SqlFragment {
-        if ref_value.contains('/') {
-            // Type/id or full URL - exact match
-            SqlFragment::with_params(
-                format!("value_reference = ?{}", param_num),
-                vec![SqlParam::string(ref_value)],
-            )
-        } else {
-            // Just an ID - match any reference ending with this ID
-            // This handles cases where the stored reference might be "Patient/123" but
-            // the search is just "123"
+        let base = strip_reference_version(ref_value);
+
+        if base.contains('/') {
+            // Type/id (or absolute URL): match the base reference, or the same
+            // reference carrying any `_history` version.
             SqlFragment::with_params(
                 format!(
-                    "(value_reference = ?{} OR value_reference LIKE '%/' || ?{})",
+                    "(value_reference = ?{} OR value_reference LIKE ?{} || '/_history/%')",
                     param_num,
                     param_num + 1
                 ),
-                vec![SqlParam::string(ref_value), SqlParam::string(ref_value)],
+                vec![SqlParam::string(base), SqlParam::string(base)],
+            )
+        } else {
+            // Just an ID - match any reference ending with this ID, with or
+            // without a trailing `_history` version.
+            SqlFragment::with_params(
+                format!(
+                    "(value_reference = ?{} \
+                      OR value_reference LIKE '%/' || ?{} \
+                      OR value_reference LIKE '%/' || ?{} || '/_history/%')",
+                    param_num,
+                    param_num + 1,
+                    param_num + 2
+                ),
+                vec![
+                    SqlParam::string(base),
+                    SqlParam::string(base),
+                    SqlParam::string(base),
+                ],
             )
         }
     }
@@ -143,8 +204,33 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Eq, "Patient/123");
         let frag = ReferenceHandler::build_sql(&value, None, 0);
 
+        // Version-agnostic: exact match or any `_history` version.
         assert!(frag.sql.contains("value_reference = ?1"));
-        assert_eq!(frag.params.len(), 1);
+        assert!(frag.sql.contains("'/_history/%'"));
+        assert_eq!(frag.params.len(), 2);
+    }
+
+    #[test]
+    fn test_reference_versioned_search_strips_version() {
+        // Searching a versioned reference matches the version-stripped base.
+        let value = SearchValue::new(SearchPrefix::Eq, "Patient/123/_history/2");
+        let frag = ReferenceHandler::build_sql(&value, None, 0);
+        assert_eq!(frag.params.len(), 2);
+        // Both bound params are the stripped base "Patient/123".
+        // (SqlParam compares via its Debug/string form.)
+        let dbg = format!("{:?}", frag.params);
+        assert!(dbg.contains("Patient/123"));
+        assert!(!dbg.contains("_history"));
+    }
+
+    #[test]
+    fn test_strip_reference_version() {
+        assert_eq!(
+            strip_reference_version("Patient/123/_history/2"),
+            "Patient/123"
+        );
+        assert_eq!(strip_reference_version("Patient/123"), "Patient/123");
+        assert_eq!(strip_reference_version("123"), "123");
     }
 
     #[test]
@@ -168,6 +254,51 @@ mod tests {
 
         assert!(frag.sql.contains("value_reference = ?1"));
         // The param should be "Patient/123"
+    }
+
+    #[test]
+    fn test_reference_contains_modifier() {
+        let value = SearchValue::new(SearchPrefix::Eq, "123");
+        let frag = ReferenceHandler::build_sql(&value, Some(&SearchModifier::Contains), 0);
+
+        assert!(frag.sql.contains("value_reference LIKE '%' ||"));
+        assert!(frag.sql.contains("|| '%'"));
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn test_reference_text_modifier() {
+        let value = SearchValue::new(SearchPrefix::Eq, "John");
+        let frag = ReferenceHandler::build_sql(&value, Some(&SearchModifier::Text), 0);
+        assert!(frag.sql.contains("value_reference_display"));
+        assert!(frag.sql.contains("'%' || ?1 || '%'"));
+    }
+
+    #[test]
+    fn test_reference_code_text_modifier() {
+        let value = SearchValue::new(SearchPrefix::Eq, "John");
+        let frag = ReferenceHandler::build_sql(&value, Some(&SearchModifier::CodeText), 0);
+        assert!(frag.sql.contains("value_reference_display"));
+        // starts-with: no leading '%'
+        assert!(frag.sql.contains("LIKE ?1 || '%'"));
+    }
+
+    #[test]
+    fn test_reference_below_modifier() {
+        let value = SearchValue::new(SearchPrefix::Eq, "http://x.org/Questionnaire/q");
+        let frag = ReferenceHandler::build_sql(&value, Some(&SearchModifier::Below), 0);
+        assert!(frag.sql.contains("value_reference = ?1"));
+        assert!(frag.sql.contains("LIKE ?2 || '/%'"));
+        assert_eq!(frag.params.len(), 2);
+    }
+
+    #[test]
+    fn test_reference_above_modifier() {
+        let value = SearchValue::new(SearchPrefix::Eq, "http://x.org/Questionnaire/q");
+        let frag = ReferenceHandler::build_sql(&value, Some(&SearchModifier::Above), 0);
+        assert!(frag.sql.contains("?1 = value_reference"));
+        assert!(frag.sql.contains("?2 LIKE value_reference || '/%'"));
+        assert_eq!(frag.params.len(), 2);
     }
 
     #[test]

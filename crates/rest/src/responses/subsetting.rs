@@ -41,6 +41,43 @@ impl SummaryMode {
 /// Elements that are always included regardless of subsetting.
 const ALWAYS_INCLUDED: &[&str] = &["resourceType", "id", "meta"];
 
+/// CodeSystem for the `SUBSETTED` tag added to incomplete representations.
+const SUBSETTED_SYSTEM: &str = "http://terminology.hl7.org/CodeSystem/v3-ObservationValue";
+
+/// Adds a `SUBSETTED` `meta.tag` to a resource, flagging that the returned
+/// representation is incomplete (per `_summary`/`_elements`), as required by the
+/// FHIR spec. Idempotent; a no-op for non-object JSON values.
+pub fn add_subsetted_tag(resource: &mut Value) {
+    let Value::Object(obj) = resource else {
+        return;
+    };
+    let meta = obj
+        .entry("meta")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(meta_obj) = meta else {
+        return;
+    };
+    let tags = meta_obj
+        .entry("tag")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Value::Array(arr) = tags else {
+        return;
+    };
+    let already_tagged = arr.iter().any(|t| {
+        t.get("system").and_then(|s| s.as_str()) == Some(SUBSETTED_SYSTEM)
+            && t.get("code").and_then(|c| c.as_str()) == Some("SUBSETTED")
+    });
+    if !already_tagged {
+        let mut tag = Map::new();
+        tag.insert(
+            "system".to_string(),
+            Value::String(SUBSETTED_SYSTEM.to_string()),
+        );
+        tag.insert("code".to_string(), Value::String("SUBSETTED".to_string()));
+        arr.push(Value::Object(tag));
+    }
+}
+
 /// Converts a Rust snake_case field name to JSON camelCase.
 ///
 /// The generated FHIR types use snake_case for Rust field names, but the
@@ -439,6 +476,32 @@ mod tests {
             assert!(first.get("family").is_some());
             // given should not be included as we only requested name.family
         }
+    }
+
+    #[test]
+    fn test_add_subsetted_tag_is_idempotent() {
+        let mut resource = json!({ "resourceType": "Patient", "id": "1" });
+        add_subsetted_tag(&mut resource);
+        add_subsetted_tag(&mut resource);
+
+        let tags = resource["meta"]["tag"].as_array().expect("tag array");
+        let subsetted: Vec<_> = tags
+            .iter()
+            .filter(|t| t["code"] == "SUBSETTED" && t["system"] == SUBSETTED_SYSTEM)
+            .collect();
+        assert_eq!(subsetted.len(), 1, "SUBSETTED tag added exactly once");
+    }
+
+    #[test]
+    fn test_add_subsetted_tag_preserves_existing_tags() {
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": "1",
+            "meta": { "tag": [{ "system": "http://example.org", "code": "x" }] }
+        });
+        add_subsetted_tag(&mut resource);
+        let tags = resource["meta"]["tag"].as_array().unwrap();
+        assert_eq!(tags.len(), 2, "existing tag preserved + SUBSETTED added");
     }
 
     #[test]

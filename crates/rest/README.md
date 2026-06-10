@@ -91,7 +91,7 @@ The server is configured via environment variables:
 | `HFS_SERVER_PORT` | 8080 | Server port |
 | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `HFS_LOG_LEVEL` | info | Log level |
-| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes) |
+| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `HFS_ENABLE_CORS` | true | Enable CORS |
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
@@ -99,6 +99,14 @@ The server is configured via environment variables:
 | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode |
 | `HFS_TENANT_STRICT_VALIDATION` | false | Error on tenant mismatch |
 | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name (future) |
+
+### HTTP Compression
+
+Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
+`zstd`) are decompressed transparently before parsing; unsupported encodings
+are rejected with `415 Unsupported Media Type`. Responses are compressed when
+the client advertises support via `Accept-Encoding`, with `Content-Encoding`
+and `Vary: Accept-Encoding` set accordingly.
 
 ### Bulk Data Export
 

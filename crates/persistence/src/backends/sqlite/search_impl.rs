@@ -15,8 +15,8 @@ use helios_fhir::FhirVersion;
 use rusqlite::params;
 
 use crate::core::{
-    ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, RevincludeProvider,
-    SearchProvider, SearchResult,
+    ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
+    RevincludeProvider, SearchProvider, SearchResult,
 };
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -26,7 +26,7 @@ use crate::types::{
 };
 
 use super::SqliteBackend;
-use super::search::{QueryBuilder, SqlParam};
+use super::search::{QueryBuilder, SortValueKind, SqlParam};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -36,6 +36,39 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+/// Binds the cursor's boundary sort value as `?3`, typed per the sort key kind.
+/// Timestamps are stored as RFC3339 text, so they bind (and compare) as text.
+fn bind_cursor_value(
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    kind: SortValueKind,
+    cursor: &PageCursor,
+) -> StorageResult<()> {
+    let value = cursor.sort_values().first();
+    match kind {
+        SortValueKind::Number => {
+            let n = match value {
+                Some(CursorValue::Decimal(f)) => *f,
+                Some(CursorValue::Number(i)) => *i as f64,
+                Some(CursorValue::String(s)) => s.parse().unwrap_or(0.0),
+                _ => {
+                    return Err(internal_error(
+                        "Invalid cursor: expected number".to_string(),
+                    ));
+                }
+            };
+            params.push(Box::new(n));
+        }
+        SortValueKind::Timestamp | SortValueKind::Text => match value {
+            Some(CursorValue::String(s)) => params.push(Box::new(s.clone())),
+            Some(CursorValue::Null) | None => params.push(Box::new(Option::<String>::None)),
+            _ => {
+                return Err(internal_error("Invalid cursor: expected text".to_string()));
+            }
+        },
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SearchProvider for SqliteBackend {
     async fn search(
@@ -43,6 +76,21 @@ impl SearchProvider for SqliteBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        // `_contained` search uses a dedicated path (different index columns and
+        // heterogeneous result types); standard search handles `_contained=false`.
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+
+        // Populate Bundle.total only when the client asked for it
+        // (`_total=accurate|estimate`). Computed up-front, before acquiring the
+        // (non-Send) connection, so it is not held across this await.
+        let total = if query.wants_total() {
+            Some(self.search_count(tenant, query).await?)
+        } else {
+            None
+        };
+
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
@@ -50,25 +98,30 @@ impl SearchProvider for SqliteBackend {
         // Get count with default
         let count = query.count.unwrap_or(100) as usize;
 
-        // Check for cursor-based pagination
-        let cursor = query
-            .cursor
-            .as_ref()
-            .and_then(|c| PageCursor::decode(c).ok());
+        // Keyset key for cursor pagination. `None` for multi-field sorts, which
+        // are returned as a single page rather than paged with an inconsistent
+        // keyset.
+        let keyset = QueryBuilder::new(tenant_id, resource_type).primary_keyset_key(query);
 
-        // Determine param offset based on pagination mode
-        // Cursor pagination: ?1=tenant, ?2=type, ?3=timestamp, ?4=id -> offset=4
-        // Non-cursor: ?1=tenant, ?2=type -> offset=2
+        // Only honor an inbound cursor when we can build a keyset comparison.
+        let cursor = if keyset.is_some() {
+            query
+                .cursor
+                .as_ref()
+                .and_then(|c| PageCursor::decode(c).ok())
+        } else {
+            None
+        };
+
+        // Param layout: ?1=tenant, ?2=type, then (cursor) ?3=sort value, ?4=id,
+        // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
-        // Build the search filter subquery if there are search parameters
-        let search_filter = if !query.parameters.is_empty() {
+        let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
             let builder =
                 QueryBuilder::new(tenant_id, resource_type).with_param_offset(param_offset);
             let fragment = builder.build(query);
             if !fragment.sql.is_empty() {
-                // The QueryBuilder returns a SELECT DISTINCT resource_id query
-                // We use this as a subquery to filter the resources table
                 Some(fragment)
             } else {
                 None
@@ -76,207 +129,140 @@ impl SearchProvider for SqliteBackend {
         } else {
             None
         };
+        let filter_clause = search_filter
+            .as_ref()
+            .map(|f| format!(" AND id IN ({})", f.sql))
+            .unwrap_or_default();
+        let search_params = search_filter.map(|f| f.params).unwrap_or_default();
 
-        // Build query based on pagination mode
-        let (sql, has_previous, search_params) = if let Some(ref cursor) = cursor {
-            // Cursor-based pagination using keyset
+        // SELECT the sort key alongside the row so the next cursor can be built.
+        let select_cols = match &keyset {
+            Some(k) => format!(
+                "id, version_id, data, last_updated, fhir_version, {} AS sort_key",
+                k.expr
+            ),
+            None => "id, version_id, data, last_updated, fhir_version".to_string(),
+        };
+
+        // ORDER BY for the first-page / offset paths.
+        let order_by = if query.sort.is_empty() {
+            "ORDER BY last_updated DESC, id ASC".to_string()
+        } else {
+            QueryBuilder::new(tenant_id, resource_type).build_order_by(query)
+        };
+
+        // Build query based on pagination mode.
+        let (sql, has_previous) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
+            let e = &k.expr;
+            let asc = k.direction == crate::types::SortDirection::Ascending;
             match cursor.direction() {
                 CursorDirection::Next => {
-                    let sql = if let Some(ref filter) = search_filter {
-                        format!(
-                            "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0
-                             AND id IN ({})
-                             AND (last_updated < ?3 OR (last_updated = ?3 AND id < ?4))
-                             ORDER BY last_updated DESC, id DESC
-                             LIMIT {}",
-                            filter.sql,
-                            count + 1
-                        )
-                    } else {
-                        format!(
-                            "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0
-                             AND (last_updated < ?3 OR (last_updated = ?3 AND id < ?4))
-                             ORDER BY last_updated DESC, id DESC
-                             LIMIT {}",
-                            count + 1
-                        )
-                    };
-                    (
-                        sql,
-                        true,
-                        search_filter.map(|f| f.params).unwrap_or_default(),
-                    )
+                    let e_op = if asc { ">" } else { "<" };
+                    let sql = format!(
+                        "SELECT {cols} FROM resources \
+                         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                         AND ({e} {e_op} ?3 OR ({e} = ?3 AND id > ?4)) \
+                         ORDER BY {e} {dir}, id ASC LIMIT {lim}",
+                        cols = select_cols,
+                        filter = filter_clause,
+                        e = e,
+                        e_op = e_op,
+                        dir = if asc { "ASC" } else { "DESC" },
+                        lim = count + 1,
+                    );
+                    (sql, true)
                 }
                 CursorDirection::Previous => {
-                    let sql = if let Some(ref filter) = search_filter {
-                        format!(
-                            "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0
-                             AND id IN ({})
-                             AND (last_updated > ?3 OR (last_updated = ?3 AND id > ?4))
-                             ORDER BY last_updated ASC, id ASC
-                             LIMIT {}",
-                            filter.sql,
-                            count + 1
-                        )
-                    } else {
-                        format!(
-                            "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0
-                             AND (last_updated > ?3 OR (last_updated = ?3 AND id > ?4))
-                             ORDER BY last_updated ASC, id ASC
-                             LIMIT {}",
-                            count + 1
-                        )
-                    };
-                    (
-                        sql,
-                        false,
-                        search_filter.map(|f| f.params).unwrap_or_default(),
-                    )
+                    let e_op = if asc { "<" } else { ">" };
+                    let sql = format!(
+                        "SELECT {cols} FROM resources \
+                         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                         AND ({e} {e_op} ?3 OR ({e} = ?3 AND id < ?4)) \
+                         ORDER BY {e} {dir}, id DESC LIMIT {lim}",
+                        cols = select_cols,
+                        filter = filter_clause,
+                        e = e,
+                        e_op = e_op,
+                        dir = if asc { "DESC" } else { "ASC" },
+                        lim = count + 1,
+                    );
+                    (sql, false)
                 }
             }
         } else if let Some(offset) = query.offset {
-            // Offset-based pagination (legacy support)
-            let sql = if let Some(ref filter) = search_filter {
-                format!(
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                     WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0
-                     AND id IN ({})
-                     ORDER BY last_updated DESC, id DESC
-                     LIMIT {} OFFSET {}",
-                    filter.sql,
-                    count + 1,
-                    offset
-                )
-            } else {
-                format!(
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                     WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0
-                     ORDER BY last_updated DESC, id DESC
-                     LIMIT {} OFFSET {}",
-                    count + 1,
-                    offset
-                )
-            };
-            (
-                sql,
-                offset > 0,
-                search_filter.map(|f| f.params).unwrap_or_default(),
-            )
+            let sql = format!(
+                "SELECT {cols} FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                 {order} LIMIT {lim} OFFSET {off}",
+                cols = select_cols,
+                filter = filter_clause,
+                order = order_by,
+                lim = count + 1,
+                off = offset,
+            );
+            (sql, offset > 0)
         } else {
-            // First page (no cursor, no offset)
-            let sql = if let Some(ref filter) = search_filter {
-                format!(
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                     WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0
-                     AND id IN ({})
-                     ORDER BY last_updated DESC, id DESC
-                     LIMIT {}",
-                    filter.sql,
-                    count + 1
-                )
-            } else {
-                format!(
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                     WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0
-                     ORDER BY last_updated DESC, id DESC
-                     LIMIT {}",
-                    count + 1
-                )
-            };
-            (
-                sql,
-                false,
-                search_filter.map(|f| f.params).unwrap_or_default(),
-            )
+            let sql = format!(
+                "SELECT {cols} FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                 {order} LIMIT {lim}",
+                cols = select_cols,
+                filter = filter_clause,
+                order = order_by,
+                lim = count + 1,
+            );
+            (sql, false)
         };
 
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| internal_error(format!("Failed to prepare search query: {}", e)))?;
 
-        // Build the parameter list for binding
-        // Base params are always tenant_id and resource_type
-        // For cursor pagination, add cursor_timestamp and cursor_id
-        // Then append any search params from the QueryBuilder
-        let raw_rows: Vec<(String, String, Vec<u8>, String, String)> =
-            if let Some(ref cursor) = cursor {
-                let (cursor_timestamp, cursor_id) = Self::extract_cursor_values(cursor)?;
+        // Bind params: tenant, type, then (cursor) sort value + id, then filter params.
+        let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
+            bind_cursor_value(&mut all_params, k.kind, cursor)?;
+            all_params.push(Box::new(cursor.resource_id().to_string()));
+        }
+        for param in &search_params {
+            match param {
+                SqlParam::String(s) => all_params.push(Box::new(s.clone())),
+                SqlParam::Integer(i) => all_params.push(Box::new(*i)),
+                SqlParam::Float(f) => all_params.push(Box::new(*f)),
+                SqlParam::Null => all_params.push(Box::new(Option::<String>::None)),
+            }
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
 
-                // Build params: [tenant_id, resource_type, cursor_timestamp, cursor_id, ...search_params]
-                let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                    Box::new(tenant_id.to_string()),
-                    Box::new(resource_type.to_string()),
-                    Box::new(cursor_timestamp),
-                    Box::new(cursor_id),
-                ];
-
-                // Add search params
-                for param in &search_params {
-                    match param {
-                        SqlParam::String(s) => all_params.push(Box::new(s.clone())),
-                        SqlParam::Integer(i) => all_params.push(Box::new(*i)),
-                        SqlParam::Float(f) => all_params.push(Box::new(*f)),
-                        SqlParam::Null => all_params.push(Box::new(Option::<String>::None)),
+        // The sort key (column 5) is selected only when keyset paging is active.
+        let sort_kind = keyset.as_ref().map(|k| k.kind);
+        let raw_rows: Vec<(String, String, Vec<u8>, String, String, Option<CursorValue>)> = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                let id: String = row.get(0)?;
+                let version_id: String = row.get(1)?;
+                let data: Vec<u8> = row.get(2)?;
+                let last_updated: String = row.get(3)?;
+                let fhir_version: String = row.get(4)?;
+                let sort_key = match sort_kind {
+                    Some(SortValueKind::Number) => {
+                        row.get::<_, Option<f64>>(5)?.map(CursorValue::Decimal)
                     }
-                }
+                    // Timestamps are stored as RFC3339 text, so read text.
+                    Some(_) => row.get::<_, Option<String>>(5)?.map(CursorValue::String),
+                    None => None,
+                };
+                Ok((id, version_id, data, last_updated, fhir_version, sort_key))
+            })
+            .map_err(|e| internal_error(format!("Failed to execute search: {}", e)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| internal_error(format!("Failed to read row: {}", e)))?;
 
-                let param_refs: Vec<&dyn rusqlite::ToSql> =
-                    all_params.iter().map(|p| p.as_ref()).collect();
-
-                let rows = stmt
-                    .query_map(param_refs.as_slice(), |row| {
-                        let id: String = row.get(0)?;
-                        let version_id: String = row.get(1)?;
-                        let data: Vec<u8> = row.get(2)?;
-                        let last_updated: String = row.get(3)?;
-                        let fhir_version: String = row.get(4)?;
-                        Ok((id, version_id, data, last_updated, fhir_version))
-                    })
-                    .map_err(|e| internal_error(format!("Failed to execute search: {}", e)))?;
-
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| internal_error(format!("Failed to read row: {}", e)))?
-            } else {
-                // Build params: [tenant_id, resource_type, ...search_params]
-                let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                    Box::new(tenant_id.to_string()),
-                    Box::new(resource_type.to_string()),
-                ];
-
-                // Add search params
-                for param in &search_params {
-                    match param {
-                        SqlParam::String(s) => all_params.push(Box::new(s.clone())),
-                        SqlParam::Integer(i) => all_params.push(Box::new(*i)),
-                        SqlParam::Float(f) => all_params.push(Box::new(*f)),
-                        SqlParam::Null => all_params.push(Box::new(Option::<String>::None)),
-                    }
-                }
-
-                let param_refs: Vec<&dyn rusqlite::ToSql> =
-                    all_params.iter().map(|p| p.as_ref()).collect();
-
-                let rows = stmt
-                    .query_map(param_refs.as_slice(), |row| {
-                        let id: String = row.get(0)?;
-                        let version_id: String = row.get(1)?;
-                        let data: Vec<u8> = row.get(2)?;
-                        let last_updated: String = row.get(3)?;
-                        let fhir_version: String = row.get(4)?;
-                        Ok((id, version_id, data, last_updated, fhir_version))
-                    })
-                    .map_err(|e| internal_error(format!("Failed to execute search: {}", e)))?;
-
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| internal_error(format!("Failed to read row: {}", e)))?
-            };
-
-        let mut resources = Vec::new();
-        for (id, version_id, data, last_updated_str, fhir_version_str) in raw_rows {
+        // Parse rows, carrying the sort key for cursor construction.
+        let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
+        for (id, version_id, data, last_updated_str, fhir_version_str, sort_key) in raw_rows {
             let json_data: serde_json::Value = serde_json::from_slice(&data)
                 .map_err(|e| internal_error(format!("Failed to deserialize resource: {}", e)))?;
 
@@ -284,7 +270,8 @@ impl SearchProvider for SqliteBackend {
                 .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                 .with_timezone(&Utc);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 resource_type.clone(),
@@ -298,53 +285,44 @@ impl SearchProvider for SqliteBackend {
                 fhir_version,
             );
 
-            resources.push(resource);
+            parsed.push((resource, sort_key));
         }
 
-        // For backward pagination, reverse the results to maintain DESC order
+        // Backward pagination fetched in reverse order — restore sort order.
         if cursor
             .as_ref()
             .map(|c| c.direction() == CursorDirection::Previous)
             .unwrap_or(false)
         {
-            resources.reverse();
+            parsed.reverse();
         }
 
-        // Check if there are more results (we fetched one extra)
-        let has_next = resources.len() > count;
+        // We fetched one extra to detect a further page.
+        let has_next = parsed.len() > count;
         if has_next {
-            resources.pop(); // Remove the extra one
+            parsed.pop();
         }
 
-        // Generate cursors for pagination
         let next_cursor = if has_next {
-            resources.last().map(|r| {
-                let cursor = PageCursor::new(
-                    vec![CursorValue::String(r.last_modified().to_rfc3339())],
-                    r.id(),
-                );
-                cursor.encode()
+            parsed.last().map(|(r, sk)| {
+                PageCursor::new(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
             })
         } else {
             None
         };
-
         let previous_cursor = if has_previous {
-            resources.first().map(|r| {
-                let cursor = PageCursor::previous(
-                    vec![CursorValue::String(r.last_modified().to_rfc3339())],
-                    r.id(),
-                );
-                cursor.encode()
+            parsed.first().map(|(r, sk)| {
+                PageCursor::previous(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
             })
         } else {
             None
         };
 
+        let resources: Vec<StoredResource> = parsed.into_iter().map(|(r, _)| r).collect();
         let page_info = PageInfo {
             next_cursor,
             previous_cursor,
-            total: None,
+            total,
             has_next,
             has_previous,
         };
@@ -354,7 +332,8 @@ impl SearchProvider for SqliteBackend {
         Ok(SearchResult {
             resources: page,
             included: Vec::new(),
-            total: None,
+            total,
+            scores: Default::default(),
         })
     }
 
@@ -367,10 +346,11 @@ impl SearchProvider for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
 
-        // Build the search filter if there are search parameters
+        // Build the search filter if there are search parameters or a compartment.
         let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query
             .parameters
             .is_empty()
+            || query.compartment.is_some()
         {
             let builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
             let fragment = builder.build(query);
@@ -418,6 +398,10 @@ impl SearchProvider for SqliteBackend {
         &self,
     ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
         self.search_registry()
+    }
+
+    fn supports_contained_search(&self) -> bool {
+        true
     }
 }
 
@@ -494,7 +478,8 @@ impl MultiTypeSearchProvider for SqliteBackend {
                 .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                 .with_timezone(&Utc);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             let resource = StoredResource::from_storage(
                 resource_type,
@@ -529,6 +514,7 @@ impl MultiTypeSearchProvider for SqliteBackend {
             resources: Page::new(resources, page_info),
             included: Vec::new(),
             total: None,
+            scores: Default::default(),
         })
     }
 }
@@ -698,7 +684,8 @@ impl RevincludeProvider for SqliteBackend {
                     .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                     .with_timezone(&Utc);
 
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 let resource = StoredResource::from_storage(
                     &revinclude.source_type,
@@ -868,23 +855,171 @@ impl ChainedSearchProvider for SqliteBackend {
     }
 }
 
+/// Finds the `contained[]` entry with the given local `id` in a container's
+/// content.
+fn extract_contained_resource(
+    content: &serde_json::Value,
+    local_id: &str,
+) -> Option<serde_json::Value> {
+    content
+        .get("contained")?
+        .as_array()?
+        .iter()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(local_id))
+        .cloned()
+}
+
+/// Builds a `StoredResource` for a contained resource, inheriting the
+/// container's version/tenant/timestamps. Used for `_containedType=contained`.
+fn build_contained_stored(
+    container: &StoredResource,
+    contained_type: &str,
+    local_id: &str,
+    content: serde_json::Value,
+) -> StoredResource {
+    StoredResource::from_storage(
+        contained_type.to_string(),
+        local_id.to_string(),
+        container.version_id().to_string(),
+        container.tenant_id().clone(),
+        content,
+        container.created_at(),
+        container.last_modified(),
+        None,
+        container.fhir_version(),
+    )
+}
+
+// Contained (`_contained`) search.
+impl SqliteBackend {
+    /// Executes a `_contained=true|both` search.
+    ///
+    /// Matches contained resources of `query.resource_type` via the
+    /// `is_contained` index rows, then returns either the container resources
+    /// (`_containedType=container`, default) or the contained resources
+    /// themselves (`_containedType=contained`). For `_contained=both`, top-level
+    /// matches (run through the standard path) are merged in first.
+    ///
+    /// Paginated by `_offset`/`_count` as a single window (no keyset cursor);
+    /// contained result sets are expected to be small.
+    async fn search_contained(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        use crate::types::{ContainedMode, ContainedReturn};
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let contained_type = query.resource_type.as_str();
+
+        // 1. Resolve contained matches → (container_type, container_id, local_id).
+        let builder = QueryBuilder::new(tenant_id, contained_type);
+        let matches: Vec<(String, String, Option<String>)> = match builder.build_contained(query) {
+            Some(fragment) => {
+                let conn = self.get_connection()?;
+                let mut stmt = conn.prepare(&fragment.sql).map_err(|e| {
+                    internal_error(format!("Failed to prepare contained query: {e}"))
+                })?;
+                let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                    Box::new(tenant_id.to_string()),
+                    Box::new(contained_type.to_string()),
+                ];
+                for param in &fragment.params {
+                    match param {
+                        SqlParam::String(s) => all_params.push(Box::new(s.clone())),
+                        SqlParam::Integer(i) => all_params.push(Box::new(*i)),
+                        SqlParam::Float(f) => all_params.push(Box::new(*f)),
+                        SqlParam::Null => all_params.push(Box::new(Option::<String>::None)),
+                    }
+                }
+                let refs: Vec<&dyn rusqlite::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+                stmt.query_map(refs.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| internal_error(format!("Failed to execute contained query: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| internal_error(format!("Failed to read contained row: {e}")))?
+            }
+            None => Vec::new(),
+        };
+
+        // 2. Materialize result items (container or contained), de-duplicated.
+        let mut items: Vec<StoredResource> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        match query.contained_return {
+            ContainedReturn::Container => {
+                for (ctype, cid, _) in &matches {
+                    if !seen.insert(format!("{ctype}/{cid}")) {
+                        continue;
+                    }
+                    if let Some(container) = self.read(tenant, ctype, cid).await? {
+                        items.push(container);
+                    }
+                }
+            }
+            ContainedReturn::Contained => {
+                for (ctype, cid, local) in &matches {
+                    let Some(local_id) = local else { continue };
+                    if !seen.insert(format!("{ctype}/{cid}#{local_id}")) {
+                        continue;
+                    }
+                    if let Some(container) = self.read(tenant, ctype, cid).await? {
+                        if let Some(c) = extract_contained_resource(container.content(), local_id) {
+                            items.push(build_contained_stored(
+                                &container,
+                                contained_type,
+                                local_id,
+                                c,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. For `both`, merge top-level matches ahead of contained ones.
+        if query.contained == ContainedMode::Both {
+            let mut top_query = query.clone();
+            top_query.contained = ContainedMode::Off;
+            top_query.contained_return = ContainedReturn::Container;
+            let top = self.search(tenant, &top_query).await?;
+            let mut merged = top.resources.items;
+            let top_urls: HashSet<String> = merged.iter().map(|r| r.url()).collect();
+            for item in items {
+                if !top_urls.contains(&item.url()) {
+                    merged.push(item);
+                }
+            }
+            items = merged;
+        }
+
+        // 4. Apply the offset/count window.
+        let count = query.count.unwrap_or(100) as usize;
+        let offset = query.offset.unwrap_or(0) as usize;
+        let total_matches = items.len() as u64;
+        let windowed: Vec<StoredResource> = items.into_iter().skip(offset).take(count).collect();
+
+        let total = if query.wants_total() {
+            Some(total_matches)
+        } else {
+            None
+        };
+        let page = Page::new(windowed, PageInfo::end());
+        let mut result = SearchResult::new(page);
+        if let Some(t) = total {
+            result = result.with_total(t);
+        }
+        Ok(result)
+    }
+}
+
 // Helper methods for search implementations
 impl SqliteBackend {
-    /// Extract timestamp and ID from a cursor for keyset pagination.
-    fn extract_cursor_values(cursor: &PageCursor) -> StorageResult<(String, String)> {
-        let sort_values = cursor.sort_values();
-        let timestamp = match sort_values.first() {
-            Some(CursorValue::String(s)) => s.clone(),
-            _ => {
-                return Err(internal_error(
-                    "Invalid cursor: missing or invalid timestamp".to_string(),
-                ));
-            }
-        };
-        let id = cursor.resource_id().to_string();
-        Ok((timestamp, id))
-    }
-
     /// Extract references from a resource for a given search parameter.
     fn extract_references(&self, content: &serde_json::Value, search_param: &str) -> Vec<String> {
         let mut refs = Vec::new();
@@ -976,7 +1111,8 @@ impl SqliteBackend {
                     .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                     .with_timezone(&Utc);
 
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 Ok(Some(StoredResource::from_storage(
                     resource_type,
@@ -1129,7 +1265,8 @@ impl SqliteBackend {
                 .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                 .with_timezone(&Utc);
 
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
             resources.push(StoredResource::from_storage(
                 resource_type,
@@ -2486,5 +2623,145 @@ mod tests {
             "Combined patient + type search should find exactly doc1"
         );
         assert_eq!(result.resources.items[0].id(), "doc1");
+    }
+
+    // ---- _contained / _containedType search ----
+
+    use crate::types::{ContainedMode, ContainedReturn, SearchParamType, SearchValue};
+
+    /// Seeds an Observation containing a Patient named "Smith", plus a top-level
+    /// Patient also named "Smith".
+    async fn seed_contained(backend: &SqliteBackend, tenant: &TenantContext) {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs1",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
+                    "subject": { "reference": "#p1" },
+                    "contained": [{
+                        "resourceType": "Patient",
+                        "id": "p1",
+                        "name": [{ "family": "Smith", "given": ["Contained"] }],
+                        "gender": "male"
+                    }]
+                }),
+                helios_fhir::FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "top1", "name": [{ "family": "Smith" }] }),
+                helios_fhir::FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn name_query(mode: ContainedMode, ret: ContainedReturn) -> SearchQuery {
+        let mut q = SearchQuery::new("Patient");
+        q.contained = mode;
+        q.contained_return = ret;
+        q.parameters.push(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Smith")],
+            chain: vec![],
+            components: vec![],
+        });
+        q
+    }
+
+    #[tokio::test]
+    async fn contained_off_excludes_contained_resources() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_contained(&backend, &tenant).await;
+
+        // Default (_contained=off): only the top-level Patient matches.
+        let result = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::Off, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let urls: Vec<String> = result.resources.items.iter().map(|r| r.url()).collect();
+        assert_eq!(urls, vec!["Patient/top1"]);
+    }
+
+    #[tokio::test]
+    async fn contained_on_returns_container_by_default() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_contained(&backend, &tenant).await;
+
+        let result = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::On, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let urls: Vec<String> = result.resources.items.iter().map(|r| r.url()).collect();
+        assert_eq!(urls, vec!["Observation/obs1"], "container is returned");
+    }
+
+    #[tokio::test]
+    async fn contained_on_contained_type_returns_contained_resource() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_contained(&backend, &tenant).await;
+
+        let result = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::On, ContainedReturn::Contained),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.resources.items.len(), 1);
+        let r = &result.resources.items[0];
+        assert_eq!(r.resource_type(), "Patient");
+        assert_eq!(r.id(), "p1");
+        assert_eq!(r.content()["name"][0]["given"][0], "Contained");
+    }
+
+    #[tokio::test]
+    async fn contained_both_merges_top_level_and_container() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_contained(&backend, &tenant).await;
+
+        let result = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::Both, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let mut urls: Vec<String> = result.resources.items.iter().map(|r| r.url()).collect();
+        urls.sort();
+        assert_eq!(urls, vec!["Observation/obs1", "Patient/top1"]);
+    }
+
+    #[tokio::test]
+    async fn contained_respects_param_so_no_false_match() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_contained(&backend, &tenant).await;
+
+        // No contained Patient named "Jones" → no container match.
+        let mut q = name_query(ContainedMode::On, ContainedReturn::Container);
+        q.parameters[0].values = vec![SearchValue::eq("Jones")];
+        let result = backend.search(&tenant, &q).await.unwrap();
+        assert!(result.resources.items.is_empty());
     }
 }

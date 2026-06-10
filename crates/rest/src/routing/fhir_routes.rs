@@ -11,8 +11,8 @@ use axum::{
 };
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
-    BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
-    SystemHistoryProvider, TypeHistoryProvider,
+    BundleProvider, ConditionalStorage, IncludeProvider, InstanceHistoryProvider, ResourceStorage,
+    RevincludeProvider, SearchProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
 use tower::ServiceExt;
 
@@ -58,6 +58,8 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
         + TypeHistoryProvider
         + SystemHistoryProvider
@@ -82,6 +84,8 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
         + TypeHistoryProvider
         + SystemHistoryProvider
@@ -105,6 +109,8 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
         + TypeHistoryProvider
         + SystemHistoryProvider
@@ -133,6 +139,8 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
         + TypeHistoryProvider
         + SystemHistoryProvider
@@ -157,7 +165,7 @@ fn strip_tenant_prefix(mut request: Request<Body>) -> Request<Body> {
     let path = request.uri().path().to_string();
 
     // Use the default FHIR version for resource type checking
-    let fhir_version = FhirVersion::default();
+    let fhir_version = FhirVersion::default_enabled();
 
     if let Some((tenant, remaining_path)) = extract_tenant_from_path(&path, &fhir_version) {
         // Store original path and extracted tenant in extensions
@@ -200,6 +208,8 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
         + TypeHistoryProvider
         + SystemHistoryProvider
@@ -352,7 +362,7 @@ where
 /// of functionality.
 pub fn create_minimal_routes<S>(state: AppState<S>) -> Router
 where
-    S: ResourceStorage + Send + Sync + 'static,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     Router::new()
         .route("/health", get(handlers::health_handler::<S>))

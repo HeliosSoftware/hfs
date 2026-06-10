@@ -99,6 +99,12 @@ pub enum RestError {
         content_type: String,
     },
 
+    /// Request body exceeds the configured size limit (HTTP 413).
+    PayloadTooLarge {
+        /// Error message.
+        message: String,
+    },
+
     /// Unprocessable entity - semantic error (HTTP 422).
     UnprocessableEntity {
         /// Error message.
@@ -203,6 +209,9 @@ impl fmt::Display for RestError {
             RestError::UnsupportedMediaType { content_type } => {
                 write!(f, "Unsupported media type: {}", content_type)
             }
+            RestError::PayloadTooLarge { message } => {
+                write!(f, "Payload too large: {}", message)
+            }
             RestError::UnprocessableEntity { message } => {
                 write!(f, "Unprocessable entity: {}", message)
             }
@@ -289,6 +298,9 @@ impl IntoResponse for RestError {
                 "not-supported",
                 format!("Content type '{}' is not supported", content_type),
             ),
+            RestError::PayloadTooLarge { message } => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "too-long", message.clone())
+            }
             RestError::UnprocessableEntity { message } => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "processing",

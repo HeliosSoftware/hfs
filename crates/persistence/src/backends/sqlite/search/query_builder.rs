@@ -5,12 +5,72 @@
 
 use std::collections::HashSet;
 
-use crate::types::{SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue};
+use crate::types::{
+    CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+    SearchValue, strip_reference_version,
+};
 
 use super::parameter_handlers::{
     CompositeHandler, DateHandler, NumberHandler, QuantityHandler, ReferenceHandler, StringHandler,
     TokenHandler, UriHandler,
 };
+
+/// How a sort key's value is typed for cursor (keyset) binding and comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortValueKind {
+    /// Text column (string/token/uri/reference/`_id`).
+    Text,
+    /// Floating-point column (number/quantity).
+    Number,
+    /// Timestamp column, stored as RFC3339 text (`_lastUpdated`, date).
+    Timestamp,
+}
+
+/// A single keyset sort key: the SQL value expression, its direction, and the
+/// value kind used to bind/read the cursor boundary value.
+#[derive(Debug, Clone)]
+pub struct KeysetKey {
+    /// SQL expression yielding the sort value (column or correlated subquery).
+    pub expr: String,
+    /// Sort direction.
+    pub direction: crate::types::SortDirection,
+    /// How the value is typed for binding/reading.
+    pub kind: SortValueKind,
+}
+
+/// Determines the value kind for a sort parameter.
+pub(crate) fn sort_value_kind(
+    parameter: &str,
+    param_type: Option<SearchParamType>,
+) -> SortValueKind {
+    match parameter {
+        "_id" => SortValueKind::Text,
+        "_lastUpdated" => SortValueKind::Timestamp,
+        _ => match param_type {
+            Some(SearchParamType::Number) | Some(SearchParamType::Quantity) => {
+                SortValueKind::Number
+            }
+            Some(SearchParamType::Date) => SortValueKind::Timestamp,
+            _ => SortValueKind::Text,
+        },
+    }
+}
+
+/// Maps a search-parameter type to the `search_index` value column used when
+/// sorting on that parameter. Returns `None` for types that are not sortable via
+/// a single value column (composite, special).
+pub(crate) fn sort_value_column(param_type: SearchParamType) -> Option<&'static str> {
+    match param_type {
+        SearchParamType::String => Some("value_string"),
+        SearchParamType::Token => Some("value_token_code"),
+        SearchParamType::Date => Some("value_date"),
+        SearchParamType::Number => Some("value_number"),
+        SearchParamType::Quantity => Some("value_quantity_value"),
+        SearchParamType::Reference => Some("value_reference"),
+        SearchParamType::Uri => Some("value_uri"),
+        SearchParamType::Composite | SearchParamType::Special => None,
+    }
+}
 
 /// A fragment of SQL with bound parameters.
 #[derive(Debug, Clone)]
@@ -182,6 +242,16 @@ impl QueryBuilder {
             }
         }
 
+        // Compartment membership: a resource is in the compartment if it
+        // references the compartment via ANY of the membership params (OR),
+        // per the FHIR CompartmentDefinition. Applied as a single subquery.
+        if let Some(comp) = &query.compartment {
+            // Last condition appended, so no need to advance `current_offset`.
+            if let Some(condition) = self.build_compartment_condition(comp, current_offset) {
+                conditions.push(condition);
+            }
+        }
+
         // Combine all conditions with AND
         if !conditions.is_empty() {
             let mut combined = conditions.remove(0);
@@ -196,6 +266,116 @@ impl QueryBuilder {
         base
     }
 
+    /// Builds the `_contained` match subquery.
+    ///
+    /// Returns SQL selecting `(resource_type, resource_id, contained_local_id)`
+    /// from `search_index` for contained resources (`is_contained = 1`) of the
+    /// searched type (`contained_type = ?2`) that match every standard search
+    /// parameter. Matching is keyed on the contained entity
+    /// `(resource_id, contained_local_id)` via `GROUP BY ... HAVING
+    /// COUNT(DISTINCT param_name) >= <n>`, so a container only matches when a
+    /// single contained resource satisfies all parameters.
+    ///
+    /// Param layout: `?1` = tenant, `?2` = contained type, then value params.
+    /// Returns `None` when no standard parameter contributes a condition
+    /// (special `_`-params and composites are not applied to contained matching).
+    ///
+    /// Limitation: repeated occurrences of the same parameter name are treated
+    /// as OR rather than AND for the distinct-name count.
+    pub fn build_contained(&self, query: &SearchQuery) -> Option<SqlFragment> {
+        let mut branches: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParam> = Vec::new();
+        let mut distinct_names: HashSet<String> = HashSet::new();
+        // ?1 = tenant, ?2 = contained_type already consumed by the caller.
+        let mut offset = 2;
+
+        for param in &query.parameters {
+            if param.name.starts_with('_')
+                || matches!(
+                    param.param_type,
+                    SearchParamType::Composite | SearchParamType::Special
+                )
+            {
+                continue;
+            }
+
+            let mut or_conditions = Vec::new();
+            let mut local_offset = offset;
+            for value in &param.values {
+                if let Some(cond) = self.build_value_condition(param, value, local_offset) {
+                    local_offset += cond.params.len();
+                    or_conditions.push(cond);
+                }
+            }
+            if or_conditions.is_empty() {
+                continue;
+            }
+            let mut combined = or_conditions.remove(0);
+            for cond in or_conditions {
+                combined = combined.or(cond);
+            }
+            offset += combined.params.len();
+            branches.push(format!(
+                "(param_name = '{}' AND ({}))",
+                param.name, combined.sql
+            ));
+            params.extend(combined.params);
+            distinct_names.insert(param.name.clone());
+        }
+
+        if branches.is_empty() {
+            return None;
+        }
+
+        let sql = format!(
+            "SELECT resource_type, resource_id, contained_local_id FROM search_index \
+             WHERE tenant_id = ?1 AND is_contained = 1 AND contained_type = ?2 AND ({}) \
+             GROUP BY resource_type, resource_id, contained_local_id \
+             HAVING COUNT(DISTINCT param_name) >= {}",
+            branches.join(" OR "),
+            distinct_names.len()
+        );
+        Some(SqlFragment::with_params(sql, params))
+    }
+
+    /// Builds the compartment-membership subquery: matches resources that
+    /// reference `comp.reference` via ANY of `comp.params` (logical OR), which
+    /// is how a resource joins a FHIR compartment. Reference matching mirrors the
+    /// standard reference handler (version-agnostic). Returns `None` if there are
+    /// no membership params or no reference.
+    fn build_compartment_condition(
+        &self,
+        comp: &CompartmentMembership,
+        param_offset: usize,
+    ) -> Option<SqlFragment> {
+        if comp.params.is_empty() || comp.reference.is_empty() {
+            return None;
+        }
+
+        // Membership params come from the bundled FHIR CompartmentDefinitions
+        // (trusted, e.g. "patient"), but bind nothing user-controlled here: build
+        // a safe `IN (...)` list by escaping any single quotes defensively.
+        let in_list = comp
+            .params
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let base = strip_reference_version(&comp.reference);
+        let p1 = param_offset + 1;
+        let p2 = param_offset + 2;
+
+        Some(SqlFragment::with_params(
+            format!(
+                "resource_id IN (SELECT resource_id FROM search_index \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
+                 AND (value_reference = ?{p1} OR value_reference LIKE ?{p2} || '/_history/%'))"
+            ),
+            vec![SqlParam::string(base), SqlParam::string(base)],
+        ))
+    }
+
     /// Builds a condition for a single search parameter.
     fn build_parameter_condition(
         &self,
@@ -205,6 +385,11 @@ impl QueryBuilder {
         // Handle special parameters
         if param.name.starts_with('_') {
             return self.build_special_parameter_condition(param, param_offset);
+        }
+
+        // Composite parameters need a group-aware subquery (see below).
+        if matches!(param.param_type, SearchParamType::Composite) {
+            return self.build_composite_parameter_condition(param, param_offset);
         }
 
         // Multiple values are ORed together
@@ -237,6 +422,56 @@ impl QueryBuilder {
             ),
             combined.params,
         ))
+    }
+
+    /// Builds a condition for a composite parameter.
+    ///
+    /// Each composite instance is indexed as a set of `search_index` rows that
+    /// share a `composite_group`. A resource matches when there is a group in
+    /// which every component is satisfied by some row, expressed as
+    /// `GROUP BY resource_id, composite_group HAVING <every component present>`.
+    fn build_composite_parameter_condition(
+        &self,
+        param: &SearchParameter,
+        param_offset: usize,
+    ) -> Option<SqlFragment> {
+        if param.components.is_empty() {
+            return None;
+        }
+
+        let mut or_conditions = Vec::new();
+        let mut params = Vec::new();
+        let mut total_params = 0usize;
+
+        for value in &param.values {
+            match CompositeHandler::build_component_fragments(
+                value,
+                &param.components,
+                param_offset + total_params,
+            ) {
+                Some(fragments) if !fragments.is_empty() => {
+                    let havings: Vec<String> = fragments
+                        .iter()
+                        .map(|f| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", f.sql))
+                        .collect();
+                    for f in fragments {
+                        total_params += f.params.len();
+                        params.extend(f.params);
+                    }
+                    or_conditions.push(format!(
+                        "resource_id IN (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' GROUP BY resource_id, composite_group HAVING {})",
+                        param.name,
+                        havings.join(" AND ")
+                    ));
+                }
+                _ => or_conditions.push("0 = 1".to_string()),
+            }
+        }
+
+        if or_conditions.is_empty() {
+            return None;
+        }
+        Some(SqlFragment::with_params(or_conditions.join(" OR "), params))
     }
 
     /// Builds a condition for a special parameter (_id, _lastUpdated, etc.).
@@ -409,12 +644,16 @@ impl QueryBuilder {
                     conditions.push(sql);
                 }
                 Err(e) => {
-                    // Log parse error but continue with other filters
+                    // A malformed `_filter` must NOT be silently dropped — that
+                    // would return an unfiltered superset (everything matching
+                    // the other params). Fail closed: emit a match-nothing
+                    // condition so the client gets zero results, not wrong ones.
                     tracing::warn!(
-                        "Failed to parse _filter expression '{}': {}",
+                        "Failed to parse _filter expression '{}': {} — failing closed (no matches)",
                         value.value,
                         e
                     );
+                    conditions.push(SqlFragment::new("1 = 0"));
                 }
             }
         }
@@ -537,10 +776,7 @@ impl QueryBuilder {
                     crate::types::SortDirection::Ascending => "ASC",
                     crate::types::SortDirection::Descending => "DESC",
                 };
-
-                // Map sort parameters to SQL columns
-                let column = self.sort_column(&s.parameter);
-                format!("{} {}", column, dir)
+                format!("{} {}", self.sort_expression(s), dir)
             })
             .collect();
 
@@ -553,17 +789,54 @@ impl QueryBuilder {
         format!("ORDER BY {}", clauses.join(", "))
     }
 
-    /// Maps a sort parameter name to the corresponding SQL column.
+    /// Returns the keyset sort key for cursor pagination, or `None` when the
+    /// query has multiple sort fields (those are returned as a single page
+    /// rather than paged with a possibly-inconsistent keyset).
+    pub fn primary_keyset_key(&self, query: &SearchQuery) -> Option<KeysetKey> {
+        match query.sort.len() {
+            0 => Some(KeysetKey {
+                expr: "last_updated".to_string(),
+                direction: crate::types::SortDirection::Descending,
+                kind: SortValueKind::Timestamp,
+            }),
+            1 => {
+                let directive = &query.sort[0];
+                Some(KeysetKey {
+                    expr: self.sort_expression(directive),
+                    direction: directive.direction,
+                    kind: sort_value_kind(&directive.parameter, directive.param_type),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Builds the ORDER BY expression for a single sort directive.
     ///
-    /// This is used by `build_order_by` to translate FHIR sort parameters
-    /// to SQLite column names.
-    fn sort_column(&self, parameter: &str) -> &'static str {
-        match parameter {
-            "_id" => "id",
-            "_lastUpdated" => "last_updated",
-            // Future: could support arbitrary parameters via search_index join
-            // For now, use id as a stable fallback
-            _ => "id",
+    /// `_id`/`_lastUpdated` map to `resources` columns. Any other indexed search
+    /// parameter sorts on a correlated subquery into `search_index`, taking the
+    /// MIN value for ascending and MAX for descending (FHIR multi-value sort).
+    fn sort_expression(&self, directive: &crate::types::SortDirective) -> String {
+        match directive.parameter.as_str() {
+            "_id" => return "id".to_string(),
+            "_lastUpdated" => return "last_updated".to_string(),
+            _ => {}
+        }
+
+        let column = directive.param_type.and_then(sort_value_column);
+        match column {
+            Some(col) => {
+                let agg = match directive.direction {
+                    crate::types::SortDirection::Ascending => "MIN",
+                    crate::types::SortDirection::Descending => "MAX",
+                };
+                format!(
+                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_id = resources.id AND si.param_name = '{}')",
+                    agg, col, directive.parameter
+                )
+            }
+            // Unsortable (composite/special/unresolved) — stable fallback.
+            None => "id".to_string(),
         }
     }
 
@@ -670,10 +943,12 @@ mod tests {
             SortDirective {
                 parameter: "_lastUpdated".to_string(),
                 direction: SortDirection::Descending,
+                param_type: None,
             },
             SortDirective {
                 parameter: "_id".to_string(),
                 direction: SortDirection::Ascending,
+                param_type: None,
             },
         ];
 
@@ -690,6 +965,7 @@ mod tests {
         query.sort = vec![SortDirective {
             parameter: "_lastUpdated".to_string(),
             direction: SortDirection::Ascending,
+            param_type: None,
         }];
 
         let order_by = builder.build_order_by(&query);
@@ -726,12 +1002,14 @@ mod tests {
 
         let fragment = builder.build(&query);
 
-        // Should use ?3 and ?4 for the two params in ID-only reference search
-        // (after ?1 tenant and ?2 resource_type)
+        // ID-only reference search is version-agnostic: exact, `%/id`, and
+        // `%/id/_history/%`, so three params (?3, ?4, ?5) after ?1 tenant / ?2
+        // resource_type.
         assert!(fragment.sql.contains("?3"));
         assert!(fragment.sql.contains("?4"));
-        // Should have 4 total params: tenant, resource_type, ref_value, ref_value
-        assert_eq!(fragment.params.len(), 4);
+        assert!(fragment.sql.contains("?5"));
+        // tenant, resource_type, + 3 ref_value bindings
+        assert_eq!(fragment.params.len(), 5);
     }
 
     #[test]
@@ -751,13 +1029,12 @@ mod tests {
 
         let fragment = builder.build(&query);
 
-        // First value uses ?3 and ?4 (2 params for ID-only)
-        // Second value uses ?5 and ?6 (2 more params for ID-only)
-        assert!(fragment.sql.contains("?3"));
-        assert!(fragment.sql.contains("?4"));
-        assert!(fragment.sql.contains("?5"));
-        assert!(fragment.sql.contains("?6"));
-        // Should have 6 total params: tenant, resource_type, + 4 for 2 ID-only refs
-        assert_eq!(fragment.params.len(), 6);
+        // Each ID-only value now binds 3 params (exact, `%/id`, `%/id/_history/%`):
+        // first value ?3..?5, second value ?6..?8.
+        for p in ["?3", "?4", "?5", "?6", "?7", "?8"] {
+            assert!(fragment.sql.contains(p), "missing placeholder {p}");
+        }
+        // tenant, resource_type, + 3 per ID-only ref × 2 values
+        assert_eq!(fragment.params.len(), 8);
     }
 }

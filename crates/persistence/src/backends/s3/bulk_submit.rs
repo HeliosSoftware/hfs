@@ -697,7 +697,7 @@ impl S3Backend {
                             tenant,
                             &entry.resource_type,
                             entry.resource.clone(),
-                            FhirVersion::default(),
+                            FhirVersion::default_enabled(),
                         )
                         .await?;
 
@@ -724,7 +724,7 @@ impl S3Backend {
                     tenant,
                     &entry.resource_type,
                     entry.resource.clone(),
-                    FhirVersion::default(),
+                    FhirVersion::default_enabled(),
                 )
                 .await?;
 

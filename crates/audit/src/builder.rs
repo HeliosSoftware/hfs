@@ -1,10 +1,10 @@
 //! Fluent builder for FHIR `AuditEvent` resources.
 //!
-//! Uses the typed `helios_fhir::r4::AuditEvent` struct with convenience
+//! Uses the typed `crate::fhir_model::AuditEvent` struct with convenience
 //! helpers from [`crate::helpers`] and BALP profile selection from
 //! [`crate::balp`].
 
-use helios_fhir::r4::{AuditEvent, AuditEventAgent, AuditEventEntity, AuditEventSource, Meta};
+use crate::fhir_model::{AuditEvent, AuditEventAgent, AuditEventEntity, AuditEventSource, Meta};
 
 use crate::balp::{self, AuditAction, code_systems};
 use crate::helpers::*;
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_custom_entity_appended() {
-        use helios_fhir::r4::AuditEventEntity;
+        use crate::fhir_model::AuditEventEntity;
 
         let custom = AuditEventEntity {
             what: Some(reference("Job/export-1")),

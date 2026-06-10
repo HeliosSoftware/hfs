@@ -215,7 +215,7 @@ impl Transaction for SqliteTransaction {
         let version_id = "1";
 
         // Use default FHIR version for transaction operations
-        let fhir_version = FhirVersion::default();
+        let fhir_version = FhirVersion::default_enabled();
         let fhir_version_str = fhir_version.as_mime_param();
 
         // Insert the resource
@@ -293,7 +293,8 @@ impl Transaction for SqliteTransaction {
                     .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
                     .with_timezone(&Utc);
 
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str).unwrap_or_default();
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
                 Ok(Some(StoredResource::from_storage(
                     resource_type,

@@ -340,6 +340,222 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_total_accurate_populates_bundle_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Baseline count of all patients (no _total -> total omitted).
+        let baseline: Value = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let patient_count = get_bundle_entries(&baseline).len() as i64;
+        assert!(patient_count > 0, "fixture should seed patients");
+        assert!(
+            baseline["total"].is_null(),
+            "Bundle.total should be absent without _total"
+        );
+
+        // _total=accurate -> Bundle.total present and equal to the match count.
+        let response = server
+            .get("/Patient?_total=accurate")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert_eq!(
+            body["total"].as_i64(),
+            Some(patient_count),
+            "Bundle.total must equal the number of matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_param_lenient_ignored_strict_rejected() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // Lenient (default): unknown parameter is ignored, search succeeds.
+        let lenient = server
+            .get("/Patient?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+
+        // Strict: unknown parameter is rejected with 400.
+        let strict = server
+            .get("/Patient?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(strict.status_code(), StatusCode::BAD_REQUEST);
+
+        // A known parameter is accepted even under strict handling.
+        let ok = server
+            .get("/Patient?name=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        ok.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn test_date_prefix_uses_precision_boundaries() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "born-2020", "birthDate": "2020-06-15" }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        let ids = |body: &Value| -> Vec<String> {
+            get_bundle_entries(body)
+                .iter()
+                .filter_map(|e| e["resource"]["id"].as_str().map(String::from))
+                .collect()
+        };
+        let search = |q: &'static str| {
+            let server = &server;
+            async move {
+                server
+                    .get(&format!("/Patient?birthdate={}", q))
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .await
+                    .json::<Value>()
+            }
+        };
+
+        // gt2020 means "after all of 2020" → 2020-06-15 must NOT match.
+        assert!(
+            !ids(&search("gt2020").await).contains(&"born-2020".to_string()),
+            "gt2020 should not match a date within 2020"
+        );
+        // gt2019 → after 2019 → matches.
+        assert!(
+            ids(&search("gt2019").await).contains(&"born-2020".to_string()),
+            "gt2019 should match 2020-06-15"
+        );
+        // lt2021 → before 2021 → matches; lt2020 → before 2020 → no match.
+        assert!(ids(&search("lt2021").await).contains(&"born-2020".to_string()));
+        assert!(!ids(&search("lt2020").await).contains(&"born-2020".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_string_search_is_accent_insensitive() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "accent-pt",
+                    "name": [{ "family": "Müller" }]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        // An unaccented, lowercase query must match the accented stored name.
+        for query in ["muller", "Müller", "MULLER"] {
+            let response = server
+                .get(&format!("/Patient?family={}", query))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+            let ids: Vec<&str> = get_bundle_entries(&body)
+                .iter()
+                .filter_map(|e| e["resource"]["id"].as_str())
+                .collect();
+            assert!(
+                ids.contains(&"accent-pt"),
+                "accent-insensitive family search '{query}' should match 'Müller'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quantity_search_ucum_unit_equivalence() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+        // Observation with a mass quantity expressed in grams.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-mass",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "x" }] },
+                    "valueQuantity": {
+                        "value": 1,
+                        "unit": "g",
+                        "system": "http://unitsofmeasure.org",
+                        "code": "g"
+                    }
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        // Searching the equivalent quantity in milligrams must match (g ⇄ mg).
+        let response = server
+            .get("/Observation?value-quantity=1000|http://unitsofmeasure.org|mg")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let ids: Vec<&str> = get_bundle_entries(&body)
+            .iter()
+            .filter_map(|e| e["resource"]["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"obs-mass"),
+            "UCUM-equivalent quantity (1000 mg) should match the stored 1 g"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reference_search_is_version_agnostic() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // obs-1 stores an unversioned subject (Patient/patient-1). A versioned
+        // reference search must still match it (version is not considered).
+        let response = server
+            .get("/Observation?subject=Patient/patient-1/_history/5")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let ids: Vec<&str> = get_bundle_entries(&body)
+            .iter()
+            .filter_map(|e| e["resource"]["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"obs-1"),
+            "versioned reference search should match the unversioned stored reference"
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_by_id() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
@@ -463,6 +679,67 @@ mod string_search {
         let entries = get_bundle_entries(&body);
         assert!(!entries.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_string_search_text_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `:text` on a string is a case-insensitive partial match (FHIR spec
+        // allows :text on string). Previously the gate rejected it as
+        // token-only; now it matches "Smith" via the substring "mit".
+        let response = server
+            .get("/Patient?name:text=mit")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert!(!entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_not_in_modifier_returns_501_without_terminology_server() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // :not-in needs negated value-set filtering, which is unimplemented; it
+        // must return 501 rather than silently returning a superset, even when
+        // no terminology server is configured.
+        let response = server
+            .get("/Observation?code:not-in=http://example.org/vs")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn test_modifier_invalid_for_param_type_returns_400() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `:above` is only defined for token/uri/reference params; applying it
+        // to the string param `name` must be rejected with a 400 + invalid
+        // OperationOutcome rather than silently ignored.
+        let response = server
+            .get("/Patient?name:above=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["severity"], "error");
+        assert_eq!(body["issue"][0]["code"], "invalid");
+        assert!(
+            body["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("above")
+        );
+    }
 }
 
 // =============================================================================
@@ -568,6 +845,105 @@ mod reference_search {
 
         let entries = get_bundle_entries(&body);
         assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reference_search_contains_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // `:contains` is spec-valid for reference params (substring match on the
+        // stored reference). Previously the validation gate rejected it as
+        // string-only; now it resolves and matches "Patient/patient-1".
+        let response = server
+            .get("/Observation?subject:contains=patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+
+        let entries = get_bundle_entries(&body);
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            let subject = entry["resource"]["subject"]["reference"].as_str().unwrap();
+            assert!(subject.contains("patient-1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reference_search_below_modifier() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        // :below does URL/path-prefix hierarchy on the reference. "Patient"
+        // matches "Patient/patient-1" etc. (the seeded observation subjects).
+        let response = server
+            .get("/Observation?subject:below=Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            let subject = entry["resource"]["subject"]["reference"].as_str().unwrap();
+            assert!(subject.starts_with("Patient/"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reference_search_text_modifier_on_display() {
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+
+        // An Observation whose subject reference carries a display string. The
+        // extractor indexes Reference.display so :text (contains) and :code-text
+        // (starts-with) can match it.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-display-1",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+                    "subject": {"reference": "Patient/p-xyz", "display": "Johnny Appleseed"}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        // :text matches a substring of the display.
+        let response = server
+            .get("/Observation?subject:text=Appleseed")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resource"]["id"], "obs-display-1");
+
+        // :code-text matches a prefix of the display, but not a mid-string token.
+        let prefix = server
+            .get("/Observation?subject:code-text=Johnny")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        prefix.assert_status_ok();
+        let prefix_body: Value = prefix.json();
+        assert_eq!(get_bundle_entries(&prefix_body).len(), 1);
+
+        let mid = server
+            .get("/Observation?subject:code-text=Appleseed")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        mid.assert_status_ok();
+        let mid_body: Value = mid.json();
+        assert_eq!(get_bundle_entries(&mid_body).len(), 0);
     }
 }
 
@@ -813,6 +1189,39 @@ mod subsetting {
             // Should not include unrequested elements
             assert!(resource["gender"].is_null());
             assert!(resource["birthDate"].is_null());
+            // Subset responses must carry the SUBSETTED meta.tag (FHIR spec).
+            let tags = resource["meta"]["tag"]
+                .as_array()
+                .expect("meta.tag present");
+            assert!(
+                tags.iter().any(|t| t["code"] == "SUBSETTED"
+                    && t["system"] == "http://terminology.hl7.org/CodeSystem/v3-ObservationValue"),
+                "subsetted entry should be tagged SUBSETTED"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_subsetted_tag_without_subsetting() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_count=1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        if let Some(entry) = entries.first() {
+            let tags = entry["resource"]["meta"]["tag"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !tags.iter().any(|t| t["code"] == "SUBSETTED"),
+                "full representation must not be tagged SUBSETTED"
+            );
         }
     }
 }
@@ -820,6 +1229,32 @@ mod subsetting {
 // =============================================================================
 // Compartment Search Tests
 // =============================================================================
+
+mod unsupported_params {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_unsupported_control_param_rejected() {
+        // `_query`/`_contained`/`_containedType` are not implemented; the server
+        // must reject them (400) rather than silently ignoring them and returning
+        // an unfiltered result. (`_list` and `_score` are implemented — see the
+        // `list_search` and `score_param` modules below.)
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for param in ["_query", "_contained", "_containedType"] {
+            let response = server
+                .get(&format!("/Patient?{param}=anything"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for unsupported param {param}"
+            );
+        }
+    }
+}
 
 mod compartment_search {
     use super::*;
@@ -896,6 +1331,57 @@ mod compartment_search {
     }
 
     #[tokio::test]
+    async fn test_compartment_membership_via_non_first_param() {
+        // A resource that belongs to the compartment via a NON-first membership
+        // param must still be found. AllergyIntolerance joins the Patient
+        // compartment via patient/recorder/asserter; here the resource is linked
+        // ONLY through `recorder` (its `patient` points elsewhere). The previous
+        // first-param-only behaviour would have missed it.
+        let (server, backend) = create_test_server().await;
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "patient-1", "active": true}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("create patient-1");
+
+        backend
+            .create(
+                &tenant,
+                "AllergyIntolerance",
+                json!({
+                    "resourceType": "AllergyIntolerance",
+                    "id": "ai-1",
+                    "patient": {"reference": "Patient/patient-2"},
+                    "recorder": {"reference": "Patient/patient-1"}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("create allergy");
+
+        let response = server
+            .get("/Patient/patient-1/AllergyIntolerance")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(
+            entries.len(),
+            1,
+            "AllergyIntolerance linked via `recorder` should be in the compartment"
+        );
+        assert_eq!(entries[0]["resource"]["id"], "ai-1");
+    }
+
+    #[tokio::test]
     async fn test_compartment_invalid_combination() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
@@ -908,6 +1394,44 @@ mod compartment_search {
 
         // Should return 400 Bad Request
         response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_patient_compartment_all_types() {
+        // `GET /Patient/{id}/*` returns every resource in the compartment,
+        // regardless of type. patient-1 has 2 Observations in the seed data,
+        // all of which must appear; nothing referencing another patient should.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient/patient-1/*")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "Bundle");
+        assert_eq!(body["type"], "searchset");
+
+        let entries = get_bundle_entries(&body);
+        // At least the 2 Observations for patient-1 should be present.
+        let observations = entries
+            .iter()
+            .filter(|e| e["resource"]["resourceType"] == "Observation")
+            .count();
+        assert_eq!(observations, 2, "expected both patient-1 observations");
+
+        // Every returned resource must actually belong to patient-1 (never
+        // patient-2). We can't assert a single reference field across types, so
+        // confirm patient-2 is not referenced anywhere in the matched set.
+        for entry in &entries {
+            let serialized = entry["resource"].to_string();
+            assert!(
+                !serialized.contains("patient-2"),
+                "compartment all-types must not include resources of another patient"
+            );
+        }
     }
 }
 
@@ -1278,12 +1802,20 @@ mod includes {
 
         assert!(obs_count >= 1, "Should have at least 1 observation");
 
-        // If includes are working, we should have a patient too
-        // Check if any entry has search.mode = "include"
-        let has_include = entries.iter().any(|e| e["search"]["mode"] == "include");
-        if has_include {
-            assert!(patient_count >= 1, "Should include the patient");
-        }
+        // The referenced Patient must be included, tagged search.mode=include.
+        assert!(patient_count >= 1, "Should include the referenced patient");
+        let included_patient = entries.iter().find(|e| {
+            e["resource"]["resourceType"] == "Patient" && e["search"]["mode"] == "include"
+        });
+        assert!(
+            included_patient.is_some(),
+            "Patient should be present as an include entry"
+        );
+        assert_eq!(
+            included_patient.unwrap()["resource"]["id"],
+            "patient-1",
+            "the subject of obs-1 is patient-1"
+        );
     }
 
     #[tokio::test]
@@ -1330,7 +1862,13 @@ mod includes {
             resource_types.contains(&"Observation"),
             "Should have observation"
         );
-        // Included resources depend on implementation
+        // Repeated _include keys are both honored (AND). obs-1's subject is
+        // Patient/patient-1; it has no encounter, so only the Patient is added —
+        // but crucially the subject include is NOT lost to the encounter one.
+        assert!(
+            resource_types.contains(&"Patient"),
+            "subject include must survive alongside the encounter include"
+        );
     }
 
     #[tokio::test]
@@ -1362,11 +1900,15 @@ mod includes {
             .filter(|e| e["resource"]["resourceType"] == "Observation")
             .count();
 
-        // If revinclude is working, we should have observations
-        let has_include = entries.iter().any(|e| e["search"]["mode"] == "include");
-        if has_include {
-            assert!(obs_count >= 1, "Should revinclude observations");
-        }
+        // Observations referencing patient-1 must be reverse-included.
+        assert!(obs_count >= 1, "Should revinclude observations");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["resource"]["resourceType"] == "Observation"
+                    && e["search"]["mode"] == "include"),
+            "revincluded observations must be tagged search.mode=include"
+        );
     }
 
     #[tokio::test]
@@ -1392,17 +1934,26 @@ mod includes {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        // Use _include:iterate to follow references from included resources
+        // _include:iterate follows references from included resources:
+        // obs-1 -> subject Patient/patient-1 -> organization Organization/org-1.
         let response = server
             .get("/Observation?_id=obs-1&_include=Observation:subject&_include:iterate=Patient:organization")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        // May or may not be supported
-        let status = response.status_code();
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        let types: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e["resource"]["resourceType"].as_str())
+            .collect();
+
+        // First-hop include (Patient) and the transitively-included Organization.
+        assert!(types.contains(&"Patient"), "subject Patient included");
         assert!(
-            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
-            "Should return OK or indicate unsupported"
+            types.contains(&"Organization"),
+            ":iterate should transitively include the Patient's managingOrganization"
         );
     }
 
@@ -1411,17 +1962,28 @@ mod includes {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        // Use * to include all references
+        // _include=Observation:* expands to every reference search param of
+        // Observation; obs-1 references subject (Patient) and performer
+        // (Practitioner), both of which should be included.
         let response = server
             .get("/Observation?_id=obs-1&_include=Observation:*")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        // May or may not be supported
-        let status = response.status_code();
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        let types: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e["resource"]["resourceType"].as_str())
+            .collect();
         assert!(
-            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
-            "Should return OK or indicate unsupported"
+            types.contains(&"Patient"),
+            "wildcard include resolves subject"
+        );
+        assert!(
+            types.contains(&"Practitioner"),
+            "wildcard include resolves performer"
         );
     }
 
@@ -1626,6 +2188,283 @@ mod fulltext_search {
         assert!(
             status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
             "Should return OK or 400"
+        );
+    }
+}
+
+mod list_search {
+    use super::*;
+
+    /// Creates a `List` resource whose entries reference the given patient ids.
+    async fn create_patient_list(backend: &SqliteBackend, id: &str, patient_ids: &[&str]) {
+        let entries: Vec<Value> = patient_ids
+            .iter()
+            .map(|pid| json!({ "item": { "reference": format!("Patient/{pid}") } }))
+            .collect();
+        backend
+            .create(
+                &test_tenant(),
+                "List",
+                json!({
+                    "resourceType": "List",
+                    "id": id,
+                    "status": "current",
+                    "mode": "working",
+                    "entry": entries,
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create List {id}: {e}"));
+    }
+
+    #[tokio::test]
+    async fn test_list_filters_to_members() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        create_patient_list(&backend, "list-1", &["patient-1", "patient-3"]).await;
+
+        let response = server
+            .get("/Patient?_list=list-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let mut ids: Vec<String> = get_bundle_entries(&body)
+            .iter()
+            .map(|e| e["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["patient-1", "patient-3"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_combined_with_other_criteria() {
+        // `_list` membership AND-s with ordinary search criteria.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        create_patient_list(&backend, "list-1", &["patient-1", "patient-2", "patient-3"]).await;
+
+        let response = server
+            .get("/Patient?_list=list-1&gender=male")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        // Only list members that are also male.
+        for entry in get_bundle_entries(&body) {
+            assert_eq!(entry["resource"]["gender"], "male");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_missing_yields_empty() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_list=does-not-exist")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(get_bundle_entries(&body).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_functional_list_rejected() {
+        // The `$current-*` functional lists are not implemented; reject (501)
+        // rather than silently returning an unfiltered result.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_list=$current-problems")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
+    }
+}
+
+mod score_param {
+    use super::*;
+
+    const PREFER: HeaderName = HeaderName::from_static("prefer");
+
+    #[tokio::test]
+    async fn test_score_input_accepted_and_ignored() {
+        // `_score` is an output concept, not a filter. It must not be rejected
+        // (it used to 400) and must not filter results — it is simply ignored
+        // as an input.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_score=5")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(
+            !get_bundle_entries(&body).is_empty(),
+            "`_score` input is ignored, so all patients are returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sort_by_score_accepted() {
+        // `_sort=_score` is accepted under both lenient and strict handling. On a
+        // non-full-text backend (SQLite) it falls back to default ordering.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let lenient = server
+            .get("/Patient?_sort=_score")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+
+        let strict = server
+            .get("/Patient?_sort=_score")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(PREFER, HeaderValue::from_static("handling=strict"))
+            .await;
+        strict.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn test_no_score_without_relevance_backend() {
+        // SQLite does not compute relevance, so match entries carry no
+        // `search.score` field.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_id=patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["search"]["mode"], "match");
+        assert!(entries[0]["search"].get("score").is_none());
+    }
+}
+
+mod contained_search {
+    use super::*;
+
+    /// Seeds an Observation containing a Patient named "Smith".
+    async fn seed_contained(backend: &SqliteBackend) {
+        backend
+            .create(
+                &test_tenant(),
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-c",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
+                    "subject": { "reference": "#pc" },
+                    "contained": [{
+                        "resourceType": "Patient",
+                        "id": "pc",
+                        "name": [{ "family": "Smith" }]
+                    }]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_contained_true_returns_container() {
+        let (server, backend) = create_test_server().await;
+        seed_contained(&backend).await;
+
+        let response = server
+            .get("/Patient?_contained=true&name=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resource"]["resourceType"], "Observation");
+        assert_eq!(entries[0]["resource"]["id"], "obs-c");
+    }
+
+    #[tokio::test]
+    async fn test_contained_type_contained_returns_contained_resource() {
+        let (server, backend) = create_test_server().await;
+        seed_contained(&backend).await;
+
+        let response = server
+            .get("/Patient?_contained=true&_containedType=contained&name=Smith")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resource"]["resourceType"], "Patient");
+        assert_eq!(entries[0]["resource"]["id"], "pc");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_contained_value_rejected() {
+        let (server, backend) = create_test_server().await;
+        seed_contained(&backend).await;
+
+        let response = server
+            .get("/Patient?_contained=maybe")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_advertises_new_search_controls() {
+        // SQLite supports contained search, so `_contained`/`_containedType` are
+        // advertised alongside the always-supported `_list`.
+        let (server, _backend) = create_test_server().await;
+
+        let response = server
+            .get("/metadata")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+
+        let patient = body["rest"][0]["resource"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["type"] == "Patient")
+            .expect("Patient resource in CapabilityStatement");
+        let names: Vec<&str> = patient["searchParam"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+
+        assert!(names.contains(&"_list"), "advertises _list");
+        assert!(names.contains(&"_contained"), "advertises _contained");
+        assert!(
+            names.contains(&"_containedType"),
+            "advertises _containedType"
         );
     }
 }

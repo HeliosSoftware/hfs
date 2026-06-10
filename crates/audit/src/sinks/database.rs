@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
+use crate::fhir_model::AuditEvent;
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
-use helios_fhir::r4::AuditEvent;
 
 use crate::sink::AuditSink;
 

@@ -19,17 +19,37 @@ impl DateHandler {
         let date_value = &value.value;
         let precision = DatePrecision::from_date_string(date_value);
 
+        // Precision range [start, end). Comparators match against its
+        // boundaries per the FHIR spec. When the value is full-precision the
+        // range is degenerate (start == end); fall back to scalar comparison
+        // so an exact instant still matches le/ge/eq.
+        let (start, end) = Self::get_precision_range(date_value, precision);
+
         match value.prefix {
             SearchPrefix::Eq => Self::build_equals(date_value, precision, param_num),
             SearchPrefix::Ne => Self::build_not_equals(date_value, precision, param_num),
-            SearchPrefix::Gt => Self::build_greater_than(date_value, param_num),
-            SearchPrefix::Lt => Self::build_less_than(date_value, param_num),
-            SearchPrefix::Ge => Self::build_greater_equal(date_value, param_num),
-            SearchPrefix::Le => Self::build_less_equal(date_value, param_num),
-            SearchPrefix::Sa => Self::build_starts_after(date_value, param_num),
-            SearchPrefix::Eb => Self::build_ends_before(date_value, param_num),
+            // gt / sa: strictly after the whole range → value_date >= end.
+            SearchPrefix::Gt | SearchPrefix::Sa if start != end => Self::cmp(">=", &end, param_num),
+            SearchPrefix::Gt | SearchPrefix::Sa => Self::cmp(">", date_value, param_num),
+            // lt / eb: strictly before the whole range → value_date < start.
+            SearchPrefix::Lt | SearchPrefix::Eb if start != end => {
+                Self::cmp("<", &start, param_num)
+            }
+            SearchPrefix::Lt | SearchPrefix::Eb => Self::cmp("<", date_value, param_num),
+            SearchPrefix::Ge if start != end => Self::cmp(">=", &start, param_num),
+            SearchPrefix::Ge => Self::cmp(">=", date_value, param_num),
+            SearchPrefix::Le if start != end => Self::cmp("<", &end, param_num),
+            SearchPrefix::Le => Self::cmp("<=", date_value, param_num),
             SearchPrefix::Ap => Self::build_approximately(date_value, precision, param_num),
         }
+    }
+
+    /// Builds a single-boundary date comparison `value_date {op} ?`.
+    fn cmp(op: &str, bound: &str, param_num: usize) -> SqlFragment {
+        SqlFragment::with_params(
+            format!("value_date {} ?{}", op, param_num),
+            vec![SqlParam::string(bound)],
+        )
     }
 
     /// Equality - matches any date within the precision range.
@@ -57,54 +77,6 @@ impl DateHandler {
                 param_num + 1
             ),
             vec![SqlParam::string(start), SqlParam::string(end)],
-        )
-    }
-
-    /// Greater than.
-    fn build_greater_than(date: &str, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_date > ?{}", param_num),
-            vec![SqlParam::string(date)],
-        )
-    }
-
-    /// Less than.
-    fn build_less_than(date: &str, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_date < ?{}", param_num),
-            vec![SqlParam::string(date)],
-        )
-    }
-
-    /// Greater than or equal.
-    fn build_greater_equal(date: &str, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_date >= ?{}", param_num),
-            vec![SqlParam::string(date)],
-        )
-    }
-
-    /// Less than or equal.
-    fn build_less_equal(date: &str, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_date <= ?{}", param_num),
-            vec![SqlParam::string(date)],
-        )
-    }
-
-    /// Starts after (for Period.start).
-    fn build_starts_after(date: &str, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_date > ?{}", param_num),
-            vec![SqlParam::string(date)],
-        )
-    }
-
-    /// Ends before (for Period.end).
-    fn build_ends_before(date: &str, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_date < ?{}", param_num),
-            vec![SqlParam::string(date)],
         )
     }
 
@@ -219,19 +191,30 @@ mod tests {
 
     #[test]
     fn test_date_gt() {
+        // gt on day-precision "2024-01-15" matches strictly after the day, i.e.
+        // value_date >= 2024-01-16T00:00:00.
         let value = SearchValue::new(SearchPrefix::Gt, "2024-01-15");
         let frag = DateHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains("> ?1"));
+        assert!(frag.sql.contains(">= ?1"));
         assert_eq!(frag.params.len(), 1);
+        match &frag.params[0] {
+            SqlParam::String(s) => assert_eq!(s, "2024-01-16T00:00:00"),
+            _ => panic!("expected string bound"),
+        }
     }
 
     #[test]
     fn test_date_le() {
+        // le on day-precision matches up to the end of the day → < next day.
         let value = SearchValue::new(SearchPrefix::Le, "2024-01-15");
         let frag = DateHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains("<= ?1"));
+        assert!(frag.sql.contains("< ?1"));
+        match &frag.params[0] {
+            SqlParam::String(s) => assert_eq!(s, "2024-01-16T00:00:00"),
+            _ => panic!("expected string bound"),
+        }
     }
 
     #[test]

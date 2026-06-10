@@ -5,8 +5,8 @@
 use serde_json::{Value, json};
 
 use crate::types::{
-    PageCursor, SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
-    SortDirection, SortDirective,
+    CompartmentMembership, PageCursor, SearchModifier, SearchParamType, SearchParameter,
+    SearchPrefix, SearchQuery, SortDirection, SortDirective, strip_reference_version,
 };
 
 use super::fts;
@@ -20,6 +20,19 @@ pub struct EsQuery {
     pub body: Value,
     /// The index to search.
     pub index: String,
+}
+
+/// Returns true if the query contains a relevance-scoring (full-text) clause:
+/// the `_text` / `_content` special params, or a `:text` / `:text-advanced`
+/// modifier. Such clauses make Elasticsearch's `_score` meaningful.
+fn query_has_relevance(query: &SearchQuery) -> bool {
+    query.parameters.iter().any(|p| {
+        matches!(p.name.as_str(), "_text" | "_content")
+            || matches!(
+                p.modifier,
+                Some(SearchModifier::Text) | Some(SearchModifier::TextAdvanced)
+            )
+    })
 }
 
 /// Builds Elasticsearch queries from FHIR search queries.
@@ -43,14 +56,39 @@ impl<'a> EsQueryBuilder<'a> {
     /// Builds a complete ES query from a FHIR SearchQuery.
     pub fn build(&self, query: &SearchQuery) -> EsQuery {
         let mut must_clauses: Vec<Value> = Vec::new();
-        let filter_clauses: Vec<Value> = vec![
+        let mut filter_clauses: Vec<Value> = vec![
             json!({ "term": { "tenant_id": self.tenant_id } }),
             json!({ "term": { "is_deleted": false } }),
         ];
 
+        // `_contained` mode selects between top-level and contained docs. Contained
+        // docs carry `is_contained=true`; top-level docs omit the field, so
+        // `must_not term is_contained=true` excludes contained docs without
+        // requiring a value on every existing document.
+        let mut must_not_clauses: Vec<Value> = Vec::new();
+        match query.contained {
+            crate::types::ContainedMode::Off => {
+                must_not_clauses.push(json!({ "term": { "is_contained": true } }));
+            }
+            crate::types::ContainedMode::On => {
+                filter_clauses.push(json!({ "term": { "is_contained": true } }));
+            }
+            crate::types::ContainedMode::Both => {}
+        }
+
         // Process each search parameter
         for param in &query.parameters {
             if let Some(clause) = self.build_parameter_clause(param) {
+                must_clauses.push(clause);
+            }
+        }
+
+        // Compartment membership: a resource joins the compartment if it
+        // references `comp.reference` via ANY of the membership params (OR),
+        // per the FHIR CompartmentDefinition. Modeled as a single nested query
+        // over the stored reference search params.
+        if let Some(comp) = &query.compartment {
+            if let Some(clause) = Self::build_compartment_clause(comp) {
                 must_clauses.push(clause);
             }
         }
@@ -62,6 +100,10 @@ impl<'a> EsQueryBuilder<'a> {
 
         if !must_clauses.is_empty() {
             bool_query["must"] = json!(must_clauses);
+        }
+
+        if !must_not_clauses.is_empty() {
+            bool_query["must_not"] = json!(must_not_clauses);
         }
 
         let mut body = json!({
@@ -88,10 +130,57 @@ impl<'a> EsQueryBuilder<'a> {
         // Track total hits
         body["track_total_hits"] = json!(true);
 
+        // When the query contributes relevance (full-text), ask ES to compute
+        // `_score` even though we sort by a field — otherwise `_score` is null
+        // and we can't populate `Bundle.entry.search.score`. A `_sort=_score`
+        // already scores natively, so this only matters for the field-sort case.
+        if query_has_relevance(query) {
+            body["track_scores"] = json!(true);
+        }
+
         EsQuery {
             body,
             index: self.index.clone(),
         }
+    }
+
+    /// Builds a nested clause matching resources that reference
+    /// `comp.reference` through ANY of the compartment membership params
+    /// (logical OR), which is how a resource joins a FHIR compartment.
+    ///
+    /// Reference matching is version-agnostic and mirrors the reference
+    /// parameter handler: the stored reference must equal the base reference or
+    /// carry a `/_history/<vid>` suffix. The membership params come from the
+    /// bundled FHIR `CompartmentDefinition`s. Returns `None` if there are no
+    /// membership params or no reference.
+    fn build_compartment_clause(comp: &CompartmentMembership) -> Option<Value> {
+        if comp.params.is_empty() || comp.reference.is_empty() {
+            return None;
+        }
+
+        let base = strip_reference_version(&comp.reference);
+
+        Some(json!({
+            "nested": {
+                "path": "search_params.reference",
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "terms": { "search_params.reference.name": comp.params } },
+                            {
+                                "bool": {
+                                    "should": [
+                                        { "term": { "search_params.reference.reference": base } },
+                                        { "prefix": { "search_params.reference.reference": format!("{base}/_history/") } }
+                                    ],
+                                    "minimum_should_match": 1
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }))
     }
 
     /// Builds a clause for a single search parameter.
@@ -223,6 +312,10 @@ impl<'a> EsQueryBuilder<'a> {
                 "_lastUpdated" => {
                     sort_clauses.push(json!({ "last_updated": { "order": order } }));
                 }
+                // `_sort=_score` ranks by Elasticsearch relevance.
+                "_score" => {
+                    sort_clauses.push(json!({ "_score": { "order": order } }));
+                }
                 // For other parameters, sort on the nested search_params field
                 name => {
                     // Use nested sort on the most likely field type (string)
@@ -336,6 +429,7 @@ mod tests {
         let query = SearchQuery::new("Patient").with_sort(SortDirective {
             parameter: "_id".to_string(),
             direction: SortDirection::Ascending,
+            param_type: None,
         });
 
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
